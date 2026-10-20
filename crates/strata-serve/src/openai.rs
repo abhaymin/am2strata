@@ -23,7 +23,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
         .mgr
         .models
         .iter()
-        .map(|m| json!({"id": m.id, "object": "model", "created": now(), "owned_by": "polystrata",
+        .map(|m| json!({"id": m.id, "object": "model", "created": now(), "owned_by": "am2strata",
                         "meta": {"n_ctx": m.cfg.max_context()},
                         "status": {"value": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "unloaded" }}}))
         .collect();

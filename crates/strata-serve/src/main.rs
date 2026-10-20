@@ -1,4 +1,4 @@
-//! strata-serve: the PolyStrata server in Rust.
+//! strata-serve: am2Strata, the PolyStrata server rewritten in Rust.
 //!
 //! Serves every installed model (the `strata-*.json` run configs of a PolyStrata folder) through one address,
 //! switching between them on request, with the OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs,
@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
-#[command(about = "PolyStrata server in Rust: every installed model, OpenAI and Anthropic APIs, the web app")]
+#[command(name = "am2strata", about = "am2Strata: every installed PolyStrata model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
 struct Args {
     /// folder with the strata-<model>.json run configs (a PolyStrata folder)
     #[arg(long, default_value = "~/Development/PolyStrata")]
@@ -49,7 +49,7 @@ struct Args {
     /// API key (default: the default model's config api_key)
     #[arg(long)]
     api_key: Option<String>,
-    /// the web app's files (default: <models-dir>/serve/web)
+    /// the web app's files (default: this repository's web/, the am2Strata app; else <models-dir>/serve/web)
     #[arg(long)]
     web_dir: Option<String>,
     /// keep the last 100 API calls (bodies, output, timings) in memory for /api-monitor (also "api_monitor": true
@@ -160,7 +160,10 @@ async fn main() -> Result<()> {
     }
     let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on) };
-    let web_dir = args.web_dir.map(|p| expand(&p)).unwrap_or_else(|| dir.join("serve/web"));
+    let own_web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let web_dir = args.web_dir.map(|p| expand(&p)).unwrap_or_else(|| {
+        if own_web.join("index.html").exists() { own_web.clone() } else { dir.join("serve/web") }
+    });
     let app = Router::new()
         .route("/health", get(web::health))
         .route("/v1/models", get(openai::models))

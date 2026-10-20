@@ -243,7 +243,7 @@ impl Monitor {
         let mib = |k: &str| tel.now.get(k).and_then(Value::as_f64).map(|v| (v / 1048576.0).round());
         let t = now();
         json!({
-            "service": "strata", "server": "strata-serve (Rust)", "model": model, "loaded": loaded, "auto_load": true,
+            "service": "strata", "server": "am2Strata", "model": model, "loaded": loaded, "auto_load": true,
             "started": self.started as u64, "uptime_s": (t - self.started) as u64,
             "cache_max_tokens": ctx, "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": 1, "requested": 1},

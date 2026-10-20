@@ -1,6 +1,6 @@
-# polystrata-rs
+# am2Strata
 
-A staged rewrite of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
+am2Strata (repository polystrata-rs) is a staged rewrite of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
 risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 and Phase 1 done**: the Rust server can stand in for the Python one for chat, coding agents (OpenAI, Anthropic and Responses APIs), MCP tools, pictures and documents. Image generation is the one PolyStrata feature not ported.
 
 ## What works
@@ -24,7 +24,7 @@ MiniCPM-V and the others) over their line protocol.
 | Images (image encoder process, cache, `GENI`), complex documents | done | live: invoice and purchase order fields exact |
 | Video | as frames: video parts are cut into frames with ffmpeg when installed; frames sent as images always work | live (frames); ffmpeg path needs `sudo apt install ffmpeg` |
 | Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
-| Web app (PolyStrata's own files) | done: chat, model picker, settings, monitor polling | live in a browser |
+| Web app (am2Strata's `web/`, PolyStrata's app rebranded; MIT notice in `web/LICENSE-PolyStrata.txt`) | done: chat, model picker, settings, monitor polling | live in a browser |
 | Stop strings, model-card default sampling, `fit_max_tokens` | done | live |
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
 

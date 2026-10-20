@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the PolyStrata Rust server (strata-serve).
+"""Run am2Strata (the PolyStrata server rewritten in Rust; binary strata-serve).
 
   python3 run.py                         build if needed, serve every model of ~/Development/PolyStrata
   python3 run.py --model minicpm --port 8001
@@ -31,7 +31,7 @@ TEMP_UNIT = "strata-rs"
 
 
 def say(msg: str) -> None:
-    print(f"[run] {msg}", flush=True)
+    print(f"[am2strata] {msg}", flush=True)
 
 
 def needs_build() -> bool:
@@ -86,7 +86,7 @@ def temp_service(args, rest) -> int:
     if service_active():
         service("stop")
         time.sleep(3)                                  # the engine gives its GPU memory back
-    unit = ["systemd-run", "--user", f"--unit={TEMP_UNIT}", f"--description=PolyStrata Rust server (temporary)",
+    unit = ["systemd-run", "--user", f"--unit={TEMP_UNIT}", f"--description=am2Strata (temporary)",
             f"--working-directory={ROOT}", f"--property=Conflicts={SERVICE}.service",
             f"--property=ExecStopPost=/usr/bin/systemctl --user start {SERVICE}.service",
             "--property=KillSignal=SIGINT", "--property=TimeoutStopSec=90", *cmd]
