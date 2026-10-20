@@ -1,11 +1,11 @@
 # am2Strata
 
-am2Strata (repository polystrata-rs) is a staged rewrite of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
+am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
 risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 and Phase 1 done**: the Rust server can stand in for the Python one for chat, coding agents (OpenAI, Anthropic and Responses APIs), MCP tools, pictures and documents. Image generation is the one PolyStrata feature not ported.
 
 ## What works
 
-`strata-serve` runs every model of a PolyStrata folder (each `strata-*.json`) behind one address and switches
+`am2strata` runs every model of a PolyStrata folder (each `strata-*.json`) behind one address and switches
 between them, driving PolyStrata's own C++/CUDA engines (`strata` for Orca / Qwen3.8, `strata-poly` for Tiel Coder,
 MiniCPM-V and the others) over their line protocol.
 
@@ -48,7 +48,7 @@ python3 run.py --take-over --port 8000                  # in the foreground, in 
 python3 run.py --temp-service --port 8000               # as a temporary user service; PolyStrata's comes back when it stops
 python3 run.py --stop-temp-service
 # live GPU tests against a running server
-STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p strata-serve --release --test live -- --ignored --test-threads=1
+STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p am2strata --release --test live -- --ignored --test-threads=1
 ```
 
 Golden files are recorded from PolyStrata with:

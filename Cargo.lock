@@ -32,6 +32,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "am2strata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "futures",
+ "image",
+ "jsonschema",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "strata-engine",
+ "strata-frontend",
+ "strata-protocol",
+ "strata-template",
+ "strata-tokenizer",
+ "tokio",
+ "tokio-stream",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1744,33 +1771,6 @@ name = "strata-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "strata-serve"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "clap",
- "futures",
- "image",
- "jsonschema",
- "reqwest",
- "serde",
- "serde_json",
- "strata-engine",
- "strata-frontend",
- "strata-protocol",
- "strata-template",
- "strata-tokenizer",
- "tokio",
- "tokio-stream",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

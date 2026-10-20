@@ -1,6 +1,6 @@
-//! Live tests against a running strata-serve with the real engines (GPU). Ignored by default:
+//! Live tests against a running am2strata with the real engines (GPU). Ignored by default:
 //!
-//!   STRATA_LIVE_URL=http://127.0.0.1:8001 STRATA_LIVE_KEY=... cargo test -p strata-serve --release --test live -- --ignored --test-threads=1
+//!   STRATA_LIVE_URL=http://127.0.0.1:8001 STRATA_LIVE_KEY=... cargo test -p am2strata --release --test live -- --ignored --test-threads=1
 //!
 //! The server must have the installed PolyStrata models (Orca, Tiel Coder, MiniCPM-V). Answers vary between runs (the
 //! engines are not deterministic), so the checks look for the facts an answer must contain, not exact text.

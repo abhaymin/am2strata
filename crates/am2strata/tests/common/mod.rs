@@ -1,4 +1,4 @@
-//! Test harness: the real `strata-serve` binary driving `strata-mock-engine` (no GPU). Each test gets its own
+//! Test harness: the real `am2strata` binary driving `strata-mock-engine` (no GPU). Each test gets its own
 //! models folder, port, scripted engine replies and a record of every command the engine and encoder received.
 
 #![allow(dead_code)]
@@ -86,7 +86,7 @@ fn write_config(dir: &Path, m: &Model) {
 impl Server {
     /// Start a server over `models` (the first is loaded at start) with the engine's scripted `replies`.
     pub fn start(models: &[Model], replies: &[Vec<u32>], extra: Value) -> Server {
-        let dir = std::env::temp_dir().join(format!("strata-serve-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        let dir = std::env::temp_dir().join(format!("am2strata-test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         for m in models {
             write_config(&dir, m);
@@ -98,7 +98,7 @@ impl Server {
         std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
         let record = dir.join("record.txt");
         let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_strata-serve"))
+        let child = Command::new(env!("CARGO_BIN_EXE_am2strata"))
             .args(["--models-dir"]).arg(&dir)
             .args(["--model", models[0].id, "--port", &port.to_string(), "--host", "127.0.0.1"])
             .arg("--web-dir").arg(testdata().join("web"))
@@ -108,7 +108,7 @@ impl Server {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start strata-serve");
+            .expect("start am2strata");
         let s = Server { child, port, dir, record, base: format!("http://127.0.0.1:{port}") };
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(30) {
@@ -117,7 +117,7 @@ impl Server {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("strata-serve did not start");
+        panic!("am2strata did not start");
     }
 
     pub fn post(&self, path: &str, body: &Value) -> (u16, Value) {

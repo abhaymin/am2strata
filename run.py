@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Run am2Strata (the PolyStrata server rewritten in Rust; binary strata-serve).
+"""Run am2Strata (a new edition of the PolyStrata server, written in Rust).
 
   python3 run.py                         build if needed, serve every model of ~/Development/PolyStrata
   python3 run.py --model minicpm --port 8001
   python3 run.py --take-over             stop the PolyStrata systemd service first (the GPU fits one engine), start it
                                          again when this server ends
   python3 run.py --temp-service --port 8000
-                                         run it as a temporary systemd user service (strata-rs) in place of the
+                                         run it as a temporary systemd user service (am2strata) in place of the
                                          PolyStrata service, which starts again when this one stops
   python3 run.py --stop-temp-service     stop that temporary service (PolyStrata's comes back)
   python3 run.py --test                  run the Rust test suite instead
   python3 run.py --build                 rebuild first even when the binary looks current
 
-Everything after the known options is passed to strata-serve (see `run.py -- --help`).
+Everything after the known options is passed to the am2strata binary (see `run.py -- --help`).
 """
 import argparse
 import json
@@ -25,9 +25,9 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-BINARY = ROOT / "target" / "release" / "strata-serve"
+BINARY = ROOT / "target" / "release" / "am2strata"
 SERVICE = "strata-orca"
-TEMP_UNIT = "strata-rs"
+TEMP_UNIT = "am2strata"
 
 
 def say(msg: str) -> None:
@@ -44,8 +44,8 @@ def needs_build() -> bool:
 
 
 def build() -> None:
-    say("building strata-serve (cargo build --release) ...")
-    subprocess.run(["cargo", "build", "--release", "-p", "strata-serve"], cwd=ROOT, check=True)
+    say("building am2strata (cargo build --release) ...")
+    subprocess.run(["cargo", "build", "--release", "-p", "am2strata"], cwd=ROOT, check=True)
 
 
 def service_active() -> bool:

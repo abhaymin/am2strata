@@ -1,4 +1,4 @@
-//! strata-serve: am2Strata, the PolyStrata server rewritten in Rust.
+//! am2Strata: a new edition of the PolyStrata server, written in Rust.
 //!
 //! Serves every installed model (the `strata-*.json` run configs of a PolyStrata folder) through one address,
 //! switching between them on request, with the OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs,
@@ -49,7 +49,7 @@ struct Args {
     /// API key (default: the default model's config api_key)
     #[arg(long)]
     api_key: Option<String>,
-    /// the web app's files (default: this repository's web/, the am2Strata app; else <models-dir>/serve/web)
+    /// the web app's files (default: the am2Strata app, web/ in the folder the binary was built in)
     #[arg(long)]
     web_dir: Option<String>,
     /// keep the last 100 API calls (bodies, output, timings) in memory for /api-monitor (also "api_monitor": true
@@ -110,6 +110,13 @@ fn expand(p: &str) -> PathBuf {
     }
 }
 
+/// am2Strata's own web app: `web/` beside the binary or in a folder above it (target/release/am2strata ->
+/// <am2strata folder>/web), so the folder can be moved or renamed.
+fn own_web_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    exe.ancestors().skip(1).take(4).map(|d| d.join("web")).find(|w| w.join("index.html").exists())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -160,10 +167,10 @@ async fn main() -> Result<()> {
     }
     let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on) };
-    let own_web = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web");
-    let web_dir = args.web_dir.map(|p| expand(&p)).unwrap_or_else(|| {
-        if own_web.join("index.html").exists() { own_web.clone() } else { dir.join("serve/web") }
-    });
+    let web_dir = match args.web_dir.map(|p| expand(&p)) {
+        Some(d) => d,
+        None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
+    };
     let app = Router::new()
         .route("/health", get(web::health))
         .route("/v1/models", get(openai::models))

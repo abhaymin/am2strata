@@ -1,6 +1,6 @@
 [package]
-name = "strata-serve"
-description = "OpenAI-compatible HTTP server for PolyStrata engines"
+name = "am2strata"
+description = "am2Strata: OpenAI/Anthropic-compatible server for the PolyStrata engines"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -6,7 +6,7 @@ members = [
     "crates/strata-protocol",
     "crates/strata-engine",
     "crates/strata-frontend",
-    "crates/strata-serve",
+    "crates/am2strata",
 ]
 
 [workspace.package]
