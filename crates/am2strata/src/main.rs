@@ -197,6 +197,9 @@ async fn main() -> Result<()> {
         .route_service("/api-monitor", ServeFile::new(web_dir.join("monitor.html")))
         .nest_service("/web", ServeDir::new(&web_dir))
         .nest_service("/fonts", ServeDir::new(web_dir.join("fonts")))
+        // browsers check the web app's files for a newer version every time (an update is never stuck behind a cache)
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         .with_state(state);
