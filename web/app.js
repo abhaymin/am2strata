@@ -101,8 +101,8 @@ let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
-                                          : "Attach a text file (or drop it here)";
+    $("attach-btn").title = health.images ? "Attach a text file, a picture, a video or a PDF (or drop it here)"
+                                          : "Attach a text file or a PDF (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
     if (location.hash === "#images" && health.image_generation) showTab("images");
@@ -609,12 +609,13 @@ function samplingUntouched(s) {
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);
-let attachments = [];                 // {name, url}
+let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
 let busy = null;                      // {controller, msg}
 
 function saveChat() {
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+                                           files: (m.files || []).map((f) => ({name: f.name})),
+                                           media: (m.media || []).map((x) => ({kind: x.kind, name: x.name}))})));
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
@@ -631,6 +632,18 @@ function msgEl(m, i) {
         c.className = "chip";
         c.innerHTML = icon("attach", "st-icon st-icon--sm");
         c.append(f.name);
+        wrap.appendChild(c);
+      }
+      el.appendChild(wrap);
+    }
+    if (m.media && m.media.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-images";
+      for (const x of m.media) {
+        const c = document.createElement("span");
+        c.className = "chip";
+        c.innerHTML = icon(x.kind === "video" ? "image" : "attach", "st-icon st-icon--sm");
+        c.append(x.kind === "video" && x.frames ? `${x.name} (${x.frames.length} frames)` : x.name);
         wrap.appendChild(c);
       }
       el.appendChild(wrap);
@@ -775,9 +788,18 @@ function apiMessages() {
   for (const m of messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
+      const media = (m.media || []).filter((x) => x.frames || x.url);
       const text = userText(m);
-      out.push({role: "user", content: imgs.length ? [{type: "text", text},
-        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
+      const parts = [{type: "text", text}, ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))];
+      for (const x of media) {
+        if (x.kind === "video") {          // the browser's frames, in order: how MiniCPM-V and the others read a video
+          parts.push({type: "text", text: `[A video, "${x.name}", ${x.duration.toFixed(1)} s, as ${x.frames.length} frames in order:]`});
+          parts.push(...x.frames.map((u) => ({type: "image_url", image_url: {url: u}})));
+        } else {                           // the server reads the PDF: its text, and its pages as pictures
+          parts.push({type: "file", file: {filename: x.name, file_data: x.url}});
+        }
+      }
+      out.push({role: "user", content: parts.length > 1 ? parts : text});
     } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
     }
@@ -820,8 +842,9 @@ function setBusy(on) {
 async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
-  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
-                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
+  messages.push({role: "user", text, images: attachments.filter((a) => a.kind === "image"),
+                 files: attachments.filter((a) => a.kind === "file"),
+                 media: attachments.filter((a) => a.kind === "video" || a.kind === "pdf"), time: Date.now()});
   attachments = [];
   renderAttachments();
   $("input").value = "";
@@ -955,8 +978,46 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+const VIDEO_FRAMES = 16;              // frames a video is sent as (evenly spread over it)
+// A video's frames, decoded by the browser itself (no ffmpeg needed on the server), as JPEG data URLs
+async function videoFrames(file, n) {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement("video");
+  v.muted = true; v.preload = "auto"; v.playsInline = true; v.src = url;
+  try {
+    await new Promise((ok, bad) => { v.onloadeddata = ok; v.onerror = () => bad(new Error("this browser cannot play this video format")); });
+    const dur = v.duration;
+    if (!isFinite(dur) || dur <= 0) throw new Error("the video has no length");
+    const scale = Math.min(1, 768 / Math.max(v.videoWidth, v.videoHeight));
+    const c = document.createElement("canvas");
+    c.width = Math.max(2, Math.round(v.videoWidth * scale)); c.height = Math.max(2, Math.round(v.videoHeight * scale));
+    const g = c.getContext("2d"), frames = [];
+    for (let i = 0; i < n; i++) {
+      v.currentTime = Math.min(dur - 0.01, dur * (i + 0.5) / n);
+      await new Promise((ok) => { v.onseeked = ok; });
+      g.drawImage(v, 0, 0, c.width, c.height);
+      frames.push(c.toDataURL("image/jpeg", 0.8));
+    }
+    return {frames, duration: dur};
+  } finally { URL.revokeObjectURL(url); }
+}
 function addFiles(files) {
   for (const f of files) {
+    if (f.type.startsWith("video/") || /\.(mp4|m4v|mov|webm|mkv|avi|ogv)$/i.test(f.name)) {
+      if (!health.images) { toast("warn", "Video needs a picture model", "This model reads text only: load one that reads pictures (MiniCPM-V)."); continue; }
+      const chip = {kind: "video", name: f.name, frames: null, duration: 0};
+      toast("info", "Reading the video", `${f.name}: taking ${VIDEO_FRAMES} frames…`, 2500);
+      videoFrames(f, VIDEO_FRAMES).then((r) => { Object.assign(chip, r); attachments.push(chip); renderAttachments(); })
+        .catch((e) => toast("error", "Video not read", `${f.name}: ${e.message}. Try an MP4 (H.264) or WebM file.`, 6000));
+      continue;
+    }
+    if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) {
+      if (f.size > 50e6) { toast("warn", "PDF too large", `${f.name} is over 50 MB.`); continue; }
+      const r = new FileReader();
+      r.onload = () => { attachments.push({kind: "pdf", name: f.name, url: r.result}); renderAttachments(); };
+      r.readAsDataURL(f);
+      continue;
+    }
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
@@ -965,7 +1026,7 @@ function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
+    if (!isTextFile(f)) { toast("warn", "Not a supported file", `${f.name}: attach text files (code, notes, logs, data), PDFs${health.images ? ", pictures or videos" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
     r.onload = () => {
@@ -994,8 +1055,8 @@ function renderAttachments() {
   attachments.forEach((a, i) => {
     const c = document.createElement("span");
     c.className = "chip";
-    c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
-    c.append(a.name);
+    c.innerHTML = icon(a.kind === "file" || a.kind === "pdf" ? "attach" : "image", "st-icon st-icon--sm");
+    c.append(a.kind === "video" ? `${a.name} (${a.frames.length} frames, ${a.duration.toFixed(0)} s)` : a.name);
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
     x.innerHTML = icon("trash");

@@ -783,9 +783,25 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, Json(error_body("a valid API key is required", "authentication_error", None, None))).into_response()
 }
 
-pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut req): Json<Value>) -> Response {
     if !authorized(&s, &headers) {
         return unauthorized();
+    }
+    // documents (input_file) become text and page pictures before the request is read
+    if req.get("input").and_then(Value::as_array).is_some_and(|items| items.iter().any(|i| {
+        i.get("content").and_then(Value::as_array).is_some_and(|c| c.iter().any(|p| p["type"] == "input_file"))
+    })) {
+        let images = match s.mgr.ensure().await {
+            Ok(l) => l.vision.is_some(),
+            Err(e) => {
+                let mut r = RespError::new(format!("{e:#}"), None);
+                (r.status, r.kind) = (503, "server_error");
+                return r.into_response();
+            }
+        };
+        if let Err(e) = media::expand_documents(&mut req, images, false).await {
+            return RespError::new(e.to_string(), None).into_response();
+        }
     }
     let (mut chat, names) = match to_chat(&req) {
         Ok(c) => c,

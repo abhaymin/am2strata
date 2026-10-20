@@ -601,3 +601,58 @@ fn a_model_added_while_running_is_listed_and_loads() {
     assert_eq!(c, 200, "{r}");
     assert_eq!(s.get("/v1/models", true).1["data"].as_array().unwrap().len(), 2);
 }
+
+/// A one-page PDF with `text` on it (Helvetica), xref offsets computed.
+fn tiny_pdf(text: &str) -> Vec<u8> {
+    let content = format!("BT /F1 18 Tf 72 720 Td ({text}) Tj ET");
+    let objs = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_string(),
+        format!("<< /Length {} >>\nstream\n{content}\nendstream", content.len()),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend(format!("{} 0 obj\n{o}\nendobj\n", i + 1).bytes());
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objs.len() + 1).bytes());
+    for off in offsets {
+        out.extend(format!("{off:010} 00000 n \n").bytes());
+    }
+    out.extend(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objs.len() + 1).bytes());
+    out
+}
+
+fn pdftools() -> bool {
+    std::process::Command::new("pdftotext").arg("-v").output().is_ok()
+}
+
+#[test]
+fn pdf_documents_become_text_and_page_pictures() {
+    if !pdftools() {
+        eprintln!("skipped: poppler-utils not installed");
+        return;
+    }
+    use base64::Engine as _;
+    let pdf = base64::engine::general_purpose::STANDARD.encode(tiny_pdf("Invoice total 4217 EUR"));
+    let s = Server::start(&[Model::default()], &[ids("The total is 4217 EUR."), ids("4217.")], json!({"image_tokens": 4}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"max_tokens": 50, "chat_template_kwargs": {"enable_thinking": false},
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "What is the total?"},
+            {"type": "file", "file": {"filename": "invoice.pdf", "file_data": format!("data:application/pdf;base64,{pdf}")}}]}]}));
+    assert_eq!(c, 200, "{r}");
+    let g = s.gen_lines();
+    assert!(g[0].starts_with("GENI"), "the page goes to the encoder as a picture: {}", &g[0][..40]);
+    let tok = tokenizer();
+    let prompt = tok.decode(&line_ids(&g[0])).unwrap();
+    assert!(prompt.contains("[Document: invoice.pdf, 1 page") && prompt.contains("Invoice total 4217 EUR"), "{prompt}");
+    // Anthropic's document block
+    let (c, r) = s.post("/v1/messages", &json!({"model": "x", "max_tokens": 50, "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": [{"type": "document", "title": "inv.pdf",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": pdf}}, {"type": "text", "text": "Total?"}]}]}));
+    assert_eq!(c, 200, "{r}");
+    assert!(tok.decode(&line_ids(&s.gen_lines()[1])).unwrap().contains("Invoice total 4217 EUR"));
+}

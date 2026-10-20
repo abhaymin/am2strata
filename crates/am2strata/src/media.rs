@@ -142,3 +142,133 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
     }
     Ok(videos)
 }
+
+// ------------------------------------------------------------------------------------------------ documents (PDF)
+
+/// Page images sent with a document's text (the rest of the pages go as text only).
+pub const MAX_PAGE_IMAGES: usize = 20;
+
+pub fn pdftools_available() -> bool {
+    Command::new("pdftotext").arg("-v").output().is_ok() && Command::new("pdftoppm").arg("-v").output().is_ok()
+}
+
+/// A PDF -> (its text, page by page, and up to `max_images` page images as JPEG; none when `images` is false).
+pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(Vec<String>, Vec<Vec<u8>>)> {
+    if !pdftools_available() {
+        bail!("this server cannot read PDF files: install poppler-utils (sudo apt install poppler-utils)");
+    }
+    if !pdf.starts_with(b"%PDF") {
+        bail!("the document is not a PDF file");
+    }
+    let dir = tempdir()?;
+    let input = dir.join("in.pdf");
+    std::fs::write(&input, pdf)?;
+    let out = Command::new("pdftotext").args(["-layout", "-enc", "UTF-8"]).arg(&input).arg("-").output()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!("the PDF could not be read ({})", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    // pdftotext ends each page with a form feed
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut pages: Vec<String> = text.split('\u{c}').map(|p| p.trim_end().to_string()).collect();
+    while pages.last().is_some_and(|p| p.is_empty()) {
+        pages.pop();
+    }
+    let mut imgs = Vec::new();
+    if images && max_images > 0 {
+        let status = Command::new("pdftoppm")
+            .args(["-jpeg", "-jpegopt", "quality=80", "-r", "110", "-l", &max_images.to_string()])
+            .arg(&input)
+            .arg(dir.join("p"))
+            .status()?;
+        if status.success() {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)?.flatten().map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "jpg")).collect();
+            files.sort();
+            imgs = files.iter().take(max_images).map(std::fs::read).collect::<std::io::Result<Vec<_>>>()?;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok((pages, imgs))
+}
+
+/// The text the model reads for a document: its name, then each page's text under a page heading.
+fn document_text(name: &str, pages: &[String], images: usize) -> String {
+    let mut s = format!("[Document: {name}, {} page{}{}]\n", pages.len(), if pages.len() == 1 { "" } else { "s" },
+                        if images > 0 { format!("; the first {images} page{} also as pictures after the text", if images == 1 { "" } else { "s" }) } else { String::new() });
+    for (i, p) in pages.iter().enumerate() {
+        s.push_str(&format!("\n--- page {} ---\n{}\n", i + 1, if p.trim().is_empty() { "(no text on this page: see its picture)" } else { p }));
+    }
+    s
+}
+
+/// (data, file name) of a document part in any of the three APIs' shapes, or None when the part is not one.
+fn document_source(part: &Value) -> Option<(String, String)> {
+    let kind = part.get("type").and_then(Value::as_str)?;
+    match kind {
+        // OpenAI Chat: {"type": "file", "file": {"file_data": "data:application/pdf;base64,...", "filename": ...}}
+        "file" => {
+            let f = part.get("file")?;
+            Some((f.get("file_data")?.as_str()?.to_string(), f.get("filename").and_then(Value::as_str).unwrap_or("document.pdf").to_string()))
+        }
+        // OpenAI Responses: {"type": "input_file", "file_data": ..., "filename": ...}
+        "input_file" => Some((part.get("file_data")?.as_str()?.to_string(),
+                              part.get("filename").and_then(Value::as_str).unwrap_or("document.pdf").to_string())),
+        // Anthropic: {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": ...}}
+        "document" => {
+            let s = part.get("source")?;
+            let name = part.get("title").and_then(Value::as_str).unwrap_or("document.pdf").to_string();
+            match s.get("type").and_then(Value::as_str) {
+                Some("base64") => Some((format!("data:application/pdf;base64,{}", s.get("data")?.as_str()?), name)),
+                Some("url") => Some((s.get("url")?.as_str()?.to_string(), name)),
+                Some("text") => Some((format!("text:{}", s.get("data")?.as_str()?), name)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Replace every document part (PDF) in a request's messages with its text and, for a model that reads pictures,
+/// its first pages as images, in the request's own API shape (`anthropic`: image blocks, else image_url parts).
+pub async fn expand_documents(req: &mut Value, images: bool, anthropic: bool) -> Result<usize> {
+    let key = if req.get("input").is_some_and(Value::is_array) { "input" } else { "messages" };
+    let Some(messages) = req.get_mut(key).and_then(Value::as_array_mut) else { return Ok(0) };
+    let mut docs = 0;
+    let mut budget = MAX_PAGE_IMAGES;
+    for m in messages.iter_mut() {
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        if !parts.iter().any(|p| document_source(p).is_some()) {
+            continue;
+        }
+        let mut out = Vec::with_capacity(parts.len() + 4);
+        for p in parts.drain(..) {
+            let Some((src, name)) = document_source(&p) else {
+                out.push(p);
+                continue;
+            };
+            docs += 1;
+            let text_kind = if key == "input" { "input_text" } else { "text" };
+            if let Some(plain) = src.strip_prefix("text:") {
+                out.push(json!({"type": text_kind, "text": format!("[Document: {name}]\n{plain}")}));
+                continue;
+            }
+            let data = load_source(&src).await?;
+            let (pages, imgs) = pdf_pages(&data, images, budget).await?;
+            budget -= imgs.len();
+            out.push(json!({"type": text_kind, "text": document_text(&name, &pages, imgs.len())}));
+            for img in imgs {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(img);
+                out.push(if anthropic {
+                    json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}})
+                } else if key == "input" {
+                    json!({"type": "input_image", "image_url": format!("data:image/jpeg;base64,{b64}")})
+                } else {
+                    json!({"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{b64}")}})
+                });
+            }
+        }
+        *parts = out;
+    }
+    Ok(docs)
+}

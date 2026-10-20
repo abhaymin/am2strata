@@ -43,6 +43,9 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
+    if let Err(e) = media::expand_documents(&mut req, loaded.vision.is_some(), true).await {
+        return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
+    }
     {
         let shared = loaded.shared.read().unwrap().clone();
         crate::settings::with_shared(&mut req, &shared, loaded.config_effort().as_deref(), "anthropic");
