@@ -329,3 +329,51 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .call-error { grid-column: 1 / -1; background: var(--st-danger-tint); color: var(--st-danger-text); border-radius: 8px; padding: 10px; font-size: var(--st-fs-sm); }
 .chat-item .st-btn--icon svg { width: 16px; height: 16px; }
 .calls-list > .call-item { flex: none; }
+
+/* the canvas: beside the chat on wide screens, over it on narrow ones */
+.canvas { flex: 0 0 min(46%, 760px); min-width: 0; display: flex; flex-direction: column; border-left: 1px solid var(--st-line);
+          background: var(--st-surface); }
+.canvas[hidden] { display: none; }
+.canvas[data-wide="true"] { flex-basis: 72%; }
+.canvas__head { display: flex; align-items: center; gap: var(--st-s-2); padding: 10px 12px; border-bottom: 1px solid var(--st-line); flex-wrap: wrap; }
+.canvas__title { flex: 1 1 120px; min-width: 0; font-weight: var(--st-fw-bold); font-size: var(--st-fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.canvas-tabs button { padding: 0 10px; }
+.canvas-tabs button[hidden] { display: none; }
+.canvas__actions { display: flex; gap: 2px; }
+.canvas__actions .st-btn--icon { width: 34px; height: 34px; }
+.canvas__body { flex: 1; min-height: 0; position: relative; display: flex; }
+.canvas__frame { flex: 1; border: 0; width: 100%; background: #fff; }
+.canvas__frame[hidden] { display: none; }
+.canvas__output, .canvas__code { flex: 1; min-width: 0; overflow: auto; margin: 0; padding: var(--st-s-4); }
+.canvas__code { font: 400 13px/1.6 var(--st-font-mono); background: var(--st-code-bg); color: var(--st-code-ink); white-space: pre; }
+.canvas__output { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.canvas__output[hidden], .canvas__code[hidden] { display: none; }
+.run-status { display: flex; gap: var(--st-s-2); align-items: center; flex-wrap: wrap; font-size: var(--st-fs-sm); }
+.run-stream { margin: 0; padding: 12px; border-radius: var(--st-r-md); background: var(--st-code-bg); color: var(--st-code-ink);
+              font: 400 13px/1.55 var(--st-font-mono); white-space: pre-wrap; word-break: break-word; max-height: 50vh; overflow: auto; }
+.run-stream--err { color: #FFB4AE; }
+.run-label { font-size: 11px; font-weight: var(--st-fw-bold); letter-spacing: .06em; text-transform: uppercase; color: var(--st-ink-muted); }
+.run-file { display: flex; flex-direction: column; gap: 6px; }
+.run-file img { max-width: 100%; border-radius: var(--st-r-md); border: 1px solid var(--st-line); background: #fff; align-self: flex-start; }
+.run-file__row { display: flex; gap: var(--st-s-2); align-items: center; font-size: var(--st-fs-sm); flex-wrap: wrap; }
+.canvas__foot { display: flex; align-items: center; gap: var(--st-s-2); justify-content: space-between; padding: 10px 12px; border-top: 1px solid var(--st-line); }
+.st-code__btns { display: flex; align-items: center; gap: 2px; }
+.st-code .code-run { height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,.14); background: transparent;
+                     color: #cfe9dc; font: 600 12px var(--st-font); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.st-code .code-run:hover { background: rgba(61,214,140,.16); border-color: rgba(61,214,140,.5); color: #fff; }
+.st-code .code-run .st-icon { width: 14px; height: 14px; }
+@media (max-width: 1100px) {
+  .canvas, .canvas[data-wide="true"] { position: fixed; inset: 0 0 0 auto; width: min(100%, 720px); z-index: 25; box-shadow: var(--st-sh-pop); }
+}
+@media (max-width: 860px) {
+  .canvas, .canvas[data-wide="true"] { width: 100%; bottom: 56px; }
+}
+/* Monitor and API calls use the whole window: full width, the requests table grows to the bottom */
+.monitor { max-width: none; min-height: 100%; }
+.monitor-row { flex: 1; min-height: 380px; grid-template-columns: minmax(280px, 1fr) minmax(0, 3fr); }
+.req-card .table-wrap { flex: 1; min-height: 0; overflow: auto; }
+.calls { max-width: none; }
+.calls-side { width: clamp(320px, 24vw, 460px); }
+@media (min-width: 1700px) {
+  .metrics { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+}

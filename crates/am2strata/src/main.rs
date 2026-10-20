@@ -7,6 +7,7 @@
 
 mod anthropic;
 mod api_monitor;
+mod code_run;
 mod manager;
 mod hub_api;
 mod mcp;
@@ -81,6 +82,9 @@ pub struct AppState {
     pub hub_job: Arc<std::sync::Mutex<serde_json::Value>>,
     pub models_dir: PathBuf,
     pub data_dir: PathBuf,
+    /// running a chat's Python code for the canvas (POST /api/run)
+    pub code_run: Arc<code_run::CodeRun>,
+    pub code_run_config_on: bool,
 }
 
 /// A web page of another origin sent this: its Origin is neither this server's address nor a trusted one (no Origin
@@ -176,7 +180,9 @@ async fn main() -> Result<()> {
     let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
-                           models_dir: dir.clone(), data_dir: expand(&args.data_dir) };
+                           models_dir: dir.clone(), data_dir: expand(&args.data_dir),
+                           code_run: Arc::new(code_run::CodeRun::from_config(&first.cfg.rest)),
+                           code_run_config_on: first.cfg.rest.get("code_run") != Some(&serde_json::Value::Bool(false)) };
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -196,6 +202,7 @@ async fn main() -> Result<()> {
         .route("/api/requests", get(api_monitor::requests))
         .route("/api/hub/quants", post(hub_api::quants))
         .route("/api/hub/pull", get(hub_api::status).post(hub_api::pull))
+        .route("/api/run", get(code_run::info).post(code_run::run))
         .route("/load", post(api_monitor::load))
         .route("/unload", post(api_monitor::unload))
         .route("/settings", get(web::settings_get).post(web::settings_post))

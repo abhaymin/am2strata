@@ -103,6 +103,30 @@
         </form>
       </div>
     </div>
+    <!-- the canvas: an HTML preview (sandboxed frame) or a Python run's result, from a code block's Preview / Run -->
+    <aside class="canvas" id="canvas" aria-label="Canvas" hidden>
+      <div class="canvas__head">
+        <span class="canvas__title" id="canvas-title">Canvas</span>
+        <div class="seg seg--3 canvas-tabs" id="canvas-tabs" role="tablist" aria-label="Canvas view">
+          <button type="button" role="tab" data-v="preview">Preview</button><button type="button" role="tab" data-v="output">Output</button><button type="button" role="tab" data-v="code">Code</button>
+        </div>
+        <span class="canvas__actions">
+          <button type="button" class="st-btn st-btn--icon" id="canvas-run" title="Run again" aria-label="Run again"><svg class="st-icon"><use href="web/sprite.svg#i-play"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="canvas-download" title="Download" aria-label="Download"><svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="canvas-wide" title="Wider" aria-label="Wider"><svg class="st-icon"><use href="web/sprite.svg#i-expand"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="canvas-close" title="Close" aria-label="Close the canvas"><svg class="st-icon"><use href="web/sprite.svg#i-close"/></svg></button>
+        </span>
+      </div>
+      <div class="canvas__body">
+        <iframe class="canvas__frame" id="canvas-frame" title="Preview" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads" referrerpolicy="no-referrer"></iframe>
+        <div class="canvas__output" id="canvas-output" hidden></div>
+        <pre class="canvas__code" id="canvas-code" hidden></pre>
+      </div>
+      <div class="canvas__foot">
+        <span class="muted small" id="canvas-note"></span>
+        <button type="button" class="st-btn st-btn--secondary" id="canvas-ask">Ask about the result</button>
+      </div>
+    </aside>
   </section>
 
   <!-- ============================ Images ============================ -->

@@ -602,9 +602,20 @@ function inline(s) {
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
+// what the canvas can do with a code block: preview HTML/SVG in a sandboxed frame, run Python on the server
+function canvasKind(lang, code) {
+  const l = (lang || "").toLowerCase();
+  if (["html", "htm", "svg", "xml+svg"].includes(l)) return "html";
+  if (!l && /^\s*(<!doctype html|<html|<svg)/i.test(code)) return "html";
+  if (["python", "py", "python3"].includes(l)) return "python";
+  return null;
+}
 function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
+  const kind = canvasKind(lang, code);
+  const btn = kind === "html" ? `<button type="button" class="code-run" data-canvas="html">${icon("eye")}Preview</button>`
+            : kind === "python" ? `<button type="button" class="code-run" data-canvas="python" aria-label="Run this Python code" title="Runs on this PC in a sandbox: no network, home folders hidden">${icon("play")}Run</button>` : "";
+  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span><span class="st-code__btns">${btn}` +
+    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></span></div>` +
     `<pre><code>${esc(code)}</code></pre></div>`;
 }
 function blocks(text) {
@@ -904,6 +915,8 @@ function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.sc
 function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
 
 $("chat").addEventListener("click", (e) => {
+  const cv = e.target.closest("[data-canvas]");
+  if (cv) { openCanvas(cv.dataset.canvas, cv.closest(".st-code").querySelector("pre").textContent); return; }
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
   const mc = e.target.closest("[data-msg-copy]");
@@ -1494,6 +1507,117 @@ function callContent() {
   if ($("call-content").textContent !== t) $("call-content").textContent = t;
 }
 for (const b of $("call-tabs").children) b.onclick = () => { callPane = b.dataset.p; store.set("call-pane", callPane); callContent(); };
+
+// ------------------------------------------------------------------ the canvas (code block › Preview / Run)
+// HTML runs in a sandboxed frame without this page's origin: it cannot reach the server's API or this browser's
+// storage. Python runs on the server (POST /api/run) in a bubblewrap sandbox, only when Run is clicked.
+let cv = null;                                       // {kind, code, result, html}
+function canvasView(v) {
+  for (const b of $("canvas-tabs").children) b.setAttribute("aria-selected", String(b.dataset.v === v));
+  $("canvas-frame").hidden = v !== "preview"; $("canvas-output").hidden = v !== "output"; $("canvas-code").hidden = v !== "code";
+}
+for (const b of $("canvas-tabs").children) b.onclick = () => canvasView(b.dataset.v);
+function setFrame(html) {
+  cv.html = html;
+  $("canvas-frame").srcdoc = html;
+  $("canvas-tabs").querySelector('[data-v="preview"]').hidden = false;
+}
+function openCanvas(kind, code) {
+  cv = {kind, code, result: null, html: null};
+  $("canvas").hidden = false;
+  $("canvas-code").textContent = code;
+  $("canvas-title").textContent = kind === "html" ? "HTML preview" : "Python";
+  $("canvas-run").hidden = kind !== "python";
+  $("canvas-ask").hidden = kind !== "python";
+  $("canvas-tabs").querySelector('[data-v="output"]').hidden = kind !== "python";
+  $("canvas-tabs").querySelector('[data-v="preview"]').hidden = kind !== "html";
+  $("canvas-frame").srcdoc = "";
+  if (kind === "html") {
+    setFrame(code);
+    $("canvas-note").textContent = "Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.";
+    canvasView("preview");
+  } else runCanvas();
+}
+async function runCanvas() {
+  if (!cv || cv.kind !== "python") return;
+  const out = $("canvas-output");
+  canvasView("output");
+  $("canvas-run").disabled = true;
+  out.innerHTML = `<div class="run-status"><span class="st-badge st-badge--reading">Running</span><span class="muted">on this PC, in a sandbox</span></div>`;
+  $("canvas-note").textContent = "";
+  try {
+    const r = await fetch("api/run", {method: "POST", headers: headers(true), body: JSON.stringify({language: "python", code: cv.code})});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    cv.result = j;
+    renderRun(j);
+  } catch (e) {
+    out.innerHTML = `<div class="run-status"><span class="st-badge st-badge--error">Not run</span></div><pre class="run-stream run-stream--err"></pre>`;
+    out.querySelector("pre").textContent = String(e.message || e);
+  }
+  $("canvas-run").disabled = false;
+}
+function renderRun(j) {
+  const out = $("canvas-output");
+  const ok = j.exit_code === 0 && !j.timed_out;
+  out.innerHTML = `<div class="run-status"><span class="st-badge ${ok ? "st-badge--generating" : "st-badge--error"}">${j.timed_out ? "Time limit" : ok ? "Done" : `Exit code ${j.exit_code}`}</span>` +
+    `<span class="muted">${j.duration_s.toFixed(2)} s${j.files.length ? ` · ${j.files.length} file${j.files.length === 1 ? "" : "s"}` : ""}${j.truncated ? " · output cut at 200 KB" : ""}</span></div>`;
+  const stream = (label, text, err) => {
+    if (!text) return;
+    const l = document.createElement("span"); l.className = "run-label"; l.textContent = label;
+    const p = document.createElement("pre"); p.className = "run-stream" + (err ? " run-stream--err" : ""); p.textContent = text;
+    out.append(l, p);
+  };
+  stream("Output", j.stdout, false);
+  stream("Errors", j.stderr, true);
+  if (!j.stdout && !j.stderr && !j.files.length) stream("Output", "(nothing printed)", false);
+  let firstHtml = null;
+  for (const f of j.files) {
+    const box = document.createElement("div"); box.className = "run-file";
+    const row = document.createElement("div"); row.className = "run-file__row";
+    const name = document.createElement("b"); name.className = "mono"; name.textContent = f.name;
+    const size = document.createElement("span"); size.className = "muted"; size.textContent = f.size >= 1048576 ? `${fmt(f.size / 1048576, 1)} MB` : `${fmt(f.size / 1024, 1)} KB`;
+    row.append(name, size);
+    if (f.data) {
+      const a = document.createElement("a"); a.className = "st-btn st-btn--secondary"; a.style.height = "30px"; a.textContent = "Download";
+      a.download = f.name.split("/").pop(); a.href = `data:${f.mime};base64,${f.data}`; row.append(a);
+    } else if (f.note) { const n = document.createElement("span"); n.className = "muted"; n.textContent = f.note; row.append(n); }
+    box.append(row);
+    if (f.data && f.mime.startsWith("image/")) { const im = document.createElement("img"); im.src = `data:${f.mime};base64,${f.data}`; im.alt = f.name; box.append(im); }
+    if (f.data && f.mime === "text/html") {
+      const html = new TextDecoder().decode(Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0)));
+      if (!firstHtml) firstHtml = html;
+      const b = document.createElement("button"); b.className = "st-btn st-btn--secondary"; b.style.height = "30px"; b.textContent = "Show in Preview";
+      b.onclick = () => { setFrame(html); canvasView("preview"); }; row.append(b);
+    }
+    if (f.data && /^(text\/(csv|plain)|application\/json)$/.test(f.mime) && f.size < 65536) {
+      const p = document.createElement("pre"); p.className = "run-stream";
+      p.textContent = new TextDecoder().decode(Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0))); box.append(p);
+    }
+    out.append(box);
+  }
+  if (firstHtml) setFrame(firstHtml);
+  $("canvas-note").textContent = "Ran in a sandbox: no network, home folders hidden, system read-only.";
+}
+$("canvas-run").onclick = runCanvas;
+$("canvas-close").onclick = () => { $("canvas").hidden = true; $("canvas-frame").srcdoc = ""; cv = null; };
+$("canvas-wide").onclick = () => { const c = $("canvas"); c.dataset.wide = String(c.dataset.wide !== "true"); };
+$("canvas-download").onclick = () => {
+  if (!cv) return;
+  const html = cv.kind === "html" || $("canvas-frame").hidden === false && cv.html;
+  const blob = new Blob([html ? cv.html : cv.code], {type: html ? "text/html" : "text/x-python"});
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = html ? "canvas.html" : "main.py"; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+};
+$("canvas-ask").onclick = () => {
+  if (!cv || !cv.result) return;
+  const j = cv.result, cut = (t) => (t.length > 6000 ? t.slice(0, 6000) + "\n[...]" : t);
+  let t = `I ran the code. Exit code ${j.timed_out ? "(time limit)" : j.exit_code}.`;
+  if (j.stdout) t += `\n\nOutput:\n\`\`\`\n${cut(j.stdout)}\n\`\`\``;
+  if (j.stderr) t += `\n\nErrors:\n\`\`\`\n${cut(j.stderr)}\n\`\`\``;
+  if (j.files.length) t += `\n\nFiles written: ${j.files.map((f) => f.name).join(", ")}`;
+  $("input").value = t + "\n\n"; autosize(); $("input").focus();
+};
 
 // ------------------------------------------------------------------ start
 setBusy(false);

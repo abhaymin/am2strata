@@ -678,3 +678,27 @@ fn hugging_face_downloads_check_what_they_are_sent() {
     }
     assert_eq!(s.get("/api/hub/pull", true).1["state"], "idle");
 }
+
+#[test]
+fn python_runs_in_a_sandbox_only_when_asked_from_this_page() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, info) = s.get("/api/run", true);
+    assert_eq!(c, 200);
+    assert_eq!(s.get("/api/run", false).0, 401);
+    let (c, r) = s.post("/api/run", &json!({"language": "ruby", "code": "puts 1"}));
+    assert_eq!(c, if info["enabled"] == true { 400 } else { 501 }, "{r}");
+    let r = reqwest::blocking::Client::new().post(format!("{}/api/run", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").json(&json!({"code": "print(1)"})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403, "another web page may not run code here");
+    if info["enabled"] != true {
+        return;                                       // no bubblewrap on this machine
+    }
+    let code = "import os, socket\nprint(sorted(os.listdir('/home')))\nopen('out.txt', 'w').write('hi')\n\
+                try:\n    socket.create_connection(('1.1.1.1', 80), timeout=2); print('net')\nexcept OSError:\n    print('no net')\n";
+    let (c, r) = s.post("/api/run", &json!({"language": "python", "code": code}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert_eq!(r["stdout"], "[]\nno net\n", "home hidden, no network");
+    assert_eq!(r["files"][0]["name"], "out.txt");
+    assert_eq!(r["files"][0]["data"], "aGk=");
+}
