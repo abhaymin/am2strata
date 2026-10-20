@@ -764,6 +764,26 @@ impl OutputParser {
         }
     }
 
+    /// Still inside the reasoning (for counting a thinking budget).
+    pub fn in_reasoning(&self) -> bool {
+        self.state == State::Reasoning
+    }
+
+    /// In the answer, with nothing held back: a forced call can be opened here.
+    pub fn at_clean_content(&self) -> bool {
+        self.state == State::Content && self.buf.is_empty()
+    }
+
+    /// Nothing held back (no partial tag), so a pass can end here.
+    pub fn is_clean(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// The reasoning's held text is exactly a `</think>` that has not been confirmed as the end yet.
+    pub fn holds_think_end(&self) -> bool {
+        self.state == State::Reasoning && self.buf == THINK_END
+    }
+
     /// End of generation. `reason`: how the turn ended (`None` or "stop" = a natural stop); calls waiting from the
     /// reasoning become real calls only on a natural stop.
     pub fn finish(&mut self, reason: Option<&str>) -> Vec<Event> {

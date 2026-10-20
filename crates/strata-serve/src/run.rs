@@ -10,6 +10,7 @@ use strata_engine::vision::normalize_image;
 use strata_engine::GenEvent;
 use strata_frontend::images::{expand_images, images_of};
 use strata_frontend::output::{Event, OutputParser};
+use strata_frontend::request::forced_call;
 use strata_frontend::Prepared;
 use strata_protocol::{Images, Sampling};
 use strata_tokenizer::Detokenizer;
@@ -144,9 +145,38 @@ pub struct Started {
     pub model: String,
 }
 
+/// What a request asks beyond its messages.
+#[derive(Default, Clone)]
+pub struct RunOpts {
+    /// report tool calls while they are being written
+    pub stream_tools: bool,
+    /// the most tokens to think (Anthropic's budget_tokens, or reasoning_budget_tokens)
+    pub budget: Option<u64>,
+    /// the request's tool_choice, in either API's shape
+    pub tool_choice: Option<Value>,
+}
+
+/// From this max_tokens on, thinking without a budget is closed early enough to leave the answer room (0.1.45).
+const ANSWER_ROOM_MIN_CAP: usize = 1024;
+/// The tokens kept for the answer when a thinking budget is cut down to fit max_tokens (#984).
+const ANSWER_RESERVE_MIN: usize = 512;
+/// What closes the thinking at its budget (#123): the model's own end-of-thinking tag after a short sentence.
+const REASONING_WRAP_UP: &str = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n";
+
+/// The thinking budget for this request: its own, cut to leave the answer room, or (without one, from
+/// ANSWER_ROOM_MIN_CAP) three quarters of max_tokens at most.
+pub fn thinking_budget(asked: Option<u64>, max_new: usize, answer_room: bool) -> Option<usize> {
+    let reserve = (max_new / 4).max(ANSWER_RESERVE_MIN).min(max_new / 2);
+    let mut budget = asked.filter(|b| *b > 0).map(|b| b as usize);
+    if budget.is_none() && answer_room && max_new >= ANSWER_ROOM_MIN_CAP {
+        budget = Some(max_new - reserve);
+    }
+    budget.map(|b| if b > max_new - reserve { (max_new - reserve).max(1) } else { b })
+}
+
 /// Start a request. `prep`: the normalized messages, tools and template kwargs; `req`: the raw request (sampling,
-/// max tokens, stop strings); `stream_tools`: report tool calls while they are being written.
-pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, stream_tools: bool)
+/// max tokens, stop strings).
+pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts)
     -> Result<Started, Refusal> {
     let stops = stop_strings(&req)?;
     // one request on the GPU at a time: image encoding and generation both take the turn
@@ -195,116 +225,217 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             }));
         }
     };
+
     let thinking = prep.kwargs.get("enable_thinking") != Some(&Value::Bool(false));
     let sampling = sampling_of(&req, loaded.family.as_deref(), thinking);
+    let answer_room = loaded.entry.cfg.rest.get("answer_room") != Some(&Value::Bool(false));
+    let asked_budget = opts.budget.or_else(|| req.get("reasoning_budget_tokens").and_then(Value::as_u64));
+    let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room) } else { None };
+    let mut force = forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref());
+    let mut parser = OutputParser::new(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools);
+    let mut opening = Vec::new();
+    if let (Some(f), false) = (&force, thinking) {
+        // without thinking the prompt ends with the forced opening, read as if the model had written it
+        ids.extend(loaded.tok.encode(f, true).map_err(|e| Refusal(500, e.to_string()))?);
+        opening = parser.feed(f).map_err(|e| Refusal(500, e.0))?;
+        force = None;
+    }
     let turn_at = strata_protocol::turn_at(&ids, &loaded.turn_ids);
     let prompt_tokens = ids.len();
-    let mut rx = loaded.engine.generate(max_new as u32, sampling, turn_at, ids, images).await;
     let (tx, events) = mpsc::channel(256);
-    let tools = prep.tools.clone();
-    let opens = prompt.opens_reasoning;
     let model = loaded.entry.id.clone();
     let lc = loaded.clone();
     tokio::spawn(async move {
         let _turn = turn; // held until this request ends
-        let mut parser = OutputParser::new(opens, tools.as_deref(), stream_tools);
         let mut detok = Detokenizer::new();
         let mut cut = StopCutter { stops, held: String::new(), hit: None };
-        let mut generated = 0u64;
-        let send_events = |evs: Vec<Event>, cut: &mut StopCutter| -> Vec<RunEvent> {
-            let mut out = Vec::new();
-            for e in evs {
-                match e {
-                    Event::Content(t) if cut.hit.is_none() => {
-                        let t = cut.push(&t);
-                        if !t.is_empty() {
-                            out.push(RunEvent::Event(Event::Content(t)));
+        let mut prompt_ids = ids;
+        let (mut n, mut thought) = (0usize, 0usize);
+        let mut tail = String::new(); // the last characters written (the newlines before a forced call)
+        let mut last_done: Option<strata_protocol::Done> = None;
+        // events through the stop strings to the client; false when the client has gone
+        macro_rules! emit {
+            ($evs:expr) => {{
+                let mut alive = true;
+                for e in $evs {
+                    let out = match e {
+                        Event::Content(t) if cut.hit.is_none() => {
+                            let t = cut.push(&t);
+                            if t.is_empty() { continue; }
+                            Event::Content(t)
                         }
+                        Event::Content(_) => continue,
+                        other => other,
+                    };
+                    if let Event::Content(t) | Event::Reasoning(t) = &out {
+                        tail = format!("{tail}{t}").chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
                     }
-                    Event::Content(_) => {}
-                    other => out.push(RunEvent::Event(other)),
+                    if tx.send(RunEvent::Event(out)).await.is_err() { alive = false; break; }
                 }
-            }
-            out
-        };
-        let finish_with = |done: Option<strata_protocol::Done>, finish: &str, stop: Option<String>, generated: u64| Summary {
-            finish: finish.to_string(),
-            completion_tokens: done.as_ref().map_or(generated, |d| d.generated),
-            reused: done.as_ref().and_then(|d| d.reused).unwrap_or(0),
-            stop_sequence: stop,
-            timings: done.as_ref().map(timings).unwrap_or(Value::Null),
-        };
-        loop {
-            match rx.recv().await {
-                Some(Ok(GenEvent::Token(t))) => {
-                    generated += 1;
-                    if lc.tok.token_type(t) == 3 {
-                        continue; // CONTROL tokens (<|im_end|>) are not text
-                    }
-                    let text = lc.tok.token_bytes(t).map(|b| detok.push(&b)).unwrap_or_default();
-                    match parser.feed(&text) {
-                        Ok(evs) => {
-                            for e in send_events(evs, &mut cut) {
-                                if tx.send(e).await.is_err() {
-                                    return; // the client left: dropping rx makes the engine STOP
+                alive
+            }};
+        }
+        if !emit!(opening) {
+            return;
+        }
+        let summary = loop {
+            let left = max_new.saturating_sub(n);
+            let mut rx = lc.engine.generate(left as u32, sampling.clone(), turn_at, prompt_ids.clone(), images.clone()).await;
+            let (mut seg, mut wrap, mut opens) = (Vec::new(), false, false);
+            let mut ended: Option<strata_protocol::Done> = None;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    Ok(GenEvent::Token(t)) => {
+                        n += 1;
+                        if lc.tok.token_type(t) == 3 {
+                            // a CONTROL token (<|im_end|>): the end of the turn, not text
+                            if force.is_some() && parser.holds_think_end() {
+                                opens = true; // the held </think> was the end: the call opens there
+                                break;
+                            }
+                            continue;
+                        }
+                        seg.push(t);
+                        let text = lc.tok.token_bytes(t).map(|b| detok.push(&b)).unwrap_or_default();
+                        let evs = match parser.feed(&text) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                let _ = tx.send(RunEvent::Error(e.0)).await;
+                                return;
+                            }
+                        };
+                        let writes_call = evs.iter().any(|e| matches!(e, Event::ToolStart { .. } | Event::ToolCall(_)));
+                        if !emit!(evs) {
+                            return; // the client left: dropping rx makes the engine STOP
+                        }
+                        if cut.hit.is_some() {
+                            break;
+                        }
+                        if let Some(b) = budget {
+                            if parser.in_reasoning() {
+                                thought += 1;
+                                if thought >= b && parser.is_clean() && !detok.has_pending() {
+                                    wrap = true;
+                                    break;
                                 }
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(RunEvent::Error(e.0)).await;
+                        if force.is_some() {
+                            if writes_call {
+                                force = None; // the model is writing a call of its own
+                            } else if parser.at_clean_content() && !detok.has_pending() {
+                                opens = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(GenEvent::Progress { .. }) => {
+                        if tx.send(RunEvent::Ping).await.is_err() {
                             return;
                         }
                     }
-                    if cut.hit.is_some() {
-                        // a stop string: stop the engine (dropping rx sends STOP) and finish here
-                        drop(rx);
-                        let mut tail = parser.finish(Some("stop"));
-                        tail.retain(|e| !matches!(e, Event::Content(_)));
-                        for e in tail {
-                            let _ = tx.send(RunEvent::Event(e)).await;
-                        }
-                        let stop = cut.hit.clone();
-                        let _ = tx.send(RunEvent::Done(finish_with(None, "stop", stop, generated))).await;
+                    Ok(GenEvent::Done(d)) => {
+                        ended = Some(d);
                         break;
                     }
-                }
-                Some(Ok(GenEvent::Progress { .. })) => {
-                    if tx.send(RunEvent::Ping).await.is_err() {
+                    Err(e) => {
+                        let _ = tx.send(RunEvent::Error(e.to_string())).await;
                         return;
                     }
                 }
-                Some(Ok(GenEvent::Done(d))) => {
-                    // the engine's own codes: "stop" (end of sequence), "length", "cancel" (after STOP)
-                    let finish = match d.finish.as_str() {
-                        "length" => "length",
-                        "cancel" => "cancel",
-                        _ => "stop",
-                    };
-                    // the parser's held text first goes through the stop strings, then what they held back
-                    for e in send_events(parser.finish(Some(finish)), &mut cut) {
-                        let _ = tx.send(e).await;
+            }
+            drop(rx); // a pass ended early: the engine is told to STOP and drained before the next one
+            if let Some(d) = &ended {
+                last_done = Some(d.clone());
+            }
+            if cut.hit.is_some() {
+                let mut evs = parser.finish(Some("stop"));
+                evs.retain(|e| !matches!(e, Event::Content(_)));
+                let _ = emit!(evs);
+                break ("stop", cut.hit.clone());
+            }
+            if !(wrap || opens) {
+                let finish = match ended.as_ref().map(|d| d.finish.as_str()) {
+                    Some("length") => "length",
+                    Some("cancel") => "cancel",
+                    _ => "stop",
+                };
+                if !emit!(parser.finish(Some(finish))) {
+                    return;
+                }
+                if cut.hit.is_none() {
+                    let rest = cut.finish();
+                    if !rest.is_empty() {
+                        let _ = tx.send(RunEvent::Event(Event::Content(rest))).await;
                     }
-                    if cut.hit.is_none() {
-                        let tail = cut.finish();
-                        if !tail.is_empty() {
-                            let _ = tx.send(RunEvent::Event(Event::Content(tail))).await;
+                }
+                break (if cut.hit.is_some() { "stop" } else { finish }, cut.hit.clone());
+            }
+            // the thinking reached its budget, or a forced call opens: write the wrap-up / the call's opening and go on
+            // from the prefix the engine already holds
+            let text = if wrap {
+                budget = None;
+                format!("{REASONING_WRAP_UP}{}", force.take().unwrap_or_default())
+            } else {
+                let have = tail.len() - tail.trim_end_matches('\n').len();
+                format!("{}{}", "\n".repeat(2usize.saturating_sub(have)), force.take().unwrap_or_default())
+            };
+            let extra = lc.tok.encode(&text, true).unwrap_or_default();
+            if max_new < n + extra.len() + 1 {
+                if !emit!(parser.finish(Some("length"))) {
+                    return;
+                }
+                break ("length", None);
+            }
+            for t in &extra {
+                n += 1;
+                let piece = lc.tok.token_bytes(*t).map(|b| detok.push(&b)).unwrap_or_default();
+                match parser.feed(&piece) {
+                    Ok(evs) => {
+                        if !emit!(evs) {
+                            return;
                         }
                     }
-                    let stop = cut.hit.clone();
-                    let finish = if stop.is_some() { "stop" } else { finish };
-                    let _ = tx.send(RunEvent::Done(finish_with(Some(d), finish, stop, generated))).await;
-                    break;
+                    Err(e) => {
+                        let _ = tx.send(RunEvent::Error(e.0)).await;
+                        return;
+                    }
                 }
-                Some(Err(e)) => {
-                    let _ = tx.send(RunEvent::Error(e.to_string())).await;
-                    break;
-                }
-                None => break,
             }
-        }
+            prompt_ids.extend(seg);
+            prompt_ids.extend(extra);
+        };
+        let (finish, stop) = summary;
+        let _ = tx
+            .send(RunEvent::Done(Summary {
+                finish: finish.to_string(),
+                completion_tokens: n as u64,
+                reused: last_done.as_ref().and_then(|d| d.reused).unwrap_or(0),
+                stop_sequence: stop,
+                timings: last_done.as_ref().map(timings).unwrap_or(Value::Null),
+            }))
+            .await;
         if let Some(t) = temp {
             let _ = std::fs::remove_file(t);
         }
     });
     Ok(Started { events, prompt_tokens, model })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_leaves_the_answer_room() {
+        // no budget asked: from 1024 max_tokens on, the answer keeps a quarter (at least 512, at most half)
+        assert_eq!(thinking_budget(None, 8192, true), Some(6144));
+        assert_eq!(thinking_budget(None, 1024, true), Some(512));
+        assert_eq!(thinking_budget(None, 1000, true), None);
+        assert_eq!(thinking_budget(None, 8192, false), None, "answer_room off");
+        // a budget of its own is kept unless it leaves no room
+        assert_eq!(thinking_budget(Some(100), 8192, true), Some(100));
+        assert_eq!(thinking_budget(Some(8000), 8192, true), Some(6144));
+        assert_eq!(thinking_budget(Some(0), 500, true), None);
+    }
 }

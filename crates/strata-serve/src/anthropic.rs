@@ -43,7 +43,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
-    let (mut prep, _budget) = match anthropic_to_messages(&req, &loaded.tool_orders, true) {
+    let (mut prep, budget) = match anthropic_to_messages(&req, &loaded.tool_orders, true) {
         Ok(p) => p,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),
     };
@@ -51,7 +51,8 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         prep.tools = None;
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let started = match run::start(s.mgr.clone(), loaded, prep, req.clone(), stream).await {
+    let opts = run::RunOpts { stream_tools: stream, budget, tool_choice: req.get("tool_choice").cloned() };
+    let started = match run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             return anthropic_error(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), "invalid_request_error", msg)

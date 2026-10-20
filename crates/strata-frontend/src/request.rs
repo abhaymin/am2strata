@@ -341,6 +341,55 @@ fn answers_in_call_order(messages: Vec<Value>) -> Vec<Value> {
     out
 }
 
+/// A client's `tool_choice` in either API's shape -> ("auto" | "none" | "required" | "named" | "unknown", name).
+pub fn tool_choice_of(tool_choice: Option<&Value>) -> (&'static str, Option<String>) {
+    match tool_choice {
+        None | Some(Value::Null) => ("auto", None),
+        Some(Value::String(s)) => match s.as_str() {
+            "auto" => ("auto", None),
+            "none" => ("none", None),
+            "required" => ("required", None),
+            _ => ("unknown", None),
+        },
+        Some(Value::Object(o)) => match o.get("type").and_then(Value::as_str) {
+            Some("auto") => ("auto", None),
+            Some("none") => ("none", None),
+            Some("any" | "required") => ("required", None),
+            Some("function" | "tool") => {
+                let name = o.get("function").and_then(|f| f.get("name")).or_else(|| o.get("name")).and_then(Value::as_str);
+                match name.filter(|n| !n.is_empty()) {
+                    Some(n) => ("named", Some(n.to_string())),
+                    None => ("unknown", None),
+                }
+            }
+            _ => ("unknown", None),
+        },
+        Some(_) => ("unknown", None),
+    }
+}
+
+/// `tool_choice` -> the text that opens the call the reply must make, or None (the model decides). There is no
+/// grammar: the server writes this opening itself, so the model can only go on with a call. A choice that cannot be
+/// honoured (an unknown shape, a name that is not one of the tools) acts as "auto".
+pub fn forced_call(tool_choice: Option<&Value>, tools: Option<&[Value]>) -> Option<String> {
+    let (mut kind, mut name) = tool_choice_of(tool_choice);
+    let names: Vec<&str> = tools.into_iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str)).collect();
+    if matches!(kind, "auto" | "none") {
+        return None;
+    }
+    if kind == "required" && names.len() == 1 {
+        kind = "named";
+        name = Some(names[0].to_string());
+    }
+    if kind == "required" && !names.is_empty() {
+        return Some("<tool_call>\n<function=".into());
+    }
+    match name {
+        Some(n) if kind == "named" && names.contains(&n.as_str()) => Some(format!("<tool_call>\n<function={n}>\n")),
+        _ => None,
+    }
+}
+
 const BILLING_HEADER: &str = "x-anthropic-billing-header:";
 
 /// Claude Code's billing stamp (`cch=` changes every request, the version's 4th part every session) pinned to f's,

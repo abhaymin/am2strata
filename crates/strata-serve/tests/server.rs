@@ -255,3 +255,52 @@ fn web_app_is_served() {
     let (c, m) = s.get("/mcp", false);
     assert_eq!((c, m["tools"].as_u64()), (200, Some(0)));
 }
+
+#[test]
+fn a_thinking_budget_wraps_up_and_the_answer_follows() {
+    let long: Vec<u32> = std::iter::repeat_n(ids(" hmm")[0], 60).collect();
+    // the engine still writing when the budget is reached (no delay: it may have finished, with nothing to STOP)
+    let s = Server::start(&[Model::default()], &[long, ids("Answer: 4.")], json!({"delay_ms": 5}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("2+2?")], "max_tokens": 200,
+                                                         "reasoning_budget_tokens": 10}));
+    assert_eq!(c, 200, "{r}");
+    let m = &r["choices"][0]["message"];
+    assert!(m["reasoning_content"].as_str().unwrap().contains("I have thought about this long enough"), "{m}");
+    assert_eq!(m["content"], "Answer: 4.");
+    let gens = s.gen_lines();
+    assert_eq!(gens.len(), 2, "a second pass after the wrap-up: {gens:?}");
+    let first = line_ids(&gens[0]);
+    let second = line_ids(&gens[1]);
+    assert!(second.starts_with(&first), "the second pass continues the first one's prefix");
+    let wrap = ids("\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n");
+    assert!(second.ends_with(&wrap), "the wrap-up ends the second pass's prompt");
+    assert_eq!(second.len(), first.len() + 10 + wrap.len(), "ten thought tokens, then the wrap-up");
+    assert!(s.commands().iter().any(|c| c == "STOP"), "the first pass was stopped at the budget");
+}
+
+#[test]
+fn tool_choice_forces_the_call() {
+    let rest = "<parameter=city>\nPune\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(rest), ids("Let me check.\n</think>\n\n"), ids(rest)], json!({}));
+    // without thinking: the call's opening ends the prompt
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Weather?")], "tools": [weather_openai()],
+        "tool_choice": {"type": "function", "function": {"name": "get_weather"}}, "chat_template_kwargs": {"enable_thinking": false}}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["finish_reason"], "tool_calls");
+    let call = &r["choices"][0]["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather");
+    assert_eq!(serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(), json!({"city": "Pune"}));
+    let g = s.gen_lines();
+    assert!(line_ids(&g[0]).ends_with(&ids("<tool_call>\n<function=get_weather>\n")), "the opening ends the prompt");
+    // with thinking: the opening is written once the thinking ends (Anthropic's "any" with one tool names it)
+    let (c, r) = s.post("/v1/messages", &json!({"model": "x", "max_tokens": 300, "messages": [user("Weather?")],
+        "tool_choice": {"type": "any"},
+        "tools": [{"name": "get_weather", "description": "Weather.", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}]}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["stop_reason"], "tool_use", "{r}");
+    let tu: Vec<&Value> = r["content"].as_array().unwrap().iter().filter(|b| b["type"] == "tool_use").collect();
+    assert_eq!(tu[0]["input"], json!({"city": "Pune"}));
+    let g = s.gen_lines();
+    assert_eq!(g.len(), 3, "two passes for the thinking request: {g:?}");
+    assert!(line_ids(&g[2]).ends_with(&ids("<tool_call>\n<function=get_weather>\n")));
+}
