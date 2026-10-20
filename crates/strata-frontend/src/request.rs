@@ -341,6 +341,185 @@ fn answers_in_call_order(messages: Vec<Value>) -> Vec<Value> {
     out
 }
 
+const BILLING_HEADER: &str = "x-anthropic-billing-header:";
+
+/// Claude Code's billing stamp (`cch=` changes every request, the version's 4th part every session) pinned to f's,
+/// so the prompt start stays the same and the conversation cache keeps it (llama.cpp #21793). Only a header at
+/// the very start of the system text, inside its first 160 characters.
+fn pin_billing_stamp(system: &str) -> String {
+    if !system.starts_with(BILLING_HEADER) {
+        return system.to_string();
+    }
+    let mut s: Vec<char> = system.chars().collect();
+    let chars: Vec<char> = s.clone();
+    let find = |pat: &str, from: usize| -> Option<usize> {
+        let p: Vec<char> = pat.chars().collect();
+        (from..chars.len().saturating_sub(p.len() - 1)).find(|&i| chars[i..i + p.len()] == p[..])
+    };
+    if let Some(cch) = find("cch=", BILLING_HEADER.len()).filter(|c| *c <= 160) {
+        let v = cch + 4;
+        if let Some(end) = find(";", v) {
+            if end > v && end - v <= 16 {
+                for c in &mut s[v..end] {
+                    *c = 'f';
+                }
+            }
+        }
+    }
+    if let Some(cv) = find("cc_version=", 0).filter(|c| *c <= 160) {
+        let v = cv + "cc_version=".len();
+        if let Some(end) = find(";", cv) {
+            if v < end && end - v <= 64 {
+                let ver: String = chars[v..end].iter().collect();
+                let parts: Vec<&str> = ver.split('.').collect();
+                if parts.len() > 3 {
+                    let tail = v + parts[..3].join(".").chars().count() + 1;
+                    for c in &mut s[tail..end] {
+                        *c = 'f';
+                    }
+                }
+            }
+        }
+    }
+    s.into_iter().collect()
+}
+
+fn budget_effort(tokens: &Value) -> Map<String, Value> {
+    let mut out = Map::new();
+    let n = tokens.as_i64().or_else(|| tokens.as_f64().map(|f| f as i64)).or_else(|| tokens.as_str().and_then(|s| s.trim().parse().ok()));
+    if let Some(n) = n {
+        out.insert("reasoning_effort".into(), json!(if n < 2048 { "low" } else if n < 8192 { "medium" } else { "xhigh" }));
+    }
+    out
+}
+
+/// Anthropic Messages -> (template messages, template tools, template kwargs). `think_unasked`: a request without
+/// "thinking", an effort or a budget gets the template's default (it thinks). Also returns the thinking budget the
+/// request asks for (Anthropic's budget_tokens, or the request's own reasoning_budget_tokens).
+pub fn anthropic_to_messages(req: &Value, orders: &ToolOrders, think_unasked: bool) -> Result<(Prepared, Option<u64>)> {
+    let mut messages = Vec::new();
+    if let Some(system) = req.get("system").filter(|s| truthy(s)) {
+        messages.push(json!({"role": "system", "content": pin_billing_stamp(&text_of(&check_parts(system)))}));
+    }
+    for m in object_list(req.get("messages"), "messages")? {
+        let role = m.get("role").cloned().ok_or_else(|| bad("each message needs a role"))?;
+        let content = check_parts(m.get("content").unwrap_or(&Value::Null));
+        if content.is_string() {
+            messages.push(json!({"role": role, "content": content}));
+            continue;
+        }
+        let blocks: Vec<Value> = content.as_array().cloned().unwrap_or_default();
+        let has_tool_result = blocks.iter().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"));
+        if role.as_str() == Some("user") && has_image(&content) && !has_tool_result {
+            messages.push(json!({"role": "user", "content": parts_of(&content)}));
+            continue;
+        }
+        let (mut text, mut reasoning, mut calls, mut parts) = (String::new(), String::new(), Vec::new(), Vec::new());
+        let (mut any_text, mut any_reasoning) = (false, false);
+        for block in &blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    text.push_str(block.get("text").and_then(Value::as_str).unwrap_or(""));
+                    any_text = true;
+                    parts.push(block.clone());
+                }
+                Some(k) if IMAGE_PARTS.contains(&k) => parts.push(block.clone()),
+                Some("thinking") => {
+                    reasoning.push_str(block.get("thinking").and_then(Value::as_str).unwrap_or(""));
+                    any_reasoning = true;
+                }
+                Some("tool_use") => {
+                    let mut call = Map::new();
+                    call.insert("function".into(), json!({
+                        "name": block.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": tool_arguments(block.get("input")),
+                    }));
+                    if let Some(id) = block.get("id").filter(|v| truthy(v)) {
+                        call.insert("id".into(), id.clone());
+                    }
+                    calls.push(Value::Object(call));
+                }
+                Some("tool_result") => {
+                    let mut t = Map::new();
+                    t.insert("role".into(), json!("tool"));
+                    t.insert("content".into(), parts_of(&check_parts(block.get("content").unwrap_or(&Value::Null))));
+                    if let Some(id) = block.get("tool_use_id").filter(|v| truthy(v)) {
+                        t.insert("tool_call_id".into(), id.clone());
+                    }
+                    messages.push(Value::Object(t));
+                }
+                _ => {}
+            }
+        }
+        if any_text || !calls.is_empty() || any_reasoning || !parts.is_empty() {
+            let parts_v = Value::Array(parts);
+            let mut out = Map::new();
+            out.insert("role".into(), role.clone());
+            out.insert("content".into(), if has_image(&parts_v) { parts_of(&parts_v) } else { json!(text) });
+            if !reasoning.is_empty() {
+                out.insert("reasoning_content".into(), json!(reasoning));
+            }
+            if !calls.is_empty() {
+                out.insert("tool_calls".into(), Value::Array(calls));
+            }
+            messages.push(Value::Object(out));
+        }
+    }
+    let tools: Vec<Value> = anthropic_tool_list(req.get("tools"), orders)?
+        .iter()
+        .map(|t| json!({
+            "name": t.get("name").cloned().unwrap_or(Value::Null),
+            "description": t.get("description").cloned().unwrap_or(json!("")),
+            "parameters": t.get("input_schema").cloned().unwrap_or(json!({})),
+        }))
+        .collect();
+    let tools = if tools.is_empty() { None } else { Some(tools) };
+
+    let thinking = req.get("thinking");
+    let effort = req.get("output_config").and_then(Value::as_object).and_then(|o| o.get("effort")).filter(|e| truthy(e));
+    let disabled = thinking.and_then(|t| t.get("type")).and_then(Value::as_str) == Some("disabled");
+    let bt = if thinking.is_some_and(Value::is_object) && !disabled {
+        thinking.and_then(|t| t.get("budget_tokens")).and_then(Value::as_u64).filter(|n| *n > 0)
+    } else {
+        None
+    };
+    let own_budget = req.get("reasoning_budget_tokens").filter(|v| !v.is_null()).and_then(Value::as_u64);
+    let budget = own_budget.or(bt);
+    let mut kwargs = Map::new();
+    if disabled {
+        kwargs.insert("enable_thinking".into(), json!(false));
+    } else if thinking.is_none_or(Value::is_null) && budget.is_none_or(|b| b == 0) && !think_unasked {
+        kwargs.insert("enable_thinking".into(), json!(false));
+    } else if let Some(e) = effort {
+        kwargs.extend(effort_kwargs(Some(e))?);
+    } else if let Some(b) = thinking.and_then(|t| t.get("budget_tokens")).filter(|b| truthy(b)) {
+        kwargs.extend(budget_effort(b));
+    }
+    let messages = answers_in_call_order(late_system_to_user(messages));
+    Ok((Prepared { messages, tools, kwargs }, budget))
+}
+
+/// Anthropic tools: each `{"name": ..., "input_schema": {...}}`.
+fn anthropic_tool_list(value: Option<&Value>, orders: &ToolOrders) -> Result<Vec<Value>> {
+    if value.is_none_or(|v| !truthy(v)) {
+        return Ok(Vec::new());
+    }
+    let shape = r#"{"name": ..., "input_schema": {...}}"#;
+    let tools = object_list(value, "tools").map_err(|_| bad(format!("tools must be a list of tool objects, each {shape}")))?;
+    for (i, t) in tools.iter().enumerate() {
+        let Some(name) = t.get("name").and_then(Value::as_str).filter(|n| !n.is_empty()) else {
+            return Err(bad(format!("tools[{i}] has no name: each tool must be {shape}")));
+        };
+        if let Some(schema) = t.get("input_schema") {
+            if !schema.is_null() && !schema.is_object() {
+                return Err(bad(format!(
+                    "tools[{i}] ({name}): \"input_schema\" must be an object (the JSON schema of its parameters)")));
+            }
+        }
+    }
+    Ok(orders.order(tools, |t| t.get("name").and_then(Value::as_str).unwrap_or("").to_string()))
+}
+
 pub fn openai_to_messages(req: &Value, orders: &ToolOrders) -> Result<Prepared> {
     let mut messages = Vec::new();
     for m in object_list(req.get("messages"), "messages")? {

@@ -73,8 +73,9 @@ REQUESTS = {
 }
 
 
-def encode_request(req, tmpl, tok, literals, template_tokens):
-    msgs, tools, kw = F.openai_to_messages(json.loads(json.dumps(req)))
+def encode_request(req, tmpl, tok, literals, template_tokens, api="openai"):
+    req = json.loads(json.dumps(req))
+    msgs, tools, kw = F.openai_to_messages(req) if api == "openai" else F.anthropic_to_messages(req)
     marked, mtools, changed = F.mark_think_literals(msgs, tools, literals)
     off = kw.get("enable_thinking") is False
     kwargs = {**template_tokens, **kw, "enable_thinking": not off}
@@ -85,7 +86,33 @@ def encode_request(req, tmpl, tok, literals, template_tokens):
     if changed:
         prompt, plain = F.unmark_think_literals(prompt, literals)
     ids = tok.encode(prompt, parse_special=True, plain=plain) if plain else tok.encode(prompt, parse_special=True)
-    return {"messages": msgs, "tools": tools, "kwargs": kw, "prompt": prompt, "plain": plain, "ids": ids}
+    return {"messages": msgs, "tools": tools, "kwargs": kw, "prompt": prompt, "plain": plain, "ids": ids,
+            "budget": req.get("reasoning_budget_tokens")}
+
+
+ATOOL = {"name": "get_weather", "description": "Weather.", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}}
+ANTHROPIC = {
+    "a_plain": {"messages": [U("Hello!")], "max_tokens": 100},
+    "a_system_blocks_billing": {"system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.170.bf4; cc_entrypoint=sdk-cli; cch=b145e;\nYou are helpful."}],
+                                "messages": [U("Hi")]},
+    "a_text_blocks": {"messages": [{"role": "user", "content": [{"type": "text", "text": "A. "}, {"type": "text", "text": "B."}]}]},
+    "a_image_block": {"messages": [{"role": "user", "content": [{"type": "text", "text": "What?"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}}]}]},
+    "a_tool_round": {"messages": [U("Weather in Pune?"),
+        {"role": "assistant", "content": [{"type": "thinking", "thinking": "Need the tool."}, {"type": "text", "text": "Checking."},
+                                          {"type": "tool_use", "id": "tu1", "name": "get_weather", "input": {"city": "Pune"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "tu1", "content": [{"type": "text", "text": "31C"}]}]},
+        U("Thanks")], "tools": [ATOOL]},
+    "a_tool_result_image": {"messages": [U("Read the picture"),
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "get_weather", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": [
+            {"type": "text", "text": "here"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}]}]}],
+        "tools": [ATOOL]},
+    "a_thinking_disabled": {"messages": [U("2+2?")], "thinking": {"type": "disabled"}},
+    "a_effort_low": {"messages": [U("Plan")], "output_config": {"effort": "low"}},
+    "a_budget": {"messages": [U("Plan")], "thinking": {"type": "enabled", "budget_tokens": 4096}},
+    "a_quoted_tags": {"messages": [U("Quote </think> and <|im_end|> please")]},
+}
 
 
 def main() -> int:
@@ -100,7 +127,12 @@ def main() -> int:
         cases = []
         for cname, req in REQUESTS.items():
             F._TOOL_ORDERS.clear()
-            cases.append({"name": cname, "request": req, **encode_request(req, tmpl, tok, literals, template_tokens)})
+            cases.append({"name": cname, "api": "openai", "request": req,
+                          **encode_request(req, tmpl, tok, literals, template_tokens)})
+        for cname, req in ANTHROPIC.items():
+            F._TOOL_ORDERS.clear()
+            cases.append({"name": cname, "api": "anthropic", "request": req,
+                          **encode_request(req, tmpl, tok, literals, template_tokens, "anthropic")})
         # tool-order stability: the same tool set sent in another order comes back in the first order
         F._TOOL_ORDERS.clear()
         first = encode_request({"messages": [U("x")], "tools": [WEATHER, CLOCK]}, tmpl, tok, literals, template_tokens)

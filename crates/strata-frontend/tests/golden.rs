@@ -24,8 +24,18 @@ fn check(model: &str) {
     for c in g["cases"].as_array().unwrap() {
         let name = c["name"].as_str().unwrap();
         let orders = ToolOrders::default();
-        let p = match openai_to_messages(&c["request"], &orders) {
-            Ok(p) => p,
+        let converted = if c["api"] == "anthropic" {
+            strata_frontend::request::anthropic_to_messages(&c["request"], &orders, true).map(|(p, b)| (p, b))
+        } else {
+            openai_to_messages(&c["request"], &orders).map(|p| (p, None))
+        };
+        let p = match converted {
+            Ok((p, budget)) => {
+                if c["api"] == "anthropic" && budget != c["budget"].as_u64() {
+                    failures.push(format!("{name}: budget {budget:?} want {}", c["budget"]));
+                }
+                p
+            }
             Err(e) => {
                 failures.push(format!("{name}: refused: {e}"));
                 continue;

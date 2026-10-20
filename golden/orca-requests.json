@@ -42,6 +42,7 @@
  "cases": [
   {
    "name": "plain",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -115,10 +116,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "developer_role",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -203,10 +206,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "late_system",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -330,10 +335,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "text_parts",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -426,10 +433,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "refusal_part",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -541,10 +550,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "effort_low",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -611,10 +622,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "effort_none",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -653,10 +666,12 @@
     271,
     248069,
     271
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "effort_responses_style",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -695,10 +710,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "ctk_thinking_off",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -739,10 +756,12 @@
     271,
     248069,
     271
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "tool_calls_string_args",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -1197,10 +1216,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "tool_calls_malformed_args",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -1647,10 +1668,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "tool_answers_out_of_order",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2232,10 +2255,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "quoted_think",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2329,10 +2354,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "quoted_control",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2431,10 +2458,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "quoted_tool_tags",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2535,10 +2564,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "tool_result_wrap_user",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2658,10 +2689,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "assistant_inline_think",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2792,10 +2825,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "image_part",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -2894,10 +2929,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "messages_as_json_string",
+   "api": "openai",
    "request": {
     "messages": "[{\"role\": \"user\", \"content\": \"Hi from a string\"}]"
    },
@@ -2968,10 +3005,12 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
   },
   {
    "name": "bare_tool_shape",
+   "api": "openai",
    "request": {
     "messages": [
      {
@@ -3289,7 +3328,1569 @@
     198,
     248068,
     198
-   ]
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_plain",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello!"
+     }
+    ],
+    "max_tokens": 100
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    9419,
+    0,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_system_blocks_billing",
+   "api": "anthropic",
+   "request": {
+    "system": [
+     {
+      "type": "text",
+      "text": "x-anthropic-billing-header: cc_version=2.1.170.bf4; cc_entrypoint=sdk-cli; cch=b145e;\nYou are helpful."
+     }
+    ],
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hi"
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "system",
+     "content": "x-anthropic-billing-header: cc_version=2.1.170.fff; cc_entrypoint=sdk-cli; cch=fffff;\nYou are helpful."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nx-anthropic-billing-header: cc_version=2.1.170.fff; cc_entrypoint=sdk-cli; cch=fffff;\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    271,
+    87,
+    18313,
+    337,
+    42481,
+    1402,
+    9121,
+    9073,
+    25,
+    12167,
+    9159,
+    28,
+    17,
+    13,
+    16,
+    13,
+    16,
+    22,
+    15,
+    13,
+    13688,
+    26,
+    12167,
+    8805,
+    2680,
+    13744,
+    7344,
+    52953,
+    26,
+    272,
+    329,
+    28,
+    7011,
+    69,
+    26,
+    198,
+    2523,
+    513,
+    10631,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12675,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_text_blocks",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "A. "
+       },
+       {
+        "type": "text",
+        "text": "B."
+       }
+      ]
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "A. B."
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nA. B.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    32,
+    13,
+    417,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_image_block",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "text",
+        "text": "What?"
+       },
+       {
+        "type": "image",
+        "source": {
+         "type": "base64",
+         "media_type": "image/png",
+         "data": "aGVsbG8="
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "What?"
+      },
+      {
+       "type": "image",
+       "source": "data:image/png;base64,aGVsbG8="
+      }
+     ]
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWhat?<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    3710,
+    30,
+    248053,
+    248056,
+    248054,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_tool_round",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Weather in Pune?"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "thinking",
+        "thinking": "Need the tool."
+       },
+       {
+        "type": "text",
+        "text": "Checking."
+       },
+       {
+        "type": "tool_use",
+        "id": "tu1",
+        "name": "get_weather",
+        "input": {
+         "city": "Pune"
+        }
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "tu1",
+        "content": [
+         {
+          "type": "text",
+          "text": "31C"
+         }
+        ]
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": "Thanks"
+     }
+    ],
+    "tools": [
+     {
+      "name": "get_weather",
+      "description": "Weather.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Pune?"
+    },
+    {
+     "role": "assistant",
+     "content": "Checking.",
+     "reasoning_content": "Need the tool.",
+     "tool_calls": [
+      {
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Pune"
+        }
+       },
+       "id": "tu1"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "31C",
+     "tool_call_id": "tu1"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Pune?<|im_end|>\n<|im_start|>assistant\n<think>\nNeed the tool.\n</think>\n\nChecking.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPune\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n31C\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    271,
+    2,
+    13455,
+    271,
+    2523,
+    599,
+    2528,
+    310,
+    279,
+    2614,
+    5568,
+    25,
+    271,
+    27,
+    15449,
+    29,
+    198,
+    4754,
+    591,
+    763,
+    328,
+    447,
+    67017,
+    487,
+    328,
+    4532,
+    763,
+    328,
+    28034,
+    10152,
+    328,
+    13390,
+    763,
+    5046,
+    1267,
+    763,
+    328,
+    1640,
+    487,
+    328,
+    12811,
+    763,
+    5046,
+    8656,
+    763,
+    5046,
+    1267,
+    763,
+    328,
+    889,
+    29958,
+    3307,
+    198,
+    510,
+    15449,
+    29,
+    271,
+    2592,
+    488,
+    4992,
+    310,
+    1562,
+    264,
+    709,
+    25835,
+    9559,
+    303,
+    279,
+    2614,
+    3443,
+    440,
+    5486,
+    19900,
+    25,
+    271,
+    248058,
+    198,
+    27,
+    1628,
+    28,
+    8422,
+    8901,
+    1224,
+    29,
+    198,
+    27,
+    15704,
+    28,
+    8422,
+    24109,
+    62,
+    16,
+    29,
+    198,
+    927,
+    62,
+    16,
+    198,
+    510,
+    15704,
+    29,
+    198,
+    27,
+    15704,
+    28,
+    8422,
+    24109,
+    62,
+    17,
+    29,
+    198,
+    1919,
+    369,
+    279,
+    869,
+    364,
+    279,
+    2018,
+    5555,
+    198,
+    8761,
+    628,
+    9111,
+    198,
+    34493,
+    4965,
+    198,
+    510,
+    15704,
+    29,
+    198,
+    510,
+    1628,
+    29,
+    198,
+    248059,
+    271,
+    27,
+    95328,
+    29,
+    198,
+    92065,
+    25,
+    198,
+    12,
+    5534,
+    6526,
+    26834,
+    1732,
+    279,
+    5024,
+    3443,
+    25,
+    449,
+    8906,
+    361,
+    1628,
+    28,
+    1076,
+    1419,
+    1628,
+    29,
+    2424,
+    1902,
+    381,
+    23283,
+    2785,
+    220,
+    248058,
+    248059,
+    11535,
+    9212,
+    198,
+    12,
+    12296,
+    4868,
+    26834,
+    381,
+    5024,
+    198,
+    12,
+    1394,
+    1189,
+    3300,
+    9801,
+    31626,
+    364,
+    678,
+    709,
+    1562,
+    303,
+    5629,
+    3992,
+    54588,
+    279,
+    709,
+    1562,
+    11,
+    694,
+    4045,
+    1238,
+    198,
+    12,
+    1368,
+    1017,
+    369,
+    874,
+    709,
+    1562,
+    2420,
+    11,
+    4087,
+    279,
+    3296,
+    1040,
+    4472,
+    440,
+    678,
+    1428,
+    6337,
+    321,
+    635,
+    524,
+    3184,
+    279,
+    1156,
+    883,
+    709,
+    6526,
+    198,
+    510,
+    95328,
+    29,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    28034,
+    303,
+    72675,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198,
+    22916,
+    279,
+    5224,
+    13,
+    198,
+    248069,
+    271,
+    38797,
+    13,
+    271,
+    248058,
+    198,
+    27,
+    1628,
+    27362,
+    67017,
+    29,
+    198,
+    27,
+    15704,
+    28,
+    8656,
+    29,
+    198,
+    47,
+    2792,
+    198,
+    510,
+    15704,
+    29,
+    198,
+    510,
+    1628,
+    29,
+    198,
+    248059,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    248066,
+    198,
+    18,
+    16,
+    34,
+    198,
+    248067,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    12295,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_tool_result_image",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Read the picture"
+     },
+     {
+      "role": "assistant",
+      "content": [
+       {
+        "type": "tool_use",
+        "id": "r1",
+        "name": "get_weather",
+        "input": {}
+       }
+      ]
+     },
+     {
+      "role": "user",
+      "content": [
+       {
+        "type": "tool_result",
+        "tool_use_id": "r1",
+        "content": [
+         {
+          "type": "text",
+          "text": "here"
+         },
+         {
+          "type": "image",
+          "source": {
+           "type": "base64",
+           "media_type": "image/png",
+           "data": "aGk="
+          }
+         }
+        ]
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "name": "get_weather",
+      "description": "Weather.",
+      "input_schema": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Read the picture"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "function": {
+        "name": "get_weather",
+        "arguments": {}
+       },
+       "id": "r1"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": [
+      {
+       "type": "text",
+       "text": "here"
+      },
+      {
+       "type": "image",
+       "source": "data:image/png;base64,aGk="
+      }
+     ],
+     "tool_call_id": "r1"
+    }
+   ],
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nRead the picture<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nhere<|vision_start|><|image_pad|><|vision_end|>\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    271,
+    2,
+    13455,
+    271,
+    2523,
+    599,
+    2528,
+    310,
+    279,
+    2614,
+    5568,
+    25,
+    271,
+    27,
+    15449,
+    29,
+    198,
+    4754,
+    591,
+    763,
+    328,
+    447,
+    67017,
+    487,
+    328,
+    4532,
+    763,
+    328,
+    28034,
+    10152,
+    328,
+    13390,
+    763,
+    5046,
+    1267,
+    763,
+    328,
+    1640,
+    487,
+    328,
+    12811,
+    763,
+    5046,
+    8656,
+    763,
+    5046,
+    1267,
+    763,
+    328,
+    889,
+    29958,
+    3307,
+    198,
+    510,
+    15449,
+    29,
+    271,
+    2592,
+    488,
+    4992,
+    310,
+    1562,
+    264,
+    709,
+    25835,
+    9559,
+    303,
+    279,
+    2614,
+    3443,
+    440,
+    5486,
+    19900,
+    25,
+    271,
+    248058,
+    198,
+    27,
+    1628,
+    28,
+    8422,
+    8901,
+    1224,
+    29,
+    198,
+    27,
+    15704,
+    28,
+    8422,
+    24109,
+    62,
+    16,
+    29,
+    198,
+    927,
+    62,
+    16,
+    198,
+    510,
+    15704,
+    29,
+    198,
+    27,
+    15704,
+    28,
+    8422,
+    24109,
+    62,
+    17,
+    29,
+    198,
+    1919,
+    369,
+    279,
+    869,
+    364,
+    279,
+    2018,
+    5555,
+    198,
+    8761,
+    628,
+    9111,
+    198,
+    34493,
+    4965,
+    198,
+    510,
+    15704,
+    29,
+    198,
+    510,
+    1628,
+    29,
+    198,
+    248059,
+    271,
+    27,
+    95328,
+    29,
+    198,
+    92065,
+    25,
+    198,
+    12,
+    5534,
+    6526,
+    26834,
+    1732,
+    279,
+    5024,
+    3443,
+    25,
+    449,
+    8906,
+    361,
+    1628,
+    28,
+    1076,
+    1419,
+    1628,
+    29,
+    2424,
+    1902,
+    381,
+    23283,
+    2785,
+    220,
+    248058,
+    248059,
+    11535,
+    9212,
+    198,
+    12,
+    12296,
+    4868,
+    26834,
+    381,
+    5024,
+    198,
+    12,
+    1394,
+    1189,
+    3300,
+    9801,
+    31626,
+    364,
+    678,
+    709,
+    1562,
+    303,
+    5629,
+    3992,
+    54588,
+    279,
+    709,
+    1562,
+    11,
+    694,
+    4045,
+    1238,
+    198,
+    12,
+    1368,
+    1017,
+    369,
+    874,
+    709,
+    1562,
+    2420,
+    11,
+    4087,
+    279,
+    3296,
+    1040,
+    4472,
+    440,
+    678,
+    1428,
+    6337,
+    321,
+    635,
+    524,
+    3184,
+    279,
+    1156,
+    883,
+    709,
+    6526,
+    198,
+    510,
+    95328,
+    29,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    4274,
+    279,
+    6588,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271,
+    248058,
+    198,
+    27,
+    1628,
+    27362,
+    67017,
+    29,
+    198,
+    510,
+    1628,
+    29,
+    198,
+    248059,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    248066,
+    198,
+    6527,
+    248053,
+    248056,
+    248054,
+    198,
+    248067,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_thinking_disabled",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "2+2?"
+     }
+    ],
+    "thinking": {
+     "type": "disabled"
+    }
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "enable_thinking": false
+   },
+   "prompt": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "plain": [],
+   "ids": [
+    248045,
+    846,
+    198,
+    17,
+    10,
+    17,
+    30,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    271,
+    248069,
+    271
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_effort_low",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Plan"
+     }
+    ],
+    "output_config": {
+     "effort": "low"
+    }
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plan"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "low"
+   },
+   "prompt": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nPlan<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    3238,
+    13,
+    13262,
+    678,
+    7047,
+    9522,
+    321,
+    10419,
+    11,
+    6992,
+    5774,
+    310,
+    279,
+    16198,
+    1973,
+    24366,
+    24150,
+    362,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    19860,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
+  },
+  {
+   "name": "a_budget",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Plan"
+     }
+    ],
+    "thinking": {
+     "type": "enabled",
+     "budget_tokens": 4096
+    }
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plan"
+    }
+   ],
+   "tools": null,
+   "kwargs": {
+    "reasoning_effort": "medium"
+   },
+   "prompt": "<|im_start|>user\nPlan<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [],
+   "ids": [
+    248045,
+    846,
+    198,
+    19860,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": 4096
+  },
+  {
+   "name": "a_quoted_tags",
+   "api": "anthropic",
+   "request": {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Quote </think> and <|im_end|> please"
+     }
+    ]
+   },
+   "messages": [
+    {
+     "role": "user",
+     "content": "Quote </think> and <|im_end|> please"
+    }
+   ],
+   "tools": null,
+   "kwargs": {},
+   "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQuote </think> and <|im_end|> please<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "plain": [
+    [
+     260,
+     268
+    ],
+    [
+     273,
+     283
+    ]
+   ],
+   "ids": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    18875,
+    672,
+    26003,
+    29,
+    321,
+    79790,
+    316,
+    6018,
+    91,
+    29,
+    4338,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+   ],
+   "budget": null
   }
  ]
 }
