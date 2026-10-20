@@ -43,10 +43,12 @@ build runs on an RTX 3060 12 GB; warm speed on the 5060 Ti is unchanged (Orca 62
 ## Use
 
 ```sh
-python3 run.py --test                                   # the whole Rust test suite (no GPU)
-python3 run.py --take-over --port 8000                  # in the foreground, in place of the PolyStrata service
-python3 run.py --temp-service --port 8000               # as a temporary user service; PolyStrata's comes back when it stops
-python3 run.py --stop-temp-service
+cargo run -q --release --bin am2strata-run -- test                          # the whole test suite (no GPU)
+cargo run -q --release --bin am2strata-run -- serve --take-over --port 8000 # foreground, in place of PolyStrata's service
+cargo run -q --release --bin am2strata-run -- temp-service --port 8000      # temporary user service; PolyStrata's returns when it stops
+cargo run -q --release --bin am2strata-run -- stop-temp-service
+cargo run -q --release --bin am2strata-run -- install --port 8000           # boot service in place of strata-orca (same configs, models)
+cargo run -q --release --bin am2strata-run -- uninstall                     # strata-orca back as the boot service
 # live GPU tests against a running server
 STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p am2strata --release --test live -- --ignored --test-threads=1
 ```
