@@ -986,15 +986,23 @@ async function videoFrames(file, n) {
   v.muted = true; v.preload = "auto"; v.playsInline = true; v.src = url;
   try {
     await new Promise((ok, bad) => { v.onloadeddata = ok; v.onerror = () => bad(new Error("this browser cannot play this video format")); });
-    const dur = v.duration;
-    if (!isFinite(dur) || dur <= 0) throw new Error("the video has no length");
+    let dur = v.duration;
+    if (!isFinite(dur)) {                // a recorder's WebM says no length: seeking past the end makes the browser find it
+      v.currentTime = 1e101;
+      await new Promise((ok) => { v.ontimeupdate = () => { v.ontimeupdate = null; ok(); }; setTimeout(ok, 3000); });
+      dur = v.duration;
+      v.currentTime = 0;                 // wait for this seek too, or the first frame is the video's end
+      await new Promise((ok) => { v.onseeked = ok; setTimeout(ok, 3000); });
+    }
+    if (!isFinite(dur) || dur <= 0) throw new Error("the video's length could not be read");
     const scale = Math.min(1, 768 / Math.max(v.videoWidth, v.videoHeight));
     const c = document.createElement("canvas");
     c.width = Math.max(2, Math.round(v.videoWidth * scale)); c.height = Math.max(2, Math.round(v.videoHeight * scale));
     const g = c.getContext("2d"), frames = [];
     for (let i = 0; i < n; i++) {
-      v.currentTime = Math.min(dur - 0.01, dur * (i + 0.5) / n);
-      await new Promise((ok) => { v.onseeked = ok; });
+      const at = Math.min(dur - 0.01, dur * (i + 0.5) / n);
+      // the handler first, then the seek; a seek to where it already is fires no event, hence the timeout
+      await new Promise((ok) => { const t = setTimeout(ok, 2000); v.onseeked = () => { clearTimeout(t); ok(); }; v.currentTime = at; });
       g.drawImage(v, 0, 0, c.width, c.height);
       frames.push(c.toDataURL("image/jpeg", 0.8));
     }
