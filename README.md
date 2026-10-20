@@ -1,7 +1,7 @@
 # polystrata-rs
 
 A staged rewrite of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
-risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 done, Phase 1 started**.
+risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 done, Phase 1 largely done**: the Rust server can stand in for the Python one for chat, coding agents, pictures and documents.
 
 ## What works
 
