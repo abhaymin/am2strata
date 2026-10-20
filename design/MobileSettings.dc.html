@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>am2Strata Settings on a phone</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; display: flex; flex-direction: column; background: #0D1117; color: #E6EDF3; font-family: Manrope, system-ui, sans-serif; font-size: 14px">
+  <header style="display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid #2A3441; background: #0F141B">
+    <svg aria-hidden="true" width="28" height="28" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+    <span style="font-weight: 800; font-size: 16px">Settings</span>
+  </header>
+  <div style="flex: 1 1 auto; overflow: hidden; padding: 16px; display: flex; flex-direction: column; gap: 12px">
+    <div style="background: #151B23; border: 1px solid #2A3441; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 10px">
+      <span style="font-size: 12px; color: #9BA7B4; font-weight: 700; letter-spacing: 0.06em">THEME</span>
+      <div role="group" aria-label="Theme" style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; padding: 3px; border-radius: 10px; background: #0F141B; border: 1px solid #2A3441">
+        <button type="button" aria-pressed="true" style="min-height: 40px; border-radius: 8px; border: 0; background: #1C2430; color: #E6EDF3; font-family: inherit; font-weight: 800">System</button>
+        <button type="button" aria-pressed="false" style="min-height: 40px; border-radius: 8px; border: 0; background: transparent; color: #9BA7B4; font-family: inherit; font-weight: 700">Light</button>
+        <button type="button" aria-pressed="false" style="min-height: 40px; border-radius: 8px; border: 0; background: transparent; color: #9BA7B4; font-family: inherit; font-weight: 700">Dark</button>
+      </div>
+    </div>
+    <div style="background: #151B23; border: 1px solid #2A3441; border-radius: 12px">
+      <sc-for list="{{rows}}" as="r" hint-placeholder-count="7">
+        <a href="#section" style="display: flex; align-items: center; gap: 12px; min-height: 60px; padding: 0 14px; border-bottom: 1px solid #222B36; color: #E6EDF3; text-decoration: none">
+          <span style="flex: 1 1 auto"><span style="display: block; font-weight: 700">{{r.label}}</span><span style="display: block; font-size: 12px; color: #9BA7B4; margin-top: 2px">{{r.hint}}</span></span>
+          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="#9BA7B4" stroke-width="2"><path d="M6 3l5 5-5 5"></path></svg>
+        </a>
+      </sc-for>
+    </div>
+  </div>
+  <nav aria-label="Main" style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid #2A3441; background: #0F141B">
+    <a href="Mobile.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">Chat</a>
+    <a href="MobileMonitor.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">Monitor</a>
+    <a href="MobileSettings.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #E6EDF3; text-decoration: none; font-weight: 800; font-size: 12px; box-shadow: inset 0 2px 0 #3DD68C">Settings</a>
+    <a href="#calls" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">API calls</a>
+  </nav>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      rows: [['Models', 'MiniCPM-V 4.7 loaded · 4 installed'], ['Model config', 'Context 262K · KV 8-bit'], ['Chat defaults', 'Thinking High · shared with apps'],
+        ['Server and access', '0.0.0.0:8000 · API key set'], ['Tools (MCP)', 'No tool servers'], ['Appearance', 'System theme · green accent'],
+        ['Connect', 'Base URLs for your apps']].map(([label, hint]) => ({ label, hint }))
+    };
+  }
+}
+</script>
+</body>
+</html>

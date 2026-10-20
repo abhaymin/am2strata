@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>am2Strata</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="{{rootStyle}}">
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--bg2)">
+    <div style="display: flex; align-items: center; gap: 10px">
+      <svg aria-hidden="true" width="30" height="30" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" style="fill: var(--logo-tile)"></rect><rect x="14" y="16" width="36" height="8" rx="4" style="fill: var(--accent)"></rect><rect x="14" y="28" width="26" height="8" rx="4" style="fill: var(--accent); opacity: 0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" style="fill: var(--accent); opacity: 0.45"></rect><circle cx="45" cy="44" r="5" style="fill: var(--logo-spark)"></circle></svg>
+      <span style="font-weight: 800; font-size: 18px; letter-spacing: -0.02em">am<span style="color: var(--accent)">2</span>Strata</span>
+    </div>
+    <nav aria-label="Main" style="display: flex; gap: 4px; padding: 4px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px">
+      <sc-for list="{{tabs}}" as="t" hint-placeholder-count="4">
+        <button type="button" onClick="{{t.pick}}" style="{{t.style}}">{{t.label}}</button>
+      </sc-for>
+    </nav>
+    <div style="flex: 1 1 0"></div>
+    <div role="group" aria-label="Theme" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border)">
+      <sc-for list="{{themes}}" as="th" hint-placeholder-count="3">
+        <button type="button" onClick="{{th.pick}}" aria-label="{{th.label}}" aria-pressed="{{th.on}}" title="{{th.label}}" style="{{th.style}}">{{th.short}}</button>
+      </sc-for>
+    </div>
+    <label for="model-pick" style="font-size: 12px; color: var(--muted)">Model</label>
+    <select id="model-pick" style="background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-family: inherit; font-size: 13px; min-height: 36px">
+      <option>MiniCPM-V 4.7 35B-A3B · AD-Q5_K-Q4_K</option>
+      <option>Orca (Qwen3.8 Flash Next) · IQ3_XXS</option>
+      <option>Tiel Coder 35B-A3B · UD-Q6_K_XL</option>
+      <option>LFM2 8B A1B · Q4_K_M</option>
+    </select>
+    <span style="display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: var(--ok-bg); color: var(--ok-fg); font-size: 12px; font-weight: 600">
+      <span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent)"></span>Ready · 262K context · pictures, video, PDF
+    </span>
+  </header>
+
+  <sc-if value="{{isChat}}" hint-placeholder-val="{{true}}">
+  <main style="flex: 1 1 auto; display: flex; flex-wrap: wrap; min-height: 0">
+    <aside aria-label="Chats" style="flex: 1 1 240px; max-width: 280px; border-right: 1px solid var(--border); padding: 16px; display: flex; flex-direction: column; gap: 8px; background: var(--bg2)">
+      <button type="button" style="display: flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; border-radius: 10px; border: 1px solid var(--accent); background: transparent; color: var(--ok-fg); font-family: inherit; font-weight: 700; font-size: 14px">
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3v10M3 8h10"></path></svg>New chat
+      </button>
+      <label for="chat-search" style="font-size: 12px; color: var(--muted); margin-top: 8px">Search chats</label>
+      <input id="chat-search" placeholder="Find a chat…" style="background: var(--panel); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit">
+      <div style="font-size: 11px; font-weight: 700; color: var(--muted); letter-spacing: 0.06em; margin-top: 12px">TODAY</div>
+      <sc-for list="{{chats}}" as="c" hint-placeholder-count="4">
+        <button type="button" style="{{c.style}}"><span style="display: block; font-weight: 600; color: var(--text)">{{c.title}}</span><span style="display: block; font-size: 12px; color: var(--muted); margin-top: 2px">{{c.meta}}</span></button>
+      </sc-for>
+    </aside>
+
+    <section aria-label="Conversation" style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column">
+      <sc-if value="{{isWelcome}}" hint-placeholder-val="{{false}}">
+      <div style="flex: 1 1 auto; padding: 56px 32px 24px; display: flex; flex-direction: column; align-items: center; gap: 22px; max-width: 920px; width: 100%; box-sizing: border-box; margin: 0 auto; text-align: center">
+        <h1 style="margin: 0; font-size: 40px; font-weight: 800; letter-spacing: -0.03em">What shall we work on?</h1>
+        <p style="margin: 0; color: var(--muted); font-size: 15px; max-width: 560px; line-height: 1.5">MiniCPM-V 4.7 runs on this PC — nothing leaves it. It reads text, pictures, videos and PDFs.</p>
+        <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; width: 100%; max-width: 680px; margin-top: 8px">
+          <sc-for list="{{starters}}" as="st" hint-placeholder-count="4">
+            <button type="button" style="text-align: left; min-height: 72px; padding: 14px 16px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font-family: inherit; cursor: pointer"><span style="display: block; font-weight: 700">{{st.title}}</span><span style="display: block; font-size: 13px; color: var(--muted); margin-top: 4px">{{st.hint}}</span></button>
+          </sc-for>
+        </div>
+        <div style="width: 100%; max-width: 680px; border: 2px dashed var(--border); border-radius: 14px; padding: 22px; color: var(--muted); display: flex; align-items: center; justify-content: center; gap: 10px">
+          <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M10 13V3M6 7l4-4 4 4"></path><path d="M3 13v3a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-3"></path></svg>
+          Drop pictures, videos, PDFs or text files anywhere on the page
+        </div>
+      </div>
+      </sc-if>
+      <sc-if value="{{hasChat}}" hint-placeholder-val="{{true}}">
+      <div style="flex: 1 1 auto; padding: 28px 32px; display: flex; flex-direction: column; gap: 22px; max-width: 920px; width: 100%; box-sizing: border-box; margin: 0 auto">
+
+        <div style="align-self: flex-end; max-width: 78%; display: flex; flex-direction: column; align-items: flex-end; gap: 8px">
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px; display: flex; flex-direction: column; gap: 8px">
+            <div style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted)">
+              <svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="1.5" y="3.5" width="10" height="9" rx="1.5"></rect><path d="M11.5 7l3-2v6l-3-2"></path></svg>
+              <span style="color: var(--text); font-weight: 600">ball.webm</span> · 3.2 s · 16 frames sent in order
+            </div>
+            <div role="img" aria-label="Frame strip: a red ball moving from left to right" style="display: flex; gap: 4px">
+              <sc-for list="{{frames}}" as="f" hint-placeholder-count="8">
+                <div style="width: 44px; height: 28px; border-radius: 4px; background: #F5F7FA; position: relative; overflow: hidden"><div style="{{f.ball}}"></div></div>
+              </sc-for>
+            </div>
+          </div>
+          <div style="background: var(--bubble); color: var(--bubble-fg); border-radius: 14px 14px 4px 14px; padding: 12px 16px; line-height: 1.5">What happens in this video? Which direction does the object move?</div>
+          <div style="font-size: 12px; color: var(--muted)">You · 23:05</div>
+        </div>
+
+        <div style="max-width: 82%; display: flex; flex-direction: column; gap: 8px">
+          <details style="background: var(--panel-soft); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px">
+            <summary style="cursor: pointer; color: var(--muted); font-size: 13px">Thought for 1.1 s</summary>
+            <p style="margin: 10px 0 0; color: var(--muted); line-height: 1.5">The ball starts at the left edge in the first frames and reaches the right edge in the last ones.</p>
+          </details>
+          <div style="line-height: 1.6">The video shows a red ball on a white background moving steadily <strong>from left to right</strong> across the frame over about three seconds.</div>
+          <div style="display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--muted)">
+            <span style="font-family: 'JetBrains Mono', monospace">199 tokens · 91.8 tok/s · 0.4 s to first token</span>
+            <button type="button" aria-label="Copy the answer" style="min-width: 32px; min-height: 32px; border-radius: 6px; border: 1px solid var(--border); background: transparent; color: var(--muted)"><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="5" y="5" width="9" height="9" rx="1.5"></rect><path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2h-6A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5"></path></svg></button>
+          </div>
+        </div>
+
+        <div style="align-self: flex-end; max-width: 78%; display: flex; flex-direction: column; align-items: flex-end; gap: 8px">
+          <div style="display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px">
+            <svg aria-hidden="true" width="28" height="34" viewBox="0 0 28 34" fill="none"><path d="M3 2h15l7 7v23H3z" stroke-width="1.5" style="fill: var(--raised); stroke: var(--info)"></path><text x="7" y="25" font-size="8" font-family="Manrope" font-weight="800" style="fill: var(--info)">PDF</text></svg>
+            <div><div style="font-weight: 600">invoice-0815.pdf</div><div style="font-size: 12px; color: var(--muted)">1 page · read as text and as a page picture</div></div>
+          </div>
+          <div style="background: var(--bubble); color: var(--bubble-fg); border-radius: 14px 14px 4px 14px; padding: 12px 16px; line-height: 1.5">Who is the seller, how many wrenches, the total due and the due date?</div>
+        </div>
+
+        <div style="max-width: 82%; line-height: 1.6">
+          <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; background: var(--panel-soft); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px">
+            <span style="color: var(--muted)">Seller</span><span>ACME Tools GmbH</span>
+            <span style="color: var(--muted)">Wrenches</span><span>3</span>
+            <span style="color: var(--muted)">Total due</span><span>157.20 EUR</span>
+            <span style="color: var(--muted)">Due date</span><span>30 Nov 2026</span>
+          </div>
+          <div style="font-size: 12px; color: var(--muted); margin-top: 8px; font-family: 'JetBrains Mono', monospace">343 tokens · 93.2 tok/s</div>
+        </div>
+      </div>
+      </sc-if>
+
+      <div style="padding: 16px 32px 24px; max-width: 920px; width: 100%; box-sizing: border-box; margin: 0 auto">
+        <div style="border: 1px solid var(--border-strong); background: var(--panel); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 10px">
+          <div style="display: flex; flex-wrap: wrap; gap: 8px">
+            <span style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 8px; background: var(--raised); font-size: 12px">
+              <span aria-hidden="true" style="width: 28px; height: 18px; border-radius: 3px; background: #F5F7FA; position: relative"><span style="position: absolute; left: 4px; top: 5px; width: 8px; height: 8px; border-radius: 50%; background: #E5484D"></span></span>
+              WhatsApp Video 19.05.10.mp4 · 16 frames · 42 s
+              <button type="button" aria-label="Remove WhatsApp Video" style="min-width: 28px; min-height: 28px; border: 0; background: transparent; color: var(--muted)">✕</button>
+            </span>
+            <span style="display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 8px; background: var(--raised); font-size: 12px">quarterly-report.pdf · 12 pages
+              <button type="button" aria-label="Remove quarterly-report.pdf" style="min-width: 28px; min-height: 28px; border: 0; background: transparent; color: var(--muted)">✕</button>
+            </span>
+          </div>
+          <label for="composer" style="position: absolute; left: -9999px">Message</label>
+          <textarea id="composer" rows="2" placeholder="Ask anything — drop pictures, videos, PDFs or text files here" style="resize: none; background: transparent; border: 0; color: var(--text); font-family: inherit; font-size: 15px; outline: none"></textarea>
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px">
+            <button type="button" aria-label="Attach files" style="min-width: 40px; min-height: 40px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text)"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13 7.5l-5.2 5.2a3.2 3.2 0 0 1-4.5-4.5L8.6 3a2.1 2.1 0 0 1 3 3L6.4 11.2a1 1 0 0 1-1.5-1.5L9.6 5"></path></svg></button>
+            <div role="group" aria-label="Thinking" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border)">
+              <sc-for list="{{levels}}" as="l" hint-placeholder-count="4">
+                <button type="button" onClick="{{l.pick}}" style="{{l.style}}">{{l.label}}</button>
+              </sc-for>
+            </div>
+            <span style="font-size: 12px; color: var(--muted)">Thinking</span>
+            <div style="flex: 1 1 0"></div>
+            <span style="font-size: 12px; color: var(--muted)">Shift+Enter: new line</span>
+            <button type="button" style="min-height: 40px; padding: 0 18px; border-radius: 10px; border: 0; background: var(--accent); color: var(--on-accent); font-family: inherit; font-weight: 800; font-size: 14px">Send</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  </sc-if>
+
+  <sc-if value="{{isMonitor}}" hint-placeholder-val="{{false}}">
+  <main style="flex: 1 1 auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; max-width: 1280px; width: 100%; box-sizing: border-box; margin: 0 auto">
+    <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px">
+      <span style="font-weight: 700">Model state</span>
+      <span style="padding: 4px 10px; border-radius: 999px; background: var(--ok-bg); color: var(--ok-fg); font-size: 12px; font-weight: 700">Generating · 91.8 tok/s</span>
+      <span style="color: var(--muted)">243 of ~1,000 tokens · thinking finished, answering</span>
+      <div style="flex: 1 1 200px; height: 6px; border-radius: 3px; background: var(--raised)"><div style="width: 24%; height: 6px; border-radius: 3px; background: var(--accent)"></div></div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px">
+      <sc-for list="{{metrics}}" as="m" hint-placeholder-count="8">
+        <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 6px">
+          <span style="font-size: 12px; color: var(--muted)">{{m.label}}</span>
+          <span style="font-size: 26px; font-weight: 800; letter-spacing: -0.02em">{{m.value}} <span style="font-size: 13px; font-weight: 600; color: var(--muted)">{{m.unit}}</span></span>
+          <span style="font-size: 12px; color: var(--muted)">{{m.note}}</span>
+          <div style="height: 4px; border-radius: 2px; background: var(--raised)"><div style="{{m.bar}}"></div></div>
+        </div>
+      </sc-for>
+    </div>
+    <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 20px; overflow-x: auto">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px"><span style="font-weight: 700">Recent requests</span><span style="font-size: 12px; color: var(--muted)">Since 22:02 · 54 requests · 141,755 prompt tokens read at 802 tok/s · 17,500 reused</span></div>
+      <table style="width: 100%; border-collapse: collapse; font-size: 13px; min-width: 760px">
+        <thead><tr style="color: var(--muted); text-align: left"><th style="padding: 8px">Time</th><th style="padding: 8px">Status</th><th style="padding: 8px">API</th><th style="padding: 8px; text-align: right">Prompt</th><th style="padding: 8px; text-align: right">Reused</th><th style="padding: 8px; text-align: right">Output</th><th style="padding: 8px; text-align: right">Prefill t/s</th><th style="padding: 8px; text-align: right">Decode t/s</th><th style="padding: 8px; text-align: right">Duration</th></tr></thead>
+        <tbody>
+          <sc-for list="{{requests}}" as="r" hint-placeholder-count="5">
+            <tr style="border-top: 1px solid var(--border-soft); font-family: 'JetBrains Mono', monospace"><td style="padding: 8px">{{r.time}}</td><td style="padding: 8px"><span style="{{r.badge}}">{{r.status}}</span></td><td style="padding: 8px">{{r.api}}</td><td style="padding: 8px; text-align: right">{{r.prompt}}</td><td style="padding: 8px; text-align: right">{{r.reused}}</td><td style="padding: 8px; text-align: right">{{r.out}}</td><td style="padding: 8px; text-align: right">{{r.prefill}}</td><td style="padding: 8px; text-align: right">{{r.decode}}</td><td style="padding: 8px; text-align: right">{{r.dur}}</td></tr>
+          </sc-for>
+        </tbody>
+      </table>
+    </div>
+  </main>
+  </sc-if>
+
+  <sc-if value="{{isSettings}}" hint-placeholder-val="{{false}}">
+  <main style="flex: 1 1 auto; display: flex; flex-wrap: wrap; max-width: 1280px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 24px; gap: 24px">
+    <nav aria-label="Settings sections" style="flex: 1 1 200px; max-width: 240px; display: flex; flex-direction: column; gap: 4px">
+      <sc-for list="{{sections}}" as="s" hint-placeholder-count="6">
+        <button type="button" onClick="{{s.pick}}" style="{{s.style}}"><span style="display: block; font-weight: 700">{{s.label}}</span><span style="display: block; font-size: 12px; color: var(--muted); margin-top: 2px">{{s.hint}}</span></button>
+      </sc-for>
+    </nav>
+    <div style="flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 16px">
+
+      <sc-if value="{{secModels}}" hint-placeholder-val="{{true}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Models</h2>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
+            <sc-for list="{{models}}" as="md" hint-placeholder-count="4">
+              <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border-soft)">
+                <div style="flex: 1 1 260px; min-width: 0"><div style="font-weight: 700">{{md.name}}</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px; font-family: 'JetBrains Mono', monospace">{{md.facts}}</div></div>
+                <span style="padding: 3px 8px; border-radius: 6px; background: var(--raised); font-size: 12px; color: var(--text-soft)">{{md.family}}</span>
+                <span style="{{md.stateStyle}}">{{md.state}}</span>
+                <button type="button" style="{{md.btnStyle}}">{{md.action}}</button>
+              </div>
+            </sc-for>
+          </div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px">
+            <div><div style="font-weight: 700; font-size: 16px">Add a model from Hugging Face</div><div style="color: var(--muted); font-size: 13px; margin-top: 4px">Downloads are resumable and checked against the Hub's SHA-256. A token is only needed for gated or private repositories.</div></div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px">
+              <div style="display: flex; flex-direction: column; gap: 6px"><label for="hf-repo" style="font-size: 12px; color: var(--muted)">Repository</label><input id="hf-repo" value="LiquidAI/LFM2-8B-A1B-GGUF" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px"></div>
+              <div style="display: flex; flex-direction: column; gap: 6px"><label for="hf-quant" style="font-size: 12px; color: var(--muted)">Quantization</label><select id="hf-quant" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"><option>Q4_K_M · 4.70 GB</option><option>Q4_0 · 4.41 GB</option><option>Q5_K_M · 5.51 GB</option><option>Q6_K · 6.38 GB</option><option>Q8_0 · 8.26 GB</option></select></div>
+              <div style="display: flex; flex-direction: column; gap: 6px"><label for="hf-token" style="font-size: 12px; color: var(--muted)">Token (optional)</label><input id="hf-token" type="password" placeholder="hf_… — saved login is used if empty" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"></div>
+            </div>
+            <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+              <button type="button" style="min-height: 40px; padding: 0 18px; border-radius: 10px; border: 0; background: var(--accent); color: var(--on-accent); font-family: inherit; font-weight: 800">Download</button>
+              <span style="font-size: 12px; color: var(--muted)">Architecture lfm2moe · runs on the strata-poly engine · 128K context · 32 experts</span>
+            </div>
+            <div style="display: flex; flex-direction: column; gap: 6px">
+              <div style="display: flex; justify-content: space-between; font-size: 12px; font-family: 'JetBrains Mono', monospace"><span>LFM2-8B-A1B-Q4_K_M.gguf</span><span style="color: var(--muted)">2.31 / 4.70 GB · 46 MB/s · 52 s left</span></div>
+              <div style="height: 6px; border-radius: 3px; background: var(--raised)"><div style="width: 49%; height: 6px; border-radius: 3px; background: var(--info)"></div></div>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secConfig}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px"><h2 style="margin: 0; font-size: 20px">Model config</h2><span style="font-size: 13px; color: var(--muted)">MiniCPM-V 4.7 · strata-minicpmv-uncensored-ad-q5_k-q4_k.json</span></div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px">
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-ctx" style="font-size: 12px; color: var(--muted)">Context window</label><select id="c-ctx" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"><option>262,144 tokens (model maximum)</option><option>131,072 tokens</option><option>65,536 tokens</option></select><span style="font-size: 12px; color: var(--muted)">Engine restart needed</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-kv" style="font-size: 12px; color: var(--muted)">KV cache</label><select id="c-kv" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"><option>8-bit (q8_0)</option><option>16-bit</option></select><span style="font-size: 12px; color: var(--muted)">8-bit keeps more experts in VRAM</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-par" style="font-size: 12px; color: var(--muted)">Requests at once</label><select id="c-par" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"><option>1 (fastest for one user)</option><option>2</option><option>3</option><option>4</option></select><span style="font-size: 12px; color: var(--muted)">Each slot takes VRAM from the expert cache</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-budget" style="font-size: 12px; color: var(--muted)">Thinking budget (tokens)</label><input id="c-budget" placeholder="No cap — a quarter of max tokens is kept for the answer" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-temp" style="font-size: 12px; color: var(--muted)">Temperature · top_p · top_k</label><input id="c-temp" value="1.0 · 0.95 · 20  (model card)" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 13px"></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="c-loop" style="font-size: 12px; color: var(--muted)">Looping reasoning</label><select id="c-loop" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"><option>Off</option><option>Stop the reply</option><option>Recover with low effort</option></select></div>
+          </div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
+            <sc-for list="{{toggles}}" as="tg" hint-placeholder-count="4">
+              <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border-soft)">
+                <div style="flex: 1 1 auto"><div style="font-weight: 600">{{tg.label}}</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">{{tg.hint}}</div></div>
+                <button type="button" role="switch" aria-checked="{{tg.on}}" aria-label="{{tg.label}}" onClick="{{tg.flip}}" style="{{tg.track}}"><span style="{{tg.knob}}"></span></button>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: center">
+            <button type="button" style="min-height: 40px; padding: 0 18px; border-radius: 10px; border: 0; background: var(--accent); color: var(--on-accent); font-family: inherit; font-weight: 800">Save and reload model</button>
+            <button type="button" style="min-height: 40px; padding: 0 18px; border-radius: 10px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: inherit; font-weight: 700">Save for next load</button>
+            <span style="font-size: 12px; color: var(--muted)">The earlier file is kept as .bak</span>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secDefaults}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Chat defaults</h2>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px">
+            <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Thinking level</span><div role="group" aria-label="Default thinking level" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--border)"><sc-for list="{{levels}}" as="l" hint-placeholder-count="4"><button type="button" onClick="{{l.pick}}" style="{{l.style}}">{{l.label}}</button></sc-for></div></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="d-max" style="font-size: 12px; color: var(--muted)">Max tokens</label><input id="d-max" placeholder="Until done" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="d-seed" style="font-size: 12px; color: var(--muted)">Seed</label><input id="d-seed" placeholder="Random" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"></div>
+          </div>
+          <div style="display: flex; align-items: center; gap: 16px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 18px">
+            <div style="flex: 1 1 auto"><div style="font-weight: 600">Use for other apps too</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">API clients get these defaults for anything they leave out. Saved next to the model's config.</div></div>
+            <button type="button" role="switch" aria-checked="true" aria-label="Use for other apps too" style="width: 44px; height: 26px; border-radius: 13px; border: 0; background: var(--accent); position: relative"><span style="position: absolute; top: 3px; left: 21px; width: 20px; height: 20px; border-radius: 50%; background: var(--on-accent)"></span></button>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secServer}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Server and access</h2>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px">
+            <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Listening on</span><span style="font-family: 'JetBrains Mono', monospace">0.0.0.0:8000</span><span style="font-size: 12px; color: var(--muted)">Service: am2strata (temporary) · PolyStrata paused</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Over Tailscale</span><span style="font-family: 'JetBrains Mono', monospace">http://abhay-ai-pc:8000</span><span style="font-size: 12px; color: var(--muted)">100.72.13.89</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="s-key" style="font-size: 12px; color: var(--muted)">API key</label><div style="display: flex; gap: 8px"><input id="s-key" type="password" value="sk-unsloth-xxxxxxxxxxxxxxxxxxxx" style="flex: 1 1 auto; min-width: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: 'JetBrains Mono', monospace"><button type="button" style="min-height: 40px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: inherit; font-weight: 600">Copy</button></div></div>
+          </div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
+            <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border-soft)"><div style="flex: 1 1 auto"><div style="font-weight: 600">API monitor</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">Keep the last 100 API calls (bodies, output, timings) in memory for the API calls tab. No headers or keys are kept.</div></div><button type="button" role="switch" aria-checked="true" aria-label="API monitor" style="width: 44px; height: 26px; border-radius: 13px; border: 0; background: var(--accent); position: relative"><span style="position: absolute; top: 3px; left: 21px; width: 20px; height: 20px; border-radius: 50%; background: var(--on-accent)"></span></button></div>
+            <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px"><div style="flex: 1 1 auto"><div style="font-weight: 600">Start at boot</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">Make am2Strata the boot service in place of strata-orca (same configs and models). Off: PolyStrata starts at boot.</div></div><button type="button" role="switch" aria-checked="false" aria-label="Start at boot" style="width: 44px; height: 26px; border-radius: 13px; border: 1px solid var(--border-strong); background: var(--raised); position: relative"><span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--muted)"></span></button></div>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secTools}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Tools (MCP)</h2>
+          <div style="background: var(--panel); border: 1px dashed var(--border-strong); border-radius: 12px; padding: 28px; display: flex; flex-direction: column; align-items: center; gap: 10px; text-align: center">
+            <div style="font-weight: 700">No tool servers yet</div>
+            <div style="color: var(--muted); max-width: 520px; line-height: 1.5">Add an MCP server — a program on this PC or an address — and the chat can use its tools. Tools run with your rights on this PC, so only this page can use them.</div>
+          </div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; align-items: end">
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="t-name" style="font-size: 12px; color: var(--muted)">Name</label><input id="t-name" placeholder="files" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit"></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><label for="t-cmd" style="font-size: 12px; color: var(--muted)">Command or URL</label><input id="t-cmd" placeholder="npx -y @modelcontextprotocol/server-filesystem ~/Documents" style="background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: 'JetBrains Mono', monospace; font-size: 12px"></div>
+            <button type="button" style="min-height: 42px; border-radius: 10px; border: 0; background: var(--accent); color: var(--on-accent); font-family: inherit; font-weight: 800">Add server</button>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secAppearance}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Appearance</h2>
+          <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px">
+            <sc-for list="{{themeCards}}" as="tc" hint-placeholder-count="3">
+              <button type="button" onClick="{{tc.pick}}" aria-pressed="{{tc.on}}" style="{{tc.style}}">
+                <span style="{{tc.preview}}"><span style="{{tc.bar}}"></span><span style="{{tc.line}}"></span><span style="{{tc.line2}}"></span></span>
+                <span style="display: block; font-weight: 700; margin-top: 10px">{{tc.label}}</span>
+                <span style="display: block; font-size: 12px; color: var(--muted); margin-top: 2px">{{tc.hint}}</span>
+              </button>
+            </sc-for>
+          </div>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+            <span style="flex: 1 1 240px"><span style="display: block; font-weight: 600">Accent colour</span><span style="display: block; font-size: 12px; color: var(--muted); margin-top: 2px">Buttons, the logo and progress bars. Kept in this browser.</span></span>
+            <span style="width: 32px; height: 32px; border-radius: 8px; background: #3DD68C; border: 2px solid var(--text)"></span>
+            <span style="width: 32px; height: 32px; border-radius: 8px; background: #6CB6FF"></span>
+            <span style="width: 32px; height: 32px; border-radius: 8px; background: #F2B84B"></span>
+            <span style="width: 32px; height: 32px; border-radius: 8px; background: #C297FF"></span>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{secConnect}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-direction: column; gap: 16px">
+          <h2 style="margin: 0; font-size: 20px">Connect your tools</h2>
+          <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
+            <sc-for list="{{endpoints}}" as="e" hint-placeholder-count="4">
+              <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border-soft)">
+                <span style="flex: 0 0 180px; color: var(--muted)">{{e.label}}</span>
+                <code style="flex: 1 1 280px; font-family: 'JetBrains Mono', monospace; font-size: 13px">{{e.value}}</code>
+                <button type="button" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: inherit; font-weight: 600">Copy</button>
+              </div>
+            </sc-for>
+          </div>
+          <pre style="margin: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; color: var(--text-soft)">curl http://abhay-ai-pc:8000/v1/chat/completions \
+  -H "Authorization: Bearer $AM2STRATA_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k", "messages": [{"role": "user", "content": "Hello"}]}'</pre>
+        </div>
+      </sc-if>
+    </div>
+  </main>
+  </sc-if>
+
+  <sc-if value="{{isCalls}}" hint-placeholder-val="{{false}}">
+  <main style="flex: 1 1 auto; display: flex; flex-wrap: wrap; max-width: 1280px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 24px; gap: 20px">
+    <div style="flex: 1 1 320px; max-width: 400px; display: flex; flex-direction: column; gap: 8px">
+      <label for="call-search" style="font-size: 12px; color: var(--muted)">Search calls</label>
+      <input id="call-search" placeholder="ID, endpoint or model" style="background: var(--panel); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: inherit">
+      <sc-for list="{{calls}}" as="k" hint-placeholder-count="5">
+        <button type="button" style="{{k.style}}">
+          <span style="display: flex; justify-content: space-between; font-size: 12px; color: var(--muted)"><span>{{k.time}}</span><span style="{{k.badge}}">{{k.state}}</span></span>
+          <span style="display: block; font-family: 'JetBrains Mono', monospace; font-size: 13px; margin-top: 6px; color: var(--text)">POST {{k.path}}</span>
+          <span style="display: block; font-size: 12px; color: var(--muted); margin-top: 4px">{{k.meta}}</span>
+        </button>
+      </sc-for>
+    </div>
+    <div style="flex: 999 1 520px; min-width: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 14px">
+      <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px"><span style="font-family: 'JetBrains Mono', monospace; font-weight: 600">1ed421cfd2fb · /v1/chat/completions</span><span style="padding: 3px 8px; border-radius: 6px; background: var(--ok-bg); color: var(--ok-fg); font-size: 12px; font-weight: 700">completed</span></div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px">
+        <sc-for list="{{callFacts}}" as="cf" hint-placeholder-count="8">
+          <div style="background: var(--bg2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 10px"><div style="font-size: 11px; color: var(--muted)">{{cf.label}}</div><div style="font-family: 'JetBrains Mono', monospace; font-weight: 600; margin-top: 4px">{{cf.value}}</div></div>
+        </sc-for>
+      </div>
+      <div role="tablist" aria-label="Call content" style="display: flex; gap: 4px"><button type="button" role="tab" aria-selected="true" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: var(--raised); color: var(--text); font-family: inherit; font-weight: 700">Input</button><button type="button" role="tab" aria-selected="false" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--muted); font-family: inherit">Output</button><button type="button" role="tab" aria-selected="false" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--muted); font-family: inherit">Reasoning</button><button type="button" role="tab" aria-selected="false" style="min-height: 36px; padding: 0 12px; border-radius: 8px; border: 0; background: transparent; color: var(--muted); font-family: inherit">Response</button></div>
+      <pre style="margin: 0; background: var(--bg2); border: 1px solid var(--border-soft); border-radius: 8px; padding: 14px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; color: var(--text-soft)">{
+  "model": "orcarouter-qwen3.8-flash-next-uncensored-iq3_xxs",
+  "messages": [
+    { "role": "user", "content": "In two sentences, why is the sky blue?" }
+  ],
+  "stream": true,
+  "reasoning_effort": "high"
+}</pre>
+    </div>
+  </main>
+  </sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#3DD68C","options":["#3DD68C","#6CB6FF","#F2B84B","#C297FF"]},"theme":{"editor":"enum","options":["system","light","dark"],"default":"system"},"startTab":{"editor":"enum","options":["chat","monitor","settings","calls"],"default":"chat"},"startSection":{"editor":"enum","options":["models","config","defaults","server","tools","appearance","connect"],"default":"models"},"emptyChat":{"editor":"boolean","default":false},"$preview":{"width":1440,"height":960}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { tab: props.startTab ?? 'chat', section: props.startSection ?? 'models', level: 'High', theme: props.theme ?? 'system',
+                   flips: { preserve: false, fit: true, close: false, mcp: true } };
+  }
+  renderVals() {
+    const accent = this.props.accent ?? '#3DD68C';
+    const s = this.state;
+    const prefersDark = typeof window !== 'undefined' && window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)').matches : true;
+    const dark = s.theme === 'dark' || (s.theme === 'system' && prefersDark);
+    const pal = dark ? {
+      bg: '#0D1117', bg2: '#0F141B', panel: '#151B23', 'panel-soft': '#12171F', raised: '#1C2430', border: '#2A3441', 'border-soft': '#222B36',
+      'border-strong': '#3A4757', text: '#E6EDF3', muted: '#9BA7B4', 'text-soft': '#C9D3DD', 'ok-bg': '#12261D', 'ok-fg': '#7EE8B2',
+      bubble: '#1E5C42', 'bubble-fg': '#F0FFF7', info: '#6CB6FF', warn: '#F2B84B', 'warn-bg': '#2B2412', 'err-bg': '#2D1517', 'err-fg': '#FF9B94',
+      'on-accent': '#0D1117', 'logo-tile': '#1C2430', 'logo-spark': '#F2B84B' } : {
+      bg: '#F6F8FA', bg2: '#FFFFFF', panel: '#FFFFFF', 'panel-soft': '#F3F5F8', raised: '#EEF1F5', border: '#D5DBE3', 'border-soft': '#E6EAF0',
+      'border-strong': '#B8C2CE', text: '#1A2230', muted: '#566372', 'text-soft': '#33404F', 'ok-bg': '#DDF5E8', 'ok-fg': '#0F6B41',
+      bubble: '#1D7A51', 'bubble-fg': '#FFFFFF', info: '#1F6FD1', warn: '#9A6200', 'warn-bg': '#FFF1D6', 'err-bg': '#FDE3E1', 'err-fg': '#A8281E',
+      'on-accent': '#0D1117', 'logo-tile': '#0F1B16', 'logo-spark': '#F2B84B' };
+    const rootStyle = Object.entries(pal).map(([k, v]) => '--' + k + ': ' + v).join('; ') + '; --accent: ' + accent +
+      '; min-height: 960px; display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-family: Manrope, system-ui, sans-serif; font-size: 14px';
+    const themes = [['system', 'Use the system theme', 'Auto'], ['light', 'Light theme', 'Light'], ['dark', 'Dark theme', 'Dark']].map(([id, label, short]) => ({
+      label, short, on: s.theme === id ? 'true' : 'false', pick: () => this.setState({ theme: id }),
+      style: 'min-height: 30px; padding: 0 10px; border-radius: 6px; border: 0; font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer; ' +
+        (s.theme === id ? 'background: var(--raised); color: var(--text)' : 'background: transparent; color: var(--muted)') }));
+    const themeCards = [['system', 'System', 'Follows your computer or phone (now ' + (prefersDark ? 'dark' : 'light') + ')', 'linear-gradient(90deg, #F6F8FA 50%, #0D1117 50%)'],
+      ['light', 'Light', 'Bright background, dark text', '#F6F8FA'], ['dark', 'Dark', 'Dark background, light text', '#0D1117']].map(([id, label, hint, bgc]) => ({
+      label, hint, on: s.theme === id ? 'true' : 'false', pick: () => this.setState({ theme: id }),
+      style: 'text-align: left; padding: 14px; border-radius: 12px; font-family: inherit; color: var(--text); cursor: pointer; background: var(--panel); ' +
+        (s.theme === id ? 'border: 2px solid ' + accent : 'border: 2px solid var(--border)'),
+      preview: 'display: flex; flex-direction: column; gap: 6px; padding: 12px; height: 72px; box-sizing: border-box; border-radius: 8px; border: 1px solid var(--border); background: ' + bgc,
+      bar: 'width: 40%; height: 8px; border-radius: 4px; background: ' + accent,
+      line: 'width: 80%; height: 6px; border-radius: 3px; background: #8892A0',
+      line2: 'width: 60%; height: 6px; border-radius: 3px; background: #8892A0' }));
+    const starters = [['Describe a picture', 'Attach a photo or screenshot'], ['Summarize a PDF', 'Contracts, reports, invoices'],
+      ['What happens in this video?', 'Clips are read as ordered frames'], ['Explain or fix code', 'Paste it or attach the file']].map(([title, hint]) => ({ title, hint }));
+    const tabBtn = (on) => 'min-height: 36px; padding: 0 14px; border-radius: 7px; border: 0; font-family: inherit; font-size: 14px; font-weight: 700; cursor: pointer; ' +
+      (on ? 'background: var(--raised); color: var(--text); box-shadow: inset 0 -2px 0 ' + accent : 'background: transparent; color: var(--muted)');
+    const tabs = [['chat', 'Chat'], ['monitor', 'Monitor'], ['settings', 'Settings'], ['calls', 'API calls']].map(([id, label]) => ({
+      label, style: tabBtn(s.tab === id), pick: () => this.setState({ tab: id }) }));
+    const secBtn = (on) => 'text-align: left; min-height: 52px; padding: 10px 12px; border-radius: 10px; font-family: inherit; font-size: 14px; color: var(--text); cursor: pointer; ' +
+      (on ? 'background: var(--raised); border: 1px solid var(--border-strong)' : 'background: transparent; border: 1px solid transparent');
+    const sections = [['models', 'Models', 'Switch, unload, add from Hugging Face'], ['config', 'Model config', 'Context, KV cache, sampling'],
+      ['defaults', 'Chat defaults', 'Shared with other apps'], ['server', 'Server and access', 'Address, API key, monitor'],
+      ['tools', 'Tools (MCP)', 'Tool servers for the chat'], ['appearance', 'Appearance', 'Light, dark or system; accent'],
+      ['connect', 'Connect', 'Base URLs for your apps']].map(([id, label, hint]) => ({
+      label, hint, style: secBtn(s.section === id), pick: () => this.setState({ section: id }) }));
+    const levels = ['Off', 'Low', 'Medium', 'High'].map((l) => ({ label: l,
+      style: 'min-height: 32px; padding: 0 12px; border-radius: 6px; border: 0; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; ' +
+        (s.level === l ? 'background: ' + accent + '; color: var(--on-accent)' : 'background: transparent; color: var(--muted)'),
+      pick: () => this.setState({ level: l }) }));
+    const chatStyle = (on) => 'text-align: left; padding: 10px 12px; border-radius: 10px; font-family: inherit; font-size: 13px; cursor: pointer; ' +
+      (on ? 'background: var(--raised); border: 1px solid var(--border-strong)' : 'background: transparent; border: 1px solid transparent');
+    const chats = [['Ball video and invoice', 'MiniCPM-V · 4 messages', true], ['Why is the sky blue?', 'Orca · 2 messages', false],
+      ['Refactor the parser', 'Tiel Coder · 12 messages', false], ['Mixture of experts, briefly', 'LFM2 8B · 2 messages', false]].map(([title, meta, on]) => ({ title, meta, style: chatStyle(on) }));
+    const frames = [8, 16, 24, 32, 40, 48, 56, 64].map((p) => ({ ball: 'position: absolute; top: 9px; left: ' + (p * 0.42) + 'px; width: 10px; height: 10px; border-radius: 50%; background: #E5484D' }));
+    const bar = (pct, color) => 'width: ' + pct + '%; height: 4px; border-radius: 2px; background: ' + color;
+    const metrics = [
+      { label: 'Decode', value: '91.8', unit: 'tok/s', note: 'last request 93.2', bar: bar(62, accent) },
+      { label: 'Prefill', value: '887', unit: 'tok/s', note: '97,547-token prompt in 110 s', bar: bar(55, 'var(--info)') },
+      { label: 'VRAM', value: '15.1', unit: '/ 16 GB', note: '5,760 experts cached (10.4 GB)', bar: bar(94, 'var(--warn)') },
+      { label: 'System RAM', value: '55.2', unit: '/ 60 GB', note: 'engine 52.2 GB · am2Strata 29 MB', bar: bar(92, 'var(--warn)') },
+      { label: 'GPU load', value: '96', unit: '%', note: 'RTX 5060 Ti · sm_120', bar: bar(96, accent) },
+      { label: 'GPU temp', value: '58', unit: '°C', note: 'power 142 of 180 W', bar: bar(58, accent) },
+      { label: 'Conversation cache', value: '99', unit: '% reused', note: 'follow-up read 25 new tokens', bar: bar(99, 'var(--info)') },
+      { label: 'Context fill', value: '6.1', unit: '% of 262K', note: '16,346 tokens in this chat', bar: bar(6, accent) } ];
+    const badge = (st) => 'padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; font-family: Manrope, sans-serif; ' +
+      (st === 'Done' || st === 'completed' ? 'background: var(--ok-bg); color: var(--ok-fg)' : st === 'Closed' || st === 'disconnected' ? 'background: var(--warn-bg); color: var(--warn)' : 'background: var(--err-bg); color: var(--err-fg)');
+    const requests = [['23:06:41', 'Done', 'chat', '1,204', '0', '343', '912', '93.2', '4.1 s'], ['23:05:12', 'Done', 'chat', '2,881', '0', '199', '845', '91.8', '2.9 s'],
+      ['22:58:30', 'Done', 'responses', '612', '590', '41', '—', '88.4', '0.6 s'], ['22:51:04', 'Closed', 'chat', '23', '—', '20', '—', '—', '0.7 s'],
+      ['22:46:17', 'Done', 'messages', '16,346', '16,321', '9', '89', '51.6', '0.5 s']].map(([time, status, api, prompt, reused, out, prefill, decode, dur]) => ({
+      time, status, api, prompt, reused, out, prefill, decode, dur, badge: badge(status) }));
+    const pill = (txt, on) => ({ stateStyle: 'padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; ' + (on ? 'background: var(--ok-bg); color: var(--ok-fg)' : 'background: var(--raised); color: var(--muted)'),
+      btnStyle: 'min-height: 36px; padding: 0 14px; border-radius: 8px; font-family: inherit; font-weight: 700; cursor: pointer; ' + (on ? 'border: 1px solid var(--border-strong); background: transparent; color: var(--text)' : 'border: 0; background: ' + accent + '; color: var(--on-accent)'),
+      state: txt, action: on ? 'Unload' : 'Load' });
+    const models = [
+      { name: 'MiniCPM-V 4.7 35B-A3B Uncensored', facts: 'AD-Q5_K-Q4_K · 20.6 GB · 262K · pictures, video, PDF', family: 'qwen35moe', ...pill('Loaded', true) },
+      { name: 'Orca (Qwen3.8 Flash Next) Uncensored', facts: 'IQ3_XXS · 262K · KV k8v4 streamed · MTP drafts', family: 'qwen4exp', ...pill('Available', false) },
+      { name: 'Tiel Coder 35B-A3B', facts: 'UD-Q6_K_XL · 262K · ~100 tok/s warm', family: 'qwen35moe', ...pill('Available', false) },
+      { name: 'LFM2 8B A1B', facts: 'Q4_K_M · 4.7 GB · 128K · added from Hugging Face', family: 'lfm2moe', ...pill('Available', false) } ];
+    const sw = (key, label, hint) => {
+      const on = !!s.flips[key];
+      return { label, hint, on: on ? 'true' : 'false',
+        track: 'flex: 0 0 auto; width: 44px; height: 26px; border-radius: 13px; position: relative; cursor: pointer; ' + (on ? 'border: 0; background: ' + accent : 'border: 1px solid var(--border-strong); background: var(--raised)'),
+        knob: 'position: absolute; top: 3px; width: 20px; height: 20px; border-radius: 50%; ' + (on ? 'left: 21px; background: var(--on-accent)' : 'left: 3px; background: var(--muted)'),
+        flip: () => this.setState({ flips: { ...s.flips, [key]: !on } }) };
+    };
+    const toggles = [sw('preserve', 'Keep earlier thinking in the prompt', 'preserve_thinking — templates that support it reuse their reasoning across turns'),
+      sw('fit', 'Shorten max_tokens that do not fit', 'fit_max_tokens — instead of answering 400'),
+      sw('close', 'Close the thinking when a reply stops inside it', 'reasoning_close_retry — the model gets one more pass to answer'),
+      sw('mcp', 'Let this model use MCP tools', 'Only from this page')];
+    const endpoints = [{ label: 'OpenAI base URL', value: 'http://abhay-ai-pc:8000/v1' }, { label: 'Anthropic base URL', value: 'http://abhay-ai-pc:8000' },
+      { label: 'Responses API (Codex)', value: 'http://abhay-ai-pc:8000/v1/responses' }, { label: 'Model name', value: 'minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k' }];
+    const callStyle = (on) => 'text-align: left; padding: 12px; border-radius: 10px; font-family: inherit; cursor: pointer; ' + (on ? 'background: var(--raised); border: 1px solid var(--border-strong)' : 'background: var(--panel); border: 1px solid var(--border)');
+    const calls = [['23:06:41', 'completed', '/v1/chat/completions', '1ed421cfd2fb · 4.1 s · stream · HTTP 200', true], ['23:05:12', 'completed', '/v1/chat/completions', '9b20aa1c03ef · 2.9 s · stream · HTTP 200', false],
+      ['22:58:30', 'completed', '/v1/responses', '41c7de88a6b1 · 0.6 s · JSON · HTTP 200', false], ['22:51:04', 'disconnected', '/v1/chat/completions', '7a01f2c9e4d3 · 0.7 s · stream', false],
+      ['22:46:17', 'completed', '/v1/messages', 'c3e9905b17aa · 0.5 s · JSON · HTTP 200', false]].map(([time, state, path, meta, on]) => ({ time, state, path, meta, style: callStyle(on), badge: badge(state) }));
+    const callFacts = [['Wall clock', '4.10 s'], ['Queue wait', '0.05 s'], ['First token', '0.41 s'], ['Model load', '0.00 s'],
+      ['Prompt tokens', '1,204'], ['Output tokens', '343'], ['Decode speed', '93.2 t/s'], ['Format', 'text']].map(([label, value]) => ({ label, value }));
+    return {
+      tabs, sections, levels, chats, frames, metrics, requests, models, toggles, endpoints, calls, callFacts,
+      rootStyle, themes, themeCards, starters,
+      isWelcome: !!this.props.emptyChat, hasChat: !this.props.emptyChat, secAppearance: s.section === 'appearance',
+      isChat: s.tab === 'chat', isMonitor: s.tab === 'monitor', isSettings: s.tab === 'settings', isCalls: s.tab === 'calls',
+      secModels: s.section === 'models', secConfig: s.section === 'config', secDefaults: s.section === 'defaults',
+      secServer: s.section === 'server', secTools: s.section === 'tools', secConnect: s.section === 'connect'
+    };
+  }
+}
+</script>
+</body>
+</html>

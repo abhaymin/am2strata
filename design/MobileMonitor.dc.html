@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>am2Strata Monitor on a phone</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; display: flex; flex-direction: column; background: #0D1117; color: #E6EDF3; font-family: Manrope, system-ui, sans-serif; font-size: 14px">
+  <header style="display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid #2A3441; background: #0F141B">
+    <svg aria-hidden="true" width="28" height="28" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+    <span style="font-weight: 800; font-size: 16px; flex: 1 1 auto">Monitor</span>
+    <span style="padding: 6px 10px; border-radius: 999px; background: #12261D; color: #7EE8B2; font-size: 12px; font-weight: 700">Generating</span>
+  </header>
+  <div style="flex: 1 1 auto; overflow: hidden; padding: 16px; display: flex; flex-direction: column; gap: 12px">
+    <div style="background: #151B23; border: 1px solid #2A3441; border-radius: 12px; padding: 14px; display: flex; flex-direction: column; gap: 8px">
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: #9BA7B4"><span>MiniCPM-V 4.7 · answering</span><span>243 / ~1,000</span></div>
+      <div style="height: 6px; border-radius: 3px; background: #1C2430"><div style="width: 24%; height: 6px; border-radius: 3px; background: #3DD68C"></div></div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px">
+      <sc-for list="{{cards}}" as="c" hint-placeholder-count="6">
+        <div style="background: #151B23; border: 1px solid #2A3441; border-radius: 12px; padding: 12px; display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 11px; color: #9BA7B4">{{c.label}}</span>
+          <span style="font-size: 22px; font-weight: 800">{{c.value}} <span style="font-size: 12px; color: #9BA7B4; font-weight: 600">{{c.unit}}</span></span>
+          <div style="height: 4px; border-radius: 2px; background: #1C2430"><div style="{{c.bar}}"></div></div>
+        </div>
+      </sc-for>
+    </div>
+    <div style="background: #151B23; border: 1px solid #2A3441; border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px">
+      <span style="font-weight: 700">Recent requests</span>
+      <sc-for list="{{reqs}}" as="r" hint-placeholder-count="4">
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 13px">
+          <span style="font-family: 'JetBrains Mono', monospace; color: #9BA7B4">{{r.time}}</span>
+          <span style="{{r.badge}}">{{r.status}}</span>
+          <span style="flex: 1 1 auto; text-align: right; font-family: 'JetBrains Mono', monospace">{{r.speed}}</span>
+        </div>
+      </sc-for>
+    </div>
+  </div>
+  <nav aria-label="Main" style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid #2A3441; background: #0F141B">
+    <a href="Mobile.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">Chat</a>
+    <a href="MobileMonitor.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #E6EDF3; text-decoration: none; font-weight: 800; font-size: 12px; box-shadow: inset 0 2px 0 #3DD68C">Monitor</a>
+    <a href="MobileSettings.dc.html" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">Settings</a>
+    <a href="#calls" style="min-height: 56px; display: flex; align-items: center; justify-content: center; color: #9BA7B4; text-decoration: none; font-weight: 700; font-size: 12px">API calls</a>
+  </nav>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const bar = (p, c) => 'width: ' + p + '%; height: 4px; border-radius: 2px; background: ' + c;
+    const badge = (s) => 'padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; ' + (s === 'Done' ? 'background: #12261D; color: #7EE8B2' : 'background: #2B2412; color: #F2B84B');
+    return {
+      cards: [{ label: 'Decode', value: '91.8', unit: 'tok/s', bar: bar(62, '#3DD68C') }, { label: 'VRAM', value: '15.1', unit: '/ 16 GB', bar: bar(94, '#F2B84B') },
+        { label: 'System RAM', value: '55.2', unit: '/ 60 GB', bar: bar(92, '#F2B84B') }, { label: 'GPU', value: '96', unit: '%', bar: bar(96, '#3DD68C') },
+        { label: 'GPU temp', value: '58', unit: '°C', bar: bar(58, '#3DD68C') }, { label: 'Cache reused', value: '99', unit: '%', bar: bar(99, '#6CB6FF') }],
+      reqs: [['23:06', 'Done', '93.2 t/s'], ['23:05', 'Done', '91.8 t/s'], ['22:58', 'Done', '88.4 t/s'], ['22:51', 'Closed', '—']].map(([time, status, speed]) => ({ time, status, speed, badge: badge(status) }))
+    };
+  }
+}
+</script>
+</body>
+</html>

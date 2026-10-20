@@ -1,4 +1,4 @@
-// web/app.js - the am2Strata web app (derived from PolyStrata's, MIT): Chat, Monitor, About. No framework, no network beyond this server.
+// web/app.js - the am2Strata web app (derived from PolyStrata's, MIT): Chat, Monitor, Settings, API calls. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 "use strict";
 
@@ -54,33 +54,37 @@ async function copyText(text, btn) {
 }
 
 // ------------------------------------------------------------------ theme and tabs
-// the system's theme until the user picks one (only a click is saved)
-function setTheme(t, save) {
-  document.documentElement.dataset.theme = t;
-  if (save) try { localStorage.setItem("strata.theme", t); } catch (e) { /* ignore */ }
-  $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
-  $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
+// three choices: system (follows the computer or phone, live), light, dark; and an accent colour (Settings › Appearance)
+const darkQuery = matchMedia("(prefers-color-scheme: dark)");
+let themeMode = store.get("theme-mode", "system");
+function applyTheme() {
+  const dark = themeMode === "dark" || (themeMode === "system" && darkQuery.matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  for (const g of ["theme-seg", "theme-cards"]) for (const b of $(g).children) b.setAttribute("aria-checked", String(b.dataset.v === themeMode));
+  $("tc-system-hint").textContent = `Follows your computer or phone (now ${darkQuery.matches ? "dark" : "light"})`;
 }
-const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
-$("theme-btn").onclick = flipTheme;
-$("dark-toggle").onclick = flipTheme;
-setTheme(document.documentElement.dataset.theme || "light", false);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-  let saved = null;
-  try { saved = localStorage.getItem("strata.theme"); } catch (err) { /* ignore */ }
-  if (!saved) setTheme(e.matches ? "dark" : "light", false);
-});
+function setThemeMode(mode) { themeMode = mode; store.set("theme-mode", mode); applyTheme(); }
+for (const g of ["theme-seg", "theme-cards"]) for (const b of $(g).children) b.onclick = () => setThemeMode(b.dataset.v);
+darkQuery.addEventListener("change", applyTheme);
+applyTheme();
+function applyAccent() {
+  const a = store.get("accent", null);
+  if (a) document.documentElement.style.setProperty("--st-accent", a); else document.documentElement.style.removeProperty("--st-accent");
+  for (const b of $("accent-swatches").children) b.setAttribute("aria-checked", String(b.dataset.v === (a || "#3DD68C")));
+}
+for (const b of $("accent-swatches").children) b.onclick = () => { store.set("accent", b.dataset.v === "#3DD68C" ? null : b.dataset.v); applyAccent(); };
+applyAccent();
 
 let tab = "chat";
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "settings", "calls"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") $("img-prompt").focus();
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
-  if (tab === "monitor") loadMcp();
-  if (tab === "about") loadConfig();
+  if (tab === "settings") showSection(section);
+  if (tab === "calls") refreshCalls();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -126,7 +130,35 @@ async function loadModels() {
     `${m.status === "unavailable" ? " - unavailable" : ""}</option>`).join("");
   sel.hidden = models.length < 2;
   sel.dataset.current = (models.find((m) => m.current) || {}).id || "";
+  installed = models;
+  renderModels();
 }
+let installed = [];
+function renderModels() {
+  const box = $("models-list");
+  if (!installed.length) { box.innerHTML = `<p class="muted">No models are installed yet: add one from Hugging Face below.</p>`; return; }
+  box.innerHTML = installed.map((m) => {
+    const facts = [m.context ? `${ctxfmt(m.context)} context` : null, m.multimodal ? "pictures, video, PDF" : "text"].filter(Boolean).join(" · ");
+    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span></div>` +
+      `<span class="st-badge ${m.current ? "st-badge--generating" : ""}">${m.current ? "Loaded" : "Available"}</span>` +
+      (m.current ? `<button class="st-btn st-btn--secondary" data-unload>Unload</button>`
+                 : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) + `</div>`;
+  }).join("");
+}
+$("models-list").addEventListener("click", async (e) => {
+  const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]");
+  if (load) { $("model-select").value = load.dataset.load; $("model-select").onchange(); }
+  if (unload) {
+    if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+    unload.disabled = true;
+    try {
+      const r = await fetch("api/models/unload", {method: "POST", headers: headers(true), body: "{}"});
+      if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+      toast("success", "Model unloaded", "Its GPU memory is free; the next request loads it again.");
+    } catch (err) { toast("error", "Not unloaded", String(err.message || err), 6000); }
+    loadModels(); loadHealth();
+  }
+});
 $("model-select").onchange = async () => {
   const sel = $("model-select"), name = sel.value, before = sel.dataset.current;
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); sel.value = before; return; }
@@ -141,9 +173,7 @@ $("model-select").onchange = async () => {
   await loadHealth();
   await loadModels();
   if (message) { toast("error", "The model was not switched", message, 10000); return; }
-  messages = [];
-  saveChat();
-  renderChat();
+  newChat();
   toast("success", `${name} is loaded`, "A new chat was started.");
 };
 
@@ -231,7 +261,7 @@ function render(m) {
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
-  if (tab === "about") renderAbout(eng, hw, st);
+  if (tab === "settings") renderAbout(eng, hw, st);
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -429,7 +459,17 @@ function renderAbout(eng, hw, st) {
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
     ["Anthropic base URL", base, true],
-    ["Model name", eng.model, true],
+    ["Responses API (Codex)", `${base}/v1/responses`, true],
+    ["Model name", eng.id || eng.model, true],
+  ]);
+  $("curl-example").textContent = `curl ${base}/v1/chat/completions \\\n  -H "Authorization: Bearer $AM2STRATA_KEY" -H "Content-Type: application/json" \\\n` +
+    `  -d '{"model": "${eng.id || eng.model}", "messages": [{"role": "user", "content": "Hello"}]}'`;
+  facts($("facts-server"), [
+    ["Address", base],
+    ["Server", "am2Strata (Rust)"],
+    ["Model", eng.model ? `${eng.model}${eng.max_context ? ` · ${ctxfmt(eng.max_context)} context` : ""}` : "none loaded (the next request loads the default)"],
+    ["API monitor", callsOn ? "on: the API calls tab keeps the last 100 calls in memory" : "off"],
+    ["Video", health.video ? "frames cut on the server with ffmpeg; the web app decodes videos itself" : "the web app decodes videos itself; API clients need ffmpeg on the server"],
   ]);
 }
 document.addEventListener("click", (e) => {
@@ -457,6 +497,7 @@ const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-
 function renderMcp() {
   const servers = mcpInfo.servers || [];
   $("mcp-card").hidden = !servers.length;
+  $("mcp-empty").hidden = !!servers.length;
   $("mcp-row").hidden = !servers.length;
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
   $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
@@ -508,7 +549,15 @@ function configValue(k, el) {
   if (k.kind === "number") return Number(s);
   return s;                                         // enum, or names (the server splits them at commas)
 }
-$("cfg-save").addEventListener("click", async () => {
+$("cfg-reload").addEventListener("click", async () => {
+  await saveConfig();
+  const cur = $("model-select").dataset.current;
+  if (cur && !$("cfg-msg").dataset.failed) { $("model-select").value = cur; reloadingModel = true; $("model-select").onchange(); }
+});
+let reloadingModel = false;
+$("cfg-save").addEventListener("click", () => saveConfig());
+async function saveConfig() {
+  delete $("cfg-msg").dataset.failed;
   const set = {};
   cfgKeys.forEach((k, i) => {
     const v = configValue(k, $(`cfg-${i}`));
@@ -525,9 +574,10 @@ $("cfg-save").addEventListener("click", async () => {
     loadConfig();
   } catch (e) {
     $("cfg-msg").textContent = "";
+    $("cfg-msg").dataset.failed = "1";
     toast("error", "Not saved", String(e.message || e), 6000);
   }
-});
+}
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {
@@ -608,15 +658,87 @@ function samplingUntouched(s) {
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
+// chats: [{id, title, time, model, messages}], the newest first; the one on screen is `current`
+let chats = store.get("chats", null);
+if (!Array.isArray(chats)) {                          // the one chat of before (the "chat" key) becomes the first
+  const old = store.get("chat", []);
+  chats = old.length ? [{id: Date.now().toString(36), title: "", time: Date.now(), model: "", messages: old}] : [];
+}
+let current = store.get("current-chat", chats[0] ? chats[0].id : null);
+if (!chats.some((c) => c.id === current)) current = chats[0] ? chats[0].id : null;
+let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
 let busy = null;                      // {controller, msg}
 
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+const slim = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name})),
-                                           media: (m.media || []).map((x) => ({kind: x.kind, name: x.name}))})));
+                                           media: (m.media || []).map((x) => ({kind: x.kind, name: x.name}))}));
+function chatTitle(list) {
+  const first = list.find((m) => m.role === "user");
+  if (!first) return "New chat";
+  const t = (first.text || "").replace(/\s+/g, " ").trim();
+  return t ? (t.length > 48 ? t.slice(0, 46) + "…" : t) : ((first.media || [])[0] || (first.images || [])[0] || (first.files || [])[0] || {name: "Attachment"}).name;
 }
+function saveChat() {
+  if (messages.length) {
+    let c = chats.find((x) => x.id === current);
+    if (!c) { c = {id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), model: health.model}; chats.unshift(c); current = c.id; }
+    c.messages = messages; c.title = chatTitle(messages); c.time = Date.now(); c.model = c.model || health.model;
+  }
+  store.set("chats", chats.slice(0, 200).map((c) => ({...c, messages: slim(c.messages)})));
+  store.set("current-chat", current);
+  renderChatList();
+}
+function newChat() {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return false; }
+  messages = []; current = null; attachments = []; renderAttachments();
+  store.set("current-chat", null);
+  renderChat(); renderChatList(); openChats(false);
+  return true;
+}
+function openChat(id) {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const c = chats.find((x) => x.id === id);
+  if (!c) return;
+  current = id; messages = c.messages; store.set("current-chat", id);
+  renderChat(); renderChatList(); openChats(false);
+}
+function deleteChat(id) {
+  const i = chats.findIndex((x) => x.id === id);
+  if (i < 0) return;
+  if (busy && id === current) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const [gone] = chats.splice(i, 1);
+  if (id === current) { messages = []; current = null; renderChat(); }
+  store.set("chats", chats.map((c) => ({...c, messages: slim(c.messages)})));
+  renderChatList();
+  toast("info", "Chat deleted", gone.title || "", 6000, {label: "Undo", run: () => { chats.splice(i, 0, gone); saveChat(); }});
+}
+function renderChatList() {
+  const q = ($("chat-search").value || "").toLowerCase();
+  const list = chats.filter((c) => !q || (c.title || "").toLowerCase().includes(q) ||
+                                   c.messages.some((m) => (m.text || "").toLowerCase().includes(q)));
+  const day = (t) => { const d = new Date(t), now = new Date(); const diff = Math.floor((new Date(now.toDateString()) - new Date(d.toDateString())) / 864e5);
+                       return diff <= 0 ? "Today" : diff === 1 ? "Yesterday" : diff < 7 ? "This week" : "Older"; };
+  let group = null, html = "";
+  for (const c of list) {
+    const g = day(c.time);
+    if (g !== group) { html += `<div class="chat-group">${g}</div>`; group = g; }
+    const n = c.messages.filter((m) => m.role === "user").length;
+    html += `<div class="chat-item" aria-current="${c.id === current}"><button type="button" data-chat="${esc(c.id)}"><b>${esc(c.title || "New chat")}</b>` +
+      `<span>${esc(c.model || "")}${c.model ? " · " : ""}${n} message${n === 1 ? "" : "s"}</span></button>` +
+      `<button type="button" class="st-btn st-btn--icon" data-del="${esc(c.id)}" aria-label="Delete this chat">${icon("trash")}</button></div>`;
+  }
+  $("chat-list").innerHTML = html || `<p class="muted small">${q ? "No chat matches." : "No chats yet."}</p>`;
+}
+$("chat-list").addEventListener("click", (e) => {
+  const d = e.target.closest("[data-del]"); if (d) { deleteChat(d.dataset.del); return; }
+  const c = e.target.closest("[data-chat]"); if (c) openChat(c.dataset.chat);
+});
+$("chat-search").addEventListener("input", renderChatList);
+function openChats(open) { $("chats").dataset.open = String(open); $("menu-btn").setAttribute("aria-expanded", String(open)); }
+$("menu-btn").onclick = () => { if (tab !== "chat") showTab("chat"); openChats($("chats").dataset.open !== "true"); };
+for (const b of $("starters").children) b.onclick = () => { $("input").value = b.dataset.q; autosize(); $("input").focus();
+  if (/picture|PDF|video|file/.test(b.dataset.q)) $("file").click(); };
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -640,10 +762,19 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const x of m.media) {
+        if (x.kind === "video" && x.frames) {        // the frames the model reads, in order
+          const box = document.createElement("div");
+          box.className = "msg-media";
+          box.innerHTML = `<span><b></b> · ${x.duration.toFixed(1)} s · ${x.frames.length} frames sent in order</span><div class="frame-strip"></div>`;
+          box.querySelector("b").textContent = x.name;
+          for (const u of x.frames.filter((_, k) => k % 2 === 0)) { const im = document.createElement("img"); im.src = u; im.alt = ""; box.lastChild.appendChild(im); }
+          wrap.appendChild(box);
+          continue;
+        }
         const c = document.createElement("span");
         c.className = "chip";
         c.innerHTML = icon(x.kind === "video" ? "image" : "attach", "st-icon st-icon--sm");
-        c.append(x.kind === "video" && x.frames ? `${x.name} (${x.frames.length} frames)` : x.name);
+        c.append(x.kind === "pdf" ? `${x.name} · read as text and page pictures` : x.name);
         wrap.appendChild(c);
       }
       el.appendChild(wrap);
@@ -948,15 +1079,7 @@ $("input").addEventListener("keydown", (e) => {
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
 
-$("new-btn").onclick = () => {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
-  if (!messages.length) return;
-  const backup = messages;
-  messages = [];
-  saveChat();
-  renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
-};
+$("new-btn").onclick = () => { if (newChat()) $("input").focus(); };
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
@@ -1063,8 +1186,9 @@ function renderAttachments() {
   attachments.forEach((a, i) => {
     const c = document.createElement("span");
     c.className = "chip";
-    c.innerHTML = icon(a.kind === "file" || a.kind === "pdf" ? "attach" : "image", "st-icon st-icon--sm");
-    c.append(a.kind === "video" ? `${a.name} (${a.frames.length} frames, ${a.duration.toFixed(0)} s)` : a.name);
+    c.innerHTML = a.kind === "image" ? `<img src="${a.url}" alt="">` : a.kind === "video" ? `<img src="${a.frames[0]}" alt="">`
+                                                      : icon("attach", "st-icon st-icon--sm");
+    c.append(a.kind === "video" ? `${a.name} · ${a.frames.length} frames · ${a.duration.toFixed(0)} s` : a.name);
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
     x.innerHTML = icon("trash");
@@ -1075,7 +1199,7 @@ function renderAttachments() {
 }
 $("attach-btn").onclick = () => $("file").click();
 // drop files on the chat or the message box
-for (const id of ["chat", "composer"]) {
+for (const id of ["chat-scroll", "composer"]) {
   const el = $(id);
   el.addEventListener("dragover", (e) => {
     if (![...(e.dataTransfer || {}).types || []].includes("Files")) return;
@@ -1173,6 +1297,7 @@ $("s-apply").onclick = async () => {
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
+  renderThinking(); loadDefaults();
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {
@@ -1187,14 +1312,180 @@ $("s-apply").onclick = async () => {
   }
   toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
 };
+function renderThinking() {
+  for (const g of ["c-thinking", "d-thinking"]) for (const b of $(g).children) b.setAttribute("aria-checked", String(b.dataset.v === settings.thinking));
+}
+for (const b of $("c-thinking").children) b.onclick = () => { settings.thinking = b.dataset.v; store.set("sampling", settings); renderThinking();
+  if (sharedOn) saveShared(true, settings).catch(() => {}); };
+renderThinking();
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
 $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
+// ------------------------------------------------------------------ Settings: sections
+let section = store.get("settings-section", "models");
+function showSection(name) {
+  section = ["models", "config", "defaults", "server", "tools", "appearance", "connect"].includes(name) ? name : "models";
+  store.set("settings-section", section);
+  for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
+  for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
+  if (section === "models") { loadModels(); hubStatus(); }
+  if (section === "config") loadConfig();
+  if (section === "defaults") { loadShared().then(loadDefaults); }
+  if (section === "tools") loadMcp();
+  if (lastMetrics) render(lastMetrics);
+}
+for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
+
+// Settings › Chat defaults: the same settings as the drawer (this browser), optionally shared with other apps
+function loadDefaults() {
+  renderThinking();
+  $("d-max").value = settings.max || ""; $("d-seed").value = settings.seed || "";
+  $("d-share").setAttribute("aria-checked", String(sharedOn));
+}
+for (const b of $("d-thinking").children) b.onclick = () => { for (const x of $("d-thinking").children) x.setAttribute("aria-checked", String(x === b)); };
+$("d-share").onclick = () => $("d-share").setAttribute("aria-checked", String($("d-share").getAttribute("aria-checked") !== "true"));
+$("d-save").onclick = async () => {
+  const sel = [...$("d-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  settings = {...settings, thinking: sel ? sel.dataset.v : settings.thinking, max: $("d-max").value.trim(), seed: $("d-seed").value.trim()};
+  store.set("sampling", settings);
+  renderThinking();
+  const share = $("d-share").getAttribute("aria-checked") === "true";
+  if (share || sharedOn) {
+    try { await saveShared(share, settings); toast("success", "Defaults saved", share ? "Other apps use them from their next request." : "Other apps use their own settings again."); }
+    catch (e) { toast("error", "Saved here, but not for other apps", e.message, 6000); }
+    return;
+  }
+  toast("success", "Defaults saved", "For this browser.");
+};
+
+// Settings › Models: add one from Hugging Face (POST /api/hub/quants, POST + GET /api/hub/pull)
+async function hubCall(path, body) {
+  const r = await fetch(path, body ? {method: "POST", headers: headers(true), body: JSON.stringify(body)} : {headers: headers(), cache: "no-store"});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  return j;
+}
+const bytes = (n) => n >= 1073741824 ? `${gb(n)} GB` : `${fmt(n / 1048576)} MB`;
+$("hf-repo").oninput = () => { $("hf-quant").disabled = true; $("hf-quant").innerHTML = "<option>List the repository first</option>"; $("hf-pull").disabled = true; };
+$("hf-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const repo = $("hf-repo").value.trim();
+  if (!repo) { $("hf-repo").focus(); return; }
+  $("hf-list").disabled = true; $("hf-msg").textContent = "Asking Hugging Face…";
+  try {
+    const j = await hubCall("api/hub/quants", {repo, token: $("hf-token").value.trim() || undefined});
+    const pick = j.quants.find((q) => /Q4_K_M/i.test(q.quant)) || j.quants[0];
+    $("hf-quant").innerHTML = j.quants.map((q) => `<option value="${esc(q.quant)}"${q === pick ? " selected" : ""}>${esc(q.quant)} · ${bytes(q.size)}${q.files > 1 ? ` · ${q.files} files` : ""}</option>`).join("");
+    $("hf-quant").disabled = false; $("hf-pull").disabled = false;
+    $("hf-msg").textContent = `${j.repo}: ${j.quants.length} quantization${j.quants.length === 1 ? "" : "s"}`;
+  } catch (err) { $("hf-msg").textContent = ""; toast("error", "Not listed", String(err.message || err), 8000); }
+  $("hf-list").disabled = false;
+};
+$("hf-pull").onclick = async () => {
+  $("hf-pull").disabled = true;
+  try {
+    await hubCall("api/hub/pull", {repo: $("hf-repo").value.trim(), quant: $("hf-quant").value, token: $("hf-token").value.trim() || undefined});
+    hubStatus();
+  } catch (err) { $("hf-pull").disabled = false; toast("error", "Not started", String(err.message || err), 8000); }
+};
+let hubTimer = null, hubWas = null;
+async function hubStatus() {
+  clearTimeout(hubTimer);
+  let j;
+  try { j = await hubCall("api/hub/pull"); } catch (e) { return; }
+  const running = j.state === "running";
+  $("hf-progress").hidden = !running;
+  if (running) {
+    const pct = j.total ? (100 * j.done / j.total) : 0;
+    $("hf-file").textContent = j.file || `${j.repo} ${j.quant}`;
+    $("hf-rate").textContent = j.total ? `${bytes(j.done)} of ${bytes(j.total)} · ${bytes(j.speed)}/s` : "starting…";
+    $("hf-bar").style.width = `${pct.toFixed(1)}%`;
+    $("hf-msg").textContent = `Downloading ${j.repo} ${j.quant}`;
+    $("hf-pull").disabled = true;
+    hubTimer = setTimeout(hubStatus, 1000);
+  } else if (hubWas === "running") {
+    $("hf-pull").disabled = false;
+    $("hf-msg").textContent = j.message || "";
+    if (j.state === "done") { toast("success", "Download finished", j.message || "", 10000); loadModels(); }
+    else toast("error", "Download failed", j.message || "", 10000);
+  }
+  hubWas = j.state;
+}
+
+// ------------------------------------------------------------------ API calls (the API monitor's /api/requests)
+let callsOn = true, callSel = null, callDetail = null, callPane = store.get("call-pane", "output"), calls = [], callsTimer = null;
+const secs = (n) => typeof n === "number" ? `${n.toFixed(2)} s` : "–";
+const callActive = (r) => !["completed", "error", "disconnected"].includes(r.state);
+const callTone = (st) => st === "completed" ? "st-badge--generating" : st === "error" ? "st-badge--error" : st === "disconnected" ? "" : "st-badge--queued";
+async function refreshCalls() {
+  clearTimeout(callsTimer);
+  if (tab !== "calls") return;
+  try {
+    const r = await fetch("api/requests", {headers: headers(), cache: "no-store"});
+    if (r.status === 404) { callsOn = false; $("calls-off").hidden = false; $("calls-list").innerHTML = ""; return; }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    callsOn = true; $("calls-off").hidden = true;
+    calls = (await r.json()).requests || [];
+    renderCalls();
+    if (callSel) await showCall(callSel, true);
+  } catch (e) { /* the server restarts: try again */ }
+  callsTimer = setTimeout(refreshCalls, 2000);
+}
+let callsStamp = "";
+function renderCalls() {
+  const q = $("calls-search").value.toLowerCase(), f = $("calls-filter").value;
+  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
+  const stamp = JSON.stringify([list, callSel]);
+  if (stamp === callsStamp) return;
+  callsStamp = stamp;
+  $("calls-list").innerHTML = list.length ? list.map((r) => {
+    const sp = r.timings && r.timings.predicted_per_second;
+    return `<button type="button" class="call-item" data-call="${esc(r.id)}" aria-current="${r.id === callSel}">` +
+      `<span class="call-item__top"><span>${new Date(r.started_at * 1000).toLocaleTimeString()}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
+      `<span class="call-item__path">POST ${esc(r.path)}</span>` +
+      `<span class="call-item__meta">${esc(r.model || "")} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
+      `${r.stream ? " · stream" : ""}${r.http_status && r.http_status !== 200 ? ` · HTTP ${r.http_status}` : ""}</span></button>`;
+  }).join("") : `<p class="muted small">${calls.length ? "No call matches." : "No API calls yet: they appear here as clients send them."}</p>`;
+}
+$("calls-list").addEventListener("click", (e) => { const b = e.target.closest("[data-call]"); if (b) showCall(b.dataset.call); });
+$("calls-search").oninput = renderCalls; $("calls-filter").onchange = renderCalls;
+async function showCall(id, quiet = false) {
+  callSel = id; if (!quiet) renderCalls();
+  let v;
+  try { v = await (await fetch(`api/requests?id=${encodeURIComponent(id)}`, {headers: headers(), cache: "no-store"})).json(); } catch (e) { return; }
+  if (callSel !== id || !v || v.error && !v.id) return;
+  callDetail = v;
+  $("calls-empty").hidden = true; $("call-body").hidden = false;
+  $("call-title").textContent = `${v.id} · ${v.path}`;
+  $("call-state").textContent = v.state; $("call-state").className = `st-badge ${callTone(v.state)}`;
+  const u = v.usage || {};
+  const cell = (k, val) => `<div><span class="muted small">${k}</span><b>${esc(val)}</b></div>`;
+  $("call-facts").innerHTML = [
+    cell("Started", new Date(v.started_at * 1000).toLocaleTimeString()),
+    cell("Wall time", secs(v.wallclock_s ?? (Date.now() / 1000 - v.started_at))),
+    cell("Load", secs(v.load_s)), cell("Queue", secs(v.queue_s)), cell("First token", secs(v.first_token_s)),
+    cell("Prompt", u.prompt_tokens ?? u.input_tokens ?? "–"), cell("Output", u.completion_tokens ?? u.output_tokens ?? "–"),
+    cell("Speed", v.timings && v.timings.predicted_per_second ? `${v.timings.predicted_per_second.toFixed(1)} tok/s` : "–"),
+    cell("Format", v.response_format || "text"),
+  ].join("") + (v.error ? `<div class="call-error">${esc(v.error.message || "")}</div>` : "");
+  callContent();
+}
+function callContent() {
+  for (const b of $("call-tabs").children) b.setAttribute("aria-selected", String(b.dataset.p === callPane));
+  if (!callDetail) return;
+  let t = callDetail[callPane] || (callPane === "response" && callDetail.stream ? "A streamed response: see Output." : "Nothing.");
+  try { t = JSON.stringify(JSON.parse(t), null, 2); } catch (e) { /* plain text */ }
+  if (callDetail[`${callPane}_truncated`]) t += "\n\n[the monitor kept the first 256K characters; the client got all of it]";
+  if ($("call-content").textContent !== t) $("call-content").textContent = t;
+}
+for (const b of $("call-tabs").children) b.onclick = () => { callPane = b.dataset.p; store.set("call-pane", callPane); callContent(); };
+
 // ------------------------------------------------------------------ start
 setBusy(false);
 renderChat();
+renderChatList();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
 loadModels();

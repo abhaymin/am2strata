@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -9,69 +9,99 @@
 <link rel="stylesheet" href="web/components.css">
 <link rel="stylesheet" href="web/app.css">
 <script>
-  // the theme before the first paint: the saved choice, else the system's
+  // the theme before the first paint: the saved choice (system, light or dark), "system" following the computer's
   try {
-    const t = localStorage.getItem("strata.theme") ||
-      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    document.documentElement.dataset.theme = t;
+    const mode = localStorage.getItem("strata.theme-mode") || "system";
+    const dark = mode === "dark" || (mode === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+    const accent = localStorage.getItem("strata.accent");
+    if (accent) document.documentElement.style.setProperty("--st-accent", JSON.parse(accent));
   } catch (e) {}
 </script>
 </head>
 <body>
 <header class="st-header">
-  <span class="st-header__brand">am2Strata</span>
-  <nav class="st-tabs" role="tablist" aria-label="Views">
+  <button class="st-btn st-btn--icon narrow-only" id="menu-btn" aria-label="Show chats" aria-expanded="false">
+    <svg class="st-icon"><use href="web/sprite.svg#i-menu"/></svg></button>
+  <a class="st-header__brand" href="#chat" aria-label="am2Strata, chat">
+    <svg class="logo" width="30" height="30" viewBox="0 0 64 64" aria-hidden="true"><rect x="2" y="2" width="60" height="60" rx="16" class="logo-tile"/><rect x="14" y="16" width="36" height="8" rx="4" class="logo-bar"/><rect x="14" y="28" width="26" height="8" rx="4" class="logo-bar" opacity=".7"/><rect x="14" y="40" width="16" height="8" rx="4" class="logo-bar" opacity=".45"/><circle cx="45" cy="44" r="5" class="logo-spark"/></svg>
+    <span>am<b>2</b>Strata</span></a>
+  <nav class="st-tabs main-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
-    <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About</button>
+    <button class="st-tab" role="tab" id="tab-btn-settings" aria-controls="view-settings" aria-selected="false" data-tab="settings">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>Settings</button>
+    <button class="st-tab" role="tab" id="tab-btn-calls" aria-controls="view-calls" aria-selected="false" data-tab="calls">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-list"/></svg>API calls</button>
   </nav>
   <span class="st-header__spacer"></span>
+  <div class="seg seg--3 theme-seg" id="theme-seg" role="radiogroup" aria-label="Theme">
+    <button type="button" role="radio" data-v="system" title="Follow the computer's theme">Auto</button>
+    <button type="button" role="radio" data-v="light" title="Light theme">Light</button>
+    <button type="button" role="radio" data-v="dark" title="Dark theme">Dark</button>
+  </div>
   <select class="model-select" id="model-select" title="The model that answers. One is in memory at a time."
           aria-label="Model" hidden></select>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
     <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
-    <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
 
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
-    <div class="chat-scroll" id="chat-scroll">
-      <div class="chat" id="chat">
-        <div class="chat-empty" id="chat-empty">
-          <div class="chat-empty__title">Ask anything</div>
-          <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+    <aside class="chats" id="chats" aria-label="Chats">
+      <button type="button" class="st-btn st-btn--secondary new-chat" id="new-btn">
+        <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-new-chat"/></svg>New chat</button>
+      <label class="st-label" for="chat-search">Search chats</label>
+      <input class="st-input" id="chat-search" placeholder="Find a chat&hellip;" autocomplete="off">
+      <div class="chat-list" id="chat-list"></div>
+      <p class="muted small chats-note">Chats are kept in this browser only.</p>
+    </aside>
+    <div class="chat-main">
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat" id="chat">
+          <div class="chat-empty" id="chat-empty">
+            <h1 class="chat-empty__title">What shall we work on?</h1>
+            <p class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</p>
+            <div class="starters" id="starters">
+              <button type="button" data-q="Describe this picture in detail."><b>Describe a picture</b><span>Attach a photo or screenshot</span></button>
+              <button type="button" data-q="Summarize this PDF: the key points, figures and dates."><b>Summarize a PDF</b><span>Contracts, reports, invoices</span></button>
+              <button type="button" data-q="What happens in this video?"><b>What happens in this video?</b><span>Clips are read as ordered frames</span></button>
+              <button type="button" data-q="Explain this code and point out any bugs:"><b>Explain or fix code</b><span>Paste it or attach the file</span></button>
+            </div>
+            <div class="drop-hint"><svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-attach"/></svg>
+              Drop pictures, videos, PDFs or text files anywhere on the chat</div>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="composer-wrap">
-      <form class="st-composer" id="composer">
-        <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
-        <div class="st-composer__bar">
-          <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
-            <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
-          <input type="file" id="file" multiple hidden>
-          <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
-            <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
-          <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
-            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-          <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
-            <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
-          <span class="spacer"></span>
-          <span class="composer-hint" id="composer-hint"></span>
-          <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
-            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg>Stop</button>
-          <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send">
-            <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
-        </div>
-      </form>
+      <div class="composer-wrap">
+        <form class="st-composer" id="composer">
+          <div class="attachments" id="attachments" hidden></div>
+          <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
+          <div class="st-composer__bar">
+            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a file (or drop it here)" aria-label="Attach files">
+              <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
+            <input type="file" id="file" multiple hidden>
+            <div class="seg seg--4 think-seg" id="c-thinking" role="radiogroup" aria-label="Thinking">
+              <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
+              <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
+            </div>
+            <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
+              <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+            <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling for this browser" aria-label="Sampling">
+              <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
+            <span class="spacer"></span>
+            <span class="composer-hint" id="composer-hint"></span>
+            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
+              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg>Stop</button>
+            <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send">Send</button>
+          </div>
+        </form>
+      </div>
     </div>
   </section>
 
@@ -114,9 +144,7 @@
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 
-      <div class="metrics" id="metrics">
-        <!-- filled by app.js: Speed, GPU load, VRAM, GPU temp, Power, PCIe, CPU, Disk read -->
-      </div>
+      <div class="metrics" id="metrics"></div>
 
       <div class="monitor-row">
         <div class="st-card ctx-card">
@@ -143,7 +171,7 @@
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num">Reused</th><th class="num">Output</th>
-                <th class="num" title="New prompt tokens per second, excluding reused cache tokens (engine prompt time)">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM. Experts the GPU read over PCIe (--pcie-frac) are not counted in it; their share of all routed experts is shown after it (+N% PCIe)">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
+                <th class="num" title="New prompt tokens per second, excluding reused cache tokens">Prefill t/s</th><th class="num">Decode t/s</th><th class="num" title="While writing the answer: the share of the experts looked up that were already in VRAM">VRAM hit rate</th><th class="num">Duration</th></tr></thead>
               <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
@@ -162,52 +190,178 @@
         <dl class="facts" id="cc-facts"></dl>
         <p class="muted small cc-note" id="cc-note"></p>
       </div>
+    </div>
+  </section>
 
-      <div class="st-card mcp-card" id="mcp-card" hidden>
-        <div class="req-head"><span class="card-title">MCP servers</span><span class="muted small" id="mcp-sum"></span></div>
-        <div class="mcp-list" id="mcp-list"></div>
-        <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them
-          (in this page's chat only; switch it off in Sampling).</p>
+  <!-- ============================ Settings ============================ -->
+  <section class="view view--settings" id="view-settings" role="tabpanel" aria-labelledby="tab-btn-settings" hidden>
+    <div class="settings">
+      <nav class="set-nav" id="set-nav" aria-label="Settings sections">
+        <button type="button" data-sec="models"><b>Models</b><span>Switch, unload, add from Hugging Face</span></button>
+        <button type="button" data-sec="config"><b>Model config</b><span>Context, KV cache, sampling</span></button>
+        <button type="button" data-sec="defaults"><b>Chat defaults</b><span>Shared with other apps</span></button>
+        <button type="button" data-sec="server"><b>Server and access</b><span>Address, API key, monitor</span></button>
+        <button type="button" data-sec="tools"><b>Tools (MCP)</b><span>Tool servers for the chat</span></button>
+        <button type="button" data-sec="appearance"><b>Appearance</b><span>Light, dark or system; accent</span></button>
+        <button type="button" data-sec="connect"><b>Connect</b><span>Base URLs for your apps</span></button>
+      </nav>
+      <div class="set-body">
+
+        <section class="set-panel" id="sec-models" aria-labelledby="h-models">
+          <h2 id="h-models">Models</h2>
+          <div class="st-card list-card" id="models-list"><p class="muted">Loading&hellip;</p></div>
+          <form class="st-card hf-card" id="hf-form">
+            <div><span class="card-title">Add a model from Hugging Face</span>
+              <p class="muted small">Downloads are resumable and checked against the Hub's SHA-256. A token is only needed for gated or private repositories.</p></div>
+            <div class="form-grid">
+              <div class="st-field"><label class="st-label" for="hf-repo">Repository</label>
+                <input class="st-input mono" id="hf-repo" placeholder="LiquidAI/LFM2-8B-A1B-GGUF" autocomplete="off" spellcheck="false"></div>
+              <div class="st-field"><label class="st-label" for="hf-quant">Quantization</label>
+                <select class="st-input" id="hf-quant" disabled><option>List the repository first</option></select></div>
+              <div class="st-field"><label class="st-label" for="hf-token">Token <output>optional</output></label>
+                <input class="st-input" id="hf-token" type="password" placeholder="hf_… (the saved login is used if empty)" autocomplete="off"></div>
+            </div>
+            <div class="row-actions">
+              <button type="submit" class="st-btn st-btn--secondary" id="hf-list">List quantizations</button>
+              <button type="button" class="st-btn st-btn--primary" id="hf-pull" disabled>Download</button>
+              <span class="muted small" id="hf-msg" role="status"></span>
+            </div>
+            <div class="hf-progress" id="hf-progress" hidden>
+              <div class="bar-row"><span class="mono" id="hf-file">&ndash;</span><span class="muted" id="hf-rate">&ndash;</span></div>
+              <div class="st-progress" data-tone="info"><div class="st-progress__bar" id="hf-bar" style="width:0%"></div></div>
+            </div>
+          </form>
+        </section>
+
+        <section class="set-panel" id="sec-config" aria-labelledby="h-config" hidden>
+          <h2 id="h-config">Model config <span class="muted small" id="cfg-file"></span></h2>
+          <div class="st-card">
+            <span class="card-title">Running now</span>
+            <dl class="facts" id="facts-engine"></dl>
+          </div>
+          <div class="st-card cfg-card" id="cfg-card" hidden>
+            <p class="muted small">Kept in the model's run config for every client. An empty field is the default. Used from the
+              next time the model loads; the earlier file is kept as .bak.</p>
+            <form class="cfg-form" id="cfg-form"></form>
+            <div class="row-actions"><button class="st-btn st-btn--primary" id="cfg-reload" type="button">Save and reload model</button>
+              <button class="st-btn st-btn--secondary" id="cfg-save" type="button">Save for next load</button>
+              <span class="muted small" id="cfg-msg" role="status"></span></div>
+          </div>
+        </section>
+
+        <section class="set-panel" id="sec-defaults" aria-labelledby="h-defaults" hidden>
+          <h2 id="h-defaults">Chat defaults</h2>
+          <div class="st-card form-grid">
+            <div class="st-field"><span class="st-label">Thinking level</span>
+              <div class="seg seg--4" id="d-thinking" role="radiogroup" aria-label="Default thinking level">
+                <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
+                <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button></div></div>
+            <div class="st-field"><label class="st-label" for="d-max">Max tokens <output>empty = until done</output></label>
+              <input class="st-input" id="d-max" type="number" min="1" step="1" placeholder="Until done"></div>
+            <div class="st-field"><label class="st-label" for="d-seed">Seed <output>empty = random</output></label>
+              <input class="st-input" id="d-seed" type="number" min="1" step="1" placeholder="Random"></div>
+          </div>
+          <div class="st-card toggle-row"><span>Use for other apps too<br><span class="muted small">API clients get these defaults
+            (and this browser's sampling) for anything they leave out. Saved next to the model's config.</span></span>
+            <button class="st-toggle" id="d-share" role="switch" aria-checked="false" aria-label="Use for other apps too"></button></div>
+          <div class="row-actions"><button class="st-btn st-btn--primary" id="d-save" type="button">Save</button>
+            <span class="muted small">Temperature, top-p and top-k: the sampling button in the chat box.</span></div>
+        </section>
+
+        <section class="set-panel" id="sec-server" aria-labelledby="h-server" hidden>
+          <h2 id="h-server">Server and access</h2>
+          <div class="st-card"><dl class="facts" id="facts-server"></dl></div>
+          <div class="st-card">
+            <div class="st-field">
+              <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
+              <input class="st-input mono" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+            </div>
+            <p class="muted small">Kept in this browser only.</p>
+          </div>
+          <div class="st-card"><span class="card-title">This PC</span><dl class="facts" id="facts-hw"></dl></div>
+          <div class="st-card"><span class="card-title">Start at boot</span>
+            <p class="muted small">PolyStrata's service (strata-orca) starts at boot today. To make am2Strata the boot service with the
+              same configs and models, run in the am2strata folder:</p>
+            <pre class="snippet"><code>cargo run -q --release --bin am2strata-run -- install --port 8000</code><button class="st-btn st-btn--icon" data-copy="cargo run -q --release --bin am2strata-run -- install --port 8000" aria-label="Copy"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></pre>
+            <p class="muted small"><code>am2strata-run uninstall</code> gives the boot service back to PolyStrata.</p>
+          </div>
+        </section>
+
+        <section class="set-panel" id="sec-tools" aria-labelledby="h-tools" hidden>
+          <h2 id="h-tools">Tools (MCP)</h2>
+          <div class="st-card mcp-card" id="mcp-card" hidden>
+            <div class="req-head"><span class="card-title">Tool servers</span><span class="muted small" id="mcp-sum"></span></div>
+            <div class="mcp-list" id="mcp-list"></div>
+            <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them (in this
+              page's chat only; switch it off in the chat's sampling settings).</p>
+          </div>
+          <div class="st-card empty-card" id="mcp-empty">
+            <span class="card-title">No tool servers yet</span>
+            <p class="muted">Add an MCP server - a program on this PC or an address - to the default model's run config and the chat
+              can use its tools:</p>
+            <pre class="snippet"><code>"mcp_servers": {
+  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/abhaym/Documents"]},
+  "search": {"url": "http://127.0.0.1:9000/mcp"}
+}</code></pre>
+            <p class="muted small">Then restart am2Strata. Tools run with your rights on this PC, so only this page can use them.</p>
+          </div>
+        </section>
+
+        <section class="set-panel" id="sec-appearance" aria-labelledby="h-appearance" hidden>
+          <h2 id="h-appearance">Appearance</h2>
+          <div class="theme-cards" id="theme-cards" role="radiogroup" aria-label="Theme">
+            <button type="button" role="radio" data-v="system"><span class="tc-preview tc-system"><i></i><em></em><em></em></span><b>System</b><span class="muted small" id="tc-system-hint">Follows your computer or phone</span></button>
+            <button type="button" role="radio" data-v="light"><span class="tc-preview tc-light"><i></i><em></em><em></em></span><b>Light</b><span class="muted small">Bright background, dark text</span></button>
+            <button type="button" role="radio" data-v="dark"><span class="tc-preview tc-dark"><i></i><em></em><em></em></span><b>Dark</b><span class="muted small">Dark background, light text</span></button>
+          </div>
+          <div class="st-card toggle-row"><span>Accent colour<br><span class="muted small">Buttons, the logo and progress bars. Kept in this browser.</span></span>
+            <span class="swatches" id="accent-swatches" role="radiogroup" aria-label="Accent colour">
+              <button type="button" role="radio" data-v="#3DD68C" style="background:#3DD68C" aria-label="Green"></button>
+              <button type="button" role="radio" data-v="#6CB6FF" style="background:#6CB6FF" aria-label="Blue"></button>
+              <button type="button" role="radio" data-v="#F2B84B" style="background:#F2B84B" aria-label="Amber"></button>
+              <button type="button" role="radio" data-v="#C297FF" style="background:#C297FF" aria-label="Violet"></button>
+            </span></div>
+        </section>
+
+        <section class="set-panel" id="sec-connect" aria-labelledby="h-connect" hidden>
+          <h2 id="h-connect">Connect your tools</h2>
+          <div class="st-card"><p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
+            <dl class="facts" id="facts-api"></dl></div>
+          <pre class="snippet" id="curl-example"></pre>
+          <p class="muted small">am2Strata, a new edition of <a href="https://github.com/VecSzn/PolyStrata" target="_blank" rel="noopener noreferrer">PolyStrata</a>
+            (MIT, <a href="/web/LICENSE-PolyStrata.txt" target="_blank">license</a>).</p>
+        </section>
       </div>
     </div>
   </section>
 
-  <!-- ============================ About ============================ -->
-  <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
-    <div class="about">
-      <div class="st-card">
-        <span class="card-title">Model and engine</span>
-        <dl class="facts" id="facts-engine"></dl>
-      </div>
-      <div class="st-card">
-        <span class="card-title">This PC</span>
-        <dl class="facts" id="facts-hw"></dl>
-      </div>
-      <div class="st-card">
-        <span class="card-title">Connect your tools</span>
-        <p class="muted">Any OpenAI- or Anthropic-compatible client works with these addresses.</p>
-        <dl class="facts" id="facts-api"></dl>
-      </div>
-      <div class="st-card">
-        <span class="card-title">Settings</span>
-        <div class="st-field">
-          <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
-          <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+  <!-- ============================ API calls ============================ -->
+  <section class="view view--calls" id="view-calls" role="tabpanel" aria-labelledby="tab-btn-calls" hidden>
+    <div class="calls">
+      <div class="calls-side">
+        <div class="calls-filter">
+          <input class="st-input" id="calls-search" placeholder="ID, endpoint or model" aria-label="Search calls" autocomplete="off">
+          <select class="st-input" id="calls-filter" aria-label="Status">
+            <option value="all">All</option><option value="active">Active</option><option value="completed">Completed</option>
+            <option value="error">Errors</option><option value="disconnected">Closed</option></select>
         </div>
-        <div class="toggle-row"><span>Dark theme</span>
-          <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
-        <p class="muted small">Chats, settings and the key are kept in this browser only.
-          am2Strata, based on <a href="https://github.com/VecSzn/PolyStrata" target="_blank" rel="noopener noreferrer">PolyStrata</a> (MIT, <a href="/web/LICENSE-PolyStrata.txt" target="_blank">license</a>)</p>
+        <div class="calls-list" id="calls-list"></div>
       </div>
-      <div class="st-card cfg-card" id="cfg-card" hidden>
-        <div class="req-head"><span class="card-title">Model settings</span><span class="muted small" id="cfg-file"></span></div>
-        <p class="muted small">Kept in the model's run config for every client. An empty field is the default. They
-          take effect the next time the model starts (restart am2Strata).</p>
-        <form class="cfg-form" id="cfg-form"></form>
-        <div class="cfg-actions"><button class="st-btn st-btn--primary" id="cfg-save" type="button">Save</button>
-          <span class="muted small" id="cfg-msg" role="status"></span></div>
+      <div class="st-card call-detail" id="call-detail">
+        <p class="muted" id="calls-empty">Select a call to see its request, the model's output and reasoning, and the timings.</p>
+        <div id="call-body" hidden>
+          <div class="req-head"><span class="mono strong" id="call-title"></span><span class="st-badge" id="call-state"></span></div>
+          <div class="call-facts" id="call-facts"></div>
+          <div class="seg seg--4 call-tabs" id="call-tabs" role="tablist" aria-label="Call content">
+            <button type="button" role="tab" data-p="input">Input</button><button type="button" role="tab" data-p="output">Output</button>
+            <button type="button" role="tab" data-p="reasoning">Reasoning</button><button type="button" role="tab" data-p="response">Response</button>
+          </div>
+          <pre class="snippet call-content" id="call-content"></pre>
+        </div>
       </div>
     </div>
+    <p class="muted small calls-off" id="calls-off" hidden>The API monitor is off: start am2Strata with <code>--api-monitor</code> (am2strata-run does
+      by default) or set <code>"api_monitor": true</code> in the config.</p>
   </section>
 </main>
 
@@ -219,7 +373,7 @@
   <div class="st-drawer__body">
     <div class="st-field">
       <label class="st-label" for="s-thinking">Thinking <output id="o-thinking"></output></label>
-      <div class="seg" id="s-thinking" role="radiogroup" aria-label="Thinking">
+      <div class="seg seg--4" id="s-thinking" role="radiogroup" aria-label="Thinking">
         <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
         <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
       </div>
@@ -253,8 +407,8 @@
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>
-    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">omp and other API clients get
-      these settings for anything they don't set themselves</span></span>
+    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">API clients get these settings for
+      anything they don't set themselves</span></span>
       <button class="st-toggle" id="s-share" role="switch" aria-checked="false" aria-label="Use for other apps too"></button></div>
     <div class="drawer-actions">
       <button class="st-btn st-btn--secondary" id="s-reset" type="button">Reset</button>

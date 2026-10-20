@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>am2Strata icon</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 1440px; height: 960px; box-sizing: border-box; padding: 48px 56px; background: #0D1117; color: #E6EDF3; font-family: Manrope, system-ui, sans-serif; display: flex; flex-direction: column; gap: 28px">
+  <div style="display: flex; align-items: baseline; gap: 16px">
+    <h1 style="margin: 0; font-size: 34px; font-weight: 800; letter-spacing: -0.02em">Icon and logo</h1>
+    <span style="color: #9BA7B4">Three directions · A is used in the redesign</span>
+  </div>
+
+  <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px">
+    <sc-for list="{{options}}" as="o" hint-placeholder-count="3">
+      <div style="{{o.card}}">
+        <div style="display: flex; align-items: center; justify-content: space-between"><span style="font-weight: 800; font-size: 16px">{{o.name}}</span><span style="{{o.tagStyle}}">{{o.tag}}</span></div>
+        <div style="display: flex; align-items: flex-end; gap: 18px; padding: 18px; border-radius: 12px; background: #151B23">
+          <sc-if value="{{o.isA}}" hint-placeholder-val="{{true}}">
+            <svg role="img" aria-label="Strata stack icon, large" width="128" height="128" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+            <svg aria-hidden="true" width="64" height="64" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+            <svg aria-hidden="true" width="32" height="32" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="12" y="14" width="40" height="10" rx="5" fill="#3DD68C"></rect><rect x="12" y="28" width="28" height="10" rx="5" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="12" y="42" width="16" height="10" rx="5" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="46" cy="46" r="6" fill="#F2B84B"></circle></svg>
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 64 64"><rect x="0" y="0" width="64" height="64" rx="14" fill="#1C2430"></rect><rect x="10" y="12" width="44" height="12" rx="6" fill="#3DD68C"></rect><rect x="10" y="30" width="30" height="12" rx="6" fill="#3DD68C" fill-opacity="0.75"></rect><circle cx="47" cy="48" r="8" fill="#F2B84B"></circle></svg>
+          </sc-if>
+          <sc-if value="{{o.isB}}" hint-placeholder-val="{{false}}">
+            <svg role="img" aria-label="Layers icon, large" width="128" height="128" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><path d="M32 12l18 9-18 9-18-9z" fill="#3DD68C"></path><path d="M14 31l18 9 18-9" fill="none" stroke="#3DD68C" stroke-width="4" stroke-linejoin="round" stroke-opacity="0.7"></path><path d="M14 41l18 9 18-9" fill="none" stroke="#3DD68C" stroke-width="4" stroke-linejoin="round" stroke-opacity="0.45"></path></svg>
+            <svg aria-hidden="true" width="64" height="64" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><path d="M32 12l18 9-18 9-18-9z" fill="#3DD68C"></path><path d="M14 31l18 9 18-9" fill="none" stroke="#3DD68C" stroke-width="4" stroke-linejoin="round" stroke-opacity="0.7"></path><path d="M14 41l18 9 18-9" fill="none" stroke="#3DD68C" stroke-width="4" stroke-linejoin="round" stroke-opacity="0.45"></path></svg>
+            <svg aria-hidden="true" width="32" height="32" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><path d="M32 10l20 10-20 10-20-10z" fill="#3DD68C"></path><path d="M12 34l20 10 20-10" fill="none" stroke="#3DD68C" stroke-width="6" stroke-linejoin="round" stroke-opacity="0.7"></path></svg>
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 64 64"><rect x="0" y="0" width="64" height="64" rx="14" fill="#1C2430"></rect><path d="M32 10l22 11-22 11-22-11z" fill="#3DD68C"></path><path d="M10 38l22 11 22-11" fill="none" stroke="#3DD68C" stroke-width="8" stroke-linejoin="round"></path></svg>
+          </sc-if>
+          <sc-if value="{{o.isC}}" hint-placeholder-val="{{false}}">
+            <svg role="img" aria-label="a2 monogram icon, large" width="128" height="128" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#3DD68C"></rect><text x="10" y="42" font-family="Manrope" font-weight="800" font-size="28" fill="#0D1117">a2</text><rect x="10" y="48" width="44" height="3" rx="1.5" fill="#0D1117" fill-opacity="0.5"></rect><rect x="10" y="54" width="30" height="3" rx="1.5" fill="#0D1117" fill-opacity="0.3"></rect></svg>
+            <svg aria-hidden="true" width="64" height="64" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#3DD68C"></rect><text x="10" y="42" font-family="Manrope" font-weight="800" font-size="28" fill="#0D1117">a2</text><rect x="10" y="48" width="44" height="3" rx="1.5" fill="#0D1117" fill-opacity="0.5"></rect></svg>
+            <svg aria-hidden="true" width="32" height="32" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#3DD68C"></rect><text x="8" y="44" font-family="Manrope" font-weight="800" font-size="32" fill="#0D1117">a2</text></svg>
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 64 64"><rect x="0" y="0" width="64" height="64" rx="14" fill="#3DD68C"></rect><text x="6" y="46" font-family="Manrope" font-weight="800" font-size="38" fill="#0D1117">a2</text></svg>
+          </sc-if>
+        </div>
+        <div style="font-size: 12px; color: #9BA7B4">128 · 64 · 32 · 16 px</div>
+        <p style="margin: 0; color: #C9D3DD; line-height: 1.5; font-size: 14px">{{o.idea}}</p>
+      </div>
+    </sc-for>
+  </div>
+
+  <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px">
+    <div style="border-radius: 14px; padding: 22px; background: #0F141B; border: 1px solid #2A3441; display: flex; flex-direction: column; gap: 16px">
+      <span style="font-size: 12px; color: #9BA7B4; font-weight: 700; letter-spacing: 0.06em">LOGO ON DARK</span>
+      <div style="display: flex; align-items: center; gap: 14px">
+        <svg aria-hidden="true" width="56" height="56" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+        <span style="font-size: 40px; font-weight: 800; letter-spacing: -0.03em">am<span style="color: #3DD68C">2</span>Strata</span>
+      </div>
+      <span style="color: #9BA7B4; font-size: 13px">Local models, one address. Built in Rust on the PolyStrata engines.</span>
+    </div>
+    <div style="border-radius: 14px; padding: 22px; background: #F6F8FA; border: 1px solid #D5DBE3; color: #1A2230; display: flex; flex-direction: column; gap: 16px">
+      <span style="font-size: 12px; color: #566372; font-weight: 700; letter-spacing: 0.06em">LOGO ON LIGHT</span>
+      <div style="display: flex; align-items: center; gap: 14px">
+        <svg aria-hidden="true" width="56" height="56" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" fill="#0F1B16"></rect><rect x="14" y="16" width="36" height="8" rx="4" fill="#3DD68C"></rect><rect x="14" y="28" width="26" height="8" rx="4" fill="#3DD68C" fill-opacity="0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" fill="#3DD68C" fill-opacity="0.45"></rect><circle cx="45" cy="44" r="5" fill="#F2B84B"></circle></svg>
+        <span style="font-size: 40px; font-weight: 800; letter-spacing: -0.03em">am<span style="color: #0F6B41">2</span>Strata</span>
+      </div>
+      <div style="display: flex; align-items: center; gap: 0; width: fit-content; border-radius: 10px 10px 0 0; background: #E6EAF0; padding: 8px 14px; font-size: 13px; gap: 8px">
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 64 64"><rect x="0" y="0" width="64" height="64" rx="14" fill="#1C2430"></rect><rect x="10" y="12" width="44" height="12" rx="6" fill="#3DD68C"></rect><rect x="10" y="30" width="30" height="12" rx="6" fill="#3DD68C" fill-opacity="0.75"></rect><circle cx="47" cy="48" r="8" fill="#F2B84B"></circle></svg>
+        am2Strata — abhay-ai-pc:8000
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":960}}'>
+class Component extends DCLogic {
+  renderVals() {
+    const card = (on) => 'border-radius: 14px; padding: 20px; display: flex; flex-direction: column; gap: 14px; background: #0F141B; ' +
+      (on ? 'border: 2px solid #3DD68C' : 'border: 2px solid #2A3441');
+    const tag = (on) => 'padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; ' + (on ? 'background: #12261D; color: #7EE8B2' : 'background: #1C2430; color: #9BA7B4');
+    return {
+      options: [
+        { name: 'A · Strata stack', tag: 'Chosen', isA: true, isB: false, isC: false, card: card(true), tagStyle: tag(true),
+          idea: 'Three layers that taper, like strata or a stack of experts, and an amber spark for the model running here. Reads at 16 px because the bars are thick and the spark stays separate.' },
+        { name: 'B · Layers', tag: 'Option', isA: false, isB: true, isC: false, card: card(false), tagStyle: tag(false),
+          idea: 'The classic layer glyph, closest to the old header mark. Familiar, but common for databases and design tools, so it says less about am2Strata.' },
+        { name: 'C · a2 monogram', tag: 'Option', isA: false, isB: false, isC: true, card: card(false), tagStyle: tag(false),
+          idea: 'The name itself on a green tile with two strata lines. Strongest as an app icon; the letters blur below 32 px.' } ]
+    };
+  }
+}
+</script>
+</body>
+</html>
