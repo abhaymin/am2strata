@@ -10,6 +10,7 @@ strata-tokenizer.workspace = true
 strata-template.workspace = true
 strata-protocol.workspace = true
 strata-engine.workspace = true
+strata-frontend.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

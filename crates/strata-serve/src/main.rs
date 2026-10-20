@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strata_engine::{Engine, GenEvent, RunConfig};
+use strata_frontend::{openai_to_messages, PromptBuilder, ToolOrders};
 use strata_protocol::Sampling;
 use strata_template::ChatTemplate;
 use strata_tokenizer::{Detokenizer, Tokenizer};
@@ -44,8 +45,9 @@ struct Args {
 
 struct AppState {
     cfg: RunConfig,
-    tok: Tokenizer,
-    template: ChatTemplate,
+    tok: &'static Tokenizer,
+    prompts: PromptBuilder<'static>,
+    tool_orders: ToolOrders,
     engine: Engine,
     turn_ids: Vec<u32>,
     max_context: usize,
@@ -99,15 +101,6 @@ fn sampling_of(req: &Value) -> Sampling {
     }
 }
 
-/// The rendered prompt left a `<think>` open: the reply starts inside the reasoning.
-fn opens_reasoning(prompt: &str) -> bool {
-    match (prompt.rfind("<think>"), prompt.rfind("</think>")) {
-        (Some(o), Some(c)) => o > c,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
-
 fn finish_reason(engine: &str) -> &'static str {
     match engine {
         "length" => "length",
@@ -130,24 +123,16 @@ async fn chat(State(s): State<Shared>, headers: HeaderMap, Json(req): Json<Value
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    let Some(messages) = req.get("messages").and_then(Value::as_array) else {
-        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "messages is required");
-    };
-    let tools = req.get("tools").filter(|t| t.as_array().is_some_and(|a| !a.is_empty()));
-    let mut extra: Map<String, Value> =
-        req.get("chat_template_kwargs").and_then(Value::as_object).cloned().unwrap_or_default();
-    if let Some(e) = req.get("reasoning_effort").cloned() {
-        extra.entry("reasoning_effort").or_insert(e);
-    }
-    let prompt = match s.template.render(messages, tools, true, &extra) {
+    // the request normalized and the prompt built exactly as PolyStrata's Python server builds it
+    let prepared = match openai_to_messages(&req, &s.tool_orders) {
         Ok(p) => p,
-        Err(strata_template::Error::Request(m)) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", m),
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),
     };
-    let ids = match s.tok.encode(&prompt, true) {
-        Ok(ids) => ids,
-        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    let prompt = match s.prompts.build(&prepared) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),
     };
+    let ids = prompt.ids;
     // requests are never truncated; max_tokens is clamped to the room left only with fit_max_tokens
     let room = s.max_context.saturating_sub(ids.len() + 1);
     let asked = req.get("max_tokens").or_else(|| req.get("max_completion_tokens")).and_then(Value::as_u64);
@@ -167,7 +152,7 @@ async fn chat(State(s): State<Shared>, headers: HeaderMap, Json(req): Json<Value
     }
     let turn_at = strata_protocol::turn_at(&ids, &s.turn_ids);
     let prompt_tokens = ids.len();
-    let in_reasoning = opens_reasoning(&prompt);
+    let in_reasoning = prompt.opens_reasoning;
     let rx = s.engine.generate(max_new as u32, sampling_of(&req), turn_at, ids).await;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     if req.get("stream").and_then(Value::as_bool).unwrap_or(false) {
@@ -295,8 +280,10 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let cfg = RunConfig::load(&args.config).context("run config")?;
     let started = Instant::now();
-    let tok = Tokenizer::from_dir(&cfg.tokenizer).context("tokenizer")?;
-    let template = ChatTemplate::from_file(cfg.tokenizer.join("chat_template.jinja")).context("chat template")?;
+    // tokenizer and template live as long as the process; the prompt builder borrows them
+    let tok: &'static Tokenizer = Box::leak(Box::new(Tokenizer::from_dir(&cfg.tokenizer).context("tokenizer")?));
+    let template: &'static ChatTemplate = Box::leak(Box::new(
+        ChatTemplate::from_file(cfg.tokenizer.join("chat_template.jinja")).context("chat template")?));
     let turn_ids: Vec<u32> = tok.token_id("<|im_start|>").into_iter().collect();
     tracing::info!(model = %cfg.model_name, vocab = tok.vocab_size(), "tokenizer and template loaded in {:?}", started.elapsed());
     let max_context = cfg.max_context();
@@ -304,7 +291,8 @@ async fn main() -> Result<()> {
     tracing::info!("engine ready after {:?}", started.elapsed());
     let host = args.host.or_else(|| cfg.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
     let port = args.port.or(cfg.port).unwrap_or(8080);
-    let state = Arc::new(AppState { cfg, tok, template, engine, turn_ids, max_context });
+    let prompts = PromptBuilder::new(template, tok);
+    let state = Arc::new(AppState { cfg, tok, prompts, tool_orders: ToolOrders::default(), engine, turn_ids, max_context });
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))

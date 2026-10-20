@@ -853,6 +853,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strata-engine",
+ "strata-frontend",
  "strata-protocol",
  "strata-template",
  "strata-tokenizer",
