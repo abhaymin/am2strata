@@ -518,6 +518,17 @@ function renderMcp() {
 // A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The
 // server lists them, checks every value and keeps every other key of the file as it is.
 let cfgKeys = [];
+// the run config's keys, in groups
+const CFG_GROUPS = [["sampling", "Sampling defaults"], ["thinking", "Thinking"], ["context", "Context and long chats"],
+                    ["memory", "Loading and memory"], ["server", "Server"], ["other", "Other"]];
+function cfgGroup(key) {
+  if (key.startsWith("sampling.")) return "sampling";
+  if (/reasoning|thinking|effort/.test(key)) return "thinking";
+  if (/max_tokens|drop_oldest|ctx|context/.test(key)) return "context";
+  if (/unload|lazy|vram|kv|expert|silence/.test(key)) return "memory";
+  if (/aliases|monitor|switch|browser|host|port|key/.test(key)) return "server";
+  return "other";
+}
 async function loadConfig() {
   let r;
   try { r = await fetch("config", {headers: headers()}); } catch (e) { return; }
@@ -525,7 +536,7 @@ async function loadConfig() {
   const c = await r.json();
   cfgKeys = c.keys || [];
   $("cfg-file").textContent = c.file || "";
-  $("cfg-form").innerHTML = cfgKeys.map((k, i) => {
+  const rows = cfgKeys.map((k, i) => {
     const id = `cfg-${i}`, v = k.value;
     let input;
     if (k.kind === "bool" || k.kind === "enum") {
@@ -538,8 +549,10 @@ async function loadConfig() {
       input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
         `value="${esc(text)}" placeholder="default" autocomplete="off">`;
     }
-    return `<label for="${id}" title="${esc(k.help)}">${esc(k.help)}<code>${esc(k.key)}</code></label>${input}`;
-  }).join("");
+    return {group: cfgGroup(k.key), html: `<div class="cfg-row"><label for="${id}"><span>${esc(k.help)}</span><code>${esc(k.key)}</code></label>${input}</div>`};
+  }).reduce((acc, x) => { (acc[x.group] = acc[x.group] || []).push(x.html); return acc; }, {});
+  $("cfg-form").innerHTML = CFG_GROUPS.filter(([g]) => rows[g]).map(([g, title]) =>
+    `<fieldset class="cfg-group"><legend>${title}</legend>${rows[g].join("")}</fieldset>`).join("");
   $("cfg-card").hidden = false;
 }
 function configValue(k, el) {

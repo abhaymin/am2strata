@@ -244,6 +244,19 @@ fn temp_service(s: &ServerArgs) -> ExitCode {
     if !build() {
         return ExitCode::FAILURE;
     }
+    if active(TEMP_UNIT) {
+        // a restart: stop the running one and wait until systemd has unloaded it (a transient unit's name is busy
+        // until then, and systemd-run would fail)
+        say(format!("{TEMP_UNIT} is running: restarting it"));
+        systemctl(&["stop", TEMP_UNIT]);
+        for _ in 0..100 {
+            if !quiet_systemctl(&["cat", TEMP_UNIT]) {
+                break;
+            }
+            quiet_systemctl(&["reset-failed", TEMP_UNIT]);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
     quiet_systemctl(&["reset-failed", TEMP_UNIT]);
     if active(BOOT_UNIT) {
         say(format!("{BOOT_UNIT} (am2Strata's boot service) is running already"));
