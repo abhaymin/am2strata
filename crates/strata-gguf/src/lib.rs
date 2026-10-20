@@ -256,7 +256,13 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
         write("merges.txt", &merges.join("\n"))?;
     }
     write("token_type.json", &py_json(&Value::Array(types)))?;
-    write("tokenizer.json", &serde_json::to_string_pretty(&cfg).unwrap().replace("\n  ", "\n "))?;
+    write("tokenizer.json", &{
+        use serde::Serialize;
+        let mut buf = Vec::new();
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, serde_json::ser::PrettyFormatter::with_indent(b" "));
+        cfg.serialize(&mut ser).unwrap();
+        String::from_utf8(buf).unwrap()
+    })?;
     if let Some(tpl) = gguf.str("tokenizer.chat_template").filter(|t| !t.is_empty()) {
         write("chat_template.jinja", tpl)?;
     }

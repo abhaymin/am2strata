@@ -1,0 +1,15 @@
+[package]
+name = "strata-hub"
+description = "Hugging Face model downloads for am2Strata (token optional, resumable, SHA-256 checked) and run-config writing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-gguf.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"

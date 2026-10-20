@@ -146,7 +146,7 @@ async fn main() -> Result<()> {
     for m in &models {
         tracing::info!(id = %m.id, context = m.cfg.max_context(), images = m.cfg.vision.is_some(), "installed model");
     }
-    let mgr = Arc::new(Manager::new(models, default.clone(), Duration::from_secs(args.ready_timeout)));
+    let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout)));
     for g in &mgr.hw.gpus {
         tracing::info!("GPU {}: {} ({} MiB, sm_{})", g.index, g.name, g.vram_mib, g.arch);
     }

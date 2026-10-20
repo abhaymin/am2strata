@@ -585,3 +585,19 @@ fn api_monitor_is_off_by_default() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
     assert_eq!(s.get("/api/requests", true).0, 404);
 }
+
+#[test]
+fn a_model_added_while_running_is_listed_and_loads() {
+    let s = Server::start(&[Model::default()], &[ids("hello from b")], json!({}));
+    let (_, l) = s.get("/api/models", true);
+    assert_eq!(l["models"].as_array().unwrap().len(), 1);
+    // a pulled model's config appears beside the others
+    let a = std::fs::read_to_string(s.dir.join("strata-mock-a.json")).unwrap().replace("mock-a", "mock-new");
+    std::fs::write(s.dir.join("strata-mock-new.json"), a).unwrap();
+    let (_, l) = s.get("/api/models", true);
+    let ids: Vec<&str> = l["models"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["mock-a", "mock-new"]);
+    let (c, r) = s.post("/api/models/load", &json!({"model": "mock-new"}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(s.get("/v1/models", true).1["data"].as_array().unwrap().len(), 2);
+}

@@ -130,7 +130,9 @@ impl Loaded {
 }
 
 pub struct Manager {
-    pub models: Vec<ModelEntry>,
+    /// the installed models, scanned again when they are listed or one is loaded (a model pulled meanwhile shows up)
+    models: std::sync::RwLock<Vec<ModelEntry>>,
+    models_dir: PathBuf,
     pub hw: Hardware,
     pub default_id: String,
     current: RwLock<Option<Arc<Loaded>>>,
@@ -199,9 +201,10 @@ pub fn adapt(cfg: &RunConfig, hw: &Hardware) -> Result<(RunConfig, bool, Vec<Str
 }
 
 impl Manager {
-    pub fn new(models: Vec<ModelEntry>, default_id: String, ready_timeout: Duration) -> Self {
+    pub fn new(models: Vec<ModelEntry>, models_dir: PathBuf, default_id: String, ready_timeout: Duration) -> Self {
         Self {
-            models,
+            models: std::sync::RwLock::new(models),
+            models_dir,
             hw: Hardware::detect(),
             default_id,
             current: RwLock::new(None),
@@ -212,11 +215,21 @@ impl Manager {
         }
     }
 
-    pub fn entry(&self, id: &str) -> Option<&ModelEntry> {
-        self.models.iter().find(|m| m.id == id).or_else(|| {
+    /// The installed models, scanned again (a config pulled or edited meanwhile is seen without a restart).
+    pub fn models(&self) -> Vec<ModelEntry> {
+        let fresh = scan(&self.models_dir);
+        if !fresh.is_empty() {
+            *self.models.write().unwrap() = fresh;
+        }
+        self.models.read().unwrap().clone()
+    }
+
+    pub fn entry(&self, id: &str) -> Option<ModelEntry> {
+        let models = self.models();
+        models.iter().find(|m| m.id == id).cloned().or_else(|| {
             // a part of a name is enough when only one name has it
-            let hits: Vec<&ModelEntry> = self.models.iter().filter(|m| m.id.contains(id)).collect();
-            (hits.len() == 1).then(|| hits[0])
+            let hits: Vec<&ModelEntry> = models.iter().filter(|m| m.id.contains(id)).collect();
+            (hits.len() == 1).then(|| hits[0].clone())
         })
     }
 
@@ -247,7 +260,7 @@ impl Manager {
     }
 
     pub async fn load(&self, id: &str) -> Result<Arc<Loaded>> {
-        let entry = self.entry(id).cloned().ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
         let _s = self.switching.lock().await;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
@@ -270,7 +283,7 @@ impl Manager {
                 Ok(l)
             }
             Err(e) => {
-                if let Some(prev) = before_id.and_then(|id| self.entry(&id).cloned()) {
+                if let Some(prev) = before_id.and_then(|id| self.entry(&id)) {
                     tracing::warn!("loading {} failed ({e:#}); starting {} again", entry.id, prev.id);
                     if let Ok(l) = start(&prev, &self.hw, self.ready_timeout).await {
                         *self.current.write().await = Some(Arc::new(l));
@@ -285,7 +298,7 @@ impl Manager {
     pub async fn list(&self) -> Value {
         let cur = self.current().await.map(|l| l.entry.id.clone());
         let models: Vec<Value> = self
-            .models
+            .models()
             .iter()
             .map(|m| {
                 json!({

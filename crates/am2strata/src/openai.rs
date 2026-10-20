@@ -21,7 +21,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let cur = s.mgr.current().await.map(|l| l.entry.id.clone());
     let data: Vec<Value> = s
         .mgr
-        .models
+        .models()
         .iter()
         .map(|m| json!({"id": m.id, "object": "model", "created": now(), "owned_by": "am2strata",
                         "meta": {"n_ctx": m.cfg.max_context()},

@@ -7,6 +7,7 @@ members = [
     "crates/strata-engine",
     "crates/strata-frontend",
     "crates/strata-gguf",
+    "crates/strata-hub",
     "crates/am2strata",
 ]
 
@@ -40,6 +41,7 @@ strata-template = { path = "crates/strata-template" }
 strata-protocol = { path = "crates/strata-protocol" }
 strata-engine = { path = "crates/strata-engine" }
 strata-gguf = { path = "crates/strata-gguf" }
+strata-hub = { path = "crates/strata-hub" }
 strata-frontend = { path = "crates/strata-frontend" }
 
 [profile.release]

@@ -47,6 +47,8 @@ dependencies = [
  "serde_json",
  "strata-engine",
  "strata-frontend",
+ "strata-gguf",
+ "strata-hub",
  "strata-protocol",
  "strata-template",
  "strata-tokenizer",
@@ -1770,8 +1772,22 @@ dependencies = [
 name = "strata-gguf"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "strata-hub"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strata-gguf",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
