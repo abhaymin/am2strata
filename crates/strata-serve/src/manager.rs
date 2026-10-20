@@ -53,6 +53,8 @@ pub struct Loaded {
     pub shared: std::sync::RwLock<crate::settings::Defaults>,
     /// the run config's `sampling` block
     pub sampling_defaults: crate::settings::Defaults,
+    /// #25: answers' thinking by their text, for clients that send an answer back without it (the last 512)
+    pub reasoning_memory: std::sync::Mutex<std::collections::VecDeque<(String, String)>>,
 }
 
 impl Loaded {
@@ -63,6 +65,62 @@ impl Loaded {
         d.extend(self.sampling_defaults.clone());
         d.extend(self.shared.read().unwrap().clone());
         d
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.entry.cfg.rest.get(key) == Some(&serde_json::Value::Bool(true))
+    }
+
+    /// #25 (opt-in "preserve_thinking"): earlier turns keep their thinking in the prompt.
+    pub fn preserve_thinking(&self) -> bool {
+        self.flag("preserve_thinking")
+    }
+
+    /// #1053 (opt-in "reasoning_close_retry"): a reply that ends inside its thinking is continued once, closed.
+    pub fn reasoning_close_retry(&self) -> bool {
+        self.flag("reasoning_close_retry")
+    }
+
+    /// #728 "reasoning_loop_recovery": None (off), Some(false) = "stop", Some(true) = "recover" (or true).
+    pub fn loop_recovery(&self) -> Option<bool> {
+        match self.entry.cfg.rest.get("reasoning_loop_recovery") {
+            Some(serde_json::Value::Bool(true)) => Some(true),
+            Some(serde_json::Value::String(s)) if s == "recover" => Some(true),
+            Some(serde_json::Value::String(s)) if s == "stop" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// #25: remember an answer's thinking by its text.
+    pub fn remember_reasoning(&self, text: &str, reasoning: &str) {
+        let (key, reasoning) = (text.trim(), reasoning.trim());
+        if key.is_empty() || reasoning.is_empty() {
+            return;
+        }
+        let mut m = self.reasoning_memory.lock().unwrap();
+        m.retain(|(k, _)| k != key);
+        m.push_back((key.to_string(), reasoning.to_string()));
+        while m.len() > 512 {
+            m.pop_front();
+        }
+    }
+
+    /// #25: earlier answers get back the thinking this server wrote for them, where the client left it out.
+    pub fn restore_reasoning(&self, messages: &mut [serde_json::Value]) {
+        let m = self.reasoning_memory.lock().unwrap();
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            let Some(text) = msg.get("content").and_then(serde_json::Value::as_str) else { continue };
+            let has = msg.get("reasoning_content").is_some_and(|r| r.as_str().is_some_and(|s| !s.is_empty()));
+            if has || text.contains("</think>") {
+                continue;
+            }
+            if let Some((_, r)) = m.iter().find(|(k, _)| k == text.trim()) {
+                msg["reasoning_content"] = serde_json::json!(r);
+            }
+        }
     }
 
     /// The thinking level of a request that names none: the shared Chat settings first, then the config's.
@@ -330,5 +388,6 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         adapted,
         shared: std::sync::RwLock::new(crate::settings::read_shared(&entry.path)),
         sampling_defaults,
+        reasoning_memory: Default::default(),
     })
 }

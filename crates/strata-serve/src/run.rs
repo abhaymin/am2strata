@@ -1,6 +1,7 @@
 //! One request on the loaded model: prompt, pictures, sampling, generation, output parsing and stop strings.
 //! Both APIs (OpenAI and Anthropic) format the events this produces.
 
+use std::collections::HashMap;
 use crate::manager::{Loaded, Manager};
 use crate::media;
 use serde_json::{json, Value};
@@ -18,6 +19,80 @@ use tokio::sync::mpsc;
 
 /// The engine keeps a few tokens of slack at the end of the context (serve/server.py CTX_SLACK).
 const CTX_SLACK: usize = 1;
+/// #1053: what closes the thinking when a reply stopped inside it (reasoning_close_retry)
+const REASONING_CLOSE: &str = "\n</think>\n\n";
+/// #728: the effort sentences the loop recovery swaps (the template's own xhigh one, and low)
+const HIGH_EFFORT: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, \
+                           consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+const LOW_EFFORT: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion \
+                          without unnecessary elaboration.";
+const LOOP_CHECK_EVERY: usize = 512;
+const LOOP_COVERAGE: f64 = 0.25;
+const LOOP_HISTORY_WORDS: usize = 30000;
+const LOOP_TAIL_CHARS: usize = 2048;
+const LOOP_TAIL_PERIOD: usize = 64;
+
+/// #728: the share of the last 2,000 words inside 12-word passages seen at least three times; a tail of the last
+/// 2,048 characters with a period of at most 64 reads as full coverage (#1753). Port of reasoning_repeat_coverage.
+pub fn reasoning_repeat_coverage(text: &str) -> f64 {
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    if lower.len() >= LOOP_TAIL_CHARS {
+        let tail = &lower[lower.len() - LOOP_TAIL_CHARS..];
+        if (1..=LOOP_TAIL_PERIOD).any(|p| tail[p..] == tail[..tail.len() - p]) {
+            return 1.0;
+        }
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in lower {
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+            continue;
+        }
+        if !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+        if !c.is_whitespace() {
+            words.push(c.to_string());
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    if words.len() > LOOP_HISTORY_WORDS {
+        words.drain(..words.len() - LOOP_HISTORY_WORDS);
+    }
+    let (width, window) = (12usize, 2000usize);
+    if words.len() < window {
+        return 0.0;
+    }
+    let grams: Vec<&[String]> = words.windows(width).collect();
+    let mut counts: HashMap<&[String], usize> = HashMap::new();
+    for g in &grams {
+        *counts.entry(*g).or_default() += 1;
+    }
+    let start = words.len() - window;
+    let mut covered = vec![false; words.len()];
+    for i in start..grams.len() {
+        if counts[grams[i]] >= 3 {
+            covered[i..i + width].iter_mut().for_each(|c| *c = true);
+        }
+    }
+    covered[start..].iter().filter(|c| **c).count() as f64 / (words.len() - start) as f64
+}
+
+/// #728: the prompt's ids with the xhigh effort sentence of the first system message replaced by the low one, then
+/// every token generated so far (a splice of ids: the prompt is never decoded and encoded again).
+fn focused_recovery_prompt(tok: &strata_tokenizer::Tokenizer, ids: &[u32], generated: &[u32]) -> Option<Vec<u32>> {
+    let end = tok.encode("<|im_end|>", true).ok().filter(|v| v.len() == 1)?[0];
+    let head = &ids[..ids.iter().position(|t| *t == end)?];
+    if !tok.decode(head).ok()?.starts_with("<|im_start|>system\n") {
+        return None;
+    }
+    let (old, new) = (tok.encode(HIGH_EFFORT, false).ok()?, tok.encode(LOW_EFFORT, false).ok()?);
+    let i = head.windows(old.len()).position(|w| w == old.as_slice())?;
+    Some([&ids[..i], &new, &ids[i + old.len()..], generated].concat())
+}
 /// #606: a reply that repeats one token this many times in a row is ended there ("length"); the config's
 /// "repeat_stop_tokens" sets it, 0 turns it off.
 const REPEAT_STOP_TOKENS: usize = 256;
@@ -185,6 +260,8 @@ pub fn thinking_budget(asked: Option<u64>, max_new: usize, answer_room: bool) ->
 
 /// Start a request. `prep`: the normalized messages, tools and template kwargs; `req`: the raw request (sampling,
 /// max tokens, stop strings).
+// (the emit! macro also runs after the last check of `answered`)
+#[allow(unused_assignments)]
 pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts)
     -> Result<Started, Refusal> {
     let stops = stop_strings(&req)?;
@@ -192,6 +269,13 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let waiting = mgr.monitor.waiting();
     let turn = mgr.take_turn().await;
     drop(waiting);
+    let mut prep = prep;
+    // #25: preserve_thinking is the config's default; a request's chat_template_kwargs can still turn it off
+    let preserve = loaded.preserve_thinking() && prep.kwargs.get("preserve_thinking") != Some(&Value::Bool(false));
+    if preserve {
+        prep.kwargs.entry("preserve_thinking").or_insert(Value::Bool(true));
+        loaded.restore_reasoning(&mut prep.messages);
+    }
     let prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
     let mut ids = prompt.ids.clone();
     let sources = images_of(&prep.messages);
@@ -276,6 +360,14 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         let mut prompt_ids = ids;
         let (mut n, mut thought) = (0usize, 0usize);
         let (mut run_tok, mut run_len): (Option<u32>, usize) = (None, 0);
+        let mut sampling = sampling;
+        let orig_ids = prompt_ids.clone();
+        let mut generated: Vec<u32> = Vec::new(); // every token of the reply so far, the wrap-ups included
+        let (mut reasoning_text, mut answer_text, mut answered) = (String::new(), String::new(), false);
+        let (mut next_loop_check, mut recovered, mut close_retried) = (LOOP_CHECK_EVERY, false, false);
+        let loop_recovery = lc.loop_recovery();
+        let close_retry = lc.reasoning_close_retry();
+        let has_images = images.is_some();
         let mut tail = String::new(); // the last characters written (the newlines before a forced call)
         let mut last_done: Option<strata_protocol::Done> = None;
         // events through the stop strings to the client; false when the client has gone
@@ -295,6 +387,15 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                     if let Event::Content(t) | Event::Reasoning(t) = &out {
                         tail = format!("{tail}{t}").chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
                     }
+                    match &out {
+                        Event::Reasoning(t) => reasoning_text.push_str(t),
+                        Event::Content(t) => {
+                            answer_text.push_str(t);
+                            answered = true;
+                        }
+                        Event::ToolStart { .. } | Event::ToolCall(_) => answered = true,
+                        _ => {}
+                    }
                     if tx.send(RunEvent::Event(out)).await.is_err() { alive = false; break; }
                 }
                 alive
@@ -307,7 +408,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             let left = max_new.saturating_sub(n);
             let mut rx = lc.engine.generate(left as u32, sampling.clone(), turn_at, prompt_ids.clone(), images.clone()).await;
             let (mut seg, mut wrap, mut opens) = (Vec::new(), false, false);
-            let (mut stopped, mut repeated) = (false, false);
+            let (mut stopped, mut repeated, mut looped) = (false, false, false);
+            let mut recover_prompt: Option<Vec<u32>> = None;
             let mut ended: Option<strata_protocol::Done> = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
@@ -330,6 +432,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                             break;
                         }
                         seg.push(t);
+                        generated.push(t);
                         let text = lc.tok.token_bytes(t).map(|b| detok.push(&b)).unwrap_or_default();
                         let evs = match parser.feed(&text) {
                             Ok(e) => e,
@@ -345,6 +448,28 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         }
                         if cut.hit.is_some() {
                             break;
+                        }
+                        if let Some(recover) = loop_recovery {
+                            if !recovered && parser.in_reasoning() && n >= next_loop_check && parser.is_clean() && !detok.has_pending() {
+                                next_loop_check = n + LOOP_CHECK_EVERY;
+                                let cov = reasoning_repeat_coverage(&reasoning_text);
+                                if cov >= LOOP_COVERAGE {
+                                    if !recover {
+                                        tracing::warn!("the thinking repeated the same passages (coverage={cov:.3}) at {n} tokens: \
+                                                        ended as \"length\" (reasoning_loop_recovery: \"stop\")");
+                                        looped = true;
+                                        break;
+                                    }
+                                    if !has_images {
+                                        recover_prompt = focused_recovery_prompt(&lc.tok, &orig_ids, &generated);
+                                        if recover_prompt.is_some() {
+                                            tracing::warn!("repeated reasoning detected at {n} tokens (coverage={cov:.3}); resuming \
+                                                            the same output with the low-effort instruction");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         if let Some(b) = budget {
                             if parser.in_reasoning() {
@@ -385,15 +510,55 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             if let Some(d) = &ended {
                 last_done = Some(d.clone());
             }
+            if let Some(p) = recover_prompt.take().filter(|_| n < max_new) {
+                // #728: once, from the same output with the low-effort sentence; only temperature and presence penalty
+                // are raised (to at least 1.0 and 1.5)
+                recovered = true;
+                sampling.temperature = Some(sampling.temperature.unwrap_or(0.0).max(1.0));
+                sampling.presence_penalty = Some(sampling.presence_penalty.unwrap_or(0.0).max(1.5));
+                prompt_ids = p;
+                continue;
+            }
             if cut.hit.is_some() {
                 let mut evs = parser.finish(Some("stop"));
                 evs.retain(|e| !matches!(e, Event::Content(_)));
                 let _ = emit!(evs);
                 break ("stop", cut.hit.clone());
             }
+            let natural = !repeated && !looped && (stopped || ended.as_ref().is_none_or(|d| d.finish == "stop"));
+            if close_retry && thinking && natural && !close_retried && !answered && !wrap && !opens
+                && parser.in_reasoning() && !parser.holds_think_end()
+            {
+                // #1053: the model wrote its reasoning and stopped before </think>: close it once and let it answer
+                close_retried = true;
+                let extra = lc.tok.encode(REASONING_CLOSE, true).unwrap_or_default();
+                if max_new.saturating_sub(n + extra.len()) >= 1 {
+                    tracing::info!("the reply ended inside its thinking with no answer: closing the thinking once and continuing");
+                    for t in &extra {
+                        n += 1;
+                        generated.push(*t);
+                        let piece = lc.tok.token_bytes(*t).map(|b| detok.push(&b)).unwrap_or_default();
+                        match parser.feed(&piece) {
+                            Ok(evs) => {
+                                if !emit!(evs) {
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                record.fail();
+                                let _ = tx.send(RunEvent::Error(e.0)).await;
+                                return;
+                            }
+                        }
+                    }
+                    prompt_ids.extend(seg);
+                    prompt_ids.extend(extra);
+                    continue;
+                }
+            }
             if !(wrap || opens) {
                 let finish = match ended.as_ref().map(|d| d.finish.as_str()) {
-                    _ if repeated => "length",
+                    _ if repeated || looped => "length",
                     _ if stopped => "stop",
                     Some("length") => "length",
                     Some("cancel") => "cancel",
@@ -428,6 +593,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             }
             for t in &extra {
                 n += 1;
+                generated.push(*t);
                 let piece = lc.tok.token_bytes(*t).map(|b| detok.push(&b)).unwrap_or_default();
                 match parser.feed(&piece) {
                     Ok(evs) => {
@@ -446,6 +612,9 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             prompt_ids.extend(extra);
         };
         let (finish, stop) = summary;
+        if preserve {
+            lc.remember_reasoning(&answer_text, &reasoning_text);
+        }
         let t = last_done.as_ref().map(timings).unwrap_or(Value::Null);
         record.finish(finish, n as u64, last_done.as_ref(), t.clone());
         let _ = tx
@@ -479,5 +648,20 @@ mod tests {
         assert_eq!(thinking_budget(Some(100), 8192, true), Some(100));
         assert_eq!(thinking_budget(Some(8000), 8192, true), Some(6144));
         assert_eq!(thinking_budget(Some(0), 500, true), None);
+    }
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::reasoning_repeat_coverage;
+
+    #[test]
+    fn repeated_passages_and_periodic_tails_are_loops() {
+        assert_eq!(reasoning_repeat_coverage("short text"), 0.0);
+        let looping = "check the sum again to be sure it is right now ok ".repeat(300);
+        assert!(reasoning_repeat_coverage(&looping) > 0.9);
+        assert_eq!(reasoning_repeat_coverage(&"12345678901".repeat(300)), 1.0, "#1753: one long periodic word");
+        let varied: String = (0..3000).map(|i| format!("w{i} ")).collect();
+        assert_eq!(reasoning_repeat_coverage(&varied), 0.0);
     }
 }

@@ -437,3 +437,40 @@ fn the_reply_ends_at_the_models_stop_token() {
     assert_eq!(r["choices"][0]["message"]["content"], "Done.");
     assert_eq!(r["choices"][0]["finish_reason"], "stop");
 }
+
+#[test]
+fn preserve_thinking_puts_the_servers_own_thinking_back() {
+    let m = Model { extra: json!({"preserve_thinking": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("Thought A.\n</think>\n\nAnswer A."), ids("ok")], json!({}));
+    s.post("/v1/chat/completions", &json!({"messages": [user("Q1")], "max_tokens": 50}));
+    let follow = json!({"messages": [user("Q1"), {"role": "assistant", "content": "Answer A."}, user("Q2")], "max_tokens": 50});
+    s.post("/v1/chat/completions", &follow);
+    let want = json!({"messages": [user("Q1"), {"role": "assistant", "content": "Answer A.", "reasoning_content": "Thought A."}, user("Q2")],
+                      "chat_template_kwargs": {"preserve_thinking": true}});
+    assert_eq!(line_ids(&s.gen_lines()[1]), expected_prompt(&want), "the answer's thinking is back in the prompt");
+}
+
+#[test]
+fn reasoning_close_retry_closes_the_thinking_once() {
+    let m = Model { extra: json!({"reasoning_close_retry": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("Only thinking.<|im_end|>"), ids("Final.")], json!({"delay_ms": 2}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 100}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["reasoning_content"], "Only thinking.\n");
+    assert_eq!(r["choices"][0]["message"]["content"], "Final.");
+    let g = s.gen_lines();
+    assert_eq!(g.len(), 2);
+    let close = ids("\n</think>\n\n");
+    assert!(line_ids(&g[1]).ends_with(&close), "the second pass goes on after the closed thinking");
+}
+
+#[test]
+fn reasoning_loop_recovery_stop_ends_a_looping_reply() {
+    let m = Model { extra: json!({"reasoning_loop_recovery": "stop"}), context: 65536, ..Model::default() };
+    let looping = "I will check the sum again to be sure that it is right. ".repeat(400);
+    let s = Server::start(&[m], &[ids(&looping)], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 20000}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["finish_reason"], "length");
+    assert!(r["usage"]["completion_tokens"].as_u64().unwrap() < ids(&looping).len() as u64, "ended early");
+}

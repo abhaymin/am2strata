@@ -48,11 +48,13 @@ pub struct Model<'a> {
     pub vision: bool,
     pub arch: Option<&'a str>,
     pub context: u32,
+    /// more run-config keys (merged in)
+    pub extra: Value,
 }
 
 impl Default for Model<'_> {
     fn default() -> Self {
-        Model { id: "mock-a", vision: true, arch: None, context: 8192 }
+        Model { id: "mock-a", vision: true, arch: None, context: 8192, extra: Value::Null }
     }
 }
 
@@ -74,6 +76,9 @@ fn write_config(dir: &Path, m: &Model) {
     }
     if let Some(a) = m.arch {
         cfg["arch"] = json!(a);
+    }
+    if let (Some(c), Some(e)) = (cfg.as_object_mut(), m.extra.as_object()) {
+        c.extend(e.clone());
     }
     std::fs::write(dir.join(format!("strata-{}.json", m.id)), serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
 }
