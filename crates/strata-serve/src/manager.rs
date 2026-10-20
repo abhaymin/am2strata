@@ -54,6 +54,7 @@ pub struct Manager {
     pub turn: Arc<Mutex<()>>,
     switching: Mutex<()>,
     pub ready_timeout: Duration,
+    pub monitor: Arc<crate::monitor::Monitor>,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -123,6 +124,7 @@ impl Manager {
             turn: Arc::new(Mutex::new(())),
             switching: Mutex::new(()),
             ready_timeout,
+            monitor: crate::monitor::Monitor::new(),
         }
     }
 

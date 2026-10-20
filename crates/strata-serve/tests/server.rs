@@ -358,3 +358,27 @@ fn responses_api_is_stateless() {
     assert_eq!(r["error"]["code"], "unsupported_parameter");
     assert_eq!(s.get("/v1/responses/resp_1", true).0, 404);
 }
+
+#[test]
+fn monitor_records_requests_totals_and_the_machine() {
+    let s = Server::start(&[Model::default()], &[ids("Thinking.\n</think>\n\nDone.")], json!({}));
+    assert_eq!(s.get("/metrics", false).0, 401, "the monitor needs the key");
+    let (_, m) = s.get("/metrics", true);
+    assert_eq!(m["live"]["state"], "idle");
+    assert_eq!(m["requests"], json!([]));
+    s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 50}));
+    let (_, m) = s.get("/metrics", true);
+    let r = &m["requests"][0];
+    assert_eq!(r["finish"], "stop");
+    assert_eq!(r["output_tokens"], ids("Thinking.\n</think>\n\nDone.").len());
+    assert!(r["prompt_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(m["totals"]["requests"], 1);
+    assert_eq!(m["engine"]["max_context"], 8192);
+    assert!(m["hardware_static"]["threads"].as_u64().unwrap() > 0);
+    let text = reqwest::blocking::Client::new().get(format!("{}/metrics/prometheus", s.base)).bearer_auth(KEY).send().unwrap().text().unwrap();
+    assert!(text.contains("strata:requests_total 1"), "{text}");
+    let (c, st) = s.get("/v1/status", true);
+    assert_eq!(c, 200);
+    assert_eq!(st["activity"]["requests"], 1);
+    assert_eq!(st["dialects"][2], "/v1/responses");
+}

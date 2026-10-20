@@ -180,7 +180,9 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     -> Result<Started, Refusal> {
     let stops = stop_strings(&req)?;
     // one request on the GPU at a time: image encoding and generation both take the turn
+    let waiting = mgr.monitor.waiting();
     let turn = mgr.take_turn().await;
+    drop(waiting);
     let prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
     let mut ids = prompt.ids.clone();
     let sources = images_of(&prep.messages);
@@ -242,6 +244,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     }
     let turn_at = strata_protocol::turn_at(&ids, &loaded.turn_ids);
     let prompt_tokens = ids.len();
+    let mut record = mgr.monitor.begin(prompt_tokens, max_new);
     let (tx, events) = mpsc::channel(256);
     let model = loaded.entry.id.clone();
     let lc = loaded.clone();
@@ -287,6 +290,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                 match ev {
                     Ok(GenEvent::Token(t)) => {
                         n += 1;
+                        record.token(parser.in_reasoning());
                         if lc.tok.token_type(t) == 3 {
                             // a CONTROL token (<|im_end|>): the end of the turn, not text
                             if force.is_some() && parser.holds_think_end() {
@@ -300,6 +304,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         let evs = match parser.feed(&text) {
                             Ok(e) => e,
                             Err(e) => {
+                                record.fail();
                                 let _ = tx.send(RunEvent::Error(e.0)).await;
                                 return;
                             }
@@ -329,7 +334,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                             }
                         }
                     }
-                    Ok(GenEvent::Progress { .. }) => {
+                    Ok(GenEvent::Progress { done, total }) => {
+                        record.progress(done, total);
                         if tx.send(RunEvent::Ping).await.is_err() {
                             return;
                         }
@@ -339,6 +345,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         break;
                     }
                     Err(e) => {
+                        record.fail();
                         let _ = tx.send(RunEvent::Error(e.to_string())).await;
                         return;
                     }
@@ -397,6 +404,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         }
                     }
                     Err(e) => {
+                        record.fail();
                         let _ = tx.send(RunEvent::Error(e.0)).await;
                         return;
                     }
@@ -406,13 +414,15 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             prompt_ids.extend(extra);
         };
         let (finish, stop) = summary;
+        let t = last_done.as_ref().map(timings).unwrap_or(Value::Null);
+        record.finish(finish, n as u64, last_done.as_ref(), t.clone());
         let _ = tx
             .send(RunEvent::Done(Summary {
                 finish: finish.to_string(),
                 completion_tokens: n as u64,
                 reused: last_done.as_ref().and_then(|d| d.reused).unwrap_or(0),
                 stop_sequence: stop,
-                timings: last_done.as_ref().map(timings).unwrap_or(Value::Null),
+                timings: t,
             }))
             .await;
         if let Some(t) = temp {

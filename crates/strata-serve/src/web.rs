@@ -84,13 +84,48 @@ pub async fn mcp() -> Json<Value> {
     Json(json!({"servers": [], "tools": 0}))
 }
 
-/// The monitor's figures: the current model, the machine, and empty history until request tracking is ported.
-pub async fn metrics(State(s): State<AppState>, Query(_q): Query<HashMap<String, String>>) -> Json<Value> {
+/// The engine facts the monitor and the About tab show.
+async fn engine_facts(s: &AppState) -> (Value, bool) {
     let cur = s.mgr.current().await;
-    Json(json!({
-        "engine": {"model": cur.as_ref().map(|l| l.entry.id.clone()), "loaded": cur.is_some(),
-                   "context": cur.as_ref().map(|l| l.max_context)},
-        "hardware": s.mgr.hw, "hardware_static": s.mgr.hw,
-        "history": {}, "live": {"running": 0}, "requests": [],
-    }))
+    let facts = match cur.as_ref() {
+        Some(l) => {
+            let args = &l.entry.cfg.args;
+            let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+            json!({"model": l.entry.display_name(), "id": l.entry.id, "max_context": l.max_context,
+                   "images": l.vision.is_some(), "kv": arg("--kv"), "kv_resident": arg("--kv-resident").and_then(|v| v.parse::<u64>().ok()),
+                   "family": l.family, "adapted": l.adapted})
+        }
+        None => json!({"model": s.mgr.entry(&s.mgr.default_id).map(|e| e.display_name()), "max_context": null, "images": false}),
+    };
+    (facts, cur.is_some())
+}
+
+/// GET /metrics: the Monitor tab's figures (the running request, the last ones, totals and the machine).
+pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let (engine, loaded) = engine_facts(&s).await;
+    let all = q.get("requests").is_some_and(|v| v == "all");
+    Json(s.mgr.monitor.metrics(engine, loaded, all)).into_response()
+}
+
+/// GET /metrics/prometheus.
+pub async fn prometheus(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let loaded = s.mgr.current().await.is_some();
+    ([("content-type", "text/plain; version=0.0.4")], s.mgr.monitor.prometheus(loaded)).into_response()
+}
+
+/// GET /v1/status.
+pub async fn status(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let (engine, loaded) = engine_facts(&s).await;
+    let ctx = engine["max_context"].as_u64().map(|c| c as usize);
+    let images = engine["images"].as_bool().unwrap_or(false);
+    Json(s.mgr.monitor.status(engine["model"].clone(), loaded, ctx, images)).into_response()
 }

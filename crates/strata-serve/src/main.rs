@@ -8,6 +8,7 @@
 mod anthropic;
 mod manager;
 mod media;
+mod monitor;
 mod openai;
 mod responses;
 mod run;
@@ -139,6 +140,8 @@ async fn main() -> Result<()> {
         .route("/config", get(web::config_get))
         .route("/mcp", get(web::mcp))
         .route("/metrics", get(web::metrics))
+        .route("/metrics/prometheus", get(web::prometheus))
+        .route("/v1/status", get(web::status))
         // the web app: the page at /, its files under /web/ (as PolyStrata serves them), the monitor at /api-monitor
         .route_service("/", ServeFile::new(web_dir.join("index.html")))
         .route_service("/api-monitor", ServeFile::new(web_dir.join("monitor.html")))
