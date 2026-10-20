@@ -1,4 +1,4 @@
-//! The Rust tokenizer against ids recorded from PolyStrata's Python tokenizer (tools/make_golden.py).
+//! The Rust tokenizer against ids recorded from PolyStrata's Python tokenizer (tools/reference-polystrata/make_golden.py).
 
 use serde_json::Value;
 use strata_tokenizer::{Detokenizer, Tokenizer};

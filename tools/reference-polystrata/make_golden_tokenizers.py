@@ -12,7 +12,7 @@ POLY = pathlib.Path.home() / "Development/PolyStrata"
 sys.path[:0] = [str(POLY / "tools")]
 from strata_tokenizer import BYTE_TO_UNICODE, SPACE, Tokenizer  # noqa: E402
 
-OUT = pathlib.Path(__file__).resolve().parent.parent / "crates/strata-tokenizer/testdata"
+OUT = pathlib.Path(__file__).resolve().parent.parent.parent / "crates/strata-tokenizer/testdata"
 TEXTS = ["Hello world", "the theme of the thesis", "  two  spaces\n\n\nnew lines\n", "naïve café 東京 🙂",
          "<|turn>user\nhi<turn|>\n<|tool_call>call:f{a:1}<tool_call|>", "<think>x</think> 12345 abc123",
          "日本語のテキスト、カタカナ！", "don't stop: a.b,c;d?!", ""]

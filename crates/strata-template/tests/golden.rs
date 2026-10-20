@@ -1,4 +1,4 @@
-//! Rendered prompts against PolyStrata's Python ChatTemplate (tools/make_golden.py).
+//! Rendered prompts against PolyStrata's Python ChatTemplate (tools/reference-polystrata/make_golden.py).
 
 use serde_json::Value;
 use strata_template::ChatTemplate;

@@ -1,4 +1,4 @@
-//! Whole requests against PolyStrata's Python front end (tools/make_golden_requests.py): normalized messages,
+//! Whole requests against PolyStrata's Python front end (tools/reference-polystrata/make_golden_requests.py): normalized messages,
 //! tools and kwargs, the literal tags, the prompt text and the token ids sent to the engine.
 
 use serde_json::Value;

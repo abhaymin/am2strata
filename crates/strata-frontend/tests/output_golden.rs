@@ -1,4 +1,4 @@
-//! The Rust OutputParser against events recorded from PolyStrata's Python OutputParser (tools/make_golden_output.py).
+//! The Rust OutputParser against events recorded from PolyStrata's Python OutputParser (tools/reference-polystrata/make_golden_output.py).
 //! Text events are compared merged by kind (what a client sees); tool events exactly (name, arguments, and the
 //! concatenated streamed argument pieces).
 

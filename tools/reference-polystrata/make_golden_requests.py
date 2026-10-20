@@ -116,7 +116,7 @@ ANTHROPIC = {
 
 
 def main() -> int:
-    out_dir = pathlib.Path(__file__).resolve().parent.parent / "golden"
+    out_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "golden"
     for name, tdir in MODELS.items():
         tmpl = F.ChatTemplate(tdir / "chat_template.jinja")
         tok = ST.Tokenizer.from_dir(tdir)

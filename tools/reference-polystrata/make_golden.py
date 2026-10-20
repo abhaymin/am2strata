@@ -59,7 +59,7 @@ CASES = [
 
 
 def main() -> int:
-    out_dir = pathlib.Path(__file__).resolve().parent.parent / "golden"
+    out_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "golden"
     out_dir.mkdir(exist_ok=True)
     for name, tdir in MODELS.items():
         tmpl = ChatTemplate(tdir / "chat_template.jinja")

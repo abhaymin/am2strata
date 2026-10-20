@@ -56,7 +56,7 @@ STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p am2strat
 Golden files are recorded from PolyStrata with:
 
 ```sh
-~/Development/PolyStrata/.venv/bin/python tools/make_golden.py
+~/Development/PolyStrata/.venv/bin/python tools/reference-polystrata/make_golden.py
 ```
 
 The engine protocol is written down in [docs/PROTOCOL.md](docs/PROTOCOL.md).

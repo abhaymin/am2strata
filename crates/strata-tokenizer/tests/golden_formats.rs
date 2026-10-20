@@ -1,5 +1,5 @@
 //! The gemma4 (UTF-8 pieces, byte fallback) and deepseek-v3 (pattern sequence) pre-tokenizers against ids recorded
-//! from PolyStrata's Python tokenizer on small synthetic vocabularies (tools/make_golden_tokenizers.py).
+//! from PolyStrata's Python tokenizer on small synthetic vocabularies (tools/reference-polystrata/make_golden_tokenizers.py).
 
 use serde_json::Value;
 use strata_tokenizer::Tokenizer;

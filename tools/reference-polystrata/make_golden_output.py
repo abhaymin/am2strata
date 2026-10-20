@@ -100,7 +100,7 @@ def main() -> int:
                 cases.append({"name": name, "text": text, "thinking": thinking, "tools": tools, "chunks": chunks,
                               "stream_tools": stream_tools, "call_format": fmt, "opened": opened,
                               "events": run(text, thinking, tools, chunks, stream_tools, fmt, opened)})
-    path = pathlib.Path(__file__).resolve().parent.parent / "golden" / "output.json"
+    path = pathlib.Path(__file__).resolve().parent.parent.parent / "golden" / "output.json"
     path.write_text(json.dumps({"cases": cases}, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"{path}: {len(cases)} cases")
     return 0
