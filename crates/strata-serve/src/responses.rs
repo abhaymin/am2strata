@@ -762,7 +762,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req):
         }
         while let Some(ev) = events.recv().await {
             let out = match ev {
-                RunEvent::Ping => vec![asm.in_progress()],
+                RunEvent::Ping | RunEvent::Mcp(_) => vec![asm.in_progress()],
                 RunEvent::Event(e) => asm.feed(e),
                 RunEvent::Done(sum) => {
                     for e in asm.finish(&sum) {

@@ -62,7 +62,29 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned() };
-    let started = match run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await {
+    // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
+    let mut mcp = None;
+    if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
+        if crate::foreign_origin(&s, &headers) {
+            return crate::not_own_page("MCP tools can be used");
+        }
+        hub.wait(Duration::from_secs(10)).await; // servers still starting (only right after the start)
+        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        let extra = hub.template_tools(&own); // the request's own tools win a name clash
+        if !extra.is_empty() {
+            if strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_some() {
+                return error(StatusCode::BAD_REQUEST, "invalid_request_error", "a forced tool_choice with MCP tools is not supported");
+            }
+            let names = extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect();
+            prep.tools.get_or_insert_with(Vec::new).extend(extra);
+            mcp = Some((hub, names));
+        }
+    }
+    let started = match mcp {
+        Some((hub, names)) => run::start_mcp(s.mgr.clone(), loaded, prep, req.clone(), opts, hub, names).await,
+        None => run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await,
+    };
+    let started = match started {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             return error(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), "invalid_request_error", msg)
@@ -86,6 +108,11 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
         while let Some(ev) = events.recv().await {
             let out = match ev {
                 RunEvent::Ping => None,
+                RunEvent::Mcp(v) => {
+                    let mut c = chunk(json!({}), None);
+                    c["strata_mcp"] = v;
+                    Some(c)
+                }
                 RunEvent::Event(Event::Reasoning(t)) if !t.is_empty() => Some(chunk(json!({"reasoning_content": t}), None)),
                 RunEvent::Event(Event::Content(t)) if !t.is_empty() => Some(chunk(json!({"content": t}), None)),
                 RunEvent::Event(Event::ToolStart { id, name }) => {

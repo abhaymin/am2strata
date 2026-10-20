@@ -81,7 +81,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         while let Some(ev) = events.recv().await {
             let mut out: Vec<Option<(String, Value)>> = Vec::new();
             match ev {
-                RunEvent::Ping => out.push(None),
+                RunEvent::Ping | RunEvent::Mcp(_) => out.push(None),
                 RunEvent::Event(Event::ToolArgs { text, .. }) => out.push(send("content_block_delta", json!({
                     "type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": text}}))),
                 RunEvent::Event(Event::ToolCall(c)) if streamed.contains(&c.id) => {

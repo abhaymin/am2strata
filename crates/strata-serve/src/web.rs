@@ -91,6 +91,9 @@ pub async fn settings_post(State(s): State<AppState>, headers: HeaderMap, Json(r
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("settings can be changed");
+    }
     let d = match crate::settings::clean_shared_defaults(req.get("defaults").unwrap_or(&Value::Null)) {
         Ok(d) => d,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
@@ -134,6 +137,9 @@ pub async fn config_post(State(s): State<AppState>, headers: HeaderMap, Json(req
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the run config can be changed");
+    }
     let Some(p) = config_path(&s).await else {
         return error(StatusCode::NOT_FOUND, "not_found", "this server was started without a run config");
     };
@@ -157,8 +163,12 @@ pub async fn config_post(State(s): State<AppState>, headers: HeaderMap, Json(req
     Json(v).into_response()
 }
 
-pub async fn mcp() -> Json<Value> {
-    Json(json!({"servers": [], "tools": 0}))
+/// GET /mcp: the MCP servers, their state and tools (the web app's switch and Monitor card).
+pub async fn mcp(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    Json(s.mcp.as_ref().map(|h| h.status()).unwrap_or(json!({"servers": [], "tools": 0}))).into_response()
 }
 
 /// The engine facts the monitor and the About tab show.

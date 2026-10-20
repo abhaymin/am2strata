@@ -7,6 +7,7 @@
 
 mod anthropic;
 mod manager;
+mod mcp;
 mod media;
 mod monitor;
 mod openai;
@@ -61,6 +62,23 @@ struct Args {
 pub struct AppState {
     pub mgr: Arc<Manager>,
     pub api_key: Option<String>,
+    /// the MCP servers of the default model's run config (the web app's chats can use their tools)
+    pub mcp: Option<Arc<mcp::McpHub>>,
+    /// web origins besides this server's own that may change settings and run tools (the config's trusted_origins)
+    pub trusted_origins: Vec<String>,
+}
+
+/// A web page of another origin sent this: its Origin is neither this server's address nor a trusted one (no Origin
+/// is a client that is no browser). Settings, the run config and MCP tools refuse it (serve/server.py).
+pub fn foreign_origin(state: &AppState, headers: &HeaderMap) -> bool {
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("").trim_end_matches('/');
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    !origin.is_empty() && origin.split("://").last() != Some(host) && !state.trusted_origins.iter().any(|t| t == origin)
+}
+
+pub fn not_own_page(what: &str) -> Response {
+    error(StatusCode::FORBIDDEN, "permission_error",
+          format!("{what} only from PolyStrata's own page (or an origin in the config's trusted_origins)"))
 }
 
 pub fn now() -> u64 {
@@ -123,7 +141,13 @@ async fn main() -> Result<()> {
     if !args.lazy {
         mgr.load(&default).await.with_context(|| format!("loading {default}"))?;
     }
-    let state = AppState { mgr: mgr.clone(), api_key };
+    let hub = mcp::McpHub::from_config(&first.cfg.rest).map_err(anyhow::Error::msg)?;
+    if let Some(h) = &hub {
+        h.start();
+    }
+    let trusted_origins = first.cfg.rest.get("trusted_origins").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim_end_matches('/').to_string())).collect()).unwrap_or_default();
+    let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins };
     let web_dir = args.web_dir.map(|p| expand(&p)).unwrap_or_else(|| dir.join("serve/web"));
     let app = Router::new()
         .route("/health", get(web::health))
@@ -158,5 +182,8 @@ async fn main() -> Result<()> {
         })
         .await?;
     mgr.unload().await;
+    if let Some(h) = hub {
+        h.close().await;
+    }
     Ok(())
 }

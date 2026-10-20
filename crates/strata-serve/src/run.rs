@@ -103,6 +103,8 @@ pub enum RunEvent {
     Event(Event),
     Done(Summary),
     Error(String),
+    /// MCP tool activity (the web app's `strata_mcp` chunks)
+    Mcp(Value),
 }
 
 #[derive(Debug, Clone)]
@@ -628,6 +630,114 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             .await;
         if let Some(t) = temp {
             let _ = std::fs::remove_file(t);
+        }
+    });
+    Ok(Started { events, prompt_tokens, model })
+}
+
+/// `start` with the MCP tools run here: the model writes a call to an MCP tool, the server runs it, adds the call
+/// and its result to the conversation and lets the model continue, up to `max_rounds` times. `names`: the MCP tools
+/// this request offered; any other call is the request's own and ends the turn as always (the client answers it),
+/// and MCP calls written beside it are then not run. Port of serve/server.py run_with_mcp.
+pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts,
+                       hub: Arc<crate::mcp::McpHub>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
+    let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
+    let (model, prompt_tokens) = (first.model.clone(), first.prompt_tokens);
+    let (tx, events) = mpsc::channel(256);
+    tokio::spawn(async move {
+        let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
+        loop {
+            let (mut text, mut reasoning, mut calls, mut own) = (String::new(), String::new(), Vec::new(), 0usize);
+            let mut mcp_ids = std::collections::HashSet::new();
+            let mut done = None;
+            while let Some(ev) = cur.events.recv().await {
+                let out = match ev {
+                    RunEvent::Event(Event::ToolStart { id, name }) if names.contains(&name) => {
+                        mcp_ids.insert(id.clone());
+                        RunEvent::Mcp(json!({"event": "start", "id": id, "name": name}))
+                    }
+                    RunEvent::Event(Event::ToolArgs { id, .. }) if mcp_ids.contains(&id) => continue,
+                    RunEvent::Event(Event::ToolCall(c)) if names.contains(&c.name) => {
+                        calls.push(c);
+                        continue;
+                    }
+                    RunEvent::Done(s) => {
+                        done = Some(s);
+                        break;
+                    }
+                    RunEvent::Event(e) => {
+                        match &e {
+                            Event::ToolCall(_) => own += 1,
+                            Event::Content(t) => text.push_str(t),
+                            Event::Reasoning(t) => reasoning.push_str(t),
+                            _ => {}
+                        }
+                        RunEvent::Event(e)
+                    }
+                    other => other,
+                };
+                let is_error = matches!(out, RunEvent::Error(_));
+                if tx.send(out).await.is_err() || is_error {
+                    return;
+                }
+            }
+            let Some(mut sum) = done else { return };
+            total += sum.completion_tokens;
+            let mut run_them = !calls.is_empty() && own == 0 && sum.finish == "stop";
+            if run_them && rounds >= hub.settings.max_rounds {
+                let _ = tx.send(RunEvent::Mcp(json!({"event": "limit", "max_rounds": hub.settings.max_rounds}))).await;
+                run_them = false;
+            }
+            if !run_them {
+                for c in &calls {
+                    // announced, never run: closed in the client's view
+                    let _ = tx.send(RunEvent::Mcp(json!({"event": "result", "id": c.id, "ok": false, "skipped": true,
+                        "text": "not run", "chars": 0, "truncated": false, "ms": 0}))).await;
+                }
+                sum.completion_tokens = total;
+                let _ = tx.send(RunEvent::Done(sum)).await;
+                return;
+            }
+            rounds += 1;
+            let mut results = Vec::new();
+            for c in &calls {
+                let route = hub.routes().into_iter().find(|(n, _, _)| *n == c.name);
+                let _ = tx.send(RunEvent::Mcp(json!({"event": "call", "id": c.id, "name": c.name,
+                    "server": route.as_ref().map(|(_, s, _)| s.name.clone()),
+                    "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
+                    "arguments": c.arguments, "round": rounds}))).await;
+                let args = Value::Object(c.arguments.clone());
+                // the call runs while the client is watched: one that leaves (the web app's Stop) ends it
+                let r = tokio::select! {
+                    r = hub.call(&c.name, &args) => r,
+                    _ = tx.closed() => return,
+                };
+                tracing::info!("tool {}: {}, {} characters in {:.1} s{}", c.name, if r["ok"] == true { "ok" } else { "error" },
+                               r["chars"], r["ms"].as_f64().unwrap_or(0.0) / 1000.0,
+                               if r["truncated"] == true { " (truncated for the model)" } else { "" });
+                results.push(r["text"].as_str().unwrap_or("").to_string());
+                let mut ev = json!({"event": "result", "id": c.id});
+                for k in ["ok", "text", "chars", "truncated", "ms"] {
+                    ev[k] = r[k].clone();
+                }
+                if tx.send(RunEvent::Mcp(ev)).await.is_err() {
+                    return;
+                }
+            }
+            let mut msg = json!({"role": "assistant", "content": text.trim(),
+                "tool_calls": calls.iter().map(|c| json!({"function": {"name": c.name, "arguments": c.arguments}})).collect::<Vec<_>>()});
+            if !reasoning.is_empty() {
+                msg["reasoning_content"] = json!(reasoning.trim());
+            }
+            prep.messages.push(msg);
+            prep.messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
+            cur = match start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await {
+                Ok(s) => s,
+                Err(Refusal(_, m)) => {
+                    let _ = tx.send(RunEvent::Error(m)).await;
+                    return;
+                }
+            };
         }
     });
     Ok(Started { events, prompt_tokens, model })

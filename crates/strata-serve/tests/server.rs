@@ -252,7 +252,7 @@ fn web_app_is_served() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
     let page = reqwest::blocking::get(format!("{}/", s.base)).unwrap().text().unwrap();
     assert!(page.contains("PolyStrata test page"));
-    let (c, m) = s.get("/mcp", false);
+    let (c, m) = s.get("/mcp", true);
     assert_eq!((c, m["tools"].as_u64()), (200, Some(0)));
 }
 
@@ -473,4 +473,38 @@ fn reasoning_loop_recovery_stop_ends_a_looping_reply() {
     assert_eq!(c, 200, "{r}");
     assert_eq!(r["choices"][0]["finish_reason"], "length");
     assert!(r["usage"]["completion_tokens"].as_u64().unwrap() < ids(&looping).len() as u64, "ended early");
+}
+
+#[test]
+fn mcp_tools_run_on_the_server_and_the_model_continues() {
+    let m = Model { extra: json!({"mcp_servers": {"calc": {"command": env!("CARGO_BIN_EXE_strata-mock-mcp")}}}), ..Model::default() };
+    let call = "\n\n<tool_call>\n<function=calc__add>\n<parameter=a>\n2\n</parameter>\n<parameter=b>\n3\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[m], &[ids(&format!("Use the tool.\n</think>{call}")), ids("Adding.\n</think>\n\nThe sum is 5.")], json!({}));
+    let (_, st) = s.get("/mcp", true);
+    let t0 = std::time::Instant::now();
+    let mut st = st;
+    while st["tools"] != 1 && t0.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        st = s.get("/mcp", true).1;
+    }
+    assert_eq!(st["servers"][0]["status"], "ready", "{st}");
+    assert_eq!(st["servers"][0]["tools"][0]["name"], "calc__add");
+
+    let ev = s.stream("/v1/chat/completions", &json!({"messages": [user("2+3?")], "stream": true, "strata_mcp": true}));
+    let mcp: Vec<&Value> = ev.iter().filter_map(|(_, v)| v.get("strata_mcp")).collect();
+    let kinds: Vec<&str> = mcp.iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["start", "call", "result"], "{mcp:?}");
+    assert_eq!(mcp[2]["text"], "5");
+    assert_eq!(mcp[2]["ok"], true);
+    let content: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
+    assert_eq!(content, "The sum is 5.");
+    let calls = ev.iter().filter_map(|(_, v)| v.get("choices")).filter(|c| c[0]["delta"].get("tool_calls").is_some()).count();
+    assert_eq!(calls, 0, "the MCP call is not the client's to answer");
+    let g = s.gen_lines();
+    assert_eq!(g.len(), 2, "a second round after the tool's result");
+
+    // without the opt-in the MCP tools are not offered; from a foreign web page they are refused
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").json(&json!({"messages": [user("x")], "strata_mcp": true})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
 }
