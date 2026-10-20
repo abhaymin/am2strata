@@ -1,0 +1,17 @@
+[package]
+name = "strata-template"
+description = "Chat template rendering with the Jinja settings of PolyStrata's serve/frontend.py ChatTemplate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minijinja.workspace = true
+minijinja-contrib.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

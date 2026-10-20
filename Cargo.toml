@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/strata-tokenizer",
+    "crates/strata-template",
+    "crates/strata-protocol",
+    "crates/strata-engine",
+    "crates/strata-serve",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+fancy-regex = "0.14"
+aho-corasick = "1"
+minijinja = { version = "2", features = ["loop_controls", "preserve_order", "json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+regex = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+axum = "0.8"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+strata-tokenizer = { path = "crates/strata-tokenizer" }
+strata-template = { path = "crates/strata-template" }
+strata-protocol = { path = "crates/strata-protocol" }
+strata-engine = { path = "crates/strata-engine" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
