@@ -5,12 +5,13 @@ use crate::literals::{mark_think_literals, unmark_think_literals, Literals};
 use crate::request::Prepared;
 use crate::{RequestError, Result};
 use serde_json::{json, Map, Value};
+use std::sync::Arc;
 use strata_template::ChatTemplate;
 use strata_tokenizer::Tokenizer;
 
-pub struct PromptBuilder<'a> {
-    pub template: &'a ChatTemplate,
-    pub tok: &'a Tokenizer,
+pub struct PromptBuilder {
+    pub template: Arc<ChatTemplate>,
+    pub tok: Arc<Tokenizer>,
     literals: Literals,
     /// bos_token / eos_token under the names templates know them by
     template_tokens: Map<String, Value>,
@@ -24,8 +25,8 @@ pub struct Prompt {
     pub opens_reasoning: bool,
 }
 
-impl<'a> PromptBuilder<'a> {
-    pub fn new(template: &'a ChatTemplate, tok: &'a Tokenizer) -> Self {
+impl PromptBuilder {
+    pub fn new(template: Arc<ChatTemplate>, tok: Arc<Tokenizer>) -> Self {
         let literals = Literals::new(&tok.control_tokens());
         let mut template_tokens = Map::new();
         for (name, key) in [("bos_token", "tokenizer.ggml.bos_token_id"), ("eos_token", "tokenizer.ggml.eos_token_id")] {

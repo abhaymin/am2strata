@@ -10,9 +10,9 @@ fn check(model: &str) {
     let path = format!("{}/../../golden/{model}-requests.json", env!("CARGO_MANIFEST_DIR"));
     let g: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let dir = g["tokenizer_dir"].as_str().unwrap();
-    let tok = Tokenizer::from_dir(dir).unwrap();
-    let tmpl = ChatTemplate::from_file(format!("{dir}/chat_template.jinja")).unwrap();
-    let builder = PromptBuilder::new(&tmpl, &tok);
+    let tok = std::sync::Arc::new(Tokenizer::from_dir(dir).unwrap());
+    let tmpl = std::sync::Arc::new(ChatTemplate::from_file(format!("{dir}/chat_template.jinja")).unwrap());
+    let builder = PromptBuilder::new(tmpl, tok);
 
     // literal tags: same tags, same marks, same order
     let want: Vec<(String, String)> =

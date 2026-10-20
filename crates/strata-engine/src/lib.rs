@@ -1,13 +1,17 @@
 //! Starts a PolyStrata engine (`strata` or `strata-poly`) from a run config (`strata-<model>.json`) and drives it
 //! over the line protocol, one request at a time, as serve/server.py's StrataEngine does.
 
+pub mod hardware;
+pub mod vision;
+
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use strata_protocol::{Done, Event, Gen, Sampling};
+use strata_protocol::{Done, Event, Gen, Images, Sampling};
+pub use vision::{Vision, VisionConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{mpsc, Mutex};
@@ -55,8 +59,84 @@ pub struct RunConfig {
     pub api_key: Option<String>,
     #[serde(default)]
     pub fit_max_tokens: bool,
+    #[serde(default)]
+    pub vision: Option<VisionConfig>,
+    /// the model family for the model card's sampling ("qwen4exp", "qwen35moe"); read from the GGUF when absent
+    #[serde(default)]
+    pub arch: Option<String>,
     #[serde(flatten)]
     pub rest: BTreeMap<String, serde_json::Value>,
+}
+
+/// `general.architecture` from a GGUF file's header (it is among the first keys).
+pub fn gguf_architecture(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 1 << 20];
+    let n = f.read(&mut buf).ok()?;
+    let b = &buf[..n];
+    if b.get(..4)? != b"GGUF" {
+        return None;
+    }
+    let rd_u64 = |o: usize| -> Option<u64> { Some(u64::from_le_bytes(b.get(o..o + 8)?.try_into().ok()?)) };
+    let rd_u32 = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    let n_kv = rd_u64(16)?;
+    let mut o = 24;
+    // value sizes of the fixed-width GGUF types, by type id
+    let fixed = |t: u32| -> Option<usize> { Some(match t { 0 | 1 | 7 => 1, 2 | 3 => 2, 4 | 5 | 6 => 4, 10 | 11 | 12 => 8, _ => return None }) };
+    for _ in 0..n_kv.min(4096) {
+        let klen = rd_u64(o)? as usize;
+        let key = std::str::from_utf8(b.get(o + 8..o + 8 + klen)?).ok()?;
+        o += 8 + klen;
+        let t = rd_u32(o)?;
+        o += 4;
+        if t == 8 {
+            let vlen = rd_u64(o)? as usize;
+            let v = b.get(o + 8..o + 8 + vlen)?;
+            if key == "general.architecture" {
+                return std::str::from_utf8(v).ok().map(str::to_owned);
+            }
+            o += 8 + vlen;
+        } else if t == 9 {
+            let et = rd_u32(o)?;
+            let cnt = rd_u64(o + 4)? as usize;
+            o += 12;
+            if et == 8 {
+                for _ in 0..cnt {
+                    o += 8 + rd_u64(o)? as usize;
+                }
+            } else {
+                o += cnt * fixed(et)?;
+            }
+        } else {
+            o += fixed(t)?;
+        }
+    }
+    None
+}
+
+/// The engine's environment: GPU selection, the config's `env`, and its library directories first on the path.
+pub fn child_env(cfg: &RunConfig) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    let gpus = cfg.gpus();
+    if !gpus.is_empty() {
+        env.push(("CUDA_DEVICE_ORDER".into(), "PCI_BUS_ID".into()));
+        env.push(("CUDA_VISIBLE_DEVICES".into(), gpus.iter().map(u64::to_string).collect::<Vec<_>>().join(",")));
+    }
+    for (k, v) in &cfg.env {
+        env.push((k.clone(), v.clone()));
+    }
+    let dirs: Vec<String> = cfg.lib_dirs.iter().filter(|d| d.is_dir()).map(|d| d.display().to_string()).collect();
+    if !dirs.is_empty() {
+        let mut path = dirs.join(":");
+        if let Ok(old) = std::env::var("LD_LIBRARY_PATH") {
+            if !old.is_empty() {
+                path = format!("{path}:{old}");
+            }
+        }
+        env.push(("LD_LIBRARY_PATH".into(), path));
+    }
+    env
 }
 
 impl RunConfig {
@@ -75,6 +155,23 @@ impl RunConfig {
             .and_then(|i| self.args.get(i + 1))
             .and_then(|v| v.parse().ok())
             .unwrap_or(8192)
+    }
+
+    /// The model file: `--model` (strata-poly) or `--native` (strata).
+    pub fn model_file(&self) -> Option<PathBuf> {
+        ["--model", "--native"].iter().find_map(|flag| {
+            self.args.iter().position(|a| a == flag).and_then(|i| self.args.get(i + 1)).map(PathBuf::from)
+        })
+    }
+
+    /// The model family: the config's `arch`, else the GGUF's `general.architecture`.
+    pub fn family(&self) -> Option<String> {
+        self.arch.clone().or_else(|| self.model_file().and_then(|p| gguf_architecture(&p)))
+    }
+
+    /// The first GPU the config names (nvidia-smi numbering).
+    pub fn first_gpu(&self) -> Option<u32> {
+        self.gpus().first().map(|g| *g as u32)
     }
 
     /// The GPUs to show the engine, numbered as nvidia-smi numbers them.
@@ -116,23 +213,8 @@ impl Engine {
         if let Some(cwd) = &cfg.cwd {
             cmd.current_dir(cwd);
         }
-        let gpus = cfg.gpus();
-        if !gpus.is_empty() {
-            cmd.env("CUDA_DEVICE_ORDER", "PCI_BUS_ID");
-            cmd.env("CUDA_VISIBLE_DEVICES", gpus.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
-        }
-        for (k, v) in &cfg.env {
+        for (k, v) in child_env(cfg) {
             cmd.env(k, v);
-        }
-        let dirs: Vec<String> = cfg.lib_dirs.iter().filter(|d| d.is_dir()).map(|d| d.display().to_string()).collect();
-        if !dirs.is_empty() {
-            let mut path = dirs.join(":");
-            if let Ok(old) = std::env::var("LD_LIBRARY_PATH") {
-                if !old.is_empty() {
-                    path = format!("{path}:{old}");
-                }
-            }
-            cmd.env("LD_LIBRARY_PATH", path);
         }
         match &cfg.log {
             Some(log) => {
@@ -180,13 +262,13 @@ impl Engine {
 
     /// Run one request. Events arrive on the returned channel; dropping the receiver stops the engine (STOP) and
     /// drains it to DONE, so the next request starts clean.
-    pub async fn generate(&self, max_new: u32, sampling: Sampling, turn_at: Option<usize>, ids: Vec<u32>)
-        -> mpsc::Receiver<Result<GenEvent>> {
+    pub async fn generate(&self, max_new: u32, sampling: Sampling, turn_at: Option<usize>, ids: Vec<u32>,
+                          images: Option<Images>) -> mpsc::Receiver<Result<GenEvent>> {
         let (out, rx) = mpsc::channel(256);
         let inner = self.inner.clone();
         tokio::spawn(async move {
             let _turn = inner.turn.lock().await;
-            let line = Gen { max_new, sampling: &sampling, turn_at, ids: &ids }.line();
+            let line = Gen { max_new, sampling: &sampling, turn_at, ids: &ids, images: images.as_ref() }.line();
             {
                 let mut stdin = inner.stdin.lock().await;
                 if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {

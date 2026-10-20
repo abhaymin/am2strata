@@ -70,7 +70,16 @@ impl Sampling {
     }
 }
 
-/// A generation request: `GEN <max_new>[ key=value ...] <id,id,...>`.
+/// Pictures of a request: the combined embeddings file the image encoder wrote (`GENI`), the token that marks
+/// their rows (strata-poly finds them by it), and each picture's key (its bytes' hash, PolyStrata #2228).
+#[derive(Debug, Clone, Default)]
+pub struct Images {
+    pub embeddings: String,
+    pub pad: u32,
+    pub keys: Vec<String>,
+}
+
+/// A generation request: `GEN <max_new>[ key=value ...] <id,id,...>`, or `GENI <max_new>[ keys] <file> <ids>`.
 #[derive(Debug, Clone)]
 pub struct Gen<'a> {
     pub max_new: u32,
@@ -78,13 +87,26 @@ pub struct Gen<'a> {
     /// Where the prompt's last turn begins (`turn_at=POS`): strata-poly keeps a conversation checkpoint there.
     pub turn_at: Option<usize>,
     pub ids: &'a [u32],
+    pub images: Option<&'a Images>,
 }
 
 impl Gen<'_> {
     pub fn line(&self) -> String {
-        let mut s = format!("GEN {}{}", self.max_new, self.sampling.keys());
+        let verb = if self.images.is_some() { "GENI" } else { "GEN" };
+        let mut s = format!("{verb} {}{}", self.max_new, self.sampling.keys());
+        if let Some(img) = self.images {
+            let _ = write!(s, " image_pad={}", img.pad);
+            let keys: Vec<&String> =
+                img.keys.iter().filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())).collect();
+            if !keys.is_empty() && keys.len() == img.keys.len() {
+                let _ = write!(s, " img_keys={}", keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(","));
+            }
+        }
         if let Some(at) = self.turn_at {
             let _ = write!(s, " turn_at={at}");
+        }
+        if let Some(img) = self.images {
+            let _ = write!(s, " {}", img.embeddings);
         }
         s.push(' ');
         for (i, id) in self.ids.iter().enumerate() {
@@ -192,9 +214,12 @@ mod tests {
     fn gen_line_matches_python_format() {
         let s = Sampling { temperature: Some(0.7), top_p: Some(0.8), top_k: Some(20), presence_penalty: Some(1.5),
                            ..Default::default() };
-        let g = Gen { max_new: 600, sampling: &s, turn_at: Some(3), ids: &[1, 2, 3, 4] };
+        let g = Gen { max_new: 600, sampling: &s, turn_at: Some(3), ids: &[1, 2, 3, 4], images: None };
         assert_eq!(g.line(),
             "GEN 600 temperature=0.7 top_p=0.8 top_k=20 penalty_present=1.5 penalty_last_n=64 turn_at=3 1,2,3,4\n");
+        let img = Images { embeddings: "/dev/shm/x.sve".into(), pad: 248056, keys: vec!["ab12".into(), "cd34".into()] };
+        let g = Gen { max_new: 10, sampling: &Sampling::default(), turn_at: Some(2), ids: &[7, 8], images: Some(&img) };
+        assert_eq!(g.line(), "GENI 10 image_pad=248056 img_keys=ab12,cd34 turn_at=2 /dev/shm/x.sve 7,8\n");
         let greedy = Sampling { temperature: Some(0.0), top_p: Some(1.0), top_k: Some(0), ..Default::default() };
         assert_eq!(greedy.keys(), " top_k=64");
         assert_eq!(Sampling { temperature: Some(1.0), ..Default::default() }.keys(), " temperature=1.0");

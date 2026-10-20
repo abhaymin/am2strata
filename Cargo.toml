@@ -41,5 +41,7 @@ strata-engine = { path = "crates/strata-engine" }
 strata-frontend = { path = "crates/strata-frontend" }
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+# the server is ~1% of request time (the engine is the rest): fast builds matter more than the last few percent
+lto = false
+codegen-units = 16
+incremental = true
