@@ -508,3 +508,80 @@ fn mcp_tools_run_on_the_server_and_the_model_continues() {
         .header("Origin", "https://evil.example").json(&json!({"messages": [user("x")], "strata_mcp": true})).send().unwrap();
     assert_eq!(r.status().as_u16(), 403);
 }
+
+#[test]
+fn the_engine_gets_its_eight_token_margin() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let req = json!({"messages": [user("hi")]});
+    let (c, _) = s.post("/v1/chat/completions", &req);
+    assert_eq!(c, 200);
+    let max_new: usize = s.gen_lines()[0].split(' ').nth(1).unwrap().parse().unwrap();
+    assert_eq!(max_new + expected_prompt(&req).len() + 8, 8192, "prompt + max_new + 8 = context");
+}
+
+#[test]
+fn structured_output_is_checked_before_delivery() {
+    let schema = json!({"type": "json_schema", "json_schema": {"name": "p", "schema": {"type": "object",
+        "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name", "age"]}}});
+    let s = Server::start(&[Model::default()],
+        &[ids("```json\n{\"name\": \"Ada\", \"age\": 36}\n```"), ids("{\"name\": \"Ada\"}"), ids("{\"name\": \"Bo\", \"age\": 7}")],
+        json!({}));
+    let base = json!({"messages": [user("x")], "chat_template_kwargs": {"enable_thinking": false}, "response_format": schema});
+    let (c, r) = s.post("/v1/chat/completions", &base);
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], r#"{"name":"Ada","age":36}"#);
+    let (c, r) = s.post("/v1/chat/completions", &base);
+    assert_eq!(c, 502, "a missing field fails the schema: {r}");
+    assert_eq!(r["error"]["code"], "structured_output_failed");
+    let mut st = base.clone();
+    st["stream"] = json!(true);
+    let ev = s.stream("/v1/chat/completions", &st);
+    let content: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
+    assert_eq!(content, r#"{"name":"Bo","age":7}"#, "streamed only once checked");
+    assert!(s.gen_lines()[0].len() > 0);
+    let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+    let mut bad = base.clone();
+    bad["tools"] = tools;
+    assert_eq!(s.post("/v1/chat/completions", &bad).0, 400, "JSON format with tools is refused");
+}
+
+#[test]
+fn responses_text_format_is_checked() {
+    let s = Server::start(&[Model::default()], &[ids("{\"ok\": true}")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"input": "x", "reasoning": {"effort": "none"},
+        "text": {"format": {"type": "json_object"}}}));
+    assert_eq!(c, 200, "{r}");
+    let msg = r["output"].as_array().unwrap().iter().find(|o| o["type"] == "message").unwrap();
+    assert_eq!(msg["content"][0]["text"], r#"{"ok":true}"#);
+}
+
+#[test]
+fn api_monitor_keeps_the_calls() {
+    let m = Model { extra: json!({"api_monitor": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("Thought.\n</think>\n\nHello there."), ids("Streamed answer.")], json!({}));
+    s.post("/v1/chat/completions", &json!({"messages": [user("hi")], "max_tokens": 50}));
+    s.stream("/v1/chat/completions", &json!({"messages": [user("again")], "stream": true, "chat_template_kwargs": {"enable_thinking": false}}));
+    let (c, l) = s.get("/api/requests", true);
+    assert_eq!(c, 200, "{l}");
+    let reqs = l["requests"].as_array().unwrap();
+    assert_eq!(reqs.len(), 2);
+    assert!(reqs.iter().all(|r| r["state"] == "completed" && r["http_status"] == 200), "{l}");
+    assert!(reqs[0].get("input").is_none(), "the list leaves the bodies out");
+    let older = reqs[1]["id"].as_str().unwrap();
+    let (_, d) = s.get(&format!("/api/requests?id={older}"), true);
+    assert_eq!(d["output"], "Hello there.");
+    assert_eq!(d["reasoning"], "Thought.\n");
+    assert!(d["input"].as_str().unwrap().contains("\"hi\""));
+    assert!(d["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    let (_, d) = s.get(&format!("/api/requests?id={}", reqs[0]["id"].as_str().unwrap()), true);
+    assert_eq!(d["output"], "Streamed answer.");
+    assert_eq!(d["stream"], true);
+    let page = reqwest::blocking::get(format!("{}/api-monitor", s.base)).unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+}
+
+#[test]
+fn api_monitor_is_off_by_default() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    assert_eq!(s.get("/api/requests", true).0, 404);
+}

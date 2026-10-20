@@ -18,7 +18,8 @@ use strata_tokenizer::Detokenizer;
 use tokio::sync::mpsc;
 
 /// The engine keeps a few tokens of slack at the end of the context (serve/server.py CTX_SLACK).
-const CTX_SLACK: usize = 1;
+/// `strata --serve` refuses prompt + max_new + 8 > context: the same margin here (serve/server.py CTX_SLACK)
+const CTX_SLACK: usize = 8;
 /// #1053: what closes the thinking when a reply stopped inside it (reasoning_close_retry)
 const REASONING_CLOSE: &str = "\n</think>\n\n";
 /// #728: the effort sentences the loop recovery swaps (the template's own xhigh one, and low)

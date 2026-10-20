@@ -80,6 +80,8 @@ def temp_service(args, rest) -> int:
     cmd = [str(BINARY), "--models-dir", args.models_dir, "--port", str(args.port), "--host", args.host, *rest]
     if args.model:
         cmd += ["--model", args.model]
+    if not args.no_api_monitor:
+        cmd.append("--api-monitor")
     subprocess.run(["systemctl", "--user", "reset-failed", TEMP_UNIT], stderr=subprocess.DEVNULL)
     if service_active():
         service("stop")
@@ -113,6 +115,8 @@ def main() -> int:
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--take-over", action="store_true", help=f"stop the {SERVICE} service while this server runs")
     ap.add_argument("--build", action="store_true", help="rebuild first")
+    ap.add_argument("--no-api-monitor", action="store_true",
+                    help="do not keep the last 100 API calls for /api-monitor (on by default here)")
     ap.add_argument("--test", action="store_true", help="run the Rust test suite and exit")
     ap.add_argument("--temp-service", action="store_true",
                     help=f"run as the temporary user service {TEMP_UNIT} in place of {SERVICE} (restored when it stops)")
@@ -141,6 +145,8 @@ def main() -> int:
     cmd = [str(BINARY), "--models-dir", args.models_dir, "--port", str(args.port), "--host", args.host, *rest]
     if args.model:
         cmd += ["--model", args.model]
+    if not args.no_api_monitor:
+        cmd.append("--api-monitor")
     say(" ".join(cmd))
     proc = subprocess.Popen(cmd, cwd=ROOT)
     try:

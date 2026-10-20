@@ -60,6 +60,13 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
     if req.get("tool_choice").and_then(Value::as_str) == Some("none") {
         prep.tools = None;
     }
+    let validator = match crate::structured::prepare_format(req.get("response_format"), &mut prep.messages, false) {
+        Ok(v) => v,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    if validator.is_some() && (prep.tools.is_some() || req.get("strata_mcp") == Some(&Value::Bool(true))) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "structured response_format with tools/MCP is not supported");
+    }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned() };
     // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
@@ -164,6 +171,10 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
             }
         }
     });
+    let rx = match validator {
+        Some(v) => structured(rx, v),
+        None => rx,
+    };
     if stream {
         let stream = futures::stream::unfold(rx, |mut rx| async move {
             match rx.recv().await {
@@ -179,6 +190,55 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
     collect(rx).await
 }
 
+/// Structured output: the chunks are held (keep-alives go on) until the answer is checked; then the first chunk, one
+/// with the whole checked content, and the last (serve/server.py structured_chunks). A failed check is an error
+/// chunk (or a 502 when not streaming).
+fn structured(mut rx: tokio::sync::mpsc::Receiver<Option<Value>>, v: crate::structured::Validator)
+              -> tokio::sync::mpsc::Receiver<Option<Value>> {
+    let (tx, out) = tokio::sync::mpsc::channel::<Option<Value>>(256);
+    tokio::spawn(async move {
+        let mut held: Vec<Value> = Vec::new();
+        while let Some(c) = rx.recv().await {
+            match c {
+                Some(c) if c.get("error").is_some() => {
+                    let _ = tx.send(Some(c)).await;
+                    return;
+                }
+                Some(c) => held.push(c),
+                None => {}
+            }
+            if tx.send(None).await.is_err() {
+                return; // the client is gone
+            }
+        }
+        let (Some(first), Some(last)) = (held.first().cloned(), held.last().cloned()) else { return };
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        for c in &held {
+            let d = &c["choices"][0]["delta"];
+            content.push_str(d.get("content").and_then(Value::as_str).unwrap_or(""));
+            reasoning.push_str(d.get("reasoning_content").and_then(Value::as_str).unwrap_or(""));
+        }
+        let finish = last["choices"][0]["finish_reason"].as_str().unwrap_or("stop").to_string();
+        match crate::structured::validated_json(&content, &v, &finish) {
+            Ok(text) => {
+                let mut delta = json!({"content": text});
+                if !reasoning.is_empty() {
+                    delta["reasoning_content"] = json!(reasoning);
+                }
+                let mut mid = first.clone();
+                mid["choices"] = json!([{"index": 0, "delta": delta, "finish_reason": null}]);
+                for c in [first, mid, last] {
+                    let _ = tx.send(Some(c)).await;
+                }
+            }
+            Err(crate::structured::StructuredError(m)) => {
+                let _ = tx.send(Some(json!({"error": {"type": "structured_output_failed", "code": "structured_output_failed", "message": m}}))).await;
+            }
+        }
+    });
+    out
+}
+
 /// The streamed chunks merged into one chat.completion (serve/server.py openai_collect).
 async fn collect(mut rx: tokio::sync::mpsc::Receiver<Option<Value>>) -> Response {
     let (mut content, mut reasoning) = (String::new(), String::new());
@@ -187,7 +247,12 @@ async fn collect(mut rx: tokio::sync::mpsc::Receiver<Option<Value>>) -> Response
     while let Some(c) = rx.recv().await {
         let Some(c) = c else { continue };
         if let Some(e) = c.get("error") {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e["message"].as_str().unwrap_or("error").to_string());
+            let msg = e["message"].as_str().unwrap_or("error").to_string();
+            if e["type"] == "structured_output_failed" {
+                return (StatusCode::BAD_GATEWAY, Json(json!({"error": {"type": "structured_output_failed",
+                        "code": "structured_output_failed", "message": msg}}))).into_response();
+            }
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", msg);
         }
         let d = &c["choices"][0]["delta"];
         content.push_str(d.get("content").and_then(Value::as_str).unwrap_or(""));

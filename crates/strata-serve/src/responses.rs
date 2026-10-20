@@ -366,6 +366,24 @@ pub fn request_tools(req: &Value) -> Result<(Vec<Value>, ToolNames, Vec<String>)
     Ok((tools, names, skipped))
 }
 
+/// `text.format` -> the chat path's response_format (None: plain text).
+pub fn text_format(req: &Value) -> Result<Option<Value>, RespError> {
+    let Some(text) = req.get("text").filter(|t| !t.is_null()) else { return Ok(None) };
+    let t = text.as_object().ok_or_else(|| RespError::new("text must be an object", "text".to_string()))?;
+    let Some(fmt) = t.get("format").filter(|f| !f.is_null()) else { return Ok(None) };
+    let f = fmt.as_object().ok_or_else(|| RespError::new("text.format must be an object", "text.format".to_string()))?;
+    match f.get("type").and_then(Value::as_str) {
+        None | Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(json!({"type": "json_object"}))),
+        Some("json_schema") => {
+            let spec: serde_json::Map<String, Value> = ["name", "schema", "strict", "description"].iter()
+                .filter_map(|k| f.get(*k).map(|v| (k.to_string(), v.clone()))).collect();
+            Ok(Some(json!({"type": "json_schema", "json_schema": spec})))
+        }
+        _ => Err(RespError::new("text.format.type must be text, json_object or json_schema", "text.format.type".to_string())),
+    }
+}
+
 /// What this stateless server cannot do, refused before anything runs.
 pub fn check_request(req: &Value) -> Result<(), RespError> {
     let set = |k: &str| req.get(k).is_some_and(strata_frontend_truthy);
@@ -444,6 +462,11 @@ pub struct Assembler {
     /// the index (in response.output) of the open item
     open: Option<usize>,
     pub response: Value,
+    /// structured output (text.format): the answer is held until it is checked
+    pub validator: Option<crate::structured::Validator>,
+    json_text: String,
+    /// a tool call was made: this turn is not the final answer (its text goes out as written)
+    called: bool,
 }
 
 impl Assembler {
@@ -465,7 +488,7 @@ impl Assembler {
             "top_p": g("top_p"), "truncation": "disabled", "usage": null, "user": null,
             "metadata": req.get("metadata").filter(|t| !t.is_null()).cloned().unwrap_or(json!({})),
         });
-        Assembler { names, encrypted, prompt_tokens, seq: 0, open: None, response }
+        Assembler { names, encrypted, prompt_tokens, seq: 0, open: None, response, validator: None, json_text: String::new(), called: false }
     }
 
     fn event(&mut self, kind: &str, data: Value) -> Value {
@@ -585,6 +608,10 @@ impl Assembler {
                 append(&mut item["content"][0]["text"], &t);
                 out.push(self.event("response.reasoning_text.delta", json!({"item_id": id, "output_index": at, "content_index": 0, "delta": t})));
             }
+            Event::Content(t) if !t.is_empty() && self.validator.is_some() => {
+                out.extend(self.close("completed")); // sent once it is checked (finish)
+                self.json_text.push_str(&t);
+            }
             Event::Content(t) if !t.is_empty() => {
                 if self.item_type() != Some("message") {
                     out.extend(self.close("completed"));
@@ -599,6 +626,7 @@ impl Assembler {
             }
             Event::ToolStart { id, name } => {
                 out.extend(self.close("completed"));
+                out.extend(self.call_started());
                 let item = self.call_item(&id, &name);
                 out.extend(self.open_item(item));
             }
@@ -626,6 +654,7 @@ impl Assembler {
         if self.open_call_id().as_deref() != Some(c.id.as_str()) {
             // a call that was not announced while it was written
             out.extend(self.close("completed"));
+            out.extend(self.call_started());
             let item = self.call_item(&c.id, &c.name);
             out.extend(self.open_item(item));
             if self.item_type() == Some("function_call") {
@@ -652,12 +681,54 @@ impl Assembler {
         out
     }
 
+    /// A held answer (structured output, or the words written beside a tool call) as one message item.
+    fn release(&mut self, text: &str) -> Vec<Value> {
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut out = self.open_item(json!({"id": new_id("msg"), "type": "message", "status": "in_progress", "role": "assistant"}));
+        let at = self.open.unwrap();
+        let item = self.item().unwrap();
+        item["content"][0]["text"] = json!(text);
+        let id = item["id"].clone();
+        out.push(self.event("response.output_text.delta", json!({"item_id": id, "output_index": at, "content_index": 0, "delta": text, "logprobs": []})));
+        out.extend(self.close("completed"));
+        out
+    }
+
+    /// The first tool call of a JSON-format turn: what the model wrote before it goes out as it is (#782).
+    fn call_started(&mut self) -> Vec<Value> {
+        let mut out = Vec::new();
+        if self.validator.is_some() && !self.called {
+            let held = std::mem::take(&mut self.json_text);
+            out = self.release(&held);
+        }
+        self.called = true;
+        out
+    }
+
     /// The end: close what is open, then response.completed (or .incomplete when max_output_tokens ran out).
     pub fn finish(&mut self, sum: &Summary) -> Vec<Value> {
         let length = sum.finish == "length";
         // a call still open was cut off: incomplete, whatever the finish
         let unfinished = matches!(self.item_type(), Some("function_call" | "custom_tool_call"));
         let mut out = self.close(if length || unfinished { "incomplete" } else { "completed" });
+        if let Some(v) = self.validator.take() {
+            let text = std::mem::take(&mut self.json_text);
+            if self.called {
+                out.extend(self.release(&text));
+            } else {
+                match crate::structured::validated_json(&text, &v, &sum.finish) {
+                    Ok(t) => out.extend(self.release(&t)),
+                    Err(crate::structured::StructuredError(m)) => {
+                        let mut f = self.failed(&m);
+                        f["response"]["error"]["code"] = json!("structured_output_failed");
+                        out.push(f);
+                        return out;
+                    }
+                }
+            }
+        }
         let n = sum.completion_tokens;
         let prompt = self.prompt_tokens;
         self.response["usage"] = json!({
@@ -735,9 +806,18 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req):
         let shared = loaded.shared.read().unwrap().clone();
         crate::settings::with_shared(&mut chat, &shared, loaded.config_effort().as_deref(), "openai");
     }
-    let prep = match openai_to_messages(&chat, &loaded.tool_orders) {
+    let mut prep = match openai_to_messages(&chat, &loaded.tool_orders) {
         Ok(p) => p,
         Err(e) => return RespError::new(e.0, None).into_response(),
+    };
+    let rf = match text_format(&req) {
+        Ok(f) => f,
+        Err(e) => return e.into_response(),
+    };
+    let with_tools = prep.tools.is_some();
+    let validator = match crate::structured::prepare_format(rf.as_ref(), &mut prep.messages, with_tools) {
+        Ok(v) => v,
+        Err(e) => return RespError::new(e, "text.format".to_string()).into_response(),
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned() };
@@ -754,6 +834,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req):
         .and_then(Value::as_array)
         .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("reasoning.encrypted_content")));
     let mut asm = Assembler::new(&req, &started.model, started.prompt_tokens as u64, names, encrypted);
+    asm.validator = validator;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(256);
     let mut events = started.events;
     tokio::spawn(async move {
@@ -795,6 +876,10 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req):
         last = Some(e);
     }
     match last {
+        Some(e) if e["type"] == "response.failed" && e["response"]["error"]["code"] == "structured_output_failed" => {
+            let msg = e["response"]["error"]["message"].as_str().unwrap_or("error").to_string();
+            (StatusCode::BAD_GATEWAY, Json(error_body(&msg, "server_error", None, Some("structured_output_failed")))).into_response()
+        }
         Some(e) if e["type"] == "response.failed" => {
             let msg = e["response"]["error"]["message"].as_str().unwrap_or("error").to_string();
             (StatusCode::INTERNAL_SERVER_ERROR, Json(error_body(&msg, "server_error", None, None))).into_response()

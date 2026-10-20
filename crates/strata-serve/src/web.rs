@@ -178,9 +178,20 @@ async fn engine_facts(s: &AppState) -> (Value, bool) {
         Some(l) => {
             let args = &l.entry.cfg.args;
             let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
-            json!({"model": l.entry.display_name(), "id": l.entry.id, "max_context": l.max_context,
+            let mut f = json!({"model": l.entry.display_name(), "id": l.entry.id, "max_context": l.max_context,
                    "images": l.vision.is_some(), "kv": arg("--kv"), "kv_resident": arg("--kv-resident").and_then(|v| v.parse::<u64>().ok()),
-                   "family": l.family, "adapted": l.adapted})
+                   "family": l.family, "adapted": l.adapted});
+            // the engine's own start-up report (INFO k=v ...): version, expert cache, speculation, as PolyStrata shows it
+            for item in l.engine.info.iter().flat_map(|line| line.split_whitespace()) {
+                if let Some((k, v)) = item.split_once('=') {
+                    let key = if k == "engine" { "version" } else { k };
+                    let val = v.parse::<i64>().map(|n| json!(n)).or_else(|_| v.parse::<f64>().map(|x| json!(x))).unwrap_or(json!(v));
+                    if f.get(key).is_none_or(|x| x.is_null()) {
+                        f[key] = val;
+                    }
+                }
+            }
+            f
         }
         None => json!({"model": s.mgr.entry(&s.mgr.default_id).map(|e| e.display_name()), "max_context": null, "images": false}),
     };

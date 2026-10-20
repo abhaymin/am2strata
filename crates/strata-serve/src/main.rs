@@ -6,6 +6,7 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod anthropic;
+mod api_monitor;
 mod manager;
 mod mcp;
 mod media;
@@ -14,6 +15,7 @@ mod openai;
 mod responses;
 mod run;
 mod settings;
+mod structured;
 mod web;
 
 use anyhow::{bail, Context, Result};
@@ -50,6 +52,10 @@ struct Args {
     /// the web app's files (default: <models-dir>/serve/web)
     #[arg(long)]
     web_dir: Option<String>,
+    /// keep the last 100 API calls (bodies, output, timings) in memory for /api-monitor (also "api_monitor": true
+    /// in the config)
+    #[arg(long)]
+    api_monitor: bool,
     /// do not load a model until the first request
     #[arg(long)]
     lazy: bool,
@@ -66,6 +72,7 @@ pub struct AppState {
     pub mcp: Option<Arc<mcp::McpHub>>,
     /// web origins besides this server's own that may change settings and run tools (the config's trusted_origins)
     pub trusted_origins: Vec<String>,
+    pub api_monitor: Arc<api_monitor::ApiMonitor>,
 }
 
 /// A web page of another origin sent this: its Origin is neither this server's address nor a trusted one (no Origin
@@ -147,7 +154,12 @@ async fn main() -> Result<()> {
     }
     let trusted_origins = first.cfg.rest.get("trusted_origins").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim_end_matches('/').to_string())).collect()).unwrap_or_default();
-    let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins };
+    let monitor_on = args.api_monitor || first.cfg.rest.get("api_monitor") == Some(&serde_json::Value::Bool(true));
+    if monitor_on {
+        tracing::info!("API monitor on: the last 100 API calls are kept in memory, at /api-monitor");
+    }
+    let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
+                           api_monitor: api_monitor::ApiMonitor::new(monitor_on) };
     let web_dir = args.web_dir.map(|p| expand(&p)).unwrap_or_else(|| dir.join("serve/web"));
     let app = Router::new()
         .route("/health", get(web::health))
@@ -161,6 +173,9 @@ async fn main() -> Result<()> {
         .route("/api/models/current", get(web::current_model))
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
+        .route("/api/requests", get(api_monitor::requests))
+        .route("/load", post(api_monitor::load))
+        .route("/unload", post(api_monitor::unload))
         .route("/settings", get(web::settings_get).post(web::settings_post))
         .route("/config", get(web::config_get).post(web::config_post))
         .route("/mcp", get(web::mcp))
@@ -172,6 +187,7 @@ async fn main() -> Result<()> {
         .route_service("/api-monitor", ServeFile::new(web_dir.join("monitor.html")))
         .nest_service("/web", ServeDir::new(&web_dir))
         .nest_service("/fonts", ServeDir::new(web_dir.join("fonts")))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;
