@@ -304,3 +304,57 @@ fn tool_choice_forces_the_call() {
     assert_eq!(g.len(), 3, "two passes for the thinking request: {g:?}");
     assert!(line_ids(&g[2]).ends_with(&ids("<tool_call>\n<function=get_weather>\n")));
 }
+
+#[test]
+fn responses_api_text_reasoning_and_the_same_prompt_as_chat() {
+    let s = Server::start(&[Model::default()], &[ids("I add them.\n</think>\n\nThe answer is 4.")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"instructions": "Be brief.", "input": "What is 2+2?",
+                                                  "max_output_tokens": 100, "include": ["reasoning.encrypted_content"]}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["object"], "response");
+    assert_eq!(r["status"], "completed");
+    let out = r["output"].as_array().unwrap();
+    assert_eq!(out[0]["type"], "reasoning");
+    assert_eq!(out[0]["content"][0]["text"], "I add them.\n");
+    assert!(out[0]["encrypted_content"].as_str().unwrap().starts_with("strata.r1:"));
+    assert_eq!(out[1]["type"], "message");
+    assert_eq!(out[1]["content"][0]["text"], "The answer is 4.");
+    assert!(r["usage"]["output_tokens"].as_u64().unwrap() > 0);
+    let chat = json!({"messages": [{"role": "system", "content": "Be brief."}, user("What is 2+2?")]});
+    let gen = s.gen_lines();
+    assert!(gen[0].starts_with("GEN 100 "), "{}", gen[0]);
+    assert_eq!(line_ids(&gen[0]), expected_prompt(&chat), "the same prompt as the chat request");
+}
+
+#[test]
+fn responses_api_streams_typed_events_and_function_calls() {
+    let reply = ids(&format!("Need the tool.\n</think>{CALL}"));
+    let s = Server::start(&[Model::default()], &[reply], json!({}));
+    let ev = s.stream("/v1/responses", &json!({"input": [{"role": "user", "content": "Weather in Pune?"}], "stream": true,
+        "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}]}));
+    let kinds: Vec<&str> = ev.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(&kinds[..2], ["response.created", "response.in_progress"]);
+    assert_eq!(*kinds.last().unwrap(), "response.completed");
+    for (k, v) in &ev {
+        assert_eq!(v["type"], k.as_str(), "the event name is the data's type");
+    }
+    let seq: Vec<u64> = ev.iter().map(|(_, v)| v["sequence_number"].as_u64().unwrap()).collect();
+    assert!(seq.windows(2).all(|w| w[1] == w[0] + 1), "sequence numbers count up: {seq:?}");
+    let args: String = ev.iter().filter(|(k, _)| k == "response.function_call_arguments.delta")
+        .map(|(_, v)| v["delta"].as_str().unwrap().to_string()).collect();
+    assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({"city": "Pune"}));
+    let done = &ev.last().unwrap().1["response"]["output"];
+    let call = done.as_array().unwrap().iter().find(|i| i["type"] == "function_call").unwrap();
+    assert_eq!(call["name"], "get_weather");
+    assert_eq!(call["status"], "completed");
+    assert!(call["call_id"].as_str().unwrap().starts_with("call_"));
+}
+
+#[test]
+fn responses_api_is_stateless() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"input": "hi", "previous_response_id": "resp_1"}));
+    assert_eq!(c, 400);
+    assert_eq!(r["error"]["code"], "unsupported_parameter");
+    assert_eq!(s.get("/v1/responses/resp_1", true).0, 404);
+}

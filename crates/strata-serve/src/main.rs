@@ -9,6 +9,7 @@ mod anthropic;
 mod manager;
 mod media;
 mod openai;
+mod responses;
 mod run;
 mod web;
 
@@ -126,6 +127,8 @@ async fn main() -> Result<()> {
         .route("/health", get(web::health))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat))
+        .route("/v1/responses", post(responses::responses))
+        .route("/v1/responses/{*rest}", get(responses::not_stored).post(responses::not_stored).delete(responses::not_stored))
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
         .route("/api/models", get(web::list_models))
