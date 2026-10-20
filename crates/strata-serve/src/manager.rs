@@ -238,8 +238,8 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
     let pad_literal = tok.encode("<|image_pad|>", false).unwrap_or_default();
     let turn_ids: Vec<u32> = one("<|im_start|>").into_iter().collect();
     let family = cfg.family();
-    tracing::info!(model = %entry.id, family = ?family, "starting the engine");
-    let engine = Engine::start(&cfg, ready_timeout).await.with_context(|| format!("engine of {}", entry.id))?;
+    // the image encoder first: the engine sizes its expert cache to the VRAM it finds free, so an encoder started
+    // after it finds none (PolyStrata starts them in this order too)
     let vision = match &cfg.vision {
         Some(v) => {
             let env = child_env(&cfg);
@@ -252,6 +252,16 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
             }
         }
         None => None,
+    };
+    tracing::info!(model = %entry.id, family = ?family, "starting the engine");
+    let engine = match Engine::start(&cfg, ready_timeout).await {
+        Ok(e) => e,
+        Err(e) => {
+            if let Some(v) = &vision {
+                v.shutdown().await;
+            }
+            return Err(anyhow::Error::new(e).context(format!("engine of {}", entry.id)));
+        }
     };
     let max_context = cfg.max_context();
     let prompts = PromptBuilder::new(template, tok.clone());

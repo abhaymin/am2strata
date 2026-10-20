@@ -5,28 +5,35 @@ risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 don
 
 ## What works
 
-| Crate | What it does | Checked against |
+`strata-serve` runs every model of a PolyStrata folder (each `strata-*.json`) behind one address and switches
+between them, driving PolyStrata's own C++/CUDA engines (`strata` for Orca / Qwen3.8, `strata-poly` for Tiel Coder,
+MiniCPM-V and the others) over their line protocol.
+
+| Area | State | Checked against |
 | --- | --- | --- |
-| `strata-tokenizer` | Byte-level BPE for PolyStrata tokenizer directories (`qwen35`, `glm4` pre-tokenizers), special-token rules, incremental UTF-8 decode | Token ids recorded from PolyStrata's Python tokenizer: 12 chat prompts and 16 edge cases each for Tiel Coder and Orca, all identical |
-| `strata-template` | The model's Jinja chat template with transformers' settings, Python-style `tojson`, `raise_exception` | Prompt text recorded from PolyStrata's Python `ChatTemplate`: all 12 cases identical for both models, tools and tool round trips included |
-| `strata-protocol` | GEN/STOP/QUIT lines and engine event parsing | Unit tests on the Python server's formats |
-| `strata-engine` | Starts an engine from a PolyStrata run config, waits for READY, one request at a time, STOP and drain when a client leaves | Live, with the Tiel Coder Q6 engine |
-| `strata-serve` | `/health`, `/v1/models`, `/v1/chat/completions` (streaming and not), API key, reasoning split | Live, with the Tiel Coder Q6 engine |
+| Tokenizer, chat template, request normalization (OpenAI and Anthropic), quoted special tokens, prompt ids | done | Golden files recorded from PolyStrata's Python: 12 template cases, 16 tokenizer cases and 30 whole requests per model, all identical |
+| Output parsing: reasoning, tool calls, streamed tool arguments, quoted `</think>`, calls in code or reasoning | done | 92 recorded parser runs, all identical |
+| OpenAI `/v1/chat/completions` (stream and not, tools, images), `/v1/models` | done | live: Orca, Tiel Q6, MiniCPM-V |
+| Anthropic `/v1/messages` (stream and not, thinking, tool_use), `/v1/messages/count_tokens` | done | live |
+| Images (image encoder process, cache, `GENI`), complex documents | done | live: invoice and purchase order fields exact |
+| Video | as frames: video parts are cut into frames with ffmpeg when installed; frames sent as images always work | live (frames); ffmpeg path needs `sudo apt install ffmpeg` |
+| Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
+| Web app (PolyStrata's own files) | done: chat, model picker, settings, monitor polling | live in a browser |
+| Stop strings, model-card default sampling, `fit_max_tokens` | done | live |
+| Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
 
-Live results on the RTX 5060 Ti box (Tiel Coder UD-Q6_K_XL, greedy, warm): 96–120 tok/s; time spent outside the
-engine 1.3–1.5 ms per request (Python server: 1.6–1.8 ms); first streamed text 31 ms after the request; a client
-hanging up mid-answer stops the engine and the next request answers in 0.66 s. The engine loaded more experts into
-VRAM under the Rust server (4,180 against ~3,720) only because the Rust server does not start the image encoder yet.
-
-PolyStrata's own server is not deterministic between runs, even greedy (GPU and CPU expert paths round differently
-and the expert cache adapts), so comparing answer text is not a valid test. The gate is that the Rust server sends
-the engine the same token ids, which the golden files prove.
+Live numbers on the RTX 5060 Ti 16 GB (warm, greedy, thinking off): Tiel Coder Q6 104-106 tok/s median through
+this server (PolyStrata: ~98, same expert placement: 3,713 experts in VRAM); Orca's engine came up with the same
+expert cache as under PolyStrata (3,985 slots, 8.27 GB).
 
 ## Not yet
 
-Image input, tool-call parsing in the output, stop strings, Anthropic `/v1/messages` and the Responses API, model
-switching, the web page, metrics, the model card's default sampling (requests without a temperature are greedy
-here), and everything from Phase 2 on.
+Thinking budgets (`reasoning_budget_tokens`, Anthropic `budget_tokens` as a hard cap), `tool_choice` forcing a call,
+the Responses API, MCP tool running, request history and GPU telemetry in the monitor, shared chat settings, image
+generation, and the GLM / Gemma / DeepSeek / LFM2 tool-call formats.
+
+For an RTX 3060 (sm_86) the engines must also be compiled for sm_86; today's PolyStrata build here is sm_120 only,
+and the server says so instead of failing inside the engine.
 
 ## Use
 
@@ -34,7 +41,7 @@ here), and everything from Phase 2 on.
 cargo build --release
 cargo test --release
 # the GPU must be free: unload the PolyStrata service's model first
-./target/release/strata-serve --config ~/Development/PolyStrata/strata-tiel-ud-q6_k_xl.json --port 8001
+./target/release/strata-serve --models-dir ~/Development/PolyStrata --model orcarouter --port 8001
 ```
 
 Golden files are recorded from PolyStrata with:

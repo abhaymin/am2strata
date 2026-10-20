@@ -23,7 +23,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
 #[command(about = "PolyStrata server in Rust: every installed model, OpenAI and Anthropic APIs, the web app")]
@@ -136,7 +136,11 @@ async fn main() -> Result<()> {
         .route("/config", get(web::config_get))
         .route("/mcp", get(web::mcp))
         .route("/metrics", get(web::metrics))
-        .fallback_service(ServeDir::new(&web_dir).append_index_html_on_directories(true))
+        // the web app: the page at /, its files under /web/ (as PolyStrata serves them), the monitor at /api-monitor
+        .route_service("/", ServeFile::new(web_dir.join("index.html")))
+        .route_service("/api-monitor", ServeFile::new(web_dir.join("monitor.html")))
+        .nest_service("/web", ServeDir::new(&web_dir))
+        .nest_service("/fonts", ServeDir::new(web_dir.join("fonts")))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;

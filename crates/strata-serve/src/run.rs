@@ -274,9 +274,10 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                     }
                 }
                 Some(Ok(GenEvent::Done(d))) => {
+                    // the engine's own codes: "stop" (end of sequence), "length", "cancel" (after STOP)
                     let finish = match d.finish.as_str() {
                         "length" => "length",
-                        "stop" => "cancel",
+                        "cancel" => "cancel",
                         _ => "stop",
                     };
                     // the parser's held text first goes through the stop strings, then what they held back

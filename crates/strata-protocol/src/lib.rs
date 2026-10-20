@@ -136,7 +136,7 @@ pub struct Done {
     pub prompt_tokens: u64,
     pub prompt_ms: f64,
     pub decode_ms: f64,
-    /// `eos`, `length`, `stop`, `nonfinite`, ...
+    /// `stop` (end of sequence), `length`, `cancel` (after STOP), `nonfinite`
     pub finish: String,
     pub drafts_accepted: Option<u64>,
     pub drafts_offered: Option<u64>,
