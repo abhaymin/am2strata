@@ -1,7 +1,7 @@
 # polystrata-rs
 
 A staged rewrite of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
-risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 done, Phase 1 largely done**: the Rust server can stand in for the Python one for chat, coding agents, pictures and documents.
+risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 and Phase 1 done**: the Rust server can stand in for the Python one for chat, coding agents (OpenAI, Anthropic and Responses APIs), MCP tools, pictures and documents. Image generation is the one PolyStrata feature not ported.
 
 ## What works
 
@@ -12,7 +12,13 @@ MiniCPM-V and the others) over their line protocol.
 | Area | State | Checked against |
 | --- | --- | --- |
 | Tokenizer, chat template, request normalization (OpenAI and Anthropic), quoted special tokens, prompt ids | done | Golden files recorded from PolyStrata's Python: 12 template cases, 16 tokenizer cases and 30 whole requests per model, all identical |
-| Output parsing: reasoning, tool calls, streamed tool arguments, quoted `</think>`, calls in code or reasoning | done | 92 recorded parser runs, all identical |
+| Output parsing: reasoning, tool calls, streamed tool arguments, quoted `</think>`, calls in code or reasoning | done | 164 recorded parser runs, all identical |
+| Tool-call formats GLM, Gemma 4, DeepSeek V4 (DSML), LFM2; gemma4 and deepseek-v3 tokenizers; per-format stop tokens and prompt rules | done | recorded parser runs; synthetic tokenizers recorded from the Python tokenizer (no such model installed here) |
+| OpenAI Responses `/v1/responses` (stateless, typed SSE events, namespace and custom tools, encrypted reasoning replay) | done | mock engine; live: Orca |
+| Thinking budgets (with answer room), `tool_choice` forcing a call, preserve_thinking, reasoning_close_retry, reasoning_loop_recovery, repeat stop | done | mock engine; live: budget and forced call on Orca |
+| MCP tools (stdio and Streamable HTTP servers from the run config, `/mcp`, tool rounds for the web app's `strata_mcp`) | done | mock MCP server |
+| Monitor (`/metrics`: request history, totals, live tok/s, GPU/CPU/RAM/disk series), `/metrics/prometheus`, `/v1/status` | done | mock engine; live |
+| Shared chat settings (`/settings`), run-config view (`/config`), config `sampling` block (merged key by key, as PolyStrata) | done | mock engine |
 | OpenAI `/v1/chat/completions` (stream and not, tools, images), `/v1/models` | done | live: Orca, Tiel Q6, MiniCPM-V |
 | Anthropic `/v1/messages` (stream and not, thinking, tool_use), `/v1/messages/count_tokens` | done | live |
 | Images (image encoder process, cache, `GENI`), complex documents | done | live: invoice and purchase order fields exact |
@@ -28,20 +34,21 @@ expert cache as under PolyStrata (3,985 slots, 8.27 GB).
 
 ## Not yet
 
-Thinking budgets (`reasoning_budget_tokens`, Anthropic `budget_tokens` as a hard cap), `tool_choice` forcing a call,
-the Responses API, MCP tool running, request history and GPU telemetry in the monitor, shared chat settings, image
-generation, and the GLM / Gemma / DeepSeek / LFM2 tool-call formats.
+Image generation (`/v1/images/generations`). Parallel batch slots and replicas (PolyStrata's opt-ins) are not ported
+either; this box runs one slot.
 
-For an RTX 3060 (sm_86) the engines must also be compiled for sm_86; today's PolyStrata build here is sm_120 only,
-and the server says so instead of failing inside the engine.
+The PolyStrata engines here are built for sm_86 and sm_120 (RTX 30 and RTX 50 cards) since 2026-10-20, so the same
+build runs on an RTX 3060 12 GB; warm speed on the 5060 Ti is unchanged (Orca 62 tok/s, Tiel Q6 99-110 tok/s).
 
 ## Use
 
 ```sh
-cargo build --release
-cargo test --release
-# the GPU must be free: unload the PolyStrata service's model first
-./target/release/strata-serve --models-dir ~/Development/PolyStrata --model orcarouter --port 8001
+python3 run.py --test                                   # the whole Rust test suite (no GPU)
+python3 run.py --take-over --port 8000                  # in the foreground, in place of the PolyStrata service
+python3 run.py --temp-service --port 8000               # as a temporary user service; PolyStrata's comes back when it stops
+python3 run.py --stop-temp-service
+# live GPU tests against a running server
+STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p strata-serve --release --test live -- --ignored --test-threads=1
 ```
 
 Golden files are recorded from PolyStrata with:

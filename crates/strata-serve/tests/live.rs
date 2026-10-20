@@ -117,8 +117,46 @@ fn live_tiel_streamed_tool_call_and_speed() {
     load("tiel-coder-35b-a3b-ud-q6");
     let (_, r) = post("/v1/chat/completions", &json!({"messages": [user(json!("Write a Python function that reverses a string. Code only."))],
                                                        "max_tokens": 400, "temperature": 0, "chat_template_kwargs": no_think()}));
+    assert!(content(&r).contains("def "), "{r}");
+    // the speed of a warm engine (the first answers after a load fill its expert cache) over a long answer
+    let ask = json!({"messages": [user(json!("Write a Python module implementing a binary search tree with insert, delete, \
+                     search and in-order traversal, with docstrings."))], "max_tokens": 800, "chat_template_kwargs": no_think()});
+    post("/v1/chat/completions", &ask);
+    let (_, r) = post("/v1/chat/completions", &ask);
     let tps = r["timings"]["predicted_per_second"].as_f64().unwrap_or(0.0);
     eprintln!("Tiel Q6: {} tokens at {tps:.1} tok/s", r["timings"]["predicted_n"]);
-    assert!(content(&r).contains("def "), "{r}");
-    assert!(tps > 30.0, "far below the ~100 tok/s this card does warm: {tps}");
+    assert!(tps > 70.0, "below the 70 tok/s floor (this card does ~100-110 warm): {tps}");
+}
+
+fn get(path: &str) -> Value {
+    reqwest::blocking::Client::new().get(format!("{}{path}", base())).bearer_auth(key()).send().unwrap().json().unwrap()
+}
+
+#[test]
+#[ignore]
+fn live_orca_responses_budget_forced_call_and_monitor() {
+    load("orcarouter");
+    // the Responses API (Codex's), stateless
+    let (c, r) = post("/v1/responses", &json!({"input": "What is 12*12? Reply with just the number.", "max_output_tokens": 300,
+                                                "reasoning": {"effort": "none"}}));
+    assert_eq!(c, 200, "{r}");
+    let text: String = r["output"].as_array().unwrap().iter().filter(|i| i["type"] == "message")
+        .filter_map(|i| i["content"][0]["text"].as_str()).collect();
+    assert!(text.contains("144"), "{r}");
+    // a small thinking budget: the thinking is wrapped up and an answer follows
+    let (_, r) = post("/v1/chat/completions", &json!({"messages": [user(json!("Is 97 a prime number? Answer yes or no."))],
+                                                       "max_tokens": 2000, "reasoning_budget_tokens": 64}));
+    assert!(!content(&r).is_empty(), "an answer after the budget: {r}");
+    assert!(content(&r).contains("yes"), "{r}");
+    // tool_choice forces the named call even for a question that needs none
+    let tools = json!([{"type": "function", "function": {"name": "lookup", "description": "Look a word up.",
+                        "parameters": {"type": "object", "properties": {"word": {"type": "string"}}, "required": ["word"]}}}]);
+    let (_, r) = post("/v1/chat/completions", &json!({"messages": [user(json!("Say hello."))], "tools": tools, "max_tokens": 600,
+        "tool_choice": {"type": "function", "function": {"name": "lookup"}}, "chat_template_kwargs": no_think()}));
+    assert_eq!(r["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "lookup", "{r}");
+    // the monitor saw these requests and the GPU
+    let m = get("/metrics");
+    assert!(m["totals"]["requests"].as_u64().unwrap() >= 3, "{m}");
+    assert!(m["hardware"]["gpu_mem_total"].as_f64().unwrap_or(0.0) > 0.0, "{m}");
+    assert!(m["requests"][0]["decode_tok_s"].as_f64().unwrap_or(0.0) > 10.0, "{m}");
 }

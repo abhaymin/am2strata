@@ -415,6 +415,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             let mut ended: Option<strata_protocol::Done> = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
+                    Ok(GenEvent::Token(_)) if stopped => break, // the engine went on past its stop token: STOP it
                     Ok(GenEvent::Token(t)) => {
                         n += 1;
                         record.token(parser.in_reasoning());
@@ -422,10 +423,11 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                             // the end of the turn (<|im_end|>), not text
                             if force.is_some() && parser.holds_think_end() {
                                 opens = true; // the held </think> was the end: the call opens there
-                            } else {
-                                stopped = true;
+                                break;
                             }
-                            break;
+                            // its DONE (the timings, the reused prefix) normally follows at once
+                            stopped = true;
+                            continue;
                         }
                         run_len = if Some(t) == run_tok { run_len + 1 } else { 1 };
                         run_tok = Some(t);
