@@ -4,6 +4,7 @@
 //! against the SHA-256 the Hub publishes. `HF_ENDPOINT` points at a mirror.
 
 pub mod config;
+pub mod pull;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -126,7 +127,7 @@ impl Hub {
     /// Download one file to `dest`, resuming a `.part` left by an interrupted run and checking its SHA-256.
     /// `progress(done, total)` is called about once a second.
     pub async fn download(&self, repo: &str, revision: &str, f: &RepoFile, dest: &Path,
-                          progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+                          progress: &mut (dyn FnMut(u64, u64) + Send)) -> Result<()> {
         let io = |p: &Path, e| Error::Io { path: p.display().to_string(), source: e };
         if dest.exists() && std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0) == f.size {
             if verified(dest, f)? {

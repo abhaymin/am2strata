@@ -328,19 +328,13 @@ fn pull(p: PullArgs) -> ExitCode {
 }
 
 async fn pull_async(p: PullArgs) -> Result<(), String> {
-    use strata_hub::{human, Hub};
-    let repo = p.repo.trim_start_matches("https://huggingface.co/").trim_start_matches("hf.co/").trim_end_matches('/').to_string();
+    use strata_hub::human;
+    use strata_hub::pull::{Event, Outcome, Spec};
+    let repo = strata_hub::pull::repo_name(&p.repo);
     let token = strata_hub::token(p.token.as_deref());
     say(format!("{repo} on {} ({})", strata_hub::endpoint(), if token.is_some() { "with a token" } else { "no token: public files only" }));
-    let hub = Hub::new(token).map_err(|e| e.to_string())?;
-    let files = hub.files(&repo, &p.revision).await.map_err(|e| e.to_string())?;
-    let chosen = if !p.file.is_empty() {
-        p.file.iter().map(|want| files.iter().find(|f| &f.path == want).cloned().ok_or(format!("{repo} has no file {want}")))
-            .collect::<Result<Vec<_>, _>>()?
-    } else if let Some(q) = &p.quant {
-        strata_hub::select(&files, q, !p.no_mmproj).map_err(|e| e.to_string())?
-    } else {
-        let qs = strata_hub::quants(&files);
+    if p.quant.is_none() && p.file.is_empty() {
+        let qs = strata_hub::pull::list(&repo, token).await?;
         if qs.is_empty() {
             return Err(format!("{repo} has no GGUF files (am2Strata runs GGUF models)"));
         }
@@ -349,52 +343,29 @@ async fn pull_async(p: PullArgs) -> Result<(), String> {
             println!("  {q:<14} {:>10}{}", human(size), if n > 1 { format!("  ({n} files)") } else { String::new() });
         }
         return Ok(());
-    };
-    let total: u64 = chosen.iter().map(|f| f.size).sum();
-    let tag = strata_hub::quant_tag(&chosen[0].path).or_else(|| p.quant.as_ref().map(|q| q.to_uppercase())).unwrap_or_else(|| "model".into());
-    let base = repo.rsplit('/').next().unwrap_or(&repo).trim_end_matches("-GGUF").trim_end_matches("-gguf");
-    let dir = PathBuf::from(expand(&p.data_dir)).join("models").join(format!("{base}-{tag}"));
-    say(format!("{} file(s), {} -> {}", chosen.len(), human(total), dir.display()));
-    let have: u64 = chosen.iter().map(|f| std::fs::metadata(strata_hub::local_path(&dir, f)).map(|m| m.len()).unwrap_or(0)).sum();
-    if let Some(free) = strata_hub::free_space(&dir) {
-        if free + have < total + (1 << 30) {
-            return Err(format!("not enough disk space: {} needed, {} free", human(total - have.min(total)), human(free)));
-        }
     }
-    for f in &chosen {
-        let dest = strata_hub::local_path(&dir, f);
-        let name = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
-        let t0 = Instant::now();
-        let mut show = |done: u64, all: u64| {
+    let spec = Spec { repo, revision: p.revision.clone(), quant: p.quant.clone(), files: p.file.clone(), token, mmproj: !p.no_mmproj,
+                      data_dir: PathBuf::from(expand(&p.data_dir)), models_dir: PathBuf::from(expand(&p.models_dir)),
+                      context: p.context, write_config: !p.no_config };
+    let t0 = Instant::now();
+    let mut on = |e: Event| match e {
+        Event::Note(n) => say(n),
+        Event::Progress { file, done, total } => {
             let s = t0.elapsed().as_secs_f64().max(0.1);
-            print!("\r  {name}: {} / {} ({:.0}%, {:.1} MB/s)   ", human(done), human(all), done as f64 * 100.0 / all.max(1) as f64,
+            print!("\r  {file}: {} / {} ({:.0}%, {:.1} MB/s)   ", human(done), human(total), done as f64 * 100.0 / total.max(1) as f64,
                    done as f64 / s / 1048576.0);
             let _ = std::io::stdout().flush();
-        };
-        hub.download(&repo, &p.revision, f, &dest, &mut show).await.map_err(|e| e.to_string())?;
-        println!("\r  {name}: done, SHA-256 {}                    ", if f.sha256.is_some() { "checked" } else { "not published" });
+        }
+        Event::FileDone { file, checked } => println!("\r  {file}: done, SHA-256 {}                    ", if checked { "checked" } else { "not published" }),
+    };
+    match strata_hub::pull::run(&spec, &mut on).await? {
+        Outcome::Configured { id, config } => {
+            say(format!("run config: {}", config.display()));
+            say(format!("ready: load it from the web app's model picker, or POST /api/models/load {{\"model\": \"{id}\"}}"));
+        }
+        Outcome::Downloaded { dir, why: Some(why) } => say(format!("downloaded, but no run config was written: {why}. The files stay in {}", dir.display())),
+        Outcome::Downloaded { dir, why: None } => say(format!("downloaded to {}", dir.display())),
     }
-    if p.no_config {
-        return Ok(());
-    }
-    let models: Vec<&strata_hub::RepoFile> = chosen.iter().filter(|f| !f.path.to_lowercase().contains("mmproj")).collect();
-    let first = strata_hub::local_path(&dir, models[0]);
-    let mmproj = chosen.iter().find(|f| f.path.to_lowercase().contains("mmproj")).map(|f| strata_hub::local_path(&dir, f));
-    let g = strata_hub::config::inspect(&first)?;
-    let arch = g.architecture().unwrap_or("?").to_string();
-    say(format!("architecture {arch}, context {}, {} experts", g.arch_u64("context_length").map(|c| c.to_string()).unwrap_or("?".into()),
-                g.arch_u64("expert_count").map(|c| c.to_string()).unwrap_or("no".into())));
-    if let Err(why) = strata_hub::config::supported(&arch) {
-        say(format!("downloaded, but no run config was written: {why}. The files stay in {}", dir.display()));
-        return Ok(());
-    }
-    let file_name = first.file_name().and_then(|n| n.to_str()).unwrap_or("model");
-    let id = strata_hub::config::id_of(file_name);
-    let display = format!("{} {tag}", g.str("general.name").filter(|n| !n.is_empty()).unwrap_or(base));
-    let w = strata_hub::config::write(Path::new(&expand(&p.models_dir)), &PathBuf::from(expand(&p.data_dir)).join("packs"),
-                                      &first, &g, mmproj.as_deref(), p.context, &id, &display)?;
-    say(format!("run config: {} (tokenizer {})", w.config.display(), w.tokenizer.display()));
-    say(format!("ready: load it from the web app's model picker, or POST /api/models/load {{\"model\": \"{id}\"}}"));
     Ok(())
 }
 

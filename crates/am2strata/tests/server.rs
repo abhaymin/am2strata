@@ -656,3 +656,25 @@ fn pdf_documents_become_text_and_page_pictures() {
     assert_eq!(c, 200, "{r}");
     assert!(tok.decode(&line_ids(&s.gen_lines()[1])).unwrap().contains("Invoice total 4217 EUR"));
 }
+
+#[test]
+fn hugging_face_downloads_check_what_they_are_sent() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    // nothing running yet; the status needs the key
+    assert_eq!(s.get("/api/hub/pull", true), (200, json!({"state": "idle"})));
+    assert_eq!(s.get("/api/hub/pull", false).0, 401);
+    // a repository and a quantization are required, before anything is fetched
+    let (c, r) = s.post("/api/hub/quants", &json!({}));
+    assert_eq!(c, 400, "{r}");
+    let (c, r) = s.post("/api/hub/pull", &json!({"repo": "owner/name"}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("quant"));
+    assert_eq!(s.get("/api/hub/pull", true).1["state"], "idle", "a refused request starts nothing");
+    // they write files on this PC: another web page may not start one
+    for path in ["/api/hub/quants", "/api/hub/pull"] {
+        let r = reqwest::blocking::Client::new().post(format!("{}{path}", s.base)).bearer_auth(KEY)
+            .header("Origin", "https://evil.example").json(&json!({"repo": "owner/name", "quant": "Q4_K_M"})).send().unwrap();
+        assert_eq!(r.status().as_u16(), 403, "{path}");
+    }
+    assert_eq!(s.get("/api/hub/pull", true).1["state"], "idle");
+}
