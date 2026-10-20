@@ -3,6 +3,7 @@
 //! concatenated streamed argument pieces).
 
 use serde_json::{json, Value};
+use strata_frontend::formats::CallFormat;
 use strata_frontend::output::{Event, OutputParser};
 
 /// Merge adjacent text events of the same kind; tool events stay as they are (ids left out).
@@ -42,8 +43,8 @@ fn normalize(events: &[Value]) -> Vec<Value> {
     out
 }
 
-fn rust_events(text: &str, thinking: bool, tools: Option<&[Value]>, chunks: &Value, stream: bool) -> Value {
-    let mut p = OutputParser::new(thinking, tools, stream);
+fn rust_events(text: &str, thinking: bool, tools: Option<&[Value]>, chunks: &Value, stream: bool, format: CallFormat, opened: bool) -> Value {
+    let mut p = OutputParser::with_format(thinking, tools, stream, format, opened);
     let pieces: Vec<String> = match chunks.as_u64() {
         None => vec![text.to_string()],
         Some(n) => {
@@ -81,7 +82,9 @@ fn output_parser_matches_python() {
     for c in g["cases"].as_array().unwrap() {
         let tools: Option<Vec<Value>> = c["tools"].as_array().cloned();
         let got = rust_events(c["text"].as_str().unwrap(), c["thinking"].as_bool().unwrap(), tools.as_deref(),
-                              &c["chunks"], c["stream_tools"].as_bool().unwrap());
+                              &c["chunks"], c["stream_tools"].as_bool().unwrap(),
+                              CallFormat::from_name(c["call_format"].as_str().unwrap_or("function")),
+                              c["opened"].as_bool().unwrap_or(false));
         let want = &c["events"];
         let ok = match (want.get("error"), got.get("error")) {
             (Some(_), Some(_)) => true,

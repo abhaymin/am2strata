@@ -18,6 +18,9 @@ use tokio::sync::mpsc;
 
 /// The engine keeps a few tokens of slack at the end of the context (serve/server.py CTX_SLACK).
 const CTX_SLACK: usize = 1;
+/// #606: a reply that repeats one token this many times in a row is ended there ("length"); the config's
+/// "repeat_stop_tokens" sets it, 0 turns it off.
+const REPEAT_STOP_TOKENS: usize = 256;
 
 pub enum RunEvent {
     /// the prompt is being read: nothing to say yet (a keep-alive)
@@ -246,7 +249,13 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     });
     let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room) } else { None };
     let mut force = forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref());
-    let mut parser = OutputParser::new(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools);
+    let mut parser = if loaded.call_format == strata_frontend::formats::CallFormat::Gemma {
+        let opened = !loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids);
+        OutputParser::with_format(thinking, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened)
+    } else {
+        OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false)
+    };
+    let repeat_stop = loaded.entry.cfg.rest.get("repeat_stop_tokens").and_then(Value::as_u64).unwrap_or(REPEAT_STOP_TOKENS as u64) as usize;
     let mut opening = Vec::new();
     if let (Some(f), false) = (&force, thinking) {
         // without thinking the prompt ends with the forced opening, read as if the model had written it
@@ -266,6 +275,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         let mut cut = StopCutter { stops, held: String::new(), hit: None };
         let mut prompt_ids = ids;
         let (mut n, mut thought) = (0usize, 0usize);
+        let (mut run_tok, mut run_len): (Option<u32>, usize) = (None, 0);
         let mut tail = String::new(); // the last characters written (the newlines before a forced call)
         let mut last_done: Option<strata_protocol::Done> = None;
         // events through the stop strings to the client; false when the client has gone
@@ -297,19 +307,27 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             let left = max_new.saturating_sub(n);
             let mut rx = lc.engine.generate(left as u32, sampling.clone(), turn_at, prompt_ids.clone(), images.clone()).await;
             let (mut seg, mut wrap, mut opens) = (Vec::new(), false, false);
+            let (mut stopped, mut repeated) = (false, false);
             let mut ended: Option<strata_protocol::Done> = None;
             while let Some(ev) = rx.recv().await {
                 match ev {
                     Ok(GenEvent::Token(t)) => {
                         n += 1;
                         record.token(parser.in_reasoning());
-                        if lc.tok.token_type(t) == 3 {
-                            // a CONTROL token (<|im_end|>): the end of the turn, not text
+                        if lc.stop_ids.contains(&t) {
+                            // the end of the turn (<|im_end|>), not text
                             if force.is_some() && parser.holds_think_end() {
                                 opens = true; // the held </think> was the end: the call opens there
-                                break;
+                            } else {
+                                stopped = true;
                             }
-                            continue;
+                            break;
+                        }
+                        run_len = if Some(t) == run_tok { run_len + 1 } else { 1 };
+                        run_tok = Some(t);
+                        if repeat_stop > 0 && run_len >= repeat_stop {
+                            repeated = true; // #606: a model in a loop, not an answer: end it here
+                            break;
                         }
                         seg.push(t);
                         let text = lc.tok.token_bytes(t).map(|b| detok.push(&b)).unwrap_or_default();
@@ -375,6 +393,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             }
             if !(wrap || opens) {
                 let finish = match ended.as_ref().map(|d| d.finish.as_str()) {
+                    _ if repeated => "length",
+                    _ if stopped => "stop",
                     Some("length") => "length",
                     Some("cancel") => "cancel",
                     _ => "stop",

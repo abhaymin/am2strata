@@ -1,6 +1,7 @@
 //! The request's prompt: template rendered and tokenized, as serve/server.py `Service.encode_prompt` and
 //! `render_prompt` do with default settings (effort_end and preserve_thinking off).
 
+use crate::formats::{gemma_model_turn, CallFormat};
 use crate::literals::{mark_think_literals, unmark_think_literals, Literals};
 use crate::request::Prepared;
 use crate::{RequestError, Result};
@@ -15,6 +16,7 @@ pub struct PromptBuilder {
     literals: Literals,
     /// bos_token / eos_token under the names templates know them by
     template_tokens: Map<String, Value>,
+    format: CallFormat,
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +38,14 @@ impl PromptBuilder {
                 }
             }
         }
-        Self { template, tok, literals, template_tokens }
+        Self { template, tok, literals, template_tokens, format: CallFormat::Function }
+    }
+
+    /// The model's tool-call format: Gemma's and DeepSeek's templates read a tool as OpenAI sends it, and Gemma's
+    /// prompt needs its model turn opened after tool results.
+    pub fn with_format(mut self, format: CallFormat) -> Self {
+        self.format = format;
+        self
     }
 
     pub fn literals(&self) -> &Literals {
@@ -52,7 +61,10 @@ impl PromptBuilder {
         let mut kwargs = self.template_tokens.clone();
         kwargs.extend(p.kwargs.clone());
         kwargs.insert("enable_thinking".into(), json!(!off));
-        let tools_value = marked_tools.map(Value::Array);
+        let wrap = matches!(self.format, CallFormat::Gemma | CallFormat::Dsml);
+        let tools_value = marked_tools.map(|t| {
+            Value::Array(if wrap { t.into_iter().map(|f| json!({"type": "function", "function": f})).collect() } else { t })
+        });
         let mut text = self
             .template
             .render(&marked, tools_value.as_ref(), true, &kwargs)
@@ -60,8 +72,10 @@ impl PromptBuilder {
                 strata_template::Error::Request(m) => RequestError(m),
                 other => RequestError(other.to_string()),
             })?;
-        // GLM's template always ends on an open <think>: thinking off closes it at once
-        if off && text.ends_with("<think>") {
+        if self.format == CallFormat::Gemma {
+            text = gemma_model_turn(&text, !off);
+        } else if off && text.ends_with("<think>") {
+            // GLM's template always ends on an open <think>: thinking off closes it at once
             text.push_str("</think>");
         }
         let (text, plain) = if changed { unmark_think_literals(&text, &self.literals) } else { (text, Vec::new()) };

@@ -38,9 +38,33 @@ CASES = {
     "unterminated_call": ("Calling.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPu", False, TOOLS),
 }
 
+# the other call formats (serve/server.py picks one by the tokenizer's pre-tokenizer): (text, thinking, tools, format,
+# opened)
+GLM = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>"
+GLM_TAG = "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>"
+GEMMA = '<|tool_call>call:get_weather{city:<|"|>Pune<|"|>,days:3,metric:true}<tool_call|>'
+GEMMA_NEST = '<|tool_call>call:write_file{path:<|"|>x <tool_call|> y<|"|>,content:{a:[1,2],b:<|"|>z<|"|>}}<tool_call|>'
+DSML = "｜DSML｜"
+DSML_CALL = ("<" + DSML + "tool_calls>\n<" + DSML + 'invoke name="get_weather">\n<' + DSML + 'parameter name="city" string="true">Pune</'
+             + DSML + "parameter>\n<" + DSML + 'parameter name="days" string="false">3</' + DSML + "parameter>\n</" + DSML
+             + "invoke>\n</" + DSML + "tool_calls>")
+LFM2 = "<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>"
+FORMAT_CASES = {
+    "glm_answer_then_call": ("Need weather.</think>Checking.\n" + GLM, True, TOOLS, "glm", False),
+    "glm_value_with_end_tag": ("\n" + GLM_TAG, False, TOOLS, "glm", False),
+    "glm_end_tag_no_newline": ('say "Paris."</think>Paris', True, None, "glm", False),
+    "gemma_opens_its_thought": ("<|channel>thought\nThinking here.<channel|>Answer.\n" + GEMMA, False, TOOLS, "gemma", False),
+    "gemma_opened_by_prompt": ("Still thinking.<channel|>" + GEMMA_NEST, True, TOOLS, "gemma", True),
+    "gemma_opened_not_thinking": ("Still thinking.<channel|>" + GEMMA_NEST, False, TOOLS, "gemma", True),
+    "gemma_no_thought": ("Plain answer.", True, None, "gemma", False),
+    "dsml_block": ("Let me look.\n</think>\n\nOne moment.\n\n" + DSML_CALL, True, TOOLS, "dsml", False),
+    "lfm2_two_calls": ("Plan.</think>\n" + LFM2, True, TOOLS, "lfm2", False),
+    "lfm2_unterminated": ("<|tool_call_start|>[get_weather(city='Pu", False, TOOLS, "lfm2", False),
+}
 
-def run(text, thinking, tools, chunks, stream_tools):
-    p = OutputParser(thinking=thinking, tools=tools, stream_tools=stream_tools)
+
+def run(text, thinking, tools, chunks, stream_tools, call_format="function", opened=False):
+    p = OutputParser(thinking=thinking, tools=tools, stream_tools=stream_tools, call_format=call_format, opened=opened)
     events = []
     pieces = [text] if chunks == "whole" else [text[i:i + chunks] for i in range(0, len(text), chunks)]
     try:
@@ -68,6 +92,14 @@ def main() -> int:
                     continue
                 cases.append({"name": name, "text": text, "thinking": thinking, "tools": tools, "chunks": chunks,
                               "stream_tools": stream_tools, "events": run(text, thinking, tools, chunks, stream_tools)})
+    for name, (text, thinking, tools, fmt, opened) in FORMAT_CASES.items():
+        for chunks in ("whole", 1, 3, 7):
+            for stream_tools in (False, True):
+                if stream_tools and not tools:
+                    continue
+                cases.append({"name": name, "text": text, "thinking": thinking, "tools": tools, "chunks": chunks,
+                              "stream_tools": stream_tools, "call_format": fmt, "opened": opened,
+                              "events": run(text, thinking, tools, chunks, stream_tools, fmt, opened)})
     path = pathlib.Path(__file__).resolve().parent.parent / "golden" / "output.json"
     path.write_text(json.dumps({"cases": cases}, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"{path}: {len(cases)} cases")

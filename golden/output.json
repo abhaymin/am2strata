@@ -11491,6 +11491,5674 @@
      "arguments": {}
     }
    ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Need weather."
+    },
+    {
+     "kind": "content",
+     "text": "Checking."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Need weather."
+    },
+    {
+     "kind": "content",
+     "text": "Checking."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "N"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "d"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "w"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "r"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "C"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "c"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "g"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "N"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "d"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "w"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "r"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "C"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "c"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "g"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Nee"
+    },
+    {
+     "kind": "reasoning",
+     "text": "d w"
+    },
+    {
+     "kind": "reasoning",
+     "text": "eat"
+    },
+    {
+     "kind": "reasoning",
+     "text": "her"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "Che"
+    },
+    {
+     "kind": "content",
+     "text": "cki"
+    },
+    {
+     "kind": "content",
+     "text": "ng."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Nee"
+    },
+    {
+     "kind": "reasoning",
+     "text": "d w"
+    },
+    {
+     "kind": "reasoning",
+     "text": "eat"
+    },
+    {
+     "kind": "reasoning",
+     "text": "her"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "Che"
+    },
+    {
+     "kind": "content",
+     "text": "cki"
+    },
+    {
+     "kind": "content",
+     "text": "ng."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Need we"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ather."
+    },
+    {
+     "kind": "content",
+     "text": "Checkin"
+    },
+    {
+     "kind": "content",
+     "text": "g."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_answer_then_call",
+   "text": "Need weather.</think>Checking.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Pune</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Need we"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ather."
+    },
+    {
+     "kind": "content",
+     "text": "Checkin"
+    },
+    {
+     "kind": "content",
+     "text": "g."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"a.md\", \"content\": \"see </tool_call> here\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"a.md\", \"content\": \"see </tool_call> here\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"a.md\", \"content\": \"see </tool_call> here\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_value_with_end_tag",
+   "text": "\n<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see </tool_call> here</arg_value></tool_call>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"a.md\", \"content\": \"see </tool_call> here\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.md",
+      "content": "see </tool_call> here"
+     }
+    }
+   ]
+  },
+  {
+   "name": "glm_end_tag_no_newline",
+   "text": "say \"Paris.\"</think>Paris",
+   "thinking": true,
+   "tools": null,
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "say \"Paris.\""
+    },
+    {
+     "kind": "content",
+     "text": "Paris"
+    }
+   ]
+  },
+  {
+   "name": "glm_end_tag_no_newline",
+   "text": "say \"Paris.\"</think>Paris",
+   "thinking": true,
+   "tools": null,
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "s"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "y"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "\""
+    },
+    {
+     "kind": "reasoning",
+     "text": "P"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "r"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "s"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "reasoning",
+     "text": "\""
+    },
+    {
+     "kind": "content",
+     "text": "P"
+    },
+    {
+     "kind": "content",
+     "text": "a"
+    },
+    {
+     "kind": "content",
+     "text": "r"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "s"
+    }
+   ]
+  },
+  {
+   "name": "glm_end_tag_no_newline",
+   "text": "say \"Paris.\"</think>Paris",
+   "thinking": true,
+   "tools": null,
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "say"
+    },
+    {
+     "kind": "reasoning",
+     "text": " \"P"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ari"
+    },
+    {
+     "kind": "reasoning",
+     "text": "s.\""
+    },
+    {
+     "kind": "content",
+     "text": "P"
+    },
+    {
+     "kind": "content",
+     "text": "ari"
+    },
+    {
+     "kind": "content",
+     "text": "s"
+    }
+   ]
+  },
+  {
+   "name": "glm_end_tag_no_newline",
+   "text": "say \"Paris.\"</think>Paris",
+   "thinking": true,
+   "tools": null,
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "glm",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "say \"Pa"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ris.\""
+    },
+    {
+     "kind": "content",
+     "text": "P"
+    },
+    {
+     "kind": "content",
+     "text": "aris"
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thinking here."
+    },
+    {
+     "kind": "content",
+     "text": "Answer."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thinking here."
+    },
+    {
+     "kind": "content",
+     "text": "Answer."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "T"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "g"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "r"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "A"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "s"
+    },
+    {
+     "kind": "content",
+     "text": "w"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "r"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "T"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "g"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "r"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "A"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "s"
+    },
+    {
+     "kind": "content",
+     "text": "w"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "r"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nki"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ng "
+    },
+    {
+     "kind": "reasoning",
+     "text": "her"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e."
+    },
+    {
+     "kind": "content",
+     "text": "Ans"
+    },
+    {
+     "kind": "content",
+     "text": "wer"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nki"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ng "
+    },
+    {
+     "kind": "reasoning",
+     "text": "her"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e."
+    },
+    {
+     "kind": "content",
+     "text": "Ans"
+    },
+    {
+     "kind": "content",
+     "text": "wer"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nking h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ere."
+    },
+    {
+     "kind": "content",
+     "text": "Answer."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opens_its_thought",
+   "text": "<|channel>thought\nThinking here.<channel|>Answer.\n<|tool_call>call:get_weather{city:<|\"|>Pune<|\"|>,days:3,metric:true}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nking h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ere."
+    },
+    {
+     "kind": "content",
+     "text": "Answer."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Still thinking."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Still thinking."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "S"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "g"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "S"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "h"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "i"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "g"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Sti"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ll "
+    },
+    {
+     "kind": "reasoning",
+     "text": "thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nki"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ng."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Sti"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ll "
+    },
+    {
+     "kind": "reasoning",
+     "text": "thi"
+    },
+    {
+     "kind": "reasoning",
+     "text": "nki"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ng."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Still t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "hinking"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_by_prompt",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Still t"
+    },
+    {
+     "kind": "reasoning",
+     "text": "hinking"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Still thinking.<channel|>"
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Still thinking.<channel|>"
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "S"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": " "
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "g"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "<c"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "a"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": "|"
+    },
+    {
+     "kind": "content",
+     "text": ">"
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "S"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": " "
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "g"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "<c"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "a"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": "|"
+    },
+    {
+     "kind": "content",
+     "text": ">"
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Sti"
+    },
+    {
+     "kind": "content",
+     "text": "ll "
+    },
+    {
+     "kind": "content",
+     "text": "thi"
+    },
+    {
+     "kind": "content",
+     "text": "nki"
+    },
+    {
+     "kind": "content",
+     "text": "ng."
+    },
+    {
+     "kind": "content",
+     "text": "<ch"
+    },
+    {
+     "kind": "content",
+     "text": "ann"
+    },
+    {
+     "kind": "content",
+     "text": "el|"
+    },
+    {
+     "kind": "content",
+     "text": ">"
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Sti"
+    },
+    {
+     "kind": "content",
+     "text": "ll "
+    },
+    {
+     "kind": "content",
+     "text": "thi"
+    },
+    {
+     "kind": "content",
+     "text": "nki"
+    },
+    {
+     "kind": "content",
+     "text": "ng."
+    },
+    {
+     "kind": "content",
+     "text": "<ch"
+    },
+    {
+     "kind": "content",
+     "text": "ann"
+    },
+    {
+     "kind": "content",
+     "text": "el|"
+    },
+    {
+     "kind": "content",
+     "text": ">"
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Still t"
+    },
+    {
+     "kind": "content",
+     "text": "hinking"
+    },
+    {
+     "kind": "content",
+     "text": ".<chann"
+    },
+    {
+     "kind": "content",
+     "text": "el|>"
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_opened_not_thinking",
+   "text": "Still thinking.<channel|><|tool_call>call:write_file{path:<|\"|>x <tool_call|> y<|\"|>,content:{a:[1,2],b:<|\"|>z<|\"|>}}<tool_call|>",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "gemma",
+   "opened": true,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Still t"
+    },
+    {
+     "kind": "content",
+     "text": "hinking"
+    },
+    {
+     "kind": "content",
+     "text": ".<chann"
+    },
+    {
+     "kind": "content",
+     "text": "el|>"
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"path\": \"x <tool_call|> y\", \"content\": \"{\\\"a\\\": [1, 2], \\\"b\\\": \\\"z\\\"}\"}",
+     "name": "write_file",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "x <tool_call|> y",
+      "content": "{\"a\": [1, 2], \"b\": \"z\"}"
+     }
+    }
+   ]
+  },
+  {
+   "name": "gemma_no_thought",
+   "text": "Plain answer.",
+   "thinking": true,
+   "tools": null,
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Plain answer."
+    }
+   ]
+  },
+  {
+   "name": "gemma_no_thought",
+   "text": "Plain answer.",
+   "thinking": true,
+   "tools": null,
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "P"
+    },
+    {
+     "kind": "content",
+     "text": "l"
+    },
+    {
+     "kind": "content",
+     "text": "a"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": " "
+    },
+    {
+     "kind": "content",
+     "text": "a"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "s"
+    },
+    {
+     "kind": "content",
+     "text": "w"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "r"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    }
+   ]
+  },
+  {
+   "name": "gemma_no_thought",
+   "text": "Plain answer.",
+   "thinking": true,
+   "tools": null,
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Pla"
+    },
+    {
+     "kind": "content",
+     "text": "in "
+    },
+    {
+     "kind": "content",
+     "text": "ans"
+    },
+    {
+     "kind": "content",
+     "text": "wer"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    }
+   ]
+  },
+  {
+   "name": "gemma_no_thought",
+   "text": "Plain answer.",
+   "thinking": true,
+   "tools": null,
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "gemma",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "Plain a"
+    },
+    {
+     "kind": "content",
+     "text": "nswer."
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let me look.\n"
+    },
+    {
+     "kind": "content",
+     "text": "One moment."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let me look.\n"
+    },
+    {
+     "kind": "content",
+     "text": "One moment."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "L"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "m"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "o"
+    },
+    {
+     "kind": "reasoning",
+     "text": "o"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "reasoning",
+     "text": "\n"
+    },
+    {
+     "kind": "content",
+     "text": "O"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": " "
+    },
+    {
+     "kind": "content",
+     "text": "m"
+    },
+    {
+     "kind": "content",
+     "text": "o"
+    },
+    {
+     "kind": "content",
+     "text": "m"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "L"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": "t"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "m"
+    },
+    {
+     "kind": "reasoning",
+     "text": "e"
+    },
+    {
+     "kind": "reasoning",
+     "text": " "
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "o"
+    },
+    {
+     "kind": "reasoning",
+     "text": "o"
+    },
+    {
+     "kind": "reasoning",
+     "text": "k"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "reasoning",
+     "text": "\n"
+    },
+    {
+     "kind": "content",
+     "text": "O"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": " "
+    },
+    {
+     "kind": "content",
+     "text": "m"
+    },
+    {
+     "kind": "content",
+     "text": "o"
+    },
+    {
+     "kind": "content",
+     "text": "m"
+    },
+    {
+     "kind": "content",
+     "text": "e"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let"
+    },
+    {
+     "kind": "reasoning",
+     "text": " me"
+    },
+    {
+     "kind": "reasoning",
+     "text": " lo"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ok."
+    },
+    {
+     "kind": "reasoning",
+     "text": "\n"
+    },
+    {
+     "kind": "content",
+     "text": "O"
+    },
+    {
+     "kind": "content",
+     "text": "ne "
+    },
+    {
+     "kind": "content",
+     "text": "mom"
+    },
+    {
+     "kind": "content",
+     "text": "ent"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let"
+    },
+    {
+     "kind": "reasoning",
+     "text": " me"
+    },
+    {
+     "kind": "reasoning",
+     "text": " lo"
+    },
+    {
+     "kind": "reasoning",
+     "text": "ok."
+    },
+    {
+     "kind": "reasoning",
+     "text": "\n"
+    },
+    {
+     "kind": "content",
+     "text": "O"
+    },
+    {
+     "kind": "content",
+     "text": "ne "
+    },
+    {
+     "kind": "content",
+     "text": "mom"
+    },
+    {
+     "kind": "content",
+     "text": "ent"
+    },
+    {
+     "kind": "content",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let me "
+    },
+    {
+     "kind": "reasoning",
+     "text": "look.\n"
+    },
+    {
+     "kind": "content",
+     "text": "One m"
+    },
+    {
+     "kind": "content",
+     "text": "oment."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "dsml_block",
+   "text": "Let me look.\n</think>\n\nOne moment.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Pune</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "dsml",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Let me "
+    },
+    {
+     "kind": "reasoning",
+     "text": "look.\n"
+    },
+    {
+     "kind": "content",
+     "text": "One m"
+    },
+    {
+     "kind": "content",
+     "text": "oment."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Plan."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Plan."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "P"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "P"
+    },
+    {
+     "kind": "reasoning",
+     "text": "l"
+    },
+    {
+     "kind": "reasoning",
+     "text": "a"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n"
+    },
+    {
+     "kind": "reasoning",
+     "text": "."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Pla"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Pla"
+    },
+    {
+     "kind": "reasoning",
+     "text": "n."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Plan."
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_two_calls",
+   "text": "Plan.</think>\n<|tool_call_start|>[get_weather(city='Pune', days=3, metric=True), write_file(path=\"a.py\", content='x\\'y')]<|tool_call_end|>",
+   "thinking": true,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "reasoning",
+     "text": "Plan."
+    },
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_args",
+     "text": "{\"city\": \"Pune\", \"days\": 3, \"metric\": true}",
+     "name": "get_weather",
+     "arguments": {}
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {
+      "city": "Pune",
+      "days": 3,
+      "metric": true
+     }
+    },
+    {
+     "kind": "tool_call",
+     "text": "",
+     "name": "write_file",
+     "arguments": {
+      "path": "a.py",
+      "content": "x'y"
+     }
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "<|tool_call_start|>[get_weather(city='Pu"
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": "whole",
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "<|tool_call_start|>[get_weather(city='Pu"
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 1,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "<|tool_call_start|>[get_weather(city='Pu"
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 3,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": false,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "content",
+     "text": "<|tool_call_start|>[get_weather(city='Pu"
+    }
+   ]
+  },
+  {
+   "name": "lfm2_unterminated",
+   "text": "<|tool_call_start|>[get_weather(city='Pu",
+   "thinking": false,
+   "tools": [
+    {
+     "name": "get_weather",
+     "description": "Weather.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      }
+     }
+    },
+    {
+     "name": "write_file",
+     "description": "Write.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ],
+   "chunks": 7,
+   "stream_tools": true,
+   "call_format": "lfm2",
+   "opened": false,
+   "events": [
+    {
+     "kind": "tool_start",
+     "text": "",
+     "name": "get_weather",
+     "arguments": {}
+    }
+   ]
   }
  ]
 }

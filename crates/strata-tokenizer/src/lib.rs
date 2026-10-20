@@ -50,6 +50,26 @@ const GLM4_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// `gemma4` (Gemma 4): a BPE over UTF-8 characters, not GPT-2's byte alphabet. A space is SentencePiece's visible
+/// space, the text is cut only at runs of newlines, and a piece the vocabulary lacks goes byte by byte as <0x00>..<0xFF>.
+const GEMMA4_PATTERN: &str = r"[^\n]+|\n+";
+const SPACE: char = '\u{2581}';
+
+/// `joyai-llm` / `deepseek-v3` (DeepSeek V4): three patterns one after the other; each splits every piece the one
+/// before left into its matches and the text between them (llama.cpp's unicode_regex_split).
+const DEEPSEEK3_SEQUENCE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    concat!(
+        r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"##,
+        r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+",
+        r"| ?[\p{P}\p{S}]+[\r\n]*",
+        r"|\s*[\r\n]+",
+        r"|\s+(?!\S)",
+        r"|\s+",
+    ),
+];
+
 /// Words with more symbols than this go through the heap merge (same result, O(n log n)).
 const HEAP_MIN: usize = 64;
 
@@ -68,6 +88,10 @@ pub struct Tokenizer {
     token_types: Vec<i32>,
     pre: String,
     ignore_merges: bool,
+    /// gemma4: a vocabulary of UTF-8 pieces with byte fallback
+    raw: bool,
+    /// DeepSeek V4: patterns applied one after the other
+    sequence: Option<Vec<Regex>>,
     pattern: Regex,
     /// literal matchers: all specials (types 3 and 4), and the always-matched ones (type 4)
     special_all: Option<(AhoCorasick, Vec<u32>)>,
@@ -156,9 +180,7 @@ impl Tokenizer {
         pre: String,
         special_ids: HashMap<String, i64>,
     ) -> Result<Self> {
-        if matches!(pre.as_str(), "gemma4" | "joyai-llm" | "deepseek-v3") {
-            return Err(Error::Invalid(format!("pre-tokenizer {pre:?} is not ported yet")));
-        }
+        let raw = pre == "gemma4";
         let mut ids = HashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
             if ids.insert(t.clone(), i as u32).is_some() {
@@ -171,16 +193,24 @@ impl Tokenizer {
             let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
                 return Err(Error::Invalid(format!("merge {i} is not a pair: {m:?}")));
             };
-            if !ids.contains_key(a) || !ids.contains_key(b) {
+            // (a UTF-8 vocabulary's merges pass through pieces it does not keep, as llama.cpp accepts)
+            if !raw && (!ids.contains_key(a) || !ids.contains_key(b)) {
                 return Err(Error::Invalid(format!("merge {i} names a token outside the vocabulary: {m:?}")));
             }
             ranks.insert((a.to_owned(), b.to_owned()), i as u32);
         }
+        let compile = |src: &str| Regex::new(src).map_err(|e| Error::Invalid(format!("pre-tokenizer pattern: {e}")));
+        let sequence = match pre.as_str() {
+            "joyai-llm" | "deepseek-v3" => Some(DEEPSEEK3_SEQUENCE.iter().map(|p| compile(p)).collect::<Result<Vec<_>>>()?),
+            _ => None,
+        };
         let pattern_src = match pre.as_str() {
             "glm4" | "glm5" | "lfm2" => GLM4_PATTERN,
+            "gemma4" => GEMMA4_PATTERN,
+            "joyai-llm" | "deepseek-v3" => DEEPSEEK3_SEQUENCE[2],
             _ => QWEN35_PATTERN,
         };
-        let pattern = Regex::new(pattern_src).map_err(|e| Error::Invalid(format!("pre-tokenizer pattern: {e}")))?;
+        let pattern = compile(pattern_src)?;
         let mut all = Vec::new();
         let mut always = Vec::new();
         for (i, ty) in token_types.iter().enumerate() {
@@ -195,6 +225,8 @@ impl Tokenizer {
         let unicode_to_byte = byte_to_unicode.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
         Ok(Self {
             ignore_merges: matches!(pre.as_str(), "glm4" | "glm5" | "lfm2"),
+            raw,
+            sequence,
             tokens,
             ids,
             ranks,
@@ -283,9 +315,63 @@ impl Tokenizer {
         Ok(out)
     }
 
-    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
-        for m in self.pattern.find_iter(text) {
+    /// The pre-tokenizer's pieces: one pattern's matches, or a sequence's, where each pattern splits what the one
+    /// before left into its matches and the text between them.
+    fn pieces<'t>(&self, text: &'t str) -> Result<Vec<&'t str>> {
+        let err = |e: fancy_regex::Error| Error::Invalid(format!("pre-tokenizer: {e}"));
+        let Some(seq) = &self.sequence else {
+            return self.pattern.find_iter(text).map(|m| m.map(|m| m.as_str()).map_err(err)).collect();
+        };
+        let mut pieces = vec![text];
+        for pat in seq {
+            let mut out = Vec::new();
+            for piece in pieces {
+                let mut at = 0;
+                for m in pat.find_iter(piece) {
+                    let m = m.map_err(err)?;
+                    if m.start() > at {
+                        out.push(&piece[at..m.start()]);
+                    }
+                    if m.end() > m.start() {
+                        out.push(m.as_str());
+                    }
+                    at = m.end();
+                }
+                if at < piece.len() {
+                    out.push(&piece[at..]);
+                }
+            }
+            pieces = out;
+        }
+        Ok(pieces)
+    }
+
+    /// encode_plain for a vocabulary of UTF-8 pieces (gemma4).
+    fn encode_raw(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
+        let spaced: String = text.chars().map(|c| if c == ' ' { SPACE } else { c }).collect();
+        for m in self.pattern.find_iter(&spaced) {
             let piece = m.map_err(|e| Error::Invalid(format!("pre-tokenizer: {e}")))?.as_str();
+            if piece.starts_with('\n') {
+                if let Some(id) = self.ids.get(piece) {
+                    out.push(*id);
+                    continue;
+                }
+            }
+            for sym in self.bpe(piece) {
+                match self.ids.get(&sym) {
+                    Some(id) => out.push(*id),
+                    None => out.extend(sym.bytes().filter_map(|b| self.ids.get(&format!("<0x{b:02X}>")).copied())),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
+        if self.raw {
+            return self.encode_raw(text, out);
+        }
+        for piece in self.pieces(text)? {
             let mapped: String = piece.bytes().map(|b| self.byte_to_unicode[b as usize]).collect();
             if self.ignore_merges {
                 if let Some(id) = self.ids.get(&mapped) {
@@ -376,6 +462,13 @@ impl Tokenizer {
             .tokens
             .get(id as usize)
             .ok_or_else(|| Error::Invalid(format!("token id {id} is outside the vocabulary ({})", self.tokens.len())))?;
+        if self.raw {
+            if self.token_type(id) == 6 && t.len() == 6 && t.starts_with("<0x") {
+                let b = u8::from_str_radix(&t[3..5], 16).map_err(|_| Error::Invalid(format!("byte token {t:?}")))?;
+                return Ok(vec![b]);
+            }
+            return Ok(t.replace(SPACE, " ").into_bytes());
+        }
         if matches!(self.token_type(id), 3 | 4) {
             return Ok(t.as_bytes().to_vec());
         }

@@ -428,3 +428,12 @@ fn config_view_changes_only_its_keys() {
     assert!(s.dir.join("strata-mock-a.json.bak").exists());
     assert_eq!(s.post("/config", &json!({"set": {"api_key": "x"}})).0, 400);
 }
+
+#[test]
+fn the_reply_ends_at_the_models_stop_token() {
+    let s = Server::start(&[Model::default()], &[ids("Done.<|im_end|>never sent")], json!({"delay_ms": 5}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("x")], "chat_template_kwargs": {"enable_thinking": false}}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "Done.");
+    assert_eq!(r["choices"][0]["finish_reason"], "stop");
+}

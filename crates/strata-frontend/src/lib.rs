@@ -3,6 +3,7 @@
 //! (`literals`), and the prompt rendered and tokenized (`prompt`). Checked against golden files recorded from the
 //! Python code.
 
+pub mod formats;
 pub mod images;
 pub mod literals;
 pub mod output;

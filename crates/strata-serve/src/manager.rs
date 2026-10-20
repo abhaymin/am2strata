@@ -34,6 +34,12 @@ pub struct Loaded {
     pub engine: Engine,
     pub vision: Option<Vision>,
     pub turn_ids: Vec<u32>,
+    /// how the model writes tool calls (by its tokenizer's pre-tokenizer)
+    pub call_format: strata_frontend::formats::CallFormat,
+    /// the tokens that end the reply (serve/server.py stop_ids)
+    pub stop_ids: std::collections::HashSet<u32>,
+    /// Gemma's own opening of its reasoning: a prompt that ends on it starts the reply inside the reasoning
+    pub think_open_ids: Vec<u32>,
     pub max_context: usize,
     pub family: Option<String>,
     /// image placeholder token, the marker before it, and the placeholder's text ids
@@ -258,7 +264,24 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
     let pad = one("<|image_pad|>");
     let vision_start = template.source().contains("<|vision_start|>").then(|| one("<|vision_start|>")).flatten();
     let pad_literal = tok.encode("<|image_pad|>", false).unwrap_or_default();
-    let turn_ids: Vec<u32> = one("<|im_start|>").into_iter().collect();
+    let call_format = strata_frontend::formats::CallFormat::from_pre(tok.pre());
+    let turn_ids: Vec<u32> = call_format.turn_openers().iter().filter_map(|t| one(t)).collect();
+    let mut stop_ids: std::collections::HashSet<u32> = match one("<|im_end|>") {
+        Some(im_end) => [Some(im_end), one("<|endoftext|>")].into_iter().flatten().collect(),
+        // not a ChatML model (GLM): the ids its GGUF names for the end of the text, the turn and the message
+        None => ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"]
+            .iter()
+            .filter_map(|k| tok.special_id(k))
+            .collect(),
+    };
+    let mut think_open_ids = Vec::new();
+    if call_format == strata_frontend::formats::CallFormat::Gemma {
+        // after its calls Gemma opens the tools' answer, which is the client's to give; and a finetune's GGUF can
+        // name only <eos>, so the end of its turn is a stop by its text too
+        stop_ids.extend(one("<|tool_response>"));
+        stop_ids.extend(one("<turn|>"));
+        think_open_ids = tok.encode(strata_frontend::formats::GEMMA_THOUGHT, true).unwrap_or_default();
+    }
     let family = cfg.family();
     // the image encoder first: the engine sizes its expert cache to the VRAM it finds free, so an encoder started
     // after it finds none (PolyStrata starts them in this order too)
@@ -287,7 +310,7 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
     };
     let sampling_defaults = crate::settings::config_sampling(&cfg.rest).map_err(anyhow::Error::msg)?;
     let max_context = cfg.max_context();
-    let prompts = PromptBuilder::new(template, tok.clone());
+    let prompts = PromptBuilder::new(template, tok.clone()).with_format(call_format);
     Ok(Loaded {
         entry: ModelEntry { cfg, ..entry.clone() },
         tok,
@@ -295,6 +318,9 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         engine,
         vision,
         turn_ids,
+        call_format,
+        stop_ids,
+        think_open_ids,
         max_context,
         family,
         pad,

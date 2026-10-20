@@ -6,6 +6,7 @@
 //! defaults), including streamed tool arguments, quoted `</think>` (#537), calls written inside the reasoning (#804,
 //! #1058) and openers inside code (#1058). GLM, Gemma, DeepSeek and LFM2 call formats are not ported yet.
 
+use crate::formats::CallFormat;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
@@ -27,7 +28,7 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    fn new(name: String, arguments: Map<String, Value>) -> Self {
+    pub(crate) fn new(name: String, arguments: Map<String, Value>) -> Self {
         let hex: String = uuid_hex();
         Self { id: format!("call_{}", &hex[..24]), name, arguments }
     }
@@ -137,7 +138,7 @@ fn call_end(text: &str) -> isize {
 }
 
 /// A parameter's text as the type its schema declares.
-fn param_value(value: &str, declared: Option<&str>) -> Value {
+pub(crate) fn param_value(value: &str, declared: Option<&str>) -> Value {
     if declared == Some("string") {
         return Value::String(value.into());
     }
@@ -257,17 +258,35 @@ pub struct OutputParser {
     sval_started: bool,
     sdeclared: HashMap<String, Option<String>>,
     stype: Option<String>,
+    format: CallFormat,
+    call_start: &'static str,
+    call_stop: &'static str,
+    think_open: &'static str,
+    think_end: &'static str,
+    noise: &'static [&'static str],
+    /// #537 tells a quoted </think> by the line break after it; the other formats' answers follow their end tag at once
+    quotes_end: bool,
+    /// the reply may still start with the format's own opening of its reasoning (Gemma)
+    opening: bool,
 }
 
 impl OutputParser {
     /// `thinking`: the prompt opened the reasoning. `tools`: the request's tools (template form, each with a name).
     pub fn new(thinking: bool, tools: Option<&[Value]>, stream_tools: bool) -> Self {
+        Self::with_format(thinking, tools, stream_tools, CallFormat::Function, false)
+    }
+
+    /// `format`: how the model writes calls. `opened`: the prompt ended on the format's own opening of the
+    /// reasoning (Gemma after a tool's answer), so the reply starts inside it.
+    pub fn with_format(thinking: bool, tools: Option<&[Value]>, stream_tools: bool, format: CallFormat, opened: bool) -> Self {
+        let (call_start, call_stop) = format.call_tags();
+        let (think_open, think_end) = format.think_tags();
         let schemas = tools
             .into_iter()
             .flatten()
             .filter_map(|t| t.get("name").and_then(Value::as_str).map(|n| (n.to_string(), t.clone())))
             .collect();
-        let state = if thinking { State::Reasoning } else { State::Content };
+        let state = if thinking && (opened || think_open.is_empty()) { State::Reasoning } else { State::Content };
         let mut p = Self {
             state,
             buf: String::new(),
@@ -288,6 +307,14 @@ impl OutputParser {
             sval_started: false,
             sdeclared: HashMap::new(),
             stype: None,
+            format,
+            call_start,
+            call_stop,
+            think_open,
+            think_end,
+            noise: format.noise(),
+            quotes_end: format == CallFormat::Function,
+            opening: !think_open.is_empty() && !opened,
         };
         p.reset_scan();
         p
@@ -552,7 +579,8 @@ impl OutputParser {
     pub fn feed(&mut self, delta: &str) -> Result<Vec<Event>, ParseError> {
         self.buf.push_str(delta);
         let mut out = Vec::new();
-        let tools = !self.schemas.is_empty();
+        let tools = !self.schemas.is_empty() && self.format == CallFormat::Function;
+        let whole = self.format != CallFormat::Function;
         loop {
             match self.state {
                 State::RCall => {
@@ -615,7 +643,8 @@ impl OutputParser {
                         }
                         continue;
                     }
-                    let i = self.buf.find(THINK_END);
+                    let think_end = self.think_end;
+                    let i = self.buf.find(think_end);
                     let tool = if tools { self.buf.find(CALL_START) } else { None };
                     if let Some(tool) = tool.filter(|t| i.is_none_or(|i| *t < i)) {
                         if tool > 0 {
@@ -634,7 +663,7 @@ impl OutputParser {
                         continue;
                     }
                     let Some(i) = i else {
-                        let keep = if tools { Self::hold(&self.buf, &[THINK_END, CALL_START]) } else { Self::hold(&self.buf, &[THINK_END]) };
+                        let keep = if tools { Self::hold(&self.buf, &[think_end, CALL_START]) } else { Self::hold(&self.buf, &[think_end]) };
                         if self.buf.len() > keep {
                             let cut = self.buf.len() - keep;
                             let head = self.buf[..cut].to_string();
@@ -644,7 +673,8 @@ impl OutputParser {
                         }
                         return Ok(out);
                     };
-                    match self.quoted_think_end(i) {
+                    let quoted = if self.quotes_end { self.quoted_think_end(i) } else { Some(false) };
+                    match quoted {
                         None => {
                             if i > 0 {
                                 let head = self.buf[..i].to_string();
@@ -668,7 +698,7 @@ impl OutputParser {
                         let t = self.track(&head);
                         out.push(Event::Reasoning(t));
                     }
-                    self.buf = self.buf[i + THINK_END.len()..].to_string();
+                    self.buf = self.buf[i + think_end.len()..].to_string();
                     self.state = State::Content;
                     self.lead = true;
                     self.fence.clear();
@@ -676,6 +706,24 @@ impl OutputParser {
                     self.ticks = 0;
                 }
                 State::Content => {
+                    if self.opening {
+                        // the model's own opening of its reasoning
+                        if let Some(rest) = self.buf.strip_prefix(self.think_open) {
+                            self.buf = rest.to_string();
+                            self.state = State::Reasoning;
+                            self.opening = false;
+                            continue;
+                        }
+                        if self.think_open.starts_with(self.buf.as_str()) {
+                            return Ok(out);
+                        }
+                        self.opening = false;
+                    }
+                    for tag in self.noise {
+                        if self.buf.contains(tag) {
+                            self.buf = self.buf.replace(tag, "");
+                        }
+                    }
                     if self.lead {
                         let stripped = self.buf.trim_start_matches('\n');
                         if stripped.is_empty() {
@@ -685,8 +733,10 @@ impl OutputParser {
                         self.buf = stripped.to_string();
                         self.lead = false;
                     }
-                    let Some(i) = self.buf.find(CALL_START) else {
-                        let mut j = self.buf.len() - Self::hold(&self.buf, &[CALL_START]);
+                    let Some(i) = self.buf.find(self.call_start) else {
+                        let mut tags = vec![self.call_start];
+                        tags.extend(self.noise);
+                        let mut j = self.buf.len() - Self::hold(&self.buf, &tags);
                         while j > 0 && self.buf.as_bytes()[j - 1] == b'\n' {
                             j -= 1;
                         }
@@ -698,6 +748,17 @@ impl OutputParser {
                         }
                         return Ok(out);
                     };
+                    if whole {
+                        // GLM's, Gemma's, DSML's and LFM2's opener is a call where it stands
+                        if i > 0 && !self.buf[..i].trim().is_empty() {
+                            let head = self.buf[..i].trim_end_matches('\n').to_string();
+                            let t = self.track(&head);
+                            out.push(Event::Content(t));
+                        }
+                        self.buf = self.buf[i + self.call_start.len()..].to_string();
+                        self.state = State::Call;
+                        continue;
+                    }
                     // #1058: an opener inside a code fence or inline code is text, decided by the text before it
                     let snap = (self.fence.clone(), self.line.clone(), self.ticks);
                     let before = self.buf[..i].to_string();
@@ -740,6 +801,32 @@ impl OutputParser {
                     self.buf = self.buf[i + CALL_START.len()..].to_string();
                     self.state = State::Call;
                 }
+                State::Call if whole => {
+                    // the call is announced when its name is complete; its arguments follow whole when it ends
+                    if self.stream_tools && self.scall.is_none() {
+                        if let Some(name) = self.format.call_name(&self.buf) {
+                            let c = ToolCall::new(name.clone(), Map::new());
+                            out.push(Event::ToolStart { id: c.id.clone(), name });
+                            self.scall = Some(c);
+                        }
+                    }
+                    let Some(i) = self.format.call_end(&self.buf) else { return Ok(out) };
+                    let body = self.buf[..i].to_string();
+                    self.buf = self.buf[i + self.call_stop.len()..].to_string();
+                    let mut calls = self.format.parse(&body, &self.schemas);
+                    if calls.is_empty() {
+                        let raw = format!("{}{body}{}", self.call_start, self.call_stop);
+                        let t = self.track(&raw);
+                        out.push(Event::Content(t));
+                    } else if let Some(s) = &self.scall {
+                        calls[0].id = s.id.clone();
+                        out.push(Event::ToolArgs { id: s.id.clone(), text: py_dumps(&Value::Object(calls[0].arguments.clone()), false) });
+                    }
+                    out.extend(calls.into_iter().map(Event::ToolCall));
+                    self.reset_scan();
+                    self.state = State::Content;
+                    self.lead = true;
+                }
                 State::Call => {
                     let i = self.wrapped_call_end();
                     let drop = (i >= 0).then_some(CALL_END.len());
@@ -781,7 +868,7 @@ impl OutputParser {
 
     /// The reasoning's held text is exactly a `</think>` that has not been confirmed as the end yet.
     pub fn holds_think_end(&self) -> bool {
-        self.state == State::Reasoning && self.buf == THINK_END
+        self.state == State::Reasoning && self.buf == self.think_end
     }
 
     /// End of generation. `reason`: how the turn ended (`None` or "stop" = a natural stop); calls waiting from the
@@ -801,7 +888,7 @@ impl OutputParser {
             self.reset_scan();
             return out;
         }
-        if self.state == State::Reasoning && self.buf == THINK_END {
+        if self.state == State::Reasoning && self.buf == self.think_end {
             self.buf.clear();
             self.state = State::Content;
         }
@@ -809,7 +896,7 @@ impl OutputParser {
             let buf = std::mem::take(&mut self.buf);
             match self.state {
                 State::Reasoning | State::RCall => out.push(Event::Reasoning(buf)),
-                State::Call => out.push(Event::Content(format!("{CALL_START}{buf}"))),
+                State::Call => out.push(Event::Content(format!("{}{buf}", self.call_start))),
                 State::Content => out.push(Event::Content(buf)),
             }
         }
