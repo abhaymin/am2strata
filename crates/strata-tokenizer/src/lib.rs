@@ -230,17 +230,47 @@ impl Tokenizer {
         self.token_types.get(id as usize).copied().unwrap_or(1)
     }
 
+    /// The CONTROL tokens' texts (type 3) in vocabulary order, as the Python tokenizer's `control_tokens` lists them.
+    pub fn control_tokens(&self) -> Vec<&str> {
+        self.token_types
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| **ty == 3)
+            .map(|(i, _)| self.tokens[i].as_str())
+            .collect()
+    }
+
     /// Tokenize `text`. `parse_special` controls only the CONTROL literals (type 3); USER_DEFINED (type 4) are
     /// matched either way.
     pub fn encode(&self, text: &str, parse_special: bool) -> Result<Vec<u32>> {
+        self.encode_with_plain(text, parse_special, &[])
+    }
+
+    /// As `encode`, but a literal that starts inside one of the `plain` (start, end) byte spans is ordinary text,
+    /// tokenized with the text around it: a `</think>` a user quoted (PolyStrata #537).
+    pub fn encode_with_plain(&self, text: &str, parse_special: bool, plain: &[(usize, usize)]) -> Result<Vec<u32>> {
         let matcher = if parse_special { &self.special_all } else { &self.special_always };
         let mut out = Vec::new();
         let Some((ac, lit_ids)) = matcher else {
             self.encode_plain(text, &mut out)?;
             return Ok(out);
         };
+        let mut spans = plain.to_vec();
+        spans.sort_unstable();
+        let mut upcoming = spans.into_iter().peekable();
+        let mut plain_end = 0;
         let mut pos = 0;
         for m in ac.find_iter(text) {
+            while let Some(&(s, e)) = upcoming.peek() {
+                if s > m.start() {
+                    break;
+                }
+                plain_end = plain_end.max(e);
+                upcoming.next();
+            }
+            if m.start() < plain_end {
+                continue;
+            }
             if m.start() > pos {
                 self.encode_plain(&text[pos..m.start()], &mut out)?;
             }

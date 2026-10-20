@@ -1,0 +1,15 @@
+[package]
+name = "strata-frontend"
+description = "Request normalization and prompt building: port of PolyStrata serve/frontend.py and Service.encode_prompt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-tokenizer.workspace = true
+strata-template.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -5,6 +5,7 @@ members = [
     "crates/strata-template",
     "crates/strata-protocol",
     "crates/strata-engine",
+    "crates/strata-frontend",
     "crates/strata-serve",
 ]
 
@@ -37,6 +38,7 @@ strata-tokenizer = { path = "crates/strata-tokenizer" }
 strata-template = { path = "crates/strata-template" }
 strata-protocol = { path = "crates/strata-protocol" }
 strata-engine = { path = "crates/strata-engine" }
+strata-frontend = { path = "crates/strata-frontend" }
 
 [profile.release]
 lto = "thin"

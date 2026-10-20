@@ -826,6 +826,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-frontend"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "strata-template",
+ "strata-tokenizer",
+ "thiserror",
+]
+
+[[package]]
 name = "strata-protocol"
 version = "0.1.0"
 dependencies = [
