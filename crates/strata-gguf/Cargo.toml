@@ -1,0 +1,10 @@
+[package]
+name = "strata-gguf"
+description = "GGUF metadata reader and tokenizer extraction (port of PolyStrata's gguf_reader.py / strata_tokenizer.py extract)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true

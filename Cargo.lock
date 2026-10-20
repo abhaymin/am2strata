@@ -1767,6 +1767,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-gguf"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "strata-protocol"
 version = "0.1.0"
 dependencies = [
