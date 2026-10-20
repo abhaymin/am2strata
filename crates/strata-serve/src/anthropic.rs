@@ -43,6 +43,10 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
+    {
+        let shared = loaded.shared.read().unwrap().clone();
+        crate::settings::with_shared(&mut req, &shared, loaded.config_effort().as_deref(), "anthropic");
+    }
     let (mut prep, budget) = match anthropic_to_messages(&req, &loaded.tool_orders, true) {
         Ok(p) => p,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),

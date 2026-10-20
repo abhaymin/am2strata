@@ -43,6 +43,26 @@ pub struct Loaded {
     pub tool_orders: ToolOrders,
     /// what the launch adapted to this machine (shown in /health and the log)
     pub adapted: Vec<String>,
+    /// the Chat settings shared with other apps (POST /settings), kept next to the run config
+    pub shared: std::sync::RwLock<crate::settings::Defaults>,
+    /// the run config's `sampling` block
+    pub sampling_defaults: crate::settings::Defaults,
+}
+
+impl Loaded {
+    /// The sampling defaults of a request: the model card's for this thinking state, the config's block, then the
+    /// shared Chat settings (the request's own fields win over all of them).
+    pub fn defaults(&self, thinking: bool) -> crate::settings::Defaults {
+        let mut d = crate::run::model_card_defaults(self.family.as_deref(), thinking);
+        d.extend(self.sampling_defaults.clone());
+        d.extend(self.shared.read().unwrap().clone());
+        d
+    }
+
+    /// The thinking level of a request that names none: the shared Chat settings first, then the config's.
+    pub fn config_effort(&self) -> Option<String> {
+        self.entry.cfg.rest.get("reasoning_effort").and_then(serde_json::Value::as_str).map(str::to_owned)
+    }
 }
 
 pub struct Manager {
@@ -265,6 +285,7 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
             return Err(anyhow::Error::new(e).context(format!("engine of {}", entry.id)));
         }
     };
+    let sampling_defaults = crate::settings::config_sampling(&cfg.rest).map_err(anyhow::Error::msg)?;
     let max_context = cfg.max_context();
     let prompts = PromptBuilder::new(template, tok.clone());
     Ok(Loaded {
@@ -281,5 +302,7 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         pad_literal,
         tool_orders: ToolOrders::default(),
         adapted,
+        shared: std::sync::RwLock::new(crate::settings::read_shared(&entry.path)),
+        sampling_defaults,
     })
 }

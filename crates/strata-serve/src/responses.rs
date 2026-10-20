@@ -731,6 +731,10 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(req):
             return r.into_response();
         }
     };
+    {
+        let shared = loaded.shared.read().unwrap().clone();
+        crate::settings::with_shared(&mut chat, &shared, loaded.config_effort().as_deref(), "openai");
+    }
     let prep = match openai_to_messages(&chat, &loaded.tool_orders) {
         Ok(p) => p,
         Err(e) => return RespError::new(e.0, None).into_response(),

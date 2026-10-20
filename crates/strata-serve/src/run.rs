@@ -46,33 +46,39 @@ impl Refusal {
     }
 }
 
-/// The model card's sampling ("Best Practices"), used when the request does not say (PolyStrata 0.1.45).
-fn model_card_sampling(family: Option<&str>, thinking: bool) -> Sampling {
+/// The model card's sampling ("Best Practices") for the family and thinking state (PolyStrata 0.1.45).
+pub fn model_card_defaults(family: Option<&str>, thinking: bool) -> crate::settings::Defaults {
     let (t, p, pp) = match (family, thinking) {
         (Some("qwen4exp"), true) => (1.0, 0.95, None),
         (Some("qwen4exp"), false) => (0.7, 0.8, Some(1.5)),
         (Some("qwen35moe"), true) => (1.0, 0.95, Some(1.5)),
         (Some("qwen35moe"), false) => (0.7, 0.8, Some(1.5)),
-        _ => return Sampling::default(),
+        _ => return Default::default(),
     };
-    Sampling { temperature: Some(t), top_p: Some(p), top_k: Some(20), presence_penalty: pp, ..Default::default() }
+    let mut d = crate::settings::Defaults::new();
+    d.insert("temperature".into(), json!(t));
+    d.insert("top_p".into(), json!(p));
+    d.insert("top_k".into(), json!(20));
+    if let Some(pp) = pp {
+        d.insert("presence_penalty".into(), json!(pp));
+    }
+    d
 }
 
-/// The request's sampling over the model card's: a field the request sets wins; temperature 0 asks for greedy.
-pub fn sampling_of(req: &Value, family: Option<&str>, thinking: bool) -> Sampling {
-    let f = |k: &str| req.get(k).and_then(Value::as_f64);
-    let i = |k: &str| req.get(k).and_then(Value::as_i64);
-    let card = model_card_sampling(family, thinking);
-    let any_given = ["temperature", "top_p", "top_k", "min_p"].iter().any(|k| req.get(*k).is_some_and(|v| !v.is_null()));
-    let base = if any_given { Sampling::default() } else { card.clone() };
+/// The request's sampling over the defaults (model card, config, shared settings), key by key: a field the request
+/// sets wins (an explicit temperature 0 stays greedy), a field set to null falls back to the default.
+pub fn sampling_of(req: &Value, defaults: &crate::settings::Defaults) -> Sampling {
+    let get = |k: &str| req.get(k).filter(|v| !v.is_null()).or_else(|| defaults.get(k)).filter(|v| !v.is_null());
+    let f = |k: &str| get(k).and_then(Value::as_f64);
+    let i = |k: &str| get(k).and_then(|v| v.as_i64().or_else(|| v.as_f64().filter(|x| x.fract() == 0.0).map(|x| x as i64)));
     Sampling {
-        temperature: f("temperature").or(base.temperature),
-        top_p: f("top_p").or(base.top_p),
-        top_k: i("top_k").or(base.top_k),
-        min_p: f("min_p").or(base.min_p),
-        repetition_penalty: f("repetition_penalty").or(base.repetition_penalty),
-        frequency_penalty: f("frequency_penalty").or(base.frequency_penalty),
-        presence_penalty: f("presence_penalty").or(if any_given { None } else { card.presence_penalty }),
+        temperature: f("temperature"),
+        top_p: f("top_p"),
+        top_k: i("top_k"),
+        min_p: f("min_p"),
+        repetition_penalty: f("repetition_penalty"),
+        frequency_penalty: f("frequency_penalty"),
+        presence_penalty: f("presence_penalty"),
         penalty_last_n: i("penalty_last_n"),
         seed: i("seed"),
     }
@@ -229,9 +235,15 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     };
 
     let thinking = prep.kwargs.get("enable_thinking") != Some(&Value::Bool(false));
-    let sampling = sampling_of(&req, loaded.family.as_deref(), thinking);
+    let defaults = loaded.defaults(thinking);
+    let sampling = sampling_of(&req, &defaults);
     let answer_room = loaded.entry.cfg.rest.get("answer_room") != Some(&Value::Bool(false));
-    let asked_budget = opts.budget.or_else(|| req.get("reasoning_budget_tokens").and_then(Value::as_u64));
+    let asked_budget = opts.budget.or_else(|| {
+        req.get("reasoning_budget_tokens")
+            .or_else(|| defaults.get("reasoning_budget_tokens"))
+            .or_else(|| loaded.entry.cfg.rest.get("reasoning_budget_tokens"))
+            .and_then(Value::as_u64)
+    });
     let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room) } else { None };
     let mut force = forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref());
     let mut parser = OutputParser::new(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools);

@@ -12,6 +12,7 @@ mod monitor;
 mod openai;
 mod responses;
 mod run;
+mod settings;
 mod web;
 
 use anyhow::{bail, Context, Result};
@@ -137,7 +138,7 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/settings", get(web::settings_get).post(web::settings_post))
-        .route("/config", get(web::config_get))
+        .route("/config", get(web::config_get).post(web::config_post))
         .route("/mcp", get(web::mcp))
         .route("/metrics", get(web::metrics))
         .route("/metrics/prometheus", get(web::prometheus))

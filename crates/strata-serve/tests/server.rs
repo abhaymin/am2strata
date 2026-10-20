@@ -382,3 +382,49 @@ fn monitor_records_requests_totals_and_the_machine() {
     assert_eq!(st["activity"]["requests"], 1);
     assert_eq!(st["dialects"][2], "/v1/responses");
 }
+
+#[test]
+fn shared_settings_fill_what_requests_leave_out_and_persist() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, r) = s.post("/settings", &json!({"defaults": {"temperature": 0.3, "max_tokens": 7, "reasoning_effort": "none"}}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["shared"], true);
+    assert!(s.dir.join("strata-mock-a.shared-settings.json").exists(), "kept next to the run config");
+    assert_eq!(s.post("/settings", &json!({"defaults": {"top_k": 99}})).0, 400);
+    s.post("/v1/chat/completions", &json!({"messages": [user("x")]}));
+    s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 3, "temperature": 0.9}));
+    let g = s.gen_lines();
+    assert!(g[0].starts_with("GEN 7 ") && g[0].contains(" temperature=0.3"), "{}", g[0]);
+    assert!(g[1].starts_with("GEN 3 ") && g[1].contains(" temperature=0.9"), "{}", g[1]);
+    let chat = json!({"messages": [user("x")], "reasoning_effort": "none"});
+    assert_eq!(line_ids(&g[0]), expected_prompt(&chat), "the shared thinking level is in the prompt");
+    let (_, r) = s.post("/settings", &json!({"defaults": null}));
+    assert_eq!(r["shared"], false);
+    assert!(!s.dir.join("strata-mock-a.shared-settings.json").exists());
+}
+
+#[test]
+fn sampling_merges_the_model_card_key_by_key() {
+    let m = Model { arch: Some("qwen35moe"), ..Model::default() };
+    let s = Server::start(&[m], &[ids("ok")], json!({}));
+    s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 5, "temperature": 0.5}));
+    let g = s.gen_lines();
+    assert!(g[0].contains(" temperature=0.5 top_p=0.95 top_k=20 penalty_present=1.5"), "the card fills the rest: {}", g[0]);
+}
+
+#[test]
+fn config_view_changes_only_its_keys() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, v) = s.get("/config", true);
+    assert_eq!(c, 200);
+    assert_eq!(v["file"], "strata-mock-a.json");
+    assert!(v["keys"].as_array().unwrap().iter().any(|k| k["key"] == "sampling.temperature"));
+    let (c, r) = s.post("/config", &json!({"set": {"sampling.temperature": 0.6, "fit_max_tokens": true}}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["changed"], json!(["sampling.temperature", "fit_max_tokens"]));
+    let cfg: Value = serde_json::from_str(&std::fs::read_to_string(s.dir.join("strata-mock-a.json")).unwrap()).unwrap();
+    assert_eq!(cfg["sampling"]["temperature"], 0.6);
+    assert_eq!(cfg["api_key"], KEY, "the other keys stay");
+    assert!(s.dir.join("strata-mock-a.json.bak").exists());
+    assert_eq!(s.post("/config", &json!({"set": {"api_key": "x"}})).0, 400);
+}

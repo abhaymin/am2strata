@@ -49,6 +49,10 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
         Ok(l) => l,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
     };
+    {
+        let shared = loaded.shared.read().unwrap().clone();
+        crate::settings::with_shared(&mut req, &shared, loaded.config_effort().as_deref(), "openai");
+    }
     let mut prep = match openai_to_messages(&req, &loaded.tool_orders) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),

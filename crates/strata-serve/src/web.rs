@@ -66,18 +66,95 @@ pub async fn unload_model(State(s): State<AppState>, headers: HeaderMap) -> Resp
     Json(json!({"status": "unloaded"})).into_response()
 }
 
-/// Shared chat settings: not kept by this server yet (the web app keeps them per browser).
-pub async fn settings_get() -> Json<Value> {
-    Json(json!({"shared": false, "defaults": null}))
+/// The run config the settings belong to: the loaded model's, else the default one's.
+async fn config_path(s: &AppState) -> Option<std::path::PathBuf> {
+    match s.mgr.current().await {
+        Some(l) => Some(l.entry.path.clone()),
+        None => s.mgr.entry(&s.mgr.default_id).map(|e| e.path.clone()),
+    }
 }
 
-pub async fn settings_post() -> Json<Value> {
-    Json(json!({"shared": false}))
+/// GET /settings: the Chat settings shared with other apps (every client gets them for what it leaves out).
+pub async fn settings_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let d = match s.mgr.current().await {
+        Some(l) => l.shared.read().unwrap().clone(),
+        None => config_path(&s).await.map(|p| crate::settings::read_shared(&p)).unwrap_or_default(),
+    };
+    Json(json!({"shared": !d.is_empty(), "defaults": d})).into_response()
 }
 
-/// The run-config view: not offered (the web app hides its card on a 404).
-pub async fn config_get() -> Response {
-    error(StatusCode::NOT_FOUND, "not_found", "the run-config view is not available on this server")
+/// POST /settings {"defaults": {...} | null}: set (or, null, clear) the shared Chat settings.
+pub async fn settings_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let d = match crate::settings::clean_shared_defaults(req.get("defaults").unwrap_or(&Value::Null)) {
+        Ok(d) => d,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    if let Some(l) = s.mgr.current().await {
+        *l.shared.write().unwrap() = d.clone();
+    }
+    if let Some(p) = config_path(&s).await {
+        crate::settings::write_shared(&p, &d);
+    }
+    Json(json!({"shared": !d.is_empty(), "defaults": d})).into_response()
+}
+
+fn read_config(p: &std::path::Path) -> Result<Value, Response> {
+    let text = std::fs::read_to_string(p).map_err(|e| {
+        error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("the run config cannot be read: {e}"))
+    })?;
+    match serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) {
+        Ok(v @ Value::Object(_)) => Ok(v),
+        _ => Err(error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "the run config is not a JSON object")),
+    }
+}
+
+/// GET /config: a few documented keys of the run config, for the Settings view.
+pub async fn config_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let Some(p) = config_path(&s).await else {
+        return error(StatusCode::NOT_FOUND, "not_found", "this server was started without a run config");
+    };
+    match read_config(&p) {
+        Ok(cfg) => Json(crate::settings::view(&cfg, &p)).into_response(),
+        Err(r) => r,
+    }
+}
+
+/// POST /config {"set": {key: value | null}}: change those keys only; the earlier file is kept as .bak. Used from
+/// the next start of, or switch to, the model.
+pub async fn config_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let Some(p) = config_path(&s).await else {
+        return error(StatusCode::NOT_FOUND, "not_found", "this server was started without a run config");
+    };
+    let cfg = match read_config(&p) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let (new, changed) = match crate::settings::apply(&cfg, req.get("set")) {
+        Ok(x) => x,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    if !changed.is_empty() {
+        match crate::settings::save(&p, &new) {
+            Ok(bak) => tracing::info!("the Settings view changed {} in {} (the earlier file: {}); used from the next start",
+                                      changed.join(", "), p.display(), bak.display()),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("the run config cannot be written: {e}")),
+        }
+    }
+    let mut v = crate::settings::view(&new, &p);
+    v["changed"] = json!(changed);
+    Json(v).into_response()
 }
 
 pub async fn mcp() -> Json<Value> {
