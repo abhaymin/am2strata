@@ -125,7 +125,7 @@ profile. The compute is on the CPU for now (~0.7 s/token for GLM-4.7-Flash, ~1.1
 next: the GPU tier (dense weights and the hot experts in VRAM via candle), then integer dot products on the CPU
 (the activations are already quantized as llama.cpp does).
 
-Run configs: `configs/am2strata-hybrid-*.json` (Nemotron Bolt, GLM-4.7-Flash, Devstral); `${AM2STRATA_HOME}` is this
+Run configs: `configs/strata-{nemotron-3.5-bolt,glm-4.7-flash,devstral-small}-*.json` (exe: am2strata-hybrid) (Nemotron Bolt, GLM-4.7-Flash, Devstral); `${AM2STRATA_HOME}` is this
 checkout (default ~/Development/am2strata).
 
 ## Alongside: the knowledge and memory cache
