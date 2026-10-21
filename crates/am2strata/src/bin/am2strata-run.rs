@@ -172,6 +172,27 @@ fn server_cmd(s: &ServerArgs) -> Vec<String> {
     c
 }
 
+/// The server resolves the configs and the model name, and exits: a typo fails here, before a running server
+/// is stopped.
+fn check(s: &ServerArgs) -> bool {
+    let mut c = server_cmd(s);
+    c.push("--check".into());
+    match Command::new(&c[0]).args(&c[1..]).env("RUST_LOG", "warn").output() {
+        Ok(o) if o.status.success() => {
+            say(format!("model: {}", String::from_utf8_lossy(&o.stdout).trim()));
+            true
+        }
+        Ok(o) => {
+            say(format!("not started, nothing stopped: {}", String::from_utf8_lossy(&o.stderr).trim().trim_start_matches("Error: ")));
+            false
+        }
+        Err(e) => {
+            say(format!("could not run {}: {e}", c[0]));
+            false
+        }
+    }
+}
+
 /// GET /health over a plain socket (the launcher needs no HTTP client): Some(body) once the server answers 200.
 fn health(host: &str, port: u16) -> Option<String> {
     let host = if host == "0.0.0.0" || host.is_empty() { "127.0.0.1" } else { host };
@@ -241,7 +262,7 @@ fn serve(s: &ServerArgs, take_over: bool) -> ExitCode {
 }
 
 fn temp_service(s: &ServerArgs) -> ExitCode {
-    if !build() {
+    if !build() || !check(s) {
         return ExitCode::FAILURE;
     }
     if active(TEMP_UNIT) {
@@ -289,7 +310,7 @@ fn unit_dir() -> PathBuf {
 
 /// The boot service: the same place in the system as strata-orca (port, configs, models, linger), am2Strata's binary.
 fn install(s: &ServerArgs) -> ExitCode {
-    if !build() {
+    if !build() || !check(s) {
         return ExitCode::FAILURE;
     }
     let cmd = server_cmd(s).iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect::<Vec<_>>().join(" ");

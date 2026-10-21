@@ -68,6 +68,10 @@ struct Args {
     /// seconds to wait for an engine to load
     #[arg(long, default_value_t = 900)]
     ready_timeout: u64,
+    /// only check that the configs are readable and --model names one installed model, print its id, and exit
+    /// (am2strata-run does this before it stops a running server)
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Clone)]
@@ -155,6 +159,10 @@ async fn main() -> Result<()> {
         None => models[0].id.clone(),
     };
     let first = models.iter().find(|e| e.id == default).cloned().expect("default exists");
+    if args.check {
+        println!("{default}");
+        return Ok(());
+    }
     let host = args.host.or(first.cfg.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
     let port = args.port.or(first.cfg.port).unwrap_or(8080);
     let api_key = args.api_key.or(first.cfg.api_key.clone());
