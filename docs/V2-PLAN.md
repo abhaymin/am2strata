@@ -78,6 +78,28 @@ One model library for every kind - text MoE, text dense, image, video, speech in
 API: `GET /api/models?kind=`, `POST /api/models/load` / `unload` (any kind), `POST /api/models/pull` (any kind),
 `DELETE /api/models/{id}`; the same checks as today (key, this server's own page).
 
+## Generate from the chat (all media phases)
+
+Ask in the chat ("draw…", "make a 5-second clip of…", "read this aloud", or attach audio to transcribe) and the answer
+comes back in the conversation:
+
+- The chat model gets built-in tools, as MCP tools are offered today: `generate_image`, `generate_video`,
+  `speak` (text to speech) and `transcribe`, with their parameters (prompt, size, length, voice, ...). The server runs
+  the job with the media engine and puts the picture, video or audio in the answer (the canvas shows it; API clients
+  get it as a file or URL); the model sees a short result ("image made: 1024x1024, seed 42") and can go on.
+- **A capability check first, before anything is promised or started:**
+  - the model for the job is installed (else: which one to download, its size, and a button);
+  - the request fits the machine: VRAM and RAM for the model at that size or length (with the text model unloaded or
+    shrunk), disk for the output, limits per model (sides, frames, seconds), and the licence notes;
+  - an estimate of the time from measured speeds ("about 3 minutes for 5 s of video on this card"), so a long job is
+    confirmed by the user first;
+  - what is refused or adjusted is said plainly (e.g. "2048x2048 does not fit next to Orca; 1024x1024, or unload Orca
+    for this one?").
+  The same check answers `GET /api/media/capabilities` (what this PC can make, with which models, how big, how fast),
+  which the web app reads to show or hide the Create tabs and the chat tools.
+- The tools are offered only when the check passes and the user allows them (a switch per kind, like the MCP switch),
+  never from another web page, and API clients opt in per request.
+
 ## New architectures
 
 - **Nemotron-H MoE** (`nemotron_h_moe`: NVIDIA Nemotron 3.5 Bolt 74B-A9B; Mamba-2 state-space layers, attention and
