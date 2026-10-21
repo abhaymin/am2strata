@@ -18,6 +18,8 @@ pub struct Spec {
     pub models_dir: PathBuf,
     pub context: Option<u64>,
     pub write_config: bool,
+    /// the folder under models/ (default: the repository's name and the quantization)
+    pub dir: Option<String>,
 }
 
 pub enum Event {
@@ -54,7 +56,8 @@ pub async fn run(spec: &Spec, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Outc
     let total: u64 = chosen.iter().map(|f| f.size).sum();
     let tag = quant_tag(&chosen[0].path).or_else(|| spec.quant.as_ref().map(|q| q.to_uppercase())).unwrap_or_else(|| "model".into());
     let base = repo.rsplit('/').next().unwrap_or(&repo).trim_end_matches("-GGUF").trim_end_matches("-gguf").to_string();
-    let dir = spec.data_dir.join("models").join(format!("{base}-{tag}"));
+    let name = spec.dir.clone().filter(|d| !d.is_empty() && !d.contains('/') && d != "..").unwrap_or(format!("{base}-{tag}"));
+    let dir = spec.data_dir.join("models").join(name);
     ev(Event::Note(format!("{} file(s), {} -> {}", chosen.len(), human(total), dir.display())));
     let have: u64 = chosen.iter().map(|f| std::fs::metadata(local_path(&dir, f)).map(|m| m.len()).unwrap_or(0)).sum();
     if let Some(free) = free_space(&dir) {

@@ -216,7 +216,8 @@ fn verified(p: &Path, f: &RepoFile) -> Result<bool> {
 pub fn quants(files: &[RepoFile]) -> Vec<(String, u64, usize)> {
     let mut out: Vec<(String, u64, usize)> = Vec::new();
     for f in files.iter().filter(|f| is_model_gguf(&f.path)) {
-        let q = quant_tag(&f.path).unwrap_or_else(|| file_name(&f.path).trim_end_matches(".gguf").to_string());
+        // an unusual quant name (AD-Q5_K-Q4_K): the file name without its shard number, so a split model is one entry
+        let q = quant_tag(&f.path).unwrap_or_else(|| split_base(&f.path));
         match out.iter_mut().find(|(k, _, _)| *k == q) {
             Some(e) => {
                 e.1 += f.size;
@@ -339,5 +340,25 @@ mod tests {
         assert_eq!(quant_tag("Qwen3-30B-A3B-UD-Q6_K_XL.gguf").as_deref(), Some("UD-Q6_K_XL"));
         assert_eq!(quant_tag("x-iq3_xxs-00001-of-00002.gguf").as_deref(), Some("IQ3_XXS"));
         assert_eq!(split_base("dir/X-Q4-00002-of-00003.gguf"), "X-Q4");
+    }
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+
+    fn rf(path: &str, size: u64) -> RepoFile {
+        RepoFile { path: path.into(), size, sha256: None }
+    }
+
+    #[test]
+    fn a_split_model_with_an_unusual_quant_is_one_entry() {
+        let files = [rf("M-AD-Q5_K-Q4_K-00001-of-00002.gguf", 10), rf("M-AD-Q5_K-Q4_K-00002-of-00002.gguf", 5),
+                     rf("M-IQ4_XS-00001-of-00002.gguf", 7), rf("M-IQ4_XS-00002-of-00002.gguf", 7), rf("mmproj-F16.gguf", 1)];
+        let q = quants(&files);
+        assert_eq!(q, vec![("IQ4_XS".to_string(), 14, 2), ("M-AD-Q5_K-Q4_K".to_string(), 15, 2)]);
+        let picked = select(&files, "AD-Q5_K-Q4_K", true).unwrap();
+        assert_eq!(picked.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+                   ["M-AD-Q5_K-Q4_K-00001-of-00002.gguf", "M-AD-Q5_K-Q4_K-00002-of-00002.gguf", "mmproj-F16.gguf"]);
     }
 }

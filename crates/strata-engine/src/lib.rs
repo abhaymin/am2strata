@@ -139,12 +139,69 @@ pub fn child_env(cfg: &RunConfig) -> Vec<(String, String)> {
     env
 }
 
+/// A shareable config: in every string (engine arguments too), a leading `~/` is the home folder and `${NAME}` an
+/// environment variable. `${STRATA_HOME}` (PolyStrata's folder: engines, run configs) and `${STRATA_DATA}` (models,
+/// packs) default to ~/Development/PolyStrata and ~/Development/Strata-data. Absolute paths are left as they are.
+pub fn expand_str(s: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let var = |name: &str| -> Option<String> {
+        std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| match name {
+            "STRATA_HOME" => Some(format!("{home}/Development/PolyStrata")),
+            "STRATA_DATA" => Some(format!("{home}/Development/Strata-data")),
+            "HOME" => Some(home.clone()),
+            _ => None,
+        })
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        match rest[i + 2..].find('}') {
+            Some(j) => {
+                let name = &rest[i + 2..i + 2 + j];
+                match var(name) {
+                    Some(v) => out.push_str(&v),
+                    None => out.push_str(&rest[i..i + 3 + j]),
+                }
+                rest = &rest[i + 3 + j..];
+            }
+            None => {
+                out.push_str(&rest[i..]);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    match out.strip_prefix("~/") {
+        Some(r) if !home.is_empty() => format!("{home}/{r}"),
+        _ => out,
+    }
+}
+
+fn expand_paths(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::String(s) if s.contains("${") || s.starts_with("~/") => *s = expand_str(s),
+        serde_json::Value::Array(a) => a.iter_mut().for_each(expand_paths),
+        serde_json::Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
+                if k != "api_key" {
+                    expand_paths(x);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 impl RunConfig {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let text = std::fs::read_to_string(&path)
             .map_err(|e| Error::Config { path: path.display().to_string(), source: Box::new(e) })?;
-        serde_json::from_str(&text).map_err(|e| Error::Config { path: path.display().to_string(), source: Box::new(e) })
+        let mut v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| Error::Config { path: path.display().to_string(), source: Box::new(e) })?;
+        expand_paths(&mut v);
+        serde_json::from_value(v).map_err(|e| Error::Config { path: path.display().to_string(), source: Box::new(e) })
     }
 
     /// `--max-context N` from the engine arguments (the engine's own default is 8192).
@@ -328,5 +385,23 @@ impl Engine {
         if tokio::time::timeout(Duration::from_secs(30), child.wait()).await.is_err() {
             let _ = child.kill().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::expand_str;
+
+    #[test]
+    fn shareable_paths_expand() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_str("~/x/y"), format!("{home}/x/y"));
+        assert_eq!(expand_str("/abs/path"), "/abs/path");
+        assert_eq!(expand_str("${HOME}/a"), format!("{home}/a"));
+        assert_eq!(expand_str("${NO_SUCH_VAR_AM2}/a"), "${NO_SUCH_VAR_AM2}/a", "an unknown variable stays visible");
+        if std::env::var("STRATA_DATA").is_err() {
+            assert_eq!(expand_str("${STRATA_DATA}/models"), format!("{home}/Development/Strata-data/models"));
+        }
+        assert_eq!(expand_str("--kv"), "--kv");
     }
 }

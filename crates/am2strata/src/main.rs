@@ -145,7 +145,16 @@ async fn main() -> Result<()> {
     let dir = expand(&args.models_dir);
     let models = manager::scan(&dir);
     if models.is_empty() {
-        bail!("no strata-*.json run configs in {}", dir.display());
+        let found: Vec<String> = std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("strata-") && n.ends_with(".json")).collect()).unwrap_or_default();
+        if found.is_empty() {
+            bail!("no strata-*.json run configs in {}", dir.display());
+        }
+        let why: Vec<String> = found.iter().map(|n| match strata_engine::RunConfig::load(dir.join(n)) {
+            Ok(c) => format!("{n}: its engine {} does not exist (deploy/build-engines.sh builds it)", c.exe.display()),
+            Err(e) => format!("{n}: {e}"),
+        }).collect();
+        bail!("no usable run config in {}:\n  {}", dir.display(), why.join("\n  "));
     }
     let default = match &args.model {
         Some(m) => {

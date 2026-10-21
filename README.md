@@ -18,6 +18,18 @@ support) behind OpenAI-, Anthropic- and Responses-compatible APIs, with a web ap
 - Rust (stable). Optional: `ffmpeg` (video from API clients), `poppler-utils` (PDFs), `bubblewrap` (to run Python
   code from the chat in a sandbox).
 
+## Deploy
+
+Step by step, with ready run configs for Tiel Coder, MiniCPM-V 4.7 and Qwen3.8 Flash Next (Orca):
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short:
+
+```bash
+deploy/build-engines.sh --install                 # PolyStrata's engines, for RTX 30/50 cards
+deploy/pull-models.sh tiel                        # or minicpm, orca, all
+deploy/install.sh --host 0.0.0.0 --new-key        # configs in place, a new API key; --service to start at boot
+target/release/am2strata-run serve --port 8000 --model tiel
+```
+
 ## Web app
 
 - **Chat:** several chats kept in the browser; pictures, video (frames cut in the browser) and PDFs; a thinking level.

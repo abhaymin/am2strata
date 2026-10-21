@@ -1,0 +1,34 @@
+{
+ "exe": "${STRATA_HOME}/engine-poly/strata-poly",
+ "args": [
+  "--model",
+  "${STRATA_DATA}/models/minicpmv-uncensored-AD-Q5_K-Q4_K/MiniCPM-V-4.7-35B-A3B-Uncensored-AD-Q5_K-Q4_K-00001-of-00012.gguf",
+  "--max-context",
+  "262144",
+  "--expert-profile",
+  "${STRATA_DATA}/packs/minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k/expert-profile.txt",
+  "--conversation-cache-mib",
+  "8192",
+  "--kv",
+  "q8_0"
+ ],
+ "cwd": "${STRATA_HOME}",
+ "tokenizer": "${STRATA_DATA}/packs/minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k/tokenizer",
+ "model_name": "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k",
+ "display_name": "MiniCPM-V 4.7 35B-A3B Uncensored AD-Q5_K-Q4_K",
+ "log": "${STRATA_HOME}/strata-minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k.log",
+ "lib_dirs": [
+  "/usr/local/cuda/bin",
+  "/usr/local/cuda/lib64"
+ ],
+ "gpu": 0,
+ "host": "127.0.0.1",
+ "port": 8000,
+ "vision": {
+  "exe": "${STRATA_HOME}/engine-poly/strata-vision",
+  "mmproj": "${STRATA_DATA}/models/minicpmv-uncensored-AD-Q5_K-Q4_K/mmproj-MiniCPM-V-4.7-35B-A3B-Uncensored-BF16.gguf",
+  "model": "${STRATA_DATA}/models/minicpmv-uncensored-AD-Q5_K-Q4_K/MiniCPM-V-4.7-35B-A3B-Uncensored-AD-Q5_K-Q4_K-00001-of-00012.gguf",
+  "gpu": true,
+  "max_tokens": 1024
+ }
+}

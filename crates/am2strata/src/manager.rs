@@ -327,6 +327,9 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
     for n in &adapted {
         tracing::info!(model = %entry.id, "{n}");
     }
+    if !cfg.tokenizer.join("vocab.json").exists() {
+        ensure_tokenizer(&cfg).with_context(|| format!("tokenizer of {}", entry.id))?;
+    }
     let tok = Arc::new(Tokenizer::from_dir(&cfg.tokenizer).with_context(|| format!("tokenizer of {}", entry.id))?);
     let template = Arc::new(
         ChatTemplate::from_file(cfg.tokenizer.join("chat_template.jinja")).with_context(|| format!("chat template of {}", entry.id))?,
@@ -403,4 +406,20 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         sampling_defaults,
         reasoning_memory: Default::default(),
     })
+}
+
+/// A config whose tokenizer folder is missing (a shared config beside freshly downloaded files): write it from the
+/// model's GGUF, as `am2strata-run pull` does. The folder must be named `tokenizer`, as packs lay it out.
+fn ensure_tokenizer(cfg: &strata_engine::RunConfig) -> Result<()> {
+    let dir = &cfg.tokenizer;
+    anyhow::ensure!(dir.file_name().is_some_and(|n| n == "tokenizer"),
+                    "{} does not exist (only a folder named tokenizer can be made from the model)", dir.display());
+    let gguf = cfg.args.windows(2).find(|w| w[0] == "--model" || w[0] == "--native").map(|w| std::path::PathBuf::from(&w[1]))
+        .or_else(|| cfg.vision.as_ref().map(|v| v.model.clone()))
+        .with_context(|| format!("{} does not exist, and the config names no model file to make it from", dir.display()))?;
+    let pack = dir.parent().unwrap_or(std::path::Path::new("."));
+    tracing::info!("writing the tokenizer from {} into {}", gguf.display(), dir.display());
+    let g = strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))?;
+    strata_gguf::extract_tokenizer(&g, pack).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(())
 }

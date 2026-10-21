@@ -61,7 +61,7 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     }
     let spec = Spec { repo: repo.to_string(), revision: "main".into(), quant: Some(quant.to_string()), files: Vec::new(), token: token_of(&req),
                       mmproj: req.get("mmproj").and_then(Value::as_bool).unwrap_or(true), data_dir: s.data_dir.clone(),
-                      models_dir: s.models_dir.clone(), context: None, write_config: true };
+                      models_dir: s.models_dir.clone(), context: None, write_config: true, dir: None };
     let job = s.hub_job.clone();
     tokio::spawn(async move {
         let t0 = Instant::now();

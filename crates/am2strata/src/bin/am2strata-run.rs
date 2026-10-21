@@ -95,6 +95,9 @@ struct PullArgs {
     /// download only; write no run config
     #[arg(long)]
     no_config: bool,
+    /// the folder under <data-dir>/models for the files (default: the repository's name and the quantization)
+    #[arg(long)]
+    dir: Option<String>,
 }
 
 #[derive(Args, Clone)]
@@ -380,7 +383,7 @@ async fn pull_async(p: PullArgs) -> Result<(), String> {
     }
     let spec = Spec { repo, revision: p.revision.clone(), quant: p.quant.clone(), files: p.file.clone(), token, mmproj: !p.no_mmproj,
                       data_dir: PathBuf::from(expand(&p.data_dir)), models_dir: PathBuf::from(expand(&p.models_dir)),
-                      context: p.context, write_config: !p.no_config };
+                      context: p.context, write_config: !p.no_config, dir: p.dir.clone() };
     let t0 = Instant::now();
     let mut on = |e: Event| match e {
         Event::Note(n) => say(n),
