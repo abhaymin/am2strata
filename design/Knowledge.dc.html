@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>am2Strata — Settings, Knowledge (plan)</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="{{rootStyle}}">
+
+  <header style="display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--bg2)">
+    <div style="display: flex; align-items: center; gap: 10px">
+      <svg aria-hidden="true" width="30" height="30" viewBox="0 0 64 64"><rect x="2" y="2" width="60" height="60" rx="16" style="fill: var(--logo-tile)"></rect><rect x="14" y="16" width="36" height="8" rx="4" style="fill: var(--accent)"></rect><rect x="14" y="28" width="26" height="8" rx="4" style="fill: var(--accent); opacity: 0.7"></rect><rect x="14" y="40" width="16" height="8" rx="4" style="fill: var(--accent); opacity: 0.45"></rect><circle cx="45" cy="44" r="5" style="fill: var(--logo-spark)"></circle></svg>
+      <span style="font-weight: 800; font-size: 18px; letter-spacing: -0.02em">am<span style="color: var(--accent)">2</span>Strata</span>
+    </div>
+    <nav aria-label="Main" style="display: flex; gap: 4px; padding: 4px; background: var(--panel); border: 1px solid var(--border); border-radius: 10px">
+      <button type="button" style="{{tabOff}}">Chat</button>
+      <button type="button" style="{{tabOff}}">Monitor</button>
+      <button type="button" style="{{tabOn}}">Settings</button>
+      <button type="button" style="{{tabOff}}">API calls</button>
+    </nav>
+    <div style="flex: 1 1 0"></div>
+    <span style="font-size: 13px; color: var(--muted)">Orca (Qwen3.8 Flash Next) · IQ3_XXS</span>
+  </header>
+
+  <div style="flex: 1 1 auto; display: flex; gap: 28px; padding: 28px 32px; max-width: 1440px; box-sizing: border-box; width: 100%">
+    <nav aria-label="Settings sections" style="flex: 0 0 240px; display: flex; flex-direction: column; gap: 4px">
+      <sc-for list="{{sections}}" as="sec" hint-placeholder-count="8">
+        <button type="button" style="{{sec.style}}"><span style="display: flex; align-items: center; gap: 8px; font-weight: 700">{{sec.label}}<sc-if value="{{sec.isNew}}" hint-placeholder-val="{{false}}"><span style="padding: 1px 6px; border-radius: 5px; font-size: 10px; font-weight: 800; background: var(--info-bg); color: var(--info)">PLANNED</span></sc-if></span><span style="display: block; margin-top: 2px; font-size: 12px; color: var(--muted)">{{sec.hint}}</span></button>
+      </sc-for>
+    </nav>
+
+    <main style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 18px">
+      <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
+        <h1 style="margin: 0; font-size: 24px; font-weight: 800">Knowledge and caching</h1>
+        <span style="padding: 3px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; background: var(--info-bg); color: var(--info)">Plan · not built yet</span>
+      </div>
+      <p style="margin: 0; color: var(--muted); max-width: 820px; line-height: 1.55">Above the KV cache: answers that repeat, prompts read once and kept on disk, documents and facts the server can add to a request, shared by the web app and every API client you allow.</p>
+
+      <div aria-label="Where a request goes" style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border); font-size: 13px">
+        <sc-for list="{{path}}" as="p" hint-placeholder-count="6">
+          <span style="display: inline-flex; align-items: center; gap: 8px"><span style="{{p.style}}">{{p.label}}</span><sc-if value="{{p.arrow}}" hint-placeholder-val="{{true}}"><span aria-hidden="true" style="color: var(--muted)">→</span></sc-if></span>
+        </sc-for>
+      </div>
+
+      <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px">
+        <sc-for list="{{tiers}}" as="t" hint-placeholder-count="4">
+          <div style="display: flex; flex-direction: column; gap: 6px; padding: 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+            <span style="font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--muted)">{{t.n}}</span>
+            <span style="font-weight: 800">{{t.name}}</span>
+            <span style="font-size: 22px; font-weight: 800">{{t.value}}</span>
+            <span style="font-size: 12px; color: var(--muted); line-height: 1.45">{{t.note}}</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div role="tablist" aria-label="Knowledge" style="display: flex; gap: 2px; border-bottom: 1px solid var(--border)">
+        <sc-for list="{{tabs}}" as="tb" hint-placeholder-count="4">
+          <button type="button" role="tab" aria-selected="{{tb.on}}" onClick="{{tb.pick}}" style="{{tb.style}}">{{tb.label}}</button>
+        </sc-for>
+      </div>
+
+      <sc-if value="{{isCollections}}" hint-placeholder-val="{{true}}">
+        <div style="display: flex; flex-direction: column; gap: 12px">
+          <div style="border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+            <sc-for list="{{collections}}" as="c" hint-placeholder-count="3">
+              <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 14px 16px; border-bottom: 1px solid var(--border-soft)">
+                <div style="flex: 1 1 260px; min-width: 0"><span style="display: block; font-weight: 800">{{c.name}}</span><span style="display: block; margin-top: 2px; font: 400 12px 'JetBrains Mono', monospace; color: var(--muted)">{{c.facts}}</span></div>
+                <span style="{{c.badge}}">{{c.state}}</span>
+                <label style="display: flex; align-items: center; gap: 8px; font-size: 13px"><input type="checkbox" checked="{{c.auto}}" style="width: 18px; height: 18px; accent-color: var(--accent)">Add to answers</label>
+                <button type="button" style="{{softBtn}}">{{c.action}}</button>
+              </div>
+            </sc-for>
+          </div>
+          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 16px; border-radius: 12px; border: 2px dashed var(--border-strong); color: var(--muted)">
+            <span style="flex: 1 1 320px">Drop PDFs, Markdown, code folders or notes here, paste text, or add a web address. They are split into passages and indexed on this PC.</span>
+            <button type="button" style="{{softBtn}}">Add files</button>
+            <button type="button" style="{{primaryBtn}}">New collection</button>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{isMemory}}" hint-placeholder-val="{{false}}">
+        <div style="border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+          <sc-for list="{{memory}}" as="m" hint-placeholder-count="5">
+            <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft)">
+              <span style="flex: 1 1 360px; min-width: 0">{{m.fact}}</span>
+              <span style="font-size: 12px; color: var(--muted)">{{m.who}}</span>
+              <span style="padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; background: var(--raised)">{{m.scope}}</span>
+              <button type="button" style="{{softBtn}}">Forget</button>
+            </div>
+          </sc-for>
+          <p style="margin: 0; padding: 12px 16px; font-size: 12px; color: var(--muted)">Models write here with a remember tool (only when allowed); you can add, edit and forget facts. Facts are added to a request only when they match it.</p>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{isInjection}}" hint-placeholder-val="{{false}}">
+        <div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px">
+          <div style="display: flex; flex-direction: column; gap: 12px; padding: 16px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+            <span style="font-weight: 800">When to add knowledge</span>
+            <div role="radiogroup" aria-label="Policy" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; border: 1px solid var(--border); align-self: flex-start">
+              <button type="button" role="radio" aria-checked="false" style="{{segOff}}">Off</button>
+              <button type="button" role="radio" aria-checked="false" style="{{segOff}}">When asked</button>
+              <button type="button" role="radio" aria-checked="true" style="{{segOn}}">Automatic</button>
+            </div>
+            <sc-for list="{{knobs}}" as="k" hint-placeholder-count="4">
+              <div style="display: flex; justify-content: space-between; gap: 12px; font-size: 13px"><span>{{k.label}}</span><span style="font-family: 'JetBrains Mono', monospace; color: var(--muted)">{{k.value}}</span></div>
+            </sc-for>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 10px; padding: 16px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+            <span style="font-weight: 800">Who gets it</span>
+            <sc-for list="{{clients}}" as="cl" hint-placeholder-count="4">
+              <label style="display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 13px"><span>{{cl.name}}<span style="display: block; font-size: 12px; color: var(--muted)">{{cl.note}}</span></span><input type="checkbox" checked="{{cl.on}}" style="width: 18px; height: 18px; accent-color: var(--accent)"></label>
+            </sc-for>
+            <span style="font-size: 12px; color: var(--muted)">What was added is shown in API calls › Input, with its sources.</span>
+          </div>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{isCaches}}" hint-placeholder-val="{{false}}">
+        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px">
+          <sc-for list="{{caches}}" as="ca" hint-placeholder-count="3">
+            <div style="display: flex; flex-direction: column; gap: 8px; padding: 16px; border-radius: 12px; background: var(--panel); border: 1px solid var(--border)">
+              <div style="display: flex; justify-content: space-between; align-items: center"><span style="font-weight: 800">{{ca.name}}</span><span style="{{ca.badge}}">{{ca.state}}</span></div>
+              <span style="font-size: 13px; color: var(--muted); line-height: 1.5">{{ca.note}}</span>
+              <span style="font: 400 12px 'JetBrains Mono', monospace">{{ca.stats}}</span>
+              <button type="button" style="{{softBtn}}">Clear</button>
+            </div>
+          </sc-for>
+        </div>
+      </sc-if>
+    </main>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"startTab":{"editor":"enum","options":["collections","memory","injection","caches"],"default":"collections"},"accent":{"editor":"color","default":"#3DD68C","options":["#3DD68C","#6CB6FF","#F2B84B","#C297FF"]},"$preview":{"width":1440,"height":960}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { tab: props.startTab ?? 'collections' };
+  }
+  renderVals() {
+    const accent = this.props.accent ?? '#3DD68C';
+    const dark = (this.props.theme ?? 'dark') === 'dark';
+    const s = this.state;
+    const pal = dark ? {
+      bg: '#0D1117', bg2: '#0F141B', panel: '#151B23', 'panel-soft': '#12171F', raised: '#1C2430', border: '#2A3441', 'border-soft': '#222B36',
+      'border-strong': '#3A4757', text: '#E6EDF3', muted: '#9BA7B4', 'ok-bg': '#12261D', 'ok-fg': '#7EE8B2', info: '#9CCBFF', 'info-bg': '#142536',
+      warn: '#F2C66E', 'warn-bg': '#2B2412', 'on-accent': '#0D1117', 'logo-tile': '#1C2430', 'logo-spark': '#F2B84B' } : {
+      bg: '#F6F8FA', bg2: '#FFFFFF', panel: '#FFFFFF', 'panel-soft': '#F3F5F8', raised: '#EEF1F5', border: '#D5DBE3', 'border-soft': '#E6EAF0',
+      'border-strong': '#B8C2CE', text: '#1A2230', muted: '#566372', 'ok-bg': '#DDF5E8', 'ok-fg': '#0F6B41', info: '#1F5FB5', 'info-bg': '#E3EEFC',
+      warn: '#8A5600', 'warn-bg': '#FFF1D6', 'on-accent': '#0D1117', 'logo-tile': '#0F1B16', 'logo-spark': '#F2B84B' };
+    const rootStyle = Object.entries(pal).map(([k, v]) => '--' + k + ': ' + v).join('; ') + '; --accent: ' + accent +
+      '; min-height: 960px; display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-family: Manrope, system-ui, sans-serif; font-size: 14px';
+    const tabBase = 'min-height: 36px; padding: 0 14px; border-radius: 7px; border: 0; font-family: inherit; font-size: 14px; font-weight: 700; ';
+    const secBtn = (on) => 'text-align: left; min-height: 52px; padding: 10px 12px; border-radius: 10px; font-family: inherit; font-size: 14px; color: var(--text); cursor: pointer; ' +
+      (on ? 'background: var(--raised); border: 1px solid var(--border-strong)' : 'background: transparent; border: 1px solid transparent');
+    const sections = [['Models', 'Switch, unload, add from Hugging Face'], ['Model config', 'Context, KV cache, sampling'], ['Chat defaults', 'Shared with other apps'],
+      ['Knowledge', 'Caches, documents, shared memory', true], ['Server and access', 'Address, API key, monitor'], ['Tools (MCP)', 'Tool servers for the chat'],
+      ['Appearance', 'Light, dark or system; accent'], ['Connect', 'Base URLs for your apps']].map(([label, hint, isNew]) => ({ label, hint, isNew: !!isNew, style: secBtn(!!isNew) }));
+    const chip = (c) => 'padding: 4px 10px; border-radius: 999px; font-weight: 700; ' + c;
+    const path = [['Request', 'background: var(--raised)'], ['1 · Answer cache', 'background: var(--ok-bg); color: var(--ok-fg)'],
+      ['2 · Memory + knowledge', 'background: var(--info-bg); color: var(--info)'], ['3 · Prompt snapshot (KV on disk)', 'background: var(--warn-bg); color: var(--warn)'],
+      ['KV cache in VRAM', 'background: var(--raised)'], ['Engine', 'background: var(--raised)']].map(([label, c], i, a) => ({ label, style: chip(c), arrow: i < a.length - 1 }));
+    const tiers = [
+      { n: '1 · ANSWER CACHE', name: 'Same question, same answer', value: '312 hits', note: 'Exact matches of model + messages + settings, for greedy or seeded requests only. 41 MB.' },
+      { n: '2 · KNOWLEDGE', name: 'Documents and memory', value: '1,284 passages', note: '3 collections, 47 facts; the best matches are added to a request, with sources.' },
+      { n: '3 · PROMPT SNAPSHOTS', name: 'Read once, keep on disk', value: '6 · 9.8 GB', note: 'The KV state of long system prompts and documents: 1.2 s to load instead of 110 s to read.' },
+      { n: 'TODAY', name: 'Conversation cache', value: 'in RAM', note: 'The engine keeps the last conversation’s KV; it is lost when the model unloads.' } ];
+    const tabs = [['collections', 'Collections'], ['memory', 'Shared memory'], ['injection', 'How it is added'], ['caches', 'Caches']].map(([id, label]) => ({
+      label, on: s.tab === id ? 'true' : 'false', pick: () => this.setState({ tab: id }),
+      style: 'height: 40px; padding: 0 14px; border: 0; background: transparent; font-family: inherit; font-size: 14px; font-weight: 700; cursor: pointer; ' +
+        (s.tab === id ? 'color: var(--text); border-bottom: 2px solid ' + accent : 'color: var(--muted); border-bottom: 2px solid transparent') }));
+    const badge = (on) => 'padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; ' + (on ? 'background: var(--ok-bg); color: var(--ok-fg)' : 'background: var(--warn-bg); color: var(--warn)');
+    const collections = [
+      { name: 'PolyStrata and am2Strata docs', facts: 'docs/ · 212 files · 618 passages · snapshot 2.1 GB', state: 'Snapshot ready', badge: badge(true), auto: true, action: 'Update' },
+      { name: 'Project notes', facts: '~/Documents/notes · 74 files · 431 passages', state: 'Indexed', badge: badge(true), auto: true, action: 'Make snapshot' },
+      { name: 'Invoices 2026', facts: '38 PDFs · 235 passages · text + page pictures', state: 'Indexing 61%', badge: badge(false), auto: false, action: 'Pause' } ];
+    const memory = [
+      { fact: 'The server is a Ryzen 7 7840HS with an RTX 5060 Ti 16 GB and 60 GB RAM.', who: 'you · Oct 20', scope: 'everyone' },
+      { fact: 'Prefer answers with code in Rust unless Python is asked for.', who: 'you · Oct 19', scope: 'web app' },
+      { fact: 'Orca runs at about 60 tok/s warm; Tiel Q6 at about 100 tok/s.', who: 'Orca · Oct 20', scope: 'everyone' },
+      { fact: 'The omp agent works in ~/Development/am2strata.', who: 'omp · Oct 21', scope: 'API key omp' },
+      { fact: 'PolyStrata stays untouched; am2Strata is the new edition.', who: 'you · Oct 20', scope: 'everyone' } ];
+    const knobs = [{ label: 'Passages per request', value: 'up to 6' }, { label: 'Minimum relevance', value: '0.62' },
+      { label: 'Token budget for added text', value: '3,000' }, { label: 'Cite sources in the answer', value: 'on' }];
+    const clients = [{ name: 'This web app', note: 'chats in the browser', on: true }, { name: 'API key "omp"', note: 'the coding agent', on: true },
+      { name: 'Claude Code / Codex', note: 'Responses and Anthropic APIs', on: false }, { name: 'Other API clients', note: 'anyone with the server key', on: false }];
+    const caches = [
+      { name: 'Answer cache', state: 'On', badge: badge(true), note: 'Exact repeats only (temperature 0 or a seed). Never across different models or settings.', stats: '312 hits · 1,904 entries · 41 MB · keep 7 days' },
+      { name: 'Similar-question cache', state: 'Off', badge: badge(false), note: 'Reuses an answer to a near-identical question. Off by default: it can be wrong; asks before it is used.', stats: 'threshold 0.97 · not used' },
+      { name: 'Prompt snapshots', state: 'On', badge: badge(true), note: 'KV prefixes saved to the SSD per model and context setting; loaded instead of re-reading the prompt.', stats: '6 snapshots · 9.8 / 40 GB budget' } ];
+    const seg = (on) => 'min-height: 30px; padding: 0 12px; border-radius: 6px; border: 0; font-family: inherit; font-size: 12px; font-weight: 700; ' +
+      (on ? 'background: ' + accent + '; color: var(--on-accent)' : 'background: transparent; color: var(--muted)');
+    return {
+      rootStyle, sections, path, tiers, tabs, collections, memory, knobs, clients, caches,
+      tabOn: tabBase + 'background: var(--raised); color: var(--text); box-shadow: inset 0 -2px 0 ' + accent,
+      tabOff: tabBase + 'background: transparent; color: var(--muted)',
+      softBtn: 'min-height: 36px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--border-strong); background: transparent; color: var(--text); font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer',
+      primaryBtn: 'min-height: 36px; padding: 0 14px; border-radius: 8px; border: 0; background: ' + accent + '; color: var(--on-accent); font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer',
+      segOn: seg(true), segOff: seg(false),
+      isCollections: s.tab === 'collections', isMemory: s.tab === 'memory', isInjection: s.tab === 'injection', isCaches: s.tab === 'caches',
+    };
+  }
+}
+</script>
+</body>
+</html>
