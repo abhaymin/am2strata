@@ -287,7 +287,7 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
         "model": if raw { "gemma4" } else { "gpt2" }, "pre": pre, "vocab_size": tokens.len(), "n_merges": merges.len(),
         "special_ids": special, "add_bos_token": false, "pre_pattern": pattern, "pre_sequence": sequence,
         "pre_pattern_source": source,
-        "ignore_merges": matches!(pre.as_str(), "glm4" | "glm5" | "lfm2"),
+        "ignore_merges": matches!(pre.as_str(), "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "tekken"),
     });
     let dir = out_dir.join("tokenizer");
     let io = |p: &Path, e| Error::Io { path: p.display().to_string(), source: e };
@@ -316,6 +316,18 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     Ok(cfg)
 }
 
+/// `tekken` (Mistral's Tekken: Mistral Small / Devstral / Ministral / Mixtral 8x22B v3 tokenizers), with ignore_merges:
+/// llama.cpp's LLAMA_VOCAB_PRE_TYPE_TEKKEN.
+const TEKKEN_PATTERN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
 /// The pre-tokenizer patterns PolyStrata's strata_tokenizer.py ships in tokenizer.json (transcribed from llama.cpp's
 /// llama-vocab.cpp for each `pre` type; the readers use `pre`, but a pack is written as PolyStrata writes it).
 const QWEN35_PATTERN: &str = concat!(r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])", r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+",
@@ -337,16 +349,19 @@ fn strata_patterns(pre: &str) -> (Value, Value, &'static str) {
         DEEPSEEK3_SEQUENCE[2]
     } else {
         match pre {
-            "glm4" | "glm5" | "lfm2" => GLM4_PATTERN,
+            "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" => GLM4_PATTERN,
             "gemma4" => GEMMA4_PATTERN,
+            "tekken" => TEKKEN_PATTERN,
             _ => QWEN35_PATTERN,
         }
     };
     let source = if pre == "gemma4" {
         "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GEMMA4)"
+    } else if pre == "tekken" {
+        "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_TEKKEN)"
     } else if sequence {
         "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM)"
-    } else if matches!(pre, "glm4" | "glm5" | "lfm2") {
+    } else if matches!(pre, "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1") {
         "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"
     } else {
         ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"

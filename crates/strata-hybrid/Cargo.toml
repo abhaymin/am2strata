@@ -1,0 +1,23 @@
+[package]
+name = "strata-hybrid"
+description = "am2Strata's Rust engine for Nemotron-H, Mistral / Mixtral and GLM-4.7-Flash / DeepSeek (MLA) models: strata engine protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# shares the GPU workspace (lock file, candle build) with strata-media
+workspace = "../strata-media"
+
+[dependencies]
+strata-gguf = { path = "../strata-gguf" }
+strata-pack = { path = "../strata-pack" }
+serde_json = { version = "1", features = ["preserve_order"] }
+rayon = "1"
+memmap2 = "0.9"
+libc = "0.2"
+
+[[bin]]
+name = "am2strata-hybrid"
+path = "src/main.rs"
+
+[dev-dependencies]
+strata-tokenizer = { path = "../strata-tokenizer" }

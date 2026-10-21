@@ -33,6 +33,26 @@ pub fn dequantize(type_name: &str, data: &[u8]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
+/// The same into `out` (its length must be the value count): no allocation, for engines decoding row by row.
+pub fn dequantize_into(type_name: &str, data: &[u8], out: &mut [f32]) -> Result<(), String> {
+    let (be, bb) = strata_gguf::block_geometry(type_name).ok_or_else(|| format!("unknown encoding {type_name}"))?;
+    let (be, bb) = (be as usize, bb as usize);
+    if data.len() % bb != 0 || data.len() / bb * be != out.len() {
+        return Err(format!("{} bytes of {type_name} do not make {} values", data.len(), out.len()));
+    }
+    match type_name {
+        "F32" => out.iter_mut().zip(data.chunks_exact(4)).for_each(|(o, c)| *o = f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        "F16" => out.iter_mut().zip(data.chunks_exact(2)).for_each(|(o, c)| *o = f16_to_f32(u16::from_le_bytes([c[0], c[1]]))),
+        "BF16" => out.iter_mut().zip(data.chunks_exact(2)).for_each(|(o, c)| *o = f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)),
+        _ => {
+            for (b, y) in data.chunks_exact(bb).zip(out.chunks_exact_mut(be)) {
+                block(type_name, b, y)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn block(t: &str, b: &[u8], y: &mut [f32]) -> Result<(), String> {
     match t {
         "Q4_0" => {

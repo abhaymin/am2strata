@@ -3098,6 +3098,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -3338,6 +3339,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -3519,6 +3521,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "strata-gguf"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "strata-hybrid"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memmap2",
+ "rayon",
+ "serde_json",
+ "strata-gguf",
+ "strata-pack",
+ "strata-tokenizer",
+]
+
+[[package]]
 name = "strata-media"
 version = "0.1.0"
 dependencies = [
@@ -3529,6 +3553,27 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "strata-pack"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "strata-gguf",
+]
+
+[[package]]
+name = "strata-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "fancy-regex 0.14.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

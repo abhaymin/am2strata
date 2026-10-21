@@ -50,6 +50,18 @@ const GLM4_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// `tekken` (Mistral's Tekken: Mistral Small / Devstral / Ministral / Mixtral 8x22B v3 tokenizers), with ignore_merges:
+/// llama.cpp's LLAMA_VOCAB_PRE_TYPE_TEKKEN.
+const TEKKEN_PATTERN: &str = concat!(
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
 /// `gemma4` (Gemma 4): a BPE over UTF-8 characters, not GPT-2's byte alphabet. A space is SentencePiece's visible
 /// space, the text is cut only at runs of newlines, and a piece the vocabulary lacks goes byte by byte as <0x00>..<0xFF>.
 const GEMMA4_PATTERN: &str = r"[^\n]+|\n+";
@@ -205,8 +217,10 @@ impl Tokenizer {
             _ => None,
         };
         let pattern_src = match pre.as_str() {
-            "glm4" | "glm5" | "lfm2" => GLM4_PATTERN,
+            // llama.cpp gives these the LLAMA3 pre-tokenizer (GLM4's pattern) with ignore_merges: Nemotron 3.5 is "pixtral"
+            "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" => GLM4_PATTERN,
             "gemma4" => GEMMA4_PATTERN,
+            "tekken" => TEKKEN_PATTERN,
             "joyai-llm" | "deepseek-v3" => DEEPSEEK3_SEQUENCE[2],
             _ => QWEN35_PATTERN,
         };
@@ -224,7 +238,7 @@ impl Tokenizer {
         let byte_to_unicode = bytes_to_unicode();
         let unicode_to_byte = byte_to_unicode.iter().enumerate().map(|(b, c)| (*c, b as u8)).collect();
         Ok(Self {
-            ignore_merges: matches!(pre.as_str(), "glm4" | "glm5" | "lfm2"),
+            ignore_merges: matches!(pre.as_str(), "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "tekken"),
             raw,
             sequence,
             tokens,

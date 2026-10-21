@@ -26,6 +26,7 @@ name = "am2strata-media"
 path = "src/bin/am2strata-media.rs"
 
 [workspace]
+members = [".", "../strata-hybrid"]
 
 [profile.release]
 codegen-units = 16

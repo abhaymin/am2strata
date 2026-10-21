@@ -1,0 +1,21 @@
+--- a/src/models/nemotron-h.cpp	2026-10-19 12:10:23.816937044 +0530
++++ b/src/models/nemotron-h.cpp	2026-10-21 22:55:18.802076320 +0530
+@@ -115,6 +115,9 @@
+                     : hparams.n_ff(i) / (int64_t)hparams.n_expert_used(i);
+                 const int64_t n_ff_shexp = hparams.n_ff_shexp;
+ 
++                // oracle patch: pruned GGUFs keep a different expert count per layer (only in the tensor shapes)
++                int64_t n_expert = hparams.n_expert;
++                if (const ggml_tensor * m = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i).str().c_str())) { n_expert = m->ne[1]; }
+                 layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert}, trunk_flags);
+                 layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert         }, trunk_flags);
+ 
+@@ -306,7 +309,7 @@
+                     nullptr, // no gate
+                     model.layers[il].ffn_down_exps,
+                     model.layers[il].ffn_exp_probs_b,
+-                    n_expert, (int64_t)hparams.n_expert_used(il),
++                    model.layers[il].ffn_gate_inp->ne[1], (int64_t)hparams.n_expert_used(il),
+                     LLM_FFN_RELU_SQR, hparams.expert_weights_norm,
+                     hparams.expert_weights_scale,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
