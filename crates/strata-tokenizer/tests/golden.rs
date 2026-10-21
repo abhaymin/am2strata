@@ -14,7 +14,8 @@ fn ids(v: &Value) -> Vec<u32> {
 
 fn check(model: &str) {
     let g = golden(model);
-    let tok = Tokenizer::from_dir(g["tokenizer_dir"].as_str().unwrap()).expect("load tokenizer");
+    let Some(dir) = tokenizer_dir(g["tokenizer_dir"].as_str().unwrap()) else { return };
+    let tok = Tokenizer::from_dir(&dir).expect("load tokenizer");
     let mut failures = Vec::new();
     for c in g["tokenizer_cases"].as_array().unwrap() {
         let text = c["text"].as_str().unwrap();
@@ -50,4 +51,12 @@ fn tiel_matches_python() {
 #[test]
 fn orca_matches_python() {
     check("orca");
+}
+
+/// The recorded tokenizer, under the Strata data folder ($STRATA_DATA, default ~/Development/Strata-data); None (the
+/// test is skipped) where it is not installed.
+fn tokenizer_dir(rel: &str) -> Option<String> {
+    let base = std::env::var("STRATA_DATA").unwrap_or_else(|_| format!("{}/Development/Strata-data", std::env::var("HOME").unwrap_or_default()));
+    let dir = format!("{base}/{rel}");
+    if std::path::Path::new(&dir).is_dir() { Some(dir) } else { eprintln!("skipped: no tokenizer at {dir}"); None }
 }

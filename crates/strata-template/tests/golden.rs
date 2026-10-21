@@ -6,7 +6,8 @@ use strata_template::ChatTemplate;
 fn check(model: &str) {
     let path = format!("{}/../../golden/{model}.json", env!("CARGO_MANIFEST_DIR"));
     let g: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let dir = g["tokenizer_dir"].as_str().unwrap();
+    let Some(dir) = tokenizer_dir(g["tokenizer_dir"].as_str().unwrap()) else { return };
+    let dir = dir.as_str();
     let t = ChatTemplate::from_file(format!("{dir}/chat_template.jinja")).expect("load template");
     let mut failures = Vec::new();
     for c in g["cases"].as_array().unwrap() {
@@ -35,4 +36,12 @@ fn tiel_matches_python() {
 #[test]
 fn orca_matches_python() {
     check("orca");
+}
+
+/// The recorded tokenizer, under the Strata data folder ($STRATA_DATA, default ~/Development/Strata-data); None (the
+/// test is skipped) where it is not installed.
+fn tokenizer_dir(rel: &str) -> Option<String> {
+    let base = std::env::var("STRATA_DATA").unwrap_or_else(|_| format!("{}/Development/Strata-data", std::env::var("HOME").unwrap_or_default()));
+    let dir = format!("{base}/{rel}");
+    if std::path::Path::new(&dir).is_dir() { Some(dir) } else { eprintln!("skipped: no tokenizer at {dir}"); None }
 }

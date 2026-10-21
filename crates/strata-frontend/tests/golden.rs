@@ -9,7 +9,8 @@ use strata_tokenizer::Tokenizer;
 fn check(model: &str) {
     let path = format!("{}/../../golden/{model}-requests.json", env!("CARGO_MANIFEST_DIR"));
     let g: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let dir = g["tokenizer_dir"].as_str().unwrap();
+    let Some(dir) = tokenizer_dir(g["tokenizer_dir"].as_str().unwrap()) else { return };
+    let dir = dir.as_str();
     let tok = std::sync::Arc::new(Tokenizer::from_dir(dir).unwrap());
     let tmpl = std::sync::Arc::new(ChatTemplate::from_file(format!("{dir}/chat_template.jinja")).unwrap());
     let builder = PromptBuilder::new(tmpl, tok);
@@ -93,4 +94,12 @@ fn tool_order_is_stable() {
     let first = openai_to_messages(&serde_json::json!({"messages": [{"role": "user", "content": "x"}], "tools": [w, t]}), &orders).unwrap();
     let again = openai_to_messages(&serde_json::json!({"messages": [{"role": "user", "content": "x"}], "tools": [t, w]}), &orders).unwrap();
     assert_eq!(first.tools, again.tools);
+}
+
+/// The recorded tokenizer, under the Strata data folder ($STRATA_DATA, default ~/Development/Strata-data); None (the
+/// test is skipped) where it is not installed.
+fn tokenizer_dir(rel: &str) -> Option<String> {
+    let base = std::env::var("STRATA_DATA").unwrap_or_else(|_| format!("{}/Development/Strata-data", std::env::var("HOME").unwrap_or_default()));
+    let dir = format!("{base}/{rel}");
+    if std::path::Path::new(&dir).is_dir() { Some(dir) } else { eprintln!("skipped: no tokenizer at {dir}"); None }
 }

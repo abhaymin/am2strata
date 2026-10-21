@@ -1,7 +1,39 @@
 # am2Strata
 
-am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata) in Rust. The plan, with phases, gates and
-risks, is the "PolyStrata in Rust" document. This repository is at **Phase 0 and Phase 1 done**: the Rust server can stand in for the Python one for chat, coding agents (OpenAI, Anthropic and Responses APIs), MCP tools, pictures and documents. Image generation is the one PolyStrata feature not ported.
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/abhaymin)
+
+am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
+tokenizer, chat templates, output parsing, the Hugging Face downloader, the launcher and every test. PolyStrata's
+C++/CUDA engines still do the inference. am2Strata uses PolyStrata's run configs and models as they are, so either
+server can run on the same machine (one at a time).
+
+It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
+support) behind OpenAI-, Anthropic- and Responses-compatible APIs, with a web app for chat, monitoring and settings.
+
+## Requirements
+
+- Linux and an NVIDIA GPU, with PolyStrata's engines built (`strata`, `strata-poly`, `strata-vision`) and its run
+  configs (`strata-*.json`). By default am2Strata looks in `~/Development/PolyStrata`, and for models in
+  `~/Development/Strata-data`.
+- Rust (stable). Optional: `ffmpeg` (video from API clients), `poppler-utils` (PDFs), `bubblewrap` (to run Python
+  code from the chat in a sandbox).
+
+## Web app
+
+- **Chat:** several chats kept in the browser; pictures, video (frames cut in the browser) and PDFs; a thinking level.
+- **Canvas** beside the chat, following what an answer makes:
+  - **HTML:** a sandboxed preview with Preview / Code tabs. A Console tab appears when the page has errors, and can
+    send them back to the model.
+  - **Flows:** a Mermaid diagram opens by itself when an answer has one. Flow / Source / Sketch tabs (a whiteboard);
+    exports to Markdown, PNG, PDF, and GIF for animated flows.
+  - **Python:** runs on the server in a bubblewrap sandbox (no network, home folders hidden), only when you click Run.
+  - **Links:** links in answers open in the canvas, with an address bar.
+- **Monitor:** speed, GPU, VRAM, RAM, the context and the requests, live.
+- **API calls:** every request's input, output, reasoning and timings.
+- **Settings:**
+  - models: switch, unload, download from Hugging Face with or without a token;
+  - the model's run config, chat defaults, server and access, MCP tools, connect;
+  - appearance: light, dark or system theme, and an accent colour.
 
 ## What works
 
@@ -63,3 +95,12 @@ Golden files are recorded from PolyStrata with:
 ```
 
 The engine protocol is written down in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+## Support
+
+am2Strata is free and open source. If it is useful to you, you can support its development through
+[GitHub Sponsors](https://github.com/sponsors/abhaymin). Thank you.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Parts are derived from PolyStrata (MIT, Niko1221 and the Strata contributors).

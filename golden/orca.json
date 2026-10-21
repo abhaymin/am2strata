@@ -1,5 +1,5 @@
 {
- "tokenizer_dir": "/home/abhaym/Development/Strata-data/packs/orca-iq3_xxs/tokenizer",
+ "tokenizer_dir": "packs/orca-iq3_xxs/tokenizer",
  "cases": [
   {
    "name": "plain",

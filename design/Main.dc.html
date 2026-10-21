@@ -277,7 +277,7 @@ body{margin:0}
           <h2 style="margin: 0; font-size: 20px">Server and access</h2>
           <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px">
             <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Listening on</span><span style="font-family: 'JetBrains Mono', monospace">0.0.0.0:8000</span><span style="font-size: 12px; color: var(--muted)">Service: am2strata (temporary) · PolyStrata paused</span></div>
-            <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Over Tailscale</span><span style="font-family: 'JetBrains Mono', monospace">http://abhay-ai-pc:8000</span><span style="font-size: 12px; color: var(--muted)">100.72.13.89</span></div>
+            <div style="display: flex; flex-direction: column; gap: 6px"><span style="font-size: 12px; color: var(--muted)">Over Tailscale</span><span style="font-family: 'JetBrains Mono', monospace">http://my-pc:8000</span><span style="font-size: 12px; color: var(--muted)">100.72.13.89</span></div>
             <div style="display: flex; flex-direction: column; gap: 6px"><label for="s-key" style="font-size: 12px; color: var(--muted)">API key</label><div style="display: flex; gap: 8px"><input id="s-key" type="password" value="sk-unsloth-xxxxxxxxxxxxxxxxxxxx" style="flex: 1 1 auto; min-width: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px; font-family: 'JetBrains Mono', monospace"><button type="button" style="min-height: 40px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--text); font-family: inherit; font-weight: 600">Copy</button></div></div>
           </div>
           <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
@@ -336,7 +336,7 @@ body{margin:0}
               </div>
             </sc-for>
           </div>
-          <pre style="margin: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; color: var(--text-soft)">curl http://abhay-ai-pc:8000/v1/chat/completions \
+          <pre style="margin: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.6; color: var(--text-soft)">curl http://my-pc:8000/v1/chat/completions \
   -H "Authorization: Bearer $AM2STRATA_KEY" -H "Content-Type: application/json" \
   -d '{"model": "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k", "messages": [{"role": "user", "content": "Hello"}]}'</pre>
         </div>
@@ -472,8 +472,8 @@ class Component extends DCLogic {
       sw('fit', 'Shorten max_tokens that do not fit', 'fit_max_tokens — instead of answering 400'),
       sw('close', 'Close the thinking when a reply stops inside it', 'reasoning_close_retry — the model gets one more pass to answer'),
       sw('mcp', 'Let this model use MCP tools', 'Only from this page')];
-    const endpoints = [{ label: 'OpenAI base URL', value: 'http://abhay-ai-pc:8000/v1' }, { label: 'Anthropic base URL', value: 'http://abhay-ai-pc:8000' },
-      { label: 'Responses API (Codex)', value: 'http://abhay-ai-pc:8000/v1/responses' }, { label: 'Model name', value: 'minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k' }];
+    const endpoints = [{ label: 'OpenAI base URL', value: 'http://my-pc:8000/v1' }, { label: 'Anthropic base URL', value: 'http://my-pc:8000' },
+      { label: 'Responses API (Codex)', value: 'http://my-pc:8000/v1/responses' }, { label: 'Model name', value: 'minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k' }];
     const callStyle = (on) => 'text-align: left; padding: 12px; border-radius: 10px; font-family: inherit; cursor: pointer; ' + (on ? 'background: var(--raised); border: 1px solid var(--border-strong)' : 'background: var(--panel); border: 1px solid var(--border)');
     const calls = [['23:06:41', 'completed', '/v1/chat/completions', '1ed421cfd2fb · 4.1 s · stream · HTTP 200', true], ['23:05:12', 'completed', '/v1/chat/completions', '9b20aa1c03ef · 2.9 s · stream · HTTP 200', false],
       ['22:58:30', 'completed', '/v1/responses', '41c7de88a6b1 · 0.6 s · JSON · HTTP 200', false], ['22:51:04', 'disconnected', '/v1/chat/completions', '7a01f2c9e4d3 · 0.7 s · stream', false],

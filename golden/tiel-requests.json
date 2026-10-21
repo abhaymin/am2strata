@@ -1,5 +1,5 @@
 {
- "tokenizer_dir": "/home/abhaym/Development/Strata-data/packs/tiel-ud-q6_k_xl/tokenizer",
+ "tokenizer_dir": "packs/tiel-ud-q6_k_xl/tokenizer",
  "literals": {
   "<tts_text_bos_single>": "󰸥",
   "<|object_ref_start|>": "󰸓",
