@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "shards": [
+    {
+      "name": "tiny-00001-of-00002.gguf",
+      "size": 124896
+    },
+    {
+      "name": "tiny-00002-of-00002.gguf",
+      "size": 391168
+    }
+  ],
+  "native_experts_sha256": "fefe339d73972508c6238613488c5425b6773208a47ce1aba36f8d15ffc8a453",
+  "bytes": 485888
+}

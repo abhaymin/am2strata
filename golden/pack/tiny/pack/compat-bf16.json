@@ -1,0 +1,26 @@
+{
+  "source": "@SRC@",
+  "rounding": "nearest-even",
+  "tensors": [
+    {
+      "name": "output_hc_down.weight",
+      "source_type": "Q8_0",
+      "bytes": 2048
+    },
+    {
+      "name": "blk.0.ssm_alpha.weight",
+      "source_type": "Q6_K",
+      "bytes": 1024
+    },
+    {
+      "name": "blk.1.ffn_gate_inp.weight",
+      "source_type": "F32",
+      "bytes": 4096
+    },
+    {
+      "name": "blk.1.hc_attn_up.weight",
+      "source_type": "IQ3_XXS",
+      "bytes": 1024
+    }
+  ]
+}

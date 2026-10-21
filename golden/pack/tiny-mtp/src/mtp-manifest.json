@@ -1,0 +1,48 @@
+[
+ {
+  "name": "mtp.layers.0.mlp.experts.gate_up_proj",
+  "shape": [
+   4,
+   16,
+   128
+  ],
+  "file": "tensors/mtp.layers.0.mlp.experts.gate_up_proj.bin",
+  "sha256": "53269f4dd8cd5a716eef4fea80d16cd4e29079ab3e609a2a594be9977c77b7c5"
+ },
+ {
+  "name": "mtp.layers.0.mlp.experts.down_proj",
+  "shape": [
+   4,
+   128,
+   64
+  ],
+  "file": "tensors/mtp.layers.0.mlp.experts.down_proj.bin",
+  "sha256": "43168cb9930cd37e79f693861d9597fdd93d0e5f192f1e52a0a6939c1c765d3e"
+ },
+ {
+  "name": "mtp.pre_fc_norm_hidden.weight",
+  "shape": [
+   64
+  ],
+  "file": "tensors/mtp.pre_fc_norm_hidden.weight.bin",
+  "sha256": "5e95888fd7bfb9bedeae7b9e97c51b0a1cdf89dea9a1b7f5c6f8e4dd1cd70799"
+ },
+ {
+  "name": "mtp.fc_hidden.weight",
+  "shape": [
+   32,
+   64
+  ],
+  "file": "tensors/mtp.fc_hidden.weight.bin",
+  "sha256": "f0ac237f7a4a1fc1283d6e390435f4f2567e33a4c71d93840fb4a88cefe0ec41"
+ },
+ {
+  "name": "mtp.layers.0.mlp.gate.weight",
+  "shape": [
+   4,
+   64
+  ],
+  "file": "tensors/mtp.layers.0.mlp.gate.weight.bin",
+  "sha256": "d6f87989a6110e2578f0efa627a98e5432dd36805e09e00a38e251f950d83c17"
+ }
+]

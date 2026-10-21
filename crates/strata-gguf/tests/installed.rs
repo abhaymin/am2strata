@@ -16,7 +16,7 @@ fn check(gguf: &str, pack: &str) {
     extract_tokenizer(&g, &out).unwrap();
     let want = Path::new(&data()).join("packs").join(pack).join("tokenizer");
     let got = out.join("tokenizer");
-    for f in ["vocab.json", "merges.txt", "token_type.json", "chat_template.jinja"] {
+    for f in ["vocab.json", "merges.txt", "token_type.json", "chat_template.jinja", "tokenizer.json"] {
         let (a, b) = (std::fs::read(want.join(f)).unwrap(), std::fs::read(got.join(f)).unwrap());
         assert!(a == b, "{pack}/{f} differs ({} vs {} bytes)", a.len(), b.len());
     }

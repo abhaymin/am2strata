@@ -1,0 +1,3 @@
+# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] (n_expert 8, total 485888; absolute offsets in tiny-00001-of-00002.gguf, or in the named shard beside it)
+0 2 8 0 13312 18400 36832 55264
+1 17 13 106496 47424 11776 21248 30720 tiny-00002-of-00002.gguf

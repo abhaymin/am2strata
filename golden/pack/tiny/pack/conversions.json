@@ -1,0 +1,87 @@
+{
+ "schema": 1,
+ "tool": "tools/iq_pack.py",
+ "compat_bf16": true,
+ "source_shards": [
+  {
+   "name": "tiny-00001-of-00002.gguf",
+   "size": 124896
+  },
+  {
+   "name": "tiny-00002-of-00002.gguf",
+   "size": 391168
+  }
+ ],
+ "tensors": [
+  {
+   "name": "output_hc_down.weight",
+   "shard": "tiny-00001-of-00002.gguf",
+   "src_type": "Q8_0",
+   "dst_type": "BF16",
+   "method": "dequantize->bf16 round-to-nearest-even (--compat-bf16)",
+   "exact": false,
+   "max_abs_err": 0.9609375,
+   "source_sha256": "9b28dc9aa2906e73d750b4dabd6a684ab09cd8238f9f26e5e0534497ff5bb341"
+  },
+  {
+   "name": "blk.0.ffn_gate_inp.weight",
+   "shard": "tiny-00001-of-00002.gguf",
+   "src_type": "F32",
+   "dst_type": "BF16",
+   "method": "f32->bf16: the values are BF16's (low 16 bits zero)",
+   "exact": true,
+   "max_abs_err": 0.0,
+   "source_sha256": "da0e61754355a6c7f6801f3c72d1cf2d36f2e8020cb00bf9622f525898654b7e"
+  },
+  {
+   "name": "blk.0.ple_conv1d.weight",
+   "shard": "tiny-00001-of-00002.gguf",
+   "src_type": "F32",
+   "dst_type": "F16",
+   "exact": false,
+   "max_abs_err": 0.0008738040924072266,
+   "method": "f32->f16 by the loader (index kind 3, round-to-nearest-even)",
+   "source_sha256": "0f379fda6ee737069286edbcd53658b229e2ab827e2fd1321b349da76440a656"
+  },
+  {
+   "name": "blk.0.ssm_alpha.weight",
+   "shard": "tiny-00001-of-00002.gguf",
+   "src_type": "Q6_K",
+   "dst_type": "BF16",
+   "method": "dequantize->bf16 round-to-nearest-even (--compat-bf16)",
+   "exact": false,
+   "max_abs_err": 0.78021240234375,
+   "source_sha256": "a88e225b5abd1d71573dfa01e807a103207280a27a9f65216d1441fbdacc7b52"
+  },
+  {
+   "name": "blk.1.ffn_gate_inp.weight",
+   "shard": "tiny-00002-of-00002.gguf",
+   "src_type": "F32",
+   "dst_type": "BF16",
+   "method": "f32->bf16 round-to-nearest-even (--compat-bf16)",
+   "exact": false,
+   "max_abs_err": 0.0077359676361083984,
+   "source_sha256": "a9936a1b76c2636c18bbc807478b46cb6d157616d1ee3af2f0d67e1ee635ebf3"
+  },
+  {
+   "name": "blk.1.attn_q_norm.weight",
+   "shard": "tiny-00002-of-00002.gguf",
+   "src_type": "F16",
+   "dst_type": "F32",
+   "method": "f16->f32 widening",
+   "exact": true,
+   "max_abs_err": 0.0,
+   "source_sha256": "0f67679eaade4f2ffd61e67f077b87b3a0d9f31531dc99af951347703b6e01a5"
+  },
+  {
+   "name": "blk.1.hc_attn_up.weight",
+   "shard": "tiny-00002-of-00002.gguf",
+   "src_type": "IQ3_XXS",
+   "dst_type": "BF16",
+   "method": "dequantize->bf16 round-to-nearest-even (--compat-bf16)",
+   "exact": false,
+   "max_abs_err": 3.743171691894531e-05,
+   "source_sha256": "b2028f9390645b3a0e51dd73ee3ba8d5509cdd43ded1b1ca524323410088ed5e"
+  }
+ ]
+}

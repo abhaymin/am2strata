@@ -1,0 +1,12 @@
+[package]
+name = "strata-pack"
+description = "The packing tools in Rust: iq_pack (native packs for the strata engine), mtp_fetch, mtp_pack and mtp_rt (the MTP draft runtime), ports of PolyStrata's Python tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-gguf.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

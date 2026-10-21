@@ -1,0 +1,34 @@
+{
+ "total_bytes": 27904,
+ "tensors": [
+  {
+   "tensor": "mtp.fc_hidden.weight",
+   "format": "BF16",
+   "bytes": 4096
+  },
+  {
+   "tensor": "mtp.layers.0.mlp.experts.down_proj",
+   "format": "q4_0",
+   "bytes": 18432,
+   "relative_rms_error_first_experts": 0.08536,
+   "seconds": 0.0
+  },
+  {
+   "tensor": "mtp.layers.0.mlp.experts.gate_up_proj",
+   "format": "q4_0",
+   "bytes": 4608,
+   "relative_rms_error_first_experts": 0.08577,
+   "seconds": 0.0
+  },
+  {
+   "tensor": "mtp.layers.0.mlp.gate.weight",
+   "format": "BF16",
+   "bytes": 512
+  },
+  {
+   "tensor": "mtp.pre_fc_norm_hidden.weight",
+   "format": "F32",
+   "bytes": 256
+  }
+ ]
+}

@@ -30,6 +30,17 @@ deploy/install.sh --host 0.0.0.0 --new-key        # configs in place, a new API 
 target/release/am2strata-run serve --port 8000 --model tiel
 ```
 
+## Packing tools
+
+PolyStrata's model-preparation tools are ported too (crate `strata-pack`), writing the same files byte for byte:
+
+```bash
+am2strata-run iq-pack --gguf <model>-00001-of-0000N.gguf --out <pack> --compat-bf16   # tools/iq_pack.py
+am2strata-run mtp-fetch fetch --out <mtp>                                             # tools/mtp_fetch.py
+am2strata-run mtp-pack --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf          # tools/mtp_pack.py
+am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                        # tools/mtp_rt.py
+```
+
 ## Web app
 
 - **Chat:** several chats kept in the browser; pictures, video (frames cut in the browser) and PDFs; a thinking level.

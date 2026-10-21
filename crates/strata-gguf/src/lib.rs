@@ -25,9 +25,51 @@ pub struct TensorInfo {
     pub offset: u64,
 }
 
+/// ggml type ids -> names (gguf_reader.py GGML_TYPES; 42 = Q2_0, the GSQ-RCO routed-expert encoding)
+pub fn type_name(id: u32) -> String {
+    const NAMES: [&str; 43] = ["F32", "F16", "Q4_0", "Q4_1", "Q4_2", "Q4_3", "Q5_0", "Q5_1", "Q8_0", "Q8_1", "Q2_K", "Q3_K",
+        "Q4_K", "Q5_K", "Q6_K", "Q8_K", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ4_NL", "IQ3_S", "IQ2_S", "IQ4_XS", "I8",
+        "I16", "I32", "I64", "F64", "IQ1_M", "BF16", "Q4_0_4_4", "Q4_0_4_8", "Q4_0_8_8", "TQ1_0", "TQ2_0", "IQ4_NL_4_4",
+        "IQ4_NL_4_8", "IQ4_NL_8_8", "MXFP4", "NVFP4", "Q4_0_8_8", "Q2_0"];
+    NAMES.get(id as usize).map(|s| s.to_string()).unwrap_or_else(|| format!("type{id}"))
+}
+
+/// (elements per block, bytes per block) of the encodings gguf_reader.py knows (BLOCK_GEOMETRY)
+pub fn block_geometry(name: &str) -> Option<(u64, u64)> {
+    Some(match name {
+        "F32" => (1, 4), "F16" | "BF16" => (1, 2), "F64" => (1, 8),
+        "Q4_0" => (32, 18), "Q4_1" => (32, 20), "Q5_0" => (32, 22), "Q5_1" => (32, 24), "Q8_0" => (32, 34), "Q8_1" => (32, 36),
+        "Q2_K" => (256, 84), "Q3_K" => (256, 110), "Q4_K" => (256, 144), "Q5_K" => (256, 176), "Q6_K" => (256, 210),
+        "Q8_K" => (256, 292), "IQ2_XXS" => (256, 66), "IQ2_XS" => (256, 74), "IQ3_XXS" => (256, 98), "IQ1_S" => (256, 50),
+        "IQ4_NL" => (32, 18), "IQ3_S" => (256, 110), "IQ2_S" => (256, 82), "IQ4_XS" => (256, 136), "IQ1_M" => (256, 56),
+        "Q2_0" => (64, 18), "MXFP4" => (32, 17), "NVFP4" => (64, 36),
+        _ => return None,
+    })
+}
+
+impl TensorInfo {
+    pub fn type_name(&self) -> String {
+        type_name(self.ggml_type)
+    }
+    pub fn elements(&self) -> u64 {
+        self.dims.iter().product()
+    }
+    /// Bytes of the tensor's data; None for an unknown encoding or a size that is not whole blocks.
+    pub fn expected_bytes(&self) -> Option<u64> {
+        let (be, bb) = block_geometry(&self.type_name())?;
+        let n = self.elements();
+        (n % be == 0).then(|| n / be * bb)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Gguf {
+    pub path: PathBuf,
     pub version: u32,
+    /// `general.alignment`, else 32
+    pub alignment: u64,
+    /// where the tensor data begins: the end of the header, rounded up to the alignment (tensor offsets are from here)
+    pub data_start: u64,
     /// key -> value; arrays of strings and numbers become JSON arrays, as Python's reader gives lists
     pub metadata: Map<String, Value>,
     pub tensors: Vec<TensorInfo>,
@@ -36,12 +78,15 @@ pub struct Gguf {
 struct Rd<R: Read> {
     r: R,
     path: String,
+    /// bytes read so far: where the header ends
+    pos: u64,
 }
 
 impl<R: Read> Rd<R> {
     fn bytes(&mut self, n: usize) -> Result<Vec<u8>> {
         let mut b = vec![0u8; n];
         self.r.read_exact(&mut b).map_err(|e| Error::Io { path: self.path.clone(), source: e })?;
+        self.pos += n as u64;
         Ok(b)
     }
     fn u32(&mut self) -> Result<u32> {
@@ -97,7 +142,7 @@ impl Gguf {
     pub fn open(path: &Path) -> Result<Gguf> {
         let p = path.display().to_string();
         let f = std::fs::File::open(path).map_err(|e| Error::Io { path: p.clone(), source: e })?;
-        let mut r = Rd { r: BufReader::with_capacity(1 << 20, f), path: p.clone() };
+        let mut r = Rd { r: BufReader::with_capacity(1 << 20, f), path: p.clone(), pos: 0 };
         if r.bytes(4)? != b"GGUF" {
             return Err(Error::Format(format!("{p}: not a GGUF file")));
         }
@@ -125,7 +170,9 @@ impl Gguf {
             let offset = r.u64()?;
             tensors.push(TensorInfo { name, dims, ggml_type, offset });
         }
-        Ok(Gguf { version, metadata, tensors })
+        let alignment = metadata.get("general.alignment").and_then(Value::as_u64).filter(|a| *a > 0).unwrap_or(32);
+        let data_start = r.pos.div_ceil(alignment) * alignment;
+        Ok(Gguf { path: path.to_path_buf(), version, alignment, data_start, metadata, tensors })
     }
 
     pub fn str(&self, key: &str) -> Option<&str> {
@@ -235,11 +282,11 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     for (i, t) in tokens.iter().enumerate() {
         vocab.insert(t.clone(), json!(i));
     }
-    let (pattern, sequence) = strata_patterns(&pre);
+    let (pattern, sequence, source) = strata_patterns(&pre);
     let cfg = json!({
         "model": if raw { "gemma4" } else { "gpt2" }, "pre": pre, "vocab_size": tokens.len(), "n_merges": merges.len(),
         "special_ids": special, "add_bos_token": false, "pre_pattern": pattern, "pre_sequence": sequence,
-        "pre_pattern_source": "llama.cpp src/llama-vocab.cpp (written by am2Strata's extractor)",
+        "pre_pattern_source": source,
         "ignore_merges": matches!(pre.as_str(), "glm4" | "glm5" | "lfm2"),
     });
     let dir = out_dir.join("tokenizer");
@@ -269,14 +316,42 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     Ok(cfg)
 }
 
-/// The pre-tokenizer's pattern (or pattern sequence) for tokenizer.json (informational: the readers use `pre`).
-fn strata_patterns(pre: &str) -> (Value, Value) {
-    match pre {
-        "gemma4" => (json!(r"[^\n]+|\n+"), Value::Null),
-        "joyai-llm" | "deepseek-v3" => (Value::Null, json!("deepseek3 sequence")),
-        "glm4" | "glm5" | "lfm2" => (json!("glm4"), Value::Null),
-        _ => (json!("qwen35"), Value::Null),
-    }
+/// The pre-tokenizer patterns PolyStrata's strata_tokenizer.py ships in tokenizer.json (transcribed from llama.cpp's
+/// llama-vocab.cpp for each `pre` type; the readers use `pre`, but a pack is written as PolyStrata writes it).
+const QWEN35_PATTERN: &str = concat!(r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])", r"|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+",
+                                     r"|\p{N}", r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*", r"|\s*[\r\n]+", r"|\s+(?!\S)", r"|\s+");
+const GLM4_PATTERN: &str = concat!(r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])", r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+                                   r"|\p{N}{1,3}", r"| ?[^\s\p{L}\p{N}]+[\r\n]*", r"|\s*[\r\n]+", r"|\s+(?!\S)", r"|\s+");
+const GEMMA4_PATTERN: &str = r"[^\n]+|\n+";
+const DEEPSEEK3_SEQUENCE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    concat!(r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"##, r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+", r"| ?[\p{P}\p{S}]+[\r\n]*",
+            r"|\s*[\r\n]+", r"|\s+(?!\S)", r"|\s+"),
+];
+
+/// (pre_pattern, pre_sequence, pre_pattern_source) as strata_tokenizer.py `extract` writes them.
+fn strata_patterns(pre: &str) -> (Value, Value, &'static str) {
+    let sequence = matches!(pre, "joyai-llm" | "deepseek-v3");
+    let pattern = if sequence {
+        DEEPSEEK3_SEQUENCE[2]
+    } else {
+        match pre {
+            "glm4" | "glm5" | "lfm2" => GLM4_PATTERN,
+            "gemma4" => GEMMA4_PATTERN,
+            _ => QWEN35_PATTERN,
+        }
+    };
+    let source = if pre == "gemma4" {
+        "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GEMMA4)"
+    } else if sequence {
+        "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM)"
+    } else if matches!(pre, "glm4" | "glm5" | "lfm2") {
+        "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"
+    } else {
+        ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
+    };
+    (json!(pattern), if sequence { json!(DEEPSEEK3_SEQUENCE) } else { Value::Null }, source)
 }
 
 #[cfg(test)]

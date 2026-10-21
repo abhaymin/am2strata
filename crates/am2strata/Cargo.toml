@@ -13,6 +13,7 @@ strata-engine.workspace = true
 strata-frontend.workspace = true
 strata-gguf.workspace = true
 strata-hub.workspace = true
+strata-pack.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

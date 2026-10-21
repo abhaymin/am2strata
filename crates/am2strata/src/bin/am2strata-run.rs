@@ -63,6 +63,58 @@ enum Cmd {
     Test,
     /// download a model from Hugging Face and write its run config (no --quant: list what the repository offers)
     Pull(PullArgs),
+    /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next): PolyStrata's tools/iq_pack.py
+    IqPack {
+        /// the model's shard 1
+        #[arg(long)]
+        gguf: PathBuf,
+        /// the pack folder (e.g. ~/Development/Strata-data/packs/orca-iq3_xxs)
+        #[arg(long)]
+        out: PathBuf,
+        /// a Q2_0 canonical pack whose dense.bin holds the shared float tensors
+        #[arg(long)]
+        base: Option<PathBuf>,
+        /// rewrite the index only
+        #[arg(long)]
+        skip_experts: bool,
+        /// dequantize small non-native projections to BF16 for ordinary GGUFs (rounds them; experts and the PLE table stay)
+        #[arg(long)]
+        compat_bf16: bool,
+        /// also write experts.bin (the engine otherwise reads the experts from the GGUF itself)
+        #[arg(long)]
+        experts_bin: bool,
+    },
+    /// the MTP tensors from the Qwen3.8 Flash Next BF16 checkpoint by range requests: PolyStrata's tools/mtp_fetch.py
+    MtpFetch {
+        /// inventory (headers only), fetch (the tensors, resumable) or verify (against the pinned SHA-256; exit 3 when bad)
+        #[arg(value_parser = ["inventory", "fetch", "verify"])]
+        cmd: String,
+        #[arg(long)]
+        out: PathBuf,
+        /// only tensors whose name contains this
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// the MTP draft block as a GGUF from the fetched tensors: PolyStrata's tools/mtp_pack.py
+    MtpPack {
+        /// the folder mtp-fetch wrote
+        #[arg(long)]
+        src: PathBuf,
+        #[arg(long, default_value = "q2_0", value_parser = ["q2_0", "q4_0", "q8_0"])]
+        experts: String,
+        #[arg(long)]
+        out: PathBuf,
+        /// experts per tensor used for the error report
+        #[arg(long, default_value_t = 8)]
+        check_experts: usize,
+    },
+    /// the MTP draft layer's runtime files (experts.bin, dense.bin, dense.txt) from the MTP GGUF: tools/mtp_rt.py
+    MtpRt {
+        #[arg(long)]
+        gguf: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Args)]
@@ -417,8 +469,48 @@ fn main() -> ExitCode {
         Cmd::Install { s } => install(&s),
         Cmd::Uninstall => uninstall(),
         Cmd::Pull(p) => pull(p),
+        Cmd::IqPack { gguf, out, base, skip_experts, compat_bf16, experts_bin } => done(strata_pack::iq_pack::run(&strata_pack::iq_pack::Options {
+            gguf: expand_path(&gguf), out: expand_path(&out), base: base.map(|b| expand_path(&b)), skip_experts, compat_bf16, experts_bin })),
+        Cmd::MtpFetch { cmd, out, only } => {
+            let out = expand_path(&out);
+            let mut src = strata_pack::mtp_fetch::Source::from_env();
+            match cmd.as_str() {
+                "verify" => {
+                    let bad = strata_pack::mtp_fetch::verify(&src, &out);
+                    for n in &bad {
+                        eprintln!("MTP tensor missing or corrupt: {n}");
+                    }
+                    if bad.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(strata_pack::mtp_fetch::BAD as u8) }
+                }
+                "inventory" => {
+                    src.resolve();
+                    done(strata_pack::mtp_fetch::inventory(&src, &out).map(|_| ()))
+                }
+                _ => {
+                    src.resolve();
+                    done(strata_pack::mtp_fetch::fetch(&src, &out, only.as_deref()))
+                }
+            }
+        }
+        Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
+            src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
+        Cmd::MtpRt { gguf, out } => done(strata_pack::mtp_rt::run(&strata_pack::mtp_rt::Options { gguf: expand_path(&gguf), out: expand_path(&out) })),
         Cmd::Test => {
             if run(Command::new("cargo").args(["test", "--release"]).current_dir(root())) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
     }
+}
+
+fn done(r: Result<(), String>) -> ExitCode {
+    match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn expand_path(p: &std::path::Path) -> PathBuf {
+    PathBuf::from(expand(&p.to_string_lossy()))
 }

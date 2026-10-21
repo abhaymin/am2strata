@@ -68,12 +68,19 @@ deploy/pull-models.sh orca --token hf_...   # Orca (gated: accept its terms on h
 - **Folders:** files go to `~/Development/Strata-data/models/<folder>`, the folders the configs name.
 - **Tokenizer:** the server writes it from the model file the first time it loads the model.
 
-**Orca needs two more things**, made once with PolyStrata's Python tools; `pull-models.sh orca` prints the commands:
+**Orca needs two more things**, which `pull-models.sh orca` makes once, in Rust (no Python needed):
 
-- a native pack (`tools/iq_pack.py --compat-bf16`);
-- the MTP draft runtime (`tools/mtp_fetch.py`, `mtp_pack.py`, `mtp_rt.py`).
+| Command | What it makes |
+|---|---|
+| `am2strata-run iq-pack --gguf <shard 1> --out <pack> --compat-bf16` | the native pack (index, converted dense tensors, expert table, tokenizer) |
+| `am2strata-run mtp-fetch fetch --out <mtp>` | the 31 MTP tensors of the BF16 checkpoint, ~5 GB by range requests, checked against pinned SHA-256s |
+| `am2strata-run mtp-pack --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf` | the MTP draft block as a GGUF |
+| `am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt` | the draft runtime the engine loads (`--mtp`) |
 
-PolyStrata's `docs/ORCA.md` explains them. They are not ported to Rust yet.
+These are ports of PolyStrata's `tools/iq_pack.py`, `mtp_fetch.py`, `mtp_pack.py` and `mtp_rt.py`. They write the
+same files byte for byte (checked on the installed Orca pack and MTP files, and on recorded fixtures), and they are
+faster: the Orca pack takes ~4 s, the MTP GGUF ~25 s. The draft vocabulary, `data/draft_vocab.bin`, is a data file of
+PolyStrata's repository and is copied from there.
 
 Any other GGUF from Hugging Face whose architecture the engines run can be added later, from the web app (Settings ›
 Models) or with `target/release/am2strata-run pull <repo> --quant <quant>`. Either way the run config is written for
