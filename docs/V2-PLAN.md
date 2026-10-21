@@ -59,6 +59,35 @@ workspace with mold's lock file, so the server builds as before and the media en
 6. **v2.5 llama.cpp's features:** constrained sampling (GBNF / JSON schema) in the sampler, embeddings and rerank, LoRA
    hot-swap, a draft model, parallel slots, min-p / DRY / XTC / logprobs, FIM infill, tokenize endpoints.
 
+## Every model in the UI (all phases)
+
+One model library for every kind - text MoE, text dense, image, video, speech in, speech out - in Settings › Models
+(mockup: `design/V2Models-*.dc.html`) and `/api/models`:
+
+- **See** what is downloaded and what is loaded: per model its kind, engine, size on disk, licence, and where it sits
+  (VRAM / pinned RAM / SSD); the text engine and the media engine each show their loaded model.
+- **Download** any of them from Hugging Face (text GGUFs as today; image, video and voice models through the media
+  engine's catalog), with progress, resumable and SHA-256 checked.
+- **Load, switch, unload** from the list or the model picker; a media model loads when a job needs it.
+- **Change** its run config (Model config) and defaults.
+- **Remove** a model: its files, run config and pack, after a confirmation, never while it is loaded or in use, with
+  the disk space it frees shown.
+- **Downloaded but not runnable** models are listed too, with the reason: e.g. Nemotron 3.5 Bolt today ("needs an
+  engine for nemotron_h_moe"), so nothing on disk is invisible.
+
+API: `GET /api/models?kind=`, `POST /api/models/load` / `unload` (any kind), `POST /api/models/pull` (any kind),
+`DELETE /api/models/{id}`; the same checks as today (key, this server's own page).
+
+## New architectures
+
+- **Nemotron-H MoE** (`nemotron_h_moe`: NVIDIA Nemotron 3.5 Bolt 74B-A9B; Mamba-2 state-space layers, attention and
+  MoE experts, 262K context, with a vision encoder). Downloaded already:
+  `Strata-data/models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-Q5_K_M` (57 GB, 2 shards + mmproj). No engine runs it: it needs
+  the Mamba-2 scan (conv1d + selective state, with the SSM state kept per conversation like the KV cache), the hybrid
+  layer schedule, its MoE routing and its tool-call format, then the strata placement (experts across VRAM and pinned
+  RAM). Native only. Note: Q5_K_M's ~57 GB of weights barely fits next to the OS in 60 GB of RAM; IQ4_XS (43 GB) or
+  Q4_K_M (48 GB) leave room. Route to decide: in the C++ strata-poly engine, or in Rust with strata-dense (v2.4).
+
 ## Alongside: the knowledge and memory cache
 
 [KNOWLEDGE-CACHE.md](KNOWLEDGE-CACHE.md) is the other v2 track, for text models, server side and independent of the media
