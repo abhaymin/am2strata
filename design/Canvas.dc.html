@@ -71,16 +71,17 @@ flowchart LR
 
     <aside aria-label="Canvas" style="flex: 0 0 58%; position: relative; display: flex; flex-direction: column; border-left: 1px solid var(--border); background: var(--panel)">
       <div aria-hidden="true" title="Drag to resize" style="position: absolute; left: -3px; top: 0; bottom: 0; width: 6px; background: linear-gradient(90deg, transparent 2px, var(--accent) 2px, var(--accent) 4px, transparent 4px); opacity: 0.8"></div>
-      <div style="display: flex; align-items: center; gap: 4px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft)">
-        <button type="button" aria-label="Back" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M11 6l-6 6 6 6"></path></svg></button>
-        <button type="button" aria-label="Forward" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"></path></svg></button>
-        <button type="button" aria-label="Reload" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"></path></svg></button>
-        <label style="flex: 1 1 auto; display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 12px; border-radius: 999px; background: var(--panel-soft); border: 1px solid var(--border-soft); color: var(--ok-fg)">
-          <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.4-3 8.2-7 10-4-1.8-7-5.6-7-10V6l7-3Z"></path></svg>
-          <span style="font: 400 13px 'JetBrains Mono', monospace; color: var(--text)">{{address}}</span>
-        </label>
-        <button type="button" aria-label="Open in a new tab" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-9 9M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"></path></svg></button>
-        <button type="button" aria-label="Download" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"></path></svg></button>
+      <div style="display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft)">
+        <sc-if value="{{isHtml}}" hint-placeholder-val="{{true}}">
+          <button type="button" aria-label="Refresh the page" title="Refresh" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"></path></svg></button>
+        </sc-if>
+        <span style="flex: 1 1 auto; padding: 0 6px; font-weight: 800; font-size: 13px">{{title}}</span>
+        <sc-if value="{{isFlow}}" hint-placeholder-val="{{false}}">
+          <span role="group" aria-label="Export the flow" style="display: flex; gap: 4px">
+            <button type="button" style="{{exportBtn}}">MD</button><button type="button" style="{{exportBtn}}">PNG</button>
+            <button type="button" style="{{exportBtn}}">PDF</button><button type="button" style="{{exportBtn}}">GIF</button>
+          </span>
+        </sc-if>
         <button type="button" aria-label="Full width" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M10 20H4v-6M20 4l-7 7M4 20l7-7"></path></svg></button>
         <button type="button" aria-label="Close the canvas" style="{{iconBtn}}"><svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"></path></svg></button>
       </div>
@@ -113,32 +114,20 @@ flowchart LR
         </div>
       </sc-if>
 
-      <sc-if value="{{isBoard}}" hint-placeholder-val="{{false}}">
+      <sc-if value="{{isSketch}}" hint-placeholder-val="{{false}}">
+        <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft)">
+          <span role="radiogroup" aria-label="Tool" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; border: 1px solid var(--border)">
+            <sc-for list="{{tools}}" as="t" hint-placeholder-count="7">
+              <button type="button" role="radio" aria-checked="{{t.on}}" style="{{t.style}}">{{t.label}}</button>
+            </sc-for>
+          </span>
+          <span style="display: flex; gap: 6px"><span style="width: 20px; height: 20px; border-radius: 50%; background: #3DD68C; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px #3DD68C"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #6CB6FF"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #F2B84B"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #FF7B72"></span></span>
+          <button type="button" style="{{softBtn}}">Attach to chat</button>
+        </div>
+      </sc-if>
+      <sc-if value="{{isFlowish}}" hint-placeholder-val="{{false}}">
         <div style="flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0">
-          <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border-soft)">
-            <div role="radiogroup" aria-label="Board" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border)">
-              <button type="button" role="radio" aria-checked="{{diagramOn}}" onClick="{{pickDiagram}}" style="{{diagramBtn}}">Diagram</button>
-              <button type="button" role="radio" aria-checked="{{drawOn}}" onClick="{{pickDraw}}" style="{{drawBtn}}">Whiteboard</button>
-            </div>
-            <sc-if value="{{isDiagram}}" hint-placeholder-val="{{true}}">
-              <span style="display: flex; gap: 8px">
-                <button type="button" style="{{softBtn}}">Start from: Data flow (animated)</button>
-                <button type="button" style="{{softBtn}}">Ask the model to explain</button>
-              </span>
-            </sc-if>
-            <sc-if value="{{isDraw}}" hint-placeholder-val="{{false}}">
-              <span style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px">
-                <span role="radiogroup" aria-label="Tool" style="display: flex; gap: 2px; padding: 3px; border-radius: 8px; border: 1px solid var(--border)">
-                  <sc-for list="{{tools}}" as="t" hint-placeholder-count="7">
-                    <button type="button" role="radio" aria-checked="{{t.on}}" style="{{t.style}}">{{t.label}}</button>
-                  </sc-for>
-                </span>
-                <span style="display: flex; gap: 6px"><span style="width: 20px; height: 20px; border-radius: 50%; background: #3DD68C; box-shadow: 0 0 0 2px var(--panel), 0 0 0 4px #3DD68C"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #6CB6FF"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #F2B84B"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #FF7B72"></span><span style="width: 20px; height: 20px; border-radius: 50%; background: #C297FF"></span></span>
-                <button type="button" style="{{softBtn}}">Attach to chat</button>
-              </span>
-            </sc-if>
-          </div>
-          <sc-if value="{{isDiagram}}" hint-placeholder-val="{{true}}">
+          <sc-if value="{{isFlowView}}" hint-placeholder-val="{{true}}">
             <div style="flex: 1 1 auto; display: grid; grid-template-columns: 34% 1fr; min-height: 0">
               <pre style="margin: 0; padding: 14px; border-right: 1px solid var(--border-soft); background: var(--panel-soft); font: 400 12.5px/1.6 'JetBrains Mono', monospace; color: var(--text)">%% animate
 flowchart LR
@@ -168,7 +157,7 @@ flowchart LR
               </svg>
             </div>
           </sc-if>
-          <sc-if value="{{isDraw}}" hint-placeholder-val="{{false}}">
+          <sc-if value="{{isSketch}}" hint-placeholder-val="{{false}}">
             <div style="flex: 1 1 auto; position: relative; background-color: var(--panel); background-image: radial-gradient(var(--border) 1px, transparent 1px); background-size: 22px 22px">
               <svg role="img" aria-label="A whiteboard sketch: a box, a decision, an arrow and a hand-drawn note" viewBox="0 0 640 460" style="position: absolute; inset: 0; width: 100%; height: 100%">
                 <rect x="60" y="80" width="170" height="80" rx="10" style="fill: rgba(61,214,140,.13); stroke: #3DD68C; stroke-width: 2.2"></rect>
@@ -194,11 +183,12 @@ flowchart LR
   </div>
 </div>
 </x-dc>
-<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"startView":{"editor":"enum","options":["page","console","code","board"],"default":"page"},"startBoard":{"editor":"enum","options":["diagram","draw"],"default":"diagram"},"accent":{"editor":"color","default":"#3DD68C","options":["#3DD68C","#6CB6FF","#F2B84B","#C297FF"]},"$preview":{"width":1440,"height":960}}'>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark"},"startView":{"editor":"enum","options":["page","console","flow","sketch","board"],"default":"page"},"startBoard":{"editor":"enum","options":["diagram","draw"],"default":"diagram"},"accent":{"editor":"color","default":"#3DD68C","options":["#3DD68C","#6CB6FF","#F2B84B","#C297FF"]},"$preview":{"width":1440,"height":960}}'>
 class Component extends DCLogic {
   constructor(props) {
     super(props);
-    this.state = { view: props.startView ?? 'page', board: props.startBoard ?? 'diagram' };
+    const v = props.startView ?? 'page';
+    this.state = { view: v === 'board' ? (props.startBoard === 'draw' ? 'sketch' : 'flow') : v };
   }
   renderVals() {
     const accent = this.props.accent ?? '#3DD68C';
@@ -216,30 +206,31 @@ class Component extends DCLogic {
     const rootStyle = Object.entries(pal).map(([k, v]) => '--' + k + ': ' + v).join('; ') + '; --accent: ' + accent +
       '; min-height: 960px; display: flex; flex-direction: column; background: var(--bg); color: var(--text); font-family: Manrope, system-ui, sans-serif; font-size: 14px';
     const tabBase = 'min-height: 36px; padding: 0 14px; border-radius: 7px; border: 0; font-family: inherit; font-size: 14px; font-weight: 700; ';
-    const views = [['page', 'Page'], ['console', 'Console'], ['code', 'Code'], ['board', 'Board']].map(([id, label]) => ({
+    const flow = ['flow', 'source', 'sketch'].includes(s.view);
+    const list = flow ? [['flow', 'Flow'], ['source', 'Source'], ['sketch', 'Sketch']] : [['page', 'Preview'], ['code', 'Code'], ['console', 'Console']];
+    const views = list.map(([id, label]) => ({
       label, on: s.view === id ? 'true' : 'false', hasCount: id === 'console', count: '1',
-      pick: () => this.setState({ view: id === 'code' ? 'page' : id }),
+      pick: () => this.setState({ view: id === 'code' ? 'page' : id === 'source' ? 'flow' : id }),
       style: 'height: 38px; padding: 0 12px; border: 0; background: transparent; font-family: inherit; font-size: 13px; font-weight: 700; cursor: pointer; display: inline-flex; align-items: center; ' +
         (s.view === id ? 'color: var(--text); border-bottom: 2px solid ' + accent : 'color: var(--muted); border-bottom: 2px solid transparent') }));
     const seg = (on) => 'min-height: 30px; padding: 0 12px; border-radius: 6px; border: 0; font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer; ' +
       (on ? 'background: var(--raised); color: var(--text)' : 'background: transparent; color: var(--muted)');
     const tools = ['Pen', 'Box', 'Circle', 'Decision', 'Arrow', 'Text', 'Erase'].map((t) => ({ label: t, on: t === 'Box' ? 'true' : 'false', style: seg(t === 'Box') }));
-    const address = s.view === 'board' ? 'board: ' + (s.board === 'draw' ? 'whiteboard' : 'diagram') : 'http://localhost:8000/preview/5f925cded4d1…';
-    const footNote = s.view === 'console' ? 'The page’s console: logs and errors, and a warning when the model’s code is cut off.'
-      : s.view === 'board' ? (s.board === 'draw' ? 'Whiteboard: drag to draw; Erase removes what you click; Attach to chat sends it as a picture.' : 'Mermaid: scroll to zoom, drag to move; %% animate animates the arrows. Drag the left edge to resize.')
-      : 'Sandboxed: scripts run, but the page cannot reach am2Strata or this browser’s data. Back, forward, reload and open in a new tab work.';
+    const title = flow ? 'Flow \u00b7 how a request moves' : 'Request flow \u00b7 live';
+    const footNote = s.view === 'console' ? 'Shown only when the page has issues: errors, warnings, or code the model cut off. Send them to the model to get a fix.'
+      : s.view === 'sketch' ? 'Sketch: drag to draw; Erase removes what you click; Attach to chat sends it as a picture.'
+      : flow ? 'Opened by itself from an answer with a flow. Export MD, PNG, PDF; GIF keeps the animated arrows.'
+      : 'Sandboxed page from the chat: refresh only. The address bar appears just for other sites (links in answers).';
     return {
-      rootStyle, views, tools, address, footNote,
+      rootStyle, views, tools, title, footNote,
+      exportBtn: 'min-height: 30px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--border-strong); background: transparent; color: var(--text); font-family: inherit; font-size: 12px; font-weight: 700',
       tabOn: tabBase + 'background: var(--raised); color: var(--text); box-shadow: inset 0 -2px 0 ' + accent,
       tabOff: tabBase + 'background: transparent; color: var(--muted)',
       iconBtn: 'width: 34px; height: 34px; display: inline-grid; place-items: center; border-radius: 8px; border: 0; background: transparent; color: var(--muted); cursor: pointer',
       previewBtn: 'min-height: 28px; padding: 0 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,.14); background: transparent; color: #cfe9dc; font-family: inherit; font-size: 12px; font-weight: 700',
       softBtn: 'min-height: 32px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border-strong); background: transparent; color: var(--text); font-family: inherit; font-size: 12px; font-weight: 700; cursor: pointer',
-      isPage: s.view === 'page', isConsole: s.view === 'console', isBoard: s.view === 'board',
-      isDiagram: s.board !== 'draw', isDraw: s.board === 'draw',
-      diagramOn: s.board !== 'draw' ? 'true' : 'false', drawOn: s.board === 'draw' ? 'true' : 'false',
-      diagramBtn: seg(s.board !== 'draw'), drawBtn: seg(s.board === 'draw'),
-      pickDiagram: () => this.setState({ board: 'diagram' }), pickDraw: () => this.setState({ board: 'draw' }),
+      isHtml: !flow, isFlow: flow, isPage: s.view === 'page', isConsole: s.view === 'console',
+      isFlowish: flow, isFlowView: s.view === 'flow' || s.view === 'source', isSketch: s.view === 'sketch',
     };
   }
 }
