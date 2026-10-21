@@ -721,3 +721,43 @@ fn canvas_previews_get_a_sandboxed_address() {
         .header("Origin", "https://evil.example").json(&json!({"html": "x"})).send().unwrap();
     assert_eq!(r.status().as_u16(), 403);
 }
+
+#[test]
+fn images_are_drawn_by_the_media_engine_and_the_text_model_comes_back() {
+    let s = Server::start(&[Model::default()], &[ids("hi"), ids("again")], json!({}));
+    assert_eq!(s.get("/health", false).1["image_generation"], true);
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "n": 2, "seed": 7, "steps": 4}));
+    assert_eq!(c, 200, "{r}");
+    let data = r["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!((data[0]["seed"].as_u64(), data[1]["seed"].as_u64()), (Some(7), Some(8)), "image i uses seed + i");
+    assert!(data[0]["b64_json"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG");
+    assert_eq!((r["size"].as_str(), r["strata"]["steps"].as_u64()), (Some("512x512"), Some(4)));
+    // two generations, then the media engine frees its VRAM; the text model was stopped for the job
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let ops: Vec<String> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].as_str().unwrap().to_string()).collect();
+    assert_eq!(ops, ["generate", "generate", "unload"]);
+    assert_eq!(s.get("/health", false).1["loaded"], false, "the text model gave the GPU to the image job");
+    // the next chat request loads it again
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("hello")]}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(s.get("/health", false).1["loaded"], true);
+}
+
+#[test]
+fn image_requests_are_checked_and_failures_reported() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    for (body, what) in [(json!({"size": "512x512"}), "prompt"), (json!({"prompt": "p", "size": "300x300"}), "multiple of 16"),
+                         (json!({"prompt": "p", "n": 5}), "n must"), (json!({"prompt": "p", "response_format": "url"}), "b64_json")] {
+        let (c, r) = s.post("/v1/images/generations", &body);
+        assert_eq!(c, 400, "{body}: {r}");
+        assert!(r["error"]["message"].as_str().unwrap().contains(what), "{r}");
+    }
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "FAIL please"}));
+    assert_eq!(c, 502, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("mock failure"));
+    let n = Server::start(&[Model::default()], &[ids("x")], json!({"no_media": true}));
+    assert_eq!(n.get("/health", false).1["image_generation"], false);
+    let (c, r) = n.post("/v1/images/generations", &json!({"prompt": "p"}));
+    assert_eq!(c, 501, "{r}");
+}

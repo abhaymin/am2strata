@@ -8,6 +8,7 @@
 mod anthropic;
 mod api_monitor;
 mod code_run;
+mod image_gen;
 mod preview;
 mod manager;
 mod hub_api;
@@ -92,6 +93,8 @@ pub struct AppState {
     pub code_run_config_on: bool,
     /// the canvas's pages, served sandboxed at /preview/<id>
     pub previews: Arc<preview::Previews>,
+    /// image generation (v2): the am2strata-media engine process
+    pub media: Arc<image_gen::Media>,
 }
 
 /// A web page of another origin sent this: its Origin is neither this server's address nor a trusted one (no Origin
@@ -203,7 +206,8 @@ async fn main() -> Result<()> {
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),
                            code_run: Arc::new(code_run::CodeRun::from_config(&first.cfg.rest)),
                            code_run_config_on: first.cfg.rest.get("code_run") != Some(&serde_json::Value::Bool(false)),
-                           previews: Arc::new(preview::Previews::default()) };
+                           previews: Arc::new(preview::Previews::default()),
+                           media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)) };
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -224,6 +228,7 @@ async fn main() -> Result<()> {
         .route("/api/hub/quants", post(hub_api::quants))
         .route("/api/hub/pull", get(hub_api::status).post(hub_api::pull))
         .route("/api/run", get(code_run::info).post(code_run::run))
+        .route("/v1/images/generations", post(image_gen::generations))
         .route("/api/preview", post(preview::create))
         .route("/preview/{id}", get(preview::show))
         .route("/load", post(api_monitor::load))

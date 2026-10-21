@@ -18,7 +18,7 @@ pub async fn health(State(s): State<AppState>) -> Json<Value> {
         "status": "ok", "model": model, "loaded": cur.is_some(),
         "images": cur.as_ref().is_some_and(|l| l.vision.is_some()),
         "video": crate::media::ffmpeg_available(),
-        "image_generation": false,
+        "image_generation": s.media.available(),
         "hardware": s.mgr.hw,
         "adapted": cur.as_ref().map(|l| l.adapted.clone()).unwrap_or_default(),
         "server": "am2Strata",

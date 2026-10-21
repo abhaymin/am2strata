@@ -1,0 +1,36 @@
+[package]
+name = "strata-media"
+description = "am2Strata v2: image, video and voice generation in Rust (candle), with the strata placement techniques; built on mold's model implementations"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "MIT AND Apache-2.0"
+
+[features]
+default = []
+cuda = ["mold-ai-inference/cuda"]
+cudnn = ["mold-ai-inference/cudnn"]
+
+[dependencies]
+# mold (MIT; LTX-2 parts Apache-2.0): candle-based diffusion models, pinned to one commit
+mold-ai-inference = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b" }
+mold-ai-core = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+base64 = "0.22"
+
+[[bin]]
+name = "am2strata-media"
+path = "src/bin/am2strata-media.rs"
+
+[workspace]
+
+[profile.release]
+codegen-units = 16
+incremental = true
+
+# mold's own patch, which its candle fork needs (CUDA preflight and async-allocation calls): the same cudarc fork revision
+[patch.crates-io]
+cudarc = { git = "https://github.com/utensils/cudarc", rev = "9b3b1bc276bc27c3e99343ee82db7f99705b9ed5" }

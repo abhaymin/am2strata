@@ -251,6 +251,23 @@ impl Manager {
         self.turn.clone().lock_owned().await
     }
 
+    /// The whole GPU for a media job (an image now; video and voice later): model switches and chat requests wait
+    /// until the guards drop; with `unload_text` the text model is stopped first (it loads again with the next
+    /// request), freeing its VRAM.
+    pub async fn gpu_exclusive(&self, unload_text: bool) -> Result<(tokio::sync::MutexGuard<'_, ()>, OwnedMutexGuard<()>)> {
+        let s = self.switching.lock().await;
+        let t = tokio::time::timeout(Duration::from_secs(120), self.turn.clone().lock_owned())
+            .await
+            .map_err(|_| anyhow!("a request is still running after two minutes; try again when it ends"))?;
+        if unload_text {
+            if let Some(l) = self.current.write().await.take() {
+                tracing::info!(model = %l.entry.id, "stopping the text model for a media job (it loads again with the next request)");
+                stop(&l).await;
+            }
+        }
+        Ok((s, t))
+    }
+
     pub async fn unload(&self) {
         let _s = self.switching.lock().await;
         let _t = tokio::time::timeout(Duration::from_secs(120), self.turn.lock()).await;

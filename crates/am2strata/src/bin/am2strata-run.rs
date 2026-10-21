@@ -108,6 +108,12 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         check_experts: usize,
     },
+    /// download an image (later: video, voice) model for the media engine into <data-dir>/media, e.g. z-image-turbo:q8
+    MediaPull {
+        model: String,
+        #[arg(long, default_value = "~/Development/Strata-data")]
+        data_dir: PathBuf,
+    },
     /// the MTP draft layer's runtime files (experts.bin, dense.bin, dense.txt) from the MTP GGUF: tools/mtp_rt.py
     MtpRt {
         #[arg(long)]
@@ -494,6 +500,7 @@ fn main() -> ExitCode {
         }
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
+        Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::MtpRt { gguf, out } => done(strata_pack::mtp_rt::run(&strata_pack::mtp_rt::Options { gguf: expand_path(&gguf), out: expand_path(&out) })),
         Cmd::Test => {
             if run(Command::new("cargo").args(["test", "--release"]).current_dir(root())) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
@@ -513,4 +520,39 @@ fn done(r: Result<(), String>) -> ExitCode {
 
 fn expand_path(p: &std::path::Path) -> PathBuf {
     PathBuf::from(expand(&p.to_string_lossy()))
+}
+
+/// The media engine's pull: its catalog's files for `model`, into <data-dir>/media (resumable, SHA-256 checked).
+fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
+    let exe = root().join("crates/strata-media/target/release/am2strata-media");
+    if !exe.is_file() {
+        say("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+        return ExitCode::FAILURE;
+    }
+    let home = data_dir.join("media");
+    let _ = std::fs::create_dir_all(&home);
+    say(format!("pulling {model} into {}", home.display()));
+    let child = Command::new(&exe).env("MOLD_HOME", &home).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
+    let Ok(mut child) = child else {
+        say(format!("could not start {}", exe.display()));
+        return ExitCode::FAILURE;
+    };
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = writeln!(stdin, "{}", serde_json::json!({"op": "pull", "model": model}));
+    drop(stdin);
+    let out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut ok = false;
+    for line in std::io::BufRead::lines(out).map_while(Result::ok) {
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+        match v["event"].as_str() {
+            Some("pulled") => {
+                ok = true;
+                say(format!("{model} is downloaded"));
+            }
+            Some("error") => say(format!("not downloaded: {}", v["message"].as_str().unwrap_or(""))),
+            _ => {}
+        }
+    }
+    let _ = child.wait();
+    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }

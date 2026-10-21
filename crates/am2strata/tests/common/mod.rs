@@ -102,6 +102,10 @@ impl Server {
             .args(["--models-dir"]).arg(&dir)
             .args(["--model", models[0].id, "--port", &port.to_string(), "--host", "127.0.0.1"])
             .arg("--web-dir").arg(testdata().join("web"))
+            .arg("--data-dir").arg(&dir)
+            .env("AM2STRATA_MEDIA_EXE", if extra.get("no_media").is_some() { PathBuf::from("/nonexistent/am2strata-media") }
+                                        else { PathBuf::from(env!("CARGO_BIN_EXE_strata-mock-media")) })
+            .env("MOCK_MEDIA_RECORD", dir.join("media-record.txt"))
             .env("MOCK_SCRIPT", dir.join("script.json"))
             .env("MOCK_RECORD", &record)
             .env("RUST_LOG", "warn")
