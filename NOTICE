@@ -1,0 +1,6 @@
+am2Strata is a new edition of PolyStrata (https://github.com/VecSzn/PolyStrata); parts of it are derived from
+PolyStrata's code and web app (MIT, Copyright (c) 2026 Niko1221 and the Strata contributors).
+
+Bundled third-party files keep their own licenses:
+- web/vendor/mermaid.min.js: Mermaid 11.4.1, MIT (web/vendor/LICENSE-mermaid.txt)
+- web/fonts: the Outfit font, SIL Open Font License 1.1 (web/fonts/OFL.txt)

@@ -1,14 +1,7 @@
 MIT License
 
 Copyright (c) 2026 Abhay Menon
-
-am2Strata is a new edition of PolyStrata (https://github.com/VecSzn/PolyStrata), and parts of it are derived from
-PolyStrata's code and web app:
-
-    Copyright (c) 2026 Niko1221 and the Strata contributors
-
-Bundled third-party files keep their own licenses: web/vendor/mermaid.min.js (MIT, web/vendor/LICENSE-mermaid.txt)
-and the Outfit font in web/fonts (SIL Open Font License 1.1, web/fonts/OFL.txt).
+Copyright (c) 2026 Niko1221 and the Strata contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -103,4 +103,4 @@ am2Strata is free and open source. If it is useful to you, you can support its d
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Parts are derived from PolyStrata (MIT, Niko1221 and the Strata contributors).
+MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Parts are derived from PolyStrata (MIT, Niko1221 and the Strata contributors).
