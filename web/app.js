@@ -675,7 +675,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1015,7 +1015,7 @@ async function send() {
   busy = {controller, msg: m};
   setBusy(true);
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
+  const body = {model: health.model, messages: withHints(apiMessages()), stream: true,
                 reasoning_effort: settings.thinking};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
@@ -1096,6 +1096,7 @@ async function send() {
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  if (!m.error && !m.stopped) afterAnswer(m);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1264,6 +1265,7 @@ function loadDrawer(s = settings) {
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+  $("s-flows").setAttribute("aria-checked", String(s.flows !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   outputs();
 }
@@ -1314,6 +1316,7 @@ for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
+$("s-flows").onclick = () => $("s-flows").setAttribute("aria-checked", String($("s-flows").getAttribute("aria-checked") !== "true"));
 $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
@@ -1322,7 +1325,8 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
-              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+              mcp: $("s-mcp").getAttribute("aria-checked") === "true",
+              flows: $("s-flows").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
   renderThinking(); loadDefaults();
   const share = $("s-share").getAttribute("aria-checked") === "true";
@@ -1509,12 +1513,18 @@ function callContent() {
 }
 for (const b of $("call-tabs").children) b.onclick = () => { callPane = b.dataset.p; store.set("call-pane", callPane); callContent(); };
 
-// ------------------------------------------------------------------ the canvas: a sub-browser, a Python run, a board
-// Pages from the chat get a real address from the server (/preview/<id>, served with a CSP sandbox header) and run in
-// a sandboxed frame without this page's origin: they cannot reach the server's API or this browser's storage, not
-// even opened in their own tab. Python runs on the server (POST /api/run) in a bubblewrap sandbox, only on a click.
+// ------------------------------------------------------------------ the canvas: what an answer makes, beside the chat
+// Its controls follow what it shows (data-mode):
+//   html    a page from a code block: Preview, Code, and Console when the page has issues (they can go back to the
+//           model). Only a refresh button: no address bar.
+//   flow    a Mermaid diagram (a ```mermaid block, or a flow the model drew because it was asked how something works):
+//           Flow, Source, Sketch; exports to Markdown, PNG, PDF, and GIF when the arrows are animated.
+//   python  a run on this PC (POST /api/run, bubblewrap sandbox, only on a click): Output, Code.
+//   web     another site (a link in an answer): back, forward, refresh, an address bar, open in a new tab.
+// Pages run in sandboxed frames without this page's origin: they cannot reach the server's API or this browser's
+// storage. Our own pages go in inline (srcdoc) into a fresh frame each time; they also get an address on the server
+// (/preview/<id>, CSP sandbox) for opening in their own tab.
 const SANDBOX_PAGE = "allow-scripts allow-forms allow-modals allow-popups allow-downloads";
-// in every preview, first thing: the page's console and errors come to the Console tab
 const CONSOLE_SHIM = `<script>(function(){var P=function(t,a){try{parent.postMessage({__am2:1,t:t,a:Array.prototype.map.call(a,function(x){` +
   `try{return typeof x==="string"?x:x instanceof Error?x.stack||String(x):JSON.stringify(x)}catch(e){return String(x)}}).join(" ")},"*")}catch(e){}};` +
   `["log","info","warn","error","debug"].forEach(function(k){var o=console[k];console[k]=function(){P(k,arguments);return o.apply(console,arguments)}});` +
@@ -1530,28 +1540,34 @@ function cutOff(html) {
   const open = (html.match(/<script\b/gi) || []).length, close = (html.match(/<\/script>/gi) || []).length;
   if (open > close) why.push("a <script> is never closed, so none of its code runs");
   if (/<html\b/i.test(html) && !/<\/html>/i.test(html)) why.push("there is no </html>");
-  if (/<svg\b/i.test(html) && (html.match(/<svg\b/gi) || []).length > (html.match(/<\/svg>/gi) || []).length) why.push("an <svg> is never closed");
+  if ((html.match(/<svg\b/gi) || []).length > (html.match(/<\/svg>/gi) || []).length) why.push("an <svg> is never closed");
   return why;
 }
 
-let cv = null;                                       // what the canvas shows: {kind, code, result}
-const nav = {list: [], i: -1};                       // the sub-browser's history: {title, url, html?, external?}
+let cv = null;                                       // {mode, code, result, html, title}
 let tabNow = "page";
+const MODE_TAB = {html: "page", python: "output", flow: "flow", web: "page"};
+function setMode(mode) {
+  const c = $("canvas");
+  c.dataset.mode = mode;
+  for (const el of c.querySelectorAll('[class*="m-"]')) el.hidden = !el.classList.contains(`m-${mode}`);
+  $("tab-console").hidden = !(mode === "html" && issues.length);
+  $("canvas-tabs").hidden = mode === "web";
+  $("canvas").hidden = false;
+}
 function canvasTab(v) {
   tabNow = v;
   for (const b of $("canvas-tabs").querySelectorAll("[data-v]")) b.setAttribute("aria-selected", String(b.dataset.v === v));
   for (const p of document.querySelectorAll(".canvas__pane")) p.classList.toggle("on", p.dataset.pane === v);
-  $("canvas-run").hidden = !(cv && cv.kind === "python");
   $("canvas-ask").hidden = !(v === "output" && cv && cv.result);
-  if (v === "board") boardShow();
+  if (v === "flow") flowShow();
+  if (v === "sketch") { wbRender(); note("Sketch: drag to draw; Erase removes what you click; Attach to chat sends it as a picture. Kept in this browser."); }
+  if (v === "source") note("Edit the Mermaid source; the Flow redraws.");
 }
 for (const b of $("canvas-tabs").querySelectorAll("[data-v]")) b.onclick = () => canvasTab(b.dataset.v);
-function showCanvas() {
-  $("canvas").hidden = false;
-  $("canvas-tabs").querySelector('[data-v="output"]').hidden = !(cv && cv.kind === "python");
-}
+const note = (t) => { $("canvas-note").textContent = t; };
 
-// ---- the page frame and its history
+// ---- the page frame (html and web)
 function newFrame(sandbox) {
   const old = $("canvas-frame"), f = document.createElement("iframe");
   f.className = "canvas__frame"; f.id = "canvas-frame"; f.title = "Page";
@@ -1563,90 +1579,78 @@ async function previewUrl(html) {
   try {
     const r = await fetch("api/preview", {method: "POST", headers: headers(true), body: JSON.stringify({html})});
     if (r.ok) return (await r.json()).url;
-  } catch (e) { /* an older server: the page goes in by srcdoc */ }
+  } catch (e) { /* an older server */ }
   return null;
 }
-function loadEntry(e) {
+function showHtml() {
   clearConsole();
-  $("canvas-blank").hidden = true;
-  // a page of another site may keep its own origin (cookies, storage: a dev server works); never one of this server
-  const foreign = e.external && new URL(e.url, location.href).origin !== location.origin;
-  const f = newFrame(SANDBOX_PAGE + (foreign ? " allow-same-origin" : ""));
-  // our own pages go in inline (some browsers and blockers refuse a frame that loads a page); the address stays
-  // for reload and for opening it in its own tab
-  if (e.html) f.srcdoc = e.html; else f.src = e.url;
-  $("cb-url").value = e.url ? new URL(e.url, location.href).href : `preview: ${e.title}`;
-  $("cb-lock").style.visibility = e.external ? "hidden" : "visible";
-  $("cb-back").disabled = nav.i <= 0; $("cb-fwd").disabled = nav.i >= nav.list.length - 1;
-  if (e.hints) for (const h of e.hints) conLine("hint", h);
+  for (const w of cv.hints || []) issue("hint", w);
+  newFrame(SANDBOX_PAGE).srcdoc = cv.html;
 }
-function go(e) {
-  nav.list = nav.list.slice(0, nav.i + 1); nav.list.push(e); nav.i = nav.list.length - 1;
-  loadEntry(e);
-}
-$("cb-back").onclick = () => { if (nav.i > 0) { nav.i--; loadEntry(nav.list[nav.i]); canvasTab("page"); } };
-$("cb-fwd").onclick = () => { if (nav.i < nav.list.length - 1) { nav.i++; loadEntry(nav.list[nav.i]); canvasTab("page"); } };
-$("cb-reload").onclick = () => { if (nav.i >= 0) loadEntry(nav.list[nav.i]); };
-$("cb-form").onsubmit = (ev) => {
-  ev.preventDefault();
-  let u = $("cb-url").value.trim();
-  if (!u || u.startsWith("preview:")) return;
-  if (!/^https?:\/\//i.test(u)) u = (/^(localhost|127\.|\[::1\])/.test(u) ? "http://" : "https://") + u;
-  const own = new URL(u).origin === location.origin;
-  if (own && !new URL(u).pathname.startsWith("/preview/")) {
-    toast("warn", "Not in the canvas", "am2Strata's own pages open in the main window, not inside the sandbox."); return;
-  }
-  go({title: u, url: u, external: !own});
-  canvasTab("page");
-  conLine("hint", own ? "A preview page." : "Another site: shown if it allows being embedded (many sites refuse; your own dev servers work). Its console is not visible here.");
-};
-$("cb-open").onclick = async () => {
-  let url = nav.i >= 0 ? nav.list[nav.i].url : null;
-  if (tabNow === "board" && boardMode === "diagram") url = await previewUrl(diagramDoc($("dg-src").value, true));
-  if (url) window.open(url, "_blank", "noopener,noreferrer");
-  else toast("info", "Nothing to open", "Preview a page first.");
-};
+$("cb-reload").onclick = () => { if (!cv) return; if (cv.mode === "html") showHtml(); else if (cv.mode === "web") loadWeb(); };
 
-// ---- the console
-let conCount = 0;
-function clearConsole() { $("canvas-console").innerHTML = `<div class="con-empty">The page's console: logs and errors show here.</div>`; conCount = 0; badge(); }
-function badge(tone) { const c = $("console-count"); c.hidden = !conCount; c.textContent = conCount; if (tone) c.dataset.tone = tone; }
+// ---- the console: everything the page logs; the tab shows only when there are issues
+let issues = [], conLines = [];
+function clearConsole() { issues = []; conLines = []; $("canvas-console").innerHTML = ""; $("tab-console").hidden = true; }
 function conLine(t, text) {
-  const box = $("canvas-console"), empty = box.querySelector(".con-empty");
-  if (empty) empty.remove();
+  conLines.push({t, text});
   const d = document.createElement("div"); d.className = "con-line"; d.dataset.t = t; d.textContent = text;
-  box.appendChild(d);
-  if (box.children.length > 500) box.firstChild.remove();
-  if (t === "error" || t === "hint") { conCount++; badge(t === "error" ? "error" : "log"); }
+  $("canvas-console").appendChild(d);
+  if (conLines.length > 500) { conLines.shift(); $("canvas-console").firstChild.remove(); }
+}
+function issue(t, text) {
+  conLine(t, text);
+  issues.push({t, text});
+  if (cv && cv.mode === "html") {
+    $("tab-console").hidden = false;
+    $("console-count").textContent = issues.length;
+    note(`The page has ${issues.length} issue${issues.length === 1 ? "" : "s"}: see Console.`);
+  }
 }
 window.addEventListener("message", (e) => {
   const f = $("canvas-frame");
-  if (e.data && e.data.__am2 && f && e.source === f.contentWindow) conLine(e.data.t, e.data.a);
-  if (e.data && e.data.__am2dg && e.source === $("dg-frame").contentWindow) diagramResult(e.data);
+  if (e.data && e.data.__am2 && f && e.source === f.contentWindow) {
+    if (e.data.t === "error" || e.data.t === "warn") issue(e.data.t, e.data.a); else conLine(e.data.t, e.data.a);
+  }
+  if (e.data && e.data.__am2dg && e.source === $("dg-frame").contentWindow) flowMessage(e.data);
 });
+$("console-send").onclick = () => {
+  if (!issues.length) return;
+  const list = issues.slice(0, 30).map((x) => `- ${x.t === "hint" ? "" : x.t + ": "}${x.text.slice(0, 500)}`).join("\n");
+  $("input").value = `The page you wrote has ${issues.length === 1 ? "an issue" : "issues"} in the browser:\n${list}\n\n` +
+    "Please fix ${it} and send the whole corrected file in one html block.".replace("${it}", issues.length === 1 ? "it" : "them");
+  autosize(); $("input").focus();
+  toast("info", "Issues are in the message box", "Send it to ask the model for a fix.");
+};
 
-// ---- opening something from a code block
+// ---- opening something
 async function openCanvas(kind, code) {
-  cv = {kind, code, result: null};
+  if (kind === "mermaid") { openFlow(code); return; }
+  cv = {mode: kind, code, result: null};
   $("canvas-code").textContent = code;
-  showCanvas();
-  if (kind === "mermaid") { $("dg-src").value = code; boardMode = "diagram"; canvasTab("board"); return; }
-  if (kind === "python") { canvasTab("output"); runCanvas(); return; }
-  const hints = cutOff(code).map((w) => `This code looks cut off: ${w}. The model stopped before finishing the page; ask it to write the whole file again.`);
-  const title = (code.match(/<title>([^<]{1,80})<\/title>/i) || [, "page"])[1];
-  const html = instrument(code);
-  const url = await previewUrl(html);
-  go({title, url, html, hints, source: code});
-  $("canvas-note").textContent = "Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.";
-  canvasTab(hints.length ? "console" : "page");
+  if (kind === "python") {
+    $("canvas-title").textContent = "Python";
+    setMode("python"); canvasTab("output"); runCanvas(); return;
+  }
+  cv.title = (code.match(/<title>([^<]{1,80})<\/title>/i) || [, "Page preview"])[1];
+  cv.hints = cutOff(code).map((w) => `This code looks cut off: ${w}. The model stopped before finishing the page.`);
+  cv.html = instrument(code);
+  $("canvas-title").textContent = cv.title;
+  setMode("html");
+  showHtml();
+  canvasTab("page");
+  if (!issues.length) note("Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.");
+  cv.url = await previewUrl(cv.html);                // for opening it in its own tab later
 }
+
+// ---- python
 async function runCanvas() {
-  if (!cv || cv.kind !== "python") return;
+  if (!cv || cv.mode !== "python") return;
   const out = $("canvas-output");
   canvasTab("output");
   $("canvas-run").disabled = true;
   out.innerHTML = `<div class="run-status"><span class="st-badge st-badge--reading">Running</span><span class="muted">on this PC, in a sandbox</span></div>`;
-  $("canvas-note").textContent = "";
+  note("");
   try {
     const r = await fetch("api/run", {method: "POST", headers: headers(true), body: JSON.stringify({language: "python", code: cv.code})});
     const j = await r.json().catch(() => ({}));
@@ -1688,34 +1692,17 @@ function renderRun(j) {
     box.append(row);
     if (f.data && f.mime.startsWith("image/")) { const im = document.createElement("img"); im.src = `data:${f.mime};base64,${f.data}`; im.alt = f.name; box.append(im); }
     if (f.data && f.mime === "text/html") {
-      const b = document.createElement("button"); b.className = "st-btn st-btn--secondary"; b.style.height = "30px"; b.textContent = "Open in Page";
-      b.onclick = async () => { const html = instrument(b64text(f.data)); const url = await previewUrl(html); go({title: f.name, url, html}); canvasTab("page"); };
-      row.append(b);
+      const b = document.createElement("button"); b.className = "st-btn st-btn--secondary"; b.style.height = "30px"; b.textContent = "Preview";
+      b.onclick = () => openCanvas("html", b64text(f.data)); row.append(b);
     }
     if (f.data && /^(text\/(csv|plain)|application\/json)$/.test(f.mime) && f.size < 65536) {
       const p = document.createElement("pre"); p.className = "run-stream"; p.textContent = b64text(f.data); box.append(p);
     }
     out.append(box);
   }
-  $("canvas-note").textContent = "Ran in a sandbox: no network, home folders hidden, system read-only.";
+  note("Ran in a sandbox: no network, home folders hidden, system read-only.");
 }
 $("canvas-run").onclick = runCanvas;
-$("canvas-close").onclick = () => { $("canvas").hidden = true; newFrame(SANDBOX_PAGE); };
-$("canvas-wide").onclick = () => { const c = $("canvas"); c.dataset.wide = String(c.dataset.wide !== "true"); $("canvas-wide").title = c.dataset.wide === "true" ? "Back beside the chat" : "Full width"; };
-function save(blob, name) {
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-}
-$("canvas-download").onclick = async () => {
-  if (tabNow === "board") {
-    if (boardMode === "draw") { const png = await boardPng(); if (png) { const b = await (await fetch(png)).blob(); save(b, "whiteboard.png"); } }
-    else save(new Blob([$("dg-src").value], {type: "text/plain"}), "diagram.mmd");
-    return;
-  }
-  const e = nav.i >= 0 ? nav.list[nav.i] : null;
-  if (tabNow === "page" && e && e.source) save(new Blob([e.source], {type: "text/html"}), "page.html");
-  else if (cv) save(new Blob([cv.code], {type: "text/plain"}), cv.kind === "python" ? "main.py" : cv.kind === "html" ? "page.html" : "code.txt");
-};
 $("canvas-ask").onclick = () => {
   if (!cv || !cv.result) return;
   const j = cv.result, cut = (t) => (t.length > 6000 ? t.slice(0, 6000) + "\n[...]" : t);
@@ -1726,20 +1713,64 @@ $("canvas-ask").onclick = () => {
   $("input").value = t + "\n\n"; autosize(); $("input").focus();
 };
 
+// ---- another site (a link in an answer): the only mode with an address bar
+const webNav = {list: [], i: -1};
+function loadWeb() {
+  const u = webNav.list[webNav.i];
+  if (!u) return;
+  $("cb-url").value = u;
+  // another origin keeps its own origin (its cookies and storage work); this server's never does
+  const foreign = new URL(u).origin !== location.origin;
+  newFrame(SANDBOX_PAGE + (foreign ? " allow-same-origin" : "")).src = u;
+  $("cb-back").disabled = webNav.i <= 0; $("cb-fwd").disabled = webNav.i >= webNav.list.length - 1;
+  $("web-hint").hidden = false;
+  note("Another site, inside the canvas. Ctrl-click a link to open it in a browser tab instead.");
+}
+function openWeb(url) {
+  cv = {mode: "web", code: ""};
+  webNav.list = webNav.list.slice(0, webNav.i + 1); webNav.list.push(url); webNav.i = webNav.list.length - 1;
+  setMode("web"); canvasTab("page"); loadWeb();
+}
+$("cb-back").onclick = () => { if (webNav.i > 0) { webNav.i--; loadWeb(); } };
+$("cb-fwd").onclick = () => { if (webNav.i < webNav.list.length - 1) { webNav.i++; loadWeb(); } };
+$("cb-form").onsubmit = (ev) => {
+  ev.preventDefault();
+  let u = $("cb-url").value.trim();
+  if (!u) return;
+  if (!/^https?:\/\//i.test(u)) u = /\s/.test(u) || !/\./.test(u) ? `https://duckduckgo.com/html/?q=${encodeURIComponent(u)}`
+                                                                 : (/^(localhost|127\.|\[::1\])/.test(u) ? "http://" : "https://") + u;
+  openWeb(u);
+};
+const openTab = () => { const u = cv && cv.mode === "web" ? webNav.list[webNav.i] : cv && cv.url; if (u) window.open(u, "_blank", "noopener,noreferrer"); };
+$("cb-open").onclick = openTab;
+$("web-hint-open").onclick = openTab;
+// links in answers open in the canvas; Ctrl/Cmd/Shift-click or the middle button keep the browser's own tab
+$("chat").addEventListener("click", (e) => {
+  const a = e.target.closest(".st-msg a[href^='http']");
+  if (!a || e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+  e.preventDefault(); e.stopPropagation();
+  openWeb(a.href);
+}, true);
+
+$("canvas-close").onclick = () => { $("canvas").hidden = true; newFrame(SANDBOX_PAGE); };
+$("canvas-wide").onclick = () => { const c = $("canvas"); c.dataset.wide = String(c.dataset.wide !== "true"); $("canvas-wide").title = c.dataset.wide === "true" ? "Back beside the chat" : "Full width"; };
+function save(blob, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
 // ---- resizing: drag the left edge; the width is kept in this browser
 (function () {
   const c = $("canvas"), grip = $("canvas-grip");
   const w = store.get("canvas-width", null);
   if (w) c.style.setProperty("--canvas-w", `${w}px`);
   grip.addEventListener("pointerdown", (e) => {
-    e.preventDefault(); try { grip.setPointerCapture(e.pointerId); } catch (err) { /* not a live pointer */ } grip.classList.add("dragging"); document.body.classList.add("resizing");
+    e.preventDefault(); try { grip.setPointerCapture(e.pointerId); } catch (err) { /* not a live pointer */ }
+    grip.classList.add("dragging"); document.body.classList.add("resizing");
     const right = c.getBoundingClientRect().right;
     const side = $("chats").offsetParent ? $("chats").getBoundingClientRect().width : 0;   // the chat keeps at least 360 px
     const max = Math.max(320, c.parentElement.getBoundingClientRect().width - side - 360);
-    const move = (ev) => {
-      const px = Math.round(Math.max(320, Math.min(right - ev.clientX, max)));
-      c.style.setProperty("--canvas-w", `${px}px`);
-    };
+    const move = (ev) => c.style.setProperty("--canvas-w", `${Math.round(Math.max(320, Math.min(right - ev.clientX, max)))}px`);
     const up = () => {
       grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up);
       grip.classList.remove("dragging"); document.body.classList.remove("resizing");
@@ -1750,8 +1781,7 @@ $("canvas-ask").onclick = () => {
   grip.ondblclick = () => { c.style.removeProperty("--canvas-w"); store.set("canvas-width", null); };
 })();
 
-// ---- the board: diagrams (Mermaid, rendered in a sandboxed frame) and a whiteboard
-let boardMode = store.get("board-mode", "diagram");
+// ---- flows: Mermaid, drawn in a sandboxed frame with the library inline (the frame loads nothing)
 const DIAGRAMS = {
   flow: "flowchart TD\n  A([Request arrives]) --> B{Authorized?}\n  B -- no --> X[401 error]\n  B -- yes --> C{Model loaded?}\n  C -- no --> L[Load the engine] --> D\n  C -- yes --> D[Build the prompt]\n  D --> E[Generate tokens]\n  E --> F([Stream the answer])",
   data: "%% animate\nflowchart LR\n  U[Browser] -->|chat request| S[am2Strata]\n  S -->|token ids| E[(Engine)]\n  E -->|KV cache| G[GPU VRAM]\n  E -->|experts| R[System RAM]\n  E -->|tokens| S\n  S -->|SSE stream| U",
@@ -1760,62 +1790,214 @@ const DIAGRAMS = {
   class: "classDiagram\n  class Manager {\n    +models()\n    +load(id)\n    +unload()\n  }\n  class Engine {\n    +generate(ids)\n    +stop()\n  }\n  class Server\n  Server --> Manager\n  Manager --> Engine : drives",
   machine: "%% animate\nflowchart LR\n  subgraph Input\n    A[Camera] --> B[Frame grabber]\n  end\n  subgraph Processing\n    B --> C[Resize] --> D[Vision encoder]\n    D --> E[Language model]\n  end\n  subgraph Output\n    E --> F[Answer]\n    E --> G[(Log)]\n  end",
 };
-let mermaidJs = null;                                // the library, put inline into the diagram frame (it loads nothing)
+const animated = (src) => /^\s*%%\s*animate/m.test(src);
+let mermaidJs = null;
 async function mermaidSource() {
   if (!mermaidJs) mermaidJs = (await (await fetch("web/vendor/mermaid.min.js")).text()).replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
   return mermaidJs;
 }
-function diagramDoc(src, standalone, lib) {
+function flowColors() {
   const dark = document.documentElement.dataset.theme === "dark";
-  const css = `html,body{margin:0;height:100%;background:${dark ? "#151B23" : "#fff"};color:${dark ? "#E6EDF3" : "#1A2230"};font-family:system-ui,sans-serif}` +
+  return {dark, bg: dark ? "#151B23" : "#FFFFFF", ink: dark ? "#E6EDF3" : "#1A2230"};
+}
+// labels as SVG text (no foreignObject), so the picture can be drawn onto a canvas for PNG, PDF and GIF
+function flowDoc(lib) {
+  const {dark, bg, ink} = flowColors();
+  const css = `html,body{margin:0;height:100%;background:${bg};color:${ink};font-family:system-ui,sans-serif}` +
     `#v{width:100%;height:100%;overflow:hidden;cursor:grab;display:flex;align-items:center;justify-content:center}#v svg{max-width:none!important;flex:none}` +
     `#e{position:absolute;left:12px;right:12px;bottom:12px;padding:10px;border-radius:8px;background:#FDE3E1;color:#A8281E;font:12px ui-monospace,monospace;white-space:pre-wrap;display:none}` +
-    `.anim .flowchart-link,.anim .edgePath path{stroke-dasharray:7 5;animation:am2dash .9s linear infinite}@keyframes am2dash{to{stroke-dashoffset:-24}}` +
-    `#z{position:absolute;right:10px;top:10px;font:11px system-ui;opacity:.6}`;
-  const js = `mermaid.initialize({startOnLoad:false,theme:${JSON.stringify(dark ? "dark" : "default")},securityLevel:"strict",fontFamily:"system-ui,sans-serif"});` +
+    `.anim .flowchart-link,.anim .edgePath path,.anim .messageLine0,.anim .messageLine1,.anim .transition{stroke-dasharray:7 5;animation:am2dash .9s linear infinite}@keyframes am2dash{to{stroke-dashoffset:-24}}` +
+    `#z{position:absolute;right:10px;top:10px;font:11px system-ui;opacity:.55}`;
+  const js = `mermaid.initialize({startOnLoad:false,theme:${JSON.stringify(dark ? "dark" : "default")},securityLevel:"strict",fontFamily:"system-ui,sans-serif",htmlLabels:false,flowchart:{htmlLabels:false},class:{htmlLabels:false}});` +
     `var v=document.getElementById("v"),er=document.getElementById("e"),s=1,x=0,y=0,n=0;` +
     `function t(){var g=v.querySelector("svg");if(g)g.style.transform="translate("+x+"px,"+y+"px) scale("+s+")"}` +
+    `function fit(){var g=v.querySelector("svg");if(!g||!g.viewBox||!g.viewBox.baseVal)return;var b=g.viewBox.baseVal;if(!b.width)return;g.setAttribute("width",b.width);g.setAttribute("height",b.height);` +
+    `s=Math.min((v.clientWidth-32)/b.width,(v.clientHeight-32)/b.height,1.5);x=0;y=0;t()}` +
     `v.addEventListener("wheel",function(e){e.preventDefault();s=Math.min(6,Math.max(.2,s*(e.deltaY<0?1.1:.9)));t()},{passive:false});` +
     `var d=null;v.onpointerdown=function(e){d=[e.clientX-x,e.clientY-y];v.setPointerCapture(e.pointerId)};v.onpointermove=function(e){if(d){x=e.clientX-d[0];y=e.clientY-d[1];t()}};v.onpointerup=function(){d=null};` +
-    `function fit(){var g=v.querySelector("svg");if(!g||!g.viewBox||!g.viewBox.baseVal)return;var b=g.viewBox.baseVal;if(!b.width)return;g.setAttribute("width",b.width);g.setAttribute("height",b.height);` +
-    `s=Math.min((v.clientWidth-32)/b.width,(v.clientHeight-32)/b.height,1.5);x=0;y=0;t()}v.ondblclick=fit;addEventListener("resize",fit);` +
+    `v.ondblclick=fit;addEventListener("resize",fit);` +
     `async function r(src){try{var o=await mermaid.render("d"+(++n),src);v.innerHTML=o.svg;v.className=/^\\s*%%\\s*animate/m.test(src)?"anim":"";er.style.display="none";fit();` +
     `parent.postMessage({__am2dg:1,ok:true},"*")}catch(e){er.textContent=String(e.message||e);er.style.display="block";parent.postMessage({__am2dg:1,ok:false,error:String(e.message||e)},"*")}}` +
-    (standalone ? `r(${JSON.stringify(src)});` : `addEventListener("message",function(e){if(e.data&&typeof e.data.src==="string")r(e.data.src)});parent.postMessage({__am2dg:1,ready:true},"*");`);
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Diagram</title><style>${css}</style>` +
-    (lib ? `<script>${lib}<\/script>` : `<script src="${location.origin}/web/vendor/mermaid.min.js"><\/script>`) + `</head><body><div id="v"></div><div id="e"></div><div id="z">scroll: zoom · drag: move · double-click: reset</div><script>${js}<\/script></body></html>`;
+    `addEventListener("message",function(e){if(!e.data)return;if(typeof e.data.src==="string")r(e.data.src);` +
+    `if(e.data.exportSvg){var g=v.querySelector("svg");if(!g){parent.postMessage({__am2dg:1,svg:null},"*");return}var c=g.cloneNode(true);c.removeAttribute("style");` +
+    `c.setAttribute("xmlns","http://www.w3.org/2000/svg");var b=g.viewBox.baseVal;parent.postMessage({__am2dg:1,svg:c.outerHTML,w:b.width,h:b.height},"*")}});` +
+    `parent.postMessage({__am2dg:1,ready:true},"*");`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Flow</title><style>${css}</style><script>${lib}<\/script></head>` +
+    `<body><div id="v"></div><div id="e"></div><div id="z">scroll: zoom · drag: move · double-click: fit</div><script>${js}<\/script></body></html>`;
 }
-let dgReady = false, dgTheme = null, dgTimer = null;
-async function diagramFrame() {
+let dgReady = false, dgTheme = null, dgTimer = null, svgWait = null;
+async function flowFrame() {
   const theme = document.documentElement.dataset.theme;
   if (dgTheme === theme) return;
   dgTheme = theme; dgReady = false;
-  try { $("dg-frame").srcdoc = diagramDoc("", false, await mermaidSource()); }
-  catch (e) { dgTheme = null; $("canvas-note").textContent = "The diagram library did not load: " + (e.message || e); }
+  try { $("dg-frame").srcdoc = flowDoc(await mermaidSource()); }
+  catch (e) { dgTheme = null; note("The diagram library did not load: " + (e.message || e)); }
 }
-function diagramRender() {
-  if (!dgReady) return;
-  $("dg-frame").contentWindow.postMessage({src: $("dg-src").value}, "*");
+function flowRender() { if (dgReady) $("dg-frame").contentWindow.postMessage({src: $("dg-src").value}, "*"); }
+function flowMessage(d) {
+  if (d.ready) { dgReady = true; flowRender(); return; }
+  if ("svg" in d) { if (svgWait) { svgWait(d); svgWait = null; } return; }
+  if (tabNow === "flow") note(d.ok ? `Scroll to zoom, drag to move.${animated($("dg-src").value) ? " The arrows are animated: export a GIF to keep that." : ""}`
+                                   : "The diagram has an error (shown in red); fix it under Source.");
 }
-function diagramResult(d) {
-  if (d.ready) { dgReady = true; diagramRender(); return; }
-  $("canvas-note").textContent = d.ok ? "Mermaid diagram: scroll to zoom, drag to move. Start a line with %% animate to animate the arrows." : "The diagram has an error (shown in red).";
+function flowShow() { flowFrame(); flowRender(); $("export-gif").hidden = !animated($("dg-src").value); }
+function openFlow(src) {
+  cv = {mode: "flow", code: src};
+  $("dg-src").value = src; store.set("board-diagram", src);
+  const first = (src.match(/^\s*(?:%%[^\n]*\n\s*)*(\w+)/) || [, "Flow"])[1];
+  $("canvas-title").textContent = {flowchart: "Flow", graph: "Flow", sequenceDiagram: "Sequence", stateDiagram: "States", "stateDiagram-v2": "States",
+                                   classDiagram: "Structure", erDiagram: "Data model", gantt: "Timeline", mindmap: "Mind map"}[first] || "Flow";
+  setMode("flow"); canvasTab("flow");
 }
-$("dg-src").addEventListener("input", () => { store.set("board-diagram", $("dg-src").value); clearTimeout(dgTimer); dgTimer = setTimeout(diagramRender, 350); });
-$("dg-template").onchange = () => { const t = DIAGRAMS[$("dg-template").value]; if (t) { $("dg-src").value = t; store.set("board-diagram", t); diagramRender(); } $("dg-template").value = ""; };
+$("dg-src").addEventListener("input", () => { if (cv && cv.mode === "flow") cv.code = $("dg-src").value; store.set("board-diagram", $("dg-src").value); clearTimeout(dgTimer); dgTimer = setTimeout(flowRender, 350); });
+$("dg-template").onchange = () => { const t = DIAGRAMS[$("dg-template").value]; if (t) { $("dg-src").value = t; store.set("board-diagram", t); flowRender(); } $("dg-template").value = ""; };
 $("dg-ask").onclick = () => { $("input").value = `Explain this diagram step by step:\n\n\`\`\`mermaid\n${$("dg-src").value}\n\`\`\`\n\n`; autosize(); $("input").focus(); };
 $("dg-src").value = store.get("board-diagram", DIAGRAMS.flow);
-for (const b of $("board-mode").children) b.onclick = () => { boardMode = b.dataset.v; store.set("board-mode", boardMode); boardShow(); };
-function boardShow() {
-  for (const b of $("board-mode").children) b.setAttribute("aria-checked", String(b.dataset.v === boardMode));
-  $("board-diagram").hidden = boardMode !== "diagram"; $("diagram-tools").hidden = boardMode !== "diagram";
-  $("board-draw").hidden = boardMode !== "draw"; $("draw-tools").hidden = boardMode !== "draw";
-  if (boardMode === "diagram") { diagramFrame(); diagramRender(); $("canvas-note").textContent = "Mermaid diagram: scroll to zoom, drag to move. Start a line with %% animate to animate the arrows."; }
-  else { wbRender(); $("canvas-note").textContent = "Whiteboard: drag to draw; Erase removes what you click. Kept in this browser."; }
-}
-$("canvas-blank").hidden = false;
 
-// the whiteboard: shapes in an SVG, kept in this browser
+// ---- flow exports: Markdown, PNG, PDF (static), GIF (animated arrows)
+function flowSvg() {
+  return new Promise((ok, fail) => {
+    if (!dgReady) { fail(new Error("the flow is not drawn yet")); return; }
+    svgWait = (d) => (d.svg ? ok(d) : fail(new Error("nothing is drawn")));
+    $("dg-frame").contentWindow.postMessage({exportSvg: true}, "*");
+    setTimeout(() => { if (svgWait) { svgWait = null; fail(new Error("the flow did not answer")); } }, 4000);
+  });
+}
+async function svgToCanvas(svg, w, h, extraCss = "", scale = 2) {
+  const {bg} = flowColors(), pad = 24;
+  const inner = svg.replace(/<svg\b([^>]*)>/, (m0, a) => `<svg${a.replace(/\s(width|height)="[^"]*"/g, "")} width="${w}" height="${h}" x="${pad}" y="${pad}">` +
+                                                       (extraCss ? `<style>${extraCss}</style>` : ""));
+  const W = w + 2 * pad, H = h + 2 * pad;
+  const doc = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}"><rect width="100%" height="100%" fill="${bg}"/>${inner}</svg>`;
+  const img = new Image();
+  img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(doc);
+  await img.decode();
+  const c = document.createElement("canvas"); c.width = Math.round(W * scale); c.height = Math.round(H * scale);
+  const g = c.getContext("2d"); g.scale(scale, scale); g.drawImage(img, 0, 0);
+  return c;
+}
+function pdfFromJpeg(jpeg, pxW, pxH, scale) {
+  const enc = new TextEncoder(), parts = [], offsets = [];
+  let len = 0;
+  const put = (x) => { const b = typeof x === "string" ? enc.encode(x) : x; parts.push(b); len += b.length; };
+  const w = (pxW / scale) * 0.75, h = (pxH / scale) * 0.75;           // CSS px -> points
+  const content = `q ${w.toFixed(2)} 0 0 ${h.toFixed(2)} 0 0 cm /Im0 Do Q`;
+  put("%PDF-1.4\n%\xE2\xE3\xCF\xD3\n");
+  const obj = (n, body) => { offsets[n] = len; put(`${n} 0 obj\n`); for (const b of [].concat(body)) put(b); put("\nendobj\n"); };
+  obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
+  obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+  obj(3, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${w.toFixed(2)} ${h.toFixed(2)}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>`);
+  obj(4, [`<< /Type /XObject /Subtype /Image /Width ${pxW} /Height ${pxH} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`, jpeg, "\nendstream"]);
+  obj(5, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+  const xref = len;
+  put(`xref\n0 6\n0000000000 65535 f \n${[1, 2, 3, 4, 5].map((n) => String(offsets[n]).padStart(10, "0") + " 00000 n \n").join("")}`);
+  put(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`);
+  return new Blob(parts, {type: "application/pdf"});
+}
+// a small GIF89a encoder: a fixed 256-colour palette (a 6×6×6 cube and 40 greys suits flat diagrams), LZW, looping
+function gifEncode(frames, w, h, delayCs) {
+  const pal = new Uint8Array(768);
+  let k = 0;
+  for (let r = 0; r < 6; r++) for (let g = 0; g < 6; g++) for (let b = 0; b < 6; b++) { pal[k * 3] = r * 51; pal[k * 3 + 1] = g * 51; pal[k * 3 + 2] = b * 51; k++; }
+  for (let i = 0; i < 40; i++) { const v = Math.round(i * 255 / 39); pal[k * 3] = pal[k * 3 + 1] = pal[k * 3 + 2] = v; k++; }
+  const index = (r, g, b) => {
+    const cr = Math.round(r / 51), cg = Math.round(g / 51), cb = Math.round(b / 51);
+    const dc = (r - cr * 51) ** 2 + (g - cg * 51) ** 2 + (b - cb * 51) ** 2;
+    const gi = Math.round(((r + g + b) / 3) * 39 / 255), gv = Math.round(gi * 255 / 39);
+    return (r - gv) ** 2 + (g - gv) ** 2 + (b - gv) ** 2 < dc ? 216 + gi : cr * 36 + cg * 6 + cb;
+  };
+  const out = [];
+  const b8 = (v) => out.push(v & 255), b16 = (v) => { b8(v); b8(v >> 8); }, str = (s) => { for (const ch of s) b8(ch.charCodeAt(0)); };
+  str("GIF89a"); b16(w); b16(h); b8(0xF7); b8(0); b8(0);
+  for (const v of pal) b8(v);
+  b8(0x21); b8(0xFF); b8(11); str("NETSCAPE2.0"); b8(3); b8(1); b16(0); b8(0);
+  for (const rgba of frames) {
+    const px = new Uint8Array(w * h);
+    for (let i = 0, j = 0; i < px.length; i++, j += 4) px[i] = index(rgba[j], rgba[j + 1], rgba[j + 2]);
+    b8(0x21); b8(0xF9); b8(4); b8(0); b16(delayCs); b8(0); b8(0);
+    b8(0x2C); b16(0); b16(0); b16(w); b16(h); b8(0);
+    const data = lzw(px, 8);
+    b8(8);
+    for (let i = 0; i < data.length; i += 255) { const n = Math.min(255, data.length - i); b8(n); for (let q = 0; q < n; q++) out.push(data[i + q]); }
+    b8(0);
+  }
+  b8(0x3B);
+  return new Blob([new Uint8Array(out)], {type: "image/gif"});
+}
+function lzw(px, min) {
+  const clear = 1 << min, eoi = clear + 1, bytes = [];
+  let size = min + 1, maxcode = (1 << size) - 1, next = eoi + 1, cur = 0, nbits = 0, reset = false;
+  const dict = new Map();
+  const emit = (code) => {
+    cur |= code << nbits; nbits += size;
+    while (nbits >= 8) { bytes.push(cur & 255); cur >>>= 8; nbits -= 8; }
+    if (reset) { size = min + 1; maxcode = (1 << size) - 1; reset = false; }
+    else if (next > maxcode) { size++; maxcode = size === 12 ? 4096 : (1 << size) - 1; }
+  };
+  emit(clear);
+  let prefix = px[0];
+  for (let i = 1; i < px.length; i++) {
+    const c = px[i], key = prefix * 256 + c, hit = dict.get(key);
+    if (hit !== undefined) { prefix = hit; continue; }
+    emit(prefix);
+    if (next < 4096) dict.set(key, next++);
+    else { dict.clear(); next = eoi + 1; reset = true; emit(clear); }
+    prefix = c;
+  }
+  emit(prefix); emit(eoi);
+  if (nbits > 0) bytes.push(cur & 255);
+  return bytes;
+}
+const flowName = () => ($("canvas-title").textContent || "flow").toLowerCase().replace(/[^a-z0-9]+/g, "-");
+async function exportFlow(kind) {
+  const src = $("dg-src").value;
+  if (kind === "md") {
+    const title = chats.find((c) => c.id === current);
+    save(new Blob([`# ${$("canvas-title").textContent}${title && title.title ? ` — ${title.title}` : ""}\n\n\`\`\`mermaid\n${src}\n\`\`\`\n`], {type: "text/markdown"}), `${flowName()}.md`);
+    return;
+  }
+  try {
+    const d = await flowSvg();
+    if (kind === "png") { const c = await svgToCanvas(d.svg, d.w, d.h); c.toBlob((b) => save(b, `${flowName()}.png`), "image/png"); }
+    if (kind === "pdf") {
+      const c = await svgToCanvas(d.svg, d.w, d.h);
+      const jpeg = Uint8Array.from(atob(c.toDataURL("image/jpeg", 0.92).split(",")[1]), (ch) => ch.charCodeAt(0));
+      save(pdfFromJpeg(jpeg, c.width, c.height, 2), `${flowName()}.pdf`);
+    }
+    if (kind === "gif") {
+      note("Making the GIF…");
+      const N = 12, frames = [];
+      let W = 0, H = 0;
+      const sel = ".flowchart-link,.edgePath path,.messageLine0,.messageLine1,.transition";
+      for (let f = 0; f < N; f++) {   // the arrows' dashes moved one step per frame: 12 px a loop, as on screen
+        const c = await svgToCanvas(d.svg, d.w, d.h, `${sel}{stroke-dasharray:7 5!important;stroke-dashoffset:${-f}px!important;animation:none!important}`, 1);
+        W = c.width; H = c.height;
+        frames.push(c.getContext("2d").getImageData(0, 0, W, H).data);
+      }
+      save(gifEncode(frames, W, H, 7), `${flowName()}.gif`);
+      note("GIF saved: the animated arrows, looping.");
+    }
+  } catch (e) { toast("error", "Not exported", String(e.message || e), 6000); }
+}
+for (const b of $("flow-export").querySelectorAll("[data-export]")) b.onclick = () => exportFlow(b.dataset.export);
+
+// ---- flows from answers: the model is asked to draw one when a question is about how something flows or works,
+// and a finished answer that has one opens it here
+const FLOW_HINT = "When the user asks how something works or flows, or asks to explain a process, architecture, algorithm, pipeline, " +
+  "protocol or sequence of steps, include one diagram in a ```mermaid code block (flowchart, sequenceDiagram or stateDiagram-v2) with " +
+  "short labels; the user's app draws it next to your answer. When it shows data or steps moving, make its first line `%% animate`. " +
+  "Explain in text as usual; for other questions, no diagram.";
+function withHints(msgs) {
+  return settings.flows === false ? msgs : [{role: "system", content: FLOW_HINT}, ...msgs];
+}
+function afterAnswer(m) {
+  const blocks = [...(m.text || "").matchAll(/```mermaid[^\n]*\n([\s\S]*?)```/g)];
+  if (!blocks.length) return;
+  if (!$("canvas").hidden && cv && cv.mode !== "flow") return;     // do not replace a page the user is looking at
+  openFlow(blocks[blocks.length - 1][1].trim());
+}
+
+// ---- the sketch: shapes in an SVG, kept in this browser
 let wb = store.get("board-shapes", []), wbUndo = [], wbTool = "rect", wbColor = "#3DD68C";
 const WB_COLORS = ["#3DD68C", "#6CB6FF", "#F2B84B", "#FF7B72", "#C297FF", "currentColor"];
 $("wb-colors").innerHTML = WB_COLORS.map((c) => `<button type="button" role="radio" data-v="${c}" style="background:${c === "currentColor" ? "var(--st-ink)" : c}" aria-label="${c === "currentColor" ? "Ink" : c}"></button>`).join("");
@@ -1863,9 +2045,9 @@ $("wb").addEventListener("pointerdown", (e) => {
     inp.onblur = done;
     return;
   }
-  $("wb").setPointerCapture(e.pointerId);
-  let cur = wbTool === "pen" ? {k: "pen", p: [[x, y]], c: wbColor} : wbTool === "arrow" ? {k: "arrow", x1: x, y1: y, x2: x, y2: y, c: wbColor}
-          : {k: wbTool, x, y, w: 0, h: 0, c: wbColor, ox: x, oy: y};
+  try { $("wb").setPointerCapture(e.pointerId); } catch (err) { /* not a live pointer */ }
+  const cur = wbTool === "pen" ? {k: "pen", p: [[x, y]], c: wbColor} : wbTool === "arrow" ? {k: "arrow", x1: x, y1: y, x2: x, y2: y, c: wbColor}
+            : {k: wbTool, x, y, w: 0, h: 0, c: wbColor, ox: x, oy: y};
   const move = (ev) => {
     const [mx, my] = wbPoint(ev);
     if (cur.k === "pen") cur.p.push([mx, my]);
@@ -1884,25 +2066,25 @@ $("wb").addEventListener("pointerdown", (e) => {
 function wbUndoOne() { if (wbUndo.length) { wb = wbUndo.pop(); wbSave(); wbRender(); } }
 $("wb-undo").onclick = wbUndoOne;
 document.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "z" && !$("canvas").hidden && tabNow === "board" && boardMode === "draw" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") { e.preventDefault(); wbUndoOne(); }
+  if ((e.ctrlKey || e.metaKey) && e.key === "z" && !$("canvas").hidden && tabNow === "sketch" && !/INPUT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); wbUndoOne(); }
 });
-$("wb-clear").onclick = () => { if (!wb.length) return; wbUndo.push(wb.slice()); wb = []; wbSave(); wbRender(); toast("info", "Board cleared", "", 5000, {label: "Undo", run: wbUndoOne}); };
-async function boardPng() {
-  const svg = $("wb"), r = svg.getBoundingClientRect();
-  if (!wb.length) { toast("info", "The board is empty"); return null; }
-  const ink = getComputedStyle(document.documentElement).getPropertyValue("--st-ink").trim(), bg = getComputedStyle(document.documentElement).getPropertyValue("--st-surface").trim();
-  const body = wb.map(shapeSvg).join("").replaceAll("currentColor", ink);
-  const xml = `<svg xmlns="${SVGNS}" width="${r.width}" height="${r.height}"><rect width="100%" height="100%" fill="${bg}"/>${body}</svg>`;
+$("wb-clear").onclick = () => { if (!wb.length) return; wbUndo.push(wb.slice()); wb = []; wbSave(); wbRender(); toast("info", "Sketch cleared", "", 5000, {label: "Undo", run: wbUndoOne}); };
+async function sketchPng() {
+  const r = $("wb").getBoundingClientRect();
+  if (!wb.length) { toast("info", "The sketch is empty"); return null; }
+  const css = getComputedStyle(document.documentElement);
+  const body = wb.map(shapeSvg).join("").replaceAll("currentColor", css.getPropertyValue("--st-ink").trim());
+  const xml = `<svg xmlns="${SVGNS}" width="${r.width}" height="${r.height}"><rect width="100%" height="100%" fill="${css.getPropertyValue("--st-surface").trim()}"/>${body}</svg>`;
   const img = new Image(); img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
   await img.decode();
-  const cnv = document.createElement("canvas"); cnv.width = r.width * 2; cnv.height = r.height * 2;
-  const g = cnv.getContext("2d"); g.scale(2, 2); g.drawImage(img, 0, 0);
-  return cnv.toDataURL("image/png");
+  const c = document.createElement("canvas"); c.width = r.width * 2; c.height = r.height * 2;
+  const g = c.getContext("2d"); g.scale(2, 2); g.drawImage(img, 0, 0);
+  return c.toDataURL("image/png");
 }
 $("wb-send").onclick = async () => {
-  const png = await boardPng(); if (!png) return;
-  attachments.push({kind: "image", name: "whiteboard.png", url: png}); renderAttachments();
-  toast("success", "Whiteboard attached", "It goes with your next message (a model that reads pictures can see it).");
+  const png = await sketchPng(); if (!png) return;
+  attachments.push({kind: "image", name: "sketch.png", url: png}); renderAttachments();
+  toast("success", "Sketch attached", "It goes with your next message (a model that reads pictures can see it).");
   $("input").focus();
 };
 

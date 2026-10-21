@@ -103,66 +103,76 @@
         </form>
       </div>
     </div>
-    <!-- the canvas: a sub-browser for pages from the chat (sandboxed, real addresses at /preview/<id>), a Python run's
-         result, and a board (diagrams in Mermaid, a whiteboard). Drag its left edge to resize. -->
-    <aside class="canvas" id="canvas" aria-label="Canvas" hidden>
+    <!-- the canvas: what an answer makes, beside the chat. Its controls follow what it shows:
+         html (Preview, Code, Console when the page has issues), flow (a Mermaid diagram: Flow, Source, Sketch; exports),
+         python (Output, Code), web (another site, with an address bar). Drag its left edge to resize. -->
+    <aside class="canvas" id="canvas" aria-label="Canvas" data-mode="html" hidden>
       <div class="canvas__grip" id="canvas-grip" title="Drag to resize (double-click: default width)" role="separator" aria-orientation="vertical"></div>
       <div class="canvas__bar">
-        <button type="button" class="st-btn st-btn--icon" id="cb-back" title="Back" aria-label="Back"><svg class="st-icon"><use href="web/sprite.svg#i-arrow-left"/></svg></button>
-        <button type="button" class="st-btn st-btn--icon" id="cb-fwd" title="Forward" aria-label="Forward"><svg class="st-icon"><use href="web/sprite.svg#i-arrow-right"/></svg></button>
-        <button type="button" class="st-btn st-btn--icon" id="cb-reload" title="Reload" aria-label="Reload"><svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button>
-        <form class="canvas__address" id="cb-form"><svg class="st-icon st-icon--sm" id="cb-lock"><use href="web/sprite.svg#i-shield"/></svg>
-          <input id="cb-url" spellcheck="false" autocomplete="off" aria-label="Address" placeholder="A page from the chat, or http://localhost:3000"></form>
-        <button type="button" class="st-btn st-btn--icon" id="cb-open" title="Open in a new browser tab (still sandboxed)" aria-label="Open in a new tab"><svg class="st-icon"><use href="web/sprite.svg#i-external"/></svg></button>
-        <button type="button" class="st-btn st-btn--icon" id="canvas-download" title="Download" aria-label="Download"><svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+        <button type="button" class="st-btn st-btn--icon m-web" id="cb-back" title="Back" aria-label="Back"><svg class="st-icon"><use href="web/sprite.svg#i-arrow-left"/></svg></button>
+        <button type="button" class="st-btn st-btn--icon m-web" id="cb-fwd" title="Forward" aria-label="Forward"><svg class="st-icon"><use href="web/sprite.svg#i-arrow-right"/></svg></button>
+        <button type="button" class="st-btn st-btn--icon m-web m-html" id="cb-reload" title="Refresh the page" aria-label="Refresh"><svg class="st-icon"><use href="web/sprite.svg#i-refresh"/></svg></button>
+        <form class="canvas__address m-web" id="cb-form"><input id="cb-url" spellcheck="false" autocomplete="off" aria-label="Address"></form>
+        <span class="canvas__title m-html m-flow m-python" id="canvas-title">Canvas</span>
+        <span class="canvas__export m-flow" id="flow-export" role="group" aria-label="Export the flow">
+          <button type="button" class="st-btn st-btn--secondary" data-export="md" title="Markdown with the Mermaid source">MD</button>
+          <button type="button" class="st-btn st-btn--secondary" data-export="png" title="A picture">PNG</button>
+          <button type="button" class="st-btn st-btn--secondary" data-export="pdf" title="One page, ready to print">PDF</button>
+          <button type="button" class="st-btn st-btn--secondary" data-export="gif" id="export-gif" title="The animated flow">GIF</button>
+        </span>
+        <button type="button" class="st-btn st-btn--icon m-python" id="canvas-run" title="Run again" aria-label="Run again"><svg class="st-icon"><use href="web/sprite.svg#i-play"/></svg></button>
+        <button type="button" class="st-btn st-btn--icon m-web" id="cb-open" title="Open in a new browser tab" aria-label="Open in a new tab"><svg class="st-icon"><use href="web/sprite.svg#i-external"/></svg></button>
         <button type="button" class="st-btn st-btn--icon" id="canvas-wide" title="Full width" aria-label="Full width"><svg class="st-icon"><use href="web/sprite.svg#i-expand"/></svg></button>
         <button type="button" class="st-btn st-btn--icon" id="canvas-close" title="Close" aria-label="Close the canvas"><svg class="st-icon"><use href="web/sprite.svg#i-close"/></svg></button>
       </div>
       <div class="canvas__tabs" id="canvas-tabs" role="tablist" aria-label="Canvas view">
-        <button type="button" role="tab" data-v="page">Page</button>
-        <button type="button" role="tab" data-v="output">Output</button>
-        <button type="button" role="tab" data-v="console">Console <span class="cnt" id="console-count" hidden></span></button>
-        <button type="button" role="tab" data-v="code">Code</button>
-        <button type="button" role="tab" data-v="board">Board</button>
-        <span class="canvas__tabs-end"><button type="button" class="st-btn st-btn--icon" id="canvas-run" title="Run again" aria-label="Run again"><svg class="st-icon"><use href="web/sprite.svg#i-play"/></svg></button></span>
+        <button type="button" role="tab" data-v="page" class="m-html">Preview</button>
+        <button type="button" role="tab" data-v="output" class="m-python">Output</button>
+        <button type="button" role="tab" data-v="flow" class="m-flow">Flow</button>
+        <button type="button" role="tab" data-v="code" class="m-html m-python">Code</button>
+        <button type="button" role="tab" data-v="source" class="m-flow">Source</button>
+        <button type="button" role="tab" data-v="sketch" class="m-flow">Sketch</button>
+        <button type="button" role="tab" data-v="console" class="m-html" id="tab-console" hidden>Console <span class="cnt" id="console-count"></span></button>
       </div>
       <div class="canvas__body">
         <div class="canvas__pane" data-pane="page"><iframe class="canvas__frame" id="canvas-frame" title="Page" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads" referrerpolicy="no-referrer"></iframe>
-          <div class="canvas__blank" id="canvas-blank">Pages from the chat open here: click <b>Preview</b> on an HTML, SVG or Mermaid block, or type an address above.</div></div>
+          <div class="canvas__hint" id="web-hint" hidden>Blank? Many sites refuse to be shown inside another page. <button type="button" class="st-btn st-btn--secondary" id="web-hint-open">Open in a new tab</button></div></div>
         <div class="canvas__pane canvas__output" data-pane="output" id="canvas-output"></div>
-        <div class="canvas__pane canvas__console" data-pane="console" id="canvas-console"></div>
+        <div class="canvas__pane canvas__console" data-pane="console">
+          <div class="console__list" id="canvas-console"></div>
+          <div class="console__foot"><span class="muted small">The page's errors and warnings, as your browser reported them.</span>
+            <button type="button" class="st-btn st-btn--primary" id="console-send">Send the issues to the model</button></div></div>
         <pre class="canvas__pane canvas__code" data-pane="code" id="canvas-code"></pre>
-        <div class="canvas__pane board" data-pane="board">
+        <div class="canvas__pane" data-pane="flow"><iframe class="board__view" id="dg-frame" title="Flow" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe></div>
+        <div class="canvas__pane board__source" data-pane="source">
           <div class="board__bar">
-            <div class="seg seg--2 board-mode" id="board-mode" role="radiogroup" aria-label="Board">
-              <button type="button" role="radio" data-v="diagram">Diagram</button><button type="button" role="radio" data-v="draw">Whiteboard</button></div>
-            <span class="board__tools" id="diagram-tools">
-              <select class="st-input" id="dg-template" aria-label="Start from"><option value="">Start from&hellip;</option>
-                <option value="flow">Flowchart (logic flow)</option><option value="data">Data flow (animated)</option>
-                <option value="seq">Sequence (who calls whom)</option><option value="state">State machine</option>
-                <option value="class">Classes (code structure)</option><option value="machine">Machine / pipeline</option></select>
-              <button type="button" class="st-btn st-btn--secondary" id="dg-ask">Ask the model to explain</button></span>
-            <span class="board__tools" id="draw-tools" hidden>
-              <span class="seg wb-tools" id="wb-tools" role="radiogroup" aria-label="Tool">
-                <button type="button" role="radio" data-v="pen" title="Pen">Pen</button><button type="button" role="radio" data-v="rect" title="Box">Box</button>
-                <button type="button" role="radio" data-v="ellipse" title="Circle">Circle</button><button type="button" role="radio" data-v="diamond" title="Decision">Decision</button>
-                <button type="button" role="radio" data-v="arrow" title="Arrow">Arrow</button><button type="button" role="radio" data-v="text" title="Text">Text</button>
-                <button type="button" role="radio" data-v="erase" title="Eraser: click a shape">Erase</button></span>
-              <span class="swatches wb-colors" id="wb-colors" role="radiogroup" aria-label="Colour"></span>
-              <button type="button" class="st-btn st-btn--icon" id="wb-undo" title="Undo (Ctrl+Z)" aria-label="Undo"><svg class="st-icon"><use href="web/sprite.svg#i-undo"/></svg></button>
-              <button type="button" class="st-btn st-btn--icon" id="wb-clear" title="Clear" aria-label="Clear the board"><svg class="st-icon"><use href="web/sprite.svg#i-trash"/></svg></button>
-              <button type="button" class="st-btn st-btn--secondary" id="wb-send" title="Attach the whiteboard to your next message as a picture">Attach to chat</button></span>
+            <select class="st-input" id="dg-template" aria-label="Start from"><option value="">Start from&hellip;</option>
+              <option value="flow">Flowchart (logic flow)</option><option value="data">Data flow (animated)</option>
+              <option value="seq">Sequence (who calls whom)</option><option value="state">State machine</option>
+              <option value="class">Classes (code structure)</option><option value="machine">Machine / pipeline</option></select>
+            <span class="muted small">Edits redraw the Flow. A first line <code>%% animate</code> makes the arrows move.</span>
+            <button type="button" class="st-btn st-btn--secondary" id="dg-ask">Ask the model to explain it</button>
           </div>
-          <div class="board__diagram" id="board-diagram">
-            <textarea class="board__src" id="dg-src" spellcheck="false" aria-label="Mermaid source" placeholder="flowchart LR&#10;  A[Request] --> B{Cached?}"></textarea>
-            <iframe class="board__view" id="dg-frame" title="Diagram" sandbox="allow-scripts" referrerpolicy="no-referrer"></iframe>
+          <textarea class="board__src" id="dg-src" spellcheck="false" aria-label="Mermaid source"></textarea>
+        </div>
+        <div class="canvas__pane board" data-pane="sketch">
+          <div class="board__bar">
+            <span class="seg wb-tools" id="wb-tools" role="radiogroup" aria-label="Tool">
+              <button type="button" role="radio" data-v="pen">Pen</button><button type="button" role="radio" data-v="rect">Box</button>
+              <button type="button" role="radio" data-v="ellipse">Circle</button><button type="button" role="radio" data-v="diamond">Decision</button>
+              <button type="button" role="radio" data-v="arrow">Arrow</button><button type="button" role="radio" data-v="text">Text</button>
+              <button type="button" role="radio" data-v="erase" title="Click a shape to remove it">Erase</button></span>
+            <span class="swatches wb-colors" id="wb-colors" role="radiogroup" aria-label="Colour"></span>
+            <button type="button" class="st-btn st-btn--icon" id="wb-undo" title="Undo (Ctrl+Z)" aria-label="Undo"><svg class="st-icon"><use href="web/sprite.svg#i-undo"/></svg></button>
+            <button type="button" class="st-btn st-btn--icon" id="wb-clear" title="Clear" aria-label="Clear the sketch"><svg class="st-icon"><use href="web/sprite.svg#i-trash"/></svg></button>
+            <button type="button" class="st-btn st-btn--secondary" id="wb-send" title="Attach the sketch to your next message as a picture">Attach to chat</button>
           </div>
-          <div class="board__draw" id="board-draw" hidden><svg id="wb" xmlns="http://www.w3.org/2000/svg"></svg></div>
+          <div class="board__draw" id="board-draw"><svg id="wb" xmlns="http://www.w3.org/2000/svg"></svg></div>
         </div>
       </div>
-      <div class="canvas__foot">
+      <div class="canvas__foot" id="canvas-foot">
         <span class="muted small" id="canvas-note"></span>
-        <button type="button" class="st-btn st-btn--secondary" id="canvas-ask">Ask about the result</button>
+        <button type="button" class="st-btn st-btn--secondary" id="canvas-ask" hidden>Ask about the result</button>
       </div>
     </aside>
   </section>
@@ -463,6 +473,9 @@
     </div>
     <div class="toggle-row"><span>Show thinking<br><span class="muted small">expanded while it streams</span></span>
       <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
+    <div class="toggle-row"><span>Draw flows as diagrams<br><span class="muted small">asks the model for a Mermaid
+      diagram when you ask how something flows or works; it opens in the canvas</span></span>
+      <button class="st-toggle" id="s-flows" role="switch" aria-checked="true" aria-label="Draw flows as diagrams"></button></div>
     <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
       <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>

@@ -432,3 +432,23 @@ body.resizing iframe { pointer-events: none; }
 }
 .board-mode, .wb-tools { display: inline-flex; grid-template-columns: none; }
 .board-mode button, .wb-tools button { flex: none; height: 32px; }
+
+/* the canvas follows what it shows: controls of other modes are hidden; the console only appears with issues */
+.canvas [hidden] { display: none !important; }
+.canvas__title { flex: 1 1 auto; padding: 0 6px; }
+.canvas__export { display: flex; gap: 4px; }
+.canvas__export .st-btn { height: 30px; padding: 0 10px; font-size: 12px; }
+.canvas__address { flex: 1 1 auto; }
+.canvas__hint { position: absolute; left: 12px; right: 12px; bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+                padding: 8px 12px; border-radius: var(--st-r-md); background: var(--st-surface); border: 1px solid var(--st-line); box-shadow: var(--st-sh-bar);
+                font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.canvas__hint .st-btn { height: 30px; }
+.canvas__console { flex-direction: column; padding: 0; }
+.console__list { flex: 1; min-height: 0; overflow: auto; font: 400 12.5px/1.5 var(--st-font-mono); }
+.console__foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--st-line-soft); flex-wrap: wrap; }
+.console__foot .st-btn { height: 34px; }
+.canvas__pane[data-pane="flow"] .board__view { flex: 1; }
+.board__source { flex-direction: column; }
+.board__source .board__src { flex: 1; border-right: 0; }
+.board__source code { font: 400 12px var(--st-font-mono); }
+.board__draw { flex: 1; }
