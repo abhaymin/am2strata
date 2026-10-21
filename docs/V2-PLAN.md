@@ -59,6 +59,22 @@ workspace with mold's lock file, so the server builds as before and the media en
 6. **v2.5 llama.cpp's features:** constrained sampling (GBNF / JSON schema) in the sampler, embeddings and rerank, LoRA
    hot-swap, a draft model, parallel slots, min-p / DRY / XTC / logprobs, FIM infill, tokenize endpoints.
 
+## Alongside: the knowledge and memory cache
+
+[KNOWLEDGE-CACHE.md](KNOWLEDGE-CACHE.md) is the other v2 track, for text models, server side and independent of the media
+engine:
+
+| Phase | What |
+|---|---|
+| A | answer cache: exact repeats (temperature 0 or a seed) answered from disk |
+| B | knowledge collections: documents split into passages, keyword search, added to a request when asked |
+| C | embeddings (in Rust) and automatic injection, with sources |
+| D | shared memory: facts written by you or the models (a remember / recall tool), scoped per client |
+| E | prompt snapshots: the KV state of long system prompts and documents saved to the SSD with the engine's SAVE / RESTORE, loaded instead of re-reading (~110 s -> ~1-3 s for 97K tokens) |
+| F | a similar-question cache (opt-in) |
+
+The media engine's own memory cache - weights kept in pinned RAM between jobs - is v2.1 above.
+
 ## Gates
 
 Media cannot be bit-identical across frameworks: images are compared by similarity with reference renders from the
