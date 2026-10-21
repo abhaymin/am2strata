@@ -1,0 +1,25 @@
+{
+ "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "args": [
+  "--model",
+  "${STRATA_DATA}/models/GLM-4.7-Flash-UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL.gguf",
+  "--max-context",
+  "32768",
+  "--pack",
+  "${STRATA_DATA}/packs/glm-4.7-flash-ud-q4_k_xl",
+  "--expert-profile",
+  "${STRATA_DATA}/packs/glm-4.7-flash-ud-q4_k_xl/expert-profile.bin",
+  "--expert-profile-save",
+  "${STRATA_DATA}/packs/glm-4.7-flash-ud-q4_k_xl/expert-profile.bin",
+  "--resident-experts",
+  "--threads",
+  "12"
+ ],
+ "cwd": "${AM2STRATA_HOME}",
+ "tokenizer": "${STRATA_DATA}/packs/glm-4.7-flash-ud-q4_k_xl/tokenizer",
+ "model_name": "glm-4.7-flash-ud-q4_k_xl",
+ "display_name": "GLM-4.7-Flash 30B-A3B UD-Q4_K_XL",
+ "log": "${STRATA_DATA}/logs/glm-4.7-flash-ud-q4_k_xl.log",
+ "host": "127.0.0.1",
+ "port": 8000
+}

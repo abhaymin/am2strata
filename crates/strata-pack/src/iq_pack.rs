@@ -318,7 +318,8 @@ fn row(fields: &[String]) -> Vec<String> {
 }
 
 fn shape01(t: &TensorInfo) -> (String, String) {
-    (t.dims[0].to_string(), t.dims.get(1).map(|d| d.to_string()).unwrap_or_else(|| "0".into()))
+    let rows: u64 = t.dims[1..].iter().product();
+    (t.dims[0].to_string(), if t.dims.len() > 1 { rows.to_string() } else { "0".into() })
 }
 
 fn rename(a: &Path, b: &Path) -> Result<(), String> {
@@ -354,7 +355,9 @@ fn index_standalone(src: &Path, out: &Path, model: &Model, compat: bool) -> Resu
         if is_expert(&t.name) || t.name == NOT_IN_PACK {
             continue;
         }
-        if t.dims.len() > 2 {
+        // a 3-D tensor outside the experts (MLA's per-head attn_k_b / attn_v_b) is a stack of matrices: the index holds
+        // it as one matrix of all their rows (shape01); iq_pack.py refuses these models
+        if t.dims.len() > 3 {
             return Err(format!("tensor {} has {} dimensions; the index holds two", t.name, t.dims.len()));
         }
         let tn = t.type_name();
@@ -584,6 +587,8 @@ struct Layer {
     names: [String; 3],
     per: [u64; 3],
     nvfp4: bool,
+    /// this layer's experts (the same in every layer, except in a per-layer pruned model)
+    n: u64,
 }
 
 /// The pack's expert table and native_experts.txt (iq_pack.py expert_layout).
@@ -594,23 +599,31 @@ fn expert_layout(model: &Model, src: &Path) -> Result<(Vec<Layer>, String, u64, 
     }
     let n_layers = 1 + exps.iter().filter_map(|n| n.split('.').nth(1)?.parse::<usize>().ok()).max().unwrap_or(0);
     let router = |l: usize| model.where_.get(&format!("blk.{l}.ffn_gate_inp.weight")).map(|(_, t)| t.dims.get(1).copied().unwrap_or(0));
-    let n_expert = router(0).ok_or("no blk.0.ffn_gate_inp.weight")?;
-    if (0..n_layers).any(|l| router(l) != Some(n_expert)) {
-        return Err("the routers disagree on the expert count; a per-layer pruned model cannot be packed".into());
-    }
+    // layers without a router hold no experts (a leading dense layer, Mamba or attention layers of a hybrid model)
+    let moe_layers: Vec<usize> = (0..n_layers).filter(|&l| router(l).is_some()).collect();
+    let n_expert = moe_layers.iter().filter_map(|&l| router(l)).max().ok_or("no blk.N.ffn_gate_inp.weight")?;
+    // every layer the same expert count: v3 / v4 as iq_pack.py writes them; a per-layer pruned model (e.g. NVIDIA's
+    // Nemotron 3.5 Bolt) gets v5, which adds the layer's count - read by am2strata-hybrid, not by strata's C++ engine
+    let pruned = moe_layers.iter().any(|&l| router(l) != Some(n_expert));
     let (mut layout, mut lines, mut offset, mut n_split) = (Vec::new(), Vec::<String>::new(), 0u64, 0usize);
-    for l in 0..n_layers {
+    for &l in &moe_layers {
+        let n_expert = router(l).unwrap();
         let names: [String; 3] = ROLES.map(|r| format!("blk.{l}.ffn_{r}_exps.weight"));
-        let missing: Vec<&String> = names.iter().filter(|n| !model.where_.contains_key(*n)).collect();
+        // experts without a gate (relu^2 up/down, as Nemotron-H's): the gate's slot stays empty
+        let gateless = !model.where_.contains_key(&names[0]) && model.where_.contains_key(&names[1]);
+        let missing: Vec<&String> = names.iter().enumerate().filter(|(i, n)| !(gateless && *i == 0) && !model.where_.contains_key(*n)).map(|(_, n)| n).collect();
         if !missing.is_empty() {
             return Err(format!("layer {l}: missing {}", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
         }
-        let ts: Vec<&TensorInfo> = names.iter().map(|n| model.tensor(n)).collect();
+        let ts: Vec<&TensorInfo> = names.iter().enumerate().map(|(i, n)| model.tensor(if gateless && i == 0 { &names[1] } else { n })).collect();
         if ts.iter().any(|t| t.expected_bytes().is_none() || t.dims.len() != 3 || t.dims[2] != n_expert) {
             return Err(format!("layer {l}: an expert tensor is not [*, *, {n_expert}] of whole blocks"));
         }
-        let per = [0, 1, 2].map(|i| ts[i].expected_bytes().unwrap() / n_expert);
-        if per[0] != per[1] || ts[0].ggml_type != ts[1].ggml_type {
+        let mut per = [0, 1, 2].map(|i| ts[i].expected_bytes().unwrap() / n_expert);
+        if gateless {
+            per[0] = 0;
+        }
+        if !gateless && (per[0] != per[1] || ts[0].ggml_type != ts[1].ggml_type) {
             return Err(format!("layer {l}: gate and up differ in type"));
         }
         let mut blob = per[0] + per[1] + per[2];
@@ -621,29 +634,40 @@ fn expert_layout(model: &Model, src: &Path) -> Result<(Vec<Layer>, String, u64, 
             }
             blob += NVFP4_TAIL;
         }
-        let files: Vec<String> = names.iter().map(|n| {
+        if gateless && nvfp4 {
+            return Err(format!("layer {l}: NVFP4 experts without a gate are not supported"));
+        }
+        let files: Vec<String> = names.iter().enumerate().filter(|(i, _)| !(gateless && *i == 0)).map(|(_, n)| {
             let p = &model.shards[model.where_[n].0].path;
             if p == src { String::new() } else { fname(p) }
         }).collect();
         let uniq: BTreeSet<&String> = files.iter().collect();
         let column = if uniq.len() == 1 { files[0].clone() } else { files.join(",") };
         n_split += (uniq.len() != 1) as usize;
-        layout.push(Layer { l, gu_type: ts[0].ggml_type, d_type: ts[2].ggml_type, offset, blob, names: names.clone(), per, nvfp4 });
+        layout.push(Layer { l, gu_type: ts[0].ggml_type, d_type: ts[2].ggml_type, offset, blob, names: names.clone(), per, nvfp4, n: n_expert });
         if nvfp4 {
             lines.push(format!("{l} {} {} {offset} {blob}", ts[0].ggml_type, ts[2].ggml_type));
             offset += blob * n_expert;
             continue;
         }
-        let mut line = format!("{l} {} {} {offset} {blob} {} {} {}", ts[0].ggml_type, ts[2].ggml_type,
-                               model.abs_offset(&names[0]), model.abs_offset(&names[1]), model.abs_offset(&names[2]));
+        let gate_off = if gateless { 0 } else { model.abs_offset(&names[0]) };
+        let mut line = format!("{l} {} {} {offset} {blob} {gate_off} {} {}", ts[0].ggml_type, ts[2].ggml_type,
+                               model.abs_offset(&names[1]), model.abs_offset(&names[2]));
+        if pruned {
+            line += &format!(" {n_expert}");
+        }
         if !column.is_empty() {
             line += &format!(" {column}");
         }
         lines.push(line);
         offset += blob * n_expert;
     }
-    let head = if n_split > 0 {
-        let which: Vec<String> = layout.iter().filter(|x| lines[x.l].contains(',')).map(|x| x.l.to_string()).collect();
+    let head = if pruned {
+        format!("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off n_expert [shard | gate,up,down] \
+                 (n_expert up to {n_expert}, per layer; gate_off 0 for experts without a gate; total {offset}; absolute offsets in {}, \
+                 or in the named shard beside it)\n", fname(src))
+    } else if n_split > 0 {
+        let which: Vec<String> = layout.iter().zip(&lines).filter(|(_, line)| line.contains(',')).map(|(x, _)| x.l.to_string()).collect();
         println!("{n_split} layer(s) have their gate/up/down in different shards: native_experts.txt v4, per-role shard column for {}",
                  which.join(", "));
         format!("# strata native experts v4: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard | gate,up,down] \
@@ -686,6 +710,9 @@ fn nvfp4_tail(model: &Model, x: &Layer, e: u64) -> Result<[u8; 16], String> {
 fn expert_blob(model: &Model, x: &Layer, e: u64) -> Result<Vec<u8>, String> {
     let mut b = Vec::with_capacity(x.blob as usize);
     for i in 0..3 {
+        if x.per[i] == 0 {
+            continue; // no gate
+        }
         b.extend(model.read_at(&x.names[i], e * x.per[i], x.per[i])?);
     }
     if x.nvfp4 {
@@ -705,9 +732,9 @@ pub fn run(o: &Options) -> Result<(), String> {
     if model.shards.len() > 1 {
         println!("model shards: {}", model.shards.iter().map(|s| fname(&s.path)).collect::<Vec<_>>().join(", "));
     }
-    let (layout, text, n_expert, offset) = expert_layout(&model, &src)?;
+    let (layout, text, _n_expert, offset) = expert_layout(&model, &src)?;
     let mut experts_bin = o.experts_bin;
-    if layout.iter().any(|x| x.names.iter().any(|n| model.tensor(n).type_name() == "NVFP4")) {
+    if layout.iter().any(|x| x.names.iter().any(|n| model.where_.contains_key(n) && model.tensor(n).type_name() == "NVFP4")) {
         experts_bin = true;
     }
     let path = out.join("experts.bin");
@@ -718,7 +745,7 @@ pub fn run(o: &Options) -> Result<(), String> {
     if reuse {
         let mut f = File::open(&path).map_err(|e| e.to_string())?;
         'check: for x in [&layout[0], &layout[layout.len() / 2], &layout[layout.len() - 1]] {
-            for e in [0, n_expert - 1] {
+            for e in [0, x.n - 1] {
                 f.seek(SeekFrom::Start(x.offset + e * x.blob)).map_err(|e| e.to_string())?;
                 let mut have = vec![0u8; x.blob as usize];
                 let ok = f.read_exact(&mut have).is_ok();
@@ -776,7 +803,7 @@ pub fn run(o: &Options) -> Result<(), String> {
     let part = out.join("experts.bin.tmp");
     let mut fo = BufWriter::with_capacity(32 << 20, File::create(&part).map_err(|e| e.to_string())?);
     for x in &layout {
-        for e in 0..n_expert {
+        for e in 0..x.n {
             fo.write_all(&expert_blob(&model, x, e)?).map_err(|e| e.to_string())?;
         }
         if x.l % 8 == 0 {

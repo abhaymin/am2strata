@@ -1,0 +1,27 @@
+{
+ "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "args": [
+  "--model",
+  "${STRATA_DATA}/models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-Q5_K_M/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-AD-Q5_K_M-00001-of-00002.gguf",
+  "--max-context",
+  "32768",
+  "--pack",
+  "${STRATA_DATA}/packs/nemotron-3.5-bolt-74b-a9b-q5_k_m",
+  "--expert-profile",
+  "${STRATA_DATA}/packs/nemotron-3.5-bolt-74b-a9b-q5_k_m/expert-profile.bin",
+  "--expert-profile-save",
+  "${STRATA_DATA}/packs/nemotron-3.5-bolt-74b-a9b-q5_k_m/expert-profile.bin",
+  "--resident-experts",
+  "--expert-ram-gib",
+  "30",
+  "--threads",
+  "12"
+ ],
+ "cwd": "${AM2STRATA_HOME}",
+ "tokenizer": "${STRATA_DATA}/packs/nemotron-3.5-bolt-74b-a9b-q5_k_m/tokenizer",
+ "model_name": "nemotron-3.5-bolt-74b-a9b-q5_k_m",
+ "display_name": "NVIDIA Nemotron 3.5 Bolt 74B-A9B Q5_K_M",
+ "log": "${STRATA_DATA}/logs/nemotron-3.5-bolt-74b-a9b-q5_k_m.log",
+ "host": "127.0.0.1",
+ "port": 8000
+}

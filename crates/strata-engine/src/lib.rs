@@ -140,14 +140,16 @@ pub fn child_env(cfg: &RunConfig) -> Vec<(String, String)> {
 }
 
 /// A shareable config: in every string (engine arguments too), a leading `~/` is the home folder and `${NAME}` an
-/// environment variable. `${STRATA_HOME}` (PolyStrata's folder: engines, run configs) and `${STRATA_DATA}` (models,
-/// packs) default to ~/Development/PolyStrata and ~/Development/Strata-data. Absolute paths are left as they are.
+/// environment variable. `${STRATA_HOME}` (PolyStrata's folder: engines, run configs), `${STRATA_DATA}` (models,
+/// packs) and `${AM2STRATA_HOME}` (this checkout: the Rust engines) default to ~/Development/PolyStrata,
+/// ~/Development/Strata-data and ~/Development/am2strata. Absolute paths are left as they are.
 pub fn expand_str(s: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let var = |name: &str| -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| match name {
             "STRATA_HOME" => Some(format!("{home}/Development/PolyStrata")),
             "STRATA_DATA" => Some(format!("{home}/Development/Strata-data")),
+            "AM2STRATA_HOME" => Some(format!("{home}/Development/am2strata")),
             "HOME" => Some(home.clone()),
             _ => None,
         })

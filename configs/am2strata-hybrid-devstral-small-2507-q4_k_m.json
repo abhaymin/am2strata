@@ -1,0 +1,18 @@
+{
+ "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "args": [
+  "--model",
+  "${STRATA_DATA}/models/Devstral-Small-2507-Q4_K_M/Devstral-Small-2507-Q4_K_M.gguf",
+  "--max-context",
+  "32768",
+  "--threads",
+  "12"
+ ],
+ "cwd": "${AM2STRATA_HOME}",
+ "tokenizer": "${STRATA_DATA}/packs/devstral-small-2507-q4_k_m/tokenizer",
+ "model_name": "devstral-small-2507-q4_k_m",
+ "display_name": "Devstral Small 2507 24B Q4_K_M (Mistral Small 3.1)",
+ "log": "${STRATA_DATA}/logs/devstral-small-2507-q4_k_m.log",
+ "host": "127.0.0.1",
+ "port": 8000
+}

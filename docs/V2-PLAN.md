@@ -65,15 +65,16 @@ One model library for every kind - text MoE, text dense, image, video, speech in
 (mockup: `design/V2Models-*.dc.html`) and `/api/models`:
 
 - **See** what is downloaded and what is loaded: per model its kind, engine, size on disk, licence, and where it sits
-  (VRAM / pinned RAM / SSD); the text engine and the media engine each show their loaded model.
+  (VRAM / pinned RAM / SSD); the text engine and the media engine each show their loaded model; for an MoE model its
+  expert loadings (the profile's hottest experts, the resident share, the hit rate).
 - **Download** any of them from Hugging Face (text GGUFs as today; image, video and voice models through the media
   engine's catalog), with progress, resumable and SHA-256 checked.
 - **Load, switch, unload** from the list or the model picker; a media model loads when a job needs it.
 - **Change** its run config (Model config) and defaults.
 - **Remove** a model: its files, run config and pack, after a confirmation, never while it is loaded or in use, with
   the disk space it frees shown.
-- **Downloaded but not runnable** models are listed too, with the reason: e.g. Nemotron 3.5 Bolt today ("needs an
-  engine for nemotron_h_moe"), so nothing on disk is invisible.
+- **Downloaded but not runnable** models are listed too, with the reason (e.g. an architecture no engine runs), so
+  nothing on disk is invisible.
 
 API: `GET /api/models?kind=`, `POST /api/models/load` / `unload` (any kind), `POST /api/models/pull` (any kind),
 `DELETE /api/models/{id}`; the same checks as today (key, this server's own page).
@@ -102,13 +103,30 @@ comes back in the conversation:
 
 ## New architectures
 
-- **Nemotron-H MoE** (`nemotron_h_moe`: NVIDIA Nemotron 3.5 Bolt 74B-A9B; Mamba-2 state-space layers, attention and
-  MoE experts, 262K context, with a vision encoder). Downloaded already:
-  `Strata-data/models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-Q5_K_M` (57 GB, 2 shards + mmproj). No engine runs it: it needs
-  the Mamba-2 scan (conv1d + selective state, with the SSM state kept per conversation like the KV cache), the hybrid
-  layer schedule, its MoE routing and its tool-call format, then the strata placement (experts across VRAM and pinned
-  RAM). Native only. Note: Q5_K_M's ~57 GB of weights barely fits next to the OS in 60 GB of RAM; IQ4_XS (43 GB) or
-  Q4_K_M (48 GB) leave room. Route to decide: in the C++ strata-poly engine, or in Rust with strata-dense (v2.4).
+`am2strata-hybrid` (crates/strata-hybrid) is a Rust engine for the architectures strata's C++ engines do not run,
+checked against llama.cpp (tools/reference-llamacpp: greedy tokens identical except near-ties, tokenizers identical):
+
+| Architecture | Models | Status |
+|---|---|---|
+| `nemotron_h_moe` | NVIDIA Nemotron 3.5 Bolt 74B-A9B (Mamba-2, attention without positions, latent MoE, per-layer pruned experts) | done, parity |
+| `deepseek2` | GLM-4.7-Flash 30B-A3B (MLA with the absorbed K/V, sigmoid routing with a bias, shared expert); DeepSeek V2/V3 family | done, parity on GLM-4.7-Flash |
+| `llama` | Mistral 7B, Mistral Small / Devstral; Mixtral 8x7B / 8x22B (the same tensors plus `ffn_*_exps`, softmax top-2) | dense done, parity on Devstral; Mixtral's MoE path verified through Qwen3-MoE, its own parity needs a Mixtral GGUF |
+| `mistral3` | Ministral 3, Mistral Small / Medium 3.x (YaRN, attention temperature) | done, parity on Ministral 3 3B |
+| `qwen3`, `qwen3moe` | Qwen3 dense and MoE (per-head q/k norms, NEOX RoPE) | done, parity |
+| `glm4moe` | GLM-4.5 / 4.6 / 4.7 (Air): GQA with partial RoPE and q/k biases, sigmoid routing, NextN layer | next: needs a GGUF to check against (the smallest, GLM-4.5-Air, is ~40-60 GB) |
+
+Strata's placement in this engine: a pack (`--pack`, from `am2strata-run iq-pack`, which now also packs hybrid
+layer schedules, gate-less experts and per-layer pruned experts - native_experts.txt v5), the expert loadings
+(`--expert-profile` / `--expert-profile-save`: PolyStrata's STRP format, learned from routing counts), and residency
+(`--resident-experts [--expert-ram-gib N]`: the hottest experts kept in RAM, the rest marked cold so a model larger than
+the RAM reads only cold experts from the SSD; the hit rate is reported per request). Measured on GLM-4.7-Flash with
+4 GiB of its 14.8 GiB of experts resident: 26.6% of the routing served from RAM by layer order, 70.9% with the learned
+profile. The compute is on the CPU for now (~0.7 s/token for GLM-4.7-Flash, ~1.1 s for Nemotron Bolt on 12 threads);
+next: the GPU tier (dense weights and the hot experts in VRAM via candle), then integer dot products on the CPU
+(the activations are already quantized as llama.cpp does).
+
+Run configs: `configs/am2strata-hybrid-*.json` (Nemotron Bolt, GLM-4.7-Flash, Devstral); `${AM2STRATA_HOME}` is this
+checkout (default ~/Development/am2strata).
 
 ## Alongside: the knowledge and memory cache
 
