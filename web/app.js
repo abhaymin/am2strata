@@ -608,11 +608,12 @@ function canvasKind(lang, code) {
   if (["html", "htm", "svg", "xml+svg"].includes(l)) return "html";
   if (!l && /^\s*(<!doctype html|<html|<svg)/i.test(code)) return "html";
   if (["python", "py", "python3"].includes(l)) return "python";
+  if (l === "mermaid" || (!l && /^\s*(flowchart|graph|sequenceDiagram|stateDiagram|classDiagram|erDiagram|gantt|mindmap)\b/.test(code))) return "mermaid";
   return null;
 }
 function codeBlock(lang, code) {
   const kind = canvasKind(lang, code);
-  const btn = kind === "html" ? `<button type="button" class="code-run" data-canvas="html">${icon("eye")}Preview</button>`
+  const btn = kind === "html" || kind === "mermaid" ? `<button type="button" class="code-run" data-canvas="${kind}">${icon("eye")}Preview</button>`
             : kind === "python" ? `<button type="button" class="code-run" data-canvas="python" aria-label="Run this Python code" title="Runs on this PC in a sandbox: no network, home folders hidden">${icon("play")}Run</button>` : "";
   return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span><span class="st-code__btns">${btn}` +
     `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></span></div>` +
@@ -1508,40 +1509,141 @@ function callContent() {
 }
 for (const b of $("call-tabs").children) b.onclick = () => { callPane = b.dataset.p; store.set("call-pane", callPane); callContent(); };
 
-// ------------------------------------------------------------------ the canvas (code block › Preview / Run)
-// HTML runs in a sandboxed frame without this page's origin: it cannot reach the server's API or this browser's
-// storage. Python runs on the server (POST /api/run) in a bubblewrap sandbox, only when Run is clicked.
-let cv = null;                                       // {kind, code, result, html}
-function canvasView(v) {
-  for (const b of $("canvas-tabs").children) b.setAttribute("aria-selected", String(b.dataset.v === v));
-  $("canvas-frame").hidden = v !== "preview"; $("canvas-output").hidden = v !== "output"; $("canvas-code").hidden = v !== "code";
+// ------------------------------------------------------------------ the canvas: a sub-browser, a Python run, a board
+// Pages from the chat get a real address from the server (/preview/<id>, served with a CSP sandbox header) and run in
+// a sandboxed frame without this page's origin: they cannot reach the server's API or this browser's storage, not
+// even opened in their own tab. Python runs on the server (POST /api/run) in a bubblewrap sandbox, only on a click.
+const SANDBOX_PAGE = "allow-scripts allow-forms allow-modals allow-popups allow-downloads";
+// in every preview, first thing: the page's console and errors come to the Console tab
+const CONSOLE_SHIM = `<script>(function(){var P=function(t,a){try{parent.postMessage({__am2:1,t:t,a:Array.prototype.map.call(a,function(x){` +
+  `try{return typeof x==="string"?x:x instanceof Error?x.stack||String(x):JSON.stringify(x)}catch(e){return String(x)}}).join(" ")},"*")}catch(e){}};` +
+  `["log","info","warn","error","debug"].forEach(function(k){var o=console[k];console[k]=function(){P(k,arguments);return o.apply(console,arguments)}});` +
+  `addEventListener("error",function(e){P("error",[(e.message||"error")+(e.lineno?" (line "+e.lineno+(e.colno?":"+e.colno:"")+")":"")])});` +
+  `addEventListener("unhandledrejection",function(e){P("error",["Unhandled promise rejection: "+(e.reason&&e.reason.message||e.reason)])});})();</script>`;
+function instrument(html) {
+  const m = html.match(/<head[^>]*>/i) || html.match(/<html[^>]*>/i) || html.match(/<!doctype[^>]*>/i);
+  return m ? html.slice(0, m.index + m[0].length) + CONSOLE_SHIM + html.slice(m.index + m[0].length) : CONSOLE_SHIM + html;
 }
-for (const b of $("canvas-tabs").children) b.onclick = () => canvasView(b.dataset.v);
-function setFrame(html) {
-  cv.html = html;
-  $("canvas-frame").srcdoc = html;
-  $("canvas-tabs").querySelector('[data-v="preview"]').hidden = false;
+// signs that a model stopped before finishing the page
+function cutOff(html) {
+  const why = [];
+  const open = (html.match(/<script\b/gi) || []).length, close = (html.match(/<\/script>/gi) || []).length;
+  if (open > close) why.push("a <script> is never closed, so none of its code runs");
+  if (/<html\b/i.test(html) && !/<\/html>/i.test(html)) why.push("there is no </html>");
+  if (/<svg\b/i.test(html) && (html.match(/<svg\b/gi) || []).length > (html.match(/<\/svg>/gi) || []).length) why.push("an <svg> is never closed");
+  return why;
 }
-function openCanvas(kind, code) {
-  cv = {kind, code, result: null, html: null};
+
+let cv = null;                                       // what the canvas shows: {kind, code, result}
+const nav = {list: [], i: -1};                       // the sub-browser's history: {title, url, html?, external?}
+let tabNow = "page";
+function canvasTab(v) {
+  tabNow = v;
+  for (const b of $("canvas-tabs").querySelectorAll("[data-v]")) b.setAttribute("aria-selected", String(b.dataset.v === v));
+  for (const p of document.querySelectorAll(".canvas__pane")) p.classList.toggle("on", p.dataset.pane === v);
+  $("canvas-run").hidden = !(cv && cv.kind === "python");
+  $("canvas-ask").hidden = !(v === "output" && cv && cv.result);
+  if (v === "board") boardShow();
+}
+for (const b of $("canvas-tabs").querySelectorAll("[data-v]")) b.onclick = () => canvasTab(b.dataset.v);
+function showCanvas() {
   $("canvas").hidden = false;
+  $("canvas-tabs").querySelector('[data-v="output"]').hidden = !(cv && cv.kind === "python");
+}
+
+// ---- the page frame and its history
+function newFrame(sandbox) {
+  const old = $("canvas-frame"), f = document.createElement("iframe");
+  f.className = "canvas__frame"; f.id = "canvas-frame"; f.title = "Page";
+  f.setAttribute("sandbox", sandbox); f.setAttribute("referrerpolicy", "no-referrer");
+  old.replaceWith(f);
+  return f;
+}
+async function previewUrl(html) {
+  try {
+    const r = await fetch("api/preview", {method: "POST", headers: headers(true), body: JSON.stringify({html})});
+    if (r.ok) return (await r.json()).url;
+  } catch (e) { /* an older server: the page goes in by srcdoc */ }
+  return null;
+}
+function loadEntry(e) {
+  clearConsole();
+  $("canvas-blank").hidden = true;
+  // a page of another site may keep its own origin (cookies, storage: a dev server works); never one of this server
+  const foreign = e.external && new URL(e.url, location.href).origin !== location.origin;
+  const f = newFrame(SANDBOX_PAGE + (foreign ? " allow-same-origin" : ""));
+  // our own pages go in inline (some browsers and blockers refuse a frame that loads a page); the address stays
+  // for reload and for opening it in its own tab
+  if (e.html) f.srcdoc = e.html; else f.src = e.url;
+  $("cb-url").value = e.url ? new URL(e.url, location.href).href : `preview: ${e.title}`;
+  $("cb-lock").style.visibility = e.external ? "hidden" : "visible";
+  $("cb-back").disabled = nav.i <= 0; $("cb-fwd").disabled = nav.i >= nav.list.length - 1;
+  if (e.hints) for (const h of e.hints) conLine("hint", h);
+}
+function go(e) {
+  nav.list = nav.list.slice(0, nav.i + 1); nav.list.push(e); nav.i = nav.list.length - 1;
+  loadEntry(e);
+}
+$("cb-back").onclick = () => { if (nav.i > 0) { nav.i--; loadEntry(nav.list[nav.i]); canvasTab("page"); } };
+$("cb-fwd").onclick = () => { if (nav.i < nav.list.length - 1) { nav.i++; loadEntry(nav.list[nav.i]); canvasTab("page"); } };
+$("cb-reload").onclick = () => { if (nav.i >= 0) loadEntry(nav.list[nav.i]); };
+$("cb-form").onsubmit = (ev) => {
+  ev.preventDefault();
+  let u = $("cb-url").value.trim();
+  if (!u || u.startsWith("preview:")) return;
+  if (!/^https?:\/\//i.test(u)) u = (/^(localhost|127\.|\[::1\])/.test(u) ? "http://" : "https://") + u;
+  const own = new URL(u).origin === location.origin;
+  if (own && !new URL(u).pathname.startsWith("/preview/")) {
+    toast("warn", "Not in the canvas", "am2Strata's own pages open in the main window, not inside the sandbox."); return;
+  }
+  go({title: u, url: u, external: !own});
+  canvasTab("page");
+  conLine("hint", own ? "A preview page." : "Another site: shown if it allows being embedded (many sites refuse; your own dev servers work). Its console is not visible here.");
+};
+$("cb-open").onclick = async () => {
+  let url = nav.i >= 0 ? nav.list[nav.i].url : null;
+  if (tabNow === "board" && boardMode === "diagram") url = await previewUrl(diagramDoc($("dg-src").value, true));
+  if (url) window.open(url, "_blank", "noopener,noreferrer");
+  else toast("info", "Nothing to open", "Preview a page first.");
+};
+
+// ---- the console
+let conCount = 0;
+function clearConsole() { $("canvas-console").innerHTML = `<div class="con-empty">The page's console: logs and errors show here.</div>`; conCount = 0; badge(); }
+function badge(tone) { const c = $("console-count"); c.hidden = !conCount; c.textContent = conCount; if (tone) c.dataset.tone = tone; }
+function conLine(t, text) {
+  const box = $("canvas-console"), empty = box.querySelector(".con-empty");
+  if (empty) empty.remove();
+  const d = document.createElement("div"); d.className = "con-line"; d.dataset.t = t; d.textContent = text;
+  box.appendChild(d);
+  if (box.children.length > 500) box.firstChild.remove();
+  if (t === "error" || t === "hint") { conCount++; badge(t === "error" ? "error" : "log"); }
+}
+window.addEventListener("message", (e) => {
+  const f = $("canvas-frame");
+  if (e.data && e.data.__am2 && f && e.source === f.contentWindow) conLine(e.data.t, e.data.a);
+  if (e.data && e.data.__am2dg && e.source === $("dg-frame").contentWindow) diagramResult(e.data);
+});
+
+// ---- opening something from a code block
+async function openCanvas(kind, code) {
+  cv = {kind, code, result: null};
   $("canvas-code").textContent = code;
-  $("canvas-title").textContent = kind === "html" ? "HTML preview" : "Python";
-  $("canvas-run").hidden = kind !== "python";
-  $("canvas-ask").hidden = kind !== "python";
-  $("canvas-tabs").querySelector('[data-v="output"]').hidden = kind !== "python";
-  $("canvas-tabs").querySelector('[data-v="preview"]').hidden = kind !== "html";
-  $("canvas-frame").srcdoc = "";
-  if (kind === "html") {
-    setFrame(code);
-    $("canvas-note").textContent = "Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.";
-    canvasView("preview");
-  } else runCanvas();
+  showCanvas();
+  if (kind === "mermaid") { $("dg-src").value = code; boardMode = "diagram"; canvasTab("board"); return; }
+  if (kind === "python") { canvasTab("output"); runCanvas(); return; }
+  const hints = cutOff(code).map((w) => `This code looks cut off: ${w}. The model stopped before finishing the page; ask it to write the whole file again.`);
+  const title = (code.match(/<title>([^<]{1,80})<\/title>/i) || [, "page"])[1];
+  const html = instrument(code);
+  const url = await previewUrl(html);
+  go({title, url, html, hints, source: code});
+  $("canvas-note").textContent = "Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.";
+  canvasTab(hints.length ? "console" : "page");
 }
 async function runCanvas() {
   if (!cv || cv.kind !== "python") return;
   const out = $("canvas-output");
-  canvasView("output");
+  canvasTab("output");
   $("canvas-run").disabled = true;
   out.innerHTML = `<div class="run-status"><span class="st-badge st-badge--reading">Running</span><span class="muted">on this PC, in a sandbox</span></div>`;
   $("canvas-note").textContent = "";
@@ -1556,7 +1658,9 @@ async function runCanvas() {
     out.querySelector("pre").textContent = String(e.message || e);
   }
   $("canvas-run").disabled = false;
+  canvasTab("output");
 }
+const b64text = (d) => new TextDecoder().decode(Uint8Array.from(atob(d), (c) => c.charCodeAt(0)));
 function renderRun(j) {
   const out = $("canvas-output");
   const ok = j.exit_code === 0 && !j.timed_out;
@@ -1571,7 +1675,6 @@ function renderRun(j) {
   stream("Output", j.stdout, false);
   stream("Errors", j.stderr, true);
   if (!j.stdout && !j.stderr && !j.files.length) stream("Output", "(nothing printed)", false);
-  let firstHtml = null;
   for (const f of j.files) {
     const box = document.createElement("div"); box.className = "run-file";
     const row = document.createElement("div"); row.className = "run-file__row";
@@ -1585,29 +1688,33 @@ function renderRun(j) {
     box.append(row);
     if (f.data && f.mime.startsWith("image/")) { const im = document.createElement("img"); im.src = `data:${f.mime};base64,${f.data}`; im.alt = f.name; box.append(im); }
     if (f.data && f.mime === "text/html") {
-      const html = new TextDecoder().decode(Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0)));
-      if (!firstHtml) firstHtml = html;
-      const b = document.createElement("button"); b.className = "st-btn st-btn--secondary"; b.style.height = "30px"; b.textContent = "Show in Preview";
-      b.onclick = () => { setFrame(html); canvasView("preview"); }; row.append(b);
+      const b = document.createElement("button"); b.className = "st-btn st-btn--secondary"; b.style.height = "30px"; b.textContent = "Open in Page";
+      b.onclick = async () => { const html = instrument(b64text(f.data)); const url = await previewUrl(html); go({title: f.name, url, html}); canvasTab("page"); };
+      row.append(b);
     }
     if (f.data && /^(text\/(csv|plain)|application\/json)$/.test(f.mime) && f.size < 65536) {
-      const p = document.createElement("pre"); p.className = "run-stream";
-      p.textContent = new TextDecoder().decode(Uint8Array.from(atob(f.data), (c) => c.charCodeAt(0))); box.append(p);
+      const p = document.createElement("pre"); p.className = "run-stream"; p.textContent = b64text(f.data); box.append(p);
     }
     out.append(box);
   }
-  if (firstHtml) setFrame(firstHtml);
   $("canvas-note").textContent = "Ran in a sandbox: no network, home folders hidden, system read-only.";
 }
 $("canvas-run").onclick = runCanvas;
-$("canvas-close").onclick = () => { $("canvas").hidden = true; $("canvas-frame").srcdoc = ""; cv = null; };
-$("canvas-wide").onclick = () => { const c = $("canvas"); c.dataset.wide = String(c.dataset.wide !== "true"); };
-$("canvas-download").onclick = () => {
-  if (!cv) return;
-  const html = cv.kind === "html" || $("canvas-frame").hidden === false && cv.html;
-  const blob = new Blob([html ? cv.html : cv.code], {type: html ? "text/html" : "text/x-python"});
-  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = html ? "canvas.html" : "main.py"; a.click();
+$("canvas-close").onclick = () => { $("canvas").hidden = true; newFrame(SANDBOX_PAGE); };
+$("canvas-wide").onclick = () => { const c = $("canvas"); c.dataset.wide = String(c.dataset.wide !== "true"); $("canvas-wide").title = c.dataset.wide === "true" ? "Back beside the chat" : "Full width"; };
+function save(blob, name) {
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+$("canvas-download").onclick = async () => {
+  if (tabNow === "board") {
+    if (boardMode === "draw") { const png = await boardPng(); if (png) { const b = await (await fetch(png)).blob(); save(b, "whiteboard.png"); } }
+    else save(new Blob([$("dg-src").value], {type: "text/plain"}), "diagram.mmd");
+    return;
+  }
+  const e = nav.i >= 0 ? nav.list[nav.i] : null;
+  if (tabNow === "page" && e && e.source) save(new Blob([e.source], {type: "text/html"}), "page.html");
+  else if (cv) save(new Blob([cv.code], {type: "text/plain"}), cv.kind === "python" ? "main.py" : cv.kind === "html" ? "page.html" : "code.txt");
 };
 $("canvas-ask").onclick = () => {
   if (!cv || !cv.result) return;
@@ -1617,6 +1724,186 @@ $("canvas-ask").onclick = () => {
   if (j.stderr) t += `\n\nErrors:\n\`\`\`\n${cut(j.stderr)}\n\`\`\``;
   if (j.files.length) t += `\n\nFiles written: ${j.files.map((f) => f.name).join(", ")}`;
   $("input").value = t + "\n\n"; autosize(); $("input").focus();
+};
+
+// ---- resizing: drag the left edge; the width is kept in this browser
+(function () {
+  const c = $("canvas"), grip = $("canvas-grip");
+  const w = store.get("canvas-width", null);
+  if (w) c.style.setProperty("--canvas-w", `${w}px`);
+  grip.addEventListener("pointerdown", (e) => {
+    e.preventDefault(); try { grip.setPointerCapture(e.pointerId); } catch (err) { /* not a live pointer */ } grip.classList.add("dragging"); document.body.classList.add("resizing");
+    const right = c.getBoundingClientRect().right;
+    const side = $("chats").offsetParent ? $("chats").getBoundingClientRect().width : 0;   // the chat keeps at least 360 px
+    const max = Math.max(320, c.parentElement.getBoundingClientRect().width - side - 360);
+    const move = (ev) => {
+      const px = Math.round(Math.max(320, Math.min(right - ev.clientX, max)));
+      c.style.setProperty("--canvas-w", `${px}px`);
+    };
+    const up = () => {
+      grip.removeEventListener("pointermove", move); grip.removeEventListener("pointerup", up);
+      grip.classList.remove("dragging"); document.body.classList.remove("resizing");
+      store.set("canvas-width", parseInt(c.style.getPropertyValue("--canvas-w"), 10) || null);
+    };
+    grip.addEventListener("pointermove", move); grip.addEventListener("pointerup", up);
+  });
+  grip.ondblclick = () => { c.style.removeProperty("--canvas-w"); store.set("canvas-width", null); };
+})();
+
+// ---- the board: diagrams (Mermaid, rendered in a sandboxed frame) and a whiteboard
+let boardMode = store.get("board-mode", "diagram");
+const DIAGRAMS = {
+  flow: "flowchart TD\n  A([Request arrives]) --> B{Authorized?}\n  B -- no --> X[401 error]\n  B -- yes --> C{Model loaded?}\n  C -- no --> L[Load the engine] --> D\n  C -- yes --> D[Build the prompt]\n  D --> E[Generate tokens]\n  E --> F([Stream the answer])",
+  data: "%% animate\nflowchart LR\n  U[Browser] -->|chat request| S[am2Strata]\n  S -->|token ids| E[(Engine)]\n  E -->|KV cache| G[GPU VRAM]\n  E -->|experts| R[System RAM]\n  E -->|tokens| S\n  S -->|SSE stream| U",
+  seq: "sequenceDiagram\n  participant B as Browser\n  participant S as am2Strata\n  participant E as Engine\n  B->>S: POST /v1/chat/completions\n  S->>E: GEN prompt ids\n  loop each token\n    E-->>S: TOK id\n    S-->>B: data: delta\n  end\n  E-->>S: DONE timings\n  S-->>B: [DONE]",
+  state: "stateDiagram-v2\n  [*] --> Idle\n  Idle --> Reading: request\n  Reading --> Generating: prompt read\n  Generating --> Idle: done\n  Generating --> Idle: stopped\n  Reading --> Error: too long\n  Error --> Idle",
+  class: "classDiagram\n  class Manager {\n    +models()\n    +load(id)\n    +unload()\n  }\n  class Engine {\n    +generate(ids)\n    +stop()\n  }\n  class Server\n  Server --> Manager\n  Manager --> Engine : drives",
+  machine: "%% animate\nflowchart LR\n  subgraph Input\n    A[Camera] --> B[Frame grabber]\n  end\n  subgraph Processing\n    B --> C[Resize] --> D[Vision encoder]\n    D --> E[Language model]\n  end\n  subgraph Output\n    E --> F[Answer]\n    E --> G[(Log)]\n  end",
+};
+let mermaidJs = null;                                // the library, put inline into the diagram frame (it loads nothing)
+async function mermaidSource() {
+  if (!mermaidJs) mermaidJs = (await (await fetch("web/vendor/mermaid.min.js")).text()).replace(/<\/script/gi, "<\\/script").replace(/<!--/g, "<\\!--");
+  return mermaidJs;
+}
+function diagramDoc(src, standalone, lib) {
+  const dark = document.documentElement.dataset.theme === "dark";
+  const css = `html,body{margin:0;height:100%;background:${dark ? "#151B23" : "#fff"};color:${dark ? "#E6EDF3" : "#1A2230"};font-family:system-ui,sans-serif}` +
+    `#v{width:100%;height:100%;overflow:hidden;cursor:grab;display:flex;align-items:center;justify-content:center}#v svg{max-width:none!important;flex:none}` +
+    `#e{position:absolute;left:12px;right:12px;bottom:12px;padding:10px;border-radius:8px;background:#FDE3E1;color:#A8281E;font:12px ui-monospace,monospace;white-space:pre-wrap;display:none}` +
+    `.anim .flowchart-link,.anim .edgePath path{stroke-dasharray:7 5;animation:am2dash .9s linear infinite}@keyframes am2dash{to{stroke-dashoffset:-24}}` +
+    `#z{position:absolute;right:10px;top:10px;font:11px system-ui;opacity:.6}`;
+  const js = `mermaid.initialize({startOnLoad:false,theme:${JSON.stringify(dark ? "dark" : "default")},securityLevel:"strict",fontFamily:"system-ui,sans-serif"});` +
+    `var v=document.getElementById("v"),er=document.getElementById("e"),s=1,x=0,y=0,n=0;` +
+    `function t(){var g=v.querySelector("svg");if(g)g.style.transform="translate("+x+"px,"+y+"px) scale("+s+")"}` +
+    `v.addEventListener("wheel",function(e){e.preventDefault();s=Math.min(6,Math.max(.2,s*(e.deltaY<0?1.1:.9)));t()},{passive:false});` +
+    `var d=null;v.onpointerdown=function(e){d=[e.clientX-x,e.clientY-y];v.setPointerCapture(e.pointerId)};v.onpointermove=function(e){if(d){x=e.clientX-d[0];y=e.clientY-d[1];t()}};v.onpointerup=function(){d=null};` +
+    `function fit(){var g=v.querySelector("svg");if(!g||!g.viewBox||!g.viewBox.baseVal)return;var b=g.viewBox.baseVal;if(!b.width)return;g.setAttribute("width",b.width);g.setAttribute("height",b.height);` +
+    `s=Math.min((v.clientWidth-32)/b.width,(v.clientHeight-32)/b.height,1.5);x=0;y=0;t()}v.ondblclick=fit;addEventListener("resize",fit);` +
+    `async function r(src){try{var o=await mermaid.render("d"+(++n),src);v.innerHTML=o.svg;v.className=/^\\s*%%\\s*animate/m.test(src)?"anim":"";er.style.display="none";fit();` +
+    `parent.postMessage({__am2dg:1,ok:true},"*")}catch(e){er.textContent=String(e.message||e);er.style.display="block";parent.postMessage({__am2dg:1,ok:false,error:String(e.message||e)},"*")}}` +
+    (standalone ? `r(${JSON.stringify(src)});` : `addEventListener("message",function(e){if(e.data&&typeof e.data.src==="string")r(e.data.src)});parent.postMessage({__am2dg:1,ready:true},"*");`);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>Diagram</title><style>${css}</style>` +
+    (lib ? `<script>${lib}<\/script>` : `<script src="${location.origin}/web/vendor/mermaid.min.js"><\/script>`) + `</head><body><div id="v"></div><div id="e"></div><div id="z">scroll: zoom · drag: move · double-click: reset</div><script>${js}<\/script></body></html>`;
+}
+let dgReady = false, dgTheme = null, dgTimer = null;
+async function diagramFrame() {
+  const theme = document.documentElement.dataset.theme;
+  if (dgTheme === theme) return;
+  dgTheme = theme; dgReady = false;
+  try { $("dg-frame").srcdoc = diagramDoc("", false, await mermaidSource()); }
+  catch (e) { dgTheme = null; $("canvas-note").textContent = "The diagram library did not load: " + (e.message || e); }
+}
+function diagramRender() {
+  if (!dgReady) return;
+  $("dg-frame").contentWindow.postMessage({src: $("dg-src").value}, "*");
+}
+function diagramResult(d) {
+  if (d.ready) { dgReady = true; diagramRender(); return; }
+  $("canvas-note").textContent = d.ok ? "Mermaid diagram: scroll to zoom, drag to move. Start a line with %% animate to animate the arrows." : "The diagram has an error (shown in red).";
+}
+$("dg-src").addEventListener("input", () => { store.set("board-diagram", $("dg-src").value); clearTimeout(dgTimer); dgTimer = setTimeout(diagramRender, 350); });
+$("dg-template").onchange = () => { const t = DIAGRAMS[$("dg-template").value]; if (t) { $("dg-src").value = t; store.set("board-diagram", t); diagramRender(); } $("dg-template").value = ""; };
+$("dg-ask").onclick = () => { $("input").value = `Explain this diagram step by step:\n\n\`\`\`mermaid\n${$("dg-src").value}\n\`\`\`\n\n`; autosize(); $("input").focus(); };
+$("dg-src").value = store.get("board-diagram", DIAGRAMS.flow);
+for (const b of $("board-mode").children) b.onclick = () => { boardMode = b.dataset.v; store.set("board-mode", boardMode); boardShow(); };
+function boardShow() {
+  for (const b of $("board-mode").children) b.setAttribute("aria-checked", String(b.dataset.v === boardMode));
+  $("board-diagram").hidden = boardMode !== "diagram"; $("diagram-tools").hidden = boardMode !== "diagram";
+  $("board-draw").hidden = boardMode !== "draw"; $("draw-tools").hidden = boardMode !== "draw";
+  if (boardMode === "diagram") { diagramFrame(); diagramRender(); $("canvas-note").textContent = "Mermaid diagram: scroll to zoom, drag to move. Start a line with %% animate to animate the arrows."; }
+  else { wbRender(); $("canvas-note").textContent = "Whiteboard: drag to draw; Erase removes what you click. Kept in this browser."; }
+}
+$("canvas-blank").hidden = false;
+
+// the whiteboard: shapes in an SVG, kept in this browser
+let wb = store.get("board-shapes", []), wbUndo = [], wbTool = "rect", wbColor = "#3DD68C";
+const WB_COLORS = ["#3DD68C", "#6CB6FF", "#F2B84B", "#FF7B72", "#C297FF", "currentColor"];
+$("wb-colors").innerHTML = WB_COLORS.map((c) => `<button type="button" role="radio" data-v="${c}" style="background:${c === "currentColor" ? "var(--st-ink)" : c}" aria-label="${c === "currentColor" ? "Ink" : c}"></button>`).join("");
+function wbSel() {
+  for (const b of $("wb-tools").children) b.setAttribute("aria-checked", String(b.dataset.v === wbTool));
+  for (const b of $("wb-colors").children) b.setAttribute("aria-checked", String(b.dataset.v === wbColor));
+  $("wb").classList.toggle("erasing", wbTool === "erase");
+}
+for (const b of $("wb-tools").children) b.onclick = () => { wbTool = b.dataset.v; wbSel(); };
+for (const b of $("wb-colors").children) b.onclick = () => { wbColor = b.dataset.v; wbSel(); };
+wbSel();
+const SVGNS = "http://www.w3.org/2000/svg";
+function arrowHead(x1, y1, x2, y2) {
+  const a = Math.atan2(y2 - y1, x2 - x1), l = 12;
+  return `${x2},${y2} ${x2 - l * Math.cos(a - 0.45)},${y2 - l * Math.sin(a - 0.45)} ${x2 - l * Math.cos(a + 0.45)},${y2 - l * Math.sin(a + 0.45)}`;
+}
+function shapeSvg(sh, i) {
+  const c = sh.c, k = `data-k="${i}"`, st = `stroke="${c}" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"`;
+  const fill = c === "currentColor" ? "transparent" : c + "22";
+  if (sh.k === "pen") return `<polyline ${k} ${st} points="${sh.p.map((q) => q.join(",")).join(" ")}"/>`;
+  if (sh.k === "rect") return `<rect ${k} x="${sh.x}" y="${sh.y}" width="${sh.w}" height="${sh.h}" rx="10" stroke="${c}" stroke-width="2.2" fill="${fill}"/>`;
+  if (sh.k === "ellipse") return `<ellipse ${k} cx="${sh.x + sh.w / 2}" cy="${sh.y + sh.h / 2}" rx="${sh.w / 2}" ry="${sh.h / 2}" stroke="${c}" stroke-width="2.2" fill="${fill}"/>`;
+  if (sh.k === "diamond") { const cx = sh.x + sh.w / 2, cy = sh.y + sh.h / 2;
+    return `<polygon ${k} points="${cx},${sh.y} ${sh.x + sh.w},${cy} ${cx},${sh.y + sh.h} ${sh.x},${cy}" stroke="${c}" stroke-width="2.2" fill="${fill}" stroke-linejoin="round"/>`; }
+  if (sh.k === "arrow") return `<g ${k}><line ${st} x1="${sh.x1}" y1="${sh.y1}" x2="${sh.x2}" y2="${sh.y2}"/><polygon points="${arrowHead(sh.x1, sh.y1, sh.x2, sh.y2)}" fill="${c}"/></g>`;
+  if (sh.k === "text") return `<text ${k} x="${sh.x}" y="${sh.y}" fill="${c}" style="font:500 16px Outfit,system-ui,sans-serif">${esc(sh.t)}</text>`;
+  return "";
+}
+function wbRender(extra) { $("wb").innerHTML = wb.map(shapeSvg).join("") + (extra ? shapeSvg(extra, -1) : ""); }
+function wbSave() { store.set("board-shapes", wb); }
+function wbPush(sh) { wbUndo.push(wb.slice()); wb.push(sh); wbSave(); wbRender(); }
+function wbPoint(e) { const r = $("wb").getBoundingClientRect(); return [Math.round(e.clientX - r.left), Math.round(e.clientY - r.top)]; }
+$("wb").addEventListener("pointerdown", (e) => {
+  const [x, y] = wbPoint(e);
+  if (wbTool === "erase") {
+    const t = e.target.closest("[data-k]");
+    if (t && +t.dataset.k >= 0) { wbUndo.push(wb.slice()); wb.splice(+t.dataset.k, 1); wbSave(); wbRender(); }
+    return;
+  }
+  if (wbTool === "text") {
+    const inp = document.createElement("input"); inp.className = "wb-input"; inp.style.left = `${x}px`; inp.style.top = `${y - 14}px`;
+    $("board-draw").appendChild(inp); setTimeout(() => inp.focus(), 0);
+    const done = () => { const t = inp.value.trim(); inp.remove(); if (t) wbPush({k: "text", x, y: y + 4, t, c: wbColor}); };
+    inp.onkeydown = (ev) => { if (ev.key === "Enter") done(); if (ev.key === "Escape") { inp.value = ""; done(); } };
+    inp.onblur = done;
+    return;
+  }
+  $("wb").setPointerCapture(e.pointerId);
+  let cur = wbTool === "pen" ? {k: "pen", p: [[x, y]], c: wbColor} : wbTool === "arrow" ? {k: "arrow", x1: x, y1: y, x2: x, y2: y, c: wbColor}
+          : {k: wbTool, x, y, w: 0, h: 0, c: wbColor, ox: x, oy: y};
+  const move = (ev) => {
+    const [mx, my] = wbPoint(ev);
+    if (cur.k === "pen") cur.p.push([mx, my]);
+    else if (cur.k === "arrow") { cur.x2 = mx; cur.y2 = my; }
+    else { cur.x = Math.min(cur.ox, mx); cur.y = Math.min(cur.oy, my); cur.w = Math.abs(mx - cur.ox); cur.h = Math.abs(my - cur.oy); }
+    wbRender(cur);
+  };
+  const up = () => {
+    $("wb").removeEventListener("pointermove", move); $("wb").removeEventListener("pointerup", up);
+    delete cur.ox; delete cur.oy;
+    const tiny = cur.k === "pen" ? cur.p.length < 2 : cur.k === "arrow" ? Math.hypot(cur.x2 - cur.x1, cur.y2 - cur.y1) < 6 : cur.w < 6 || cur.h < 6;
+    if (!tiny) wbPush(cur); else wbRender();
+  };
+  $("wb").addEventListener("pointermove", move); $("wb").addEventListener("pointerup", up);
+});
+function wbUndoOne() { if (wbUndo.length) { wb = wbUndo.pop(); wbSave(); wbRender(); } }
+$("wb-undo").onclick = wbUndoOne;
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "z" && !$("canvas").hidden && tabNow === "board" && boardMode === "draw" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") { e.preventDefault(); wbUndoOne(); }
+});
+$("wb-clear").onclick = () => { if (!wb.length) return; wbUndo.push(wb.slice()); wb = []; wbSave(); wbRender(); toast("info", "Board cleared", "", 5000, {label: "Undo", run: wbUndoOne}); };
+async function boardPng() {
+  const svg = $("wb"), r = svg.getBoundingClientRect();
+  if (!wb.length) { toast("info", "The board is empty"); return null; }
+  const ink = getComputedStyle(document.documentElement).getPropertyValue("--st-ink").trim(), bg = getComputedStyle(document.documentElement).getPropertyValue("--st-surface").trim();
+  const body = wb.map(shapeSvg).join("").replaceAll("currentColor", ink);
+  const xml = `<svg xmlns="${SVGNS}" width="${r.width}" height="${r.height}"><rect width="100%" height="100%" fill="${bg}"/>${body}</svg>`;
+  const img = new Image(); img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(xml);
+  await img.decode();
+  const cnv = document.createElement("canvas"); cnv.width = r.width * 2; cnv.height = r.height * 2;
+  const g = cnv.getContext("2d"); g.scale(2, 2); g.drawImage(img, 0, 0);
+  return cnv.toDataURL("image/png");
+}
+$("wb-send").onclick = async () => {
+  const png = await boardPng(); if (!png) return;
+  attachments.push({kind: "image", name: "whiteboard.png", url: png}); renderAttachments();
+  toast("success", "Whiteboard attached", "It goes with your next message (a model that reads pictures can see it).");
+  $("input").focus();
 };
 
 // ------------------------------------------------------------------ start

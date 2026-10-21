@@ -702,3 +702,22 @@ fn python_runs_in_a_sandbox_only_when_asked_from_this_page() {
     assert_eq!(r["files"][0]["name"], "out.txt");
     assert_eq!(r["files"][0]["data"], "aGk=");
 }
+
+#[test]
+fn canvas_previews_get_a_sandboxed_address() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, r) = s.post("/api/preview", &json!({"html": "<h1>hi</h1>"}));
+    assert_eq!(c, 200, "{r}");
+    let url = r["url"].as_str().unwrap().to_string();
+    assert!(url.starts_with("/preview/") && url.len() > 30, "an unguessable address: {url}");
+    // the page itself needs no key (a frame cannot send one): its address is the capability
+    let page = reqwest::blocking::get(format!("{}{url}", s.base)).unwrap();
+    assert_eq!(page.status().as_u16(), 200);
+    let csp = page.headers().get("content-security-policy").unwrap().to_str().unwrap().to_string();
+    assert!(csp.starts_with("sandbox ") && !csp.contains("allow-same-origin"), "{csp}");
+    assert_eq!(page.text().unwrap(), "<h1>hi</h1>");
+    assert_eq!(reqwest::blocking::get(format!("{}/preview/nope", s.base)).unwrap().status().as_u16(), 404);
+    let r = reqwest::blocking::Client::new().post(format!("{}/api/preview", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").json(&json!({"html": "x"})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}
