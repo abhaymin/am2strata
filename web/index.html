@@ -30,7 +30,7 @@
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Media Generation</button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-settings" aria-controls="view-settings" aria-selected="false" data-tab="settings">
@@ -177,11 +177,19 @@
     </aside>
   </section>
 
-  <!-- ============================ Images ============================ -->
+  <!-- ============================ Media Generation ============================ -->
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
     <div class="about">
+      <div class="seg seg--3 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
+        <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button>
+      </div>
+      <div class="st-card media-soon" id="media-soon" hidden>
+        <span class="card-title" id="media-soon-title">Video</span>
+        <p class="muted" id="media-soon-text"></p>
+      </div>
       <form class="st-card img-form" id="img-form">
         <span class="card-title" id="img-title">Make an image</span>
+        <span class="muted small" id="img-model"></span>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
         <div class="img-row">
           <label class="st-field">Size
@@ -281,7 +289,20 @@
 
         <section class="set-panel" id="sec-models" aria-labelledby="h-models">
           <h2 id="h-models">Models</h2>
+          <h3 class="set-sub">Text models</h3>
           <div class="st-card list-card" id="models-list"><p class="muted">Loading&hellip;</p></div>
+          <h3 class="set-sub">Media models <span class="muted small">image, video, 3D and audio - for Media Generation</span></h3>
+          <div class="st-card list-card media-models" id="media-models">
+            <div class="media-models__bar">
+              <div class="seg seg--5" role="tablist" aria-label="Kind" id="mm-kind">
+                <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="3d">3D</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="all">All</button>
+              </div>
+              <input class="st-input" id="mm-search" placeholder="Search (flux, wan, q4&hellip;)" aria-label="Search media models" autocomplete="off">
+              <label class="mm-check"><input type="checkbox" id="mm-downloaded"> Downloaded only</label>
+            </div>
+            <p class="muted small" id="mm-status" role="status"></p>
+            <div id="mm-list"><p class="muted">Loading&hellip;</p></div>
+          </div>
           <form class="st-card hf-card" id="hf-form">
             <div><span class="card-title">Add a model from Hugging Face</span>
               <p class="muted small">Downloads are resumable and checked against the Hub's SHA-256. A token is only needed for gated or private repositories.</p></div>

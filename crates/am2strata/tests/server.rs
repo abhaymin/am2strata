@@ -761,3 +761,33 @@ fn image_requests_are_checked_and_failures_reported() {
     let (c, r) = n.post("/v1/images/generations", &json!({"prompt": "p"}));
     assert_eq!(c, 501, "{r}");
 }
+
+#[test]
+fn media_models_are_listed_pulled_and_chosen() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, r) = s.get("/api/media/models", true);
+    assert_eq!(c, 200, "{r}");
+    let kinds: Vec<&str> = r["models"].as_array().unwrap().iter().map(|m| m["kind"].as_str().unwrap()).collect();
+    assert!(kinds.contains(&"image") && kinds.contains(&"video") && kinds.contains(&"audio"), "{kinds:?}");
+    assert_eq!(r["image_model"], "z-image-turbo:q8");
+    assert_eq!(s.get("/api/media/models", false).0, 401);
+    // a video model, or one not downloaded, cannot be the image model; a downloaded image model can
+    let (c, r) = s.post("/api/media/models/default", &json!({"model": "wan22-ti2v-5b:q8"}));
+    assert!(c == 400 && r["error"]["message"].as_str().unwrap().contains("video"), "{r}");
+    let (c, r) = s.post("/api/media/models/default", &json!({"model": "flux2-klein:q4"}));
+    assert!(c == 400 && r["error"]["message"].as_str().unwrap().contains("not downloaded"), "{r}");
+    let (c, r) = s.post("/api/media/models/default", &json!({"model": "z-image-turbo:q8"}));
+    assert_eq!(c, 200, "{r}");
+    // a download runs in the background; its state is polled
+    let (c, r) = s.post("/api/media/models/pull", &json!({"model": "flux2-klein:q4"}));
+    assert_eq!(c, 202, "{r}");
+    let mut state = Value::Null;
+    for _ in 0..50 {
+        state = s.get("/api/media/models/pull", true).1;
+        if state["state"] == "done" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!((state["state"].as_str(), state["model"].as_str()), (Some("done"), Some("flux2-klein:q4")), "{state}");
+}

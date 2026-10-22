@@ -452,3 +452,15 @@ body.resizing iframe { pointer-events: none; }
 .board__source .board__src { flex: 1; border-right: 0; }
 .board__source code { font: 400 12px var(--st-font-mono); }
 .board__draw { flex: 1; }
+
+/* Media Generation: Image / Video / Audio, and Settings > Models > Media models */
+.media-kinds { align-self: flex-start; margin-bottom: 12px; }
+.media-soon { margin-bottom: 12px; }
+.seg--5 { grid-template-columns: repeat(5, auto); }
+.set-sub { font-size: 14px; font-weight: 600; margin: 18px 0 8px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.media-models__bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 14px 4px; }
+.media-models__bar .st-input { flex: 1 1 180px; min-width: 0; height: 36px; }
+.mm-check { display: inline-flex; gap: 6px; align-items: center; font-size: 13px; color: var(--st-ink-muted); }
+#mm-status { padding: 0 14px; margin: 4px 0; }
+#mm-list { max-height: 520px; overflow-y: auto; }
+#mm-list .model-row__name span { white-space: normal; }

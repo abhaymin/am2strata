@@ -109,6 +109,7 @@ async function loadHealth() {
                                           : "Attach a text file or a PDF (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
+    if (health.image_generation && !media.models.length) loadMediaModels();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -145,6 +146,89 @@ function renderModels() {
                  : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) + `</div>`;
   }).join("");
 }
+// Media models (GET api/media/models): the media engine's catalog, what is downloaded, the image model in use.
+let media = {models: [], image_model: "", pull: {state: "idle"}}, mmKind = "image", mmTimer = null;
+async function loadMediaModels() {
+  try {
+    const r = await fetch("api/media/models", {headers: headers()});
+    if (!r.ok) { $("mm-status").textContent = r.status === 401 ? "An API key is needed." : `The server answered ${r.status}.`; return; }
+    media = await r.json();
+  } catch (e) { return; }
+  renderMediaModels();
+  $("img-model").textContent = media.image_model ? `Model: ${media.image_model} (change it in Settings > Models)` : "";
+  clearTimeout(mmTimer);
+  if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(loadMediaModels, 3000);
+}
+function renderMediaModels() {
+  const q = $("mm-search").value.trim().toLowerCase(), only = $("mm-downloaded").checked;
+  const rows = (media.models || []).filter((m) => (mmKind === "all" || m.kind === mmKind) && (!only || m.downloaded) &&
+    (!q || `${m.name} ${m.display_name || ""} ${m.family || ""} ${m.description || ""}`.toLowerCase().includes(q)));
+  rows.sort((a, b) => (b.downloaded - a.downloaded) || a.name.localeCompare(b.name));
+  const p = media.pull || {};
+  const n = (media.models || []).filter((m) => m.downloaded).length;
+  $("mm-status").textContent = !media.engine ? (media.note || "The media engine is not built.")
+    : p.state === "pulling" ? `Downloading ${p.model}\u2026 (generation waits until it finishes)`
+    : p.state === "error" ? `Download of ${p.model} failed: ${p.error}`
+    : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model}`;
+  $("mm-list").innerHTML = rows.length ? rows.map((m) => {
+    const inUse = m.kind === "image" && m.name === media.image_model;
+    const facts = [m.family, m.size_gb ? `${m.size_gb} GB` : null, m.gated ? "licence to accept on Hugging Face" : null, m.description]
+      .filter(Boolean).join(" · ");
+    const badge = m.planned ? `<span class="st-badge">Planned (${esc(m.planned)})</span>`
+      : inUse ? `<span class="st-badge st-badge--generating">In use</span>`
+      : m.downloaded ? `<span class="st-badge">Downloaded</span>` : `<span class="st-badge">Not downloaded</span>`;
+    const pulling = p.state === "pulling";
+    const btn = m.planned ? ""
+      : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? "Downloading\u2026" : "Download"}</button>`
+      : m.kind === "image" && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for images</button>` : "";
+    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.name)}</b><span>${esc(m.name)} · ${esc(facts)}</span></div>${badge}${btn}</div>`;
+  }).join("") : `<p class="muted" style="padding:12px 14px">Nothing matches.</p>`;
+}
+$("mm-kind").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-kind]"); if (!b) return;
+  mmKind = b.dataset.kind;
+  for (const x of $("mm-kind").children) x.setAttribute("aria-selected", String(x === b));
+  renderMediaModels();
+});
+$("mm-search").oninput = renderMediaModels;
+$("mm-downloaded").onchange = renderMediaModels;
+$("mm-list").addEventListener("click", async (e) => {
+  const pull = e.target.closest("[data-mpull]"), use = e.target.closest("[data-muse]");
+  const post = async (path, model) => {
+    const r = await fetch(path, {method: "POST", headers: headers(true), body: JSON.stringify({model})});
+    if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+  };
+  try {
+    if (pull) {
+      const m = media.models.find((x) => x.name === pull.dataset.mpull);
+      if (!confirm(`Download ${m.name} (${m.size_gb} GB)?${m.gated ? "\n\nIts licence must be accepted on Hugging Face first, with your token saved." : ""}`)) return;
+      await post("api/media/models/pull", m.name);
+      toast("info", "Downloading", `${m.name}: resumable, in the background.`);
+    }
+    if (use) {
+      await post("api/media/models/default", use.dataset.muse);
+      toast("success", "Image model changed", `New images use ${use.dataset.muse}.`);
+    }
+  } catch (err) { toast("error", pull ? "Not downloaded" : "Not changed", String(err.message || err), 8000); }
+  loadMediaModels();
+});
+// Media Generation: Image works now; Video and Audio say what is coming and which models are ready for them
+const MEDIA_SOON = {
+  video: ["Video", "Video generation comes in v2.2 (Wan 2.2 TI2V-5B first, then the 14B MoE with strata's expert swap). Download video models now in Settings > Models; they are listed there."],
+  audio: ["Audio", "Speech comes in v2.3: speech to text (Whisper, Parakeet) and text to speech (Qwen3-TTS, Kokoro). The planned models are listed in Settings > Models."],
+};
+$("media-kinds").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-kind]"); if (!b) return;
+  for (const x of $("media-kinds").children) x.setAttribute("aria-selected", String(x === b));
+  const soon = MEDIA_SOON[b.dataset.kind];
+  $("img-form").hidden = !!soon; $("img-results").hidden = !!soon; $("media-soon").hidden = !soon;
+  if (soon) {
+    const have = (media.models || []).filter((m) => m.kind === b.dataset.kind && m.downloaded).map((m) => m.name);
+    $("media-soon-title").textContent = soon[0];
+    $("media-soon-text").textContent = soon[1] + (have.length ? ` Downloaded: ${have.join(", ")}.` : "");
+  }
+});
+
 $("models-list").addEventListener("click", async (e) => {
   const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]");
   if (load) { $("model-select").value = load.dataset.load; $("model-select").onchange(); }

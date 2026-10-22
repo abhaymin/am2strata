@@ -7,6 +7,7 @@
 //!                                                         <- {"event":"image","index":0,"width":..,"height":..,"png":"<base64>"}
 //!                                                         <- {"event":"done","ms":...}
 //!   -> {"op":"unload"}                                    <- {"event":"unloaded"}
+//!   -> {"op":"list"}                                      <- {"event":"models","models":[{name,kind,family,...}]}
 //!   any failure                                           <- {"event":"error","message":...}
 //!
 //! Models and their files come from mold's catalog, stored under $MOLD_HOME (am2Strata sets <Strata-data>/media).
@@ -36,6 +37,29 @@ fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
     rt.block_on(mold_core::download::pull_model(manifest, &mold_core::download::PullOptions::default()))
         .map_err(|e| anyhow!("{e}"))?;
     Ok(())
+}
+
+/// The catalog: every generation model mold knows, with its kind (image or video) and whether it is downloaded.
+fn list(st: &mut State) -> Value {
+    st.config = mold_core::Config::load_or_default();
+    let models: Vec<Value> = mold_core::manifest::visible_manifests()
+        .filter(|m| m.is_generation_model())
+        .map(|m| {
+            let f = m.family.to_lowercase();
+            let kind = if f.starts_with("hunyuan3d") {
+                "3d"
+            } else if f.starts_with("wan") || f.starts_with("ltx") || f.contains("video") || f.starts_with("minimax-h3") {
+                "video"
+            } else {
+                "image"
+            };
+            json!({"name": m.name, "display_name": m.display_name(), "family": m.family, "kind": kind,
+                   "description": m.description, "size_gb": (m.total_size_bytes() as f64 / 1e8).round() / 10.0, "gated": m.is_gated(),
+                   "downloaded": mold_core::ModelPaths::resolve(&m.name, &st.config).is_some(),
+                   "loaded": st.model.as_deref() == Some(m.name.as_str())})
+        })
+        .collect();
+    json!({"event": "models", "models": models})
 }
 
 fn load(st: &mut State, model: &str) -> Result<()> {
@@ -115,6 +139,7 @@ fn main() {
                     st.model = None;
                     emit(json!({"event": "unloaded"}));
                 }
+                "list" => emit(list(&mut st)),
                 "quit" => std::process::exit(0),
                 op => return Err(anyhow!("unknown op {op:?}")),
             }
