@@ -115,8 +115,7 @@ fn main() {
     let mut placement = "cpu".to_string();
     let res = if args.iter().any(|a| a == "--resident-experts") {
         // the budget: --expert-ram-gib, else what the expert tensors need, capped at 3/4 of the RAM available now
-        let all: u64 = m.moes().map(|x| (x.up_exps.data.len() + x.down_exps.data.len()
-            + x.gate_exps.as_ref().map(|g| g.data.len()).unwrap_or(0)) as u64).sum();
+        let all: u64 = m.moes().map(|x| x.up_exps.bytes() + x.down_exps.bytes() + x.gate_exps.as_ref().map(|g| g.bytes()).unwrap_or(0)).sum();
         let budget = arg("--expert-ram-gib").and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as u64)
             .unwrap_or_else(|| all.min(mem_available() / 4 * 3));
         let r = pack::place(&m, profile.as_ref(), budget);

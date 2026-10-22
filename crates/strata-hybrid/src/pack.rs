@@ -213,10 +213,10 @@ pub struct Residency {
 fn expert_ranges(m: &Moe, e: usize) -> Vec<&'static [u8]> {
     let mut v = vec![];
     if let Some(g) = &m.gate_exps {
-        v.push(g.slice(e, m.ff).data);
+        v.push(g.0[e].data);
     }
-    v.push(m.up_exps.slice(e, m.ff).data);
-    v.push(m.down_exps.slice(e, m.down_exps.rows / m.n_expert).data);
+    v.push(m.up_exps.0[e].data);
+    v.push(m.down_exps.0[e].data);
     v
 }
 

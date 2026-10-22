@@ -321,12 +321,27 @@ pub struct Moe {
     w_scale: f32,
     /// Nemotron's latent MoE: experts work in a smaller space between these two projections
     latent: Option<(QMat, QMat)>,
-    pub gate_exps: Option<QMat>,
-    pub up_exps: QMat,
-    pub down_exps: QMat,
-    pub ff: usize,
+    pub gate_exps: Option<Experts>,
+    pub up_exps: Experts,
+    pub down_exps: Experts,
     act: Act,
     shared: Option<Dense>,
+}
+
+/// One projection of every expert in a layer, a matrix per expert: sliced from the stacked tensor
+/// (`blk.N.ffn_up_exps.weight`), or the per-expert tensors of GGUFs converted before April 2024 (`blk.N.ffn_up.E.weight`,
+/// e.g. most Mixtral 8x7B files), which llama.cpp still loads.
+pub struct Experts(pub Vec<QMat>);
+
+impl Experts {
+    fn stacked(q: QMat, n_expert: usize) -> Experts {
+        let rows = q.rows / n_expert;
+        Experts((0..n_expert).map(|e| q.slice(e, rows)).collect())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.0.iter().map(|q| q.data.len() as u64).sum()
+    }
 }
 
 pub struct Attn {
@@ -498,9 +513,21 @@ impl Model {
                 let Some(router) = opt(&p("ffn_gate_inp.weight")) else {
                     return Ok(Block::Dense(Dense { gate: opt(&p("ffn_gate.weight")), up: take(&p("ffn_up.weight"))?, down: take(&p("ffn_down.weight"))?, act: act_ }));
                 };
-                let up_exps = take(&p("ffn_up_exps.weight"))?;
                 let n_expert = router.rows;
                 *max_expert = (*max_expert).max(n_expert);
+                // the experts' projections, stacked or one tensor per expert
+                let role = |r: &str| -> Result<Option<Experts>, String> {
+                    if let Some(q) = opt(&p(&format!("ffn_{r}_exps.weight"))) {
+                        return Ok(Some(Experts::stacked(q, n_expert)));
+                    }
+                    if opt(&p(&format!("ffn_{r}.0.weight"))).is_none() {
+                        return Ok(None);
+                    }
+                    (0..n_expert).map(|e| take(&p(&format!("ffn_{r}.{e}.weight")))).collect::<Result<Vec<_>, _>>().map(|v| Some(Experts(v)))
+                };
+                let up_exps = role("up")?.ok_or_else(|| format!("layer {l}: no up projection for its experts"))?;
+                let down_exps = role("down")?.ok_or_else(|| format!("layer {l}: no down projection for its experts"))?;
+                let gate_exps = role("gate")?;
                 let shared = match opt(&p("ffn_up_shexp.weight")) {
                     Some(up) => Some(Dense { gate: opt(&p("ffn_gate_shexp.weight")), up, down: take(&p("ffn_down_shexp.weight"))?, act: act_ }),
                     None => None,
@@ -518,8 +545,7 @@ impl Model {
                     n_expert, top_k: arr_u64(&g, &k("expert_used_count"), l) as usize,
                     // llama.cpp: the llama family always renormalizes the chosen experts' weights
                     w_norm: if matches!(arch.as_str(), "llama" | "mistral3" | "qwen3moe") { true } else { w_norm_meta.unwrap_or(false) },
-                    w_scale, latent, gate_exps: opt(&p("ffn_gate_exps.weight")), ff: up_exps.rows / n_expert, up_exps,
-                    down_exps: take(&p("ffn_down_exps.weight"))?, act: act_, shared,
+                    w_scale, latent, gate_exps, up_exps, down_exps, act: act_, shared,
                 }))
             };
             let mut parts = Vec::new();
@@ -832,18 +858,17 @@ impl Model {
             Some((down, _)) => down.mul(h),
             None => h.to_vec(),
         };
-        let out_dim = m.down_exps.rows / m.n_expert;
-        let mut acc = vec![0f32; out_dim];
+        let mut acc = vec![0f32; m.down_exps.0[0].rows];
         for (&e, &we) in chosen.iter().zip(&w) {
-            let mut mid = m.up_exps.slice(e, m.ff).mul(&x);
+            let mut mid = m.up_exps.0[e].mul(&x);
             match &m.gate_exps {
                 Some(g) => {
-                    let gv = g.slice(e, m.ff).mul(&x);
+                    let gv = g.0[e].mul(&x);
                     mid.iter_mut().zip(&gv).for_each(|(u, g)| *u *= act(m.act, *g));
                 }
                 None => mid.iter_mut().for_each(|v| *v = act(m.act, *v)),
             }
-            let o = m.down_exps.slice(e, out_dim).mul(&mid);
+            let o = m.down_exps.0[e].mul(&mid);
             acc.iter_mut().zip(&o).for_each(|(a, v)| *a += we * v);
         }
         let mut out = match &m.latent {
