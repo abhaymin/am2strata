@@ -229,6 +229,7 @@ async fn main() -> Result<()> {
         .route("/api/hub/pull", get(hub_api::status).post(hub_api::pull))
         .route("/api/run", get(code_run::info).post(code_run::run))
         .route("/v1/images/generations", post(image_gen::generations))
+        .route("/v1/videos/generations", post(image_gen::video_generations))
         .route("/api/media/models", get(image_gen::models))
         .route("/api/media/models/pull", get(image_gen::pull_status).post(image_gen::pull))
         .route("/api/media/models/default", post(image_gen::set_default))

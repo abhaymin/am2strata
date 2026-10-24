@@ -5,6 +5,7 @@
 //!   -> {"op":"load","model":"z-image-turbo:q8"}           <- {"event":"loaded","model":...,"vram_bytes":...}
 //!   -> {"op":"generate","request":{prompt,width,...}}     <- {"event":"step","step":3,"total":8} ...
 //!                                                         <- {"event":"image","index":0,"width":..,"height":..,"png":"<base64>"}
+//!                                                         <- {"event":"video","format":"mp4","frames":..,"fps":..,"data":"<base64>"}
 //!                                                         <- {"event":"done","ms":...}
 //!   -> {"op":"unload"}                                    <- {"event":"unloaded"}
 //!   -> {"op":"list"}                                      <- {"event":"models","models":[{name,kind,family,...}]}
@@ -56,7 +57,9 @@ fn list(st: &mut State) -> Value {
             json!({"name": m.name, "display_name": m.display_name(), "family": m.family, "kind": kind,
                    "description": m.description, "size_gb": (m.total_size_bytes() as f64 / 1e8).round() / 10.0, "gated": m.is_gated(),
                    "downloaded": mold_core::ModelPaths::resolve(&m.name, &st.config).is_some(),
-                   "loaded": st.model.as_deref() == Some(m.name.as_str())})
+                   "loaded": st.model.as_deref() == Some(m.name.as_str()),
+                   "defaults": {"steps": m.defaults.steps, "guidance": m.defaults.guidance, "width": m.defaults.width,
+                                "height": m.defaults.height, "frames": m.defaults.frames, "fps": m.defaults.fps}})
         })
         .collect();
     json!({"event": "models", "models": models})
@@ -104,6 +107,11 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
     for img in &resp.images {
         emit(json!({"event": "image", "index": img.index, "width": img.width, "height": img.height,
                     "png": base64::engine::general_purpose::STANDARD.encode(&img.data)}));
+    }
+    if let Some(v) = &resp.video {
+        let format = serde_json::to_value(v.format).ok().and_then(|f| f.as_str().map(str::to_string)).unwrap_or_default();
+        emit(json!({"event": "video", "format": format, "width": v.width, "height": v.height, "frames": v.frames, "fps": v.fps,
+                    "data": base64::engine::general_purpose::STANDARD.encode(&v.data)}));
     }
     emit(json!({"event": "done", "ms": t0.elapsed().as_millis() as u64, "seed": resp.seed_used}));
     Ok(())

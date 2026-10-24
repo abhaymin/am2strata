@@ -155,7 +155,7 @@ async function loadMediaModels() {
     media = await r.json();
   } catch (e) { return; }
   renderMediaModels();
-  $("img-model").textContent = media.image_model ? `Model: ${media.image_model} (change it in Settings > Models)` : "";
+  fillModelPickers();
   clearTimeout(mmTimer);
   if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(loadMediaModels, 3000);
 }
@@ -169,9 +169,9 @@ function renderMediaModels() {
   $("mm-status").textContent = !media.engine ? (media.note || "The media engine is not built.")
     : p.state === "pulling" ? `Downloading ${p.model}\u2026 (generation waits until it finishes)`
     : p.state === "error" ? `Download of ${p.model} failed: ${p.error}`
-    : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model}`;
+    : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model} · videos use ${media.video_model}`;
   $("mm-list").innerHTML = rows.length ? rows.map((m) => {
-    const inUse = m.kind === "image" && m.name === media.image_model;
+    const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model);
     const facts = [m.family, m.size_gb ? `${m.size_gb} GB` : null, m.gated ? "licence to accept on Hugging Face" : null, m.description]
       .filter(Boolean).join(" · ");
     const badge = m.planned ? `<span class="st-badge">Planned (${esc(m.planned)})</span>`
@@ -180,7 +180,7 @@ function renderMediaModels() {
     const pulling = p.state === "pulling";
     const btn = m.planned ? ""
       : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? "Downloading\u2026" : "Download"}</button>`
-      : m.kind === "image" && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for images</button>` : "";
+      : (m.kind === "image" || m.kind === "video") && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.kind}s</button>` : "";
     return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.name)}</b><span>${esc(m.name)} · ${esc(facts)}</span></div>${badge}${btn}</div>`;
   }).join("") : `<p class="muted" style="padding:12px 14px">Nothing matches.</p>`;
 }
@@ -207,27 +207,79 @@ $("mm-list").addEventListener("click", async (e) => {
     }
     if (use) {
       await post("api/media/models/default", use.dataset.muse);
-      toast("success", "Image model changed", `New images use ${use.dataset.muse}.`);
+      toast("success", "Model changed", `New jobs use ${use.dataset.muse}.`);
     }
   } catch (err) { toast("error", pull ? "Not downloaded" : "Not changed", String(err.message || err), 8000); }
   loadMediaModels();
 });
-// Media Generation: Image works now; Video and Audio say what is coming and which models are ready for them
-const MEDIA_SOON = {
-  video: ["Video", "Video generation comes in v2.2 (Wan 2.2 TI2V-5B first, then the 14B MoE with strata's expert swap). Download video models now in Settings > Models; they are listed there."],
-  audio: ["Audio", "Speech comes in v2.3: speech to text (Whisper, Parakeet) and text to speech (Qwen3-TTS, Kokoro). The planned models are listed in Settings > Models."],
-};
+// Media Generation: Image and Video, each with its model picker (the downloaded models of that kind); Audio is coming
+function fillModelPickers() {
+  for (const sel of document.querySelectorAll(".media-model")) {
+    const kind = sel.dataset.kind, current = kind === "video" ? media.video_model : media.image_model;
+    const have = (media.models || []).filter((m) => m.kind === kind && m.downloaded);
+    const opts = have.map((m) => `<option value="${esc(m.name)}"${m.name === current ? " selected" : ""}>${esc(m.display_name || m.name)} (${esc(m.name)}, ${m.size_gb} GB)</option>`);
+    if (!have.some((m) => m.name === current)) opts.unshift(`<option value="${esc(current)}" selected>${esc(current)} - not downloaded</option>`);
+    opts.push(`<option value="__more">Download more in Settings &gt; Models&hellip;</option>`);
+    sel.innerHTML = opts.join("");
+  }
+}
+for (const sel of document.querySelectorAll(".media-model")) {
+  sel.onchange = async () => {
+    if (sel.value === "__more") { fillModelPickers(); showTab("settings"); return; }
+    try {
+      const r = await fetch("api/media/models/default", {method: "POST", headers: headers(true), body: JSON.stringify({model: sel.value})});
+      if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+      toast("success", "Model changed", `New ${sel.dataset.kind}s use ${sel.value}.`);
+    } catch (err) { toast("error", "Not changed", String(err.message || err), 8000); }
+    loadMediaModels();
+  };
+}
 $("media-kinds").addEventListener("click", (e) => {
   const b = e.target.closest("[data-kind]"); if (!b) return;
   for (const x of $("media-kinds").children) x.setAttribute("aria-selected", String(x === b));
-  const soon = MEDIA_SOON[b.dataset.kind];
-  $("img-form").hidden = !!soon; $("img-results").hidden = !!soon; $("media-soon").hidden = !soon;
-  if (soon) {
-    const have = (media.models || []).filter((m) => m.kind === b.dataset.kind && m.downloaded).map((m) => m.name);
-    $("media-soon-title").textContent = soon[0];
-    $("media-soon-text").textContent = soon[1] + (have.length ? ` Downloaded: ${have.join(", ")}.` : "");
+  const k = b.dataset.kind;
+  $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("img-results").hidden = k === "audio";
+  $("media-soon").hidden = k !== "audio";
+  if (k === "audio") {
+    $("media-soon-title").textContent = "Audio";
+    $("media-soon-text").textContent = "Speech comes in v2.3: speech to text (Whisper, Parakeet) and text to speech (Qwen3-TTS, Kokoro). The planned models are listed in Settings > Models.";
   }
 });
+$("vid-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const prompt = $("vid-prompt").value.trim();
+  if (!prompt) return;
+  const body = {prompt, model: $("vid-model").value, format: "mp4"};
+  if ($("vid-size").value) body.size = $("vid-size").value;
+  if ($("vid-frames").value) body.frames = Number($("vid-frames").value);
+  if ($("vid-fps").value) body.fps = Number($("vid-fps").value);
+  if ($("vid-seed").value !== "") body.seed = Number($("vid-seed").value);
+  $("vid-go").disabled = true;
+  const t0 = performance.now();
+  $("vid-hint").textContent = "Generating\u2026 (several minutes; keep this tab open)";
+  try {
+    const r = await fetch("v1/videos/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    const d = j.data[0], fig = document.createElement("figure");
+    const mime = {mp4: "video/mp4", webp: "image/webp", gif: "image/gif", apng: "image/apng"}[d.format] || "video/mp4";
+    const url = URL.createObjectURL(new Blob([Uint8Array.from(atob(d.b64), (c) => c.charCodeAt(0))], {type: mime}));
+    let el;
+    if (d.format === "mp4") { el = document.createElement("video"); el.controls = true; el.loop = true; el.autoplay = true; el.muted = true; }
+    else el = document.createElement("img");
+    el.src = url;
+    const cap = document.createElement("figcaption");
+    cap.innerHTML = `${esc(j.size)}, ${j.frames} frames at ${j.fps} fps, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(prompt)} · <a href="${url}" download="am2strata-${d.seed}.${d.format}">save</a>`;
+    fig.append(el, cap);
+    $("img-results").prepend(fig);
+    $("vid-hint").textContent = "Done.";
+  } catch (e) {
+    $("vid-hint").textContent = "";
+    toast("error", "No video", String(e.message || e), 10000);
+  } finally {
+    $("vid-go").disabled = false;
+  }
+};
 
 $("models-list").addEventListener("click", async (e) => {
   const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]");
@@ -2188,7 +2240,7 @@ $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
-  const body = {prompt, size: $("img-size").value, response_format: "b64_json"};
+  const body = {prompt, size: $("img-size").value, response_format: "b64_json", model: $("img-model").value};
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   $("img-go").disabled = true;
   const t0 = performance.now();

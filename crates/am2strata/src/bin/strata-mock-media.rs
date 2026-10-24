@@ -32,7 +32,12 @@ fn main() {
                 for s in 1..=steps {
                     emit(serde_json::json!({"event": "step", "step": s, "total": steps}));
                 }
-                emit(serde_json::json!({"event": "image", "index": 0, "width": r["width"], "height": r["height"], "png": PNG}));
+                if r["frames"].is_u64() {
+                    emit(serde_json::json!({"event": "video", "format": r["output_format"], "width": r["width"], "height": r["height"],
+                                            "frames": r["frames"], "fps": r["fps"], "data": "AAAAIGZ0eXBpc29t"}));
+                } else {
+                    emit(serde_json::json!({"event": "image", "index": 0, "width": r["width"], "height": r["height"], "png": PNG}));
+                }
                 emit(serde_json::json!({"event": "done", "ms": 5, "seed": r["seed"]}));
             }
             "unload" => emit(serde_json::json!({"event": "unloaded"})),
@@ -41,7 +46,8 @@ fn main() {
             "list" => emit(serde_json::json!({"event": "models", "models": [
                 {"name": "z-image-turbo:q8", "kind": "image", "family": "z-image", "size_gb": 13.8, "downloaded": true, "gated": false},
                 {"name": "flux2-klein:q4", "kind": "image", "family": "flux2", "size_gb": 10.1, "downloaded": false, "gated": false},
-                {"name": "wan22-ti2v-5b:q8", "kind": "video", "family": "wan", "size_gb": 16.9, "downloaded": true, "gated": false}]})),
+                {"name": "wan22-ti2v-5b:q8", "kind": "video", "family": "wan", "size_gb": 16.9, "downloaded": true, "gated": false,
+                 "defaults": {"steps": 30, "guidance": 5.0, "width": 1280, "height": 704, "frames": 121, "fps": 24}}]})),
             _ => emit(serde_json::json!({"event": "error", "message": "unknown op"})),
         }
     }

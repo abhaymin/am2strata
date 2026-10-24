@@ -17,6 +17,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 pub const DEFAULT_MODEL: &str = "z-image-turbo:q8";
+/// Wan 2.2 TI2V-5B (Apache-2.0): text or image to video, 16.9 GB at Q8
+pub const DEFAULT_VIDEO_MODEL: &str = "wan22-ti2v-5b:q8";
 
 struct Proc {
     child: Child,
@@ -26,9 +28,10 @@ struct Proc {
 
 pub struct Media {
     pub exe: Option<PathBuf>,
-    /// the image model jobs use: the run config's, or the one chosen in Settings > Models (kept in
+    /// the image and video models jobs use: the run config's, or the ones chosen in the web app (kept in
     /// <data>/media/am2strata.json)
     model: std::sync::RwLock<String>,
+    video_model: std::sync::RwLock<String>,
     /// the media download in progress or last finished: {"state": "idle" | "pulling" | "done" | "error", ...}
     pub pull_job: std::sync::Mutex<Value>,
     pub keep_text_model: bool,
@@ -48,12 +51,16 @@ pub fn find_exe() -> Option<PathBuf> {
 impl Media {
     pub fn new(data_dir: &Path, rest: &std::collections::BTreeMap<String, Value>) -> Media {
         let cfg = rest.get("images").cloned().unwrap_or(Value::Null);
-        let chosen = std::fs::read_to_string(data_dir.join("media/am2strata.json")).ok()
-            .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-            .and_then(|v| v["image_model"].as_str().map(str::to_string));
+        let saved = std::fs::read_to_string(data_dir.join("media/am2strata.json")).ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok()).unwrap_or(Value::Null);
+        let chosen = saved["image_model"].as_str().map(str::to_string);
+        let video = saved["video_model"].as_str().map(str::to_string)
+            .or_else(|| rest.get("videos").and_then(|v| v["model"].as_str()).map(str::to_string))
+            .unwrap_or_else(|| DEFAULT_VIDEO_MODEL.to_string());
         Media {
             exe: find_exe(),
             model: std::sync::RwLock::new(chosen.or_else(|| cfg["model"].as_str().map(str::to_string)).unwrap_or_else(|| DEFAULT_MODEL.to_string())),
+            video_model: std::sync::RwLock::new(video),
             pull_job: std::sync::Mutex::new(json!({"state": "idle"})),
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
@@ -69,10 +76,18 @@ impl Media {
         self.model.read().unwrap().clone()
     }
 
-    fn set_model(&self, m: &str) -> anyhow::Result<()> {
+    pub fn video_model(&self) -> String {
+        self.video_model.read().unwrap().clone()
+    }
+
+    fn set_model(&self, kind: &str, m: &str) -> anyhow::Result<()> {
+        match kind {
+            "video" => *self.video_model.write().unwrap() = m.to_string(),
+            _ => *self.model.write().unwrap() = m.to_string(),
+        }
         std::fs::create_dir_all(&self.mold_home)?;
-        std::fs::write(self.mold_home.join("am2strata.json"), serde_json::to_string_pretty(&json!({"image_model": m}))?)?;
-        *self.model.write().unwrap() = m.to_string();
+        std::fs::write(self.mold_home.join("am2strata.json"),
+                       serde_json::to_string_pretty(&json!({"image_model": self.model(), "video_model": self.video_model()}))?)?;
         Ok(())
     }
 
@@ -211,7 +226,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let audio: Vec<Value> = AUDIO_PLANNED.iter().map(|(n, d, what, gb)| json!({"name": n, "display_name": d, "kind": "audio",
         "description": what, "size_gb": gb, "downloaded": false, "planned": "v2.3"})).collect();
     let pull = s.media.pull_job.lock().unwrap().clone();
-    let base = json!({"engine": s.media.available(), "image_model": s.media.model(), "pull": pull});
+    let base = json!({"engine": s.media.available(), "image_model": s.media.model(), "video_model": s.media.video_model(), "pull": pull});
     if !s.media.available() {
         let mut v = base;
         v["models"] = json!(audio);
@@ -266,12 +281,14 @@ pub async fn pull_status(State(s): State<AppState>, headers: HeaderMap) -> Respo
     Json(s.media.pull_job.lock().unwrap().clone()).into_response()
 }
 
-/// POST /api/media/models/default {"model": ...}: the image model for the next jobs (a downloaded image model).
+/// POST /api/media/models/default {"model": ...}: the image or video model for the next jobs (a downloaded one; its
+/// kind decides which).
 pub async fn set_default(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let Some(model) = req["model"].as_str() else { return bad("send {\"model\": ...}") };
+    let mut kind = "image".to_string();
     if s.media.available() {
         let list = match s.media.call(json!({"op": "list"}), |_| {}).await {
             Ok(r) => r,
@@ -280,17 +297,93 @@ pub async fn set_default(State(s): State<AppState>, headers: HeaderMap, Json(req
         let found = list["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model).cloned());
         match found {
             None => return bad(format!("{model} is not in the media catalog")),
-            Some(m) if m["kind"] != "image" => return bad(format!("{model} is a {} model; image jobs need an image model", m["kind"].as_str().unwrap_or("?"))),
+            Some(m) if m["kind"] != "image" && m["kind"] != "video" => return bad(format!("{model} is a {} model; only image and video models can be chosen", m["kind"].as_str().unwrap_or("?"))),
             Some(m) if m["downloaded"] != true => return bad(format!("{model} is not downloaded yet")),
-            _ => {}
+            Some(m) => kind = m["kind"].as_str().unwrap_or("image").to_string(),
         }
     }
-    match s.media.set_model(model) {
-        Ok(()) => Json(json!({"image_model": model})).into_response(),
+    match s.media.set_model(&kind, model) {
+        Ok(()) => Json(json!({"kind": kind, "model": model, "image_model": s.media.model(), "video_model": s.media.video_model()})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", format!("{e:#}")),
     }
 }
 
 fn chrono_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// POST /v1/videos/generations {"prompt", "model"?, "size"?: "WxH", "frames"?, "fps"?, "steps"?, "seed"?, "format"?}:
+/// one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an image. The answer is the clip
+/// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
+pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if !s.media.available() {
+        return error(StatusCode::NOT_IMPLEMENTED, "not_available",
+                     "video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+    }
+    let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
+        return bad("send {\"prompt\": \"...\"}");
+    };
+    let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.video_model());
+    // the model's own defaults (size, steps, guidance, frames, fps) fill what the request leaves out
+    let list = match s.media.call(json!({"op": "list"}), |_| {}).await {
+        Ok(r) => r,
+        Err(e) => return error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
+    };
+    let Some(m) = list["models"].as_array().and_then(|a| a.iter().find(|x| x["name"] == model.as_str()).cloned()) else {
+        return bad(format!("{model} is not in the media catalog"));
+    };
+    if m["kind"] != "video" {
+        return bad(format!("{model} is not a video model"));
+    }
+    if m["downloaded"] != true {
+        return bad(format!("{model} is not downloaded: download it in Settings > Models ({} GB)", m["size_gb"]));
+    }
+    let d = &m["defaults"];
+    let (mut w, mut h) = (d["width"].as_u64().unwrap_or(832), d["height"].as_u64().unwrap_or(480));
+    if let Some(size) = req["size"].as_str() {
+        match size.split_once('x').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
+            Some((a, b)) if (128..=1920).contains(&a) && (128..=1920).contains(&b) && a % 16 == 0 && b % 16 == 0 => (w, h) = (a, b),
+            _ => return bad("size must be WIDTHxHEIGHT, each a multiple of 16 from 128 to 1920"),
+        }
+    }
+    let frames = req["frames"].as_u64().or(d["frames"].as_u64()).unwrap_or(33);
+    if !(1..=257).contains(&frames) {
+        return bad("frames must be 1 to 257");
+    }
+    let fps = req["fps"].as_u64().or(d["fps"].as_u64()).unwrap_or(16).clamp(1, 60);
+    let steps = req["steps"].as_u64().or(d["steps"].as_u64()).unwrap_or(30).clamp(1, 100);
+    let guidance = req["guidance"].as_f64().or(d["guidance"].as_f64()).unwrap_or(5.0);
+    let format = req["format"].as_str().unwrap_or("mp4");
+    if !matches!(format, "mp4" | "webp" | "gif" | "apng") {
+        return bad("format: mp4, webp, gif or apng");
+    }
+    let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
+    let t0 = Instant::now();
+    let _gpu = match s.mgr.gpu_exclusive(!s.media.keep_text_model).await {
+        Ok(g) => g,
+        Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),
+    };
+    let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance, "seed": seed,
+                   "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
+    let mut clip = None;
+    let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
+        if ev["event"] == "video" && clip.is_none() {
+            clip = Some(ev.clone());
+        }
+    }).await;
+    if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {
+        tracing::warn!("the media engine did not unload: {e:#}");
+    }
+    let v = match (res, clip) {
+        (Ok(_), Some(v)) => v,
+        (Ok(_), None) => return error(StatusCode::BAD_GATEWAY, "video_error", "the media engine returned no video"),
+        (Err(e), _) => return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}")),
+    };
+    Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
+                "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"],
+                "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
+                           "engine": "am2strata-media (Rust, candle)"}})).into_response()
 }

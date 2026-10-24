@@ -464,3 +464,5 @@ body.resizing iframe { pointer-events: none; }
 #mm-status { padding: 0 14px; margin: 4px 0; }
 #mm-list { max-height: 520px; overflow-y: auto; }
 #mm-list .model-row__name span { white-space: normal; }
+.img-results video { width: 100%; border-radius: 8px; background: #000; }
+.media-model { max-width: 100%; }

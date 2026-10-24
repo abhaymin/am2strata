@@ -13,3 +13,4 @@ pub mod mtp_pack;
 pub mod mtp_rt;
 pub mod num;
 pub mod quants;
+pub mod stack_experts;

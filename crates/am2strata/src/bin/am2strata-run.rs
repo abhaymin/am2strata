@@ -114,6 +114,14 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/Strata-data")]
         data_dir: PathBuf,
     },
+    /// rewrite a GGUF with one tensor per expert (Mixtral 8x7B files from before April 2024) with the experts stacked,
+    /// as llama.cpp reads them now; the weights are copied byte for byte
+    GgufStackExperts {
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// the MTP draft layer's runtime files (experts.bin, dense.bin, dense.txt) from the MTP GGUF: tools/mtp_rt.py
     MtpRt {
         #[arg(long)]
@@ -501,6 +509,8 @@ fn main() -> ExitCode {
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
+        Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
+            input: expand_path(&input), output: expand_path(&out) })),
         Cmd::MtpRt { gguf, out } => done(strata_pack::mtp_rt::run(&strata_pack::mtp_rt::Options { gguf: expand_path(&gguf), out: expand_path(&out) })),
         Cmd::Test => {
             if run(Command::new("cargo").args(["test", "--release"]).current_dir(root())) { ExitCode::SUCCESS } else { ExitCode::FAILURE }

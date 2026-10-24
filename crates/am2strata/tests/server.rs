@@ -771,9 +771,9 @@ fn media_models_are_listed_pulled_and_chosen() {
     assert!(kinds.contains(&"image") && kinds.contains(&"video") && kinds.contains(&"audio"), "{kinds:?}");
     assert_eq!(r["image_model"], "z-image-turbo:q8");
     assert_eq!(s.get("/api/media/models", false).0, 401);
-    // a video model, or one not downloaded, cannot be the image model; a downloaded image model can
+    // a downloaded video model becomes the video model; one not downloaded cannot be chosen
     let (c, r) = s.post("/api/media/models/default", &json!({"model": "wan22-ti2v-5b:q8"}));
-    assert!(c == 400 && r["error"]["message"].as_str().unwrap().contains("video"), "{r}");
+    assert_eq!((c, r["kind"].as_str(), r["video_model"].as_str()), (200, Some("video"), Some("wan22-ti2v-5b:q8")), "{r}");
     let (c, r) = s.post("/api/media/models/default", &json!({"model": "flux2-klein:q4"}));
     assert!(c == 400 && r["error"]["message"].as_str().unwrap().contains("not downloaded"), "{r}");
     let (c, r) = s.post("/api/media/models/default", &json!({"model": "z-image-turbo:q8"}));
@@ -790,4 +790,23 @@ fn media_models_are_listed_pulled_and_chosen() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     assert_eq!((state["state"].as_str(), state["model"].as_str()), (Some("done"), Some("flux2-klein:q4")), "{state}");
+}
+
+#[test]
+fn videos_are_made_with_the_models_defaults_and_checked() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "waves on a beach", "frames": 17, "seed": 3}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!((r["frames"].as_u64(), r["fps"].as_u64(), r["size"].as_str()), (Some(17), Some(24), Some("1280x704")),
+               "frames from the request, fps and size from the model's defaults: {r}");
+    assert_eq!((r["data"][0]["format"].as_str(), r["data"][0]["seed"].as_u64()), (Some("mp4"), Some(3)));
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let gen: Vec<Value> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|v| v["op"] == "generate").collect();
+    assert_eq!((gen[0]["request"]["steps"].as_u64(), gen[0]["request"]["guidance"].as_f64()), (Some(30), Some(5.0)));
+    for (body, what) in [(json!({"prompt": "p", "model": "z-image-turbo:q8"}), "not a video model"),
+                         (json!({"prompt": "p", "size": "100x100"}), "multiple of 16"), (json!({"prompt": "p", "format": "avi"}), "format")] {
+        let (c, r) = s.post("/v1/videos/generations", &body);
+        assert_eq!(c, 400, "{body}: {r}");
+        assert!(r["error"]["message"].as_str().unwrap().contains(what), "{r}");
+    }
 }

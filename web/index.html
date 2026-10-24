@@ -189,7 +189,8 @@
       </div>
       <form class="st-card img-form" id="img-form">
         <span class="card-title" id="img-title">Make an image</span>
-        <span class="muted small" id="img-model"></span>
+        <label class="st-field">Model
+          <select class="st-input media-model" id="img-model" data-kind="image" aria-label="Image model"></select></label>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
         <div class="img-row">
           <label class="st-field">Size
@@ -201,6 +202,27 @@
           <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
         </div>
         <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
+      </form>
+      <form class="st-card img-form" id="vid-form" hidden>
+        <span class="card-title">Make a video</span>
+        <label class="st-field">Model
+          <select class="st-input media-model" id="vid-model" data-kind="video" aria-label="Video model"></select></label>
+        <textarea class="st-input img-prompt" id="vid-prompt" rows="3" placeholder="Describe the clip: subject, motion, camera&hellip;" aria-label="Video prompt"></textarea>
+        <div class="img-row">
+          <label class="st-field">Size
+            <select class="st-input" id="vid-size"><option value="">model default</option>
+              <option>832x480</option><option>480x832</option><option>1280x704</option><option>704x1280</option><option>640x640</option></select></label>
+          <label class="st-field">Length
+            <select class="st-input" id="vid-frames"><option value="">model default</option>
+              <option value="17">17 frames</option><option value="33">33 frames</option><option value="49">49 frames</option>
+              <option value="81">81 frames</option><option value="121">121 frames</option></select></label>
+          <label class="st-field">FPS
+            <select class="st-input" id="vid-fps"><option value="">default</option><option>16</option><option>24</option></select></label>
+          <label class="st-field">Seed
+            <input class="st-input" id="vid-seed" type="number" min="0" placeholder="random"></label>
+          <button type="submit" class="st-btn st-btn--primary" id="vid-go">Generate</button>
+        </div>
+        <span class="composer-hint" id="vid-hint">Video takes minutes; the text model gives the GPU to it and loads again with the next chat.</span>
       </form>
       <div class="img-results" id="img-results"></div>
     </div>
