@@ -90,6 +90,19 @@ pub async fn run(spec: &Spec, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Outc
     let id = config::id_of(file_name);
     let display = format!("{} {tag}", g.str("general.name").filter(|n| !n.is_empty()).unwrap_or(&base));
     let w = config::write(&spec.models_dir, &spec.data_dir.join("packs"), &first, &g, mmproj.as_deref(), spec.context, &id, &display)?;
+    // a Strata expert profile published beside the model (*.prof, STRP): in the form its engine reads
+    if let Some(pf) = all.iter().find(|f| f.path.ends_with(".prof") && f.size < (16 << 20)) {
+        let pack = spec.data_dir.join("packs").join(&id);
+        let raw = pack.join("expert-profile.strp");
+        let mut quiet = |_: u64, _: u64| {};
+        match hub.download(&repo, &spec.revision, pf, &raw, &mut quiet).await {
+            Ok(()) => match profile_for_config(&raw, &w.config) {
+                Ok(note) => ev(Event::Note(format!("{}: {note}", pf.path))),
+                Err(e) => ev(Event::Note(format!("{}: not used ({e})", pf.path))),
+            },
+            Err(e) => ev(Event::Note(format!("{}: not downloaded ({e})", pf.path))),
+        }
+    }
     Ok(Outcome::Configured { id, config: w.config })
 }
 
@@ -149,4 +162,41 @@ pub async fn check_update(dir: &Path, token: Option<String>) -> Result<UpdateChe
         }
     }
     Ok(UpdateCheck { repo, revision, changed, removed, bytes })
+}
+
+/// A STRP expert profile (PolyStrata's ranked (layer, expert) list) as strata-poly's "layer expert count" lines: the
+/// hottest expert gets the highest count. Layers past `n_layers` (an MTP layer) are left out.
+pub fn strp_to_counts(strp: &[u8]) -> Result<String, String> {
+    if strp.len() < 24 || &strp[..4] != b"STRP" {
+        return Err("not a STRP expert profile".into());
+    }
+    let h = |i: usize| u32::from_le_bytes(strp[4 + 4 * i..8 + 4 * i].try_into().unwrap()) as usize;
+    let (version, n) = (h(0), h(4));
+    if version != 1 || strp.len() < 24 + 4 * n {
+        return Err(format!("a version {version} profile or a truncated one"));
+    }
+    let mut out = String::new();
+    for r in 0..n {
+        let at = 24 + 4 * r;
+        let (l, e) = (u16::from_le_bytes([strp[at], strp[at + 1]]), u16::from_le_bytes([strp[at + 2], strp[at + 3]]));
+        out.push_str(&format!("{l} {e} {}\n", n - r));
+    }
+    Ok(out)
+}
+
+/// Puts a downloaded STRP profile where the config's engine reads it: strata-poly's `--expert-profile` text file, or the
+/// file itself for engines that read STRP (strata, am2strata-hybrid).
+fn profile_for_config(raw: &Path, config: &Path) -> Result<String, String> {
+    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(config).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let args: Vec<&str> = cfg["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+    let target = args.windows(2).find(|w| w[0] == "--expert-profile").map(|w| PathBuf::from(w[1])).ok_or("the config takes no expert profile")?;
+    let bytes = std::fs::read(raw).map_err(|e| e.to_string())?;
+    if cfg["exe"].as_str().unwrap_or("").contains("strata-poly") {
+        let text = strp_to_counts(&bytes)?;
+        std::fs::write(&target, text).map_err(|e| format!("{}: {e}", target.display()))?;
+        Ok(format!("written as strata-poly's expert counts ({})", target.display()))
+    } else {
+        std::fs::copy(raw, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+        Ok(format!("copied to {}", target.display()))
+    }
 }
