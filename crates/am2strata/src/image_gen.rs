@@ -174,6 +174,8 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),
     };
+    let mon = s.mgr.monitor.clone();
+    let job = mon.media_begin("image", &model);
     let mut data = Vec::new();
     let mut failure = None;
     for i in 0..n {
@@ -183,6 +185,9 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
         let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
             if ev["event"] == "image" && png.is_none() {
                 png = ev["png"].as_str().map(str::to_owned);
+            }
+            if ev["event"] == "step" {
+                mon.media_step(job, ev["step"].as_u64().unwrap_or(0) + i * steps, ev["total"].as_u64().unwrap_or(steps) * n);
             }
         }).await;
         match (res, png) {
@@ -202,8 +207,10 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
         tracing::warn!("the media engine did not unload: {e:#}");
     }
     if let Some(f) = failure {
+        mon.media_end(job, "error", &f);
         return error(StatusCode::BAD_GATEWAY, "image_error", f);
     }
+    mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
     Json(json!({"created": crate::now(), "data": data, "size": format!("{w}x{h}"),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
@@ -368,10 +375,15 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance, "seed": seed,
                    "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
+    let mon = s.mgr.monitor.clone();
+    let job = mon.media_begin("video", &model);
     let mut clip = None;
     let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
         if ev["event"] == "video" && clip.is_none() {
             clip = Some(ev.clone());
+        }
+        if ev["event"] == "step" {
+            mon.media_step(job, ev["step"].as_u64().unwrap_or(0), ev["total"].as_u64().unwrap_or(steps));
         }
     }).await;
     if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {
@@ -379,9 +391,16 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     }
     let v = match (res, clip) {
         (Ok(_), Some(v)) => v,
-        (Ok(_), None) => return error(StatusCode::BAD_GATEWAY, "video_error", "the media engine returned no video"),
-        (Err(e), _) => return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}")),
+        (Ok(_), None) => {
+            mon.media_end(job, "error", "no video returned");
+            return error(StatusCode::BAD_GATEWAY, "video_error", "the media engine returned no video");
+        }
+        (Err(e), _) => {
+            mon.media_end(job, "error", &format!("{e:#}"));
+            return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}"));
+        }
     };
+    mon.media_end(job, "stop", &format!("{}x{}, {} frames at {} fps", v["width"], v["height"], v["frames"], v["fps"]));
     Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
                 "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"],
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,

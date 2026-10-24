@@ -70,6 +70,7 @@ pub async fn run(spec: &Spec, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Outc
         let mut show = |done: u64, all: u64| ev(Event::Progress { file: name.clone(), done, total: all });
         hub.download(&repo, &spec.revision, f, &local_path(&dir, f), &mut show).await.map_err(|e| e.to_string())?;
         ev(Event::FileDone { file: name, checked: f.sha256.is_some() });
+        record_source(&dir, &repo, &spec.revision, f)?;
     }
     if !spec.write_config {
         return Ok(Outcome::Downloaded { dir, why: None });
@@ -102,3 +103,50 @@ pub async fn list(repo: &str, token: Option<String>) -> Result<Vec<(String, u64,
 
 #[allow(dead_code)]
 fn _p(_: &Path) {}
+
+/// Where a downloaded model came from (<model dir>/am2strata-source.json): the repository, the revision and each file's
+/// size and SHA-256, so that a newer upload of the same files can be found later (`check_update`).
+pub const SOURCE_FILE: &str = "am2strata-source.json";
+
+fn record_source(dir: &Path, repo: &str, revision: &str, f: &RepoFile) -> Result<(), String> {
+    let path = dir.join(SOURCE_FILE);
+    let mut v: serde_json::Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok())
+        .filter(|v: &serde_json::Value| v["repo"] == repo)
+        .unwrap_or_else(|| serde_json::json!({"repo": repo, "revision": revision, "files": {}}));
+    v["files"][&f.path] = serde_json::json!({"size": f.size, "sha256": f.sha256});
+    v["updated"] = serde_json::json!(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A model folder's files against the Hub now: the repository, and the files whose SHA-256 or size changed there
+/// (or that were removed from it).
+pub struct UpdateCheck {
+    pub repo: String,
+    pub revision: String,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub bytes: u64,
+}
+
+pub async fn check_update(dir: &Path, token: Option<String>) -> Result<UpdateCheck, String> {
+    let path = dir.join(SOURCE_FILE);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)
+        .map_err(|_| "this model was not downloaded by am2Strata, so its source is not known".to_string())?)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let repo = v["repo"].as_str().ok_or("the source record names no repository")?.to_string();
+    let revision = v["revision"].as_str().unwrap_or("main").to_string();
+    let hub = Hub::new(token).map_err(|e| e.to_string())?;
+    let now = hub.files(&repo, &revision).await.map_err(|e| e.to_string())?;
+    let (mut changed, mut removed, mut bytes) = (Vec::new(), Vec::new(), 0u64);
+    for (p, was) in v["files"].as_object().into_iter().flatten() {
+        match now.iter().find(|f| &f.path == p) {
+            None => removed.push(p.clone()),
+            Some(f) if f.sha256.as_deref() != was["sha256"].as_str() || Some(f.size) != was["size"].as_u64() => {
+                changed.push(p.clone());
+                bytes += f.size;
+            }
+            _ => {}
+        }
+    }
+    Ok(UpdateCheck { repo, revision, changed, removed, bytes })
+}

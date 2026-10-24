@@ -344,6 +344,7 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
     for n in &adapted {
         tracing::info!(model = %entry.id, "{n}");
     }
+    ensure_pack(&cfg, &entry.id).await?;
     if !cfg.tokenizer.join("vocab.json").exists() {
         ensure_tokenizer(&cfg).with_context(|| format!("tokenizer of {}", entry.id))?;
     }
@@ -423,6 +424,24 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         sampling_defaults,
         reasoning_memory: Default::default(),
     })
+}
+
+/// A config that names a pack (`--pack DIR`) not built yet - a model just downloaded, or one whose files were updated -
+/// gets it built here from the config's model file, as `am2strata-run iq-pack` builds it, before its engine starts.
+async fn ensure_pack(cfg: &strata_engine::RunConfig, id: &str) -> Result<()> {
+    let Some(dir) = cfg.args.windows(2).find(|w| w[0] == "--pack").map(|w| std::path::PathBuf::from(&w[1])) else { return Ok(()) };
+    if dir.join("index.txt").exists() {
+        return Ok(());
+    }
+    let gguf = cfg.args.windows(2).find(|w| w[0] == "--model" || w[0] == "--native").map(|w| std::path::PathBuf::from(&w[1]))
+        .with_context(|| format!("{id}: the config names a pack ({}) but no model file to build it from", dir.display()))?;
+    tracing::info!(model = %id, "building the pack {} from {} (first load, or the model files changed)", dir.display(), gguf.display());
+    let t0 = std::time::Instant::now();
+    let o = strata_pack::iq_pack::Options { gguf, out: dir.clone(), base: None, skip_experts: false, compat_bf16: false, experts_bin: false };
+    tokio::task::spawn_blocking(move || strata_pack::iq_pack::run(&o)).await?
+        .map_err(|e| anyhow!("building the pack for {id}: {e}"))?;
+    tracing::info!(model = %id, "pack built in {:.1} s", t0.elapsed().as_secs_f64());
+    Ok(())
 }
 
 /// A config whose tokenizer folder is missing (a shared config beside freshly downloaded files): write it from the

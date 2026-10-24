@@ -224,6 +224,8 @@ async fn main() -> Result<()> {
         .route("/api/models/current", get(web::current_model))
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
+        .route("/api/models/updates", get(hub_api::updates))
+        .route("/api/models/update", post(hub_api::update))
         .route("/api/requests", get(api_monitor::requests))
         .route("/api/hub/quants", post(hub_api::quants))
         .route("/api/hub/pull", get(hub_api::status).post(hub_api::pull))

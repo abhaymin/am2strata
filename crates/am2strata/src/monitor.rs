@@ -46,10 +46,20 @@ struct Live {
     recent: VecDeque<f64>,
 }
 
+/// A media job (image or video) on the GPU: shown live and kept in the request history like a chat request.
+struct MediaLive {
+    id: u64,
+    kind: &'static str,
+    model: String,
+    started: f64,
+    step: Option<(u64, u64)>,
+}
+
 #[derive(Default)]
 struct Inner {
     next_id: u64,
     live: Option<Live>,
+    media: Option<MediaLive>,
     queued: usize,
     history: VecDeque<Value>,
     totals: Totals,
@@ -98,6 +108,34 @@ impl Monitor {
                              progress: None, read_started: t, recent: VecDeque::new() });
         g.last_at = Some(t);
         Record { mon: self.clone(), id, prompt_tokens, done: false, outcome: "disconnect" }
+    }
+
+    /// A media job starts; `media_step` reports its progress and `media_end` records it.
+    pub fn media_begin(&self, kind: &'static str, model: &str) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.next_id += 1;
+        let id = g.next_id;
+        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None });
+        g.last_at = Some(now());
+        id
+    }
+
+    pub fn media_step(&self, id: u64, step: u64, total: u64) {
+        if let Some(m) = self.inner.lock().unwrap().media.as_mut().filter(|m| m.id == id) {
+            m.step = Some((step, total));
+        }
+    }
+
+    /// `finish`: "stop" (made) or "error"; `output`: what was made ("2 images, 1024x1024").
+    pub fn media_end(&self, id: u64, finish: &str, output: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(m) = g.media.take_if(|m| m.id == id) else { return };
+        let t = now();
+        g.history.push_back(json!({"time": m.started, "duration_s": ((t - m.started) * 10.0).round() / 10.0, "finish": finish,
+                                   "kind": m.kind, "model": m.model, "output": output, "steps": m.step.map(|s| s.1)}));
+        while g.history.len() > HISTORY_KEEP {
+            g.history.pop_front();
+        }
     }
 
     fn with_live(&self, id: u64, f: impl FnOnce(&mut Live)) {
@@ -187,6 +225,13 @@ impl Monitor {
                     "prefill_tok_s_mean": Self::prefill_rate(l, t).map(r1),
                     "tok_s_window_s": if reading { None } else { Some(RATE_WINDOW_S) },
                 })
+            }
+            None if g.media.is_some() => {
+                let m = g.media.as_ref().unwrap();
+                json!({"state": "media", "kind": m.kind, "model": m.model, "step": m.step.map(|s| s.0), "steps": m.step.map(|s| s.1),
+                       "elapsed_s": r1(t - m.started), "queued": g.queued, "phase": null, "generated": null, "max_tokens": null,
+                       "tok_s": null, "tok_s_mean": null, "prompt_tokens": null, "prompt_read": null, "prompt_total": null,
+                       "prefill_tok_s_mean": null, "tok_s_window_s": null})
             }
             None => json!({"state": if loaded { "idle" } else { "unloaded" }, "queued": g.queued, "phase": null,
                            "prompt_tokens": null, "prompt_read": null, "prompt_total": null, "generated": null,

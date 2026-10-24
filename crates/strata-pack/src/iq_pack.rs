@@ -732,6 +732,17 @@ pub fn run(o: &Options) -> Result<(), String> {
     if model.shards.len() > 1 {
         println!("model shards: {}", model.shards.iter().map(|s| fname(&s.path)).collect::<Vec<_>>().join(", "));
     }
+    // a dense model (no experts): the pack is its index, its float tensors and its tokenizer (am2strata-hybrid reads
+    // dense models from packs too); iq_pack.py packs only MoE models
+    if !model.order.iter().any(|n| n.starts_with("blk.") && (n.ends_with("_exps.weight") || n.contains(".ffn_gate.0."))) {
+        index_standalone(&src, &out, &model, o.compat_bf16)?;
+        if !out.join("tokenizer/vocab.json").exists() || !out.join("tokenizer/chat_template.jinja").exists() {
+            strata_gguf::extract_tokenizer(&model.shards[0].g, &out).map_err(|e| e.to_string())?;
+        }
+        let _ = std::fs::remove_file(out.join("native_experts.txt"));
+        println!("a dense model: no experts to place");
+        return Ok(());
+    }
     let (layout, text, _n_expert, offset) = expert_layout(&model, &src)?;
     let mut experts_bin = o.experts_bin;
     if layout.iter().any(|x| x.names.iter().any(|n| model.where_.contains_key(n) && model.tensor(n).type_name() == "NVFP4")) {

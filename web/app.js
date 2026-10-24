@@ -76,14 +76,18 @@ for (const b of $("accent-swatches").children) b.onclick = () => { store.set("ac
 applyAccent();
 
 let tab = "chat";
+// the media models again when their tabs open (after start-up: `health` is set further down)
+function refreshMedia() {
+  try { if (health.image_generation) loadMediaModels(); } catch (e) { /* still starting */ }
+}
 function showTab(name) {
   tab = ["chat", "images", "monitor", "settings", "calls"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
-  if (tab === "images") $("img-prompt").focus();
+  if (tab === "images") { $("img-prompt").focus(); refreshMedia(); }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
-  if (tab === "settings") showSection(section);
+  if (tab === "settings") { showSection(section); refreshMedia(); }
   if (tab === "calls") refreshCalls();
   if (lastMetrics) render(lastMetrics);
 }
@@ -110,6 +114,7 @@ async function loadHealth() {
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
     $("tab-btn-images").hidden = !health.image_generation;
     if (health.image_generation && !media.models.length) loadMediaModels();
+    else if (!health.image_generation) pickerNote("Media generation is not built on this server");
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -134,13 +139,32 @@ async function loadModels() {
   installed = models;
   renderModels();
 }
-let installed = [];
+let installed = [], updatesOf = {};
+// Updates: models downloaded here remember their Hugging Face files; a newer upload of them is offered as an update
+$("check-updates").onclick = async () => {
+  $("check-updates").disabled = true;
+  let n = 0, known = 0;
+  for (const m of installed) {
+    $("updates-msg").textContent = `Checking ${m.id}\u2026`;
+    try {
+      const r = await fetch(`api/models/updates?id=${encodeURIComponent(m.id)}`, {headers: headers()});
+      if (r.ok) { const u = await r.json(); updatesOf[m.id] = u; known += u.known; n += u.update ? 1 : 0; }
+    } catch (e) { /* the next one */ }
+  }
+  $("updates-msg").textContent = `${n} update(s) available · ${installed.length - known} model(s) not downloaded here, so their source is not known`;
+  $("check-updates").disabled = false;
+  renderModels();
+};
 function renderModels() {
   const box = $("models-list");
   if (!installed.length) { box.innerHTML = `<p class="muted">No models are installed yet: add one from Hugging Face below.</p>`; return; }
   box.innerHTML = installed.map((m) => {
     const facts = [m.context ? `${ctxfmt(m.context)} context` : null, m.multimodal ? "pictures, video, PDF" : "text"].filter(Boolean).join(" · ");
-    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span></div>` +
+    const u = updatesOf[m.id];
+    const upd = !u ? "" : u.update ? `<span class="st-badge st-badge--reading" title="${esc(u.changed.join(", "))}">Update available (${(u.bytes / 1e9).toFixed(1)} GB)</span>` +
+        `<button class="st-btn st-btn--secondary" data-update="${esc(m.id)}"${m.current ? " disabled title=\"Unload it first\"" : ""}>Update</button>`
+      : u.known ? `<span class="st-badge">Up to date</span>` : "";
+    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span></div>` + upd +
       `<span class="st-badge ${m.current ? "st-badge--generating" : ""}">${m.current ? "Loaded" : "Available"}</span>` +
       (m.current ? `<button class="st-btn st-btn--secondary" data-unload>Unload</button>`
                  : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) + `</div>`;
@@ -148,12 +172,21 @@ function renderModels() {
 }
 // Media models (GET api/media/models): the media engine's catalog, what is downloaded, the image model in use.
 let media = {models: [], image_model: "", pull: {state: "idle"}}, mmKind = "image", mmTimer = null;
+function pickerNote(text) {
+  for (const sel of document.querySelectorAll(".media-model")) {
+    if (!sel.options.length || sel.options[0].value === "") sel.innerHTML = `<option value="">${esc(text)}</option>`;
+  }
+}
 async function loadMediaModels() {
+  pickerNote("Loading models\u2026 (the media engine starts on first use)");
   try {
     const r = await fetch("api/media/models", {headers: headers()});
-    if (!r.ok) { $("mm-status").textContent = r.status === 401 ? "An API key is needed." : `The server answered ${r.status}.`; return; }
+    if (!r.ok) {
+      const why = r.status === 401 ? "An API key is needed (About > Settings)." : `The server answered ${r.status}.`;
+      $("mm-status").textContent = why; pickerNote(`Models not loaded: ${why}`); return;
+    }
     media = await r.json();
-  } catch (e) { return; }
+  } catch (e) { pickerNote("Models not loaded: the server is not reachable"); return; }
   renderMediaModels();
   fillModelPickers();
   clearTimeout(mmTimer);
@@ -282,7 +315,19 @@ $("vid-form").onsubmit = async (ev) => {
 };
 
 $("models-list").addEventListener("click", async (e) => {
-  const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]");
+  const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]"), upd = e.target.closest("[data-update]");
+  if (upd) {
+    const u = updatesOf[upd.dataset.update];
+    if (!confirm(`Download the new version of ${upd.dataset.update}?\n\n${u.changed.join("\n")}\n${(u.bytes / 1e9).toFixed(1)} GB from ${u.repo}. The old files stay until the new ones are checked; the pack is built again on the next load.`)) return;
+    try {
+      const r = await fetch("api/models/update", {method: "POST", headers: headers(true), body: JSON.stringify({id: upd.dataset.update})});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error || {}).message || `HTTP ${r.status}`);
+      toast("info", "Updating", j.state === "current" ? j.message : "Downloading in the background; progress shows under Add a model.");
+      hubStatus();
+    } catch (err) { toast("error", "Not updated", String(err.message || err), 8000); }
+    return;
+  }
   if (load) { $("model-select").value = load.dataset.load; $("model-select").onchange(); }
   if (unload) {
     if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
@@ -391,6 +436,8 @@ function render(m) {
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+  } else if (live.state === "media") {
+    setPill("generating", `Making ${live.kind === "video" ? "a video" : "an image"}${live.steps ? ` · step ${live.step}/${live.steps}` : ""}`);
   } else {
     setPill("idle", "Idle");
   }
@@ -462,6 +509,14 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "media") {
+    label = `Making ${live.kind === "video" ? "a video" : "an image"}`;
+    delete prog.dataset.tone;
+    pct = live.steps ? (100 * live.step) / live.steps : 0;
+    detail = `${live.model}${live.steps ? ` · step ${live.step} of ${live.steps}` : ""} · ${fmt(live.elapsed_s, 0)} s`;
+  } else if (last && last.kind) {
+    delete prog.dataset.tone;
+    detail = `last: ${last.kind}, ${last.output || ""} in ${fmt(last.duration_s, 0)} s`;
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
@@ -540,6 +595,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
+      if (r.kind) {
+        // a media job: kind, model and what it made across the token columns
+        const tm = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+        return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
+          <td colspan="6" class="muted">${esc(r.model || "")} · ${esc(r.output || "")}${r.steps ? ` · ${r.steps} steps` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+      }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one

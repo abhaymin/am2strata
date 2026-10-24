@@ -199,14 +199,20 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
         return next.run(req).await;
     }
     let path = req.uri().path().to_string();
-    if !matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages" | "/v1/responses") {
+    if !matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/images/generations" | "/v1/videos/generations") {
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 256 << 20).await else {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request body is too large");
     };
-    let default_model = s.mgr.current().await.map(|l| l.entry.id.clone()).unwrap_or_else(|| s.mgr.default_id.clone());
+    let default_model = if path.starts_with("/v1/images") {
+        s.media.model()
+    } else if path.starts_with("/v1/videos") {
+        s.media.video_model()
+    } else {
+        s.mgr.current().await.map(|l| l.entry.id.clone()).unwrap_or_else(|| s.mgr.default_id.clone())
+    };
     let id = mon.begin(&path, &bytes, &default_model);
     let resp = next.run(Request::from_parts(parts, Body::from(bytes))).await;
     let status = resp.status().as_u16();
@@ -220,8 +226,19 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
     if !sse {
         // a JSON answer (or an error): kept whole
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
-        if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+        if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
             take(&id, &mon, &v);
+            // an image or video answer: the record keeps its details, not the megabytes of base64
+            if let Some(items) = v.get_mut("data").and_then(Value::as_array_mut) {
+                for it in items {
+                    for k in ["b64_json", "b64"] {
+                        if let Some(b) = it.get(k).and_then(Value::as_str) {
+                            let note = format!("<{}, {} KB>", if k == "b64_json" { "PNG" } else { "video" }, b.len() * 3 / 4 / 1024);
+                            it[k] = json!(note);
+                        }
+                    }
+                }
+            }
             let (raw, cut) = capped(&serde_json::to_string_pretty(&v).unwrap_or_default());
             mon.update(&id, |r, _| {
                 r.insert("response".into(), json!(raw));

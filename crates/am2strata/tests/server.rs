@@ -810,3 +810,21 @@ fn videos_are_made_with_the_models_defaults_and_checked() {
         assert!(r["error"]["message"].as_str().unwrap().contains(what), "{r}");
     }
 }
+
+#[test]
+fn media_jobs_show_in_api_calls_and_the_monitor() {
+    let m = Model { extra: json!({"api_monitor": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "steps": 4}));
+    assert_eq!(c, 200, "{r}");
+    let calls = s.get("/api/requests", true).1;
+    let rec = calls["requests"].as_array().unwrap().iter().find(|r| r["path"] == "/v1/images/generations").cloned()
+        .unwrap_or_else(|| panic!("{calls}"));
+    assert_eq!(rec["model"], "z-image-turbo:q8", "{rec}");
+    let d = s.get(&format!("/api/requests?id={}", rec["id"].as_str().unwrap()), true).1;
+    let resp = d["response"].as_str().unwrap_or_else(|| panic!("{d}"));
+    assert!(resp.contains("<PNG, ") && !resp.contains("iVBORw0KGgo"), "the record keeps a note, not the image: {resp}");
+    let m = s.get("/metrics", true).1;
+    let job = m["requests"].as_array().unwrap().iter().find(|r| r["kind"] == "image").cloned().unwrap();
+    assert_eq!((job["finish"].as_str(), job["output"].as_str(), job["steps"].as_u64()), (Some("stop"), Some("1 image, 512x512"), Some(4)), "{job}");
+}
