@@ -836,7 +836,8 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         Err(e) => return RespError::new(e, "text.format".to_string()).into_response(),
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned() };
+    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned(),
+                           memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) };
     let started = match run::start(s.mgr.clone(), loaded, prep, chat.clone(), opts).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {

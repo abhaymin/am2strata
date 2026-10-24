@@ -241,6 +241,51 @@ pub struct RunOpts {
     pub budget: Option<u64>,
     /// the request's tool_choice, in either API's shape
     pub tool_choice: Option<Value>,
+    /// memory for this request (it opted in): its scope; the store is the manager's
+    pub memory: Option<String>,
+}
+
+/// What the memory adds to a request before its prompt is built: the <memory> block (matching facts and archived turns),
+/// and - when the conversation does not fit the context - its oldest turns moved to the archive. Returns the number of
+/// turns moved.
+fn with_memory(mgr: &Manager, loaded: &Loaded, prep: &mut Prepared, scope: &str, asked: Option<usize>) -> Result<usize, Refusal> {
+    let mem = &mgr.memory;
+    let settings = mem.settings.read().unwrap().clone();
+    let conv = crate::memory::conversation_id(&prep.messages);
+    let query = prep.messages.iter().rev().find(|m| m["role"] == "user").map(|m| crate::memory::content_text(&m["content"])).unwrap_or_default();
+    let ctx = loaded.max_context;
+    // the answer needs room: what was asked, else a quarter of the context (at most 4096)
+    let want = asked.unwrap_or((ctx / 4).min(4096));
+    let mut moved = 0usize;
+    loop {
+        let mut trial = prep.clone();
+        if let Some(b) = mem.block(&query, scope, conv.as_deref()) {
+            // after the system prompt, so its prefix (and KV) stays the same
+            let at = trial.messages.iter().take_while(|m| m["role"] == "system").count();
+            trial.messages.insert(at, json!({"role": "system", "content": b}));
+        }
+        let fits = !settings.extend_context || match loaded.prompts.build(&trial) {
+            Ok(p) => p.ids.len() + CTX_SLACK + want <= ctx,
+            Err(_) => true, // the real build reports it
+        };
+        // the oldest turn that may go: not the system prompt, never the last user turn
+        let first = trial.messages.iter().position(|m| m["role"] != "system");
+        let last_user = prep.messages.iter().rposition(|m| m["role"] == "user");
+        let start = prep.messages.iter().position(|m| m["role"] != "system");
+        if fits || conv.is_none() || start.is_none() || start >= last_user || first.is_none() {
+            *prep = trial;
+            return Ok(moved);
+        }
+        // move one turn (with the tool results that answer it) to the archive
+        let i = start.unwrap();
+        let mut end = i + 1;
+        while end < prep.messages.len() && prep.messages[end]["role"] == "tool" {
+            end += 1;
+        }
+        let gone: Vec<Value> = prep.messages.drain(i..end).collect();
+        mem.archive(conv.as_deref().unwrap(), &gone).map_err(|e| Refusal(500, format!("memory archive: {e}")))?;
+        moved += gone.len();
+    }
 }
 
 /// From this max_tokens on, thinking without a budget is closed early enough to leave the answer room (0.1.45).
@@ -278,6 +323,13 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     if preserve {
         prep.kwargs.entry("preserve_thinking").or_insert(Value::Bool(true));
         loaded.restore_reasoning(&mut prep.messages);
+    }
+    if let Some(scope) = &opts.memory {
+        let asked = req.get("max_tokens").or_else(|| req.get("max_completion_tokens")).and_then(Value::as_u64).map(|n| n as usize);
+        let moved = with_memory(&mgr, &loaded, &mut prep, scope, asked)?;
+        if moved > 0 {
+            tracing::info!(model = %loaded.entry.id, "memory: {moved} older message(s) moved to the conversation's archive to fit the context");
+        }
     }
     let prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
     let mut ids = prompt.ids.clone();
@@ -643,7 +695,9 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
 /// this request offered; any other call is the request's own and ends the turn as always (the client answers it),
 /// and MCP calls written beside it are then not run. Port of serve/server.py run_with_mcp.
 pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts,
-                       hub: Arc<crate::mcp::McpHub>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
+                       hub: Option<Arc<crate::mcp::McpHub>>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
+    let max_rounds = hub.as_ref().map(|h| h.settings.max_rounds).unwrap_or(8);
+    let conv = crate::memory::conversation_id(&prep.messages);
     let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
     let (model, prompt_tokens) = (first.model.clone(), first.prompt_tokens);
     let (tx, events) = mpsc::channel(256);
@@ -687,8 +741,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             let Some(mut sum) = done else { return };
             total += sum.completion_tokens;
             let mut run_them = !calls.is_empty() && own == 0 && sum.finish == "stop";
-            if run_them && rounds >= hub.settings.max_rounds {
-                let _ = tx.send(RunEvent::Mcp(json!({"event": "limit", "max_rounds": hub.settings.max_rounds}))).await;
+            if run_them && rounds >= max_rounds {
+                let _ = tx.send(RunEvent::Mcp(json!({"event": "limit", "max_rounds": max_rounds}))).await;
                 run_them = false;
             }
             if !run_them {
@@ -704,16 +758,22 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             rounds += 1;
             let mut results = Vec::new();
             for c in &calls {
-                let route = hub.routes().into_iter().find(|(n, _, _)| *n == c.name);
+                let route = hub.as_ref().and_then(|h| h.routes().into_iter().find(|(n, _, _)| *n == c.name));
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "call", "id": c.id, "name": c.name,
-                    "server": route.as_ref().map(|(_, s, _)| s.name.clone()),
+                    "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
                     "arguments": c.arguments, "round": rounds}))).await;
                 let args = Value::Object(c.arguments.clone());
                 // the call runs while the client is watched: one that leaves (the web app's Stop) ends it
-                let r = tokio::select! {
-                    r = hub.call(&c.name, &args) => r,
-                    _ = tx.closed() => return,
+                let r = if crate::memory::TOOL_NAMES.contains(&c.name.as_str()) && route.is_none() {
+                    mgr.memory.call(&c.name, &args, opts.memory.as_deref().unwrap_or("web"), conv.as_deref())
+                } else if let Some(h) = &hub {
+                    tokio::select! {
+                        r = h.call(&c.name, &args) => r,
+                        _ = tx.closed() => return,
+                    }
+                } else {
+                    json!({"ok": false, "text": format!("error: there is no tool named '{}'", c.name), "chars": 0, "truncated": false, "ms": 0})
                 };
                 tracing::info!("tool {}: {}, {} characters in {:.1} s{}", c.name, if r["ok"] == true { "ok" } else { "error" },
                                r["chars"], r["ms"].as_f64().unwrap_or(0.0) / 1000.0,

@@ -466,3 +466,6 @@ body.resizing iframe { pointer-events: none; }
 #mm-list .model-row__name span { white-space: normal; }
 .img-results video { width: 100%; border-radius: 8px; background: #000; }
 .media-model { max-width: 100%; }
+.mem-add { display: flex; gap: 8px; padding: 10px 14px; flex-wrap: wrap; }
+.mem-add .st-input:first-child { flex: 1 1 260px; min-width: 0; }
+.mem-add select { flex: 0 0 auto; width: auto; }

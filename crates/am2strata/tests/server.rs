@@ -828,3 +828,52 @@ fn media_jobs_show_in_api_calls_and_the_monitor() {
     let job = m["requests"].as_array().unwrap().iter().find(|r| r["kind"] == "image").cloned().unwrap();
     assert_eq!((job["finish"].as_str(), job["output"].as_str(), job["steps"].as_u64()), (Some("stop"), Some("1 image, 512x512"), Some(4)), "{job}");
 }
+
+fn prompt_text(line: &str) -> String {
+    common::tokenizer().decode(&common::line_ids(line)).unwrap()
+}
+
+#[test]
+fn memory_carries_a_conversation_past_the_context() {
+    let m = Model { context: 1024, ..Model::default() };
+    let s = Server::start(&[m], &[ids("It is Biscuit."), ids("x")], json!({}));
+    let filler = "The weather report said rain and wind and more rain over the hills for the whole week. ".repeat(12);
+    let mut messages = vec![user("My dog is called Biscuit."), json!({"role": "assistant", "content": "A fine name."})];
+    for i in 0..4 {
+        messages.push(user(&format!("Note {i}: {filler}")));
+        messages.push(json!({"role": "assistant", "content": "Noted."}));
+    }
+    messages.push(user("What is my dog called?"));
+    // without memory the request does not fit and is refused, as before
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": messages, "max_tokens": 64}));
+    assert_eq!(c, 400, "{r}");
+    // with it, the oldest turns go to the archive and the one that matches comes back in the <memory> block
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": messages, "max_tokens": 64, "strata_memory": true}));
+    assert_eq!(c, 200, "{r}");
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("<memory>") && p.contains("Biscuit"), "{p}");
+    assert!(p.contains("What is my dog called?"));
+    assert!(p.matches("Note ").count() < 4, "the oldest notes were moved out: {p}");
+    let st = s.get("/api/memory", true).1;
+    assert_eq!(st["conversations_archived"], 1, "{st}");
+}
+
+#[test]
+fn the_model_remembers_with_its_memory_tool() {
+    let call = "\n\n<tool_call>\n<function=remember>\n<parameter=fact>\nThe user's favourite colour is teal\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Save it.\n</think>{call}")), ids("Saved.\n</think>\n\nI will remember that.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Remember: my favourite colour is teal.")], "strata_memory": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "I will remember that.");
+    let st = s.get("/api/memory", true).1;
+    let f = &st["facts"][0];
+    assert_eq!((f["text"].as_str(), f["source"].as_str(), f["scope"].as_str()), (Some("The user's favourite colour is teal"), Some("model"), Some("api")), "{st}");
+    // facts are added and forgotten through the API too; a foreign page cannot
+    let (c, f2) = s.post("/api/memory", &json!({"text": "Deploys go to the 5060 Ti box", "scope": "all"}));
+    assert_eq!(c, 200, "{f2}");
+    let r = reqwest::blocking::Client::new().delete(format!("{}/api/memory/{}", s.base, f2["id"].as_str().unwrap())).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = reqwest::blocking::Client::new().post(format!("{}/api/memory", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").json(&json!({"text": "x"})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}

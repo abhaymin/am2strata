@@ -1223,6 +1223,7 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1554,7 +1555,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ Settings: sections
 let section = store.get("settings-section", "models");
 function showSection(name) {
-  section = ["models", "config", "defaults", "server", "tools", "appearance", "connect"].includes(name) ? name : "models";
+  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect"].includes(name) ? name : "models";
   store.set("settings-section", section);
   for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
   for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
@@ -1562,6 +1563,7 @@ function showSection(name) {
   if (section === "config") loadConfig();
   if (section === "defaults") { loadShared().then(loadDefaults); }
   if (section === "tools") loadMcp();
+  if (section === "memory") loadMemory();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
@@ -2328,3 +2330,56 @@ $("img-form").onsubmit = async (ev) => {
     $("img-go").disabled = false;
   }
 };
+
+// ------------------------------------------------------------------ Settings > Memory (GET/POST/DELETE /api/memory)
+async function loadMemory() {
+  $("mem-web").setAttribute("aria-checked", String(store.get("memory-web", true)));
+  let j;
+  try {
+    const r = await fetch("api/memory", {headers: headers()});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    j = await r.json();
+  } catch (e) { $("mem-list").innerHTML = `<p class="muted">Not loaded: ${esc(String(e.message || e))}</p>`; return; }
+  for (const [id, k] of [["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) $(id).setAttribute("aria-checked", String(!!j.settings[k]));
+  const facts = (j.facts || []).slice().sort((a, b) => b.created - a.created);
+  $("mem-sum").textContent = `${facts.length} fact(s) · ${j.conversations_archived} chat(s) with an archive`;
+  const who = {all: "everyone", web: "this web app", api: "API clients"};
+  $("mem-list").innerHTML = facts.length ? facts.map((f) => `<div class="model-row"><div class="model-row__name"><b>${esc(f.text)}</b>` +
+    `<span>${esc(who[f.scope] || f.scope)} · written by ${esc(f.source)} · ${new Date(f.created * 1000).toLocaleString()}</span></div>` +
+    `<button class="st-btn st-btn--secondary" data-forget="${esc(f.id)}">Forget</button></div>`).join("")
+    : `<p class="muted" style="padding:12px 14px">No facts yet. Tell the model something worth keeping, or add one above.</p>`;
+}
+$("mem-web").onclick = () => {
+  const on = $("mem-web").getAttribute("aria-checked") !== "true";
+  store.set("memory-web", on);
+  $("mem-web").setAttribute("aria-checked", String(on));
+};
+for (const [id, k] of [["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) {
+  $(id).onclick = async () => {
+    const on = $(id).getAttribute("aria-checked") !== "true";
+    try {
+      const r = await fetch("api/memory/settings", {method: "POST", headers: headers(true), body: JSON.stringify({[k]: on})});
+      if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+    } catch (e) { toast("error", "Not changed", String(e.message || e), 6000); }
+    loadMemory();
+  };
+}
+$("mem-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const text = $("mem-text").value.trim();
+  if (!text) return;
+  try {
+    const r = await fetch("api/memory", {method: "POST", headers: headers(true), body: JSON.stringify({text, scope: $("mem-scope").value})});
+    if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+    $("mem-text").value = "";
+  } catch (e) { toast("error", "Not added", String(e.message || e), 6000); }
+  loadMemory();
+};
+$("mem-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-forget]"); if (!b) return;
+  try {
+    const r = await fetch(`api/memory/${encodeURIComponent(b.dataset.forget)}`, {method: "DELETE", headers: headers(true)});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  } catch (err) { toast("error", "Not forgotten", String(err.message || err), 6000); }
+  loadMemory();
+});

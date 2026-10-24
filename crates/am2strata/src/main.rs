@@ -13,6 +13,7 @@ mod preview;
 mod manager;
 mod hub_api;
 mod mcp;
+mod memory;
 mod media;
 mod monitor;
 mod openai;
@@ -181,7 +182,7 @@ async fn main() -> Result<()> {
     for m in &models {
         tracing::info!(id = %m.id, context = m.cfg.max_context(), images = m.cfg.vision.is_some(), "installed model");
     }
-    let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout)));
+    let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout), expand(&args.data_dir)));
     for g in &mgr.hw.gpus {
         tracing::info!("GPU {}: {} ({} MiB, sm_{})", g.index, g.name, g.vram_mib, g.arch);
     }
@@ -232,6 +233,9 @@ async fn main() -> Result<()> {
         .route("/api/run", get(code_run::info).post(code_run::run))
         .route("/v1/images/generations", post(image_gen::generations))
         .route("/v1/videos/generations", post(image_gen::video_generations))
+        .route("/api/memory", get(memory::list).post(memory::add))
+        .route("/api/memory/settings", post(memory::set_settings))
+        .route("/api/memory/{id}", axum::routing::delete(memory::delete))
         .route("/api/media/models", get(image_gen::models))
         .route("/api/media/models/pull", get(image_gen::pull_status).post(image_gen::pull))
         .route("/api/media/models/default", post(image_gen::set_default))

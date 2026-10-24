@@ -304,6 +304,7 @@
         <button type="button" data-sec="defaults"><b>Chat defaults</b><span>Shared with other apps</span></button>
         <button type="button" data-sec="server"><b>Server and access</b><span>Address, API key, monitor</span></button>
         <button type="button" data-sec="tools"><b>Tools (MCP)</b><span>Tool servers for the chat</span></button>
+        <button type="button" data-sec="memory"><b>Memory</b><span>Facts kept on this PC, chats past the context</span></button>
         <button type="button" data-sec="appearance"><b>Appearance</b><span>Light, dark or system; accent</span></button>
         <button type="button" data-sec="connect"><b>Connect</b><span>Base URLs for your apps</span></button>
       </nav>
@@ -400,6 +401,34 @@
               same configs and models, run in the am2strata folder:</p>
             <pre class="snippet"><code>cargo run -q --release --bin am2strata-run -- install --port 8000</code><button class="st-btn st-btn--icon" data-copy="cargo run -q --release --bin am2strata-run -- install --port 8000" aria-label="Copy"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></pre>
             <p class="muted small"><code>am2strata-run uninstall</code> gives the boot service back to PolyStrata.</p>
+          </div>
+        </section>
+
+        <section class="set-panel" id="sec-memory" aria-labelledby="h-memory" hidden>
+          <h2 id="h-memory">Memory</h2>
+          <p class="muted small">Kept on this PC under Strata-data/memory. Nothing leaves it. API clients opt in per request with
+            <code>"strata_memory": true</code> (or <code>{"scope": "name"}</code> to keep their own facts apart).</p>
+          <div class="st-card toggle-row"><span>Use memory in this browser's chats<br><span class="muted small">This page's chats send
+            the opt-in; the switches below decide what it does.</span></span>
+            <button class="st-toggle" id="mem-web" role="switch" aria-checked="true" aria-label="Use memory in this browser's chats"></button></div>
+          <div class="st-card toggle-row"><span>The model can remember, recall and forget<br><span class="muted small">Three tools
+            the server runs itself: the model saves a fact when you tell it something worth keeping, and looks things up.</span></span>
+            <button class="st-toggle" id="mem-tools" role="switch" aria-checked="true" aria-label="Memory tools"></button></div>
+          <div class="st-card toggle-row"><span>Add matching facts to the prompt<br><span class="muted small">The facts that match your
+            message go in as a labelled block (marked as data, not instructions).</span></span>
+            <button class="st-toggle" id="mem-inject" role="switch" aria-checked="true" aria-label="Add matching facts"></button></div>
+          <div class="st-card toggle-row"><span>Continue chats past the context<br><span class="muted small">When a chat no longer fits
+            the model's context, its oldest turns move to this chat's archive instead of an error, and the parts that match your
+            newest message come back. Works with every model, at any context size.</span></span>
+            <button class="st-toggle" id="mem-extend" role="switch" aria-checked="true" aria-label="Continue chats past the context"></button></div>
+          <div class="st-card list-card">
+            <div class="req-head"><span class="card-title">Facts</span><span class="muted small" id="mem-sum"></span></div>
+            <form class="mem-add" id="mem-form">
+              <input class="st-input" id="mem-text" placeholder="Add a fact, e.g. I prefer answers in British English" autocomplete="off">
+              <select class="st-input" id="mem-scope" aria-label="Who sees it"><option value="all">everyone</option><option value="web">this web app</option><option value="api">API clients</option></select>
+              <button class="st-btn st-btn--primary" type="submit">Add</button>
+            </form>
+            <div id="mem-list"><p class="muted">Loading&hellip;</p></div>
           </div>
         </section>
 

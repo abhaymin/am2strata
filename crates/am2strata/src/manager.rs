@@ -141,6 +141,8 @@ pub struct Manager {
     switching: Mutex<()>,
     pub ready_timeout: Duration,
     pub monitor: Arc<crate::monitor::Monitor>,
+    /// facts and conversation archives (memory.rs), under <data>/memory
+    pub memory: Arc<crate::memory::Memory>,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -201,7 +203,7 @@ pub fn adapt(cfg: &RunConfig, hw: &Hardware) -> Result<(RunConfig, bool, Vec<Str
 }
 
 impl Manager {
-    pub fn new(models: Vec<ModelEntry>, models_dir: PathBuf, default_id: String, ready_timeout: Duration) -> Self {
+    pub fn new(models: Vec<ModelEntry>, models_dir: PathBuf, default_id: String, ready_timeout: Duration, memory_dir: PathBuf) -> Self {
         Self {
             models: std::sync::RwLock::new(models),
             models_dir,
@@ -212,6 +214,7 @@ impl Manager {
             switching: Mutex::new(()),
             ready_timeout,
             monitor: crate::monitor::Monitor::new(),
+            memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
         }
     }
 

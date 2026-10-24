@@ -71,7 +71,9 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "structured response_format with tools/MCP is not supported");
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned() };
+    let own_page = !crate::foreign_origin(&s, &headers) && headers.contains_key("origin");
+    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
+                              memory: crate::memory::scope_of(&req, own_page) };
     // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
     let mut mcp = None;
     if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
@@ -86,6 +88,18 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
                 return error(StatusCode::BAD_REQUEST, "invalid_request_error", "a forced tool_choice with MCP tools is not supported");
             }
             let names = extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect();
+            prep.tools.get_or_insert_with(Vec::new).extend(extra);
+            mcp = Some((hub, names));
+        }
+    }
+    // the memory tools (remember / recall / forget), run here like MCP tools, for a request that opted in
+    let mut mcp = mcp.map(|(h, n)| (Some(h), n));
+    if opts.memory.is_some() && s.mgr.memory.settings.read().unwrap().tools && validator.is_none() {
+        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        let extra: Vec<Value> = crate::memory::tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+        if !extra.is_empty() && strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_none() {
+            let (hub, mut names) = mcp.take().unwrap_or((None, std::collections::HashSet::new()));
+            names.extend(extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)));
             prep.tools.get_or_insert_with(Vec::new).extend(extra);
             mcp = Some((hub, names));
         }

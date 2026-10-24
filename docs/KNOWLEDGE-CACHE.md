@@ -1,6 +1,10 @@
 # Knowledge and caching above the KV cache — plan
 
-Status: plan, nothing built. UI mockups: `design/Knowledge.dc.html` (Settings › Knowledge).
+Status: **memory built** (2026-10-24, crates/am2strata/src/memory.rs, Settings › Memory): shared facts with scopes, the
+`remember` / `recall` / `forget` tools run by the server, matching facts added to the prompt, and conversations that
+continue past the model's context (the oldest turns moved to the conversation's archive and recalled when they
+match). Search is BM25 over words; embeddings (phase C), collections (B), the answer cache (A) and prompt snapshots (E)
+are still to do. UI mockups: `design/Knowledge.dc.html`.
 
 Today the only reuse is the engine's conversation cache: the KV state of the last conversation stays in memory, so a
 follow-up reads only what is new. It is gone when the model unloads, it holds one conversation (more with
@@ -100,7 +104,7 @@ measured on Orca and MiniCPM first.
 | A | Answer cache + Settings › Knowledge › Caches | server only |
 | B | Collections, keyword search, injection when asked | server only |
 | C | Embeddings (candle, CPU) + automatic injection | a Rust embedding crate |
-| D | Shared memory + remember/recall tool | B |
+| D | Shared memory + remember/recall tool - **done** (keyword search), plus chats past the context | B |
 | E | Prompt snapshots on disk (SAVE/RESTORE) | engine SAVE/RESTORE (exists), measurements |
 | F | Similar-question cache (opt-in), engine `EMBED` | C, engine change |
 
