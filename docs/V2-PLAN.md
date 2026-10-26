@@ -128,6 +128,13 @@ next: the GPU tier (dense weights and the hot experts in VRAM via candle), then 
 Run configs: `configs/strata-{nemotron-3.5-bolt,glm-4.7-flash,devstral-small}-*.json` (exe: am2strata-hybrid) (Nemotron Bolt, GLM-4.7-Flash, Devstral); `${AM2STRATA_HOME}` is this
 checkout (default ~/Development/am2strata).
 
+## Upstream
+
+`am2strata-run upstream-check` compares the ports with PolyStrata and Strata (`tools/upstream.json`). As of
+2026-10-26 they are current with PolyStrata main (b561a3b1) and with Strata 0.2.6's mtp_fetch and pack header;
+Strata 0.2's Hadamard-folded packs (native_experts v5) are refused by name until PolyStrata carries Strata 0.2's
+engine, and am2Strata's per-layer pruned packs are `am2strata native experts p1`.
+
 ## Alongside: the knowledge and memory cache
 
 [KNOWLEDGE-CACHE.md](KNOWLEDGE-CACHE.md) is the other v2 track, for text models, server side and independent of the media

@@ -25,7 +25,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 uuid.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 base64 = "0.22"
 sha2 = "0.10"
 jsonschema = { version = "0.30", default-features = false }

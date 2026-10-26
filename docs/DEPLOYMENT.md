@@ -141,6 +141,25 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Authorization: Bearer $KEY" -
 
 When PolyStrata's own `strata-orca` service is installed, these swap with it and give it back when am2Strata stops.
 
+## Keeping up with PolyStrata and Strata
+
+am2Strata runs PolyStrata's engines and carries ports of its server, tokenizer and pack tools in Rust;
+`tools/upstream.json` records which upstream file each port is current with (by git blob). To see what changed since:
+
+```bash
+am2strata-run upstream-check
+```
+
+It reads GitHub (set `GITHUB_TOKEN` to raise the rate limit) and your PolyStrata checkout, changes nothing, and lists:
+how far PolyStrata's main is past the port and how far your checkout is behind it; Strata's newest tags (Strata 0.2
+is not merged into PolyStrata yet - PolyStrata, and so the engines, carry Strata 0.1.45); and per ported file whether
+it changed upstream.
+
+Updating the engines (what was done on 2026-10-26): back up `engine-poly/` and `engine/`, `git pull --ff-only` in
+PolyStrata, rebuild with its own `setup.py` routine (`build_engine_poly`: build-poly, CUDA 13, sm_86 and sm_120) and,
+when the shared sources changed, `cmake --build build-dual --target strata` for Orca's engine; swap the binaries with a
+rename, never a copy over a running engine; restart am2Strata only when idle (`am2strata-run temp-service`).
+
 ## Folders
 
 The configs in `configs/` are written with two placeholders, so they can be shared:

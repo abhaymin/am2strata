@@ -1,0 +1,35 @@
+{
+ "about": "What am2Strata ports from upstream, and the git blob each port is current with. `am2strata-run upstream-check` compares these with the upstream repositories now. After porting a change, update the blob (git hash-object <file> in the upstream checkout) and `at`.",
+ "repos": {
+  "polystrata": {"github": "VecSzn/PolyStrata", "ref": "main", "at": "b561a3b1b389434f8e3485e734b666220f7cfd11", "checkout": "${STRATA_HOME}"},
+  "strata": {"github": "Niko1221/Strata", "ref": "v0.2.6", "latest_tags": true}
+ },
+ "files": [
+  {"repo": "polystrata", "path": "serve/server.py", "blob": "d669ce8d51a72c8d8116eb8063131e1e18a2dfff",
+   "rust": ["crates/am2strata/src/run.rs", "crates/am2strata/src/manager.rs", "crates/am2strata/src/openai.rs", "crates/am2strata/src/anthropic.rs", "crates/am2strata/src/responses.rs"]},
+  {"repo": "polystrata", "path": "serve/frontend.py", "blob": "0272317a327216cd1c2fdb8ac22af3e1ad7d871c",
+   "rust": ["crates/strata-frontend/src/output.rs", "crates/strata-frontend/src/formats.rs", "crates/strata-frontend/src/prompt.rs"]},
+  {"repo": "polystrata", "path": "serve/models.py", "blob": "97ceceb93d5b7f9f6a92d8a37f3749acbfc2ae02",
+   "rust": ["crates/strata-engine/src/lib.rs"]},
+  {"repo": "polystrata", "path": "serve/web/app.js", "blob": "2835bd4adf47c94030406de1490db3983597f519",
+   "rust": ["web/app.js"], "note": "am2Strata's web app has its own pages; upstream changes are adapted, not copied"},
+  {"repo": "polystrata", "path": "tools/strata_tokenizer.py", "blob": "5b832c35dd4aa74aa3ae9711d678f2097e8f8b9b",
+   "rust": ["crates/strata-tokenizer/src/lib.rs", "crates/strata-gguf/src/lib.rs"]},
+  {"repo": "polystrata", "path": "tools/strata_mcp.py", "blob": "0363934d4e43d3fa1f421254f0eaf22e4297a4fc",
+   "rust": ["crates/am2strata/src/mcp.rs"], "note": "its model catalog is setup's; am2Strata's own catalog is the Hub pull"},
+  {"repo": "polystrata", "path": "tools/iq_pack.py", "blob": "cb361824739a831a85dc57e66636dfdf297129af",
+   "rust": ["crates/strata-pack/src/iq_pack.rs"]},
+  {"repo": "polystrata", "path": "tools/mtp_pack.py", "blob": "2a0fb72fb7c731a7fb85c68c2278f3b62ef8b8ed",
+   "rust": ["crates/strata-pack/src/mtp_pack.rs"]},
+  {"repo": "polystrata", "path": "tools/mtp_rt.py", "blob": "db034cc62aa1127c3745701bfe51285d4d7a04df",
+   "rust": ["crates/strata-pack/src/mtp_rt.rs"]},
+  {"repo": "polystrata", "path": "tools/make_profile.py", "blob": "cf8599c09a2f58c02d92c729e5e7244c9c61da36",
+   "rust": ["crates/strata-hybrid/src/pack.rs"], "note": "the STRP profile format"},
+  {"repo": "polystrata", "path": "setup.py", "blob": "f8d0ea42b3f6e2f416c9607b4dc705b957574906",
+   "rust": ["crates/strata-hub/src/config.rs", "crates/strata-hub/src/pull.rs"], "note": "only its run-config and model checks"},
+  {"repo": "strata", "path": "tools/mtp_fetch.py", "blob": "8968dfa509581b657537da0047683b9fffb5cef1",
+   "rust": ["crates/strata-pack/src/mtp_fetch.rs"]},
+  {"repo": "strata", "path": "tools/iq_pack.py", "blob": "b33723a08cb1275343c2ff75a099e7fad766770b",
+   "rust": ["crates/strata-pack/src/iq_pack.rs"], "note": "only its native_experts v5 header (refused); the Hadamard packing itself is Strata 0.2's engine's"}
+ ]
+}

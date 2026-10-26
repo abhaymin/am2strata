@@ -108,6 +108,12 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         check_experts: usize,
     },
+    /// what upstream (PolyStrata, Strata) changed since am2Strata's ports: tools/upstream.json against GitHub, read-only
+    UpstreamCheck {
+        /// the manifest (default: tools/upstream.json in this checkout)
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+    },
     /// download an image (later: video, voice) model for the media engine into <data-dir>/media, e.g. z-image-turbo:q8
     MediaPull {
         model: String,
@@ -513,6 +519,7 @@ fn main() -> ExitCode {
         }
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
+        Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
@@ -541,6 +548,102 @@ fn expand_path(p: &std::path::Path) -> PathBuf {
 }
 
 /// The media engine's pull: its catalog's files for `model`, into <data-dir>/media (resumable, SHA-256 checked).
+/// `upstream-check`: per repository of tools/upstream.json, how far its branch is from the commit am2Strata ported
+/// (PolyStrata: also the local checkout), Strata's newest tag against the version PolyStrata carries, and per ported
+/// file whether upstream's blob changed since. Read-only: GitHub's API (GITHUB_TOKEN if set) and `git` in the checkout.
+fn upstream_check(manifest: Option<PathBuf>) -> ExitCode {
+    let path = manifest.map(|p| expand_path(&p)).unwrap_or_else(|| root().join("tools/upstream.json"));
+    let m: serde_json::Value = match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string())) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("{}: {e}", path.display()); return ExitCode::from(2); }
+    };
+    let client = reqwest::blocking::Client::builder().user_agent("am2strata-upstream-check").timeout(std::time::Duration::from_secs(60))
+        .build().expect("http client");
+    let gh = |url: &str| -> Result<serde_json::Value, String> {
+        let mut req = client.get(format!("https://api.github.com/{url}")).header("Accept", "application/vnd.github+json");
+        if let Ok(t) = std::env::var("GITHUB_TOKEN") {
+            req = req.bearer_auth(t);
+        }
+        let r = req.send().map_err(|e| e.to_string())?;
+        if !r.status().is_success() {
+            return Err(format!("GitHub {} for {url}", r.status()));
+        }
+        r.json().map_err(|e| e.to_string())
+    };
+    let git = |dir: &Path, args: &[&str]| std::process::Command::new("git").arg("-C").arg(dir).args(args).output().ok()
+        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let mut drift = 0;
+    let mut trees: std::collections::HashMap<String, std::collections::HashMap<String, String>> = Default::default();
+    for (key, r) in m["repos"].as_object().into_iter().flatten() {
+        let repo = r["github"].as_str().unwrap_or("");
+        let reference = r["ref"].as_str().unwrap_or("main");
+        println!("== {key} ({repo})");
+        if let Some(at) = r["at"].as_str() {
+            match gh(&format!("repos/{repo}/compare/{at}...{reference}")) {
+                Ok(c) => {
+                    let ahead = c["ahead_by"].as_u64().unwrap_or(0);
+                    drift += (ahead > 0) as u32;
+                    println!("  {reference} is {ahead} commit(s) past the port ({})", &at[..8.min(at.len())]);
+                    for x in c["commits"].as_array().into_iter().flatten().rev().take(8) {
+                        println!("    {} {}", &x["sha"].as_str().unwrap_or("")[..8], x["commit"]["message"].as_str().unwrap_or("").lines().next().unwrap_or(""));
+                    }
+                }
+                Err(e) => println!("  {e}"),
+            }
+        }
+        if let Some(co) = r["checkout"].as_str() {
+            let dir = PathBuf::from(strata_engine::expand_str(co));
+            match git(&dir, &["rev-parse", "HEAD"]) {
+                Some(head) => {
+                    let behind = gh(&format!("repos/{repo}/compare/{head}...{reference}")).ok().and_then(|c| c["ahead_by"].as_u64());
+                    let version = std::fs::read_to_string(dir.join("CMakeLists.txt")).ok()
+                        .and_then(|t| t.lines().find(|l| l.contains("project(strata VERSION")).map(|l| l.split_whitespace().nth(2).unwrap_or("").to_string()));
+                    println!("  local checkout {} at {} - {} commit(s) behind {reference}; carries Strata {}", dir.display(), &head[..8],
+                             behind.map(|b| b.to_string()).unwrap_or("?".into()), version.unwrap_or("?".into()));
+                }
+                None => println!("  local checkout {}: not a git checkout", dir.display()),
+            }
+        }
+        // a tagged repository is compared at its newest tag: what a port from it would take now
+        let mut compare_at = reference.to_string();
+        if r["latest_tags"] == true {
+            if let Ok(t) = gh(&format!("repos/{repo}/tags?per_page=3")) {
+                let tags: Vec<&str> = t.as_array().into_iter().flatten().filter_map(|x| x["name"].as_str()).collect();
+                println!("  newest tags: {} (ported from: {reference})", tags.join(", "));
+                if let Some(newest) = tags.first().filter(|t| **t != reference) {
+                    drift += 1;
+                    compare_at = newest.to_string();
+                }
+            }
+        }
+        println!("  files compared at {compare_at}");
+        match gh(&format!("repos/{repo}/git/trees/{compare_at}?recursive=1")) {
+            Ok(t) => {
+                trees.insert(key.clone(), t["tree"].as_array().into_iter().flatten()
+                    .filter_map(|x| Some((x["path"].as_str()?.to_string(), x["sha"].as_str()?.to_string()))).collect());
+            }
+            Err(e) => println!("  tree: {e}"),
+        }
+    }
+    println!("== ported files");
+    for f in m["files"].as_array().into_iter().flatten() {
+        let (repo, p, blob) = (f["repo"].as_str().unwrap_or(""), f["path"].as_str().unwrap_or(""), f["blob"].as_str().unwrap_or(""));
+        let now = trees.get(repo).and_then(|t| t.get(p));
+        let state = match now {
+            None => "gone or not read".to_string(),
+            Some(b) if b == blob => "current".to_string(),
+            Some(b) => {
+                drift += 1;
+                format!("CHANGED ({} -> {})", &blob[..8.min(blob.len())], &b[..8])
+            }
+        };
+        println!("  {:<11} {:<28} {:<22} -> {}", repo, p, state,
+                 f["rust"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+    }
+    println!("{}", if drift == 0 { "nothing to port" } else { "upstream has moved: see above (after porting, update tools/upstream.json)" });
+    ExitCode::SUCCESS
+}
+
 fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
     let exe = root().join("crates/strata-media/target/release/am2strata-media");
     if !exe.is_file() {

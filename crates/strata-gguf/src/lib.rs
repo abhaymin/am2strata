@@ -296,7 +296,6 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
         let p = dir.join(name);
         std::fs::write(&p, text).map_err(|e| io(&p, e))
     };
-    write("vocab.json", &py_json(&Value::Object(vocab)))?;
     if raw {
         write("merges.json", &py_json(&json!(merges)))?;
     } else {
@@ -313,6 +312,9 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     if let Some(tpl) = gguf.str("tokenizer.chat_template").filter(|t| !t.is_empty()) {
         write("chat_template.jinja", tpl)?;
     }
+    // last (PolyStrata 5e16c627): vocab.json is the sign that the folder is complete, so an extraction that stops part
+    // way is run again instead of leaving a tokenizer without its merges
+    write("vocab.json", &py_json(&Value::Object(vocab)))?;
     Ok(cfg)
 }
 

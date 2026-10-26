@@ -118,7 +118,8 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
     }
     let mut args = vec![json!("--model"), json!(model), json!("--max-context"), json!(ctx.to_string()),
                         json!("--expert-profile"), json!(pack.join("expert-profile.txt")),
-                        json!("--conversation-cache-mib"), json!("8192")];
+                        // strata-poly sizes it from the free RAM (PolyStrata b3f34db6)
+                        json!("--conversation-cache-mib"), json!("auto")];
     if arch == "qwen35moe" {
         args.extend([json!("--kv"), json!("q8_0")]);
     }
