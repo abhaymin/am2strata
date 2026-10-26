@@ -342,11 +342,33 @@ const DEEPSEEK3_SEQUENCE: [&str; 3] = [
             r"|\s*[\r\n]+", r"|\s+(?!\S)", r"|\s+"),
 ];
 
+/// `flint` (Flint 40B-A2.5B), llama.cpp's LLAMA_VOCAB_PRE_TYPE_FLINT: DeepSeek's three steps, the last one cutting a
+/// word where its capitals end, with English contractions kept on the word (PolyStrata strata_tokenizer.py).
+const FLINT_SEQUENCE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+        r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+        r"| ?[\p{P}\p{S}]+[\r\n]*",
+        r"|\s*[\r\n]+",
+        r"|\s+(?!\S)",
+        r"|\s+",
+    ),
+];
+
 /// (pre_pattern, pre_sequence, pre_pattern_source) as strata_tokenizer.py `extract` writes them.
 fn strata_patterns(pre: &str) -> (Value, Value, &'static str) {
-    let sequence = matches!(pre, "joyai-llm" | "deepseek-v3");
-    let pattern = if sequence {
-        DEEPSEEK3_SEQUENCE[2]
+    let seq: Option<[&str; 3]> = match pre {
+        "joyai-llm" | "deepseek-v3" => Some(DEEPSEEK3_SEQUENCE),
+        "flint" => Some(FLINT_SEQUENCE),
+        _ => None,
+    };
+    let sequence = seq.is_some();
+    let pattern = if let Some(q) = seq {
+        q[2]
     } else {
         match pre {
             "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" => GLM4_PATTERN,
@@ -366,7 +388,7 @@ fn strata_patterns(pre: &str) -> (Value, Value, &'static str) {
     } else {
         ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
     };
-    (json!(pattern), if sequence { json!(DEEPSEEK3_SEQUENCE) } else { Value::Null }, source)
+    (json!(pattern), seq.map(|q| json!(q)).unwrap_or(Value::Null), source)
 }
 
 #[cfg(test)]

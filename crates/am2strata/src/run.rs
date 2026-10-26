@@ -22,6 +22,13 @@ use tokio::sync::mpsc;
 const CTX_SLACK: usize = 8;
 /// #1053: what closes the thinking when a reply stopped inside it (reasoning_close_retry)
 const REASONING_CLOSE: &str = "\n</think>\n\n";
+
+/// REASONING_CLOSE or REASONING_WRAP_UP for a model whose thinking ends with `think_end` (PolyStrata 4ac7ea09
+/// closed_with): Gemma 4 ends it with <channel|>, its answer right after; a </think> there is text inside the thought
+/// and the model thinks on until max_tokens.
+fn closed_with(text: &str, think_end: &str) -> String {
+    if think_end == "</think>" { text.to_string() } else { text.replace("</think>\n\n", think_end) }
+}
 /// #728: the effort sentences the loop recovery swaps (the template's own xhigh one, and low)
 const HIGH_EFFORT: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, \
                            consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
@@ -391,6 +398,10 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let mut parser = if loaded.call_format == strata_frontend::formats::CallFormat::Gemma {
         let opened = !loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids);
         OutputParser::with_format(thinking, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened)
+    } else if loaded.call_format == strata_frontend::formats::CallFormat::Glm {
+        // GLM's template opens <think> in the prompt; Flint writes it itself, which the parser takes as the opening
+        let opened = prompt.opens_reasoning || (!loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids));
+        OutputParser::with_format(opened, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened)
     } else {
         OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false)
     };
@@ -588,7 +599,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             {
                 // #1053: the model wrote its reasoning and stopped before </think>: close it once and let it answer
                 close_retried = true;
-                let extra = lc.tok.encode(REASONING_CLOSE, true).unwrap_or_default();
+                let extra = lc.tok.encode(&closed_with(REASONING_CLOSE, parser.think_end()), true).unwrap_or_default();
                 if max_new.saturating_sub(n + extra.len()) >= 1 {
                     tracing::info!("the reply ended inside its thinking with no answer: closing the thinking once and continuing");
                     for t in &extra {
@@ -636,7 +647,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             // from the prefix the engine already holds
             let text = if wrap {
                 budget = None;
-                format!("{REASONING_WRAP_UP}{}", force.take().unwrap_or_default())
+                format!("{}{}", closed_with(REASONING_WRAP_UP, parser.think_end()), force.take().unwrap_or_default())
             } else {
                 let have = tail.len() - tail.trim_end_matches('\n').len();
                 format!("{}{}", "\n".repeat(2usize.saturating_sub(have)), force.take().unwrap_or_default())
@@ -809,6 +820,14 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemma_closes_its_thinking_with_its_own_tag() {
+        // PolyStrata 4ac7ea09: a </think> inside Gemma 4's thought is text, and it thought on until max_tokens
+        assert_eq!(closed_with(REASONING_CLOSE, "</think>"), REASONING_CLOSE);
+        assert_eq!(closed_with(REASONING_CLOSE, "<channel|>"), "\n<channel|>");
+        assert!(closed_with(REASONING_WRAP_UP, "<channel|>").ends_with("time to give my answer.\n<channel|>"));
+    }
 
     #[test]
     fn budget_leaves_the_answer_room() {

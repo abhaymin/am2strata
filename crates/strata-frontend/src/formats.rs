@@ -20,7 +20,8 @@ impl CallFormat {
     /// serve/server.py: "glm" for glm4/glm5, "gemma" for gemma4, "dsml" for joyai-llm/deepseek-v3, "lfm2" for lfm2.
     pub fn from_pre(pre: &str) -> Self {
         match pre {
-            "glm4" | "glm5" => CallFormat::Glm,
+            // Flint 40B-A2.5B writes GLM's calls (PolyStrata 4f773df4)
+            "glm4" | "glm5" | "flint" => CallFormat::Glm,
             "gemma4" => CallFormat::Gemma,
             "joyai-llm" | "deepseek-v3" => CallFormat::Dsml,
             "lfm2" => CallFormat::Lfm2,
@@ -44,7 +45,7 @@ impl CallFormat {
         match self {
             CallFormat::Function | CallFormat::Lfm2 => &["<|im_start|>"],
             CallFormat::Gemma => &["<|turn>"],
-            CallFormat::Glm => &["<|system|>", "<|user|>", "<|assistant|>", "<|observation|>"],
+            CallFormat::Glm => &["<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"],
             CallFormat::Dsml => &["<｜User｜>", "<｜Assistant｜>"],
         }
     }
@@ -59,10 +60,12 @@ impl CallFormat {
         }
     }
 
-    /// (what opens the reasoning in the reply, what ends it): Gemma opens it itself as a channel.
+    /// (what opens the reasoning in the reply, what ends it): Gemma opens it itself as a channel; GLM's template opens
+    /// <think> in the prompt, and Flint, which writes GLM's calls, writes it itself (PolyStrata frontend.py).
     pub fn think_tags(self) -> (&'static str, &'static str) {
         match self {
             CallFormat::Gemma => (GEMMA_THOUGHT, "<channel|>"),
+            CallFormat::Glm => ("<think>", "</think>"),
             _ => ("", "</think>"),
         }
     }
@@ -606,5 +609,54 @@ mod tests {
     fn gemma_turn_is_closed() {
         assert_eq!(gemma_model_turn("a<turn|>\n", true), "a<turn|>\n<|turn>model\n");
         assert_eq!(gemma_model_turn("a<turn|>\n<|channel>thought\n", false), "a<turn|>\n<|turn>model\n<|channel>thought\n<channel|>");
+    }
+}
+
+#[cfg(test)]
+mod flint_tests {
+    use super::*;
+    use crate::output::{Event, OutputParser};
+
+    const TEXT: &str = "<think>the user wants the capital</think>The capital of France is Paris.";
+
+    fn parts(thinking: bool, size: usize) -> (String, String) {
+        // Flint's template ends the prompt on <|assistant|>: the reply opens <think> itself (not `opened`)
+        let mut p = OutputParser::with_format(thinking, None, false, CallFormat::from_pre("flint"), false);
+        let chars: Vec<char> = TEXT.chars().collect();
+        let mut evs = Vec::new();
+        for c in chars.chunks(size) {
+            evs.extend(p.feed(&c.iter().collect::<String>()).unwrap());
+        }
+        evs.extend(p.finish(None));
+        let (mut r, mut c) = (String::new(), String::new());
+        for e in evs {
+            match e {
+                Event::Reasoning(t) => r.push_str(&t),
+                Event::Content(t) => c.push_str(&t),
+                _ => {}
+            }
+        }
+        (r, c)
+    }
+
+    /// PolyStrata serve/test_flint.py Reasoning
+    #[test]
+    fn flint_opens_its_own_thinking() {
+        assert_eq!(CallFormat::from_pre("flint"), CallFormat::Glm);
+        for size in [1, 3, TEXT.len()] {
+            assert_eq!(parts(true, size), ("the user wants the capital".into(), "The capital of France is Paris.".into()), "size {size}");
+        }
+        // its template has no switch to turn thinking off, so it thinks whatever the request says
+        assert_eq!(parts(false, 4), ("the user wants the capital".into(), "The capital of France is Paris.".into()));
+    }
+
+    /// PolyStrata serve/test_flint.py ServiceForFlint: llama.cpp ends a GLM-format reply at <|user|>, <|observation|>
+    /// and <|developer|>, which also open turns
+    #[test]
+    fn glm_turn_openers_include_the_developer_turn() {
+        let t = CallFormat::Glm.turn_openers();
+        for o in ["<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"] {
+            assert!(t.contains(&o), "{o}");
+        }
     }
 }

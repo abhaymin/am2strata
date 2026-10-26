@@ -377,6 +377,15 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         stop_ids.extend(one("<turn|>"));
         think_open_ids = tok.encode(strata_frontend::formats::GEMMA_THOUGHT, true).unwrap_or_default();
     }
+    if call_format == strata_frontend::formats::CallFormat::Glm {
+        // #70 (PolyStrata a8d9d6b0): GLM ends its turn with <|user|> and a tool call with <|observation|>, which
+        // llama.cpp's converter names eot and eom; a GGUF can name neither (REAP50: eos only) and the reply then ran
+        // on. Flint, which writes GLM's calls, also opens a developer turn.
+        for end in ["<|user|>", "<|observation|>", "<|developer|>"] {
+            stop_ids.extend(one(end));
+        }
+        think_open_ids = tok.encode("<think>", true).unwrap_or_default();
+    }
     let family = cfg.family();
     // the image encoder first: the engine sizes its expert cache to the VRAM it finds free, so an encoder started
     // after it finds none (PolyStrata starts them in this order too)

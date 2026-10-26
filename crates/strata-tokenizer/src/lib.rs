@@ -82,6 +82,23 @@ const DEEPSEEK3_SEQUENCE: [&str; 3] = [
     ),
 ];
 
+/// `flint` (Flint 40B-A2.5B), llama.cpp's LLAMA_VOCAB_PRE_TYPE_FLINT: DeepSeek's three steps, the last one cutting a
+/// word where its capitals end, with English contractions kept on the word (PolyStrata strata_tokenizer.py).
+const FLINT_SEQUENCE: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    concat!(
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+",
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+        r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*",
+        r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?",
+        r"| ?[\p{P}\p{S}]+[\r\n]*",
+        r"|\s*[\r\n]+",
+        r"|\s+(?!\S)",
+        r"|\s+",
+    ),
+];
+
 /// Words with more symbols than this go through the heap merge (same result, O(n log n)).
 const HEAP_MIN: usize = 64;
 
@@ -214,6 +231,7 @@ impl Tokenizer {
         let compile = |src: &str| Regex::new(src).map_err(|e| Error::Invalid(format!("pre-tokenizer pattern: {e}")));
         let sequence = match pre.as_str() {
             "joyai-llm" | "deepseek-v3" => Some(DEEPSEEK3_SEQUENCE.iter().map(|p| compile(p)).collect::<Result<Vec<_>>>()?),
+            "flint" => Some(FLINT_SEQUENCE.iter().map(|p| compile(p)).collect::<Result<Vec<_>>>()?),
             _ => None,
         };
         let pattern_src = match pre.as_str() {
@@ -222,6 +240,7 @@ impl Tokenizer {
             "gemma4" => GEMMA4_PATTERN,
             "tekken" => TEKKEN_PATTERN,
             "joyai-llm" | "deepseek-v3" => DEEPSEEK3_SEQUENCE[2],
+            "flint" => FLINT_SEQUENCE[2],
             _ => QWEN35_PATTERN,
         };
         let pattern = compile(pattern_src)?;
@@ -554,5 +573,22 @@ impl Detokenizer {
 
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod flint_tests {
+    use super::*;
+
+    /// PolyStrata serve/test_flint.py PreTokenizer: digits in threes, then ideographs, then words cut where their
+    /// capitals end, contractions kept on the word.
+    #[test]
+    fn flint_pieces_match_polystrata() {
+        let t = Tokenizer::new(vec!["a".into()], vec![], vec![1], "flint".into(), HashMap::new()).unwrap();
+        let p = |s: &str| t.pieces(s).unwrap().into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(p("1234567 dollars"), ["123", "456", "7", " dollars"]);
+        assert_eq!(p("你好ab"), ["你好", "ab"]);
+        assert_eq!(p("HTTPServer and McDonald's"), ["HTTPServer", " and", " Mc", "Donald's"]);
+        assert_eq!(p("they've  said.\n\n  x"), ["they've", " ", " said", ".\n\n", " ", " x"]);
     }
 }

@@ -890,7 +890,7 @@ let current = store.get("current-chat", chats[0] ? chats[0].id : null);
 if (!chats.some((c) => c.id === current)) current = chats[0] ? chats[0].id : null;
 let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
-let busy = null;                      // {controller, msg}
+let busy = null;                      // {controller, msg, cutoff?}
 
 const slim = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name})),
@@ -1022,7 +1022,11 @@ function msgEl(m, i) {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-regen aria-label="Regenerate" title="Regenerate">↻</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-prev aria-label="Previous variant" title="Previous variant">‹</button>` +
+      `<span class="swipe-count" data-swipe-count></span>` +
+      `<button class="st-btn st-btn--icon" data-msg-next aria-label="Next variant" title="Next variant">›</button></div>`;
     updateAssistant(el, m, false);
   }
   return el;
@@ -1101,6 +1105,13 @@ function updateAssistant(el, m, streaming) {
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+  // variants (PolyStrata PR 74): regenerate off while anything streams; the arrows when there is more than one
+  const n = Array.isArray(m.swipes) ? m.swipes.length : 1, idx = m.swipeIndex || 0;
+  const rg = el.querySelector("[data-msg-regen]"), pv = el.querySelector("[data-msg-prev]");
+  const nx = el.querySelector("[data-msg-next]"), cnt = el.querySelector("[data-swipe-count]");
+  if (rg) rg.disabled = streaming || !!busy;
+  for (const b of [pv, nx, cnt]) if (b) b.hidden = streaming || n < 2;
+  if (cnt) cnt.textContent = n > 1 ? `${idx + 1}/${n}` : "";
 }
 function renderChat() {
   const chat = $("chat");
@@ -1119,6 +1130,12 @@ $("chat").addEventListener("click", (e) => {
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const rg = e.target.closest("[data-msg-regen]");
+  if (rg) { regenerateMessage(+rg.closest(".st-msg").dataset.i); return; }
+  const pv = e.target.closest("[data-msg-prev]");
+  if (pv) { swipeGo(+pv.closest(".st-msg").dataset.i, -1); return; }
+  const nx = e.target.closest("[data-msg-next]");
+  if (nx) { swipeGo(+nx.closest(".st-msg").dataset.i, +1); return; }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -1140,7 +1157,10 @@ $("chat").addEventListener("toggle", (e) => {
 
 function apiMessages() {
   const out = [];
-  for (const m of messages) {
+  // regenerating an earlier answer: the history up to it (the later messages stay in the chat, not in this request)
+  const end = busy && busy.cutoff != null ? busy.cutoff + 1 : messages.length;
+  for (let k = 0; k < end; k++) {
+    const m = messages[k];
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
       const media = (m.media || []).filter((x) => x.frames || x.url);
@@ -1212,6 +1232,87 @@ async function send() {
   busy = {controller, msg: m};
   setBusy(true);
 
+  try {
+    await streamInto(m, el, controller.signal);
+  } catch (e) {
+    m.error = e.message || String(e);
+    toast("error", "The request failed", m.error, 6000);
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+  scrollDown();
+  if (!m.error && !m.stopped) afterAnswer(m);
+}
+
+// ------------------------------------------------------------------ variants (PolyStrata PR 74: swipes)
+// Each answer keeps its variants: m.text / reasoning / tools / meta hold the current one, m.swipes[m.swipeIndex]
+// mirrors it. Regenerating drops the variants after the current one and adds the new one at the end.
+function swipeSnapshot(m) {
+  return {text: m.text || "", reasoning: m.reasoning || "", tools: m.tools || null, meta: m.meta || null};
+}
+function swipeInit(m) {
+  if (!Array.isArray(m.swipes) || !m.swipes.length) { m.swipes = [swipeSnapshot(m)]; m.swipeIndex = 0; }
+}
+function swipeSave(m) { swipeInit(m); m.swipes[m.swipeIndex] = swipeSnapshot(m); }
+function swipeLoad(m) {
+  swipeInit(m);
+  const v = m.swipes[m.swipeIndex] || {};
+  Object.assign(m, {text: v.text || "", reasoning: v.reasoning || "", tools: v.tools || null, meta: v.meta || null,
+                    thinkSecs: null, stopped: false, error: null, limit: null});
+}
+function swipeGo(i, delta) {
+  if (busy) return;
+  const m = messages[i];
+  if (!m || m.role !== "assistant") return;
+  swipeInit(m);
+  const n = m.swipes.length;
+  if (n < 2) return;
+  swipeSave(m);
+  m.swipeIndex = (m.swipeIndex + delta + n) % n;
+  swipeLoad(m);
+  const el = $("chat").querySelector(`.st-msg[data-i="${i}"]`);
+  if (el) updateAssistant(el, m, false);
+  saveChat();
+}
+// A new answer at messages[i], kept beside the old one; on failure the old one comes back.
+async function regenerateMessage(i) {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const m = messages[i];
+  if (!m || m.role !== "assistant") return;
+  const el = $("chat").querySelector(`.st-msg[data-i="${i}"]`);
+  if (!el) return;
+  swipeSave(m);
+  m.swipes.length = m.swipeIndex + 1;
+  const keep = swipeSnapshot(m);
+  Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null});
+  const controller = new AbortController();
+  busy = {controller, msg: m, cutoff: i};
+  if (i < messages.length - 1) {
+    toast("info", "Regenerating an earlier answer",
+          `${messages.length - i - 1} later message(s) stay in the chat; this request sees the chat up to here.`, 7000);
+  }
+  setBusy(true);
+  updateAssistant(el, m, true);
+  try {
+    await streamInto(m, el, controller.signal);
+    m.swipes.push(swipeSnapshot(m));
+    m.swipeIndex = m.swipes.length - 1;
+  } catch (e) {
+    toast("error", "Regeneration failed", e.message || String(e), 6000);
+    Object.assign(m, keep, {error: null});
+    m.swipes[m.swipeIndex] = keep;
+  }
+  busy = null;
+  setBusy(false);
+  updateAssistant(el, m, false);
+  saveChat();
+}
+
+// The request and its stream into answer `m` (shared by send and regenerate). A Stop returns normally with m.stopped
+// set (the partial answer is kept); any other failure is thrown.
+async function streamInto(m, el, signal) {
   const body = {model: health.model, messages: withHints(apiMessages()), stream: true,
                 reasoning_effort: settings.thinking};
   if (!(settings.temperature > 0)) {
@@ -1228,8 +1329,7 @@ async function send() {
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                   signal: controller.signal});
+    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body), signal});
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
@@ -1272,9 +1372,12 @@ async function send() {
       }
     }
   } catch (e) {
-    if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    if (frame) cancelAnimationFrame(frame);
+    if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
+    if (e.name !== "AbortError") throw e;
+    m.stopped = true;
   }
+  if (frame) cancelAnimationFrame(frame);
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
@@ -1288,13 +1391,7 @@ async function send() {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
   if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
-  busy = null;
-  setBusy(false);
-  if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
-  saveChat();
-  scrollDown();
-  if (!m.error && !m.stopped) afterAnswer(m);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };

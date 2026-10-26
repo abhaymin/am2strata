@@ -867,6 +867,11 @@ impl OutputParser {
     }
 
     /// The reasoning's held text is exactly a `</think>` that has not been confirmed as the end yet.
+    /// What ends this format's reasoning (</think>, or Gemma's <channel|>).
+    pub fn think_end(&self) -> &'static str {
+        self.think_end
+    }
+
     pub fn holds_think_end(&self) -> bool {
         self.state == State::Reasoning && self.buf == self.think_end
     }

@@ -11537,12 +11537,8 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
-     "text": "Need weather."
-    },
-    {
      "kind": "content",
-     "text": "Checking."
+     "text": "Need weather.</think>Checking."
     },
     {
      "kind": "tool_call",
@@ -11600,12 +11596,8 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
-     "text": "Need weather."
-    },
-    {
      "kind": "content",
-     "text": "Checking."
+     "text": "Need weather.</think>Checking."
     },
     {
      "kind": "tool_start",
@@ -11675,56 +11667,84 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "N"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "d"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": " "
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "w"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "a"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "t"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "h"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "r"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "</"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": ">"
     },
     {
      "kind": "content",
@@ -11818,56 +11838,84 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "N"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "d"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": " "
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "w"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "a"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "t"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "h"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "e"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "r"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "."
+    },
+    {
+     "kind": "content",
+     "text": "</"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": ">"
     },
     {
      "kind": "content",
@@ -11973,24 +12021,32 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "Nee"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "d w"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "eat"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "her"
     },
     {
-     "kind": "reasoning",
-     "text": "."
+     "kind": "content",
+     "text": ".</"
+    },
+    {
+     "kind": "content",
+     "text": "thi"
+    },
+    {
+     "kind": "content",
+     "text": "nk>"
     },
     {
      "kind": "content",
@@ -12060,24 +12116,32 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "Nee"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "d w"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "eat"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "her"
     },
     {
-     "kind": "reasoning",
-     "text": "."
+     "kind": "content",
+     "text": ".</"
+    },
+    {
+     "kind": "content",
+     "text": "thi"
+    },
+    {
+     "kind": "content",
+     "text": "nk>"
     },
     {
      "kind": "content",
@@ -12159,12 +12223,16 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "Need we"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "ather."
+    },
+    {
+     "kind": "content",
+     "text": "</think>"
     },
     {
      "kind": "content",
@@ -12230,12 +12298,16 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "Need we"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "ather."
+    },
+    {
+     "kind": "content",
+     "text": "</think>"
     },
     {
      "kind": "content",
@@ -12767,12 +12839,8 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
-     "text": "say \"Paris.\""
-    },
-    {
      "kind": "content",
-     "text": "Paris"
+     "text": "say \"Paris.\"</think>Paris"
     }
    ]
   },
@@ -12787,52 +12855,80 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "s"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "a"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "y"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": " "
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "\""
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "P"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "a"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "r"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "i"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "s"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "."
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "\""
+    },
+    {
+     "kind": "content",
+     "text": "</"
+    },
+    {
+     "kind": "content",
+     "text": "t"
+    },
+    {
+     "kind": "content",
+     "text": "h"
+    },
+    {
+     "kind": "content",
+     "text": "i"
+    },
+    {
+     "kind": "content",
+     "text": "n"
+    },
+    {
+     "kind": "content",
+     "text": "k"
+    },
+    {
+     "kind": "content",
+     "text": ">"
     },
     {
      "kind": "content",
@@ -12867,24 +12963,32 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "say"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": " \"P"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "ari"
     },
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "s.\""
     },
     {
      "kind": "content",
-     "text": "P"
+     "text": "</t"
+    },
+    {
+     "kind": "content",
+     "text": "hin"
+    },
+    {
+     "kind": "content",
+     "text": "k>P"
     },
     {
      "kind": "content",
@@ -12907,16 +13011,16 @@
    "opened": false,
    "events": [
     {
-     "kind": "reasoning",
+     "kind": "content",
      "text": "say \"Pa"
     },
     {
-     "kind": "reasoning",
-     "text": "ris.\""
+     "kind": "content",
+     "text": "ris.\"</"
     },
     {
      "kind": "content",
-     "text": "P"
+     "text": "think>P"
     },
     {
      "kind": "content",
