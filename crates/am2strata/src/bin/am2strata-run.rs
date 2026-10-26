@@ -503,13 +503,11 @@ fn main() -> ExitCode {
                     }
                     if bad.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(strata_pack::mtp_fetch::BAD as u8) }
                 }
-                "inventory" => {
-                    src.resolve();
-                    done(strata_pack::mtp_fetch::inventory(&src, &out).map(|_| ()))
-                }
+                "inventory" => done(src.resolve().and_then(|_| strata_pack::mtp_fetch::inventory(&src, &out).map(|_| ()))),
                 _ => {
-                    src.resolve();
-                    done(strata_pack::mtp_fetch::fetch(&src, &out, only.as_deref()))
+                    strata_pack::mtp_fetch::exit_with_parent();
+                    let lock = strata_pack::mtp_fetch::lock_folder(&out, std::time::Duration::from_secs(900));
+                    done(lock.and_then(|_l| src.resolve().and_then(|_| strata_pack::mtp_fetch::fetch(&src, &out, only.as_deref()))))
                 }
             }
         }

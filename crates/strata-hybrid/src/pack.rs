@@ -104,7 +104,7 @@ impl Profile {
     }
 }
 
-/// The pack's index (index.txt v3) and its native experts (native_experts.txt v3 / v4).
+/// The pack's index (index.txt v3) and its native experts (native_experts.txt v3 / v4, or am2strata's p1).
 pub struct Pack {
     pub dir: std::path::PathBuf,
     /// float tensors stored in dense.bin: name -> (kind, offset, bytes)
@@ -138,6 +138,18 @@ impl Pack {
         }
         let mut experts = HashMap::new();
         if let Ok(text) = read("native_experts.txt") {
+            // by its header: strata's v3 / v4 and am2strata's p1 (per-layer pruned, an n_expert column); Strata 0.2's v5
+            // is Hadamard-folded experts, which only Strata 0.2's engine computes - refused, never misread
+            let head = text.lines().next().unwrap_or("");
+            if head.starts_with("# strata native experts v5:") {
+                return Err(format!("pack {}: native_experts.txt v5 holds Hadamard-folded experts (Strata 0.2), which this \
+                                    engine does not compute", dir.display()));
+            }
+            if !(head.starts_with("# strata native experts v3:") || head.starts_with("# strata native experts v4:")
+                 || head.starts_with("# am2strata native experts p1:")) {
+                return Err(format!("pack {}: native_experts.txt has a header this engine does not know: {:?}", dir.display(),
+                                   head.chars().take(48).collect::<String>()));
+            }
             for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
                 let f: Vec<&str> = line.split_whitespace().collect();
                 if f.len() >= 8 {

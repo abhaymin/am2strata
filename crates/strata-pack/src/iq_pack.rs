@@ -603,7 +603,8 @@ fn expert_layout(model: &Model, src: &Path) -> Result<(Vec<Layer>, String, u64, 
     let moe_layers: Vec<usize> = (0..n_layers).filter(|&l| router(l).is_some()).collect();
     let n_expert = moe_layers.iter().filter_map(|&l| router(l)).max().ok_or("no blk.N.ffn_gate_inp.weight")?;
     // every layer the same expert count: v3 / v4 as iq_pack.py writes them; a per-layer pruned model (e.g. NVIDIA's
-    // Nemotron 3.5 Bolt) gets v5, which adds the layer's count - read by am2strata-hybrid, not by strata's C++ engine
+    // Nemotron 3.5 Bolt) gets am2strata's own "p1", which adds the layer's count - read by am2strata-hybrid, not by
+    // strata's C++ engine. (Not "v5": Strata 0.2's v5 is its Hadamard-folded experts.)
     let pruned = moe_layers.iter().any(|&l| router(l) != Some(n_expert));
     let (mut layout, mut lines, mut offset, mut n_split) = (Vec::new(), Vec::<String>::new(), 0u64, 0usize);
     for &l in &moe_layers {
@@ -663,7 +664,7 @@ fn expert_layout(model: &Model, src: &Path) -> Result<(Vec<Layer>, String, u64, 
         offset += blob * n_expert;
     }
     let head = if pruned {
-        format!("# strata native experts v5: layer gu_type d_type offset blob_bytes gate_off up_off down_off n_expert [shard | gate,up,down] \
+        format!("# am2strata native experts p1: layer gu_type d_type offset blob_bytes gate_off up_off down_off n_expert [shard | gate,up,down] \
                  (n_expert up to {n_expert}, per layer; gate_off 0 for experts without a gate; total {offset}; absolute offsets in {}, \
                  or in the named shard beside it)\n", fname(src))
     } else if n_split > 0 {
@@ -729,6 +730,11 @@ pub fn run(o: &Options) -> Result<(), String> {
     let out = o.out.clone();
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let model = Model::open(&src)?;
+    if model.shards[0].g.metadata.contains_key("prism.hadamard.version") {
+        return Err(format!("{} holds Hadamard-folded experts (PRISM): their pack is Strata 0.2's (native_experts.txt v5 with \
+                            hadamard.txt) and runs on Strata 0.2's engine; this tool and these engines are Strata 0.1.45's",
+                           fname(&src)));
+    }
     if model.shards.len() > 1 {
         println!("model shards: {}", model.shards.iter().map(|s| fname(&s.path)).collect::<Vec<_>>().join(", "));
     }

@@ -467,6 +467,9 @@ impl Model {
             }
         }
         let g = meta.ok_or("no shards")?;
+        if g.metadata.contains_key("prism.hadamard.version") {
+            return Err("this GGUF holds Hadamard-folded experts (PRISM, Strata 0.2): they compute only on Strata 0.2's engine".into());
+        }
         let from_pack = match pack {
             Some(p) => p.apply(&mut tensors, &offsets)?,
             None => 0,

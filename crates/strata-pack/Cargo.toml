@@ -9,4 +9,5 @@ license.workspace = true
 strata-gguf.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }

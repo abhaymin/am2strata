@@ -8,13 +8,21 @@
 //!
 //! A range read must come back as 206 with the Content-Range asked for (a mirror that ignores Range sends the whole
 //! shard), and every tensor of the pinned revision is checked against its SHA-256.
+//!
+//! As Strata 0.2's mtp_fetch.py: a pinned revision gone from the Hub stops the fetch (STRATA_ALLOW_UNPINNED=1 reads
+//! the current files, still checked against the pinned SHA-256); ranges are read STRATA_DL_CONNECTIONS (16) at a time,
+//! in order, through the CDN address of the first redirect; a dropped connection ends only that try (fewer
+//! connections after it); one fetch writes a folder at a time (a lock file); STRATA_EXIT_WITH_PARENT=1 stops it with
+//! the process that started it; progress is one line every two seconds, in setup's form.
 
 use crate::num::py_json;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 pub const PINNED_REVISION: &str = "de4b8e4d43b917e7706784d8bb445c9af86a3540";
 pub const BAD: i32 = 3;
@@ -66,7 +74,11 @@ pub struct Source {
     revision: String,
     client: reqwest::blocking::Client,
     retries: u32,
+    /// a /resolve/ URL -> the signed CDN address its redirect led to, reused for CDN_TTL
+    cdn: Mutex<HashMap<String, (String, Instant)>>,
 }
+
+const CDN_TTL: Duration = Duration::from_secs(600);
 
 impl Source {
     pub fn from_env() -> Source {
@@ -82,19 +94,22 @@ impl Source {
         }
         let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(120)).user_agent("strata-mtp-fetch")
             .build().expect("http client");
-        Source { repo, pinned, revision, client, retries: 4 }
+        Source { repo, pinned, revision, client, retries: 6, cdn: Mutex::new(HashMap::new()) }
     }
 
     fn is_pinned(&self) -> bool {
         self.repo == self.pinned
     }
 
-    /// GET a URL (a byte range when `range` is given), retried four times with backoff.
+    /// GET a URL (a byte range when `range` is given), retried six times with backoff (at most 16 s), through the CDN
+    /// address an earlier redirect gave (forgotten after any error, so the next try asks the Hub again).
     fn get(&self, url: &str, range: Option<(u64, u64)>) -> Result<Vec<u8>, String> {
         let mut last = String::new();
         for attempt in 0..self.retries {
+            let used = self.cdn.lock().unwrap().get(url).filter(|(_, until)| *until > Instant::now()).map(|(u, _)| u.clone())
+                .unwrap_or_else(|| url.to_string());
             let r = (|| -> Result<Vec<u8>, String> {
-                let mut req = self.client.get(url);
+                let mut req = self.client.get(&used);
                 if let Some((a, b)) = range {
                     req = req.header("Range", format!("bytes={a}-{b}"));
                 }
@@ -111,20 +126,25 @@ impl Source {
                 } else if !resp.status().is_success() {
                     return Err(format!("HTTP {} for {url}", resp.status().as_u16()));
                 }
+                let landed = resp.url().to_string();
                 let data = resp.bytes().map_err(|e| e.to_string())?.to_vec();
                 if let Some((a, b)) = range {
                     if data.len() as u64 != b - a + 1 {
                         return Err(format!("short range read: {} of {}", data.len(), b - a + 1));
                     }
                 }
+                if used == url && landed != url {
+                    self.cdn.lock().unwrap().insert(url.to_string(), (landed, Instant::now() + CDN_TTL));
+                }
                 Ok(data)
             })();
             match r {
                 Ok(d) => return Ok(d),
                 Err(e) => {
+                    self.cdn.lock().unwrap().remove(url);
                     last = e;
                     if attempt + 1 < self.retries {
-                        std::thread::sleep(Duration::from_secs(1 << attempt));
+                        std::thread::sleep(Duration::from_secs((1u64 << attempt).min(16)));
                         eprintln!("retry {url}: {last}");
                     }
                 }
@@ -133,15 +153,95 @@ impl Source {
         Err(last)
     }
 
-    /// The pinned revision gone from the repository (a 404 on its index): read its current files (main).
-    pub fn resolve(&mut self) {
+    /// The pinned revision gone from the repository (a 404 on its index) stops the fetch, unless
+    /// STRATA_ALLOW_UNPINNED=1: then the current files (main) are read, their tensors still checked against the pinned
+    /// SHA-256 (Strata 0.2).
+    pub fn resolve(&mut self) -> Result<(), String> {
         let url = format!("{}model.safetensors.index.json", self.repo);
         if let Ok(r) = self.client.head(&url).send() {
-            if r.status().as_u16() == 404 && !self.repo.contains("/resolve/main/") {
-                eprintln!("the checkpoint's pinned revision {} is gone: reading its current files (main)", self.revision);
-                self.repo = self.repo.replace(&format!("/resolve/{}/", self.revision), "/resolve/main/");
+            if r.status().as_u16() == 404 && self.repo.contains(&format!("/resolve/{}/", self.revision)) {
+                if std::env::var("STRATA_ALLOW_UNPINNED").map(|v| v.trim() == "1").unwrap_or(false) {
+                    eprintln!("STRATA_ALLOW_UNPINNED=1: the checkpoint's pinned revision {} is gone: reading its current files (main); \
+                               every tensor is still checked against the pinned SHA256", self.revision);
+                    self.repo = self.repo.replace(&format!("/resolve/{}/", self.revision), "/resolve/main/");
+                } else {
+                    return Err(format!("the pinned version of the checkpoint ({}) is no longer on Hugging Face: update am2Strata \
+                                        (or set STRATA_ALLOW_UNPINNED=1 to read its current files)", self.revision));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// The bytes start..=last of `url`, in `chunk`-sized ranges, `workers` of them in flight at once, handed to
+    /// `sink` in order (a slow range holds only its own slot; the others read ahead, at most ~512 MiB).
+    fn ranged(&self, url: &str, start: u64, last: u64, chunk: u64, workers: usize, sink: &mut dyn FnMut(&[u8]) -> Result<(), String>)
+              -> Result<(), String> {
+        let mut spans = Vec::new();
+        let mut pos = start;
+        while pos <= last {
+            let e = (pos + chunk - 1).min(last);
+            spans.push((pos, e));
+            pos = e + 1;
+        }
+        if workers <= 1 || spans.len() <= 1 {
+            for (a, b) in spans {
+                sink(&self.get(url, Some((a, b)))?)?;
+            }
+            return Ok(());
+        }
+        let depth = workers.max((3 * workers).min(((512u64 << 20) / chunk.max(1)) as usize));
+        // results by span index; `next` is the span the sink takes next, a worker waits while it is `depth` ahead
+        let state = Mutex::new((HashMap::<usize, Result<Vec<u8>, String>>::new(), 0usize, 0usize, false)); // (done, next, handed, stop)
+        let cv = Condvar::new();
+        let n = spans.len();
+        std::thread::scope(|sc| -> Result<(), String> {
+            for _ in 0..workers.min(n) {
+                sc.spawn(|| loop {
+                    let i = {
+                        let mut g = state.lock().unwrap();
+                        loop {
+                            if g.3 || g.2 >= n {
+                                return;
+                            }
+                            if g.2 < g.1 + depth {
+                                break;
+                            }
+                            g = cv.wait(g).unwrap();
+                        }
+                        g.2 += 1;
+                        g.2 - 1
+                    };
+                    let r = self.get(url, Some(spans[i]));
+                    let mut g = state.lock().unwrap();
+                    g.0.insert(i, r);
+                    cv.notify_all();
+                });
+            }
+            let mut out = Ok(());
+            for i in 0..n {
+                let r = {
+                    let mut g = state.lock().unwrap();
+                    loop {
+                        if let Some(r) = g.0.remove(&i) {
+                            g.1 = i + 1;
+                            cv.notify_all();
+                            break r;
+                        }
+                        g = cv.wait(g).unwrap();
+                    }
+                };
+                if let Err(e) = r.and_then(|d| sink(&d)) {
+                    out = Err(e);
+                    break;
+                }
+            }
+            let mut g = state.lock().unwrap();
+            g.3 = true;
+            cv.notify_all();
+            drop(g);
+            out
+        })
     }
 
     fn shard_header(&self, shard: &str) -> Result<(u64, Map<String, Value>), String> {
@@ -174,8 +274,14 @@ pub fn inventory(src: &Source, out: &Path) -> Result<Vec<Value>, String> {
     shards.sort();
     shards.dedup();
     let (mut rows, mut total) = (Vec::new(), 0u64);
-    for shard in &shards {
-        let (base, header) = src.shard_header(shard)?;
+    // one small request pair per shard (28 of them): side by side, not one after the other (Strata 0.2: 28 s -> 4 s)
+    let k = connections().min(8).min(shards.len()).max(1);
+    let headers: Vec<Result<(u64, Map<String, Value>), String>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = shards.chunks(shards.len().div_ceil(k)).map(|part| sc.spawn(move || part.iter().map(|sh| src.shard_header(sh)).collect::<Vec<_>>())).collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    for (shard, h) in shards.iter().zip(headers) {
+        let (base, header) = h?;
         for (name, meta) in &header {
             if mtp.get(name).and_then(Value::as_str) == Some(*shard) {
                 let off = meta["data_offsets"].as_array().ok_or("no data_offsets")?;
@@ -226,36 +332,53 @@ pub fn fetch(src: &Source, out: &Path, only: Option<&str>) -> Result<(), String>
     let rows: Vec<Value> = if same { inv.unwrap()["tensors"].as_array().cloned().unwrap_or_default() } else { inventory(src, out)? };
     std::fs::create_dir_all(&tdir).map_err(|e| e.to_string())?;
     let mut manifest = Vec::new();
-    let chunk: u64 = 64 << 20;
-    for r in &rows {
+    let mut workers = connections();
+    let chunk: u64 = if workers > 1 { 16 << 20 } else { 64 << 20 };
+    let todo: Vec<&Value> = rows.iter().filter(|r| only.is_none_or(|o| r["name"].as_str().unwrap().contains(o))).collect();
+    let size = |p: &PathBuf| std::fs::metadata(p).map(|m| m.len()).ok();
+    let have_all: u64 = todo.iter().map(|r| {
+        let p = tdir.join(format!("{}.bin", r["name"].as_str().unwrap()));
+        size(&p).unwrap_or(0).min(r["bytes"].as_u64().unwrap())
+    }).sum();
+    let mut progress = Progress::new(todo.iter().map(|r| r["bytes"].as_u64().unwrap()).sum(), have_all);
+    progress.show(true);
+    for r in todo {
         let name = r["name"].as_str().unwrap();
-        if only.is_some_and(|o| !name.contains(o)) {
-            continue;
-        }
         let (start, end, bytes) = (r["start"].as_u64().unwrap(), r["end"].as_u64().unwrap(), r["bytes"].as_u64().unwrap());
         let shard = r["shard"].as_str().unwrap();
         let path = tdir.join(format!("{name}.bin"));
         let want = if src.is_pinned() { want_sha(name) } else { None };
-        let size = |p: &PathBuf| std::fs::metadata(p).map(|m| m.len()).ok();
         if path.exists() && !same && (want.is_none() || size(&path) != Some(bytes) || sha256_of(&path)? != want.unwrap()) {
             let _ = std::fs::remove_file(&path);
         }
         let mut digest = String::new();
-        for attempt in 0..2 {
+        let (mut attempt, mut net_fails) = (0, 0);
+        while attempt < 2 {
             let mut have = size(&path).unwrap_or(0);
             if have > bytes {
                 let _ = std::fs::remove_file(&path);
                 have = 0;
             }
             let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
-            let mut pos = start + have;
-            while pos <= end {
-                let e = (pos + chunk - 1).min(end);
-                f.write_all(&src.get(&format!("{}{shard}", src.repo), Some((pos, e)))?).map_err(|e| e.to_string())?;
-                pos = e + 1;
-                eprintln!("{name} {:.0}%", 100.0 * (pos - start) as f64 / bytes as f64);
-            }
+            let got = src.ranged(&format!("{}{shard}", src.repo), start + have, end, chunk, workers, &mut |d: &[u8]| {
+                f.write_all(d).map_err(|e| e.to_string())?;
+                progress.add(d.len() as u64);
+                Ok(())
+            });
             drop(f);
+            if let Err(e) = got {
+                // a timeout or a dropped connection mid-tensor ends only this try: what was written stays, the next try
+                // goes on after it with fewer connections (a link that drops 16 at once often holds 4)
+                net_fails += 1;
+                if net_fails > 3 {
+                    return Err(format!("{name}: the download keeps failing ({e}). Check the connection and try again - what is \
+                                        downloaded is kept; STRATA_SOURCE=modelscope reads the same files elsewhere"));
+                }
+                workers = (workers / 2).max(4).min(workers.max(1));
+                eprintln!("{name}: {e} - continuing with {workers} connections (try {})", net_fails + 1);
+                std::thread::sleep(Duration::from_secs((5 * net_fails as u64).min(20)));
+                continue;
+            }
             if size(&path) != Some(bytes) {
                 return Err(format!("{}: size {} != {bytes}", path.display(), size(&path).unwrap_or(0)));
             }
@@ -263,8 +386,10 @@ pub fn fetch(src: &Source, out: &Path, only: Option<&str>) -> Result<(), String>
             if want.is_none() || Some(digest.as_str()) == want {
                 break;
             }
+            progress.done = progress.done.saturating_sub(bytes);
             let _ = std::fs::remove_file(&path);
-            if attempt == 1 {
+            attempt += 1;
+            if attempt > 1 {
                 return Err(format!("{name}: sha256 {digest} is not the checkpoint's {} - the download source sends wrong data \
                                     (a mirror that ignores Range requests?)", want.unwrap()));
             }
@@ -274,8 +399,85 @@ pub fn fetch(src: &Source, out: &Path, only: Option<&str>) -> Result<(), String>
         m.insert("file".into(), json!(format!("tensors/{name}.bin")));
         m.insert("sha256".into(), json!(digest));
         manifest.push(Value::Object(m));
+        eprintln!("{name} done");
     }
+    progress.show(true);
     std::fs::write(out.join("mtp-manifest.json"), py_json(&Value::Array(manifest), Some(1))).map_err(|e| e.to_string())
+}
+
+/// Ranges read at once: STRATA_DL_CONNECTIONS (setup's download setting), else 16; 1 reads them one by one.
+pub fn connections() -> usize {
+    std::env::var("STRATA_DL_CONNECTIONS").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16).clamp(1, 32)
+}
+
+/// One line every two seconds, `  MTP draft layer: 1.23 / 5.04 GB (24%)`, the form of setup's download line (the
+/// app's progress parser reads it). `done` counts what an earlier run already has.
+struct Progress {
+    total: u64,
+    done: u64,
+    last: Option<Instant>,
+}
+
+impl Progress {
+    fn new(total: u64, done: u64) -> Self {
+        Progress { total, done, last: None }
+    }
+    fn add(&mut self, n: u64) {
+        self.done += n;
+        self.show(false);
+    }
+    fn show(&mut self, force: bool) {
+        if !force && self.last.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.last = Some(Instant::now());
+        if self.total > 0 {
+            let d = self.done.min(self.total);
+            eprintln!("  MTP draft layer: {:6.2} / {:.2} GB ({}%)", d as f64 / 1e9, self.total as f64 / 1e9, 100 * d / self.total);
+        }
+    }
+}
+
+/// Only one fetch writes a folder: a second one (a retry while the first still runs) waits for the first, then finds
+/// its tensors done. Keep the returned file open; Err when the first does not end in `wait`.
+pub fn lock_folder(out: &Path, wait: Duration) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
+    let f = std::fs::OpenOptions::new().create(true).append(true).read(true).open(out.join(".mtp_fetch.lock")).map_err(|e| e.to_string())?;
+    let end = Instant::now() + wait;
+    let mut told = false;
+    loop {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(f);
+        }
+        if Instant::now() > end {
+            return Err(format!("another MTP download is still writing {}: wait for it or end it, then try again", out.display()));
+        }
+        if !told {
+            eprintln!("another MTP download is writing {}: waiting for it to end", out.display());
+            told = true;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// STRATA_EXIT_WITH_PARENT=1 (set by a setup that runs this): end when the process that started this one ends, so a
+/// cancelled setup does not leave a download running on its own.
+pub fn exit_with_parent() {
+    if std::env::var("STRATA_EXIT_WITH_PARENT").map(|v| v.trim() != "1").unwrap_or(true) {
+        return;
+    }
+    let parent = unsafe { libc::getppid() };
+    if parent <= 1 {
+        return;
+    }
+    std::thread::spawn(move || loop {
+        if unsafe { libc::getppid() } != parent {
+            eprintln!("the process that started this download has ended: stopping");
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+    });
 }
 
 /// The fetched tensors against SHA256 -> the names that are missing or wrong ([] when there is nothing to check).
