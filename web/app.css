@@ -473,3 +473,9 @@ body.resizing iframe { pointer-events: none; }
 .swipe-count { font-size: 11px; opacity: 0.7; padding: 0 4px; align-self: center; }
 .st-msg__meta { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .st-msg__meta [data-msg-regen]:disabled { opacity: 0.4; cursor: not-allowed; }
+/* speech: the Audio tab, the chat's mic and read-aloud */
+.audio-forms { display: grid; gap: 12px; }
+.stt-out { display: grid; gap: 8px; }
+.rec-on { color: var(--st-danger, #e5484d) !important; }
+#stt-rec.rec-on { border-color: currentColor; }
+.img-results audio { width: 100%; }

@@ -17,6 +17,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex;
 
 pub const DEFAULT_MODEL: &str = "z-image-turbo:q8";
+pub const DEFAULT_STT_MODEL: &str = "whisper-large-v3-turbo";
+pub const DEFAULT_TTS_MODEL: &str = "parler-tts-mini-v1";
 /// Wan 2.2 TI2V-5B (Apache-2.0): text or image to video, 16.9 GB at Q8
 pub const DEFAULT_VIDEO_MODEL: &str = "wan22-ti2v-5b:q8";
 
@@ -32,6 +34,11 @@ pub struct Media {
     /// <data>/media/am2strata.json)
     model: std::sync::RwLock<String>,
     video_model: std::sync::RwLock<String>,
+    /// speech to text and text to speech (v2.3), and where they run: "auto" (the CPU when the RAM has room for the
+    /// model, else the GPU with the text model stopped, as for an image), "cpu" or "cuda"
+    stt_model: std::sync::RwLock<String>,
+    tts_model: std::sync::RwLock<String>,
+    pub audio_device: std::sync::RwLock<String>,
     /// the media download in progress or last finished: {"state": "idle" | "pulling" | "done" | "error", ...}
     pub pull_job: std::sync::Mutex<Value>,
     pub keep_text_model: bool,
@@ -61,6 +68,9 @@ impl Media {
             exe: find_exe(),
             model: std::sync::RwLock::new(chosen.or_else(|| cfg["model"].as_str().map(str::to_string)).unwrap_or_else(|| DEFAULT_MODEL.to_string())),
             video_model: std::sync::RwLock::new(video),
+            stt_model: std::sync::RwLock::new(saved["stt_model"].as_str().unwrap_or(DEFAULT_STT_MODEL).to_string()),
+            tts_model: std::sync::RwLock::new(saved["tts_model"].as_str().unwrap_or(DEFAULT_TTS_MODEL).to_string()),
+            audio_device: std::sync::RwLock::new(saved["audio_device"].as_str().unwrap_or("auto").to_string()),
             pull_job: std::sync::Mutex::new(json!({"state": "idle"})),
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
@@ -80,14 +90,27 @@ impl Media {
         self.video_model.read().unwrap().clone()
     }
 
-    fn set_model(&self, kind: &str, m: &str) -> anyhow::Result<()> {
+    pub fn stt_model(&self) -> String {
+        self.stt_model.read().unwrap().clone()
+    }
+
+    pub fn tts_model(&self) -> String {
+        self.tts_model.read().unwrap().clone()
+    }
+
+    /// `kind`: "image", "video", "stt", "tts" (the model) or "audio_device" (where speech runs).
+    pub fn set_model(&self, kind: &str, m: &str) -> anyhow::Result<()> {
         match kind {
             "video" => *self.video_model.write().unwrap() = m.to_string(),
+            "stt" => *self.stt_model.write().unwrap() = m.to_string(),
+            "tts" => *self.tts_model.write().unwrap() = m.to_string(),
+            "audio_device" => *self.audio_device.write().unwrap() = m.to_string(),
             _ => *self.model.write().unwrap() = m.to_string(),
         }
         std::fs::create_dir_all(&self.mold_home)?;
-        std::fs::write(self.mold_home.join("am2strata.json"),
-                       serde_json::to_string_pretty(&json!({"image_model": self.model(), "video_model": self.video_model()}))?)?;
+        std::fs::write(self.mold_home.join("am2strata.json"), serde_json::to_string_pretty(&json!({
+            "image_model": self.model(), "video_model": self.video_model(), "stt_model": self.stt_model(),
+            "tts_model": self.tts_model(), "audio_device": self.audio_device.read().unwrap().clone()}))?)?;
         Ok(())
     }
 
@@ -130,7 +153,7 @@ impl Media {
             };
             match v["event"].as_str().unwrap_or("") {
                 "error" => anyhow::bail!("{}", v["message"].as_str().unwrap_or("the media engine failed")),
-                "done" | "loaded" | "pulled" | "unloaded" | "models" => return Ok(v),
+                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" => return Ok(v),
                 _ => on_event(&v),
             }
         }
@@ -216,36 +239,26 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
 }
 
-/// Speech models planned for v2.3 (no engine yet): listed so that every kind is visible in Settings > Models.
-const AUDIO_PLANNED: &[(&str, &str, &str, f64)] = &[
-    ("whisper-large-v3-turbo", "Whisper large-v3 turbo", "speech to text (99 languages)", 1.6),
-    ("parakeet-tdt-0.6b-v3", "Parakeet TDT 0.6B v3", "speech to text (25 European languages)", 1.2),
-    ("qwen3-tts-1.7b", "Qwen3-TTS 1.7B", "text to speech, voice cloning", 3.8),
-    ("kokoro-82m", "Kokoro 82M", "text to speech, small and fast", 0.3),
-];
-
 /// GET /api/media/models: the media engine's catalog (image, video, 3D) with what is downloaded, the image model in
 /// use, the download in progress, and the speech models still to come.
 pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    let audio: Vec<Value> = AUDIO_PLANNED.iter().map(|(n, d, what, gb)| json!({"name": n, "display_name": d, "kind": "audio",
-        "description": what, "size_gb": gb, "downloaded": false, "planned": "v2.3"})).collect();
     let pull = s.media.pull_job.lock().unwrap().clone();
-    let base = json!({"engine": s.media.available(), "image_model": s.media.model(), "video_model": s.media.video_model(), "pull": pull});
+    let base = json!({"engine": s.media.available(), "image_model": s.media.model(), "video_model": s.media.video_model(),
+                      "stt_model": s.media.stt_model(), "tts_model": s.media.tts_model(),
+                      "audio_device": s.media.audio_device.read().unwrap().clone(), "pull": pull});
     if !s.media.available() {
         let mut v = base;
-        v["models"] = json!(audio);
+        v["models"] = json!([]);
         v["note"] = json!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
         return Json(v).into_response();
     }
     match s.media.call(json!({"op": "list"}), |_| {}).await {
         Ok(r) => {
-            let mut all = r["models"].as_array().cloned().unwrap_or_default();
-            all.extend(audio);
             let mut v = base;
-            v["models"] = json!(all);
+            v["models"] = r["models"].clone();
             Json(v).into_response()
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
@@ -304,13 +317,16 @@ pub async fn set_default(State(s): State<AppState>, headers: HeaderMap, Json(req
         let found = list["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model).cloned());
         match found {
             None => return bad(format!("{model} is not in the media catalog")),
-            Some(m) if m["kind"] != "image" && m["kind"] != "video" => return bad(format!("{model} is a {} model; only image and video models can be chosen", m["kind"].as_str().unwrap_or("?"))),
+            Some(m) if !matches!(m["kind"].as_str(), Some("image" | "video" | "audio")) => return bad(format!("{model} is a {} model; image, video and audio models can be chosen", m["kind"].as_str().unwrap_or("?"))),
             Some(m) if m["downloaded"] != true => return bad(format!("{model} is not downloaded yet")),
+            // an audio model is the speech-to-text or the text-to-speech one, by its task
+            Some(m) if m["kind"] == "audio" => kind = m["task"].as_str().unwrap_or("stt").to_string(),
             Some(m) => kind = m["kind"].as_str().unwrap_or("image").to_string(),
         }
     }
     match s.media.set_model(&kind, model) {
-        Ok(()) => Json(json!({"kind": kind, "model": model, "image_model": s.media.model(), "video_model": s.media.video_model()})).into_response(),
+        Ok(()) => Json(json!({"kind": kind, "model": model, "image_model": s.media.model(), "video_model": s.media.video_model(),
+                              "stt_model": s.media.stt_model(), "tts_model": s.media.tts_model()})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", format!("{e:#}")),
     }
 }

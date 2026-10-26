@@ -8,7 +8,7 @@ license = "MIT AND Apache-2.0"
 
 [features]
 default = []
-cuda = ["mold-ai-inference/cuda"]
+cuda = ["mold-ai-inference/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 cudnn = ["mold-ai-inference/cudnn"]
 
 [dependencies]
@@ -20,6 +20,13 @@ serde = { version = "1", features = ["derive"] }
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 base64 = "0.22"
+# speech (v2.3): candle's Whisper and Parler-TTS, at the revision mold pins; all pure Rust
+candle-core = { package = "candle-core-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-nn = { package = "candle-nn-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-transformers = { package = "candle-transformers-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [[bin]]
 name = "am2strata-media"

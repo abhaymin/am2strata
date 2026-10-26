@@ -51,8 +51,14 @@ workspace with mold's lock file, so the server builds as before and the media en
    step caching. Each change measured against v2.0.
 3. **v2.2 video:** `/v1/videos` (create, poll, download); Wan 2.2 TI2V-5B, then A14B with the expert swap (async copy on
    a second CUDA stream), then LTX block streaming; progress in Monitor.
-4. **v2.3 voice:** `/v1/audio/transcriptions` and `/translations` (Whisper on candle, CPU first), `/v1/audio/speech`
-   (Qwen3-TTS, Kokoro); a mic in the chat, read answers aloud, streaming.
+4. **v2.3 voice - built (2026-10-26):** in am2strata-media, on candle: Whisper (large-v3-turbo, small, base) for speech
+   to text with language detection and translation to English, and Parler-TTS mini v1 for text to speech (the voice
+   described in words; four named voices). OpenAI's `/v1/audio/transcriptions`, `/translations` (multipart or JSON;
+   json, text, verbose_json, srt, vtt) and `/v1/audio/speech` (WAV). Speech runs on the CPU when the free RAM has room
+   for the model, else as a GPU job with the text model stopped (Settings: auto / CPU / GPU). Web app: Media
+   Generation > Audio (record or a file, transcribe or translate; text to speech with a player and a download), a
+   microphone in the chat that dictates into the message, and "read aloud" on every answer. Audio jobs show in
+   Monitor and API calls. Not yet: streaming speech as it is made, Kokoro / Qwen3-TTS, non-English speech out.
 5. **v2.4 dense text models** (Qwen3, Llama 3.x, Gemma 3, Mistral): `strata-dense` in Rust on candle (its quantized
    GGUF models), placing layers instead of experts, with KV streaming and the conversation cache. Gate: the same token
    ids as llama.cpp at temperature 0.

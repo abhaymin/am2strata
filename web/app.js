@@ -189,6 +189,9 @@ async function loadMediaModels() {
   } catch (e) { pickerNote("Models not loaded: the server is not reachable"); return; }
   renderMediaModels();
   fillModelPickers();
+  if (media.audio_device) $("audio-device").value = media.audio_device;
+  const sttReady = (media.models || []).some((m) => m.kind === "audio" && m.task === "stt" && m.downloaded);
+  $("mic-btn").hidden = !sttReady;
   clearTimeout(mmTimer);
   if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(loadMediaModels, 3000);
 }
@@ -202,9 +205,11 @@ function renderMediaModels() {
   $("mm-status").textContent = !media.engine ? (media.note || "The media engine is not built.")
     : p.state === "pulling" ? `Downloading ${p.model}\u2026 (generation waits until it finishes)`
     : p.state === "error" ? `Download of ${p.model} failed: ${p.error}`
-    : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model} · videos use ${media.video_model}`;
+    : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model} · videos use ${media.video_model} · ` +
+      `speech to text ${media.stt_model} · text to speech ${media.tts_model}`;
   $("mm-list").innerHTML = rows.length ? rows.map((m) => {
-    const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model);
+    const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model) ||
+      (m.kind === "audio" && (m.task === "tts" ? m.name === media.tts_model : m.name === media.stt_model));
     const facts = [m.family, m.size_gb ? `${m.size_gb} GB` : null, m.gated ? "licence to accept on Hugging Face" : null, m.description]
       .filter(Boolean).join(" · ");
     const badge = m.planned ? `<span class="st-badge">Planned (${esc(m.planned)})</span>`
@@ -213,7 +218,8 @@ function renderMediaModels() {
     const pulling = p.state === "pulling";
     const btn = m.planned ? ""
       : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? "Downloading\u2026" : "Download"}</button>`
-      : (m.kind === "image" || m.kind === "video") && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.kind}s</button>` : "";
+      : (m.kind === "image" || m.kind === "video") && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.kind}s</button>`
+      : m.kind === "audio" && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.task === "tts" ? "speech" : "transcripts"}</button>` : "";
     return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.name)}</b><span>${esc(m.name)} · ${esc(facts)}</span></div>${badge}${btn}</div>`;
   }).join("") : `<p class="muted" style="padding:12px 14px">Nothing matches.</p>`;
 }
@@ -248,8 +254,9 @@ $("mm-list").addEventListener("click", async (e) => {
 // Media Generation: Image and Video, each with its model picker (the downloaded models of that kind); Audio is coming
 function fillModelPickers() {
   for (const sel of document.querySelectorAll(".media-model")) {
-    const kind = sel.dataset.kind, current = kind === "video" ? media.video_model : media.image_model;
-    const have = (media.models || []).filter((m) => m.kind === kind && m.downloaded);
+    const kind = sel.dataset.kind, task = sel.dataset.task;
+    const current = kind === "video" ? media.video_model : kind === "audio" ? (task === "tts" ? media.tts_model : media.stt_model) : media.image_model;
+    const have = (media.models || []).filter((m) => m.kind === kind && m.downloaded && (!task || m.task === task));
     const opts = have.map((m) => `<option value="${esc(m.name)}"${m.name === current ? " selected" : ""}>${esc(m.display_name || m.name)} (${esc(m.name)}, ${m.size_gb} GB)</option>`);
     if (!have.some((m) => m.name === current)) opts.unshift(`<option value="${esc(current)}" selected>${esc(current)} - not downloaded</option>`);
     opts.push(`<option value="__more">Download more in Settings &gt; Models&hellip;</option>`);
@@ -262,7 +269,7 @@ for (const sel of document.querySelectorAll(".media-model")) {
     try {
       const r = await fetch("api/media/models/default", {method: "POST", headers: headers(true), body: JSON.stringify({model: sel.value})});
       if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
-      toast("success", "Model changed", `New ${sel.dataset.kind}s use ${sel.value}.`);
+      toast("success", "Model changed", `New ${sel.dataset.task ? (sel.dataset.task === "tts" ? "speech" : "transcripts") : sel.dataset.kind + "s"} use ${sel.value}.`);
     } catch (err) { toast("error", "Not changed", String(err.message || err), 8000); }
     loadMediaModels();
   };
@@ -271,12 +278,7 @@ $("media-kinds").addEventListener("click", (e) => {
   const b = e.target.closest("[data-kind]"); if (!b) return;
   for (const x of $("media-kinds").children) x.setAttribute("aria-selected", String(x === b));
   const k = b.dataset.kind;
-  $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("img-results").hidden = k === "audio";
-  $("media-soon").hidden = k !== "audio";
-  if (k === "audio") {
-    $("media-soon-title").textContent = "Audio";
-    $("media-soon-text").textContent = "Speech comes in v2.3: speech to text (Whisper, Parakeet) and text to speech (Qwen3-TTS, Kokoro). The planned models are listed in Settings > Models.";
-  }
+  $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
 });
 $("vid-form").onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1023,6 +1025,7 @@ function msgEl(m, i) {
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
       `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button>` +
+      `<button class="st-btn st-btn--icon" data-msg-speak aria-label="Read aloud" title="Read aloud" hidden>${icon("volume")}</button>` +
       `<button class="st-btn st-btn--icon" data-msg-regen aria-label="Regenerate" title="Regenerate">↻</button>` +
       `<button class="st-btn st-btn--icon" data-msg-prev aria-label="Previous variant" title="Previous variant">‹</button>` +
       `<span class="swipe-count" data-swipe-count></span>` +
@@ -1105,6 +1108,8 @@ function updateAssistant(el, m, streaming) {
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
+  const sp = el.querySelector("[data-msg-speak]");
+  if (sp) sp.hidden = streaming || !m.text || !(media.models || []).some((x) => x.kind === "audio" && x.task === "tts" && x.downloaded);
   // variants (PolyStrata PR 74): regenerate off while anything streams; the arrows when there is more than one
   const n = Array.isArray(m.swipes) ? m.swipes.length : 1, idx = m.swipeIndex || 0;
   const rg = el.querySelector("[data-msg-regen]"), pv = el.querySelector("[data-msg-prev]");
@@ -1132,6 +1137,8 @@ $("chat").addEventListener("click", (e) => {
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
   const rg = e.target.closest("[data-msg-regen]");
   if (rg) { regenerateMessage(+rg.closest(".st-msg").dataset.i); return; }
+  const sk = e.target.closest("[data-msg-speak]");
+  if (sk) { readAloud(+sk.closest(".st-msg").dataset.i, sk); return; }
   const pv = e.target.closest("[data-msg-prev]");
   if (pv) { swipeGo(+pv.closest(".st-msg").dataset.i, -1); return; }
   const nx = e.target.closest("[data-msg-next]");
@@ -2480,3 +2487,179 @@ $("mem-list").addEventListener("click", async (e) => {
   } catch (err) { toast("error", "Not forgotten", String(err.message || err), 6000); }
   loadMemory();
 });
+
+// ------------------------------------------------------------------ speech (POST /v1/audio/transcriptions, /v1/audio/speech)
+// The microphone is recorded as raw samples (Web Audio) and sent as a 16 kHz WAV: what the server's decoder reads
+// (browsers record Opus otherwise). getUserMedia needs a secure page: https, or http://localhost.
+const recorder = {stream: null, ctx: null, node: null, chunks: [], rate: 48000, on: false};
+async function recStart() {
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    throw new Error("the microphone needs this page on https or on http://localhost (the browser allows it nowhere else)");
+  }
+  recorder.stream = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}});
+  recorder.ctx = new AudioContext();
+  recorder.rate = recorder.ctx.sampleRate;
+  const src = recorder.ctx.createMediaStreamSource(recorder.stream);
+  recorder.node = recorder.ctx.createScriptProcessor(4096, 1, 1);
+  recorder.chunks = [];
+  recorder.node.onaudioprocess = (e) => recorder.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  src.connect(recorder.node);
+  recorder.node.connect(recorder.ctx.destination);
+  recorder.on = true;
+}
+async function recStop() {
+  recorder.on = false;
+  recorder.node && recorder.node.disconnect();
+  recorder.stream && recorder.stream.getTracks().forEach((t) => t.stop());
+  await (recorder.ctx && recorder.ctx.close());
+  const n = recorder.chunks.reduce((a, c) => a + c.length, 0);
+  if (!n) throw new Error("nothing was recorded");
+  const all = new Float32Array(n);
+  let at = 0;
+  for (const c of recorder.chunks) { all.set(c, at); at += c.length; }
+  // to 16 kHz with the browser's own resampler
+  const off = new OfflineAudioContext(1, Math.ceil(n * 16000 / recorder.rate), 16000);
+  const buf = off.createBuffer(1, n, recorder.rate);
+  buf.copyToChannel(all, 0);
+  const s = off.createBufferSource();
+  s.buffer = buf; s.connect(off.destination); s.start();
+  const out = (await off.startRendering()).getChannelData(0);
+  return wavBlob(out, 16000);
+}
+function wavBlob(x, rate) {
+  const b = new DataView(new ArrayBuffer(44 + x.length * 2));
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) b.setUint8(o + i, t.charCodeAt(i)); };
+  str(0, "RIFF"); b.setUint32(4, 36 + x.length * 2, true); str(8, "WAVEfmt "); b.setUint32(16, 16, true);
+  b.setUint16(20, 1, true); b.setUint16(22, 1, true); b.setUint32(24, rate, true); b.setUint32(28, rate * 2, true);
+  b.setUint16(32, 2, true); b.setUint16(34, 16, true); str(36, "data"); b.setUint32(40, x.length * 2, true);
+  for (let i = 0; i < x.length; i++) b.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x[i])) * 32767, true);
+  return new Blob([b], {type: "audio/wav"});
+}
+async function transcribe(blob, {model, language, translate} = {}) {
+  const f = new FormData();
+  f.append("file", blob, blob.name || "speech.wav");
+  f.append("response_format", "verbose_json");
+  if (model) f.append("model", model);
+  if (language) f.append("language", language);
+  const r = await fetch(translate ? "v1/audio/translations" : "v1/audio/transcriptions", {method: "POST", headers: headers(), body: f});
+  const j = await r.json();
+  if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+  return j;
+}
+async function speakText(text, {model, voice} = {}) {
+  const r = await fetch("v1/audio/speech", {method: "POST", headers: headers(true), body: JSON.stringify({input: text, model, voice})});
+  if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error((j.error && j.error.message) || r.statusText); }
+  return {blob: await r.blob(), seconds: +(r.headers.get("x-strata-seconds") || 0)};
+}
+let sttBlob = null;
+$("stt-rec").onclick = async () => {
+  const b = $("stt-rec");
+  try {
+    if (!recorder.on) {
+      await recStart();
+      b.querySelector("span").textContent = "Stop"; b.classList.add("rec-on");
+      $("stt-what").textContent = "recording…";
+    } else {
+      sttBlob = await recStop();
+      b.querySelector("span").textContent = "Record"; b.classList.remove("rec-on");
+      $("stt-what").textContent = `recorded ${(sttBlob.size / 32000).toFixed(1)} s`;
+      $("stt-go").disabled = false;
+    }
+  } catch (e) { b.querySelector("span").textContent = "Record"; b.classList.remove("rec-on"); toast("error", "No recording", String(e.message || e), 8000); }
+};
+$("stt-file").onchange = () => {
+  const f = $("stt-file").files[0];
+  if (!f) return;
+  sttBlob = f;
+  $("stt-what").textContent = `${f.name} (${bytes(f.size)})`;
+  $("stt-go").disabled = false;
+};
+$("stt-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (!sttBlob) return;
+  $("stt-go").disabled = true;
+  const t0 = performance.now();
+  $("stt-hint").textContent = "Transcribing…";
+  try {
+    const j = await transcribe(sttBlob, {model: $("stt-model").value, language: $("stt-lang").value, translate: $("stt-task").value === "translate"});
+    $("stt-out").hidden = false;
+    $("stt-text").value = j.text || "";
+    $("stt-meta").textContent = `${j.duration} s of audio${j.language ? `, ${j.language}` : ""} · ${((performance.now() - t0) / 1000).toFixed(1)} s on the ${(j.strata || {}).device || "?"}`;
+    $("stt-hint").textContent = "";
+  } catch (e) { $("stt-hint").textContent = ""; toast("error", "No transcript", String(e.message || e), 8000); }
+  $("stt-go").disabled = false;
+};
+$("stt-copy").onclick = () => copyText($("stt-text").value, $("stt-copy"));
+$("stt-chat").onclick = () => { $("input").value = $("stt-text").value; showTab("chat"); autosize(); $("input").focus(); };
+$("tts-voice").onchange = () => { $("tts-desc").hidden = $("tts-voice").value !== "custom"; };
+$("tts-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const text = $("tts-text").value.trim();
+  if (!text) return;
+  const voice = $("tts-voice").value === "custom" ? $("tts-desc").value.trim() || "laura" : $("tts-voice").value;
+  $("tts-go").disabled = true;
+  const t0 = performance.now();
+  $("tts-hint").textContent = "Speaking… (a sentence takes some seconds on the CPU)";
+  try {
+    const {blob, seconds} = await speakText(text, {model: $("tts-model").value, voice});
+    const url = URL.createObjectURL(blob);
+    const fig = document.createElement("figure");
+    const a = document.createElement("audio");
+    a.controls = true; a.src = url; a.autoplay = true;
+    const cap = document.createElement("figcaption");
+    cap.innerHTML = `${fmt(seconds, 1)} s of speech in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(text.slice(0, 120))} · <a href="${url}" download="am2strata-speech.wav">save</a>`;
+    fig.append(a, cap);
+    $("img-results").prepend(fig);
+    $("img-results").hidden = false;
+    $("tts-hint").textContent = "";
+  } catch (e) { $("tts-hint").textContent = ""; toast("error", "No speech", String(e.message || e), 8000); }
+  $("tts-go").disabled = false;
+};
+$("audio-device").onchange = async () => {
+  try {
+    const r = await fetch("api/media/audio/device", {method: "POST", headers: headers(true), body: JSON.stringify({device: $("audio-device").value})});
+    if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+    toast("success", "Saved", `Speech runs on: ${$("audio-device").selectedOptions[0].textContent}.`);
+  } catch (e) { toast("error", "Not changed", String(e.message || e), 6000); }
+};
+// the chat: dictate a message; read an answer aloud
+$("mic-btn").onclick = async () => {
+  const b = $("mic-btn");
+  try {
+    if (!recorder.on) {
+      await recStart();
+      b.classList.add("rec-on"); b.title = "Stop and transcribe";
+    } else {
+      b.classList.remove("rec-on"); b.title = "Speak your message (speech to text)";
+      const blob = await recStop();
+      b.disabled = true;
+      $("composer-hint").textContent = "Transcribing…";
+      const j = await transcribe(blob, {model: media.stt_model});
+      const cur = $("input").value;
+      $("input").value = cur ? `${cur.trimEnd()} ${j.text}` : j.text;
+      autosize(); $("input").focus();
+      $("composer-hint").textContent = "";
+    }
+  } catch (e) { b.classList.remove("rec-on"); $("composer-hint").textContent = ""; toast("error", "No dictation", String(e.message || e), 8000); }
+  b.disabled = false;
+};
+let speaking = null;     // {audio, button}
+function speakable(md) {
+  return md.replace(/```[\s\S]*?```/g, " (code) ").replace(/`([^`]*)`/g, "$1").replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/[*_#>|~]+/g, " ").replace(/\s+/g, " ").trim();
+}
+async function readAloud(i, btn) {
+  if (speaking) { speaking.audio.pause(); speaking.button.classList.remove("rec-on"); const was = speaking.button; speaking = null; if (was === btn) return; }
+  const m = messages[i];
+  const text = speakable(m.text || "").slice(0, 4000);
+  if (!text) return;
+  btn.classList.add("rec-on"); btn.disabled = true;
+  try {
+    const {blob} = await speakText(text, {model: media.tts_model});
+    const audio = new Audio(URL.createObjectURL(blob));
+    speaking = {audio, button: btn};
+    audio.onended = () => { btn.classList.remove("rec-on"); speaking = null; };
+    audio.play();
+  } catch (e) { btn.classList.remove("rec-on"); toast("error", "Not read aloud", String(e.message || e), 8000); }
+  btn.disabled = false;
+}

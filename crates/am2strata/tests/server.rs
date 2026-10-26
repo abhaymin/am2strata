@@ -877,3 +877,46 @@ fn the_model_remembers_with_its_memory_tool() {
         .header("Origin", "https://evil.example").json(&json!({"text": "x"})).send().unwrap();
     assert_eq!(r.status().as_u16(), 403);
 }
+
+#[test]
+fn speech_is_transcribed_and_spoken_in_openais_shapes() {
+    let m = Model { extra: json!({"api_monitor": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    let c = reqwest::blocking::Client::new();
+    // choose the small Whisper (the default, large-v3-turbo, is not downloaded here)
+    let (code, r) = s.post("/api/media/models/default", &json!({"model": "whisper-base"}));
+    assert_eq!((code, r["kind"].as_str()), (200, Some("stt")), "{r}");
+    let (code, r) = s.post("/api/media/models/default", &json!({"model": "parler-tts-mini-v1"}));
+    assert_eq!((code, r["kind"].as_str()), (200, Some("tts")), "{r}");
+    // multipart, as OpenAI's clients send it; whisper-1 means the chosen model
+    let form = reqwest::blocking::multipart::Form::new().text("model", "whisper-1").text("language", "en")
+        .part("file", reqwest::blocking::multipart::Part::bytes(vec![1u8, 2, 3, 4]).file_name("a.wav"));
+    let r: Value = c.post(format!("{}/v1/audio/transcriptions", s.base)).bearer_auth(KEY).multipart(form).send().unwrap().json().unwrap();
+    assert_eq!(r["text"], "Hello world.", "{r}");
+    // JSON with a data URL, and the subtitle formats
+    let body = json!({"file": "data:audio/wav;base64,AQIDBA==", "response_format": "srt"});
+    let srt = c.post(format!("{}/v1/audio/transcriptions", s.base)).bearer_auth(KEY).json(&body).send().unwrap().text().unwrap();
+    assert_eq!(srt, "1\n00:00:00,000 --> 00:00:01,500\nHello world.\n\n");
+    let body = json!({"file": "AQIDBA==", "response_format": "verbose_json"});
+    let (code, r) = s.post("/v1/audio/translations", &body);
+    assert_eq!((code, r["task"].as_str(), r["text"].as_str()), (200, Some("translate"), Some("Hello in English.")), "{r}");
+    let (code, r) = s.post("/v1/audio/transcriptions", &json!({"file": "AQIDBA==", "model": "whisper-large-v3-turbo"}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("not downloaded"), "{r}");
+    // speech: WAV bytes; mp3 is refused by name
+    let w = c.post(format!("{}/v1/audio/speech", s.base)).bearer_auth(KEY).json(&json!({"input": "Hello there.", "voice": "alloy"})).send().unwrap();
+    assert_eq!(w.headers()["content-type"], "audio/wav");
+    assert!(w.bytes().unwrap().starts_with(b"RIFF"));
+    let (code, r) = s.post("/v1/audio/speech", &json!({"input": "x", "response_format": "mp3"}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("wav"), "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let speak = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "speak").unwrap();
+    assert_eq!((speak["voice"].as_str(), speak["model"].as_str()), (Some("laura"), Some("parler-tts-mini-v1")), "OpenAI's voice maps to one of ours");
+    // Monitor and API calls keep both
+    let m = s.get("/metrics", true).1;
+    let kinds: Vec<&str> = m["requests"].as_array().unwrap().iter().filter_map(|r| r["kind"].as_str()).collect();
+    assert!(kinds.contains(&"speech-to-text") && kinds.contains(&"text-to-speech") && kinds.contains(&"translation"), "{kinds:?}");
+    let calls = s.get("/api/requests", true).1;
+    let sp = calls["requests"].as_array().unwrap().iter().find(|r| r["path"] == "/v1/audio/speech" && r["http_status"] == 200).cloned().unwrap();
+    let d = s.get(&format!("/api/requests?id={}", sp["id"].as_str().unwrap()), true).1;
+    assert!(d["response"].as_str().unwrap().starts_with("<WAV audio"), "{d}");
+}

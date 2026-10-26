@@ -7,6 +7,7 @@
 
 mod anthropic;
 mod api_monitor;
+mod audio_api;
 mod code_run;
 mod image_gen;
 mod preview;
@@ -233,6 +234,10 @@ async fn main() -> Result<()> {
         .route("/api/run", get(code_run::info).post(code_run::run))
         .route("/v1/images/generations", post(image_gen::generations))
         .route("/v1/videos/generations", post(image_gen::video_generations))
+        .route("/v1/audio/transcriptions", post(audio_api::transcriptions))
+        .route("/v1/audio/translations", post(audio_api::translations))
+        .route("/v1/audio/speech", post(audio_api::speech))
+        .route("/api/media/audio/device", post(audio_api::set_device))
         .route("/api/memory", get(memory::list).post(memory::add))
         .route("/api/memory/settings", post(memory::set_settings))
         .route("/api/memory/{id}", axum::routing::delete(memory::delete))

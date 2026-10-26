@@ -86,6 +86,8 @@
             <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a file (or drop it here)" aria-label="Attach files">
               <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
             <input type="file" id="file" multiple hidden>
+            <button type="button" class="st-btn st-btn--icon" id="mic-btn" title="Speak your message (speech to text)" aria-label="Dictate" hidden>
+              <svg class="st-icon"><use href="web/sprite.svg#i-mic"/></svg></button>
             <div class="seg seg--4 think-seg" id="c-thinking" role="radiogroup" aria-label="Thinking">
               <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
               <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
@@ -183,9 +185,53 @@
       <div class="seg seg--3 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
         <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button>
       </div>
-      <div class="st-card media-soon" id="media-soon" hidden>
-        <span class="card-title" id="media-soon-title">Video</span>
-        <p class="muted" id="media-soon-text"></p>
+      <div class="audio-forms" id="audio-forms" hidden>
+        <form class="st-card img-form" id="stt-form">
+          <span class="card-title">Speech to text</span>
+          <label class="st-field">Model
+            <select class="st-input media-model" id="stt-model" data-kind="audio" data-task="stt" aria-label="Speech-to-text model"></select></label>
+          <div class="img-row">
+            <button type="button" class="st-btn st-btn--secondary" id="stt-rec"><svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-mic"/></svg><span>Record</span></button>
+            <label class="st-btn st-btn--secondary" for="stt-file">Choose a file</label>
+            <input type="file" id="stt-file" accept="audio/*,.wav,.mp3,.flac,.ogg,.m4a" hidden>
+            <span class="muted small" id="stt-what">or record from the microphone</span>
+          </div>
+          <div class="img-row">
+            <label class="st-field">Language
+              <select class="st-input" id="stt-lang"><option value="">detect</option><option value="en">English</option><option value="hi">Hindi</option>
+                <option value="de">German</option><option value="fr">French</option><option value="es">Spanish</option><option value="it">Italian</option>
+                <option value="pt">Portuguese</option><option value="ja">Japanese</option><option value="zh">Chinese</option><option value="ko">Korean</option>
+                <option value="ru">Russian</option><option value="ar">Arabic</option><option value="ta">Tamil</option><option value="te">Telugu</option>
+                <option value="mr">Marathi</option><option value="bn">Bengali</option></select></label>
+            <label class="st-field">Task
+              <select class="st-input" id="stt-task"><option value="transcribe">transcribe</option><option value="translate">translate to English</option></select></label>
+            <button type="submit" class="st-btn st-btn--primary" id="stt-go" disabled>Transcribe</button>
+          </div>
+          <span class="composer-hint" id="stt-hint">WAV, FLAC, MP3, OGG or M4A; runs on this PC.</span>
+          <div class="stt-out" id="stt-out" hidden>
+            <textarea class="st-input" id="stt-text" rows="5" aria-label="The transcript"></textarea>
+            <div class="row-actions"><button type="button" class="st-btn st-btn--secondary" id="stt-copy">Copy</button>
+              <button type="button" class="st-btn st-btn--secondary" id="stt-chat">Send to the chat</button>
+              <span class="muted small" id="stt-meta"></span></div>
+          </div>
+        </form>
+        <form class="st-card img-form" id="tts-form">
+          <span class="card-title">Text to speech</span>
+          <label class="st-field">Model
+            <select class="st-input media-model" id="tts-model" data-kind="audio" data-task="tts" aria-label="Text-to-speech model"></select></label>
+          <textarea class="st-input img-prompt" id="tts-text" rows="3" placeholder="What should be said&hellip;" aria-label="Text to speak"></textarea>
+          <div class="img-row">
+            <label class="st-field">Voice
+              <select class="st-input" id="tts-voice"><option value="laura">Laura: calm and clear</option><option value="jon">Jon: warm, steady</option>
+                <option value="lea">Lea: bright, expressive</option><option value="gary">Gary: slow, deep</option><option value="custom">described in words&hellip;</option></select></label>
+            <button type="submit" class="st-btn st-btn--primary" id="tts-go">Speak</button>
+          </div>
+          <input class="st-input" id="tts-desc" placeholder="e.g. A woman speaks quickly and cheerfully, close to the microphone" hidden>
+          <span class="composer-hint" id="tts-hint">English. Long text is spoken sentence by sentence.</span>
+        </form>
+        <div class="st-card toggle-row"><span>Where speech runs<br><span class="muted small">Auto: on the CPU when the RAM has room for
+          the model, else on the GPU with the text model stopped for the job (it loads again with the next chat).</span></span>
+          <select class="st-input" id="audio-device" style="width:auto"><option value="auto">auto</option><option value="cpu">CPU</option><option value="cuda">GPU</option></select></div>
       </div>
       <form class="st-card img-form" id="img-form">
         <span class="card-title" id="img-title">Make an image</span>

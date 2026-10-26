@@ -3548,10 +3548,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "candle-core-mold",
+ "candle-nn-mold",
+ "candle-transformers-mold",
+ "hf-hub",
  "mold-ai-core",
  "mold-ai-inference",
  "serde",
  "serde_json",
+ "symphonia",
+ "tokenizers 0.21.4",
  "tokio",
 ]
 
@@ -3559,6 +3565,7 @@ dependencies = [
 name = "strata-pack"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "reqwest",
  "serde_json",
  "sha2",

@@ -199,21 +199,29 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
         return next.run(req).await;
     }
     let path = req.uri().path().to_string();
-    if !matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/images/generations" | "/v1/videos/generations") {
+    if !matches!(path.as_str(), "/v1/chat/completions" | "/v1/messages" | "/v1/responses" | "/v1/images/generations" | "/v1/videos/generations"
+                 | "/v1/audio/transcriptions" | "/v1/audio/translations" | "/v1/audio/speech") {
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 256 << 20).await else {
         return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request body is too large");
     };
-    let default_model = if path.starts_with("/v1/images") {
+    let multipart = parts.headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("multipart/"));
+    let default_model = if path.starts_with("/v1/audio/speech") {
+        s.media.tts_model()
+    } else if path.starts_with("/v1/audio") {
+        s.media.stt_model()
+    } else if path.starts_with("/v1/images") {
         s.media.model()
     } else if path.starts_with("/v1/videos") {
         s.media.video_model()
     } else {
         s.mgr.current().await.map(|l| l.entry.id.clone()).unwrap_or_else(|| s.mgr.default_id.clone())
     };
-    let id = mon.begin(&path, &bytes, &default_model);
+    // an upload is kept as a note of its size, not its bytes
+    let note = multipart.then(|| serde_json::to_vec(&json!({"upload": format!("<multipart upload, {} KB>", bytes.len() / 1024)})).unwrap());
+    let id = mon.begin(&path, note.as_deref().unwrap_or(&bytes), &default_model);
     let resp = next.run(Request::from_parts(parts, Body::from(bytes))).await;
     let status = resp.status().as_u16();
     mon.update(&id, |r, clock| {
@@ -223,9 +231,17 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
     });
     let sse = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("text/event-stream"));
     let (parts, body) = resp.into_parts();
+    let audio = parts.headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("audio/"));
     if !sse {
-        // a JSON answer (or an error): kept whole
+        // a JSON answer (or an error): kept whole; an audio answer as a note of its size
         let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        if audio {
+            mon.update(&id, |r, _| {
+                r.insert("response".into(), json!(format!("<WAV audio, {} KB>", bytes.len() / 1024)));
+            });
+            mon.finish(&id, "completed");
+            return Response::from_parts(parts, Body::from(bytes));
+        }
         if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
             take(&id, &mon, &v);
             // an image or video answer: the record keeps its details, not the megabytes of base64
