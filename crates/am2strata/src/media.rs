@@ -52,7 +52,7 @@ pub fn non_public(ip: std::net::IpAddr) -> bool {
 
 /// GET of a public URL: each hop's address checked and pinned (no DNS rebinding between the check and the
 /// connection), up to 5 redirects, each checked again.
-async fn fetch_public(src: &str, allow_private: bool) -> Result<reqwest::Response> {
+pub async fn fetch_public(src: &str, allow_private: bool) -> Result<reqwest::Response> {
     let mut url = reqwest::Url::parse(src).map_err(|e| anyhow!("the URL could not be read: {e}"))?;
     for _ in 0..6 {
         let host = url.host_str().ok_or_else(|| anyhow!("the URL has no host"))?.to_string();

@@ -27,6 +27,7 @@ mod server_tools;
 mod settings;
 mod structured;
 mod web;
+mod web_tools;
 
 use anyhow::{bail, Context, Result};
 use axum::http::{HeaderMap, StatusCode};
@@ -299,6 +300,7 @@ async fn main() -> Result<()> {
                            media_jobs: Arc::new(media_jobs::Jobs::new()) };
     state.media_jobs.bind(state.clone());
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
+    let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,

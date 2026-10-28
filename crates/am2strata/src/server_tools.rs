@@ -1,6 +1,6 @@
 //! The tools this server runs itself, for every API (OpenAI chat, Anthropic messages, Responses): the config's MCP
 //! servers (`"strata_mcp": true`, this server's own page only), the memory tools (a request with memory, when the
-//! settings allow them) and the media tools (`"strata_media": true`). They are added to the request's tool list;
+//! settings allow them), the media tools (`"strata_media": true`) and web search (`"strata_web": true`). They are added to the request's tool list;
 //! the model's calls to them are run in run::start_mcp's loop and the rest of the turn goes on. The request's own
 //! tools win a name clash, and a forced tool_choice is left alone.
 
@@ -67,6 +67,16 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
         if !extra.is_empty() {
             add(prep, &mut offered, extra);
             opts.media = Some(caps);
+        }
+    }
+    // web_search / fetch_url: the queries leave this PC, so only for a request that asks
+    if req.get("strata_web") == Some(&Value::Bool(true)) && !structured && !forced {
+        if let Some(w) = s.mgr.web.get() {
+            let own = own_names(prep);
+            let extra: Vec<Value> = w.tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+            if !extra.is_empty() {
+                add(prep, &mut offered, extra);
+            }
         }
     }
     Ok(offered)

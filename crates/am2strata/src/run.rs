@@ -795,7 +795,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 let route = hub.as_ref().and_then(|h| h.routes().into_iter().find(|(n, _, _)| *n == c.name));
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "call", "id": c.id, "name": c.name,
                     "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string()))
-                        .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string())),
+                        .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string()))
+                        .or_else(|| crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()).then(|| "web".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
                     "arguments": c.arguments, "round": rounds}))).await;
                 let args = Value::Object(c.arguments.clone());
@@ -812,6 +813,11 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                             j.submit(&c.name, &args, caps)
                         }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
+                    }
+                } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
+                    tokio::select! {
+                        r = w.call(&c.name, &args) => r,
+                        _ = tx.closed() => return,
                     }
                 } else if let Some(h) = &hub {
                     tokio::select! {
@@ -831,6 +837,9 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 }
                 if r["job"].is_object() {
                     ev["job"] = r["job"].clone(); // a queued media job: the client shows its card
+                }
+                if r["sources"].is_array() {
+                    ev["sources"] = r["sources"].clone(); // web pages: the client shows them as links
                 }
                 if tx.send(RunEvent::Mcp(ev)).await.is_err() {
                     return;

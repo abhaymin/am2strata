@@ -935,7 +935,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1117,7 +1117,9 @@ function toolHtml(t, k) {
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
-    (t.job ? `<div class="media-job" data-job="${esc(t.job.id)}">${jobCardHtml(t.job.id)}</div>` : "");
+    (t.job ? `<div class="media-job" data-job="${esc(t.job.id)}">${jobCardHtml(t.job.id)}</div>` : "") +
+    (t.sources && t.sources.length ? `<div class="tool-sources">${t.sources.slice(0, 10).map((u, i) =>
+      `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(u.url)}">[${i + 1}] ${esc(u.title || u.url.replace(/^https?:\/\/([^/]+).*$/, "$1"))}</a>`).join("")}</div>` : "");
 }
 // Media jobs a chat's tools queued: polled until done, the file fetched with the key and shown from a blob URL.
 const jobs = {};                       // id -> {state, position, ahead, step, steps, error, mime, url, kind, model}
@@ -1190,6 +1192,7 @@ function onTool(m, x) {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
     if (x.job) { t.job = x.job; watchJob(x.job.id); }
+    if (Array.isArray(x.sources)) t.sources = x.sources.filter((u) => /^https?:\/\//.test(u.url || ""));
   }
 }
 function updateAssistant(el, m, streaming) {
@@ -1444,6 +1447,7 @@ async function streamInto(m, el, signal) {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (settings.web === true) body.strata_web = true;                         // web_search / fetch_url, run by this server
   if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
   if (store.get("media-chat", true) && (media.models || []).some((x) => x.downloaded && x.kind !== "3d")) body.strata_media = true;  // Settings > Models
 
@@ -1691,6 +1695,7 @@ function loadDrawer(s = settings) {
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
+  $("s-web").setAttribute("aria-checked", String(s.web === true));
   $("s-flows").setAttribute("aria-checked", String(s.flows !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   outputs();
@@ -1752,6 +1757,7 @@ $("s-apply").onclick = async () => {
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true",
+              web: $("s-web").getAttribute("aria-checked") === "true",
               flows: $("s-flows").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
   renderThinking(); loadDefaults();

@@ -144,6 +144,8 @@ pub struct Manager {
     pub memory: Arc<crate::memory::Memory>,
     /// media jobs a chat's tools queue (media_jobs.rs; set once the server is built)
     pub media_jobs: std::sync::OnceLock<Arc<crate::media_jobs::Jobs>>,
+    /// web_search / fetch_url (web_tools.rs; set from the run config at start)
+    pub web: std::sync::OnceLock<Arc<crate::web_tools::WebTools>>,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -217,6 +219,7 @@ impl Manager {
             monitor: crate::monitor::Monitor::new(),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
             media_jobs: std::sync::OnceLock::new(),
+            web: std::sync::OnceLock::new(),
         }
     }
 

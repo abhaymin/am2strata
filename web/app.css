@@ -485,3 +485,9 @@ body.resizing iframe { pointer-events: none; }
 .media-job img, .media-job video { display: block; max-width: min(100%, 512px); border-radius: var(--st-radius, 8px); }
 .media-job audio { width: min(100%, 420px); }
 .media-job__bar { display: flex; gap: 12px; align-items: center; margin-top: 4px; }
+
+/* the pages a web tool found or read */
+.tool-sources { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 10px; }
+.tool-sources a { font-size: var(--st-fs-xs); padding: 2px 8px; border-radius: 999px; background: var(--st-surface-2, rgba(127,127,127,.12));
+  color: inherit; text-decoration: none; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tool-sources a:hover { text-decoration: underline; }

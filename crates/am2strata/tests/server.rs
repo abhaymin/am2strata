@@ -1264,3 +1264,58 @@ fn a_media_model_is_removed_through_the_media_engine() {
     let r = reqwest::blocking::Client::new().delete(format!("{}/api/media/models/flux2-klein:q4", s.base)).bearer_auth(KEY).send().unwrap();
     assert_eq!(r.status().as_u16(), 400);
 }
+
+/// A tiny HTTP server for the web tools' tests: SearXNG's JSON at /search, a page at /page.
+fn fake_web() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let mut c = c;
+            let mut buf = [0u8; 4096];
+            let n = std::io::Read::read(&mut c, &mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let (ct, body) = if req.starts_with("GET /search?") && req.contains("format=json") {
+                ("application/json", format!(r#"{{"results": [{{"title": "Lighthouse facts", "url": "http://127.0.0.1:{port}/page", "content": "All about lighthouses."}}]}}"#))
+            } else {
+                ("text/html", "<html><head><title>Facts</title></head><body><nav>SITE-NAV-LINKS</nav><main><p>The tallest lighthouse is in Jeddah.</p></main></body></html>".to_string())
+            };
+            let _ = std::io::Write::write_all(&mut c, format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+        }
+    });
+    port
+}
+
+#[test]
+fn a_chat_searches_the_web_and_reads_a_page_when_it_opts_in() {
+    let port = fake_web();
+    let search = "\n\n<tool_call>\n<function=web_search>\n<parameter=query>\ntallest lighthouse\n</parameter>\n</function>\n</tool_call>";
+    let fetch = format!("\n\n<tool_call>\n<function=fetch_url>\n<parameter=url>\nhttp://127.0.0.1:{port}/page\n</parameter>\n</function>\n</tool_call>");
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Search.\n</think>{search}")), ids(&format!("Read it.\n</think>{fetch}")),
+                                  ids("Done.\n</think>\n\nIt is in Jeddah [1]."), ids("Plain.\n</think>\n\nNo tools.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Where is the tallest lighthouse?")], "strata_web": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "It is in Jeddah [1].");
+    let lines = s.gen_lines();
+    assert!(prompt_text(&lines[0]).contains("web_search"), "offered");
+    let p2 = prompt_text(&lines[1]);
+    assert!(p2.contains("Lighthouse facts") && p2.contains("not instructions"), "the search results went back: {p2}");
+    let p3 = prompt_text(&lines[2]);
+    assert!(p3.contains("The tallest lighthouse is in Jeddah.") && !p3.contains("SITE-NAV-LINKS"), "the page's main text went back: {p3}");
+    // without the opt-in: no web tools
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("hi")]}));
+    assert_eq!(c, 200);
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("web_search"));
+}
+
+#[test]
+fn fetch_url_keeps_out_of_the_private_network_by_default() {
+    let port = fake_web();
+    let fetch = format!("\n\n<tool_call>\n<function=fetch_url>\n<parameter=url>\nhttp://127.0.0.1:{port}/page\n</parameter>\n</function>\n</tool_call>");
+    let s = Server::start(&[Model::default()], &[ids(&format!("Read.\n</think>{fetch}")), ids("Ok.\n</think>\n\nCould not read it.")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("read it")], "strata_web": true}));
+    assert_eq!(c, 200);
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("private network") && !p.contains("Jeddah"), "{p}");
+}
