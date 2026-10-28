@@ -836,9 +836,14 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         Err(e) => return RespError::new(e, "text.format".to_string()).into_response(),
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned(),
+    let mut opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned(),
                            memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None };
-    let started = match run::start(s.mgr.clone(), loaded, prep, chat.clone(), opts).await {
+    // the server's own tools (MCP, memory, media) this request opted in to (the flags are the request's own)
+    let offered = match crate::server_tools::offer(&s, &headers, &req, &mut prep, &mut opts, validator.is_some()).await {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
+    let started = match crate::server_tools::start(s.mgr.clone(), loaded, prep, chat.clone(), opts, offered).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             let mut r = RespError::new(msg, None);

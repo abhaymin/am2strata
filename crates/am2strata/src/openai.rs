@@ -144,59 +144,16 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     let mut opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
                               memory: crate::memory::scope_of(&req, own_page), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)),
                                   media: None };
-    // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
-    let mut mcp = None;
-    if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
-        if crate::foreign_origin(&s, &headers) {
-            return crate::not_own_page("MCP tools can be used");
-        }
-        hub.wait(Duration::from_secs(10)).await; // servers still starting (only right after the start)
-        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
-        let extra = hub.template_tools(&own); // the request's own tools win a name clash
-        if !extra.is_empty() {
-            if strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_some() {
-                return error(StatusCode::BAD_REQUEST, "invalid_request_error", "a forced tool_choice with MCP tools is not supported");
-            }
-            let names = extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)).collect();
-            prep.tools.get_or_insert_with(Vec::new).extend(extra);
-            mcp = Some((hub, names));
-        }
-    }
-    // the memory tools (remember / recall / forget), run here like MCP tools, for a request that opted in
-    let mut mcp = mcp.map(|(h, n)| (Some(h), n));
-    if opts.memory.is_some() && s.mgr.memory.settings.read().unwrap().tools && validator.is_none() {
-        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
-        let extra: Vec<Value> = crate::memory::tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
-        if !extra.is_empty() && strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_none() {
-            let (hub, mut names) = mcp.take().unwrap_or((None, std::collections::HashSet::new()));
-            names.extend(extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)));
-            prep.tools.get_or_insert_with(Vec::new).extend(extra);
-            mcp = Some((hub, names));
-        }
-    }
-    // the media tools (generate_image / generate_video / speak) for a chat that opted in, the kinds this PC can make
-    if req.get("strata_media") == Some(&Value::Bool(true)) && validator.is_none() && s.media.available()
-        && !crate::foreign_origin(&s, &headers)
-        && strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_none() {
-        let caps = s.media_jobs.capabilities().await;
-        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
-        let extra: Vec<Value> = crate::media_jobs::Jobs::tools(&caps).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
-        if !extra.is_empty() {
-            let (hub, mut names) = mcp.take().unwrap_or((None, std::collections::HashSet::new()));
-            names.extend(extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)));
-            prep.tools.get_or_insert_with(Vec::new).extend(extra);
-            mcp = Some((hub, names));
-            opts.media = Some(caps);
-        }
-    }
+    // the server's own tools (MCP, memory, media) this request opted in to
+    let mcp = match crate::server_tools::offer(&s, &headers, &req, &mut prep, &mut opts, validator.is_some()).await {
+        Ok(o) => o,
+        Err(r) => return r,
+    };
     let pass_slot = opts.pass.clone();
     let has_pass = pass_slot.lock().unwrap().is_some();
     let (mgr, req2, model_id) = (s.mgr.clone(), req.clone(), loaded.entry.id.clone());
     let run_it = async move {
-        match mcp {
-            Some((hub, names)) => run::start_mcp(mgr, loaded, prep, req2, opts, hub, names).await,
-            None => run::start(mgr, loaded, prep, req2, opts).await,
-        }
+        crate::server_tools::start(mgr, loaded, prep, req2, opts, mcp).await
     };
     // a stream that has to wait for its turn starts at once and says its place in the queue (SSE comments); its
     // refusals then come as an error event, not a status code

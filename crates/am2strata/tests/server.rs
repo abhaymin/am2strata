@@ -1180,3 +1180,22 @@ fn security_media_sources_cannot_read_local_files_or_the_private_network() {
         assert!(msg.contains("not read") || msg.contains("private network"), "{src}: {msg}");
     }
 }
+
+#[test]
+fn anthropic_and_responses_clients_get_the_media_tools_too() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na fox\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Draw.\n</think>{call}")), ids("Ok.\n</think>\n\nThe fox is on its way.")], json!({}));
+    let (c, r) = s.post("/v1/messages", &json!({"max_tokens": 500, "messages": [user("Draw a fox.")], "strata_media": true}));
+    assert_eq!(c, 200, "{r}");
+    let text: String = r["content"].as_array().unwrap().iter().filter_map(|b| b["text"].as_str()).collect();
+    assert_eq!(text, "The fox is on its way.", "{r}");
+    assert_eq!(r["stop_reason"], "end_turn", "the server's own tool call does not end the turn: {r}");
+    assert_eq!(s.get("/api/jobs/mj-1", true).0, 200);
+    let s = Server::start(&[Model::default()], &[ids(&format!("Draw.\n</think>{call}")), ids("Ok.\n</think>\n\nA second fox is coming.")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"input": "Draw another fox.", "strata_media": true}));
+    assert_eq!(c, 200, "{r}");
+    let out = r["output"].to_string();
+    assert!(out.contains("A second fox is coming."), "{r}");
+    assert!(!out.contains("function_call"), "{r}");
+    assert_eq!(s.get("/api/jobs/mj-1", true).0, 200);
+}

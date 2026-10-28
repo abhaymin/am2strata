@@ -22,6 +22,7 @@ mod monitor;
 mod openai;
 mod responses;
 mod run;
+mod server_tools;
 mod settings;
 mod structured;
 mod web;
