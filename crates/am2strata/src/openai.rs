@@ -111,6 +111,9 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
         Ok(l) => l,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
     };
+    if let Err(e) = crate::media_jobs::expand_audio(&s, &mut req).await {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", e);
+    }
     if let Err(e) = media::expand_documents(&mut req, loaded.vision.is_some(), false).await {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
@@ -134,8 +137,9 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let own_page = !crate::foreign_origin(&s, &headers) && headers.contains_key("origin");
-    let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
-                              memory: crate::memory::scope_of(&req, own_page), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) };
+    let mut opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
+                              memory: crate::memory::scope_of(&req, own_page), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)),
+                                  media: None };
     // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
     let mut mcp = None;
     if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
@@ -164,6 +168,20 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
             names.extend(extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)));
             prep.tools.get_or_insert_with(Vec::new).extend(extra);
             mcp = Some((hub, names));
+        }
+    }
+    // the media tools (generate_image / generate_video / speak) for a chat that opted in, the kinds this PC can make
+    if req.get("strata_media") == Some(&Value::Bool(true)) && validator.is_none() && s.media.available()
+        && strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_none() {
+        let caps = s.media_jobs.capabilities().await;
+        let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();
+        let extra: Vec<Value> = crate::media_jobs::Jobs::tools(&caps).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+        if !extra.is_empty() {
+            let (hub, mut names) = mcp.take().unwrap_or((None, std::collections::HashSet::new()));
+            names.extend(extra.iter().filter_map(|t| t["name"].as_str().map(str::to_owned)));
+            prep.tools.get_or_insert_with(Vec::new).extend(extra);
+            mcp = Some((hub, names));
+            opts.media = Some(caps);
         }
     }
     let pass_slot = opts.pass.clone();

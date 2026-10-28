@@ -975,3 +975,49 @@ fn a_chat_waits_behind_a_media_job_in_the_queue_and_says_its_place() {
     let q = s.get("/api/queue", true).1;
     assert!(q["running"].is_null() && q["waiting"].as_array().unwrap().is_empty(), "{q}");
 }
+
+#[test]
+fn a_chat_queues_an_image_with_its_media_tool_and_the_job_runs_after_the_answer() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Draw it.\n</think>{call}")), ids("Queued.\n</think>\n\nYour lighthouse is on its way."),
+                                                 ids("Plain.\n</think>\n\nNo tools here.")], json!({}));
+    let (c, caps) = s.get("/api/media/capabilities", true);
+    assert_eq!(c, 200);
+    assert_eq!((caps["kinds"]["image"]["usable"].as_bool(), caps["kinds"]["video"]["usable"].as_bool()), (Some(true), Some(true)), "{caps}");
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Draw a lighthouse at dusk.")], "strata_media": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "Your lighthouse is on its way.");
+    let lines = s.gen_lines();
+    let first = prompt_text(&lines[0]);
+    assert!(first.contains("generate_image") && first.contains("generate_video") && first.contains("speak"), "{first}");
+    assert!(prompt_text(&lines[1]).contains("image job mj-1 queued"), "the tool result went back to the model");
+    let t0 = std::time::Instant::now();
+    let job = loop {
+        let (c, j) = s.get("/api/jobs/mj-1", true);
+        assert_eq!(c, 200, "{j}");
+        if j["state"] == "done" || j["state"] == "error" { break j; }
+        assert!(t0.elapsed().as_secs() < 10, "{j}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!((job["state"].as_str(), job["kind"].as_str(), job["mime"].as_str()), (Some("done"), Some("image"), Some("image/png")), "{job}");
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/mj-1/content", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(&r.bytes().unwrap()[1..4], b"PNG");
+    // without the opt-in, no media tools
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("Hi")]}));
+    assert_eq!(c, 200);
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("generate_image"));
+    assert_eq!(s.get("/api/jobs/mj-9", true).0, 404);
+}
+
+#[test]
+fn an_audio_attachment_in_a_chat_is_transcribed_into_the_prompt() {
+    let s = Server::start(&[Model::default()], &[ids("Heard.\n</think>\n\nYou said hello world.")], json!({}));
+    assert_eq!(s.post("/api/media/models/default", &json!({"model": "whisper-base"})).0, 200);
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What did I say?"},
+        {"type": "input_audio", "input_audio": {"data": "UklGRiYAAABXQVZF", "format": "wav", "name": "note.wav"}}]}]}));
+    assert_eq!(c, 200, "{r}");
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("[Transcript of note.wav, 2 s: Hello world.]") && p.contains("What did I say?"), "{p}");
+}

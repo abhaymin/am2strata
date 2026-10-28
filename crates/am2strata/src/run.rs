@@ -252,6 +252,9 @@ pub struct RunOpts {
     pub memory: Option<String>,
     /// the GPU's turn when the caller already waited for it (a stream that told its client its place)
     pub pass: Arc<std::sync::Mutex<Option<crate::queue::Pass>>>,
+    /// the media tools (generate_image, generate_video, speak) for a request that opted in: the capability check
+    /// they were offered by
+    pub media: Option<Value>,
 }
 
 /// What the memory adds to a request before its prompt is built: the <memory> block (matching facts and archived turns),
@@ -785,13 +788,19 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             for c in &calls {
                 let route = hub.as_ref().and_then(|h| h.routes().into_iter().find(|(n, _, _)| *n == c.name));
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "call", "id": c.id, "name": c.name,
-                    "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string())),
+                    "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string()))
+                        .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
                     "arguments": c.arguments, "round": rounds}))).await;
                 let args = Value::Object(c.arguments.clone());
                 // the call runs while the client is watched: one that leaves (the web app's Stop) ends it
                 let r = if crate::memory::TOOL_NAMES.contains(&c.name.as_str()) && route.is_none() {
                     mgr.memory.call(&c.name, &args, opts.memory.as_deref().unwrap_or("web"), conv.as_deref())
+                } else if let (Some(caps), true, None) = (&opts.media, crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()), &route) {
+                    match mgr.media_jobs.get() {
+                        Some(j) => j.submit(&c.name, &args, caps),
+                        None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
+                    }
                 } else if let Some(h) = &hub {
                     tokio::select! {
                         r = h.call(&c.name, &args) => r,
@@ -807,6 +816,9 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 let mut ev = json!({"event": "result", "id": c.id});
                 for k in ["ok", "text", "chars", "truncated", "ms"] {
                     ev[k] = r[k].clone();
+                }
+                if r["job"].is_object() {
+                    ev["job"] = r["job"].clone(); // a queued media job: the client shows its card
                 }
                 if tx.send(RunEvent::Mcp(ev)).await.is_err() {
                     return;

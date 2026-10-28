@@ -361,6 +361,10 @@
             <span class="muted small" id="updates-msg" role="status"></span></h3>
           <div class="st-card list-card" id="models-list"><p class="muted">Loading&hellip;</p></div>
           <h3 class="set-sub">Media models <span class="muted small">image, video, 3D and audio - for Media Generation</span></h3>
+          <div class="st-card toggle-row"><span>Let the chat make images, video and speech<br><span class="muted small">The model gets
+            three tools (generate_image, generate_video, speak) for the models chosen below. A job waits in the queue until the
+            answer is done, then appears in the chat. API clients opt in with <code>"strata_media": true</code>.</span></span>
+            <button class="st-toggle" id="media-chat" role="switch" aria-checked="true" aria-label="Let the chat make images, video and speech"></button></div>
           <div class="st-card list-card media-models" id="media-models">
             <div class="media-models__bar">
               <div class="seg seg--5" role="tablist" aria-label="Kind" id="mm-kind">

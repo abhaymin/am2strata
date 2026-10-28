@@ -142,6 +142,8 @@ pub struct Manager {
     pub monitor: Arc<crate::monitor::Monitor>,
     /// facts and conversation archives (memory.rs), under <data>/memory
     pub memory: Arc<crate::memory::Memory>,
+    /// media jobs a chat's tools queue (media_jobs.rs; set once the server is built)
+    pub media_jobs: std::sync::OnceLock<Arc<crate::media_jobs::Jobs>>,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -214,6 +216,7 @@ impl Manager {
             ready_timeout,
             monitor: crate::monitor::Monitor::new(),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
+            media_jobs: std::sync::OnceLock::new(),
         }
     }
 

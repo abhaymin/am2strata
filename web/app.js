@@ -1081,7 +1081,54 @@ function toolHtml(t, k) {
     (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
-    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
+    `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
+    (t.job ? `<div class="media-job" data-job="${esc(t.job.id)}">${jobCardHtml(t.job.id)}</div>` : "");
+}
+// Media jobs a chat's tools queued: polled until done, the file fetched with the key and shown from a blob URL.
+const jobs = {};                       // id -> {state, position, ahead, step, steps, error, mime, url, kind, model}
+function jobCardHtml(id) {
+  const j = jobs[id];
+  if (!j) return `<span class="muted small">Media job ${esc(id)}…</span>`;
+  const what = {image: "Image", video: "Video", tts: "Speech"}[j.kind] || "Media";
+  if (j.state === "done" && j.url) {
+    const el = j.mime.startsWith("video/") ? `<video src="${j.url}" controls loop playsinline></video>`
+      : j.mime.startsWith("audio/") ? `<audio src="${j.url}" controls></audio>` : `<img src="${j.url}" alt="${esc(j.prompt || what)}">`;
+    const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
+    return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
+      `<a href="${j.url}" download="${esc(id)}.${ext}">Save</a></div>`;
+  }
+  if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>`;
+  const where = j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
+    : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
+  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
+}
+function paintJob(id) {
+  document.querySelectorAll(`.media-job[data-job="${CSS.escape(id)}"]`).forEach((e) => { e.innerHTML = jobCardHtml(id); });
+}
+async function watchJob(id) {
+  if (jobs[id] && (jobs[id].watching || jobs[id].state === "done" || jobs[id].state === "error")) return;
+  jobs[id] = Object.assign(jobs[id] || {}, {watching: true});
+  try {
+    for (;;) {
+      const r = await fetch(`api/jobs/${encodeURIComponent(id)}`, {headers: headers()});
+      if (r.status === 404) { Object.assign(jobs[id], {state: "error", error: "no longer on the server (it keeps jobs until it restarts)"}); break; }
+      if (r.ok) {
+        const j = await r.json();
+        Object.assign(jobs[id], j);
+        if (j.state === "done") {
+          const c = await fetch(j.url.replace(/^\//, ""), {headers: headers()});
+          if (c.ok) jobs[id].url = URL.createObjectURL(await c.blob());
+          else Object.assign(jobs[id], {state: "error", error: `HTTP ${c.status}`});
+          break;
+        }
+        if (j.state === "error") break;
+      }
+      paintJob(id);
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  } catch (e) { Object.assign(jobs[id], {state: "error", error: e.message}); }
+  jobs[id].watching = false;
+  paintJob(id);
 }
 // the answer's text with the tool blocks where the model called them
 function answerHtml(m) {
@@ -1106,6 +1153,7 @@ function onTool(m, x) {
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
+    if (x.job) { t.job = x.job; watchJob(x.job.id); }
   }
 }
 function updateAssistant(el, m, streaming) {
@@ -1149,6 +1197,7 @@ function renderChat() {
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
+  for (const m of messages) for (const t of m.tools || []) if (t.job) watchJob(t.job.id);
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
@@ -1203,6 +1252,8 @@ function apiMessages() {
         if (x.kind === "video") {          // the browser's frames, in order: how MiniCPM-V and the others read a video
           parts.push({type: "text", text: `[A video, "${x.name}", ${x.duration.toFixed(1)} s, as ${x.frames.length} frames in order:]`});
           parts.push(...x.frames.map((u) => ({type: "image_url", image_url: {url: u}})));
+        } else if (x.kind === "audio") {   // the server transcribes it into the prompt
+          parts.push({type: "input_audio", input_audio: {data: x.url, format: (x.name.split(".").pop() || "wav").toLowerCase(), name: x.name}});
         } else {                           // the server reads the PDF: its text, and its pages as pictures
           parts.push({type: "file", file: {filename: x.name, file_data: x.url}});
         }
@@ -1252,7 +1303,7 @@ async function send() {
   if ((!text && !attachments.length) || busy) return;
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind === "image"),
                  files: attachments.filter((a) => a.kind === "file"),
-                 media: attachments.filter((a) => a.kind === "video" || a.kind === "pdf"), time: Date.now()});
+                 media: attachments.filter((a) => a.kind === "video" || a.kind === "pdf" || a.kind === "audio"), time: Date.now()});
   attachments = [];
   renderAttachments();
   $("input").value = "";
@@ -1358,6 +1409,7 @@ async function streamInto(m, el, signal) {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
+  if (store.get("media-chat", true) && (media.models || []).some((x) => x.downloaded && x.kind !== "3d")) body.strata_media = true;  // Settings > Models
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1379,7 +1431,10 @@ async function streamInto(m, el, signal) {
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl).trim();
         buf = buf.slice(nl + 1);
+        const q = /^: queued: (\d+) ahead/.exec(line);       // waiting its turn behind other jobs (one at a time here)
+        if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); continue; }
         if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
+        if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; }
         const data = line.slice(5).trim();
         if (data === "[DONE]") continue;
         let j;
@@ -1496,6 +1551,13 @@ function addFiles(files) {
       toast("info", "Reading the video", `${f.name}: taking ${VIDEO_FRAMES} frames…`, 2500);
       videoFrames(f, VIDEO_FRAMES).then((r) => { Object.assign(chip, r); attachments.push(chip); renderAttachments(); })
         .catch((e) => toast("error", "Video not read", `${f.name}: ${e.message}. Try an MP4 (H.264) or WebM file.`, 6000));
+      continue;
+    }
+    if (f.type.startsWith("audio/") || /\.(wav|mp3|flac|ogg|oga|opus|m4a|aac)$/i.test(f.name)) {
+      if (f.size > 100e6) { toast("warn", "Audio too large", `${f.name} is over 100 MB.`); continue; }
+      const r = new FileReader();   // the server transcribes it (speech to text on the CPU) into the prompt
+      r.onload = () => { attachments.push({kind: "audio", name: f.name, url: r.result}); renderAttachments(); };
+      r.readAsDataURL(f);
       continue;
     }
     if (f.type === "application/pdf" || /\.pdf$/i.test(f.name)) {
@@ -2479,6 +2541,12 @@ async function loadMemory() {
     `<button class="st-btn st-btn--secondary" data-forget="${esc(f.id)}">Forget</button></div>`).join("")
     : `<p class="muted" style="padding:12px 14px">No facts yet. Tell the model something worth keeping, or add one above.</p>`;
 }
+$("media-chat").setAttribute("aria-checked", String(store.get("media-chat", true)));
+$("media-chat").onclick = () => {
+  const on = $("media-chat").getAttribute("aria-checked") !== "true";
+  store.set("media-chat", on);
+  $("media-chat").setAttribute("aria-checked", String(on));
+};
 $("mem-web").onclick = () => {
   const on = $("mem-web").getAttribute("aria-checked") !== "true";
   store.set("memory-web", on);

@@ -126,6 +126,11 @@ impl Monitor {
         }
     }
 
+    /// The media job running now: its step of steps, when it said.
+    pub fn media_progress(&self) -> Option<(u64, u64)> {
+        self.inner.lock().unwrap().media.as_ref().and_then(|m| m.step)
+    }
+
     /// `finish`: "stop" (made) or "error"; `output`: what was made ("2 images, 1024x1024").
     pub fn media_end(&self, id: u64, finish: &str, output: &str) {
         let mut g = self.inner.lock().unwrap();

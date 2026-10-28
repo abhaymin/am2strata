@@ -479,3 +479,9 @@ body.resizing iframe { pointer-events: none; }
 .rec-on { color: var(--st-danger, #e5484d) !important; }
 #stt-rec.rec-on { border-color: currentColor; }
 .img-results audio { width: 100%; }
+
+/* a media job a chat's tool queued */
+.media-job { margin: 8px 0 12px; }
+.media-job img, .media-job video { display: block; max-width: min(100%, 512px); border-radius: var(--st-radius, 8px); }
+.media-job audio { width: min(100%, 420px); }
+.media-job__bar { display: flex; gap: 12px; align-items: center; margin-top: 4px; }

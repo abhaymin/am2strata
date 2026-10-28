@@ -207,6 +207,34 @@ async fn transcribe(s: AppState, headers: HeaderMap, req: Request, translate: bo
     }
 }
 
+/// A chat's audio attachment as text: the speech-to-text model on the CPU (no GPU turn, so the answer's text model
+/// stays loaded). Returns the text and the audio's length in seconds.
+pub async fn transcribe_for_chat(s: &AppState, b64: &str) -> Result<(String, f64), String> {
+    if !s.media.available() {
+        return Err("the media engine is not built".into());
+    }
+    let model = s.media.stt_model();
+    let m = audio_model(s, &model, "stt").await.map_err(|_| format!("{model} is not downloaded (Settings > Models > Media models > Audio)"))?;
+    let mon = s.mgr.monitor.clone();
+    let id = mon.media_begin("speech-to-text", &model);
+    let r = s.media.call(json!({"op": "transcribe", "model": model, "audio": b64, "translate": false, "device": "cpu"}), |_| {}).await;
+    if mem_available_gb() < m["size_gb"].as_f64().unwrap_or(1.0) * 2.0 + 2.0 {
+        let _ = s.media.call(json!({"op": "unload_audio"}), |_| {}).await;
+    }
+    match r {
+        Ok(v) => {
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            let secs = v["duration"].as_f64().unwrap_or(0.0);
+            mon.media_end(id, "stop", &format!("{secs:.1} s of audio from a chat, {} words, on the cpu", text.split_whitespace().count()));
+            Ok((text, secs))
+        }
+        Err(e) => {
+            mon.media_end(id, "error", &format!("{e:#}"));
+            Err(format!("{e:#}"))
+        }
+    }
+}
+
 pub async fn transcriptions(State(s): State<AppState>, headers: HeaderMap, req: Request) -> Response {
     transcribe(s, headers, req, false).await
 }

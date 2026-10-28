@@ -17,6 +17,7 @@ mod hub_api;
 mod mcp;
 mod memory;
 mod media;
+mod media_jobs;
 mod monitor;
 mod openai;
 mod responses;
@@ -98,6 +99,8 @@ pub struct AppState {
     pub previews: Arc<preview::Previews>,
     /// image generation (v2): the am2strata-media engine process
     pub media: Arc<image_gen::Media>,
+    /// media jobs a chat's tools queued (media_jobs.rs)
+    pub media_jobs: Arc<media_jobs::Jobs>,
 }
 
 /// A web page of another origin sent this: its Origin is neither this server's address nor a trusted one (no Origin
@@ -212,7 +215,10 @@ async fn main() -> Result<()> {
                            code_run: Arc::new(code_run::CodeRun::from_config(&first.cfg.rest)),
                            code_run_config_on: first.cfg.rest.get("code_run") != Some(&serde_json::Value::Bool(false)),
                            previews: Arc::new(preview::Previews::default()),
-                           media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)) };
+                           media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)),
+                           media_jobs: Arc::new(media_jobs::Jobs::new()) };
+    state.media_jobs.bind(state.clone());
+    let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -230,6 +236,10 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/media/capabilities", get(media_jobs::capabilities))
+        .route("/api/jobs/{id}", get(media_jobs::status))
+        .route("/v1/media/jobs/{id}", get(media_jobs::status))
+        .route("/v1/media/jobs/{id}/content", get(media_jobs::content))
         .route("/api/models/updates", get(hub_api::updates))
         .route("/api/models/update", post(hub_api::update))
         .route("/api/requests", get(api_monitor::requests))

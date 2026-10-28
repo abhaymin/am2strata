@@ -59,7 +59,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget, tool_choice: req.get("tool_choice").cloned(),
-                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) };
+                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None };
     let started = match run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
