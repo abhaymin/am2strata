@@ -252,6 +252,17 @@ $("mm-list").addEventListener("click", async (e) => {
   loadMediaModels();
 });
 // Media Generation: Image and Video, each with its model picker (the downloaded models of that kind); Audio is coming
+// the Video form's sizes: the chosen model's own (its catalog default), turned, and square for Wan 2.2
+function fillVideoSizes() {
+  const m = (media.models || []).find((x) => x.name === $("vid-model").value);
+  const d = (m && m.defaults) || {};
+  const sizes = [];
+  if (d.width && d.height) { sizes.push(`${d.width}x${d.height}`, `${d.height}x${d.width}`); }
+  if (m && /wan22/.test(m.name)) sizes.push("640x640");
+  const keep = $("vid-size").value;
+  $("vid-size").innerHTML = `<option value="">model default${d.width ? ` (${d.width}x${d.height})` : ""}</option>` +
+    [...new Set(sizes)].map((z) => `<option${z === keep ? " selected" : ""}>${z}</option>`).join("");
+}
 function fillModelPickers() {
   for (const sel of document.querySelectorAll(".media-model")) {
     const kind = sel.dataset.kind, task = sel.dataset.task;
@@ -262,6 +273,7 @@ function fillModelPickers() {
     opts.push(`<option value="__more">Download more in Settings &gt; Models&hellip;</option>`);
     sel.innerHTML = opts.join("");
   }
+  fillVideoSizes();
 }
 for (const sel of document.querySelectorAll(".media-model")) {
   sel.onchange = async () => {
@@ -280,6 +292,7 @@ $("media-kinds").addEventListener("click", (e) => {
   const k = b.dataset.kind;
   $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
 });
+$("vid-model").addEventListener("change", fillVideoSizes);
 $("vid-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("vid-prompt").value.trim();
@@ -292,6 +305,14 @@ $("vid-form").onsubmit = async (ev) => {
   $("vid-go").disabled = true;
   const t0 = performance.now();
   $("vid-hint").textContent = "Generating\u2026 (several minutes; keep this tab open)";
+  // the steps as Monitor sees them
+  const prog = setInterval(async () => {
+    try {
+      const l = (await (await fetch("metrics", {headers: headers()})).json()).live || {};
+      if (l.state === "media" && l.steps) $("vid-hint").textContent = `Generating\u2026 step ${l.step} of ${l.steps} · ${fmt(l.elapsed_s, 0)} s`;
+      else if (l.queued) $("vid-hint").textContent = `Waiting for the GPU (${l.queued} ahead)\u2026`;
+    } catch (e) { /* the next tick */ }
+  }, 2000);
   try {
     const r = await fetch("v1/videos/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const j = await r.json();
@@ -307,11 +328,12 @@ $("vid-form").onsubmit = async (ev) => {
     cap.innerHTML = `${esc(j.size)}, ${j.frames} frames at ${j.fps} fps, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(prompt)} · <a href="${url}" download="am2strata-${d.seed}.${d.format}">save</a>`;
     fig.append(el, cap);
     $("img-results").prepend(fig);
-    $("vid-hint").textContent = "Done.";
+    $("vid-hint").textContent = j.strata && j.strata.frames_note ? `Done (${j.strata.frames_note}).` : "Done.";
   } catch (e) {
     $("vid-hint").textContent = "";
     toast("error", "No video", String(e.message || e), 10000);
   } finally {
+    clearInterval(prog);
     $("vid-go").disabled = false;
   }
 };

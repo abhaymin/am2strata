@@ -13,7 +13,7 @@ fn emit(v: serde_json::Value) {
 
 fn main() {
     let record = std::env::var("MOCK_MEDIA_RECORD").ok();
-    emit(serde_json::json!({"event": "ready", "cuda": false, "version": "mock"}));
+    emit(serde_json::json!({"event": "ready", "cuda": false, "version": "mock", "video_formats": ["mp4", "apng", "gif"]}));
     for line in std::io::stdin().lock().lines().map_while(Result::ok) {
         if let Some(r) = &record {
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(r) {
@@ -54,7 +54,7 @@ fn main() {
                 emit(serde_json::json!({"event": "speech", "format": "wav", "sample_rate": 44100, "seconds": 0.5,
                     "data": "UklGRiYAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQIAAAAAAA=="}));
             }
-            "unload" => emit(serde_json::json!({"event": "unloaded"})),
+            "unload" | "unload_audio" => emit(serde_json::json!({"event": "unloaded"})),
             "load" => emit(serde_json::json!({"event": "loaded", "model": cmd["model"]})),
             "pull" => emit(serde_json::json!({"event": "pulled", "model": cmd["model"]})),
             "list" => emit(serde_json::json!({"event": "models", "models": [

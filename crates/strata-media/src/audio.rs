@@ -88,15 +88,15 @@ pub fn list() -> Vec<Value> {
 fn device(req: &Value) -> Result<Device> {
     match req["device"].as_str() {
         Some("cuda") if cfg!(feature = "cuda") => Ok(Device::new_cuda(0)?),
-        Some("cuda") => bail!("this media engine was built without CUDA"),
+        Some("cuda") => bail!("this media engine was built without CUDA: set where speech runs (audio_device) to cpu, or build it with --features cuda"),
         _ => Ok(Device::Cpu),
     }
 }
 
 // ------------------------------------------------------------------ audio files
 
-/// Any file symphonia reads -> (mono samples, sample rate).
-pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32)> {
+/// Any file symphonia reads -> (mono samples, sample rate, warnings: packets that did not decode).
+pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32, Vec<String>)> {
     use symphonia::core::audio::{AudioBufferRef, Signal};
     use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
     use symphonia::core::conv::FromSample;
@@ -118,12 +118,30 @@ pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32)> {
     let id = track.id;
     let mut dec = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("unsupported audio codec: {e}"))?;
-    let mut out = Vec::new();
-    while let Ok(packet) = format.next_packet() {
+    let (mut out, mut packets, mut bad, mut ended) = (Vec::new(), 0usize, 0usize, None);
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(symphonia::core::errors::Error::ResetRequired) => break,
+            Err(e) => {
+                ended = Some(e.to_string());
+                break;
+            }
+        };
         if packet.track_id() != id {
             continue;
         }
-        match dec.decode(&packet).map_err(|e| anyhow!("{e}"))? {
+        packets += 1;
+        let buf = match dec.decode(&packet) {
+            Ok(b) => b,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => {
+                bad += 1; // a damaged packet: skipped, and said so
+                continue;
+            }
+            Err(e) => return Err(anyhow!("{e}")),
+        };
+        match buf {
             AudioBufferRef::F32(b) => mix(&mut out, b),
             AudioBufferRef::F64(b) => mix(&mut out, b),
             AudioBufferRef::S32(b) => mix(&mut out, b),
@@ -139,7 +157,14 @@ pub fn decode(bytes: Vec<u8>) -> Result<(Vec<f32>, u32)> {
     if rate == 0 || out.is_empty() {
         bail!("the audio file holds no samples");
     }
-    Ok((out, rate))
+    let mut warnings = Vec::new();
+    if bad > 0 {
+        warnings.push(format!("decoded {} of {packets} packets: {bad} were damaged and skipped", packets - bad));
+    }
+    if let Some(e) = ended {
+        warnings.push(format!("the file ended early ({e}): the transcript covers what was read"));
+    }
+    Ok((out, rate, warnings))
 }
 
 /// Band-limited resampling (a Hann-windowed sinc, 16 zero crossings), for any rate pair.
@@ -224,14 +249,11 @@ impl Whisper {
         Ok(Whisper { name: e.name.to_string(), model, tok, config, filters, device })
     }
 
-    /// The best language for the first 30 s of `mel` (detect_language of candle's example): (code, probability).
-    fn detect(&mut self, mel: &Tensor) -> Result<(String, f32)> {
-        let (_, _, frames) = mel.dims3()?;
-        let mel = mel.narrow(2, 0, frames.min(self.config.max_source_positions))?;
+    /// The best language from a window's encoder features (detect_language of candle's example): (code, probability).
+    fn detect(&mut self, feats: &Tensor) -> Result<(String, f32)> {
         let ids: Vec<u32> = LANGUAGES.iter().map(|l| tid(&self.tok, &format!("<|{l}|>"))).collect::<Result<_>>()?;
-        let feats = self.model.encoder.forward(&mel, true)?;
         let tokens = Tensor::new(&[[tid(&self.tok, wm::SOT_TOKEN)?]], &self.device)?;
-        let ys = self.model.decoder.forward(&tokens, &feats, true)?;
+        let ys = self.model.decoder.forward(&tokens, feats, true)?;
         let logits = self.model.decoder.final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
         let logits = logits.index_select(&Tensor::new(ids.as_slice(), &self.device)?, 0)?;
         let probs = candle_nn::ops::softmax(&logits, D::Minus1)?.to_vec1::<f32>()?;
@@ -239,23 +261,27 @@ impl Whisper {
         Ok((LANGUAGES[i].to_string(), *p))
     }
 
-    /// One 30 s window at temperature `t` -> (tokens, average log-probability, no-speech probability).
-    fn decode_window(&mut self, mel: &Tensor, prefix: &[u32], t: f64, suppress: &Tensor, rng: &mut u64)
+    /// One window's tokens at temperature `t` from its encoder features (computed once per window, shared by the
+    /// language detection and every temperature) -> (sampled tokens after the prefix, average log-probability,
+    /// no-speech probability). With timestamps, the sampling follows Whisper's timestamp rules.
+    fn decode_window(&mut self, feats: &Tensor, prefix: &[u32], t: f64, suppress: &Tensor, ts: Option<&Timestamps>, rng: &mut u64)
                      -> Result<(Vec<u32>, f64, f64)> {
-        let feats = self.model.encoder.forward(mel, true)?;
         let eot = tid(&self.tok, wm::EOT_TOKEN)?;
         let no_speech = wm::NO_SPEECH_TOKENS.iter().find_map(|t| self.tok.token_to_id(t)).ok_or_else(|| anyhow!("no no-speech token"))?;
         let mut tokens = prefix.to_vec();
         let (mut sum_lp, mut no_speech_p) = (0f64, f64::NAN);
         for i in 0..self.config.max_target_positions / 2 {
             let x = Tensor::new(tokens.as_slice(), &self.device)?.unsqueeze(0)?;
-            let ys = self.model.decoder.forward(&x, &feats, i == 0)?;
+            let ys = self.model.decoder.forward(&x, feats, i == 0)?;
             if i == 0 {
                 let l = self.model.decoder.final_linear(&ys.i(..1)?)?.i(0)?.i(0)?;
                 no_speech_p = candle_nn::ops::softmax(&l, 0)?.i(no_speech as usize)?.to_scalar::<f32>()? as f64;
             }
             let (_, n, _) = ys.dims3()?;
-            let logits = self.model.decoder.final_linear(&ys.i((..1, n - 1..))?)?.i(0)?.i(0)?.broadcast_add(suppress)?;
+            let mut logits = self.model.decoder.final_linear(&ys.i((..1, n - 1..))?)?.i(0)?.i(0)?.broadcast_add(suppress)?;
+            if let Some(ts) = ts {
+                logits = ts.apply(&logits, &tokens[prefix.len()..], tokens.len() == prefix.len(), eot)?;
+            }
             let next = if t > 0.0 {
                 let p = candle_nn::ops::softmax(&(&logits / t)?, 0)?.to_vec1::<f32>()?;
                 *rng ^= *rng << 13;
@@ -283,51 +309,68 @@ impl Whisper {
             sum_lp += p.ln();
         }
         let avg = sum_lp / tokens.len() as f64;
-        Ok((tokens, avg, no_speech_p))
+        let mut out = tokens.split_off(prefix.len());
+        if out.last() == Some(&eot) {
+            out.pop();
+        }
+        Ok((out, avg, no_speech_p))
     }
 
     /// Transcribes (or translates to English) mono 16 kHz samples. `on_segment` sees each segment as it is done.
+    /// Windows of 30 s are decoded with Whisper's timestamp tokens and the next window starts after the last complete
+    /// segment (OpenAI's transcribe), so a word at a window's end is read in the next one instead of being cut.
     pub fn run(&mut self, pcm: &[f32], language: Option<&str>, translate: bool, on_segment: &mut dyn FnMut(&Value)) -> Result<Value> {
         let mel = wa::pcm_to_mel(&self.config, pcm, &self.filters);
-        let frames = mel.len() / self.config.num_mel_bins;
-        let mel = Tensor::from_vec(mel, (1, self.config.num_mel_bins, frames), &self.device)?;
-        let multilingual = self.tok.token_to_id("<|de|>").is_some() && !self.name.ends_with(".en");
-        let (lang, lang_p) = match language {
-            Some(l) if multilingual => {
-                tid(&self.tok, &format!("<|{l}|>")).map_err(|_| anyhow!("language {l:?} is not one Whisper knows"))?;
-                (Some(l.to_string()), None)
-            }
-            Some(_) => (None, None),
-            None if multilingual => {
-                let (l, p) = self.detect(&mel)?;
-                (Some(l), Some(p))
-            }
-            None => (None, None),
-        };
+        let total_frames = mel.len() / self.config.num_mel_bins;
+        let mel = Tensor::from_vec(mel, (1, self.config.num_mel_bins, total_frames), &self.device)?;
+        let content = (pcm.len() / wm::HOP_LENGTH).min(total_frames);
+        let duration = pcm.len() as f64 / wm::SAMPLE_RATE as f64;
+        let multilingual = self.tok.token_to_id("<|de|>").is_some();
         let no_ts = tid(&self.tok, wm::NO_TIMESTAMPS_TOKEN)?;
-        let mut prefix = vec![tid(&self.tok, wm::SOT_TOKEN)?];
-        if let Some(l) = &lang {
-            prefix.push(tid(&self.tok, &format!("<|{l}|>"))?);
-        }
-        prefix.push(tid(&self.tok, if translate { wm::TRANSLATE_TOKEN } else { wm::TRANSCRIBE_TOKEN })?);
-        prefix.push(no_ts); // segment times come from the 30 s windows; token-level timestamps are not decoded
+        let tb = no_ts + 1; // the first timestamp token, <|0.00|>
+        let ts = Timestamps { begin: tb, vocab: self.config.vocab_size as u32, device: self.device.clone() };
         let suppress: Vec<f32> = (0..self.config.vocab_size as u32)
-            .map(|i| if self.config.suppress_tokens.contains(&i) { f32::NEG_INFINITY } else { 0.0 }).collect();
+            .map(|i| if self.config.suppress_tokens.contains(&i) || i == no_ts { f32::NEG_INFINITY } else { 0.0 }).collect();
         let suppress = Tensor::new(suppress.as_slice(), &self.device)?;
-        let (sot, eot) = (tid(&self.tok, wm::SOT_TOKEN)?, tid(&self.tok, wm::EOT_TOKEN)?);
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        let (mut seek, mut segments, mut text) = (0usize, Vec::new(), String::new());
-        while seek < frames {
-            let size = (frames - seek).min(wm::N_FRAMES);
-            let window = mel.narrow(2, seek, size)?;
-            let start = (seek * wm::HOP_LENGTH) as f64 / wm::SAMPLE_RATE as f64;
-            let total = pcm.len() as f64 / wm::SAMPLE_RATE as f64;
-            let dur = ((size * wm::HOP_LENGTH) as f64 / wm::SAMPLE_RATE as f64).min(total - start).max(0.0);
-            seek += size;
+        let (mut seek, mut segments, mut text) = (0usize, Vec::<Value>::new(), String::new());
+        let (mut lang, mut lang_p, mut prefix) = (None::<String>, None::<f32>, Vec::<u32>::new());
+        while seek < content {
+            let window = mel.narrow(2, seek, wm::N_FRAMES.min(total_frames - seek))?;
+            let size = wm::N_FRAMES.min(content - seek);
+            let offset = (seek * wm::HOP_LENGTH) as f64 / wm::SAMPLE_RATE as f64;
+            // silence: Whisper writes a word into it ("you", "Thank you."), so a window without sound is no speech
+            let (a, z) = (seek * wm::HOP_LENGTH, ((seek + size) * wm::HOP_LENGTH).min(pcm.len()));
+            let rms = (pcm[a..z].iter().map(|v| v * v).sum::<f32>() / (z - a).max(1) as f32).sqrt();
+            if rms < 1e-3 {
+                seek += size;
+                continue;
+            }
+            let feats = self.model.encoder.forward(&window, true)?;
+            if prefix.is_empty() {
+                lang = match language {
+                    Some(l) if multilingual => {
+                        tid(&self.tok, &format!("<|{l}|>")).map_err(|_| anyhow!("language {l:?} is not one Whisper knows"))?;
+                        Some(l.to_string())
+                    }
+                    Some(_) => None,
+                    None if multilingual => {
+                        let (l, p) = self.detect(&feats)?;
+                        lang_p = Some(p);
+                        Some(l)
+                    }
+                    None => None,
+                };
+                prefix.push(tid(&self.tok, wm::SOT_TOKEN)?);
+                if let Some(l) = &lang {
+                    prefix.push(tid(&self.tok, &format!("<|{l}|>"))?);
+                }
+                prefix.push(tid(&self.tok, if translate { wm::TRANSLATE_TOKEN } else { wm::TRANSCRIBE_TOKEN })?);
+            }
             // the temperature fallback: a window decoded too unsure is decoded again, a little warmer
             let mut best = None;
             for (k, &t) in wm::TEMPERATURES.iter().enumerate() {
-                let r = self.decode_window(&window, &prefix, t, &suppress, &mut rng)?;
+                let r = self.decode_window(&feats, &prefix, t, &suppress, Some(&ts), &mut rng)?;
                 let fallback = r.1 < wm::LOGPROB_THRESHOLD && r.2 <= wm::NO_SPEECH_THRESHOLD;
                 best = Some(r);
                 if !fallback || k == wm::TEMPERATURES.len() - 1 {
@@ -336,25 +379,129 @@ impl Whisper {
             }
             let (tokens, avg, ns) = best.unwrap();
             if ns > wm::NO_SPEECH_THRESHOLD && avg < wm::LOGPROB_THRESHOLD {
-                continue; // no speech in this window
-            }
-            let body: Vec<u32> = tokens.iter().copied().filter(|t| *t != sot && *t != eot && !prefix.contains(t)).collect();
-            let s = self.tok.decode(&body, true).map_err(|e| anyhow!("{e}"))?.trim().to_string();
-            if s.is_empty() {
+                seek += size; // no speech in this window
                 continue;
             }
-            let seg = json!({"id": segments.len(), "start": (start * 100.0).round() / 100.0, "end": ((start + dur) * 100.0).round() / 100.0,
-                             "text": s, "avg_logprob": (avg * 1000.0).round() / 1000.0, "no_speech_prob": (ns * 1000.0).round() / 1000.0});
-            on_segment(&seg);
-            if !text.is_empty() {
-                text.push(' ');
+            let (spans, advance) = split_by_timestamps(&tokens, tb, size);
+            for (start, end, body) in spans {
+                let s = self.tok.decode(&body, true).map_err(|e| anyhow!("{e}"))?.trim().to_string();
+                if s.is_empty() {
+                    continue;
+                }
+                let (a, b) = ((offset + start).min(duration), (offset + end).min(duration));
+                let seg = json!({"id": segments.len(), "start": (a * 100.0).round() / 100.0, "end": (b.max(a) * 100.0).round() / 100.0,
+                                 "text": s, "avg_logprob": (avg * 1000.0).round() / 1000.0, "no_speech_prob": (ns * 1000.0).round() / 1000.0});
+                on_segment(&seg);
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(&s);
+                segments.push(seg);
             }
-            text.push_str(&s);
-            segments.push(seg);
+            seek += advance.max(1);
         }
         Ok(json!({"text": text, "language": lang, "language_probability": lang_p, "segments": segments,
-                  "duration": (pcm.len() as f64 / wm::SAMPLE_RATE as f64 * 100.0).round() / 100.0, "task": if translate { "translate" } else { "transcribe" }}))
+                  "duration": (duration * 100.0).round() / 100.0, "task": if translate { "translate" } else { "transcribe" }}))
     }
+}
+
+/// Whisper's timestamp rules (candle's whisper example apply_timestamp_rules, after OpenAI's ApplyTimestampRules):
+/// timestamps come in pairs, never go back, and a window starts with one.
+struct Timestamps {
+    begin: u32,
+    vocab: u32,
+    device: Device,
+}
+
+impl Timestamps {
+    fn apply(&self, logits: &Tensor, sampled: &[u32], first: bool, eot: u32) -> Result<Tensor> {
+        let tb = self.begin;
+        let mut mask = vec![0f32; self.vocab as usize];
+        let mut any = false;
+        let mut forbid = |r: std::ops::Range<u32>, mask: &mut Vec<f32>| {
+            for i in r {
+                if (i as usize) < mask.len() {
+                    mask[i as usize] = f32::NEG_INFINITY;
+                }
+            }
+            any = true;
+        };
+        if first {
+            forbid(0..tb, &mut mask); // a window opens with a timestamp
+        } else {
+            let last_ts = sampled.last().is_some_and(|t| *t >= tb);
+            let penult_ts = sampled.len() < 2 || sampled[sampled.len() - 2] >= tb;
+            if last_ts {
+                if penult_ts {
+                    forbid(tb..self.vocab, &mut mask); // a closed pair: text next
+                } else {
+                    forbid(0..eot, &mut mask); // an open one: its closing timestamp (or the end) next
+                }
+            }
+            // timestamps never go back
+            if let Some(&last) = sampled.iter().rev().find(|t| **t >= tb) {
+                let from = if last_ts && !penult_ts { last } else { last + 1 };
+                forbid(tb..from, &mut mask);
+            }
+        }
+        let mut logits = logits.clone();
+        if any {
+            logits = logits.broadcast_add(&Tensor::new(mask.as_slice(), &self.device)?)?;
+        }
+        // when the timestamps together are likelier than any one text token, a timestamp it is
+        let lp = candle_nn::ops::log_softmax(&logits, 0)?.to_vec1::<f32>()?;
+        let ts_lp = {
+            let m = lp[tb as usize..].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            if m.is_finite() { m + lp[tb as usize..].iter().map(|v| (v - m).exp()).sum::<f32>().ln() } else { m }
+        };
+        let text_max = lp[..tb as usize].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        if ts_lp > text_max {
+            let mut m2 = vec![0f32; self.vocab as usize];
+            m2[..tb as usize].iter_mut().for_each(|v| *v = f32::NEG_INFINITY);
+            logits = logits.broadcast_add(&Tensor::new(m2.as_slice(), &self.device)?)?;
+        }
+        Ok(logits)
+    }
+}
+
+/// A window's tokens split at their timestamps (OpenAI's transcribe): (start s, end s, text tokens) per segment, and
+/// how many mel frames the next window moves on - to the last complete segment's end, or the whole window when the
+/// output ends on a single timestamp or holds no pair.
+pub fn split_by_timestamps(tokens: &[u32], tb: u32, size: usize) -> (Vec<(f64, f64, Vec<u32>)>, usize) {
+    let is_ts = |t: u32| t >= tb;
+    let secs = |t: u32| (t - tb) as f64 * 0.02;
+    let n = tokens.len();
+    let single_end = n >= 2 && !is_ts(tokens[n - 2]) && is_ts(tokens[n - 1]);
+    let mut cuts: Vec<usize> = (1..n).filter(|&i| is_ts(tokens[i]) && is_ts(tokens[i - 1])).collect();
+    if cuts.is_empty() {
+        let body: Vec<u32> = tokens.iter().copied().filter(|t| !is_ts(*t)).collect();
+        let last = tokens.iter().rev().find(|t| is_ts(**t)).copied();
+        let end = match last {
+            Some(t) if t != tb => secs(t),
+            _ => size as f64 * wm::HOP_LENGTH as f64 / wm::SAMPLE_RATE as f64,
+        };
+        let start = tokens.first().filter(|t| is_ts(**t)).map(|t| secs(*t)).unwrap_or(0.0);
+        return (vec![(start, end, body)], size);
+    }
+    if single_end {
+        cuts.push(n);
+    }
+    let (mut spans, mut last) = (Vec::new(), 0usize);
+    for c in &cuts {
+        let part = &tokens[last..*c];
+        if let (Some(&a), Some(&b)) = (part.first(), part.last()) {
+            let body: Vec<u32> = part.iter().copied().filter(|t| !is_ts(*t)).collect();
+            spans.push((if is_ts(a) { secs(a) } else { 0.0 }, if is_ts(b) { secs(b) } else { secs(a.max(tb)) }, body));
+        }
+        last = *c;
+    }
+    let advance = if single_end {
+        size
+    } else {
+        // the last complete segment's end, in mel frames (one timestamp step = 0.02 s = 2 frames)
+        ((tokens[last - 1].saturating_sub(tb)) as usize * 2).min(size)
+    };
+    (spans, advance)
 }
 
 // ------------------------------------------------------------------ Parler-TTS
@@ -381,7 +528,7 @@ impl Parler {
 
     /// Speech for `text` in the voice `description`: sentence by sentence (each a short generation), joined with a
     /// short pause. `on_part` sees (done, total) parts.
-    pub fn speak(&mut self, text: &str, description: &str, seed: u64, on_part: &mut dyn FnMut(usize, usize)) -> Result<(Vec<f32>, u32)> {
+    pub fn speak(&mut self, text: &str, description: &str, seed: u64, temperature: f64, on_part: &mut dyn FnMut(usize, usize)) -> Result<(Vec<f32>, u32)> {
         let parts = sentences(text, 220);
         if parts.is_empty() {
             bail!("nothing to say");
@@ -395,7 +542,7 @@ impl Parler {
             let prompt = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
             // about 86 codec frames a second of speech; a generous bound for the words given (it stops at its own end)
             let steps = ((p.chars().count() as f64 / 10.0 + 3.0) * 86.0).min(2600.0) as usize;
-            let lp = candle_transformers::generation::LogitsProcessor::new(seed + k as u64, Some(0.0), None);
+            let lp = candle_transformers::generation::LogitsProcessor::new(seed + k as u64, Some(temperature), None);
             let codes = self.model.generate(&prompt, &desc, lp, steps)?;
             let codes = codes.to_dtype(DType::I64)?.unsqueeze(0)?;
             let pcm = self.model.audio_encoder.decode_codes(&codes.to_device(&self.device)?)?;
@@ -465,9 +612,38 @@ mod tests {
     }
 
     #[test]
+    fn segments_follow_their_timestamps_and_the_next_window_starts_after_the_last_complete_one() {
+        let tb = 1000;
+        // <|0.00|> a b <|1.00|><|1.00|> c <|2.50|>  then an open segment d (cut by the window)
+        let toks = [tb, 1, 2, tb + 50, tb + 50, 3, tb + 125, 4];
+        let (spans, adv) = split_by_timestamps(&toks, tb, 3000);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!((spans[0].0, spans[0].1, spans[0].2.clone()), (0.0, 1.0, vec![1, 2]));
+        assert_eq!(adv, 100, "moves to 1.00 s (100 frames), so 'c' and 'd' are read again in the next window");
+        // ending on a single timestamp: the whole window is done
+        let toks = [tb, 1, tb + 50, tb + 50, 2, tb + 125];
+        let (spans, adv) = split_by_timestamps(&toks, tb, 3000);
+        assert_eq!((spans.len(), adv), (2, 3000));
+        assert_eq!((spans[1].0, spans[1].1), (1.0, 2.5));
+        // no timestamp pair: one segment, the whole window
+        let (spans, adv) = split_by_timestamps(&[tb, 5, 6, tb + 200], tb, 3000);
+        assert_eq!((spans.len(), spans[0].1, adv), (1, 4.0, 3000));
+    }
+
+    #[test]
+    fn a_damaged_file_says_so() {
+        let tone: Vec<f32> = (0..16000).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let mut w = wav(&tone, 16000);
+        w.truncate(w.len() - 7001); // cut mid-sample
+        let (pcm, _, _) = decode(w).unwrap();
+        assert!(pcm.len() < 16000 && pcm.len() > 12000, "{}", pcm.len());
+    }
+
+    #[test]
     fn wav_round_trips_through_the_decoder_and_resampling_keeps_a_tone() {
         let tone: Vec<f32> = (0..44100).map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 44100.0).sin() * 0.5).collect();
-        let (back, rate) = decode(wav(&tone, 44100)).unwrap();
+        let (back, rate, warn) = decode(wav(&tone, 44100)).unwrap();
+        assert!(warn.is_empty());
         assert_eq!((rate, back.len()), (44100, 44100));
         assert!((back[1000] - tone[1000]).abs() < 1e-3);
         let r = resample(&back, 44100, 16000);

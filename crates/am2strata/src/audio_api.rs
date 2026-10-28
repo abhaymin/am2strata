@@ -21,8 +21,11 @@ fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
-/// MemAvailable in GB (0 when unknown).
+/// MemAvailable in GB (0 when unknown). AM2_TEST_MEM_GB stands in for it in the tests.
 fn mem_available_gb() -> f64 {
+    if let Some(v) = std::env::var("AM2_TEST_MEM_GB").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
     std::fs::read_to_string("/proc/meminfo").ok()
         .and_then(|t| t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
         .map(|kb| kb / 1048576.0).unwrap_or(0.0)
@@ -47,6 +50,10 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
 
 /// Where this job runs, and whether it holds the GPU (the text model stopped meanwhile).
 fn placement(s: &AppState, size_gb: f64) -> (&'static str, bool) {
+    // an engine without CUDA computes on the CPU whatever the setting
+    if !s.media.cuda.load(std::sync::atomic::Ordering::Relaxed) {
+        return ("cpu", false);
+    }
     match s.media.audio_device.read().unwrap().as_str() {
         "cpu" => ("cpu", false),
         "cuda" => ("cuda", true),
@@ -80,6 +87,20 @@ async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cm
         if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {
             tracing::warn!("the media engine did not unload: {e:#}");
         }
+    } else if mem_available_gb() < size_gb * 2.0 + 2.0 {
+        // the RAM is short (a large text model beside it): the speech model goes at once
+        let _ = s.media.call(json!({"op": "unload_audio"}), |_| {}).await;
+    } else {
+        // else it stays warm for the next request, and goes after 120 s without one
+        let media = s.media.clone();
+        let mut idle = s.media.audio_idle.lock().unwrap();
+        if let Some(h) = idle.take() {
+            h.abort();
+        }
+        *idle = Some(tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let _ = media.call(json!({"op": "unload_audio"}), |_| {}).await;
+        }));
     }
     match r {
         Ok(v) => Ok((v, device, id)),
@@ -224,7 +245,10 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         "fable" | "ballad" => "lea",
         v => v,
     };
-    let cmd = json!({"op": "speak", "model": model, "text": text, "voice": voice, "seed": req["seed"].as_u64().unwrap_or(0)});
+    let mut cmd = json!({"op": "speak", "model": model, "text": text, "voice": voice, "seed": req["seed"].as_u64().unwrap_or(0)});
+    if let Some(t) = req["temperature"].as_f64() {
+        cmd["temperature"] = json!(t.clamp(0.0, 2.0)); // Parler samples at 1.0 unless told (0: greedy)
+    }
     let (r, device, id) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
         Ok(x) => x,
         Err(r) => return r,

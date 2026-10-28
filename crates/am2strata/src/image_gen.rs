@@ -41,6 +41,12 @@ pub struct Media {
     pub audio_device: std::sync::RwLock<String>,
     /// the media download in progress or last finished: {"state": "idle" | "pulling" | "done" | "error", ...}
     pub pull_job: std::sync::Mutex<Value>,
+    /// the video formats the running engine can encode (its ready event); empty before it started
+    pub video_formats: std::sync::Mutex<Vec<String>>,
+    /// the engine was built with CUDA (its ready event)
+    pub cuda: std::sync::atomic::AtomicBool,
+    /// the timer that frees the speech models after a while unused (audio_api.rs)
+    pub audio_idle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub keep_text_model: bool,
     mold_home: PathBuf,
     proc: Mutex<Option<Proc>>,
@@ -72,6 +78,9 @@ impl Media {
             tts_model: std::sync::RwLock::new(saved["tts_model"].as_str().unwrap_or(DEFAULT_TTS_MODEL).to_string()),
             audio_device: std::sync::RwLock::new(saved["audio_device"].as_str().unwrap_or("auto").to_string()),
             pull_job: std::sync::Mutex::new(json!({"state": "idle"})),
+            video_formats: std::sync::Mutex::new(Vec::new()),
+            cuda: std::sync::atomic::AtomicBool::new(true),
+            audio_idle: std::sync::Mutex::new(None),
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
             proc: Mutex::new(None),
@@ -130,6 +139,11 @@ impl Media {
             anyhow::bail!("the media engine said {first}");
         }
         tracing::info!("media engine started ({}): {first}", exe.display());
+        // an older engine names none: it was built without mp4 (APNG and GIF are always there)
+        let formats: Vec<String> = v["video_formats"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(str::to_string)).collect())
+            .unwrap_or_else(|| vec!["apng".into(), "gif".into()]);
+        *self.video_formats.lock().unwrap() = formats;
+        self.cuda.store(v["cuda"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
         Ok(Proc { child, stdin, lines })
     }
 
@@ -372,17 +386,25 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             _ => return bad("size must be WIDTHxHEIGHT, each a multiple of 16 from 128 to 1920"),
         }
     }
-    let frames = req["frames"].as_u64().or(d["frames"].as_u64()).unwrap_or(33);
-    if !(1..=257).contains(&frames) {
+    let asked_frames = req["frames"].as_u64().or(d["frames"].as_u64()).unwrap_or(33);
+    if !(1..=257).contains(&asked_frames) {
         return bad("frames must be 1 to 257");
     }
+    // Wan takes 4n+1 frames, LTX 8n+1: a count between is rounded up (and said so)
+    let step = video_frame_step(m["family"].as_str().unwrap_or(""));
+    let frames = (asked_frames.saturating_sub(1)).div_ceil(step) * step + 1;
+    let frames_note = (frames != asked_frames).then(|| format!("{asked_frames} frames rounded to {frames} ({} takes {step}n+1)", m["family"].as_str().unwrap_or("")));
     let fps = req["fps"].as_u64().or(d["fps"].as_u64()).unwrap_or(16).clamp(1, 60);
     let steps = req["steps"].as_u64().or(d["steps"].as_u64()).unwrap_or(30).clamp(1, 100);
     let guidance = req["guidance"].as_f64().or(d["guidance"].as_f64()).unwrap_or(5.0);
-    let format = req["format"].as_str().unwrap_or("mp4");
-    if !matches!(format, "mp4" | "webp" | "gif" | "apng") {
-        return bad("format: mp4, webp, gif or apng");
-    }
+    let formats = s.media.video_formats.lock().unwrap().clone();
+    let format = match req["format"].as_str() {
+        // not asked: MP4 when this engine makes it, else APNG
+        None => if formats.iter().any(|f| f == "mp4") { "mp4".to_string() } else { "apng".to_string() },
+        Some(f) if formats.iter().any(|x| x == f) => f.to_string(),
+        Some(f) => return bad(format!("format {f:?}: this media engine makes {}", formats.join(", "))),
+    };
+    let format = format.as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let t0 = Instant::now();
     let _gpu = match s.mgr.gpu_exclusive(!s.media.keep_text_model).await {
@@ -420,5 +442,10 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
                 "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"],
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
-                           "engine": "am2strata-media (Rust, candle)"}})).into_response()
+                           "engine": "am2strata-media (Rust, candle)", "frames_note": frames_note}})).into_response()
+}
+
+/// A video family's frame rule: n * step + 1 frames (Wan 4, LTX-Video and LTX-2 8; mold checks the same).
+pub fn video_frame_step(family: &str) -> u64 {
+    if family.starts_with("ltx") { 8 } else { 4 }
 }

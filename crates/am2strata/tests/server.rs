@@ -803,8 +803,15 @@ fn videos_are_made_with_the_models_defaults_and_checked() {
     let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
     let gen: Vec<Value> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|v| v["op"] == "generate").collect();
     assert_eq!((gen[0]["request"]["steps"].as_u64(), gen[0]["request"]["guidance"].as_f64()), (Some(30), Some(5.0)));
+    // Wan takes 4n+1 frames: 18 is rounded up to 21, and said so
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "p", "frames": 18}));
+    assert_eq!((c, r["frames"].as_u64()), (200, Some(21)), "{r}");
+    assert!(r["strata"]["frames_note"].as_str().unwrap().contains("4n+1"), "{r}");
+    // a format this engine does not make is refused by name
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "p", "format": "webp"}));
+    assert!(c == 400 && r["error"]["message"].as_str().unwrap().contains("mp4, apng, gif"), "{r}");
     for (body, what) in [(json!({"prompt": "p", "model": "z-image-turbo:q8"}), "not a video model"),
-                         (json!({"prompt": "p", "size": "100x100"}), "multiple of 16"), (json!({"prompt": "p", "format": "avi"}), "format")] {
+                         (json!({"prompt": "p", "size": "100x100"}), "multiple of 16"), (json!({"prompt": "p", "format": "avi"}), "makes")] {
         let (c, r) = s.post("/v1/videos/generations", &body);
         assert_eq!(c, 400, "{body}: {r}");
         assert!(r["error"]["message"].as_str().unwrap().contains(what), "{r}");
@@ -919,4 +926,19 @@ fn speech_is_transcribed_and_spoken_in_openais_shapes() {
     let sp = calls["requests"].as_array().unwrap().iter().find(|r| r["path"] == "/v1/audio/speech" && r["http_status"] == 200).cloned().unwrap();
     let d = s.get(&format!("/api/requests?id={}", sp["id"].as_str().unwrap()), true).1;
     assert!(d["response"].as_str().unwrap().starts_with("<WAV audio"), "{d}");
+}
+
+#[test]
+fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
+    for (mem, unloads) in [(1, true), (64, false)] {
+        let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": mem}));
+        s.post("/api/media/models/default", &json!({"model": "whisper-base"}));
+        let (c, r) = s.post("/v1/audio/transcriptions", &json!({"file": "AQIDBA=="}));
+        assert_eq!(c, 200, "{r}");
+        let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+        let ops: Vec<String> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].as_str().unwrap().to_string()).collect();
+        assert_eq!(ops.contains(&"unload_audio".to_string()), unloads, "{mem} GB free: {ops:?}");
+        let t = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "transcribe").unwrap();
+        assert_eq!(t["device"], "cpu", "an engine without CUDA computes on the CPU");
+    }
 }

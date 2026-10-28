@@ -4,3 +4,9 @@ PolyStrata's code and web app (MIT, Copyright (c) 2026 Niko1221 and the Strata c
 Bundled third-party files keep their own licenses:
 - web/vendor/mermaid.min.js: Mermaid 11.4.1, MIT (web/vendor/LICENSE-mermaid.txt)
 - web/fonts: the Outfit font, SIL Open Font License 1.1 (web/fonts/OFL.txt)
+
+The media engine (crates/strata-media, built only on request) links, through mold (MIT):
+- OpenH264 (BSD-2-Clause, Cisco) for MP4 / H.264 video output;
+- the Fraunhofer FDK AAC codec (fdk-aac crate; "Software License for The Fraunhofer FDK AAC Codec Library for
+  Android", a permissive licence with patent and naming conditions - not OSI-approved) for audio tracks in MP4 files.
+- Whisper's mel filter banks from candle's whisper example (MIT or Apache-2.0), crates/strata-media/assets.

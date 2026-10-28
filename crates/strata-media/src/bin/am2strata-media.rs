@@ -15,6 +15,7 @@
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
 //!                                                         <- {"event":"part","done":1,"total":3} ...
 //!                                                         <- {"event":"speech","format":"wav","sample_rate":..,"seconds":..,"data":"<base64>"}
+//!   -> {"op":"unload_audio"}                              <- {"event":"unloaded"}  (Whisper and Parler only)
 //!   any failure                                           <- {"event":"error","message":...}
 //!
 //! Models and their files come from mold's catalog, stored under $MOLD_HOME (am2Strata sets <Strata-data>/media).
@@ -52,7 +53,7 @@ fn transcribe(st: &mut State, cmd: &Value) -> Result<Value> {
         st.whisper = Some(audio::Whisper::load(e, cmd)?);
     }
     let bytes = base64::engine::general_purpose::STANDARD.decode(cmd["audio"].as_str().unwrap_or("")).context("audio: base64")?;
-    let (pcm, rate) = audio::decode(bytes)?;
+    let (pcm, rate, warnings) = audio::decode(bytes)?;
     let pcm = audio::resample(&pcm, rate, 16000);
     let t0 = std::time::Instant::now();
     let mut r = st.whisper.as_mut().unwrap().run(&pcm, cmd["language"].as_str().filter(|l| !l.is_empty()),
@@ -62,6 +63,7 @@ fn transcribe(st: &mut State, cmd: &Value) -> Result<Value> {
             emit(ev);
         })?;
     r["event"] = json!("transcript");
+    r["warnings"] = json!(warnings);
     r["ms"] = json!(t0.elapsed().as_millis() as u64);
     r["model"] = json!(name);
     Ok(r)
@@ -80,6 +82,7 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
         .unwrap_or_else(|| voice.to_string());
     let t0 = std::time::Instant::now();
     let (pcm, rate) = st.parler.as_mut().unwrap().speak(text, &description, cmd["seed"].as_u64().unwrap_or(0),
+        cmd["temperature"].as_f64().unwrap_or(1.0),
         &mut |done, total| emit(json!({"event": "part", "done": done, "total": total})))?;
     Ok(json!({"event": "speech", "format": "wav", "sample_rate": rate, "seconds": (pcm.len() as f64 / rate as f64 * 100.0).round() / 100.0,
               "ms": t0.elapsed().as_millis() as u64, "model": name,
@@ -178,7 +181,9 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
     let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, whisper: None, parler: None };
-    emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION")}));
+    // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
+    emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION"),
+                "video_formats": ["mp4", "apng", "gif"]}));
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -208,6 +213,11 @@ fn main() {
                     emit(json!({"event": "unloaded"}));
                 }
                 "list" => emit(list(&mut st)),
+                "unload_audio" => {
+                    st.whisper = None;
+                    st.parler = None;
+                    emit(json!({"event": "unloaded"}));
+                }
                 "transcribe" => {
                     let r = transcribe(&mut st, &cmd)?;
                     emit(r)

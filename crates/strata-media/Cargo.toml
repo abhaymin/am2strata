@@ -13,7 +13,8 @@ cudnn = ["mold-ai-inference/cudnn"]
 
 [dependencies]
 # mold (MIT; LTX-2 parts Apache-2.0): candle-based diffusion models, pinned to one commit
-mold-ai-inference = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b" }
+# features: mp4 - MP4 (H.264 by OpenH264) output for video, which also builds the FDK-AAC codec (see NOTICE)
+mold-ai-inference = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b", features = ["mp4"] }
 mold-ai-core = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
