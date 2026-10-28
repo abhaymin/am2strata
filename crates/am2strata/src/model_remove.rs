@@ -74,7 +74,8 @@ pub async fn plan(s: &AppState, id: &str) -> Result<Value, (StatusCode, String)>
                 units.insert(u);
             }
             // data kept elsewhere (shared drafts, PolyStrata's profiles); not the engines, tokenizers and folders
-            None if r.is_file() && r.starts_with(&s.data_dir) && !kept.iter().any(|k: &Value| k["path"] == json!(r)) =>
+            None if r.is_file() && r.starts_with(&s.data_dir) && own["log"].as_str() != r.to_str()
+                && !kept.iter().any(|k: &Value| k["path"] == json!(r)) =>
                 kept.push(json!({"path": r, "why": "outside the download folders (shared)"})),
             None => {}
         }
