@@ -105,7 +105,7 @@ measured on Orca and MiniCPM first.
 | B | Collections, keyword search, injection when asked | server only |
 | C | Embeddings (candle, CPU) + automatic injection | a Rust embedding crate |
 | D | Shared memory + remember/recall tool - **done** (keyword search), plus chats past the context | B |
-| E | Prompt snapshots on disk (SAVE/RESTORE) | engine SAVE/RESTORE (exists), measurements |
+| E | Prompt snapshots on disk (SAVE/RESTORE) - **built** (2026-10-29, crates/am2strata/src/snapshots.rs): saved before the model stops and after a 16K+ prompt, restored when one gives 2,048+ more tokens than the engine holds; `strata` (Orca) only; live speed still to measure | engine SAVE/RESTORE (exists), measurements |
 | F | Similar-question cache (opt-in), engine `EMBED` | C, engine change |
 
 Each phase ships with Rust tests on the mock engine (the mock gets SAVE/RESTORE and EMBED stubs) and a live check on

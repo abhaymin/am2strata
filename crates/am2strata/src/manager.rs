@@ -55,6 +55,8 @@ pub struct Loaded {
     pub sampling_defaults: crate::settings::Defaults,
     /// #25: answers' thinking by their text, for clients that send an answer back without it (the last 512)
     pub reasoning_memory: std::sync::Mutex<std::collections::VecDeque<(String, String)>>,
+    /// the tokens the engine holds after the last request (its prompt and reply), for the prompt snapshots
+    pub held: std::sync::Mutex<Vec<u32>>,
 }
 
 impl Loaded {
@@ -142,6 +144,8 @@ pub struct Manager {
     pub monitor: Arc<crate::monitor::Monitor>,
     /// facts and conversation archives (memory.rs), under <data>/memory
     pub memory: Arc<crate::memory::Memory>,
+    /// prompt snapshots on the SSD (snapshots.rs), under <data>/cache/kv
+    pub snapshots: Arc<crate::snapshots::Snapshots>,
     /// media jobs a chat's tools queue (media_jobs.rs; set once the server is built)
     pub media_jobs: std::sync::OnceLock<Arc<crate::media_jobs::Jobs>>,
     /// web_search / fetch_url (web_tools.rs; set from the run config at start)
@@ -218,6 +222,7 @@ impl Manager {
             ready_timeout,
             monitor: crate::monitor::Monitor::new(),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
+            snapshots: Arc::new(crate::snapshots::Snapshots::open(&memory_dir)),
             media_jobs: std::sync::OnceLock::new(),
             web: std::sync::OnceLock::new(),
         }
@@ -301,6 +306,7 @@ impl Manager {
         if unload_text {
             if let Some(l) = self.current.write().await.take() {
                 tracing::info!(model = %l.entry.id, "stopping the text model for a media job (it loads again with the next request)");
+                self.snapshots.save(&l, "before the model stops").await;
                 stop(&l).await;
             }
             self.queue.set_resident(crate::queue::Resident::Gpu);
@@ -317,6 +323,7 @@ impl Manager {
             }
         };
         if let Some(l) = self.current.write().await.take() {
+            self.snapshots.save(&l, "before the model stops").await;
             stop(&l).await;
         }
         self.queue.set_resident(crate::queue::Resident::None);
@@ -347,6 +354,7 @@ impl Manager {
         let before = self.current.write().await.take();
         let before_id = before.as_ref().map(|l| l.entry.id.clone());
         if let Some(l) = before {
+            self.snapshots.save(&l, "before the model stops").await;
             stop(&l).await;
         }
         match start(&entry, &self.hw, self.ready_timeout).await {
@@ -492,6 +500,7 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         shared: std::sync::RwLock::new(crate::settings::read_shared(&entry.path)),
         sampling_defaults,
         reasoning_memory: Default::default(),
+        held: Default::default(),
     })
 }
 

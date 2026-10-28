@@ -441,8 +441,11 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let (tx, events) = mpsc::channel(256);
     let model = loaded.entry.id.clone();
     let lc = loaded.clone();
+    let mgr_task = mgr.clone();
     tokio::spawn(async move {
         let _turn = turn; // held until this request ends
+        // a prompt snapshot on the SSD that gives more of this prompt than the engine holds is read back first
+        mgr_task.snapshots.before(&lc, &ids, images.is_some()).await;
         let mut detok = Detokenizer::new();
         let mut cut = StopCutter { stops, held: String::new(), hit: None };
         let mut prompt_ids = ids;
@@ -599,6 +602,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             drop(rx); // a pass ended early: the engine is told to STOP and drained before the next one
             if let Some(d) = &ended {
                 last_done = Some(d.clone());
+                // what the engine holds now: this pass's prompt and its reply (none with pictures: not saved)
+                *lc.held.lock().unwrap() = if has_images { Vec::new() } else { prompt_ids.iter().chain(seg.iter()).copied().collect() };
             }
             if let Some(p) = recover_prompt.take().filter(|_| n < max_new) {
                 // #728: once, from the same output with the low-effort sentence; only temperature and presence penalty
@@ -718,6 +723,10 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             .await;
         if let Some(t) = temp {
             let _ = std::fs::remove_file(t);
+        }
+        // a long prompt (an agent's system prompt and tools) goes to the SSD once, after the answer, still in this turn
+        if !has_images {
+            mgr_task.snapshots.after(&lc, orig_ids.len()).await;
         }
     });
     Ok(Started { events, prompt_tokens, model })

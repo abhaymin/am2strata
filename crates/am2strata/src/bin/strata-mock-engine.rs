@@ -114,6 +114,20 @@ fn main() {
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.first().copied() {
             Some("QUIT") => return,
+            // disk sessions, as `strata --serve` answers them: a progress line, a blocking step, then the result
+            Some("SAVE") => {
+                let path = line.splitn(2, ' ').nth(1).unwrap_or("");
+                say("SWAIT capture 30");
+                match std::fs::write(path, vec![b'x'; 1234]) {
+                    Ok(()) => { say("SESSION 1234 1234"); say("SAVED 4096 1234 2.5"); }
+                    Err(e) => say(&format!("SERR io 0 {e}")),
+                }
+            }
+            Some("RESTORE") => {
+                let path = line.splitn(2, ' ').nth(1).unwrap_or("");
+                if std::path::Path::new(path).is_file() { say("SESSION 1234 1234"); say("RESTORED 4096 1234 1.5"); }
+                else { say("SERR invalid 0 session file: saved with another model (model fingerprint differs)"); }
+            }
             Some("GEN") | Some("GENI") => {
                 stop.store(false, Ordering::SeqCst);
                 let max_new: usize = f.get(1).and_then(|n| n.parse().ok()).unwrap_or(1);

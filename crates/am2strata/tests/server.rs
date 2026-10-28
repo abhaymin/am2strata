@@ -1319,3 +1319,53 @@ fn fetch_url_keeps_out_of_the_private_network_by_default() {
     let p = prompt_text(s.gen_lines().last().unwrap());
     assert!(p.contains("private network") && !p.contains("Jeddah"), "{p}");
 }
+
+#[test]
+fn a_long_conversation_goes_to_the_ssd_when_the_model_stops_and_comes_back_after() {
+    let m = Model { extra: json!({"session_files": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("Answer one."), ids("Answer two.")], json!({}));
+    // a prompt of some thousands of tokens
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(400);
+    let first = json!({"messages": [user(&long)], "chat_template_kwargs": {"enable_thinking": false}});
+    let (c, r) = s.post("/v1/chat/completions", &first);
+    assert_eq!(c, 200, "{r}");
+    // a media job stops the text model: its conversation is saved first
+    let (c, _) = s.post("/v1/images/generations", &json!({"prompt": "x", "size": "512x512", "steps": 1}));
+    assert_eq!(c, 200);
+    let cmds = s.commands();
+    let save = cmds.iter().position(|c| c.starts_with("SAVE ")).expect("SAVE before the stop");
+    let file = cmds[save]["SAVE ".len()..].to_string();
+    assert!(std::path::Path::new(&file).is_file() && file.contains("/cache/kv/mock-a/"), "{file}");
+    assert!(std::path::Path::new(&file.replace(".sess", ".ids")).is_file());
+    // the next turn of the same conversation: the model loads again, the snapshot is read back, then GEN
+    let mut msgs = first["messages"].as_array().unwrap().clone();
+    msgs.push(json!({"role": "assistant", "content": "Answer one."}));
+    msgs.push(user("and then?"));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": msgs, "chat_template_kwargs": {"enable_thinking": false}}));
+    assert_eq!(c, 200, "{r}");
+    let cmds = s.commands();
+    let restore = cmds.iter().rposition(|c| c.starts_with("RESTORE ")).expect("RESTORE after the reload");
+    let gen = cmds.iter().rposition(|c| c.starts_with("GEN ")).unwrap();
+    assert!(restore < gen && cmds[restore].ends_with(&file), "{:?}", &cmds[save..]);
+}
+
+#[test]
+fn a_snapshot_the_engine_refuses_is_dropped_and_the_request_goes_on() {
+    let m = Model { extra: json!({"session_files": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("One."), ids("Two.")], json!({}));
+    let long = "a b c d e f g h ".repeat(800);
+    let first = json!({"messages": [user(&long)], "chat_template_kwargs": {"enable_thinking": false}});
+    assert_eq!(s.post("/v1/chat/completions", &first).0, 200);
+    assert_eq!(s.post("/v1/images/generations", &json!({"prompt": "x", "size": "512x512", "steps": 1})).0, 200);
+    let cmds = s.commands();
+    let file = cmds.iter().find(|c| c.starts_with("SAVE ")).unwrap()["SAVE ".len()..].to_string();
+    std::fs::remove_file(&file).unwrap(); // gone: the engine refuses it
+    let mut msgs = first["messages"].as_array().unwrap().clone();
+    msgs.push(json!({"role": "assistant", "content": "One."}));
+    msgs.push(user("more"));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": msgs, "chat_template_kwargs": {"enable_thinking": false}}));
+    assert_eq!(c, 200, "{r}");
+    assert!(!r["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty(), "{r}");
+    assert!(s.commands().iter().any(|c| c.starts_with("RESTORE ")), "it was tried");
+    assert!(!std::path::Path::new(&file.replace(".sess", ".ids")).exists(), "the refused snapshot was dropped");
+}

@@ -211,6 +211,7 @@ pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Qu
     let all = q.get("requests").is_some_and(|v| v == "all");
     let mut m = s.mgr.monitor.metrics(engine, loaded, all);
     m["queue"] = s.mgr.queue.snapshot();
+    m["prompt_snapshots"] = s.mgr.snapshots.stats();
     Json(m).into_response()
 }
 
@@ -240,4 +241,16 @@ pub async fn status(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let ctx = engine["max_context"].as_u64().map(|c| c as usize);
     let images = engine["images"].as_bool().unwrap_or(false);
     Json(s.mgr.monitor.status(engine["model"].clone(), loaded, ctx, images)).into_response()
+}
+
+/// POST /api/cache/snapshots/clear: every prompt snapshot on the SSD goes (this server's own page only).
+pub async fn clear_snapshots(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the caches can be cleared");
+    }
+    let _p = s.mgr.queue.enter(crate::queue::Need::Any, "clear", "snapshots", |_| {}).await;
+    Json(json!({"freed_bytes": s.mgr.snapshots.clear()})).into_response()
 }

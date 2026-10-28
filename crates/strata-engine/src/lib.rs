@@ -376,6 +376,55 @@ impl Engine {
         rx
     }
 
+    /// A disk session between requests: `SAVE <path>` (the conversation the engine holds, to a file) or
+    /// `RESTORE <path>` (that conversation back, so a request that starts with its tokens reads only the rest).
+    /// -> (tokens, bytes, ms). The engine answers SAVED / RESTORED; on the way SESSION progress lines and SWAIT
+    /// <phase> <seconds> before a step that blocks (that step's allowance); SERR <kind> <published> <reason> refuses
+    /// and leaves it in step (Error::Refused); FATAL, or any other line, means it is out of step (Error::Died: the
+    /// caller restarts it). Only for an engine that has session files (`strata --serve` with --prompt-cache > 0).
+    pub async fn session(&self, save: bool, path: &std::path::Path, silence: Duration) -> Result<(u64, u64, f64)> {
+        let p = path.to_string_lossy();
+        if p.contains(['\r', '\n', '\0']) || p.is_empty() {
+            return Err(Error::Refused("invalid session path".into()));
+        }
+        let _turn = self.inner.turn.lock().await;
+        {
+            let mut stdin = self.inner.stdin.lock().await;
+            let line = format!("{} {p}\n", if save { "SAVE" } else { "RESTORE" });
+            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                return Err(Error::Died);
+            }
+        }
+        let want = if save { "SAVED" } else { "RESTORED" };
+        let mut events = self.inner.events.lock().await;
+        let mut allow = Duration::ZERO;
+        loop {
+            let wait = silence.max(allow);
+            let ev = match tokio::time::timeout(wait, events.recv()).await {
+                Err(_) => return Err(Error::Refused(format!("the engine said nothing for {} s during a session file", wait.as_secs()))),
+                Ok(Some(Some(ev))) => ev,
+                Ok(_) => return Err(Error::Died),
+            };
+            let line = match ev {
+                Event::Other(l) => l,
+                Event::Info(_) => continue,
+                _ => return Err(Error::Died),
+            };
+            let f: Vec<&str> = line.split_whitespace().collect();
+            match f.first().copied().unwrap_or("") {
+                "SESSION" => allow = Duration::ZERO,
+                "SWAIT" => allow = Duration::from_secs(f.get(2).and_then(|s| s.parse().ok()).unwrap_or(60).min(3600)),
+                "SERR" => return Err(Error::Refused(line.splitn(4, ' ').nth(3).unwrap_or("refused").to_string())),
+                "FATAL" => return Err(Error::Died),
+                w if w == want => {
+                    let n = |i: usize| f.get(i).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    return Ok((n(1) as u64, n(2) as u64, n(3)));
+                }
+                _ => return Err(Error::Died),
+            }
+        }
+    }
+
     /// Ask the engine to exit, then make sure it has.
     pub async fn shutdown(&self) {
         {

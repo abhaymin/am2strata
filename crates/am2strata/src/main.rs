@@ -25,6 +25,7 @@ mod responses;
 mod run;
 mod server_tools;
 mod settings;
+mod snapshots;
 mod structured;
 mod web;
 mod web_tools;
@@ -318,6 +319,7 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/cache/snapshots/clear", post(web::clear_snapshots))
         .route("/api/models/{id}", axum::routing::delete(model_remove::remove))
         .route("/api/models/{id}/removal", get(model_remove::removal))
         .route("/api/media/models/{name}", axum::routing::delete(model_remove::media_remove))
