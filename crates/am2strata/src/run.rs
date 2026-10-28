@@ -332,8 +332,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         None => {
             let label = format!("{} chat", loaded.entry.id);
             let p = mgr.take_turn(&loaded.entry.id, &label, |_| {});
-            p.await.map_err(|t| Refusal(503, format!("waited {} s at place {} of the queue (queue_max_wait_s); try again later",
-                                                         t.waited_s, t.position)))?
+            p.await.map_err(|t| Refusal(503, t.to_string()))?
         }
     };
     // the model may have been stopped while this waited (a media job, a switch): loaded again for this turn

@@ -15,6 +15,78 @@ const URL_MAX: usize = 64 << 20;
 pub const DEFAULT_FRAMES: usize = 16;
 pub const MAX_FRAMES: usize = 64;
 
+/// What a request's media sources may reach (main.rs sets it from the config at start). Local paths: only for a
+/// server that listens on this PC alone, or with "allow_local_files": true. URLs: public addresses only, unless
+/// "allow_private_urls": true (else an API client could read the LAN, the router or this PC's own services).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SourcePolicy {
+    pub local_files: bool,
+    pub private_urls: bool,
+}
+
+pub static POLICY: std::sync::OnceLock<SourcePolicy> = std::sync::OnceLock::new();
+
+fn policy() -> SourcePolicy {
+    POLICY.get().copied().unwrap_or_default()
+}
+
+/// Loopback, private, link-local, CGNAT, unique-local, multicast, unspecified or documentation addresses.
+pub fn non_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback() || a.is_private() || a.is_link_local() || a.is_unspecified() || a.is_broadcast() || a.is_multicast()
+                || o[0] == 0 || (o[0] == 100 && (64..128).contains(&o[1])) || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 198 && (18..20).contains(&o[1])) || o[0] >= 240
+        }
+        IpAddr::V6(a) => {
+            if let Some(v4) = a.to_ipv4_mapped() {
+                return non_public(IpAddr::V4(v4));
+            }
+            let s = a.segments();
+            a.is_loopback() || a.is_unspecified() || a.is_multicast() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// GET of a public URL: each hop's address checked and pinned (no DNS rebinding between the check and the
+/// connection), up to 5 redirects, each checked again.
+async fn fetch_public(src: &str, allow_private: bool) -> Result<reqwest::Response> {
+    let mut url = reqwest::Url::parse(src).map_err(|e| anyhow!("the URL could not be read: {e}"))?;
+    for _ in 0..6 {
+        let host = url.host_str().ok_or_else(|| anyhow!("the URL has no host"))?.to_string();
+        let port = url.port_or_known_default().unwrap_or(443);
+        let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.trim_start_matches('[').trim_end_matches(']'), port)).await
+            .map_err(|e| anyhow!("the URL's host could not be found: {e}"))?.collect();
+        let Some(addr) = addrs.first().copied() else { bail!("the URL's host could not be found") };
+        if !allow_private && addrs.iter().any(|a| non_public(a.ip())) {
+            bail!("the URL points into a private network or this PC ({host}); such URLs are not fetched (\"allow_private_urls\" in the run config)");
+        }
+        let resp = reqwest::Client::builder()
+            .user_agent("strata")
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve(&host, addr)
+            .build()?
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| anyhow!("the URL could not be read: {e}"))?;
+        if resp.status().is_redirection() {
+            let to = resp.headers().get(reqwest::header::LOCATION).and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("the URL redirects nowhere"))?;
+            url = url.join(to).map_err(|e| anyhow!("the URL redirects to a bad address: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                bail!("the URL redirects to a {} address", url.scheme());
+            }
+            continue;
+        }
+        return Ok(resp);
+    }
+    bail!("the URL redirects too many times")
+}
+
 pub async fn load_source(src: &str) -> Result<Vec<u8>> {
     if let Some(rest) = src.strip_prefix("data:") {
         let (_, b64) = rest.split_once(',').ok_or_else(|| anyhow!("the data: URL could not be read (no comma)"))?;
@@ -23,14 +95,7 @@ pub async fn load_source(src: &str) -> Result<Vec<u8>> {
             .map_err(|e| anyhow!("the data: URL could not be read ({e})"));
     }
     if src.starts_with("http://") || src.starts_with("https://") {
-        let resp = reqwest::Client::builder()
-            .user_agent("strata")
-            .timeout(std::time::Duration::from_secs(60))
-            .build()?
-            .get(src)
-            .send()
-            .await
-            .map_err(|e| anyhow!("the URL could not be read: {e}"))?;
+        let resp = fetch_public(src, policy().private_urls).await?;
         if resp.content_length().is_some_and(|n| n as usize > URL_MAX) {
             bail!("the URL's file is over {} MiB", URL_MAX >> 20);
         }
@@ -43,6 +108,10 @@ pub async fn load_source(src: &str) -> Result<Vec<u8>> {
     let path = src.strip_prefix("file://").unwrap_or(src);
     if path.starts_with("//") || path.starts_with("\\\\") {
         bail!("a file must be on this computer: network paths are not read");
+    }
+    if !path.is_empty() && !policy().local_files {
+        bail!("local file paths are not read by a server that listens beyond this PC: send the file as a data: URL \
+               (or set \"allow_local_files\": true in the run config)");
     }
     if !path.is_empty() && Path::new(path).is_file() {
         return std::fs::read(path).with_context(|| format!("the file could not be read from {path}"));

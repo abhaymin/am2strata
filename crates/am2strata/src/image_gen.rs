@@ -212,7 +212,7 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.model());
     let t0 = Instant::now();
-    let label = req["strata_label"].as_str().unwrap_or("").to_string();
+    let label = s.media_jobs.label(&req["strata_label"]);
     let _gpu = match s.mgr.gpu_exclusive_as(!s.media.keep_text_model, "media", &label).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),
@@ -413,7 +413,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let format = format.as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let t0 = Instant::now();
-    let label = req["strata_label"].as_str().unwrap_or("").to_string();
+    let label = s.media_jobs.label(&req["strata_label"]);
     let _gpu = match s.mgr.gpu_exclusive_as(!s.media.keep_text_model, "media", &label).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),

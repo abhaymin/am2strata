@@ -58,8 +58,18 @@ impl Default for Model<'_> {
     }
 }
 
+/// A port no other test of this run is given (asking the OS for port 0 and letting it go raced between parallel tests:
+/// two servers could get the same one, and a test talked to another test's server).
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+    let _ = NEXT.compare_exchange(0, 20000 + (std::process::id() % 20000) as u16, std::sync::atomic::Ordering::SeqCst,
+                                  std::sync::atomic::Ordering::SeqCst);
+    loop {
+        let p = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return p;
+        }
+    }
 }
 
 fn write_config(dir: &Path, m: &Model) {

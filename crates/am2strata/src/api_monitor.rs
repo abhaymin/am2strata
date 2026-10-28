@@ -311,11 +311,11 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
 
 /// GET /api/requests (and ?id=): the calls kept, newest first, or one with its bodies.
 pub async fn requests(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
-    if !s.api_monitor.enabled {
-        return error(StatusCode::NOT_FOUND, "not_found", "the API monitor is off (\"api_monitor\": true in the config, or --api-monitor)");
-    }
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if !s.api_monitor.enabled {
+        return error(StatusCode::NOT_FOUND, "not_found", "the API monitor is off (\"api_monitor\": true in the config, or --api-monitor)");
     }
     if let Some(id) = q.get("id") {
         return match s.api_monitor.get(id) {

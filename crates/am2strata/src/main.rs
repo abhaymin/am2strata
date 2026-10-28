@@ -128,7 +128,68 @@ pub fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(key) = state.api_key.as_deref().filter(|k| !k.is_empty()) else { return true };
     let bearer = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     let x_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-    bearer == Some(key) || x_key == Some(key)
+    // compared in constant time (the key is not guessed byte by byte from response times)
+    let same = |given: Option<&str>| given.is_some_and(|g| {
+        let (a, b) = (g.as_bytes(), key.as_bytes());
+        a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+    });
+    same(bearer) || same(x_key)
+}
+
+/// The names this server answers to: IP addresses, localhost, this PC's name (and name.local), the hosts of the
+/// trusted origins and the config's `allowed_hosts`. A request for any other Host is refused: a web page that points
+/// its own domain at this PC (DNS rebinding) would otherwise pass for this server's own page.
+#[derive(Clone)]
+pub struct Hosts(Arc<Vec<String>>);
+
+impl Hosts {
+    pub fn new(trusted_origins: &[String], extra: &[String]) -> Hosts {
+        let mut v: Vec<String> = vec!["localhost".into()];
+        if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+            let h = h.trim().to_lowercase();
+            if !h.is_empty() {
+                // this PC's name under the usual LAN suffixes (mDNS, routers)
+                for suffix in ["local", "lan", "home", "localdomain", "internal", "home.arpa"] {
+                    v.push(format!("{h}.{suffix}"));
+                }
+                v.push(h);
+            }
+        }
+        // its Tailscale name (MagicDNS)
+        if let Ok(o) = std::process::Command::new("tailscale").args(["status", "--json"]).output() {
+            if let Some(name) = serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()
+                .and_then(|j| j["Self"]["DNSName"].as_str().map(|d| d.trim_end_matches('.').to_lowercase())).filter(|d| !d.is_empty()) {
+                v.push(name);
+            }
+        }
+        v.extend(trusted_origins.iter().filter_map(|o| o.split("://").nth(1)).map(|h| strip_port(h).to_lowercase()));
+        v.extend(extra.iter().map(|h| h.to_lowercase()));
+        Hosts(Arc::new(v))
+    }
+
+    pub fn allows(&self, host: &str) -> bool {
+        let name = strip_port(host).trim_start_matches('[').trim_end_matches(']').to_lowercase();
+        name.parse::<std::net::IpAddr>().is_ok() || name.ends_with(".localhost") || self.0.iter().any(|h| *h == name)
+    }
+}
+
+fn strip_port(h: &str) -> &str {
+    if h.starts_with('[') {
+        return h.split(']').next().map(|x| &h[..x.len() + 1]).unwrap_or(h);
+    }
+    match h.rsplit_once(':') {
+        Some((n, p)) if p.chars().all(|c| c.is_ascii_digit()) && !n.contains(':') => n,
+        _ => h,
+    }
+}
+
+async fn check_host(axum::extract::State(hosts): axum::extract::State<Hosts>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !host.is_empty() && !hosts.allows(host) {
+        return error(StatusCode::MISDIRECTED_REQUEST, "permission_error",
+                     format!("this server does not answer to the name {host:?}: add it to \"allowed_hosts\" in the run config"));
+    }
+    next.run(req).await
 }
 
 fn expand(p: &str) -> PathBuf {
@@ -202,17 +263,34 @@ async fn main() -> Result<()> {
     if let Some(h) = &hub {
         h.start();
     }
-    let trusted_origins = first.cfg.rest.get("trusted_origins").and_then(|v| v.as_array())
+    let trusted_origins: Vec<String> = first.cfg.rest.get("trusted_origins").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim_end_matches('/').to_string())).collect()).unwrap_or_default();
     let monitor_on = args.api_monitor || first.cfg.rest.get("api_monitor") == Some(&serde_json::Value::Bool(true));
     if monitor_on {
         tracing::info!("API monitor on: the last 100 API calls are kept in memory, at /api-monitor");
     }
+    let extra_hosts: Vec<String> = first.cfg.rest.get("allowed_hosts").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    let hosts = Hosts::new(&trusted_origins, &extra_hosts);
+    tracing::info!("answering to IP addresses, localhost and {}", hosts.0.join(", "));
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost");
+    let flag = |k: &str| first.cfg.rest.get(k).and_then(|v| v.as_bool());
+    let _ = media::POLICY.set(media::SourcePolicy { local_files: flag("allow_local_files").unwrap_or(loopback),
+                                                     private_urls: flag("allow_private_urls").unwrap_or(false) });
+    let mut code_run = code_run::CodeRun::from_config(&first.cfg.rest);
+    if api_key.as_deref().unwrap_or("").is_empty() && !loopback {
+        tracing::warn!("no API key and listening on {host}: anyone on the network can use this server; set \"api_key\" in the run config");
+        if code_run.enabled {
+            tracing::warn!("running code (the canvas) is off: it needs an API key when the server listens beyond this PC");
+            code_run.enabled = false;
+            code_run.needs_key = true;
+        }
+    }
     let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),
-                           code_run: Arc::new(code_run::CodeRun::from_config(&first.cfg.rest)),
+                           code_run: Arc::new(code_run),
                            code_run_config_on: first.cfg.rest.get("code_run") != Some(&serde_json::Value::Bool(false)),
                            previews: Arc::new(preview::Previews::default()),
                            media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)),
@@ -276,8 +354,16 @@ async fn main() -> Result<()> {
         // browsers check the web app's files for a newer version every time (an update is never stuck behind a cache)
         .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
             axum::http::header::CACHE_CONTROL, axum::http::HeaderValue::from_static("no-cache")))
+        // no other site may frame the app (clickjacking), nothing is sniffed as another type, no address leaks out
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_FRAME_OPTIONS, axum::http::HeaderValue::from_static("SAMEORIGIN")))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS, axum::http::HeaderValue::from_static("nosniff")))
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
+        .layer(axum::middleware::from_fn_with_state(hosts, check_host))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;
     tracing::info!("listening on http://{host}:{port}/ (web app from {}), API at /v1", web_dir.display());

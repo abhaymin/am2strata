@@ -21,6 +21,9 @@ pub const TOOL_NAMES: [&str; 3] = ["generate_image", "generate_video", "speak"];
 /// The most media jobs one answer may queue.
 pub const PER_ANSWER: usize = 3;
 
+/// Audio attachments one chat request may carry (each is transcribed).
+const MAX_AUDIO_PARTS: usize = 4;
+
 /// Jobs kept (the oldest finished ones go first).
 const KEEP: usize = 64;
 
@@ -269,6 +272,16 @@ impl Jobs {
         }
     }
 
+    /// The queue label a media request may carry: the id of one of these jobs still queued, else none (a client
+    /// cannot make its job look like someone else's in the queue).
+    pub fn label(&self, asked: &Value) -> String {
+        let Some(n) = asked.as_str().and_then(|a| a.strip_prefix("mj-")).and_then(|n| n.parse::<u64>().ok()) else { return String::new() };
+        match self.jobs.lock().unwrap().get(&n) {
+            Some(j) if j.state == "queued" => j.id.clone(),
+            _ => String::new(),
+        }
+    }
+
     fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();
@@ -377,7 +390,8 @@ pub async fn content(State(s): State<AppState>, headers: HeaderMap, Path(id): Pa
     let jobs = s.media_jobs.jobs.lock().unwrap();
     match jobs.get(&n) {
         Some(Job { data: Some(d), mime: Some(m), .. }) => {
-            Response::builder().header(header::CONTENT_TYPE, m.as_str()).body(Body::from(d.clone())).unwrap()
+            Response::builder().header(header::CONTENT_TYPE, m.as_str()).header("x-content-type-options", "nosniff")
+                .header(header::CONTENT_DISPOSITION, "inline").body(Body::from(d.clone())).unwrap()
         }
         Some(j) => error(StatusCode::CONFLICT, "not_ready", format!("media job {id} is {}", j.state)),
         None => error(StatusCode::NOT_FOUND, "not_found", format!("no media job {id}")),
@@ -388,6 +402,11 @@ pub async fn content(State(s): State<AppState>, headers: HeaderMap, Path(id): Pa
 /// prompt is built, the way documents become text.
 pub async fn expand_audio(s: &AppState, req: &mut Value) -> Result<(), String> {
     let Some(msgs) = req["messages"].as_array_mut() else { return Ok(()) };
+    // each one is a transcription job: a few per request, none over 100 MB
+    let count = msgs.iter().filter_map(|m| m["content"].as_array()).flatten().filter(|p| p["type"] == "input_audio").count();
+    if count > MAX_AUDIO_PARTS {
+        return Err(format!("{count} audio attachments: at most {MAX_AUDIO_PARTS} per request"));
+    }
     for m in msgs.iter_mut() {
         let Some(parts) = m["content"].as_array_mut() else { continue };
         for p in parts.iter_mut() {
@@ -396,6 +415,9 @@ pub async fn expand_audio(s: &AppState, req: &mut Value) -> Result<(), String> {
             }
             let data = p["input_audio"]["data"].as_str().unwrap_or("");
             let data = data.split_once(";base64,").map(|(_, b)| b).unwrap_or(data).to_string();
+            if data.len() > 140 << 20 {
+                return Err("an audio attachment is larger than 100 MB".into());
+            }
             let name = p["input_audio"]["name"].as_str().map(str::to_string)
                 .unwrap_or_else(|| format!("audio.{}", p["input_audio"]["format"].as_str().unwrap_or("wav")));
             let text = crate::audio_api::transcribe_for_chat(s, &data).await

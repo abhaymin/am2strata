@@ -160,6 +160,33 @@ PolyStrata, rebuild with its own `setup.py` routine (`build_engine_poly`: build-
 when the shared sources changed, `cmake --build build-dual --target strata` for Orca's engine; swap the binaries with a
 rename, never a copy over a running engine; restart am2Strata only when idle (`am2strata-run temp-service`).
 
+## Security
+
+A server that listens beyond this PC (`--host 0.0.0.0`) should have an `"api_key"` in the default model's run
+config. Every route except `/health`, the web app's files and the sandboxed canvas previews needs it; it is compared in
+constant time. Besides the key:
+
+- **Names it answers to.** A request whose `Host` is not an IP address, `localhost`, this PC's name (with `.local`,
+  `.lan`, `.home`, `.localdomain`, `.internal` or `.home.arpa`), its Tailscale name, or a trusted origin's host is
+  refused (421): a web page that points its own domain at this PC (DNS rebinding) cannot pass for the app.
+  Add other names with `"allowed_hosts": ["ai.example.lan"]`.
+- **Other web pages.** Settings, the run config, MCP tools, running code, model loading and unloading, downloads and
+  the media tools accept only this server's own page or a `"trusted_origins"` entry. The app may not be framed by
+  another site (`X-Frame-Options: SAMEORIGIN`).
+- **What a request may read.** Pictures, videos and documents given as local file paths are read only when the server
+  listens on this PC alone (`"allow_local_files": true` allows them otherwise). URLs are fetched only from public
+  addresses, every redirect checked again (`"allow_private_urls": true` allows the LAN). Without these an API client
+  could read any file of this account, or your LAN, through the model's answer.
+- **Running code** (the canvas's Python) runs in bubblewrap with no network, a read-only system and no home folder,
+  and is off on a server that listens beyond this PC without a key.
+- **Limits.** 256 MB per request, at most 64 jobs waiting in the queue (a client that leaves takes its place out), 4
+  audio attachments per chat request, 3 media jobs per answer.
+
+Dependencies are checked against the OSV / RustSec advisories. On 2026-10-28, after `cargo update`, what remains is
+`zip` 8.6 (its advisories are about `extract()`, which neither candle nor mold calls; the fix is zip 9, waiting on
+upstream candle), `block-buffer` 0.10.4 (fixed only in 0.12; the panic path is not reached), and the unmaintained
+`paste` and `number_prefix` (no known flaw).
+
 ## Folders
 
 The configs in `configs/` are written with two placeholders, so they can be shared:

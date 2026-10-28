@@ -37,6 +37,11 @@ pub enum Outcome {
 }
 
 /// `owner/name` from what a person pastes (a hub address works too).
+/// A name that stays inside the folder it is joined to.
+pub fn safe_name(n: &str) -> bool {
+    !n.is_empty() && n != "." && n != ".." && !n.contains(['/', '\\', '\0']) && !n.starts_with('-')
+}
+
 pub fn repo_name(s: &str) -> String {
     s.trim().trim_start_matches("https://huggingface.co/").trim_start_matches("hf.co/").trim_end_matches('/').to_string()
 }
@@ -56,7 +61,14 @@ pub async fn run(spec: &Spec, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Outc
     let total: u64 = chosen.iter().map(|f| f.size).sum();
     let tag = quant_tag(&chosen[0].path).or_else(|| spec.quant.as_ref().map(|q| q.to_uppercase())).unwrap_or_else(|| "model".into());
     let base = repo.rsplit('/').next().unwrap_or(&repo).trim_end_matches("-GGUF").trim_end_matches("-gguf").to_string();
-    let name = spec.dir.clone().filter(|d| !d.is_empty() && !d.contains('/') && d != "..").unwrap_or(format!("{base}-{tag}"));
+    let name = spec.dir.clone().filter(|d| safe_name(d)).unwrap_or(format!("{base}-{tag}"));
+    // the folder is named from the request (its quant) and the repository: one plain name, never a path
+    if !safe_name(&name) {
+        return Err(format!("{name:?} cannot be a folder name"));
+    }
+    if let Some(bad) = chosen.iter().map(|f| crate::file_name(&f.path)).find(|n| !safe_name(n)) {
+        return Err(format!("the repository lists a file named {bad:?}, which cannot be saved"));
+    }
     let dir = spec.data_dir.join("models").join(name);
     ev(Event::Note(format!("{} file(s), {} -> {}", chosen.len(), human(total), dir.display())));
     let have: u64 = chosen.iter().map(|f| std::fs::metadata(local_path(&dir, f)).map(|m| m.len()).unwrap_or(0)).sum();
@@ -198,5 +210,16 @@ fn profile_for_config(raw: &Path, config: &Path) -> Result<String, String> {
     } else {
         std::fs::copy(raw, &target).map_err(|e| format!("{}: {e}", target.display()))?;
         Ok(format!("copied to {}", target.display()))
+    }
+}
+
+#[cfg(test)]
+mod safety {
+    #[test]
+    fn folder_and_file_names_stay_inside() {
+        for bad in ["", ".", "..", "a/b", "../x", "a\\b", "-rf"] {
+            assert!(!super::safe_name(bad), "{bad:?}");
+        }
+        assert!(super::safe_name("Qwen3-8B-Q4_K_M") && super::safe_name("model.gguf"));
     }
 }

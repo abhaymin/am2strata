@@ -1060,3 +1060,123 @@ fn one_answer_queues_at_most_three_media_jobs() {
     assert_eq!(s.get("/api/jobs/mj-3", true).0, 200);
     assert_eq!(s.get("/api/jobs/mj-4", true).0, 404);
 }
+
+/// Every route in main.rs but the public ones (health, the web app's files, sandboxed previews) refuses a request
+/// without the key, or with a wrong key of the same length.
+#[test]
+fn security_every_route_needs_the_key() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let main = include_str!("../src/main.rs");
+    let routes = main.split("let app = Router::new()").nth(1).unwrap().split(".with_state(").next().unwrap();
+    let caps: Vec<(String, String)> = routes.split(".route(\"").skip(1)
+        .map(|r| { let (p, rest) = r.split_once('"').unwrap(); (p.to_string(), rest.lines().next().unwrap().to_string()) }).collect();
+    let c = reqwest::blocking::Client::new();
+    let mut checked = 0;
+    for cap in &caps {
+        let cap = [String::new(), cap.0.clone(), cap.1.clone()];
+        let path = cap[1].replace("{*rest}", "x").replace("{id}", "mj-1");
+        if matches!(path.as_str(), "/health" | "/preview/mj-1") {
+            continue;
+        }
+        for (m, method) in [("get(", reqwest::Method::GET), ("post(", reqwest::Method::POST), ("delete(", reqwest::Method::DELETE)] {
+            if !cap[2].contains(m) {
+                continue;
+            }
+            for key in [None, Some("test-kez")] {
+                let mut r = c.request(method.clone(), format!("{}{path}", s.base)).header("content-type", "application/json").body("{}");
+                if let Some(k) = key {
+                    r = r.bearer_auth(k);
+                }
+                let code = r.send().unwrap().status().as_u16();
+                assert_eq!(code, 401, "{method} {path} with key {key:?}");
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 90, "only {checked} checks: did the route list move?");
+}
+
+#[test]
+fn security_a_rebound_host_and_a_foreign_page_are_refused() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let c = reqwest::blocking::Client::new();
+    // DNS rebinding: another domain pointed at this PC, its page claiming to be this server's own
+    let r = c.get(format!("{}/api/models", s.base)).bearer_auth(KEY).header("host", "evil.example:8000")
+        .header("origin", "http://evil.example:8000").send().unwrap();
+    assert_eq!(r.status().as_u16(), 421);
+    for host in ["localhost:1", "127.0.0.1:1", "[::1]:1", "app.localhost"] {
+        let r = c.get(format!("{}/api/models", s.base)).bearer_auth(KEY).header("host", host).send().unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{host}");
+    }
+    // a body-less unload from another site
+    let r = c.post(format!("{}/api/models/unload", s.base)).bearer_auth(KEY).header("origin", "https://evil.example").send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+    assert_eq!(s.get("/api/models/current", true).1["model"]["status"], "loaded");
+    let r = c.get(format!("{}/", s.base)).send().unwrap();
+    assert_eq!(r.headers()["x-frame-options"], "SAMEORIGIN");
+    assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+}
+
+#[test]
+fn security_a_client_that_leaves_the_queue_takes_its_place_out() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 2500}));
+    let base = s.base.clone();
+    let img = std::thread::spawn(move || {
+        reqwest::blocking::Client::new().post(format!("{base}/v1/images/generations")).bearer_auth(KEY)
+            .json(&json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2})).send().unwrap().status().as_u16()
+    });
+    let t0 = std::time::Instant::now();
+    while s.get("/api/queue", true).1["running"]["kind"] != "media" {
+        assert!(t0.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .json(&json!({"messages": [user("hi")], "stream": true})).send().unwrap();
+    assert_eq!(s.get("/api/queue", true).1["waiting"].as_array().unwrap().len(), 1);
+    drop(r); // the client leaves while it waits
+    let t0 = std::time::Instant::now();
+    while !s.get("/api/queue", true).1["waiting"].as_array().unwrap().is_empty() {
+        assert!(t0.elapsed().as_secs() < 2, "the abandoned stream still waits");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(img.join().unwrap(), 200);
+}
+
+#[test]
+fn security_media_inputs_are_bounded_and_labels_cannot_be_spoofed() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 800}));
+    let part = json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}});
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [part.clone(), part.clone(), part.clone(), part.clone(), part]}]}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("at most 4"), "{r}");
+    // a client's strata_label is not shown in the queue (only the server's own media jobs carry one)
+    let base = s.base.clone();
+    let h = std::thread::spawn(move || reqwest::blocking::Client::new().post(format!("{base}/v1/images/generations")).bearer_auth(KEY)
+        .json(&json!({"prompt": "x", "size": "512x512", "strata_label": "mj-1"})).send().unwrap().status().as_u16());
+    let t0 = std::time::Instant::now();
+    let q = loop {
+        let q = s.get("/api/queue", true).1;
+        if q["running"]["kind"] == "media" { break q; }
+        assert!(t0.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(q["running"]["label"], "", "{q}");
+    assert_eq!(h.join().unwrap(), 200);
+    // a finished job's file is not sniffed as another type
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/mj-1/content", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 404);
+}
+
+#[test]
+fn security_media_sources_cannot_read_local_files_or_the_private_network() {
+    let m = Model { vision: true, extra: json!({"allow_local_files": false}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    for src in ["/etc/hostname", "file:///etc/hostname", "http://127.0.0.1:1/x.png", "http://169.254.169.254/latest/meta-data",
+                "http://[::1]:1/x.png", "http://10.0.0.1/x.png", "http://localhost:1/x.png"] {
+        let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, {"type": "image_url", "image_url": {"url": src}}]}]}));
+        assert_eq!(c, 400, "{src}: {r}");
+        let msg = r["error"]["message"].as_str().unwrap_or("");
+        assert!(msg.contains("not read") || msg.contains("private network"), "{src}: {msg}");
+    }
+}

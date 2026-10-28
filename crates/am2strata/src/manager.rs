@@ -262,7 +262,7 @@ impl Manager {
         let id = self.default_id.clone();
         let w = self.monitor.waiting();
         let p = self.queue.enter(crate::queue::Need::Text(id.clone()), "chat", &format!("{id} (loads it)"), on_position).await
-            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position))?;
+            .map_err(|t| anyhow!("{t}"))?;
         drop(w);
         let l = self.load_locked(&id).await?;
         Ok((l, Some(p)))
@@ -288,7 +288,7 @@ impl Manager {
         let w = self.monitor.waiting();
         let need = if unload_text { crate::queue::Need::Gpu } else { crate::queue::Need::Any };
         let p = self.queue.enter(need, kind, label, |_| {}).await
-            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position))?;
+            .map_err(|t| anyhow!("{t}"))?;
         drop(w);
         if unload_text {
             if let Some(l) = self.current.write().await.take() {
@@ -301,7 +301,13 @@ impl Manager {
     }
 
     pub async fn unload(&self) {
-        let _p = self.queue.enter(crate::queue::Need::Any, "unload", "", |_| {}).await;
+        // an unload always waits its turn, even behind a full queue
+        let _p = loop {
+            match self.queue.enter(crate::queue::Need::Any, "unload", "", |_| {}).await {
+                Ok(p) => break p,
+                Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        };
         if let Some(l) = self.current.write().await.take() {
             stop(&l).await;
         }
@@ -317,7 +323,7 @@ impl Manager {
             }
         }
         let _p = self.queue.enter(crate::queue::Need::Text(entry.id.clone()), "switch", &entry.id, |_| {}).await
-            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try the switch again later", t.waited_s, t.position))?;
+            .map_err(|t| anyhow!("{t}"))?;
         self.load_locked(&entry.id).await
     }
 

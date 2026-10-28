@@ -62,6 +62,10 @@ pub async fn unload_model(State(s): State<AppState>, headers: HeaderMap) -> Resp
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    // no body: a plain form post from another site could send it
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the model can be unloaded");
+    }
     s.mgr.unload().await;
     Json(json!({"status": "unloaded"})).into_response()
 }

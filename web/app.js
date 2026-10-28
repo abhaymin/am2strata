@@ -1091,11 +1091,12 @@ function jobCardHtml(id) {
   if (!j) return `<span class="muted small">Media job ${esc(id)}…</span>`;
   const what = {image: "Image", video: "Video", tts: "Speech"}[j.kind] || "Media";
   if (j.state === "done" && j.url) {
-    const el = j.mime.startsWith("video/") ? `<video src="${j.url}" controls loop playsinline></video>`
-      : j.mime.startsWith("audio/") ? `<audio src="${j.url}" controls></audio>` : `<img src="${j.url}" alt="${esc(j.prompt || what)}">`;
+    const u = esc(j.url);
+    const el = j.mime.startsWith("video/") ? `<video src="${u}" controls loop playsinline></video>`
+      : j.mime.startsWith("audio/") ? `<audio src="${u}" controls></audio>` : `<img src="${u}" alt="${esc(j.prompt || what)}">`;
     const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
-      `<a href="${j.url}" download="${esc(id)}.${ext}">Save</a></div>`;
+      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>`;
   }
   if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>`;
   const where = j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")

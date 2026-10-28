@@ -57,9 +57,13 @@ fn waiting_stream(s: AppState, headers: HeaderMap, req: Value) -> Response {
     let keep = tx.clone();
     tokio::spawn(async move {
         let txp = tx.clone();
-        let got = s.mgr.ensure_with_turn_told(move |p| {
-            let _ = txp.try_send(format!(": queued: {} ahead\n\n", p.saturating_sub(1)).into());
-        }).await;
+        // a client that leaves while it waits takes its place out of the queue
+        let got = tokio::select! {
+            g = s.mgr.ensure_with_turn_told(move |p| {
+                let _ = txp.try_send(format!(": queued: {} ahead\n\n", p.saturating_sub(1)).into());
+            }) => g,
+            _ = tx.closed() => return,
+        };
         let r = match got {
             Ok(l) => chat_with(s, headers, req, Some(l)).await,
             Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
@@ -202,14 +206,17 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
         tokio::spawn(async move {
             let txp = tx.clone();
             let label = format!("{model_id} chat (stream)");
-            let pass = mgr.take_turn(&model_id, &label, move |p| {
-                let _ = txp.try_send(Some(json!({"__comment": format!("queued: {} ahead", p.saturating_sub(1))})));
-            }).await;
+            let pass = tokio::select! {
+                p = mgr.take_turn(&model_id, &label, move |p| {
+                    let _ = txp.try_send(Some(json!({"__comment": format!("queued: {} ahead", p.saturating_sub(1))})));
+                }) => p,
+                _ = tx.closed() => return, // the client left while it waited: its place goes
+            };
             match pass {
                 Ok(p) => *pass_slot.lock().unwrap() = Some(p),
                 Err(t) => {
                     let _ = tx.send(Some(json!({"error": {"type": "server_error", "message":
-                        format!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position)}}))).await;
+                        t.to_string()}}))).await;
                     return;
                 }
             }

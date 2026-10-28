@@ -24,6 +24,8 @@ const MAX_ALL_FILES: u64 = 24 << 20;
 
 pub struct CodeRun {
     pub enabled: bool,
+    /// off because the server listens beyond this PC without an API key
+    pub needs_key: bool,
     pub timeout: Duration,
     python: Option<PathBuf>,
 }
@@ -33,11 +35,12 @@ impl CodeRun {
         let python = ["/usr/bin/python3", "/usr/local/bin/python3"].iter().map(PathBuf::from).find(|p| p.exists());
         let enabled = rest.get("code_run") != Some(&Value::Bool(false)) && Path::new(BWRAP).exists() && python.is_some();
         let secs = rest.get("code_run_timeout_s").and_then(Value::as_u64).filter(|s| *s > 0).unwrap_or(30).min(600);
-        CodeRun { enabled, timeout: Duration::from_secs(secs), python }
+        CodeRun { enabled, needs_key: false, timeout: Duration::from_secs(secs), python }
     }
 
     fn why_off(&self, rest_off: bool) -> &'static str {
-        if rest_off { "switched off in the config (\"code_run\": false)" }
+        if self.needs_key { "the server listens beyond this PC without an API key (set \"api_key\" in the run config)" }
+        else if rest_off { "switched off in the config (\"code_run\": false)" }
         else if !Path::new(BWRAP).exists() { "needs bubblewrap for its sandbox: sudo apt install bubblewrap" }
         else { "needs python3 on this PC" }
     }

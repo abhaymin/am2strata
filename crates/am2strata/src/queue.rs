@@ -15,6 +15,9 @@ use tokio::sync::Notify;
 /// The most jobs taken out of order for the model already loaded, before the head of the queue gets its turn.
 pub const BATCH: usize = 4;
 
+/// The most jobs that may wait at once; one more is refused at once (a client cannot fill the memory with waiters).
+pub const MAX_WAITING: usize = 64;
+
 /// What a job needs resident while it runs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Need {
@@ -102,6 +105,18 @@ impl Drop for Waiting<'_> {
 pub struct TooLong {
     pub position: usize,
     pub waited_s: u64,
+    /// refused because MAX_WAITING jobs already wait
+    pub full: bool,
+}
+
+impl std::fmt::Display for TooLong {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.full {
+            write!(f, "{MAX_WAITING} jobs are already waiting for their turn; try again later")
+        } else {
+            write!(f, "waited {} s at place {} of the queue (queue_max_wait_s); try again later", self.waited_s, self.position)
+        }
+    }
 }
 
 impl Queue {
@@ -132,6 +147,9 @@ impl Queue {
                        -> Result<Pass, TooLong> {
         let id = {
             let mut s = self.state.lock().unwrap();
+            if s.queue.len() >= MAX_WAITING {
+                return Err(TooLong { position: s.queue.len() + 1, waited_s: 0, full: true });
+            }
             let id = s.next;
             s.next += 1;
             s.queue.push_back(Ticket { id, need, kind: kind.to_string(), label: label.to_string(), since: Instant::now() });
@@ -162,7 +180,7 @@ impl Queue {
                 }
                 if let Some(max) = self.max_wait {
                     if since.elapsed() >= max {
-                        return Err(TooLong { position, waited_s: since.elapsed().as_secs() });
+                        return Err(TooLong { position, waited_s: since.elapsed().as_secs(), full: false });
                     }
                 }
             }
@@ -291,5 +309,19 @@ mod tests {
         let e = q3.enter(Need::Gpu, "img", "", |p| seen = p).await.err().unwrap();
         assert_eq!((e.position, seen), (1, 1));
         drop(p);
+        // a full queue refuses at once
+        let q4 = Queue::new(None);
+        let _run = q4.enter(Need::Any, "run", "", |_| {}).await.unwrap();
+        let mut hs = Vec::new();
+        for _ in 0..MAX_WAITING {
+            let q = q4.clone();
+            hs.push(tokio::spawn(async move { q.enter(Need::Gpu, "img", "", |_| {}).await.map(|_| ()) }));
+        }
+        while q4.waiting() < MAX_WAITING {
+            tokio::task::yield_now().await;
+        }
+        let e = q4.enter(Need::Gpu, "img", "", |_| {}).await.err().unwrap();
+        assert!(e.full && e.to_string().contains("already waiting"), "{e}");
+        hs.iter().for_each(|h| h.abort());
     }
 }
