@@ -1029,3 +1029,34 @@ fn an_audio_attachment_in_a_chat_is_transcribed_into_the_prompt() {
     let p = prompt_text(s.gen_lines().last().unwrap());
     assert!(p.contains("[Transcript of note.wav, 2 s: Hello world.]") && p.contains("What did I say?"), "{p}");
 }
+
+/// Not a test: a server with the real web app over mock engines, for checking the page by hand or in a browser
+/// (AM2_UI_DEMO_SECS, default 900). cargo test --release --test server web_ui_demo -- --ignored --nocapture
+#[test]
+#[ignore]
+fn web_ui_demo() {
+    let img = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
+    let spk = "\n\n<tool_call>\n<function=speak>\n<parameter=text>\nGood evening.\n</parameter>\n</function>\n</tool_call>";
+    let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let s = Server::start(&[Model::default()], &[ids(&format!("Draw.\n</think>{img}")), ids("Ok.\n</think>\n\nYour lighthouse is on its way."),
+                                                 ids(&format!("Say it.\n</think>{spk}")), ids("Ok.\n</think>\n\nHere is the greeting, read aloud."),
+                                                 ids("Heard.\n</think>\n\nThe recording says: hello world.")],
+                          json!({"web_dir": web.to_str().unwrap(), "media_delay_ms": 4000}));
+    assert_eq!(s.post("/api/media/models/default", &json!({"model": "whisper-base"})).0, 200);
+    println!("UI demo at {} (key {KEY})", s.base);
+    let secs = std::env::var("AM2_UI_DEMO_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
+    std::thread::sleep(std::time::Duration::from_secs(secs));
+}
+
+#[test]
+fn one_answer_queues_at_most_three_media_jobs() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na fox\n</parameter>\n</function>\n</tool_call>";
+    let again = ids(&format!("Again.\n</think>{call}"));
+    let s = Server::start(&[Model::default()], &[again.clone(), again.clone(), again.clone(), again, ids("Done.\n</think>\n\nFour foxes coming.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Draw foxes.")], "strata_media": true}));
+    assert_eq!(c, 200, "{r}");
+    let lines = s.gen_lines();
+    assert!(prompt_text(lines.last().unwrap()).contains("already queued 3 media jobs"), "the fourth call was refused");
+    assert_eq!(s.get("/api/jobs/mj-3", true).0, 200);
+    assert_eq!(s.get("/api/jobs/mj-4", true).0, 404);
+}

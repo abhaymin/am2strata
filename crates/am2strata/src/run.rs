@@ -731,6 +731,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
     let (tx, events) = mpsc::channel(256);
     tokio::spawn(async move {
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
+        let mut media_jobs = 0usize; // queued by this answer's media tools
         loop {
             let (mut text, mut reasoning, mut calls, mut own) = (String::new(), String::new(), Vec::new(), 0usize);
             let mut mcp_ids = std::collections::HashSet::new();
@@ -798,7 +799,13 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                     mgr.memory.call(&c.name, &args, opts.memory.as_deref().unwrap_or("web"), conv.as_deref())
                 } else if let (Some(caps), true, None) = (&opts.media, crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()), &route) {
                     match mgr.media_jobs.get() {
-                        Some(j) => j.submit(&c.name, &args, caps),
+                        // a model that calls again and again does not fill the queue
+                        Some(_) if media_jobs >= crate::media_jobs::PER_ANSWER => json!({"ok": false, "chars": 0, "truncated": false, "ms": 0,
+                            "text": format!("error: this answer already queued {media_jobs} media jobs, the most one answer may; they will appear in the chat. Finish the answer now.")}),
+                        Some(j) => {
+                            media_jobs += 1;
+                            j.submit(&c.name, &args, caps)
+                        }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
                     }
                 } else if let Some(h) = &hub {

@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 
 pub const TOOL_NAMES: [&str; 3] = ["generate_image", "generate_video", "speak"];
 
+/// The most media jobs one answer may queue.
+pub const PER_ANSWER: usize = 3;
+
 /// Jobs kept (the oldest finished ones go first).
 const KEEP: usize = 64;
 

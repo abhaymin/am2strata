@@ -101,7 +101,7 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_am2strata"))
             .args(["--models-dir"]).arg(&dir)
             .args(["--model", models[0].id, "--port", &port.to_string(), "--host", "127.0.0.1"])
-            .arg("--web-dir").arg(testdata().join("web"))
+            .arg("--web-dir").arg(extra.get("web_dir").and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_else(|| testdata().join("web")))
             .arg("--data-dir").arg(&dir)
             .env("AM2STRATA_MEDIA_EXE", if extra.get("no_media").is_some() { PathBuf::from("/nonexistent/am2strata-media") }
                                         else { PathBuf::from(env!("CARGO_BIN_EXE_strata-mock-media")) })
