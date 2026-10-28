@@ -22,7 +22,7 @@ pub async fn count_tokens(State(s): State<AppState>, headers: HeaderMap, Json(re
     if !authorized(&s, &headers) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    let loaded = match s.mgr.ensure().await {
+    let (loaded, _early_pass) = match s.mgr.ensure_with_turn().await {
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
@@ -39,7 +39,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
     if let Err(e) = media::expand_videos(&mut req).await {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
-    let loaded = match s.mgr.ensure().await {
+    let (loaded, early_pass) = match s.mgr.ensure_with_turn().await {
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
@@ -59,7 +59,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget, tool_choice: req.get("tool_choice").cloned(),
-                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) };
+                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) };
     let started = match run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {

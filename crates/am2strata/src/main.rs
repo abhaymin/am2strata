@@ -11,6 +11,7 @@ mod audio_api;
 mod code_run;
 mod image_gen;
 mod preview;
+mod queue;
 mod manager;
 mod hub_api;
 mod mcp;
@@ -183,7 +184,9 @@ async fn main() -> Result<()> {
     for m in &models {
         tracing::info!(id = %m.id, context = m.cfg.max_context(), images = m.cfg.vision.is_some(), "installed model");
     }
-    let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout), expand(&args.data_dir)));
+    // queue_max_wait_s (the default model's run config): how long a job may wait for its turn before it is refused
+    let max_wait = first.cfg.rest.get("queue_max_wait_s").and_then(|v| v.as_f64()).filter(|v| *v > 0.0).map(Duration::from_secs_f64);
+    let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout), expand(&args.data_dir), max_wait));
     for g in &mgr.hw.gpus {
         tracing::info!("GPU {}: {} ({} MiB, sm_{})", g.index, g.name, g.vram_mib, g.arch);
     }
@@ -226,6 +229,7 @@ async fn main() -> Result<()> {
         .route("/api/models/current", get(web::current_model))
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
+        .route("/api/queue", get(web::queue))
         .route("/api/models/updates", get(hub_api::updates))
         .route("/api/models/update", post(hub_api::update))
         .route("/api/requests", get(api_monitor::requests))

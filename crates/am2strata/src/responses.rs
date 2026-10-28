@@ -810,7 +810,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     if let Err(e) = media::expand_videos(&mut chat).await {
         return RespError::new(e.to_string(), None).into_response();
     }
-    let loaded = match s.mgr.ensure().await {
+    let (loaded, early_pass) = match s.mgr.ensure_with_turn().await {
         Ok(l) => l,
         Err(e) => {
             let mut r = RespError::new(format!("{e:#}"), None);
@@ -837,7 +837,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned(),
-                           memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) };
+                           memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) };
     let started = match run::start(s.mgr.clone(), loaded, prep, chat.clone(), opts).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {

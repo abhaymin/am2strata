@@ -250,6 +250,8 @@ pub struct RunOpts {
     pub tool_choice: Option<Value>,
     /// memory for this request (it opted in): its scope; the store is the manager's
     pub memory: Option<String>,
+    /// the GPU's turn when the caller already waited for it (a stream that told its client its place)
+    pub pass: Arc<std::sync::Mutex<Option<crate::queue::Pass>>>,
 }
 
 /// What the memory adds to a request before its prompt is built: the <memory> block (matching facts and archived turns),
@@ -320,10 +322,22 @@ pub fn thinking_budget(asked: Option<u64>, max_new: usize, answer_room: bool) ->
 pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts)
     -> Result<Started, Refusal> {
     let stops = stop_strings(&req)?;
-    // one request on the GPU at a time: image encoding and generation both take the turn
-    let waiting = mgr.monitor.waiting();
-    let turn = mgr.take_turn().await;
-    drop(waiting);
+    // one request on the GPU at a time, in the queue's order (a turn the caller already holds is used as it is)
+    let given = opts.pass.lock().unwrap().take();
+    let turn = match given {
+        Some(p) => p,
+        None => {
+            let label = format!("{} chat", loaded.entry.id);
+            let p = mgr.take_turn(&loaded.entry.id, &label, |_| {});
+            p.await.map_err(|t| Refusal(503, format!("waited {} s at place {} of the queue (queue_max_wait_s); try again later",
+                                                         t.waited_s, t.position)))?
+        }
+    };
+    // the model may have been stopped while this waited (a media job, a switch): loaded again for this turn
+    let loaded = match mgr.current().await {
+        Some(l) if Arc::ptr_eq(&l, &loaded) => loaded,
+        _ => mgr.load_locked(&loaded.entry.id.clone()).await.map_err(|e| Refusal(503, format!("{e:#}")))?,
+    };
     let mut prep = prep;
     // #25: preserve_thinking is the config's default; a request's chat_template_kwargs can still turn it off
     let preserve = loaded.preserve_thinking() && prep.kwargs.get("preserve_thinking") != Some(&Value::Bool(false));

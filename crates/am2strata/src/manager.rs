@@ -12,7 +12,7 @@ use strata_engine::{child_env, Engine, RunConfig, Vision};
 use strata_frontend::{PromptBuilder, ToolOrders};
 use strata_template::ChatTemplate;
 use strata_tokenizer::Tokenizer;
-use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Clone)]
 pub struct ModelEntry {
@@ -136,9 +136,8 @@ pub struct Manager {
     pub hw: Hardware,
     pub default_id: String,
     current: RwLock<Option<Arc<Loaded>>>,
-    /// one request at a time on the GPU (generation and image encoding), and switches wait for it
-    pub turn: Arc<Mutex<()>>,
-    switching: Mutex<()>,
+    /// one job at a time on the GPU - chat requests, model switches, media jobs - in the queue's order (queue.rs)
+    pub queue: Arc<crate::queue::Queue>,
     pub ready_timeout: Duration,
     pub monitor: Arc<crate::monitor::Monitor>,
     /// facts and conversation archives (memory.rs), under <data>/memory
@@ -203,15 +202,15 @@ pub fn adapt(cfg: &RunConfig, hw: &Hardware) -> Result<(RunConfig, bool, Vec<Str
 }
 
 impl Manager {
-    pub fn new(models: Vec<ModelEntry>, models_dir: PathBuf, default_id: String, ready_timeout: Duration, memory_dir: PathBuf) -> Self {
+    pub fn new(models: Vec<ModelEntry>, models_dir: PathBuf, default_id: String, ready_timeout: Duration, memory_dir: PathBuf,
+               queue_max_wait: Option<Duration>) -> Self {
         Self {
             models: std::sync::RwLock::new(models),
             models_dir,
             hw: Hardware::detect(),
             default_id,
             current: RwLock::new(None),
-            turn: Arc::new(Mutex::new(())),
-            switching: Mutex::new(()),
+            queue: crate::queue::Queue::new(queue_max_wait),
             ready_timeout,
             monitor: crate::monitor::Monitor::new(),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
@@ -242,55 +241,92 @@ impl Manager {
 
     /// The loaded model, loading the default one when none is (a request after an unload starts it again).
     pub async fn ensure(&self) -> Result<Arc<Loaded>> {
+        self.ensure_with_turn().await.map(|(l, _)| l)
+    }
+
+    /// The model a request runs on. When none is loaded (stopped for a media job, or never started) the request
+    /// waits its place in the queue, the model loads in its turn, and the turn comes back with it - so the request
+    /// does not queue a second time to run.
+    pub async fn ensure_with_turn(&self) -> Result<(Arc<Loaded>, Option<crate::queue::Pass>)> {
+        self.ensure_with_turn_told(|_| {}).await
+    }
+
+    /// ensure_with_turn, telling `on_position` the request's place while it waits.
+    pub async fn ensure_with_turn_told(&self, on_position: impl FnMut(usize)) -> Result<(Arc<Loaded>, Option<crate::queue::Pass>)> {
         if let Some(l) = self.current().await {
-            return Ok(l);
+            return Ok((l, None));
         }
         let id = self.default_id.clone();
-        self.load(&id).await
+        let w = self.monitor.waiting();
+        let p = self.queue.enter(crate::queue::Need::Text(id.clone()), "chat", &format!("{id} (loads it)"), on_position).await
+            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position))?;
+        drop(w);
+        let l = self.load_locked(&id).await?;
+        Ok((l, Some(p)))
     }
 
-    /// The GPU's turn for one request; held until the request ends.
-    pub async fn take_turn(&self) -> OwnedMutexGuard<()> {
-        self.turn.clone().lock_owned().await
+    /// The GPU's turn for one request with `model` loaded; held until the request ends. It waits its place in the
+    /// queue (no time limit unless queue_max_wait_s), and the caller makes sure the model is loaded once it has it.
+    pub async fn take_turn(&self, model: &str, label: &str, on_position: impl FnMut(usize))
+                           -> std::result::Result<crate::queue::Pass, crate::queue::TooLong> {
+        let w = self.monitor.waiting();
+        let p = self.queue.enter(crate::queue::Need::Text(model.to_string()), "chat", label, on_position).await;
+        drop(w);
+        p
     }
 
-    /// The whole GPU for a media job (an image now; video and voice later): model switches and chat requests wait
-    /// until the guards drop; with `unload_text` the text model is stopped first (it loads again with the next
-    /// request), freeing its VRAM.
-    pub async fn gpu_exclusive(&self, unload_text: bool) -> Result<(tokio::sync::MutexGuard<'_, ()>, OwnedMutexGuard<()>)> {
-        let s = self.switching.lock().await;
-        let t = tokio::time::timeout(Duration::from_secs(120), self.turn.clone().lock_owned())
-            .await
-            .map_err(|_| anyhow!("a request is still running after two minutes; try again when it ends"))?;
+    /// The whole GPU for a media job: it waits its place in the queue; with `unload_text` the text model is stopped
+    /// first (it loads again with the next chat), freeing its VRAM.
+    pub async fn gpu_exclusive(&self, unload_text: bool) -> Result<crate::queue::Pass> {
+        self.gpu_exclusive_as(unload_text, "media", "").await
+    }
+
+    pub async fn gpu_exclusive_as(&self, unload_text: bool, kind: &str, label: &str) -> Result<crate::queue::Pass> {
+        let w = self.monitor.waiting();
+        let need = if unload_text { crate::queue::Need::Gpu } else { crate::queue::Need::Any };
+        let p = self.queue.enter(need, kind, label, |_| {}).await
+            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position))?;
+        drop(w);
         if unload_text {
             if let Some(l) = self.current.write().await.take() {
                 tracing::info!(model = %l.entry.id, "stopping the text model for a media job (it loads again with the next request)");
                 stop(&l).await;
             }
+            self.queue.set_resident(crate::queue::Resident::Gpu);
         }
-        Ok((s, t))
+        Ok(p)
     }
 
     pub async fn unload(&self) {
-        let _s = self.switching.lock().await;
-        let _t = tokio::time::timeout(Duration::from_secs(120), self.turn.lock()).await;
+        let _p = self.queue.enter(crate::queue::Need::Any, "unload", "", |_| {}).await;
         if let Some(l) = self.current.write().await.take() {
             stop(&l).await;
         }
+        self.queue.set_resident(crate::queue::Resident::None);
     }
 
+    /// Loads a model (a switch from the web app or the API): in its place in the queue, after the jobs before it.
     pub async fn load(&self, id: &str) -> Result<Arc<Loaded>> {
         let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
-        let _s = self.switching.lock().await;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
                 return Ok(l);
             }
         }
-        // a running request finishes first (up to two minutes), then the model in memory is stopped
-        let _t = tokio::time::timeout(Duration::from_secs(120), self.turn.lock())
-            .await
-            .map_err(|_| anyhow!("a request is still running after two minutes; try the switch again when it ends"))?;
+        let _p = self.queue.enter(crate::queue::Need::Text(entry.id.clone()), "switch", &entry.id, |_| {}).await
+            .map_err(|t| anyhow!("waited {} s at place {} of the queue (queue_max_wait_s); try the switch again later", t.waited_s, t.position))?;
+        self.load_locked(&entry.id).await
+    }
+
+    /// Loads `id` (stopping the model in memory first) for the job that holds the turn.
+    pub async fn load_locked(&self, id: &str) -> Result<Arc<Loaded>> {
+        let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        if let Some(l) = self.current().await {
+            if l.entry.id == entry.id {
+                self.queue.set_resident(crate::queue::Resident::Text(entry.id.clone()));
+                return Ok(l);
+            }
+        }
         let before = self.current.write().await.take();
         let before_id = before.as_ref().map(|l| l.entry.id.clone());
         if let Some(l) = before {
@@ -300,6 +336,7 @@ impl Manager {
             Ok(l) => {
                 let l = Arc::new(l);
                 *self.current.write().await = Some(l.clone());
+                self.queue.set_resident(crate::queue::Resident::Text(entry.id.clone()));
                 Ok(l)
             }
             Err(e) => {
@@ -307,7 +344,10 @@ impl Manager {
                     tracing::warn!("loading {} failed ({e:#}); starting {} again", entry.id, prev.id);
                     if let Ok(l) = start(&prev, &self.hw, self.ready_timeout).await {
                         *self.current.write().await = Some(Arc::new(l));
+                        self.queue.set_resident(crate::queue::Resident::Text(prev.id.clone()));
                     }
+                } else {
+                    self.queue.set_resident(crate::queue::Resident::None);
                 }
                 Err(e)
             }

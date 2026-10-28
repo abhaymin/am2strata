@@ -24,6 +24,10 @@ fn main() {
         match cmd["op"].as_str().unwrap_or("") {
             "generate" => {
                 let r = &cmd["request"];
+                // a slow job, for the queue's tests
+                if let Some(ms) = std::env::var("MOCK_MEDIA_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
                 if r["prompt"].as_str().unwrap_or("").contains("FAIL") {
                     emit(serde_json::json!({"event": "error", "message": "mock failure"}));
                     continue;

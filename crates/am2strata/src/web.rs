@@ -205,7 +205,17 @@ pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Qu
     }
     let (engine, loaded) = engine_facts(&s).await;
     let all = q.get("requests").is_some_and(|v| v == "all");
-    Json(s.mgr.monitor.metrics(engine, loaded, all)).into_response()
+    let mut m = s.mgr.monitor.metrics(engine, loaded, all);
+    m["queue"] = s.mgr.queue.snapshot();
+    Json(m).into_response()
+}
+
+/// GET /api/queue: the job that has the GPU's turn and the ones waiting, in the order they will run.
+pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    Json(s.mgr.queue.snapshot()).into_response()
 }
 
 /// GET /metrics/prometheus.

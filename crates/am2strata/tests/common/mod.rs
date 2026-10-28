@@ -107,6 +107,7 @@ impl Server {
                                         else { PathBuf::from(env!("CARGO_BIN_EXE_strata-mock-media")) })
             .env("MOCK_MEDIA_RECORD", dir.join("media-record.txt"))
             .env("AM2_TEST_MEM_GB", extra.get("mem_gb").map(|v| v.to_string()).unwrap_or_else(|| "64".into()))
+            .env("MOCK_MEDIA_DELAY_MS", extra.get("media_delay_ms").map(|v| v.to_string()).unwrap_or_else(|| "0".into()))
             .env("MOCK_SCRIPT", dir.join("script.json"))
             .env("MOCK_RECORD", &record)
             .env("RUST_LOG", "warn")

@@ -38,14 +38,76 @@ fn finish_reason(sum: &Summary, calls: usize, streamed_open: bool) -> &'static s
     }
 }
 
-pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): Json<Value>) -> Response {
+pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // a stream that must wait for the model to load again (stopped for a media job) behind other jobs starts at once
+    // and says its place (SSE comments); the answer follows on the same stream once the model is loaded
+    if stream && s.mgr.current().await.is_none() && s.mgr.queue.busy() {
+        return waiting_stream(s, headers, req);
+    }
+    chat_with(s, headers, req, None).await
+}
+
+fn waiting_stream(s: AppState, headers: HeaderMap, req: Value) -> Response {
+    use futures::StreamExt;
+    let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(256);
+    let keep = tx.clone();
+    tokio::spawn(async move {
+        let txp = tx.clone();
+        let got = s.mgr.ensure_with_turn_told(move |p| {
+            let _ = txp.try_send(format!(": queued: {} ahead\n\n", p.saturating_sub(1)).into());
+        }).await;
+        let r = match got {
+            Ok(l) => chat_with(s, headers, req, Some(l)).await,
+            Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
+        };
+        let ok = r.status().is_success();
+        let mut body = r.into_body().into_data_stream();
+        if ok {
+            while let Some(Ok(b)) = body.next().await {
+                if tx.send(b).await.is_err() {
+                    return;
+                }
+            }
+        } else {
+            let mut all = Vec::new();
+            while let Some(Ok(b)) = body.next().await {
+                all.extend_from_slice(&b);
+            }
+            let v: Value = serde_json::from_slice(&all).unwrap_or_else(|_| json!({"error": {"message": String::from_utf8_lossy(&all)}}));
+            let _ = tx.send(format!("data: {v}\n\ndata: [DONE]\n\n").into()).await;
+        }
+    });
+    // keep-alives while it waits (the answer's stream has its own); they stop when the answer's stream ends
+    let weak = keep.downgrade();
+    drop(keep);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            match weak.upgrade() {
+                Some(tx) => { let _ = tx.try_send(axum::body::Bytes::from_static(b": keep-alive\n\n")); }
+                None => return,
+            }
+        }
+    });
+    let body = futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|b| (Ok::<_, Infallible>(b), rx)) });
+    Response::builder().header("content-type", "text/event-stream").header("cache-control", "no-cache")
+        .body(axum::body::Body::from_stream(body)).unwrap()
+}
+
+async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
+                   pre: Option<(std::sync::Arc<crate::manager::Loaded>, Option<crate::queue::Pass>)>) -> Response {
     if let Err(e) = media::expand_videos(&mut req).await {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
-    let loaded = match s.mgr.ensure().await {
+    let got = match pre {
+        Some(l) => Ok(l),
+        None => s.mgr.ensure_with_turn().await,
+    };
+    let (loaded, early_pass) = match got {
         Ok(l) => l,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
     };
@@ -73,7 +135,7 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let own_page = !crate::foreign_origin(&s, &headers) && headers.contains_key("origin");
     let opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
-                              memory: crate::memory::scope_of(&req, own_page) };
+                              memory: crate::memory::scope_of(&req, own_page), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) };
     // the web app's opt-in: MCP tools run here, with the user's rights on this PC, so only for its own page
     let mut mcp = None;
     if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
@@ -104,16 +166,63 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
             mcp = Some((hub, names));
         }
     }
-    let started = match mcp {
-        Some((hub, names)) => run::start_mcp(s.mgr.clone(), loaded, prep, req.clone(), opts, hub, names).await,
-        None => run::start(s.mgr.clone(), loaded, prep, req.clone(), opts).await,
+    let pass_slot = opts.pass.clone();
+    let has_pass = pass_slot.lock().unwrap().is_some();
+    let (mgr, req2, model_id) = (s.mgr.clone(), req.clone(), loaded.entry.id.clone());
+    let run_it = async move {
+        match mcp {
+            Some((hub, names)) => run::start_mcp(mgr, loaded, prep, req2, opts, hub, names).await,
+            None => run::start(mgr, loaded, prep, req2, opts).await,
+        }
     };
-    let started = match started {
+    // a stream that has to wait for its turn starts at once and says its place in the queue (SSE comments); its
+    // refusals then come as an error event, not a status code
+    if stream && validator.is_none() && !has_pass && s.mgr.queue.busy() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Option<Value>>(256);
+        let mgr = s.mgr.clone();
+        tokio::spawn(async move {
+            let txp = tx.clone();
+            let label = format!("{model_id} chat (stream)");
+            let pass = mgr.take_turn(&model_id, &label, move |p| {
+                let _ = txp.try_send(Some(json!({"__comment": format!("queued: {} ahead", p.saturating_sub(1))})));
+            }).await;
+            match pass {
+                Ok(p) => *pass_slot.lock().unwrap() = Some(p),
+                Err(t) => {
+                    let _ = tx.send(Some(json!({"error": {"type": "server_error", "message":
+                        format!("waited {} s at place {} of the queue (queue_max_wait_s); try again later", t.waited_s, t.position)}}))).await;
+                    return;
+                }
+            }
+            match run_it.await {
+                Ok(st) => pump(st, tx).await,
+                Err(run::Refusal(_, msg)) => {
+                    let _ = tx.send(Some(json!({"error": {"type": "invalid_request_error", "message": msg}}))).await;
+                }
+            }
+        });
+        return sse(rx);
+    }
+    let started = match run_it.await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             return error(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), "invalid_request_error", msg)
         }
     };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Option<Value>>(256);
+    tokio::spawn(pump(started, tx));
+    let rx = match validator {
+        Some(v) => structured(rx, v),
+        None => rx,
+    };
+    if stream {
+        return sse(rx);
+    }
+    collect(rx).await
+}
+
+/// The engine's events of one request as chat.completion chunks (None: a keep-alive).
+async fn pump(started: run::Started, tx: tokio::sync::mpsc::Sender<Option<Value>>) {
     let cid = format!("chatcmpl-{}", &uuid::Uuid::new_v4().simple().to_string()[..24]);
     let created = now();
     let model = started.model.clone();
@@ -122,9 +231,8 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
         json!({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
     };
-    let (tx, rx) = tokio::sync::mpsc::channel::<Option<Value>>(256);
     let mut events = started.events;
-    tokio::spawn(async move {
+    {
         let _ = tx.send(Some(chunk(json!({"role": "assistant", "content": ""}), None))).await;
         let mut calls = 0usize;
         let mut streamed: HashMap<String, usize> = HashMap::new();
@@ -187,24 +295,22 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(mut req): 
                 return; // heartbeat failed: the client is gone
             }
         }
-    });
-    let rx = match validator {
-        Some(v) => structured(rx, v),
-        None => rx,
-    };
-    if stream {
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Some(Some(v)) => Some((Ok::<_, Infallible>(SseEvent::default().data(v.to_string())), rx)),
-                Some(None) => Some((Ok(SseEvent::default().comment("keep-alive")), rx)),
-                None => None,
-            }
-        });
-        let done = futures::stream::once(async { Ok::<_, Infallible>(SseEvent::default().data("[DONE]")) });
-        use futures::StreamExt;
-        return Sse::new(stream.chain(done)).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))).into_response();
     }
-    collect(rx).await
+}
+
+/// Chunks as server-sent events, ending with [DONE]; a {"__comment"} chunk is an SSE comment (the queue position).
+fn sse(rx: tokio::sync::mpsc::Receiver<Option<Value>>) -> Response {
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(Some(v)) if v.get("__comment").is_some() => Some((Ok::<_, Infallible>(SseEvent::default().comment(v["__comment"].as_str().unwrap_or(""))), rx)),
+            Some(Some(v)) => Some((Ok::<_, Infallible>(SseEvent::default().data(v.to_string())), rx)),
+            Some(None) => Some((Ok(SseEvent::default().comment("keep-alive")), rx)),
+            None => None,
+        }
+    });
+    let done = futures::stream::once(async { Ok::<_, Infallible>(SseEvent::default().data("[DONE]")) });
+    use futures::StreamExt;
+    Sse::new(stream.chain(done)).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))).into_response()
 }
 
 /// Structured output: the chunks are held (keep-alives go on) until the answer is checked; then the first chunk, one

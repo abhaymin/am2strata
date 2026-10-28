@@ -465,7 +465,11 @@ function render(m) {
   } else {
     setPill("idle", "Idle");
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  const q = m.queue || {};
+  if ((q.waiting || []).length) {
+    const r = q.running ? ` behind ${q.running.kind === "chat" ? "a chat" : `a ${q.running.kind} job`}` : "";
+    setPill("queued", `${q.waiting.length} waiting${r}`);
+  } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);

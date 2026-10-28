@@ -942,3 +942,36 @@ fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
         assert_eq!(t["device"], "cpu", "an engine without CUDA computes on the CPU");
     }
 }
+
+#[test]
+fn a_chat_waits_behind_a_media_job_in_the_queue_and_says_its_place() {
+    let s = Server::start(&[Model::default()], &[ids("Queued answer.")], json!({"media_delay_ms": 1500}));
+    let base = s.base.clone();
+    let img = std::thread::spawn(move || {
+        reqwest::blocking::Client::new().post(format!("{base}/v1/images/generations")).bearer_auth(KEY)
+            .json(&json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2})).send().unwrap().status().as_u16()
+    });
+    // the image job holds the turn
+    let t0 = std::time::Instant::now();
+    loop {
+        let q = s.get("/api/queue", true).1;
+        if q["running"]["kind"] == "media" { break; }
+        assert!(t0.elapsed().as_secs() < 10, "{q}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // a streamed chat now waits; it starts at once and tells its place in SSE comments
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .json(&json!({"messages": [user("hi")], "stream": true})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let q = s.get("/api/queue", true).1;
+    assert_eq!(q["waiting"][0]["kind"], "chat", "{q}");
+    let body = r.text().unwrap();
+    assert!(body.contains(": queued: 0 ahead"), "{body}");
+    let content: String = body.lines().filter_map(|l| l.strip_prefix("data: ")).filter(|d| *d != "[DONE]")
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok()).map(|v| { let d = &v["choices"][0]["delta"];
+            format!("{}{}", d["reasoning_content"].as_str().unwrap_or(""), d["content"].as_str().unwrap_or("")) }).collect();
+    assert_eq!(content, "Queued answer.", "{body}");
+    assert_eq!(img.join().unwrap(), 200);
+    let q = s.get("/api/queue", true).1;
+    assert!(q["running"].is_null() && q["waiting"].as_array().unwrap().is_empty(), "{q}");
+}
