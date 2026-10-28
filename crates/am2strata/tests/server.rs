@@ -1038,7 +1038,7 @@ fn web_ui_demo() {
     let img = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
     let spk = "\n\n<tool_call>\n<function=speak>\n<parameter=text>\nGood evening.\n</parameter>\n</function>\n</tool_call>";
     let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
-    let s = Server::start(&[Model::default()], &[ids(&format!("Draw.\n</think>{img}")), ids("Ok.\n</think>\n\nYour lighthouse is on its way."),
+    let s = Server::start(&[Model::default(), Model { id: "mock-b", ..Model::default() }], &[ids(&format!("Draw.\n</think>{img}")), ids("Ok.\n</think>\n\nYour lighthouse is on its way."),
                                                  ids(&format!("Say it.\n</think>{spk}")), ids("Ok.\n</think>\n\nHere is the greeting, read aloud."),
                                                  ids("Heard.\n</think>\n\nThe recording says: hello world.")],
                           json!({"web_dir": web.to_str().unwrap(), "media_delay_ms": 4000}));
@@ -1198,4 +1198,69 @@ fn anthropic_and_responses_clients_get_the_media_tools_too() {
     assert!(out.contains("A second fox is coming."), "{r}");
     assert!(!out.contains("function_call"), "{r}");
     assert_eq!(s.get("/api/jobs/mj-1", true).0, 200);
+}
+
+#[test]
+fn a_downloaded_model_is_removed_from_the_disk_keeping_what_others_use() {
+    let b = Model { id: "mock-b", ..Model::default() };
+    let s = Server::start(&[Model::default(), b], &[ids("x")], json!({}));
+    let d = s.dir.clone();
+    let mk = |p: &std::path::Path| { std::fs::create_dir_all(p.parent().unwrap()).unwrap(); std::fs::write(p, vec![7u8; 1000]).unwrap(); };
+    let (own, pack, shared) = (d.join("models/B-dl/b.gguf"), d.join("packs/mock-b/profile.txt"), d.join("models/shared-dl/s.bin"));
+    for p in [&own, &pack, &shared] { mk(p); }
+    // a download folder that is a link to a cache elsewhere: the link goes, the cache stays
+    let outside = std::env::temp_dir().join(format!("am2strata-outside-{}", uuid::Uuid::new_v4().simple()));
+    mk(&outside.join("cached.gguf"));
+    std::os::unix::fs::symlink(&outside, d.join("models/linked")).unwrap();
+    let edit = |id: &str, k: &str, v: Value| {
+        let p = d.join(format!("strata-{id}.json"));
+        let mut c: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        c[k] = v;
+        std::fs::write(&p, serde_json::to_vec_pretty(&c).unwrap()).unwrap();
+    };
+    edit("mock-b", "files", json!([own, pack, shared, d.join("models/linked/cached.gguf")]));
+    edit("mock-a", "files", json!([shared]));
+    // the loaded (and start-up) model cannot go
+    let (c, p) = s.get("/api/models/mock-a/removal", true);
+    assert_eq!(c, 200);
+    assert!(p["blocked"].as_str().unwrap().contains("loaded"), "{p}");
+    let del = |id: &str, origin: Option<&str>| {
+        let mut r = reqwest::blocking::Client::new().delete(format!("{}/api/models/{id}", s.base)).bearer_auth(KEY);
+        if let Some(o) = origin { r = r.header("origin", o); }
+        let r = r.send().unwrap();
+        (r.status().as_u16(), r.json::<Value>().unwrap_or(Value::Null))
+    };
+    assert_eq!(del("mock-a", None).0, 409);
+    assert_eq!(del("mock-b", Some("https://evil.example")).0, 403);
+    // the plan, then the removal
+    let (c, p) = s.get("/api/models/mock-b/removal", true);
+    assert_eq!(c, 200, "{p}");
+    assert!(p["blocked"].is_null(), "{p}");
+    let paths: Vec<&str> = p["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert!(paths.iter().any(|x| x.ends_with("models/B-dl")) && paths.iter().any(|x| x.ends_with("packs/mock-b"))
+            && paths.iter().any(|x| x.ends_with("models/linked")) && !paths.iter().any(|x| x.contains("shared-dl")), "{p}");
+    assert!(p["kept"].to_string().contains("also used by mock-a"), "{p}");
+    let (c, r) = del("mock-b", None);
+    assert_eq!(c, 200, "{r}");
+    assert!(r["freed_bytes"].as_u64().unwrap() >= 2000, "{r}");
+    assert!(!d.join("models/B-dl").exists() && !d.join("packs/mock-b").exists() && !d.join("strata-mock-b.json").exists());
+    assert!(std::fs::symlink_metadata(d.join("models/linked")).is_err(), "the link is gone");
+    assert!(outside.join("cached.gguf").exists(), "what it pointed at is not touched");
+    assert!(shared.exists(), "mock-a still uses it");
+    let list = s.get("/api/models", true).1.to_string();
+    assert!(!list.contains("mock-b"), "{list}");
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[test]
+fn a_media_model_is_removed_through_the_media_engine() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let (c, p) = s.get("/api/media/models/z-image-turbo:q8/removal", true);
+    assert_eq!(c, 200, "{p}");
+    assert_eq!(p["bytes"], 6_580_000_000u64);
+    let r = reqwest::blocking::Client::new().delete(format!("{}/api/media/models/z-image-turbo:q8", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.json::<Value>().unwrap()["freed_bytes"], 6_580_000_000u64);
+    let r = reqwest::blocking::Client::new().delete(format!("{}/api/media/models/flux2-klein:q4", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 400);
 }

@@ -63,6 +63,23 @@ fn local(e: &Entry) -> Option<Vec<PathBuf>> {
     FILES.iter().map(|f| repo.get(f)).collect()
 }
 
+/// The model's whole Hugging Face cache folder (blobs, snapshots, refs): what removing it deletes.
+pub fn folder(e: &Entry) -> PathBuf {
+    cache_dir().join(format!("models--{}", e.repo.replace('/', "--")))
+}
+
+/// Bytes on disk under `p`, symlinks counted as links (the HF cache's snapshots point at its blobs).
+pub fn disk_bytes(p: &std::path::Path) -> u64 {
+    let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
+    if m.is_dir() {
+        std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| disk_bytes(&e.path())).sum()).unwrap_or(0)
+    } else if m.file_type().is_symlink() {
+        0
+    } else {
+        m.len()
+    }
+}
+
 pub fn downloaded(e: &Entry) -> bool {
     local(e).is_some()
 }

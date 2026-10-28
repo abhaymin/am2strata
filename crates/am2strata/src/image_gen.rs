@@ -172,7 +172,7 @@ impl Media {
             };
             match v["event"].as_str().unwrap_or("") {
                 "error" => anyhow::bail!("{}", v["message"].as_str().unwrap_or("the media engine failed")),
-                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" => return Ok(v),
+                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "removal" | "removed" => return Ok(v),
                 _ => on_event(&v),
             }
         }

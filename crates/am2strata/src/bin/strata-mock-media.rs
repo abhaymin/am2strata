@@ -69,6 +69,12 @@ fn main() {
                 {"name": "whisper-large-v3-turbo", "kind": "audio", "task": "stt", "family": "whisper", "size_gb": 1.62, "downloaded": false, "gated": false},
                 {"name": "wan22-ti2v-5b:q8", "kind": "video", "family": "wan", "size_gb": 16.9, "downloaded": true, "gated": false,
                  "defaults": {"steps": 30, "guidance": 5.0, "width": 1280, "height": 704, "frames": 121, "fps": 24}}]})),
+            "remove_plan" if cmd["model"] == "z-image-turbo:q8" => emit(serde_json::json!({"event": "removal", "model": cmd["model"],
+                "files": [{"path": "/mock/z-image-turbo-q8/z.gguf", "bytes": 6_580_000_000u64}],
+                "kept": [{"path": "/mock/shared/z-image/vae.safetensors", "used_by": ["z-image-te"]}], "bytes": 6_580_000_000u64})),
+            "remove" if cmd["model"] == "z-image-turbo:q8" => emit(serde_json::json!({"event": "removed", "model": cmd["model"],
+                "freed_bytes": 6_580_000_000u64, "removed": ["/mock/z-image-turbo-q8/z.gguf"], "warnings": []})),
+            "remove_plan" | "remove" => emit(serde_json::json!({"event": "error", "message": format!("{} is not downloaded", cmd["model"].as_str().unwrap_or(""))})),
             _ => emit(serde_json::json!({"event": "error", "message": "unknown op"})),
         }
     }

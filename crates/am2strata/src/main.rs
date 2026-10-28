@@ -18,6 +18,7 @@ mod mcp;
 mod memory;
 mod media;
 mod media_jobs;
+mod model_remove;
 mod monitor;
 mod openai;
 mod responses;
@@ -315,6 +316,10 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/models/{id}", axum::routing::delete(model_remove::remove))
+        .route("/api/models/{id}/removal", get(model_remove::removal))
+        .route("/api/media/models/{name}", axum::routing::delete(model_remove::media_remove))
+        .route("/api/media/models/{name}/removal", get(model_remove::media_removal))
         .route("/api/media/capabilities", get(media_jobs::capabilities))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))

@@ -167,7 +167,8 @@ function renderModels() {
     return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span></div>` + upd +
       `<span class="st-badge ${m.current ? "st-badge--generating" : ""}">${m.current ? "Loaded" : "Available"}</span>` +
       (m.current ? `<button class="st-btn st-btn--secondary" data-unload>Unload</button>`
-                 : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) + `</div>`;
+                 : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) +
+      `<button class="st-btn st-btn--danger" data-remove="${esc(m.id)}"${m.current ? " disabled title=\"Unload it first\"" : ""}>Remove</button></div>`;
   }).join("");
 }
 // Media models (GET api/media/models): the media engine's catalog, what is downloaded, the image model in use.
@@ -220,7 +221,8 @@ function renderMediaModels() {
       : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? "Downloading\u2026" : "Download"}</button>`
       : (m.kind === "image" || m.kind === "video") && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.kind}s</button>`
       : m.kind === "audio" && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.task === "tts" ? "speech" : "transcripts"}</button>` : "";
-    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.name)}</b><span>${esc(m.name)} · ${esc(facts)}</span></div>${badge}${btn}</div>`;
+    const rm = m.downloaded && !m.planned ? `<button class="st-btn st-btn--danger" data-mremove="${esc(m.name)}"${pulling ? " disabled" : ""}>Remove</button>` : "";
+    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.name)}</b><span>${esc(m.name)} · ${esc(facts)}</span></div>${badge}${btn}${rm}</div>`;
   }).join("") : `<p class="muted" style="padding:12px 14px">Nothing matches.</p>`;
 }
 $("mm-kind").addEventListener("click", (e) => {
@@ -232,6 +234,12 @@ $("mm-kind").addEventListener("click", (e) => {
 $("mm-search").oninput = renderMediaModels;
 $("mm-downloaded").onchange = renderMediaModels;
 $("mm-list").addEventListener("click", async (e) => {
+  const mrm = e.target.closest("[data-mremove]");
+  if (mrm) {
+    const n = mrm.dataset.mremove, enc = encodeURIComponent(n);
+    await removeModel(n, `api/media/models/${enc}/removal`, `api/media/models/${enc}`, loadMediaModels);
+    return;
+  }
   const pull = e.target.closest("[data-mpull]"), use = e.target.closest("[data-muse]");
   const post = async (path, model) => {
     const r = await fetch(path, {method: "POST", headers: headers(true), body: JSON.stringify({model})});
@@ -338,7 +346,34 @@ $("vid-form").onsubmit = async (ev) => {
   }
 };
 
+// Removing a model from the disk: the server's plan first (what goes, what is kept and why), then the removal.
+const gbOf = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(b >= 1e10 ? 0 : 1)} GB` : b >= 1e6 ? `${Math.round(b / 1e6)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`);
+async function removeModel(name, planUrl, delUrl, after) {
+  try {
+    const r = await fetch(planUrl, {headers: headers()});
+    const p = await r.json();
+    if (!r.ok) throw new Error((p.error || {}).message || `HTTP ${r.status}`);
+    if (p.blocked) { toast("warn", "Cannot remove it now", `${name}: ${p.blocked}.`, 8000); return; }
+    const short = (x) => String(x).replace(/^.*\/(models|packs|media)\//, "$1/");
+    const files = (p.files || []).map((f) => `  ${short(f.path)}  ${gbOf(f.bytes || 0)}${f.link ? " (a link; what it points at stays)" : ""}`);
+    const kept = (p.kept || []).map((k) => `  ${short(k.path)}: ${k.why || ("also used by " + (k.used_by || []).join(", "))}`);
+    const text = `Remove ${name} from the disk? This frees ${gbOf(p.bytes || 0)} and cannot be undone.\n\nDeleted:\n${files.join("\n")}` +
+      (kept.length ? `\n\nKept:\n${kept.slice(0, 8).join("\n")}${kept.length > 8 ? `\n  and ${kept.length - 8} more` : ""}` : "");
+    if (!confirm(text)) return;
+    const d = await fetch(delUrl, {method: "DELETE", headers: headers()});
+    const j = await d.json();
+    if (!d.ok) throw new Error((j.error || {}).message || `HTTP ${d.status}`);
+    toast("success", "Removed", `${name}: ${gbOf(j.freed_bytes || 0)} freed.${(j.warnings || []).length ? " " + j.warnings.join("; ") : ""}`, 6000);
+  } catch (err) { toast("error", "Not removed", String(err.message || err), 8000); }
+  after();
+}
 $("models-list").addEventListener("click", async (e) => {
+  const rm = e.target.closest("[data-remove]");
+  if (rm) {
+    const id = rm.dataset.remove;
+    await removeModel(id, `api/models/${encodeURIComponent(id)}/removal`, `api/models/${encodeURIComponent(id)}`, loadModels);
+    return;
+  }
   const load = e.target.closest("[data-load]"), unload = e.target.closest("[data-unload]"), upd = e.target.closest("[data-update]");
   if (upd) {
     const u = updatesOf[upd.dataset.update];

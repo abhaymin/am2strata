@@ -16,6 +16,8 @@
 //!                                                         <- {"event":"part","done":1,"total":3} ...
 //!                                                         <- {"event":"speech","format":"wav","sample_rate":..,"seconds":..,"data":"<base64>"}
 //!   -> {"op":"unload_audio"}                              <- {"event":"unloaded"}  (Whisper and Parler only)
+//!   -> {"op":"remove_plan","model":...}  <- {"event":"removal","model","files":[{path,bytes}],"kept":[{path,used_by}],"bytes"}
+//!   -> {"op":"remove","model":...}       <- {"event":"removed","model","freed_bytes","removed":[...],"warnings":[...]}
 //!   any failure                                           <- {"event":"error","message":...}
 //!
 //! Models and their files come from mold's catalog, stored under $MOLD_HOME (am2Strata sets <Strata-data>/media).
@@ -43,6 +45,29 @@ struct State {
     model: Option<String>,
     whisper: Option<audio::Whisper>,
     parler: Option<audio::Parler>,
+}
+
+/// What removing `model` deletes (its own files) and keeps (files another model also uses).
+fn removal(st: &mut State, model: &str) -> Result<Value> {
+    if let Some(e) = audio::entry(model) {
+        let dir = audio::folder(e);
+        if !dir.exists() {
+            return Err(anyhow!("{model} is not downloaded"));
+        }
+        let bytes = audio::disk_bytes(&dir);
+        return Ok(json!({"event": "removal", "model": model, "files": [{"path": dir, "bytes": bytes}], "kept": [], "bytes": bytes}));
+    }
+    st.config = mold_core::Config::load_or_default();
+    let canonical = mold_core::manifest::resolve_model_name(model);
+    let plan = mold_core::removal::plan_removal(&st.config, &canonical);
+    if plan.unique_files.is_empty() && plan.shared_files.is_empty() {
+        return Err(anyhow!("{model} is not downloaded"));
+    }
+    let bytes: u64 = plan.unique_files.iter().map(|(_, b)| b).sum();
+    Ok(json!({"event": "removal", "model": canonical,
+              "files": plan.unique_files.iter().map(|(p, b)| json!({"path": p, "bytes": b})).collect::<Vec<_>>(),
+              "kept": plan.shared_files.iter().map(|(p, by)| json!({"path": p, "used_by": by})).collect::<Vec<_>>(),
+              "bytes": bytes}))
 }
 
 fn transcribe(st: &mut State, cmd: &Value) -> Result<Value> {
@@ -225,6 +250,39 @@ fn main() {
                 "speak" => {
                     let r = speak(&mut st, &cmd)?;
                     emit(r)
+                }
+                "remove_plan" => emit(removal(&mut st, &model)?),
+                "remove" => {
+                    // out of memory first: the engine (or the speech models) may hold it
+                    if st.model.as_deref() == Some(model.as_str()) {
+                        if let Some(mut e) = st.engine.take() {
+                            e.unload();
+                        }
+                        st.model = None;
+                    }
+                    if let Some(e) = audio::entry(&model) {
+                        st.whisper = None;
+                        st.parler = None;
+                        let dir = audio::folder(e);
+                        let freed = audio::disk_bytes(&dir);
+                        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+                        emit(json!({"event": "removed", "model": model, "freed_bytes": freed, "removed": [dir], "warnings": []}));
+                    } else {
+                        st.config = mold_core::Config::load_or_default();
+                        let canonical = mold_core::manifest::resolve_model_name(&model);
+                        let plan = mold_core::removal::plan_removal(&st.config, &canonical);
+                        if plan.unique_files.is_empty() && plan.shared_files.is_empty() {
+                            return Err(anyhow!("{model} is not downloaded"));
+                        }
+                        let out = mold_core::removal::execute_removal(&st.config, &plan);
+                        mold_core::download::remove_pulling_marker(&canonical);
+                        if st.config.models.contains_key(&canonical) {
+                            st.config.remove_model(&canonical);
+                            let _ = st.config.save();
+                        }
+                        emit(json!({"event": "removed", "model": canonical, "freed_bytes": out.freed_bytes,
+                                    "removed": out.removed, "warnings": out.warnings}));
+                    }
                 }
                 "quit" => std::process::exit(0),
                 op => return Err(anyhow!("unknown op {op:?}")),

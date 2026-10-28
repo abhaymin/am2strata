@@ -221,6 +221,11 @@ impl Manager {
     }
 
     /// The installed models, scanned again (a config pulled or edited meanwhile is seen without a restart).
+    /// The folder of the run configs (PolyStrata's).
+    pub fn models_dir(&self) -> PathBuf {
+        self.models_dir.clone()
+    }
+
     pub fn models(&self) -> Vec<ModelEntry> {
         let fresh = scan(&self.models_dir);
         if !fresh.is_empty() {
