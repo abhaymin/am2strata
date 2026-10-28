@@ -82,7 +82,7 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
         .unwrap_or_else(|| voice.to_string());
     let t0 = std::time::Instant::now();
     let (pcm, rate) = st.parler.as_mut().unwrap().speak(text, &description, cmd["seed"].as_u64().unwrap_or(0),
-        cmd["temperature"].as_f64().unwrap_or(1.0),
+        cmd["temperature"].as_f64().unwrap_or(0.7), // a round trip through Whisper: 2% WER at 0.7, 25% at 1.0
         &mut |done, total| emit(json!({"event": "part", "done": done, "total": total})))?;
     Ok(json!({"event": "speech", "format": "wav", "sample_rate": rate, "seconds": (pcm.len() as f64 / rate as f64 * 100.0).round() / 100.0,
               "ms": t0.elapsed().as_millis() as u64, "model": name,

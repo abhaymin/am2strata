@@ -172,6 +172,7 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     }
     // the media tools (generate_image / generate_video / speak) for a chat that opted in, the kinds this PC can make
     if req.get("strata_media") == Some(&Value::Bool(true)) && validator.is_none() && s.media.available()
+        && !crate::foreign_origin(&s, &headers)
         && strata_frontend::request::forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_none() {
         let caps = s.media_jobs.capabilities().await;
         let own: Vec<String> = prep.tools.iter().flatten().filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_owned)).collect();

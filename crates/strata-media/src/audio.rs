@@ -529,7 +529,8 @@ impl Parler {
     /// Speech for `text` in the voice `description`: sentence by sentence (each a short generation), joined with a
     /// short pause. `on_part` sees (done, total) parts.
     pub fn speak(&mut self, text: &str, description: &str, seed: u64, temperature: f64, on_part: &mut dyn FnMut(usize, usize)) -> Result<(Vec<f32>, u32)> {
-        let parts = sentences(text, 220);
+        // Parler reads words, not digits: numbers, times, prices and percentages spelled out first
+        let parts = sentences(&spoken(text), 220);
         if parts.is_empty() {
             bail!("nothing to say");
         }
@@ -588,6 +589,149 @@ pub fn sentences(text: &str, max: usize) -> Vec<String> {
     parts
 }
 
+const ONES: [&str; 20] = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+                          "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+const TENS: [&str; 10] = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+
+/// A whole number in English words ("one thousand two hundred thirty-four").
+pub fn number_words(n: u64) -> String {
+    fn below_1000(n: u64) -> String {
+        let (h, r) = (n / 100, n % 100);
+        let mut out = Vec::new();
+        if h > 0 {
+            out.push(format!("{} hundred", ONES[h as usize]));
+        }
+        if r > 0 || h == 0 {
+            out.push(if r < 20 { ONES[r as usize].to_string() } else if r % 10 == 0 { TENS[(r / 10) as usize].to_string() }
+                     else { format!("{}-{}", TENS[(r / 10) as usize], ONES[(r % 10) as usize]) });
+        }
+        out.join(" ")
+    }
+    if n < 1000 {
+        return below_1000(n);
+    }
+    let mut out = Vec::new();
+    for (scale, name) in [(1_000_000_000_000u64, "trillion"), (1_000_000_000, "billion"), (1_000_000, "million"), (1000, "thousand")] {
+        if n >= scale && n / scale % 1000 > 0 || (scale == 1_000_000_000_000 && n >= scale) {
+            out.push(format!("{} {name}", if scale == 1_000_000_000_000 { number_words(n / scale) } else { below_1000(n / scale % 1000) }));
+        }
+    }
+    if n % 1000 > 0 {
+        out.push(below_1000(n % 1000));
+    }
+    out.join(" ")
+}
+
+fn ordinal(words: &str) -> String {
+    let (head, last) = match words.rfind([' ', '-']) {
+        Some(i) => (&words[..=i], &words[i + 1..]),
+        None => ("", words),
+    };
+    let last = match last {
+        "one" => "first".to_string(), "two" => "second".to_string(), "three" => "third".to_string(),
+        "five" => "fifth".to_string(), "eight" => "eighth".to_string(), "nine" => "ninth".to_string(), "twelve" => "twelfth".to_string(),
+        l if l.ends_with('y') => format!("{}ieth", &l[..l.len() - 1]),
+        l => format!("{l}th"),
+    };
+    format!("{head}{last}")
+}
+
+/// Text as it is read aloud: numbers in words (with thousands separators, decimals, ordinals), clock times, prices in
+/// $ / EUR / GBP, percentages and "&". Everything else is left as it is.
+pub fn spoken(text: &str) -> String {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut i = 0;
+    let digits = |i: usize| -> usize { let mut j = i; while j < c.len() && c[j].is_ascii_digit() { j += 1 } j };
+    while i < c.len() {
+        let ch = c[i];
+        let currency = match ch { '$' => Some(("dollar", "cent")), '€' => Some(("euro", "cent")), '£' => Some(("pound", "penny")), _ => None };
+        if let Some((unit, sub)) = currency.filter(|_| i + 1 < c.len() && c[i + 1].is_ascii_digit()) {
+            // $1,200.50 -> one thousand two hundred dollars and fifty cents
+            let mut j = i + 1;
+            let mut whole = String::new();
+            while j < c.len() && (c[j].is_ascii_digit() || (c[j] == ',' && j + 3 < c.len() + 0 && c.get(j + 1).is_some_and(|d| d.is_ascii_digit()))) {
+                if c[j] != ',' { whole.push(c[j]) }
+                j += 1;
+            }
+            let n: u64 = whole.parse().unwrap_or(0);
+            let mut cents = None;
+            if j + 2 < c.len() + 1 && c.get(j) == Some(&'.') && c.get(j + 1).is_some_and(|d| d.is_ascii_digit()) && c.get(j + 2).is_some_and(|d| d.is_ascii_digit())
+                && !c.get(j + 3).is_some_and(|d| d.is_ascii_digit()) {
+                cents = Some((c[j + 1] as u64 - 48) * 10 + (c[j + 2] as u64 - 48));
+                j += 3;
+            }
+            let plural = |w: &str, k: u64| if k == 1 { w.to_string() } else if w == "penny" { "pence".into() } else { format!("{w}s") };
+            out.push_str(&format!("{} {}", number_words(n), plural(unit, n)));
+            if let Some(ct) = cents.filter(|ct| *ct > 0) {
+                out.push_str(&format!(" and {} {}", number_words(ct), plural(sub, ct)));
+            }
+            i = j;
+            continue;
+        }
+        if ch == '&' {
+            // "R&D" -> "R and D"; "you & me" keeps its own spaces
+            if !out.ends_with(' ') { out.push(' ') }
+            out.push_str("and");
+            if !c.get(i + 1).is_some_and(|x| x.is_whitespace()) { out.push(' ') }
+            i += 1;
+            continue;
+        }
+        if !ch.is_ascii_digit() || (i > 0 && (c[i - 1].is_alphanumeric())) {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        let j = digits(i);
+        let int: String = c[i..j].iter().collect();
+        // 7:45 -> seven forty-five, 7:00 -> seven o'clock, 7:05 -> seven oh five
+        if c.get(j) == Some(&':') && digits(j + 1) == j + 3 && int.len() <= 2 {
+            let (h, m): (u64, u64) = (int.parse().unwrap_or(0), c[j + 1..j + 3].iter().collect::<String>().parse().unwrap_or(0));
+            if h < 24 && m < 60 {
+                out.push_str(&number_words(h));
+                out.push_str(&match m { 0 => " o'clock".to_string(), 1..=9 => format!(" oh {}", number_words(m)), _ => format!(" {}", number_words(m)) });
+                i = j + 3;
+                continue;
+            }
+        }
+        // 1,234,567 (groups of three after the first)
+        let (mut whole, mut k) = (int.clone(), j);
+        while c.get(k) == Some(&',') && digits(k + 1) == k + 4 && int.len() <= 3 {
+            whole.extend(&c[k + 1..k + 4]);
+            k += 4;
+        }
+        let Ok(n) = whole.parse::<u64>() else {
+            out.push_str(&whole); // longer than any number word: digit by digit is no better
+            i = k;
+            continue;
+        };
+        let mut w = number_words(n);
+        // 3.14 -> three point one four
+        if c.get(k) == Some(&'.') && c.get(k + 1).is_some_and(|d| d.is_ascii_digit()) {
+            let e = digits(k + 1);
+            w.push_str(" point");
+            for d in &c[k + 1..e] {
+                w.push(' ');
+                w.push_str(ONES[*d as usize - 48]);
+            }
+            k = e;
+        }
+        // 1st 2nd 3rd 4th
+        let suf: String = c[k..(k + 2).min(c.len())].iter().collect::<String>().to_lowercase();
+        if matches!(suf.as_str(), "st" | "nd" | "rd" | "th") && !c.get(k + 2).is_some_and(|x| x.is_alphanumeric()) {
+            w = ordinal(&w);
+            k += 2;
+        }
+        out.push_str(&w);
+        if c.get(k) == Some(&'%') {
+            out.push_str(" percent");
+            k += 1;
+        }
+        i = k;
+    }
+    out
+}
+
 /// RMS to about -18 dBFS, a soft limit at full scale.
 fn loudness(x: &[f32]) -> Vec<f32> {
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt();
@@ -601,6 +745,18 @@ fn loudness(x: &[f32]) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numbers_times_and_prices_are_spelled_out_for_speech() {
+        assert_eq!(spoken("The train leaves at 7:45, platform 12; tickets cost $30."),
+                   "The train leaves at seven forty-five, platform twelve; tickets cost thirty dollars.");
+        assert_eq!(spoken("We grew 12.5% to 1,234,567 users & 3 teams on the 21st, at 9:05 and 10:00."),
+                   "We grew twelve point five percent to one million two hundred thirty-four thousand five hundred sixty-seven users and three teams on the twenty-first, at nine oh five and ten o'clock.");
+        assert_eq!(spoken("£1.01 and €2,000.50 for 1 user"), "one pound and one penny and two thousand euros and fifty cents for one user");
+        assert_eq!(number_words(0), "zero");
+        assert_eq!(number_words(100_000_000_105), "one hundred billion one hundred five");
+        assert_eq!(spoken("GPT4 and H100 stay"), "GPT4 and H100 stay");
+    }
 
     #[test]
     fn sentences_are_cut_at_their_ends_and_long_ones_at_commas() {

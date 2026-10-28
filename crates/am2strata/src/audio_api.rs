@@ -49,7 +49,7 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
 }
 
 /// Where this job runs, and whether it holds the GPU (the text model stopped meanwhile).
-fn placement(s: &AppState, size_gb: f64) -> (&'static str, bool) {
+fn placement(s: &AppState, size_gb: f64, tts: bool) -> (&'static str, bool) {
     // an engine without CUDA computes on the CPU whatever the setting
     if !s.media.cuda.load(std::sync::atomic::Ordering::Relaxed) {
         return ("cpu", false);
@@ -57,8 +57,14 @@ fn placement(s: &AppState, size_gb: f64) -> (&'static str, bool) {
     match s.media.audio_device.read().unwrap().as_str() {
         "cpu" => ("cpu", false),
         "cuda" => ("cuda", true),
-        // the weights in f32 and the activations beside them; Orca's 46 GB leave ~5 GB, which is not room for Parler
-        _ if mem_available_gb() >= size_gb * 1.6 + 1.5 => ("cpu", false),
+        // no text model loaded: the GPU is free, and 10 to 30 times faster
+        _ if !matches!(s.mgr.queue.resident(), crate::queue::Resident::Text(_)) => ("cuda", true),
+        // Parler on the CPU runs at about 20x real time (a paragraph: 140 s, on the GPU 6 s): a GPU job, the text model
+        // stopped meanwhile and loaded again with the next chat
+        _ if tts => ("cuda", true),
+        // measured peak RSS on the CPU (2026-10-28): Whisper large-v3-turbo 5.0 GB for 1.6 GB of weights, Parler mini
+        // 7.1 GB for 3.5 GB; Orca's 46 GB leave ~5 GB, room for neither
+        _ if mem_available_gb() >= size_gb * 2.5 + 1.5 => ("cpu", false),
         _ => ("cuda", true),
     }
 }
@@ -67,7 +73,7 @@ fn placement(s: &AppState, size_gb: f64) -> (&'static str, bool) {
 /// after a GPU job. `on_event` sees the engine's progress events.
 async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cmd: Value, mut on_event: impl FnMut(&Value))
              -> Result<(Value, &'static str, u64), Response> {
-    let (device, gpu) = placement(s, size_gb);
+    let (device, gpu) = placement(s, size_gb, kind == "text-to-speech");
     cmd["device"] = json!(device);
     let _turn = if gpu {
         Some(s.mgr.gpu_exclusive(!s.media.keep_text_model).await
@@ -275,7 +281,7 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     };
     let mut cmd = json!({"op": "speak", "model": model, "text": text, "voice": voice, "seed": req["seed"].as_u64().unwrap_or(0)});
     if let Some(t) = req["temperature"].as_f64() {
-        cmd["temperature"] = json!(t.clamp(0.0, 2.0)); // Parler samples at 1.0 unless told (0: greedy)
+        cmd["temperature"] = json!(t.clamp(0.0, 2.0)); // Parler samples at 0.7 unless told (0: greedy)
     }
     let (r, device, id) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
         Ok(x) => x,
