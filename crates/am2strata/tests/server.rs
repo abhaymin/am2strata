@@ -926,6 +926,14 @@ fn speech_is_transcribed_and_spoken_in_openais_shapes() {
     let sp = calls["requests"].as_array().unwrap().iter().find(|r| r["path"] == "/v1/audio/speech" && r["http_status"] == 200).cloned().unwrap();
     let d = s.get(&format!("/api/requests?id={}", sp["id"].as_str().unwrap()), true).1;
     assert!(d["response"].as_str().unwrap().starts_with("<WAV audio"), "{d}");
+    // OpenAI's names (whisper-1, tts-1) are recorded as the models that ran; a multipart form's model is read too
+    assert!(calls["requests"].as_array().unwrap().iter().filter(|r| r["path"].as_str().unwrap().starts_with("/v1/audio"))
+        .all(|r| r["model"] != "whisper-1" && r["model"] != "tts-1"), "{calls}");
+    let form = reqwest::blocking::multipart::Form::new().text("model", "whisper-base")
+        .part("file", reqwest::blocking::multipart::Part::bytes(vec![1u8, 2, 3, 4]).file_name("a.wav"));
+    assert_eq!(c.post(format!("{}/v1/audio/transcriptions", s.base)).bearer_auth(KEY).multipart(form).send().unwrap().status().as_u16(), 200);
+    let calls = s.get("/api/requests", true).1;
+    assert_eq!(calls["requests"][0]["model"], "whisper-base", "{}", calls["requests"][0]);
 }
 
 #[test]

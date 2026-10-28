@@ -162,3 +162,51 @@ The media engine's own memory cache - weights kept in pinned RAM between jobs - 
 Media cannot be bit-identical across frameworks: images are compared by similarity with reference renders from the
 same initial noise, and speed against stable-diffusion.cpp on the same card. Everything else as before: Rust tests on a
 mock engine, then a live GPU check (run only when the server is idle).
+
+## Video and speech: test results (2026-10-28, RTX 5060 Ti 16 GB, 60 GB RAM)
+
+Engine on its own (`am2strata-media`, the text model stopped), then the live server with Orca as the text model.
+
+**Speech to text**
+- Whisper base and large-v3-turbo on JFK (11 s): the exact text, language en.
+- The same clip at 44.1 kHz stereo: the same text (decoded, downmixed, resampled).
+- 66 s (JFK ×6): all 6 sentences in 6 segments, starts within 0.6 s of the true ones, nothing lost at 30 or 60 s.
+- 10 s of silence: empty text.
+- Translation: correct.
+- Speed, CPU: base 3.0 s per 11 s; turbo 0.8× real time (66 s in 52 s). GPU: turbo 66 s in 1.8 s.
+- Peak RSS on the CPU: turbo 5.0 GB.
+
+**Text to speech (Parler-TTS mini v1)**
+- Every clip is a valid 44.1 kHz WAV, its length within chars/15 s ±50%, RMS ≈ 3,800.
+- CPU: ~20× real time (a 3-sentence paragraph in 140 s), peak RSS 7.1 GB. GPU: ~1× real time (the same paragraph in 6 s), peak 4.9 GB VRAM.
+- TTS → Whisper turbo round trip:
+  - temperature 1.0: 25% WER;
+  - temperature 0.7: 2% WER, now the default.
+- Digits were unreadable to Parler ("7:45, platform 12" came back as noise). The engine now spells out numbers, times,
+  prices and percentages first, and the round trip gives "7:45… Platform 12… $30" back.
+
+**Video (Wan 2.1 T2V 1.3B turbo, 832×480, 17 frames, 3 steps)**
+- MP4 (`ftyp`, 17 H.264 samples), APNG (acTL: 17 frames) and GIF (GIF89a, 17 frames at 16 fps): ~30 s each, peak 11.7 GB VRAM.
+- The frames show what was asked.
+
+**Live API (Orca loaded)**
+- `/v1/audio/transcriptions`, the OpenAI multipart form, in json, text, verbose_json, srt and vtt; the JSON data-URL
+  form; translations. Whisper base ran on the CPU and Orca stayed loaded.
+- A chat during a 66 s CPU transcription answered in 0.8 s.
+- `/v1/audio/speech` (tts-1, voice nova): 11.5 s as a GPU job, Orca stopped. An image sent meanwhile waited at place 1
+  and ran next, without reloading Orca in between. mp3 is refused with a 400.
+- The next chat reloaded Orca: **83 s**. That is the cost of every GPU media job while Orca is the text model.
+- API calls and Monitor list every job, with its model, device and output. A multipart form's model used to be
+  recorded as the default one; now fixed.
+- **Chat tools:** "draw me a red lighthouse on a cliff at dusk" with `strata_media`. Orca called `generate_image` with
+  a detailed prompt and answered in 11.8 s ("Here it comes…"); the job ran after the answer, labelled mj-1 in the queue.
+
+**Changed by these results**
+- "auto" speech placement:
+  - text to speech is a GPU job (CPU is 20× slower);
+  - with no text model loaded, everything goes to the GPU;
+  - speech to text stays on the CPU beside a text model when MemAvailable ≥ 2.5 × size + 1.5 GB.
+
+**Still for you to check**
+- The microphone (getUserMedia) at http://localhost:8000.
+- A listening test of Parler at 0.7.

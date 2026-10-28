@@ -58,7 +58,9 @@ impl ApiMonitor {
         let raw = serde_json::to_string_pretty(&req).unwrap_or_else(|_| String::from_utf8_lossy(body).into_owned());
         let (input, input_truncated) = capped(&raw);
         let id = uuid::Uuid::new_v4().simple().to_string()[..12].to_string();
-        let model = req.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()).unwrap_or(default_model);
+        // OpenAI's speech model names stand for the model chosen here
+        let model = req.get("model").and_then(Value::as_str)
+            .filter(|m| !m.is_empty() && !matches!(*m, "whisper-1" | "tts-1" | "tts-1-hd") && !m.starts_with("gpt-4o")).unwrap_or(default_model);
         let rf = req.get("response_format").and_then(|r| r.get("type")).cloned().unwrap_or(Value::Null);
         let v = json!({"id": id, "path": path, "model": model, "started_at": now(), "state": "queued",
                        "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false), "response_format": rf,
@@ -219,8 +221,12 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
     } else {
         s.mgr.current().await.map(|l| l.entry.id.clone()).unwrap_or_else(|| s.mgr.default_id.clone())
     };
-    // an upload is kept as a note of its size, not its bytes
-    let note = multipart.then(|| serde_json::to_vec(&json!({"upload": format!("<multipart upload, {} KB>", bytes.len() / 1024)})).unwrap());
+    // an upload is kept as a note of its size, not its bytes (with the form's model, which names the job's model
+    // unless it is OpenAI's whisper-1)
+    let form_model = multipart.then(|| form_field(&bytes, "model")).flatten().filter(|m| !m.is_empty() && m != "whisper-1");
+    let default_model = form_model.clone().unwrap_or(default_model);
+    let note = multipart.then(|| serde_json::to_vec(&json!({"upload": format!("<multipart upload, {} KB>", bytes.len() / 1024),
+                                                             "model": form_model})).unwrap());
     let id = mon.begin(&path, note.as_deref().unwrap_or(&bytes), &default_model);
     let resp = next.run(Request::from_parts(parts, Body::from(bytes))).await;
     let status = resp.status().as_u16();
@@ -347,4 +353,14 @@ async fn control(s: AppState, headers: HeaderMap, load: bool) -> Response {
         s.mgr.unload().await;
         Json(json!({"status": "unloaded"})).into_response()
     }
+}
+
+/// A text field of a multipart/form-data body, found by its name (enough for the monitor's record).
+fn form_field(body: &[u8], name: &str) -> Option<String> {
+    let key = format!("name=\"{name}\"");
+    let at = body.windows(key.len()).position(|w| w == key.as_bytes())?;
+    let rest = &body[at + key.len()..];
+    let start = rest.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let end = rest[start..].windows(2).position(|w| w == b"\r\n")?;
+    String::from_utf8(rest[start..start + end].to_vec()).ok().map(|v| v.trim().to_string())
 }
