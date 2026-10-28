@@ -169,6 +169,28 @@ fn strip_one_newline(mut v: &str) -> &str {
     v.strip_suffix('\n').unwrap_or(v)
 }
 
+/// recover: `{"name": N, "arguments": {...}}` (or "parameters", or the arguments as a JSON string), possibly in a
+/// ```json fence, for a declared tool N -> ToolCall; anything else -> None (the text stays text).
+fn json_call(inner: &str, schemas: &HashMap<String, Value>) -> Option<ToolCall> {
+    let mut t = inner.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        t = rest.trim_start_matches(|c: char| c.is_ascii_alphabetic()).trim();
+        t = t.strip_suffix("```").unwrap_or(t).trim();
+    }
+    let v: Value = serde_json::from_str(t).ok()?;
+    let name = v.get("name")?.as_str()?.to_string();
+    if !schemas.contains_key(&name) {
+        return None;
+    }
+    let args = match v.get("arguments").or_else(|| v.get("parameters")) {
+        Some(Value::Object(m)) => m.clone(),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s).ok()? { Value::Object(m) => m, _ => return None },
+        None => Map::new(),
+        _ => return None,
+    };
+    Some(ToolCall::new(name, args))
+}
+
 /// `<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>` -> ToolCall.
 pub fn parse_tool_call(body: &str, schema: Option<&Value>) -> Result<ToolCall, ParseError> {
     let body = body.trim();
@@ -244,6 +266,8 @@ pub struct OutputParser {
     lead: bool,
     schemas: HashMap<String, Value>,
     stream_tools: bool,
+    /// the config's "tool_call_recovery": a declared tool's call written as JSON inside <tool_call> is the call
+    recover: bool,
     pending: Vec<(String, Option<ToolCall>)>,
     pub rescued: usize,
     pub refused: usize,
@@ -278,6 +302,13 @@ impl OutputParser {
 
     /// `format`: how the model writes calls. `opened`: the prompt ended on the format's own opening of the
     /// reasoning (Gemma after a tool's answer), so the reply starts inside it.
+    /// Opt in to reading a declared tool's call written as JSON inside the call wrapper (`<tool_call>{"name": ...,
+    /// "arguments": {...}}</tool_call>`, also in a ```json fence): one of serve/frontend.py's recoveries, the one
+    /// Kolibri 1 needs (PolyStrata's setup writes "tool_call_recovery": true for it).
+    pub fn set_recover(&mut self, on: bool) {
+        self.recover = on;
+    }
+
     pub fn with_format(thinking: bool, tools: Option<&[Value]>, stream_tools: bool, format: CallFormat, opened: bool) -> Self {
         let (call_start, call_stop) = format.call_tags();
         let (think_open, think_end) = format.think_tags();
@@ -293,6 +324,7 @@ impl OutputParser {
             lead: state == State::Content,
             schemas,
             stream_tools,
+            recover: false,
             pending: Vec::new(),
             rescued: 0,
             refused: 0,
@@ -773,6 +805,35 @@ impl OutputParser {
                         continue;
                     }
                     let after = self.buf[i + CALL_START.len()..].trim_start().to_string();
+                    if self.recover && (after.starts_with('{') || after.starts_with("```")) {
+                        let inner_at = i + CALL_START.len();
+                        let Some(end) = self.buf[inner_at..].find(CALL_END) else {
+                            // the call is still arriving: what came before it goes out now
+                            if i > 0 && !self.buf[..i].trim().is_empty() {
+                                let head = self.buf[..i].trim_end_matches('\n').to_string();
+                                let t = self.track(&head);
+                                out.push(Event::Content(t));
+                                self.buf = self.buf[i..].to_string();
+                            }
+                            return Ok(out);
+                        };
+                        if let Some(call) = json_call(&self.buf[inner_at..inner_at + end], &self.schemas) {
+                            if i > 0 && !self.buf[..i].trim().is_empty() {
+                                let head = self.buf[..i].trim_end_matches('\n').to_string();
+                                let t = self.track(&head);
+                                out.push(Event::Content(t));
+                            }
+                            if self.stream_tools {
+                                out.push(Event::ToolStart { id: call.id.clone(), name: call.name.clone() });
+                                out.push(Event::ToolArgs { id: call.id.clone(), text: py_dumps(&Value::Object(call.arguments.clone()), false) });
+                            }
+                            out.push(Event::ToolCall(call));
+                            self.buf = self.buf[inner_at + end + CALL_END.len()..].to_string();
+                            self.reset_scan();
+                            self.lead = true;
+                            continue;
+                        }
+                    }
                     if !after.is_empty() && !after.starts_with(FUNC_START) && !FUNC_START.starts_with(after.as_str()) {
                         let head = self.buf[..i + CALL_START.len()].to_string();
                         let t = self.track(&head);

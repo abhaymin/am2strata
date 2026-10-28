@@ -309,10 +309,13 @@ const REASONING_WRAP_UP: &str = "\n\nI have thought about this long enough; time
 
 /// The thinking budget for this request: its own, cut to leave the answer room, or (without one, from
 /// ANSWER_ROOM_MIN_CAP) three quarters of max_tokens at most.
-pub fn thinking_budget(asked: Option<u64>, max_new: usize, answer_room: bool) -> Option<usize> {
+/// `by_context`: max_new is all the context had left (no max_tokens, or fit_max_tokens), so the reply was cut by the
+/// context, not by a small cap the client chose, and gets the answer room however short it is (serve/server.py,
+/// issue 16: Flint in an agent had 416 tokens left in a full 32K context, thought through all of them, no answer).
+pub fn thinking_budget(asked: Option<u64>, max_new: usize, answer_room: bool, by_context: bool) -> Option<usize> {
     let reserve = (max_new / 4).max(ANSWER_RESERVE_MIN).min(max_new / 2);
     let mut budget = asked.filter(|b| *b > 0).map(|b| b as usize);
-    if budget.is_none() && answer_room && max_new >= ANSWER_ROOM_MIN_CAP {
+    if budget.is_none() && answer_room && max_new > 0 && (max_new >= ANSWER_ROOM_MIN_CAP || by_context) {
         budget = Some(max_new - reserve);
     }
     budget.map(|b| if b > max_new - reserve { (max_new - reserve).max(1) } else { b })
@@ -409,7 +412,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             .or_else(|| loaded.entry.cfg.rest.get("reasoning_budget_tokens"))
             .and_then(Value::as_u64)
     });
-    let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room) } else { None };
+    let by_context = ctx > 0 && max_new >= room;
+    let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room, by_context) } else { None };
     let mut force = forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref());
     let mut parser = if loaded.call_format == strata_frontend::formats::CallFormat::Gemma {
         let opened = !loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids);
@@ -421,6 +425,8 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     } else {
         OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false)
     };
+    // the config's "tool_call_recovery" (Kolibri 1): a declared tool's call written as JSON inside <tool_call>
+    parser.set_recover(loaded.entry.cfg.rest.get("tool_call_recovery") == Some(&Value::Bool(true)));
     let repeat_stop = loaded.entry.cfg.rest.get("repeat_stop_tokens").and_then(Value::as_u64).unwrap_or(REPEAT_STOP_TOKENS as u64) as usize;
     let mut opening = Vec::new();
     if let (Some(f), false) = (&force, thinking) {
@@ -864,14 +870,17 @@ mod tests {
     #[test]
     fn budget_leaves_the_answer_room() {
         // no budget asked: from 1024 max_tokens on, the answer keeps a quarter (at least 512, at most half)
-        assert_eq!(thinking_budget(None, 8192, true), Some(6144));
-        assert_eq!(thinking_budget(None, 1024, true), Some(512));
-        assert_eq!(thinking_budget(None, 1000, true), None);
-        assert_eq!(thinking_budget(None, 8192, false), None, "answer_room off");
+        assert_eq!(thinking_budget(None, 8192, true, false), Some(6144));
+        assert_eq!(thinking_budget(None, 1024, true, false), Some(512));
+        assert_eq!(thinking_budget(None, 1000, true, false), None);
+        assert_eq!(thinking_budget(None, 8192, false, false), None, "answer_room off");
         // a budget of its own is kept unless it leaves no room
-        assert_eq!(thinking_budget(Some(100), 8192, true), Some(100));
-        assert_eq!(thinking_budget(Some(8000), 8192, true), Some(6144));
-        assert_eq!(thinking_budget(Some(0), 500, true), None);
+        assert_eq!(thinking_budget(Some(100), 8192, true, false), Some(100));
+        assert_eq!(thinking_budget(Some(8000), 8192, true, false), Some(6144));
+        assert_eq!(thinking_budget(Some(0), 500, true, false), None);
+        // the context had only 416 tokens left (issue 16): the answer still gets its room
+        assert_eq!(thinking_budget(None, 416, true, true), Some(208));
+        assert_eq!(thinking_budget(None, 416, true, false), None, "a small cap the client chose is left as it is");
     }
 }
 

@@ -39,6 +39,18 @@ const QWEN35_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// `kolibri1` (Kolibri 1) pre-tokenizer: llama.cpp's LLAMA_VOCAB_PRE_TYPE_QWEN2 - Qwen 3.5's without the `\p{M}`
+/// classes (letters are cut without the combining marks), single digits (tools/strata_tokenizer.py QWEN2_PATTERN).
+const QWEN2_PATTERN: &str = concat!(
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+",
+    r"|\p{N}",
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"|\s*[\r\n]+",
+    r"|\s+(?!\S)",
+    r"|\s+",
+);
+
 /// `glm4` / `glm5` / `lfm2` pre-tokenizer: no `\p{M}`, digits in runs of up to three, with ignore_merges.
 const GLM4_PATTERN: &str = concat!(
     r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])",
@@ -239,6 +251,7 @@ impl Tokenizer {
             "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" => GLM4_PATTERN,
             "gemma4" => GEMMA4_PATTERN,
             "tekken" => TEKKEN_PATTERN,
+            "kolibri1" => QWEN2_PATTERN,
             "joyai-llm" | "deepseek-v3" => DEEPSEEK3_SEQUENCE[2],
             "flint" => FLINT_SEQUENCE[2],
             _ => QWEN35_PATTERN,

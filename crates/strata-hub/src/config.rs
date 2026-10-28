@@ -6,9 +6,9 @@ use std::path::{Path, PathBuf};
 use strata_gguf::{extract_tokenizer, Gguf};
 
 /// GGUF architectures strata-poly runs (src/poly/engine.cpp Engine::open), with their display family.
-pub const POLY_ARCHS: [(&str, &str); 7] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("glm5next", "GLM-5 Next"), ("glm5-next", "GLM-5 Next"),
+pub const POLY_ARCHS: [(&str, &str); 8] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("glm5next", "GLM-5 Next"), ("glm5-next", "GLM-5 Next"),
                                            ("gemma4", "Gemma 4"), ("deepseek4", "DeepSeek V4"), ("lfm2moe", "LFM2 MoE"),
-                                           ("flint", "Flint 40B-A2.5B")];
+                                           ("flint", "Flint 40B-A2.5B"), ("kolibri1", "Kolibri 1")];
 
 /// GGUF architectures am2strata-hybrid runs (crates/strata-hybrid, checked against llama.cpp), with their family.
 pub const HYBRID_ARCHS: [(&str, &str); 7] = [("nemotron_h_moe", "Nemotron-H MoE"), ("nemotron_h", "Nemotron-H"), ("deepseek2", "GLM-4.7-Flash / DeepSeek"),
@@ -128,6 +128,10 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
         "model_name": id, "display_name": display, "log": models_dir.join(format!("strata-{id}.log")), "gpu": 0,
         "pulled_by": "am2strata",
     });
+    // its tool calls are JSON inside the wrapper: read with the recovery (PolyStrata setup.py "tool_call_recovery")
+    if arch == "kolibri1" {
+        cfg["tool_call_recovery"] = json!(true);
+    }
     // serve like the installed models: copy the shared keys from an existing config (the first one found)
     if let Some(existing) = first_config(models_dir) {
         if let Some(o) = existing.as_object() {

@@ -99,3 +99,33 @@ fn output_parser_matches_python() {
     assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), g["cases"].as_array().unwrap().len(),
             failures.join("\n"));
 }
+
+/// tool_call_recovery (Kolibri 1): a declared tool's call written as JSON inside <tool_call>, fed in small pieces.
+#[test]
+fn recovery_reads_a_json_call_inside_the_wrapper() {
+    let tools = vec![json!({"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}})];
+    let run = |text: &str, recover: bool| {
+        let mut p = OutputParser::new(false, Some(&tools), false);
+        p.set_recover(recover);
+        let mut ev = Vec::new();
+        for ch in text.chars().collect::<Vec<_>>().chunks(3) {
+            ev.extend(p.feed(&ch.iter().collect::<String>()).unwrap());
+        }
+        ev.extend(p.finish(Some("stop")));
+        let calls: Vec<(String, Value)> = ev.iter().filter_map(|e| match e {
+            Event::ToolCall(c) => Some((c.name.clone(), Value::Object(c.arguments.clone()))), _ => None }).collect();
+        let text: String = ev.iter().filter_map(|e| match e { Event::Content(t) => Some(t.as_str()), _ => None }).collect();
+        (calls, text)
+    };
+    let (calls, text) = run("Checking.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>", true);
+    assert_eq!(calls, vec![("get_weather".to_string(), json!({"city": "Paris"}))]);
+    assert_eq!(text.trim(), "Checking.");
+    // in a ```json fence, the arguments as a JSON string
+    let (calls, _) = run("<tool_call>\n```json\n{\"name\": \"get_weather\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}\n```\n</tool_call>", true);
+    assert_eq!(calls, vec![("get_weather".to_string(), json!({"city": "Oslo"}))]);
+    // an undeclared tool, or recovery off: text, as before
+    let (calls, text) = run("<tool_call>{\"name\": \"rm_rf\", \"arguments\": {}}</tool_call>", true);
+    assert!(calls.is_empty() && text.contains("rm_rf"), "{text}");
+    let (calls, _) = run("<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>", false);
+    assert!(calls.is_empty());
+}
