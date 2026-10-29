@@ -65,9 +65,35 @@ struct Tab {
     used: Instant,
 }
 
+/// Chrome is started from this one thread, which lives as long as the server: a child's parent-death signal fires
+/// when the thread that started it ends, and the runtime's threads come and go.
+fn spawn_kept(mut cmd: std::process::Command) -> std::io::Result<std::process::Child> {
+    type Job = (std::process::Command, std::sync::mpsc::Sender<std::io::Result<std::process::Child>>);
+    static KEEPER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = std::sync::OnceLock::new();
+    let tx = KEEPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new().name("browser-keeper".into()).spawn(move || {
+            for (mut c, back) in rx {
+                let _ = back.send(c.spawn());
+            }
+        }).expect("the browser's keeper thread");
+        std::sync::Mutex::new(tx)
+    });
+    let (back, got) = std::sync::mpsc::channel();
+    // SAFETY: prctl is async-signal-safe; it only sets this child's parent-death signal
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    tx.lock().unwrap().send((cmd, back)).map_err(|_| std::io::Error::other("the browser's keeper thread is gone"))?;
+    got.recv().map_err(|_| std::io::Error::other("the browser's keeper thread is gone"))?
+}
+
 struct Running {
     browser: Browser,
-    child: tokio::process::Child,
+    child: std::process::Child,
     profile: PathBuf,
     tabs: HashMap<String, Tab>,
 }
@@ -153,21 +179,28 @@ impl Browsers {
         std::fs::create_dir_all(&profile).map_err(|e| e.to_string())?;
         // started here, not by the DevTools client: it dies with this server (PR_SET_PDEATHSIG), even when the
         // server is killed outright, and its port is the one it picked (no fixed port another program could take)
-        let mut cmd = tokio::process::Command::new(&exe);
+        // inside bubblewrap when it is here: a read-only system, an empty home (no files of yours), the network
+        // kept; Chrome's own sandbox then off (it needs user namespaces that AppArmor refuses a service on Ubuntu).
+        // Without bubblewrap, Chrome's own sandbox.
+        let bwrap = std::path::Path::new("/usr/bin/bwrap");
+        let mut cmd = if bwrap.is_file() {
+            let dir = exe.parent().unwrap_or(std::path::Path::new("/")).to_path_buf();
+            let mut c = std::process::Command::new(bwrap);
+            c.args(["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/home", "--tmpfs", "/root",
+                    "--tmpfs", "/run/user"])
+                .arg("--ro-bind").arg(&dir).arg(&dir).arg("--bind").arg(&profile).arg(&profile)
+                .args(["--unshare-all", "--share-net", "--die-with-parent", "--new-session", "--"])
+                .arg(&exe).args(["--no-sandbox", "--disable-dev-shm-usage"]);
+            c
+        } else {
+            std::process::Command::new(&exe)
+        };
         cmd.arg("--headless").arg("--remote-debugging-port=0").arg(format!("--user-data-dir={}", profile.display()))
             .arg(format!("--window-size={WIDTH},{HEIGHT}"))
             .args(["--no-first-run", "--disable-extensions", "--disable-sync", "--disable-background-networking",
                    "--disable-default-apps", "--mute-audio", "--hide-scrollbars", "--disable-features=Translate", "about:blank"])
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        // SAFETY: prctl is async-signal-safe; it only sets this child's parent-death signal
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-                Ok(())
-            });
-        }
-        let child = cmd.spawn().map_err(|e| format!("starting the browser {}: {e}", exe.display()))?;
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        let child = spawn_kept(cmd).map_err(|e| format!("starting the browser {}: {e}", exe.display()))?;
         let port_file = profile.join("DevToolsActivePort");
         let t0 = Instant::now();
         let ws = loop {
@@ -357,9 +390,9 @@ impl Browsers {
     pub async fn close(&self) {
         if let Some(mut r) = self.run.lock().await.take() {
             let _ = r.browser.close().await;
-            if tokio::time::timeout(Duration::from_secs(5), r.child.wait()).await.is_err() {
-                let _ = r.child.kill().await;
-            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = r.child.kill();
+            let _ = r.child.wait();
             let _ = std::fs::remove_dir_all(&r.profile);
         }
     }
