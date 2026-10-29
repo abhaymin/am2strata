@@ -107,8 +107,13 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
             let prof = pack.join("expert-profile.bin");
             args.extend([json!("--expert-profile"), json!(prof), json!("--expert-profile-save"), json!(prof), json!("--resident-experts")]);
         }
+        // weights on the NVIDIA card when there is one: its memory less 2 GiB (the attention cache, the runtime);
+        // what does not fit stays on the CPU (docs/GPU-PLAN.md). Other GPUs are added by hand ("hip:0=6").
+        if let Some(gib) = nvidia_gib().filter(|g| *g > 4.0) {
+            args.extend([json!("--devices"), json!(format!("cuda:0={:.0}", gib - 2.0))]);
+        }
         let cfg = json!({
-            "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid", "args": args, "cwd": "${AM2STRATA_HOME}",
+            "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid", "args": args, "cwd": "${AM2STRATA_HOME}",
             "tokenizer": pack.join("tokenizer"), "model_name": id, "display_name": display,
             "log": models_dir.join(format!("strata-{id}.log")), "pulled_by": "am2strata",
         });
@@ -229,4 +234,11 @@ mod tests {
         assert!(supported("llama").is_ok());
         assert!(supported("gpt2").unwrap_err().contains("'gpt2'"));
     }
+}
+
+/// The first NVIDIA GPU's memory in GiB (nvidia-smi), None without one.
+fn nvidia_gib() -> Option<f64> {
+    let o = std::process::Command::new("nvidia-smi").args(["--query-gpu=memory.total", "--format=csv,noheader,nounits", "-i", "0"]).output().ok()?;
+    let mib: f64 = String::from_utf8_lossy(&o.stdout).trim().lines().next()?.trim().parse().ok()?;
+    Some(mib / 1024.0)
 }

@@ -57,6 +57,16 @@ impl QMat {
         }
         let x = &xq[..];
         let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
+        // the common encodings: multiplied as they are read (cpu_dot.rs)
+        if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) {
+            y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
+                for (k, out) in ys.iter_mut().enumerate() {
+                    let r = ci * chunk + k;
+                    *out = crate::cpu_dot::row_dot(fast, &self.data[r * self.row_bytes..(r + 1) * self.row_bytes], x);
+                }
+            });
+            return;
+        }
         y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
             let mut row = vec![0f32; self.cols];
             for (k, out) in ys.iter_mut().enumerate() {
@@ -80,6 +90,20 @@ impl QMat {
             return Err(format!("{} bytes of {ty} for a {}x{} tensor", data.len(), self.rows, self.cols));
         }
         Ok(QMat { data, ty: ty.to_string(), vdt: Vdt::of(ty), rows: self.rows, cols: self.cols, row_bytes, #[cfg(feature = "gpu")] gpu: None })
+    }
+
+    /// The products of several matrices with the same input: in one GPU submission when they are all on one device
+    /// and round the input the same way, else one by one.
+    pub fn mul_many(qs: &[&QMat], x: &[f32]) -> Vec<Vec<f32>> {
+        #[cfg(feature = "gpu")]
+        {
+            let on: Vec<&crate::gpu::OnDevice> = qs.iter().filter_map(|q| q.gpu.as_ref()).collect();
+            if qs.len() > 1 && on.len() == qs.len() && on.iter().all(|g| g.device() == on[0].device())
+                && qs.iter().all(|q| q.vdt == qs[0].vdt && q.cols == qs[0].cols) {
+                return crate::gpu::OnDevice::matvec_many(&on, &qs[0].vdt.round_trip(x));
+            }
+        }
+        qs.iter().map(|q| q.mul(x)).collect()
     }
 
     fn mul(&self, x: &[f32]) -> Vec<f32> {
@@ -305,10 +329,16 @@ pub struct Dense {
 
 impl Dense {
     fn forward(&self, h: &[f32]) -> Vec<f32> {
-        let mut mid = self.up.mul(h);
-        match &self.gate {
+        let (mut mid, gate) = match &self.gate {
             Some(g) => {
-                let gv = g.mul(h);
+                let mut v = QMat::mul_many(&[&self.up, g], h);
+                let gv = v.pop().unwrap();
+                (v.pop().unwrap(), Some(gv))
+            }
+            None => (self.up.mul(h), None),
+        };
+        match gate {
+            Some(gv) => {
                 mid.iter_mut().zip(&gv).for_each(|(u, g)| *u *= act(self.act, *g));
             }
             None => mid.iter_mut().for_each(|v| *v = act(self.act, *v)),
@@ -755,7 +785,12 @@ impl Model {
     fn attention(&self, slot: usize, a: &Attn, h: &[f32], st: &mut State) -> Vec<f32> {
         let hd = a.head_dim;
         let pos = st.pos;
-        let (mut qv, mut kv, mut vv) = (a.q.mul(h), a.k.mul(h), a.v.mul(h));
+        let (mut qv, mut kv, mut vv) = {
+            let mut v = QMat::mul_many(&[&a.q, &a.k, &a.v], h);
+            let vv = v.pop().unwrap();
+            let kv = v.pop().unwrap();
+            (v.pop().unwrap(), kv, vv)
+        };
         add_bias(&mut qv, &a.q_b);
         add_bias(&mut kv, &a.k_b);
         add_bias(&mut vv, &a.v_b);
@@ -878,10 +913,16 @@ impl Model {
         };
         let mut acc = vec![0f32; m.down_exps.0[0].rows];
         for (&e, &we) in chosen.iter().zip(&w) {
-            let mut mid = m.up_exps.0[e].mul(&x);
-            match &m.gate_exps {
+            let (mut mid, gate) = match &m.gate_exps {
                 Some(g) => {
-                    let gv = g.0[e].mul(&x);
+                    let mut v = QMat::mul_many(&[&m.up_exps.0[e], &g.0[e]], &x);
+                    let gv = v.pop().unwrap();
+                    (v.pop().unwrap(), Some(gv))
+                }
+                None => (m.up_exps.0[e].mul(&x), None),
+            };
+            match gate {
+                Some(gv) => {
                     mid.iter_mut().zip(&gv).for_each(|(u, g)| *u *= act(m.act, *g));
                 }
                 None => mid.iter_mut().for_each(|v| *v = act(m.act, *v)),

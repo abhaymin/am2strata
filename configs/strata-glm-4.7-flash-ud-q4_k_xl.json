@@ -1,5 +1,5 @@
 {
- "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid",
  "args": [
   "--model",
   "${STRATA_DATA}/models/GLM-4.7-Flash-UD-Q4_K_XL/GLM-4.7-Flash-UD-Q4_K_XL.gguf",

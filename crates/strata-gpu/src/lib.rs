@@ -164,6 +164,35 @@ impl Gpu {
         Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len() })
     }
 
+    /// The products of several matrices with the same input (q, k, v; gate and up): one upload of x, the kernels
+    /// launched back to back, then the results read (only the first read waits for the device).
+    pub fn matvec_many(&self, ws: &[&Weights], x: &[f32]) -> Vec<Vec<f32>> {
+        if ws.is_empty() {
+            return Vec::new();
+        }
+        let cols = ws[0].cols;
+        debug_assert!(ws.iter().all(|w| w.cols == cols));
+        let tokens = (x.len() / cols as usize).max(1) as u32;
+        with_client!(self, c, R, {
+            let hx = c.create_from_slice(f32::as_bytes(x));
+            let outs: Vec<_> = ws.iter().map(|w| {
+                let (be, bb, k) = w.geometry;
+                let cubes = w.rows.div_ceil(kernels::ROWS_PER_CUBE);
+                let cx = cubes.min(65535);
+                let cy = cubes.div_ceil(cx);
+                let hy = c.empty(tokens as usize * w.rows as usize * 4);
+                unsafe {
+                    kernels::matvec::launch_unchecked::<R>(c, CubeCount::Static(cx, cy, tokens), CubeDim::new_1d(kernels::CUBE),
+                        ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts(hx.clone(), x.len()),
+                        ArrayArg::from_raw_parts(hy.clone(), tokens as usize * w.rows as usize),
+                        w.rows, w.cols, w.row_bytes, be, bb, k);
+                }
+                hy
+            }).collect();
+            outs.into_iter().map(|hy| f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()).collect()
+        })
+    }
+
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).
     pub fn matvec(&self, w: &Weights, x: &[f32]) -> Vec<f32> {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;

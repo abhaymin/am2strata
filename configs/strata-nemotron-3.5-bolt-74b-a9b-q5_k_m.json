@@ -1,5 +1,5 @@
 {
- "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid",
  "args": [
   "--model",
   "${STRATA_DATA}/models/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-Q5_K_M/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-AD-Q5_K_M-00001-of-00002.gguf",

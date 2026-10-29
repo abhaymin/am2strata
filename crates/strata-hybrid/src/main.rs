@@ -7,6 +7,7 @@
 //! placement is strata's (pack.rs): a pack's float tensors, the expert loadings (profile), and the hottest experts kept
 //! in RAM with the rest left to the SSD. The GPU tier (dense weights and hot experts in VRAM) comes next.
 
+mod cpu_dot;
 mod model;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -93,6 +94,16 @@ fn mem_available() -> u64 {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
+    // the GPUs this engine can use here, as JSON (am2strata's Settings and --devices take these names)
+    if args.iter().any(|a| a == "--list-devices") {
+        #[cfg(feature = "gpu")]
+        let list: Vec<serde_json::Value> = strata_gpu::list().into_iter()
+            .map(|d| serde_json::json!({"name": d.name, "backend": d.backend, "detail": d.detail})).collect();
+        #[cfg(not(feature = "gpu"))]
+        let list: Vec<serde_json::Value> = vec![serde_json::json!({"name": "cpu", "backend": "cpu", "detail": "built without the gpu feature"})];
+        println!("{}", serde_json::Value::Array(list));
+        return;
+    }
     let Some(model_path) = arg("--model") else {
         eprintln!("usage: am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]");
         std::process::exit(2);

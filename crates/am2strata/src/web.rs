@@ -254,3 +254,27 @@ pub async fn clear_snapshots(State(s): State<AppState>, headers: HeaderMap) -> R
     let _p = s.mgr.queue.enter(crate::queue::Need::Any, "clear", "snapshots", |_| {}).await;
     Json(json!({"freed_bytes": s.mgr.snapshots.clear()})).into_response()
 }
+
+/// The GPUs am2strata-hybrid can put weights on here (its --list-devices, run once): their names are what
+/// "--devices" takes in a run config (e.g. "cuda:0=12,hip:0=6").
+pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    static LIST: tokio::sync::OnceCell<Value> = tokio::sync::OnceCell::const_new();
+    let v = LIST.get_or_init(|| async {
+        let exe = std::env::current_exe().ok().and_then(|e| e.ancestors().skip(1).take(5)
+            .map(|d| d.join("crates/strata-hybrid/target/release/am2strata-hybrid")).find(|p| p.is_file()));
+        let Some(exe) = exe else { return json!({"devices": [], "note": "am2strata-hybrid is not built (tools/build-hybrid.sh)"}) };
+        let out = tokio::time::timeout(std::time::Duration::from_secs(60),
+                                       tokio::process::Command::new(&exe).arg("--list-devices").output()).await;
+        match out {
+            Ok(Ok(o)) => match serde_json::from_slice::<Value>(&o.stdout) {
+                Ok(list) => json!({"devices": list, "engine": exe}),
+                Err(_) => json!({"devices": [], "note": "am2strata-hybrid did not list its devices"}),
+            },
+            _ => json!({"devices": [], "note": "am2strata-hybrid did not answer in 60 s"}),
+        }
+    }).await;
+    Json(v.clone()).into_response()
+}

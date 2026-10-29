@@ -1,5 +1,5 @@
 {
- "exe": "${AM2STRATA_HOME}/crates/strata-media/target/release/am2strata-hybrid",
+ "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid",
  "args": [
   "--model",
   "${STRATA_DATA}/models/Devstral-Small-2507-Q4_K_M/Devstral-Small-2507-Q4_K_M.gguf",

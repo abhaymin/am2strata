@@ -321,6 +321,7 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/gpus", get(web::gpus))
         .route("/api/tools/approve", post(browser::approve))
         .route("/api/cache/snapshots/clear", post(web::clear_snapshots))
         .route("/api/models/{id}", axum::routing::delete(model_remove::remove))

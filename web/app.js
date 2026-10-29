@@ -137,6 +137,7 @@ async function loadModels() {
   sel.hidden = models.length < 2;
   sel.dataset.current = (models.find((m) => m.current) || {}).id || "";
   installed = models;
+  if (!$("gpus-line").dataset.loaded) { $("gpus-line").dataset.loaded = "1"; loadGpus(); }
   renderModels();
 }
 let installed = [], updatesOf = {};
@@ -155,6 +156,18 @@ $("check-updates").onclick = async () => {
   $("check-updates").disabled = false;
   renderModels();
 };
+// the GPUs the Rust engine can use (GET api/gpus): shown under the model list, with the --devices names
+async function loadGpus() {
+  try {
+    const r = await fetch("api/gpus", {headers: headers()});
+    if (!r.ok) return;
+    const j = await r.json(), gpus = (j.devices || []).filter((d) => d.backend !== "cpu");
+    const el = $("gpus-line");
+    el.hidden = false;
+    el.textContent = gpus.length ? `GPUs for the Rust engine (am2strata-hybrid): ${gpus.map((d) => `${d.name} (${d.detail})`).join(", ")}. ` +
+      `A run config puts weights on them with "--devices", e.g. ${gpus[0].name}=12.` : (j.note || "No GPU the Rust engine can use was found.");
+  } catch (e) { /* not shown */ }
+}
 function renderModels() {
   const box = $("models-list");
   if (!installed.length) { box.innerHTML = `<p class="muted">No models are installed yet: add one from Hugging Face below.</p>`; return; }

@@ -24,6 +24,16 @@ impl OnDevice {
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
         DEVICES.get().expect("devices opened")[self.dev].matvec(&self.w, x)
     }
+
+    /// Several matrices on the same device with the same input, in one submission.
+    pub fn matvec_many(group: &[&OnDevice], x: &[f32]) -> Vec<Vec<f32>> {
+        let ws: Vec<&strata_gpu::Weights> = group.iter().map(|g| g.w.as_ref()).collect();
+        DEVICES.get().expect("devices opened")[group[0].dev].matvec_many(&ws, x)
+    }
+
+    pub fn device(&self) -> usize {
+        self.dev
+    }
 }
 
 /// `cuda:0=12,hip:0=6` -> [("cuda:0", 12 GiB), ("hip:0", 6 GiB)]; a device without `=` gets 1 TiB (all it takes).

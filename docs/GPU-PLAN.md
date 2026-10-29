@@ -63,3 +63,56 @@ Considered and set aside:
 - **The 780M shares system RAM:** it helps only for weights that would otherwise sit in RAM read by the CPU. Measure
   before relying on it.
 - **CubeCL 0.11 is pre-release:** pin a version, and keep the CPU path as the reference.
+
+## Status (2026-10-29)
+
+**Phases 1–3 are built and gated. Phase 4's placement across several devices is built.**
+
+**Pieces**
+- `crates/strata-gpu`: the kernels and the device layer, on CubeCL 0.10, the last release for this rustc (1.93).
+- `am2strata-hybrid --devices cuda:0=13,hip:0=8`: GiB per device, in order of preference.
+- Build: `tools/build-hybrid.sh`. It is memory-capped and includes a hipconfig shim: Ubuntu's HIP is 7.1.52801,
+  and cubecl-hip-sys ships 7.1.52802's bindings.
+
+**Devices found on this PC**
+- `cuda:0` (RTX 5060 Ti);
+- `hip:0` (Radeon 780M, gfx1103: ROCm 7.1 runs it without an override);
+- `vulkan:discrete` and `vulkan:integrated` (the same two GPUs through RADV / NVIDIA's Vulkan);
+- CubeCL's CPU runtime.
+
+**Gates**
+- **Kernels:** F32, F16, BF16, Q8_0, Q4_0, Q4_K, Q5_K and Q6_K against the CPU dequantizer on every device. Worst
+  relative error 7.6e-8; the limit is 1e-3.
+- **Engine:** Ministral-3 3B Q4_K_M teacher-forced against llama.cpp. 24/24 steps identical on cuda:0, hip:0,
+  vulkan:discrete and vulkan:integrated, with logit differences as on the CPU (≤ 0.21).
+
+**Decode speed (tok/s)**
+
+| Model | CPU engine | cuda:0 | vulkan (5060 Ti) | hip:0 (780M) | vulkan (780M) |
+|---|---|---|---|---|---|
+| Ministral-3 3B Q4_K_M (all on the device) | 2.2 | 15.7 | 11.9 | 8.8 | 7.2 |
+| GLM-4.7-Flash UD-Q4_K_XL (17.6 GB; cuda:0 = 13 GB, the rest on the CPU) | 1.84 | 9.09 | – | – | – |
+
+GLM-4.7-Flash split over two GPUs, nothing on the CPU (cuda:0 13 GB, the 780M 2.9 GB):
+
+| Split | tok/s |
+|---|---|
+| cuda:0 + hip:0 | 9.24 |
+| cuda:0 + vulkan:integrated | 8.23 |
+
+It is barely faster than leaving the rest on the CPU: each product is still a round trip.
+
+Parity after the fused CPU products and the batched GPU products:
+- Ministral-3 on the CPU: 23/24 steps identical and 1 near-tie.
+- Ministral-3 on cuda:0: 24/24.
+- GLM-4.7-Flash split over cuda:0 and hip:0: 16/16 identical, but its worst logit difference is 2.44, larger than
+  Ministral's (about 0.2) - to look into.
+
+The CPU numbers are after the fused CPU products (cpu_dot.rs). Before them, GLM on the CPU took over 8 s a token.
+
+**Next**
+- Keep activations on the device between layers. Every product is still its own round trip (0.1–0.6 ms); batching
+  q/k/v and gate/up halves that.
+- Wider loads in the k-quant kernels: about 70 GB/s of the card's ~448 GB/s.
+- Speech kernels for AMD (phase 5).
+- The server's per-device placement in the run config and the UI (phase 6).
