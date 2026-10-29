@@ -261,8 +261,12 @@ pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    static LIST: tokio::sync::OnceCell<Value> = tokio::sync::OnceCell::const_new();
-    let v = LIST.get_or_init(|| async {
+    // a list is kept; a failure is not (the engine may be built after the server started)
+    static LIST: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+    if let Some(v) = LIST.lock().unwrap().clone() {
+        return Json(v).into_response();
+    }
+    let v = (|| async {
         let exe = std::env::current_exe().ok().and_then(|e| e.ancestors().skip(1).take(5)
             .map(|d| d.join("crates/strata-hybrid/target/release/am2strata-hybrid")).find(|p| p.is_file()));
         let Some(exe) = exe else { return json!({"devices": [], "note": "am2strata-hybrid is not built (tools/build-hybrid.sh)"}) };
@@ -275,6 +279,9 @@ pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {
             },
             _ => json!({"devices": [], "note": "am2strata-hybrid did not answer in 60 s"}),
         }
-    }).await;
-    Json(v.clone()).into_response()
+    })().await;
+    if v["devices"].as_array().is_some_and(|a| !a.is_empty()) {
+        *LIST.lock().unwrap() = Some(v.clone());
+    }
+    Json(v).into_response()
 }
