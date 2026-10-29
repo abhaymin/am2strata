@@ -8,6 +8,8 @@
 //! in RAM with the rest left to the SSD. The GPU tier (dense weights and hot experts in VRAM) comes next.
 
 mod model;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod pack;
 
 use std::io::{BufRead, Write};
@@ -106,7 +108,8 @@ fn main() {
         std::process::exit(1);
     };
     let pk = arg("--pack").map(|d| pack::Pack::open(std::path::Path::new(&d)).unwrap_or_else(|e| fail(e)));
-    let (m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
+    #[allow(unused_mut)]
+    let (mut m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
     let n_layers = m.layers.len();
     // a profile not written yet (the first run of a config that also saves to it) is learned from scratch
     let profile = arg("--expert-profile").filter(|p| std::path::Path::new(p).exists())
@@ -126,6 +129,17 @@ fn main() {
     } else {
         None
     };
+    // weights on GPUs: --devices cuda:0=12,hip:0=6 (GiB each), in that order of preference
+    #[cfg(feature = "gpu")]
+    if let Some(spec) = arg("--devices") {
+        let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
+        let summary = gpu::place(&mut m, &devs, profile.as_ref()).unwrap_or_else(|e| fail(e));
+        placement = format!("{placement} {summary}");
+    }
+    #[cfg(not(feature = "gpu"))]
+    if arg("--devices").is_some() {
+        fail("--devices: this am2strata-hybrid was built without the gpu feature".into());
+    }
     let packed = match &pk {
         Some(p) => format!(" pack={} pack_floats={from_pack} pack_native={}", p.dir.display(), p.n_native()),
         None => String::new(),

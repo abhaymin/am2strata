@@ -1,0 +1,21 @@
+[package]
+name = "strata-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+workspace = "../strata-hybrid"
+description = "am2Strata's GPU kernels in Rust (CubeCL): one source for NVIDIA (CUDA), AMD (ROCm/HIP) and any Vulkan GPU (wgpu), integrated ones included"
+
+[features]
+default = ["cuda", "hip", "wgpu"]
+cuda = ["cubecl/cuda"]
+# ROCm: Ubuntu's HIP 7.1.52801 needs tools/hip-shim first in PATH at build time (cubecl-hip-sys has 7.1.52802's bindings)
+hip = ["cubecl/hip"]
+wgpu = ["cubecl/wgpu"]
+
+[dependencies]
+# 0.10: the last release for rustc 1.93 (0.11 needs 1.95)
+cubecl = { version = "=0.10.0", default-features = false, features = ["std", "cpu"] }
+
+[dev-dependencies]
+strata-pack = { path = "../strata-pack" }

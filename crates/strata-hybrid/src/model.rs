@@ -26,6 +26,9 @@ pub struct QMat {
     pub rows: usize,
     pub cols: usize,
     row_bytes: usize,
+    /// a copy on a GPU (gpu.rs places it): the products are computed there
+    #[cfg(feature = "gpu")]
+    pub gpu: Option<crate::gpu::OnDevice>,
 }
 
 impl QMat {
@@ -37,7 +40,8 @@ impl QMat {
     /// Slice `index` (an expert, or a head) of a 3-D tensor stored as `rows`-row matrices, as a matrix of its own.
     pub fn slice(&self, index: usize, rows: usize) -> QMat {
         let start = index * rows * self.row_bytes;
-        QMat { data: &self.data[start..start + rows * self.row_bytes], ty: self.ty.clone(), vdt: self.vdt, rows, cols: self.cols, row_bytes: self.row_bytes }
+        QMat { data: &self.data[start..start + rows * self.row_bytes], ty: self.ty.clone(), vdt: self.vdt, rows, cols: self.cols, row_bytes: self.row_bytes,
+               #[cfg(feature = "gpu")] gpu: None }
     }
 
     /// y = W x, rows in parallel.
@@ -45,6 +49,12 @@ impl QMat {
         debug_assert_eq!(x.len(), self.cols);
         debug_assert_eq!(y.len(), self.rows);
         let xq = self.vdt.round_trip(x);
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &self.gpu {
+            // the same rounded activations, the same dequantized weights: on the device
+            y.copy_from_slice(&g.matvec(&xq));
+            return;
+        }
         let x = &xq[..];
         let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
         y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
@@ -59,12 +69,17 @@ impl QMat {
     }
 
     /// The same matrix stored differently (a pack's copy of a float tensor).
+    /// The GGUF type name of the stored encoding.
+    pub fn ty(&self) -> &str {
+        &self.ty
+    }
+
     pub fn with_data(&self, data: &'static [u8], ty: &str) -> Result<QMat, String> {
         let row_bytes = QMat::row_bytes(ty, self.cols);
         if data.len() != row_bytes * self.rows {
             return Err(format!("{} bytes of {ty} for a {}x{} tensor", data.len(), self.rows, self.cols));
         }
-        Ok(QMat { data, ty: ty.to_string(), vdt: Vdt::of(ty), rows: self.rows, cols: self.cols, row_bytes })
+        Ok(QMat { data, ty: ty.to_string(), vdt: Vdt::of(ty), rows: self.rows, cols: self.cols, row_bytes, #[cfg(feature = "gpu")] gpu: None })
     }
 
     fn mul(&self, x: &[f32]) -> Vec<f32> {
@@ -885,6 +900,70 @@ impl Model {
     }
 
     /// The MoE layers, in order.
+    /// Every matrix the forward pass multiplies by, for placing on devices: the ones every token uses (the output
+    /// projection first, then each layer's attention / SSM / dense / shared-expert / latent ones), and the routed
+    /// experts' matrices by (layer, expert). The embedding (one row read per token) and MLA's per-head absorbed
+    /// slices stay on the CPU.
+    #[allow(clippy::type_complexity)]
+    pub fn matrices_mut(&mut self) -> (Vec<&mut QMat>, HashMap<(usize, usize), Vec<&mut QMat>>) {
+        let mut every: Vec<&mut QMat> = vec![&mut self.output];
+        let mut experts: HashMap<(usize, usize), Vec<&mut QMat>> = HashMap::new();
+        fn dense<'a>(d: &'a mut Dense, out: &mut Vec<&'a mut QMat>) {
+            let Dense { gate, up, down, .. } = d;
+            if let Some(g) = gate.as_mut() {
+                out.push(g);
+            }
+            out.push(up);
+            out.push(down);
+        }
+        for layer in self.layers.iter_mut() {
+            for (_, b) in layer.parts.iter_mut() {
+                match b {
+                    Block::Mamba(m) => {
+                        let Mamba { ssm_in, ssm_out, .. } = m;
+                        every.push(ssm_in);
+                        every.push(ssm_out);
+                    }
+                    Block::Attn(a) => {
+                        let Attn { q, k, v, o, .. } = a;
+                        every.extend([q, k, v, o]);
+                    }
+                    Block::Mla(m) => {
+                        let Mla { q_a, q_b, kv_a, o, .. } = m;
+                        if let Some((qa, _)) = q_a.as_mut() {
+                            every.push(qa);
+                        }
+                        every.extend([q_b, kv_a, o]);
+                    }
+                    Block::Dense(d) => dense(d, &mut every),
+                    Block::Moe(m) => {
+                        let Moe { layer: l, latent, shared, gate_exps, up_exps, down_exps, .. } = m;
+                        if let Some((a, b)) = latent.as_mut() {
+                            every.push(a);
+                            every.push(b);
+                        }
+                        if let Some(d) = shared.as_mut() {
+                            dense(d, &mut every);
+                        }
+                        let l = *l;
+                        if let Some(g) = gate_exps.as_mut() {
+                            for (e, q) in g.0.iter_mut().enumerate() {
+                                experts.entry((l, e)).or_default().push(q);
+                            }
+                        }
+                        for (e, q) in up_exps.0.iter_mut().enumerate() {
+                            experts.entry((l, e)).or_default().push(q);
+                        }
+                        for (e, q) in down_exps.0.iter_mut().enumerate() {
+                            experts.entry((l, e)).or_default().push(q);
+                        }
+                    }
+                }
+            }
+        }
+        (every, experts)
+    }
+
     pub fn moes(&self) -> impl Iterator<Item = &Moe> {
         self.layers.iter().flat_map(|l| l.parts.iter()).filter_map(|(_, b)| if let Block::Moe(m) = b { Some(m) } else { None })
     }
@@ -926,7 +1005,7 @@ fn qmat(mm: &'static memmap2::Mmap, g: &Gguf, t: &TensorInfo) -> Result<QMat, St
     let cols = t.dims[0] as usize;
     let rows = (t.elements() as usize) / cols;
     let ty = t.type_name();
-    Ok(QMat { data, row_bytes: QMat::row_bytes(&ty, cols), vdt: Vdt::of(&ty), ty, rows, cols })
+    Ok(QMat { data, row_bytes: QMat::row_bytes(&ty, cols), vdt: Vdt::of(&ty), ty, rows, cols, #[cfg(feature = "gpu")] gpu: None })
 }
 
 #[cfg(test)]

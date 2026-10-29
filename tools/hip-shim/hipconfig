@@ -1,0 +1,4 @@
+#!/bin/sh
+# cubecl-hip-sys picks its HIP bindings by hipconfig's patch number and has none for Ubuntu's 7.1.52801;
+# 7.1.52802's are the same 7.1 API. Only the version answer changes; everything else is the real hipconfig.
+if [ "$1" = "--version" ] || [ "$1" = "-v" ]; then echo "7.1.52802-am2strata-shim"; else exec /usr/bin/hipconfig "$@"; fi

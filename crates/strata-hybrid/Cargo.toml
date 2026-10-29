@@ -4,10 +4,14 @@ description = "am2Strata's Rust engine for Nemotron-H, Mistral / Mixtral and GLM
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-# shares the GPU workspace (lock file, candle build) with strata-media
-workspace = "../strata-media"
+
+[features]
+default = ["gpu"]
+# weights on GPUs: NVIDIA (CUDA), AMD (ROCm), any Vulkan GPU - strata-gpu's CubeCL kernels (tools/build-hybrid.sh)
+gpu = ["dep:strata-gpu"]
 
 [dependencies]
+strata-gpu = { path = "../strata-gpu", optional = true }
 strata-gguf = { path = "../strata-gguf" }
 strata-pack = { path = "../strata-pack" }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -21,3 +25,11 @@ path = "src/main.rs"
 
 [dev-dependencies]
 strata-tokenizer = { path = "../strata-tokenizer" }
+
+# its own workspace, with the GPU kernels (strata-gpu, CubeCL): not mold's pinned cudarc (strata-media's patch)
+[workspace]
+members = [".", "../strata-gpu"]
+
+[profile.release]
+codegen-units = 16
+incremental = true

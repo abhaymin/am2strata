@@ -14,7 +14,9 @@ members = [
 
 # strata-media (candle + CUDA kernels, mold's pinned dependency versions) is its own workspace with its own lock file:
 #   cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda
-exclude = ["crates/strata-media"]
+# strata-hybrid (the Rust engine) and strata-gpu (its CubeCL kernels) are another:
+#   cargo build --release --manifest-path crates/strata-hybrid/Cargo.toml
+exclude = ["crates/strata-media", "crates/strata-hybrid", "crates/strata-gpu"]
 
 [workspace.package]
 version = "0.1.0"

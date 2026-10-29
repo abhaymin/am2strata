@@ -10,7 +10,7 @@ set -euo pipefail
 model=$1; n=$2; text=$3
 here=$(cd "$(dirname "$0")/../.." && pwd)
 oracle=${ORACLE:-${STRATA_DATA:-$HOME/Development/Strata-data}/oracle/oracle2}
-engine=${ENGINE:-$here/crates/strata-media/target/release/am2strata-hybrid}
+engine=${ENGINE:-$here/crates/strata-hybrid/target/release/am2strata-hybrid}
 tmp=${KEEP:-$(mktemp -d)}; [ -n "${KEEP:-}" ] || trap 'rm -rf "$tmp"' EXIT; mkdir -p "$tmp"
 "$oracle" "$model" "$n" "text:$text" >"$tmp/o" 2>"$tmp/oe" || { tail -5 "$tmp/oe"; exit 1; }
 ids=$(grep -o 'IDS [0-9,]*' "$tmp/oe" | cut -d' ' -f2)
