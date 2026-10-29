@@ -1275,7 +1275,9 @@ fn fake_web() -> u16 {
             let mut buf = [0u8; 4096];
             let n = std::io::Read::read(&mut c, &mut buf).unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let (ct, body) = if req.starts_with("GET /search?") && req.contains("format=json") {
+            let (ct, body) = if req.starts_with("GET /login") {
+                ("text/html", "<html><head><title>Sign in</title></head><body><form action=\"/done\"><input id=\"user\"><input id=\"pw\" type=\"password\"><button type=\"submit\">Sign in</button></form></body></html>".to_string())
+            } else if req.starts_with("GET /search?") && req.contains("format=json") {
                 ("application/json", format!(r#"{{"results": [{{"title": "Lighthouse facts", "url": "http://127.0.0.1:{port}/page", "content": "All about lighthouses."}}]}}"#))
             } else {
                 ("text/html", "<html><head><title>Facts</title></head><body><nav>SITE-NAV-LINKS</nav><main><p>The tallest lighthouse is in Jeddah.</p></main></body></html>".to_string())
@@ -1368,4 +1370,79 @@ fn a_snapshot_the_engine_refuses_is_dropped_and_the_request_goes_on() {
     assert!(!r["choices"][0]["message"]["content"].as_str().unwrap_or("").is_empty(), "{r}");
     assert!(s.commands().iter().any(|c| c.starts_with("RESTORE ")), "it was tried");
     assert!(!std::path::Path::new(&file.replace(".sess", ".ids")).exists(), "the refused snapshot was dropped");
+}
+
+/// The headless Chrome these tests drive (skipped where there is none).
+fn chrome() -> Option<String> {
+    let p = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell");
+    p.is_file().then(|| p.display().to_string())
+}
+
+#[test]
+fn the_browser_opens_a_page_and_keeps_out_of_the_private_network_by_default() {
+    let Some(exe) = chrome() else { eprintln!("no chrome-headless-shell: skipped"); return };
+    let port = fake_web();
+    let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/page\n</parameter>\n</function>\n</tool_call>");
+    // allowed to the private network (the test page is on this PC)
+    let m = Model { extra: json!({"browser": {"exe": exe}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids("Ok.\n</think>\n\nIt says Jeddah.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("open the page")], "strata_browser": true}));
+    assert_eq!(c, 200, "{r}");
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("The tallest lighthouse is in Jeddah.") && p.contains("\"Facts\""), "the page's text went back: {p}");
+    // the default: this PC's pages are not opened
+    let m = Model { extra: json!({"browser": {"exe": exe}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids("Ok.\n</think>\n\nBlocked.")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("open the page")], "strata_browser": true}));
+    assert_eq!(c, 200);
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("not a public web address") && !p.contains("Jeddah"), "{p}");
+}
+
+#[test]
+fn a_password_in_the_browser_waits_for_the_users_yes() {
+    let Some(exe) = chrome() else { eprintln!("no chrome-headless-shell: skipped"); return };
+    let port = fake_web();
+    let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/login\n</parameter>\n</function>\n</tool_call>");
+    let typ = "\n\n<tool_call>\n<function=browser_type>\n<parameter=selector>\n#pw\n</parameter>\n<parameter=text>\nhunter2\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"browser": {"exe": exe}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids(&format!("Type.\n</think>{typ}")),
+                                  ids("Ok.\n</think>\n\nYou did not allow it.")], json!({}));
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .json(&json!({"messages": [user("sign in")], "strata_browser": true, "stream": true})).send().unwrap();
+    let mut lines = std::io::BufRead::lines(std::io::BufReader::new(r));
+    let mut denied = false;
+    let mut body = String::new();
+    while let Some(Ok(l)) = lines.next() {
+        body.push_str(&l);
+        body.push('\n');
+        let Some(d) = l.strip_prefix("data: ") else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(d) else { continue };
+        if v["strata_mcp"]["event"] == "approve" && !denied {
+            assert!(v["strata_mcp"]["what"].as_str().unwrap().contains("password"), "{v}");
+            let id = v["strata_mcp"]["id"].as_str().unwrap().to_string();
+            let (c, a) = s.post("/api/tools/approve", &json!({"id": id, "ok": false}));
+            assert_eq!(c, 200, "{a}");
+            denied = true;
+        }
+    }
+    assert!(denied, "an approval was asked: {body}");
+    assert!(body.contains("did not allow this step"), "{body}");
+}
+
+/// Not a test: the web app over mock engines with the real browser on a sign-in page (AM2_UI_DEMO_SECS).
+#[test]
+#[ignore]
+fn web_ui_demo_browser() {
+    let exe = chrome().expect("chrome-headless-shell");
+    let port = fake_web();
+    let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/login\n</parameter>\n</function>\n</tool_call>");
+    let typ = "\n\n<tool_call>\n<function=browser_type>\n<parameter=selector>\n#pw\n</parameter>\n<parameter=text>\nhunter2\n</parameter>\n</function>\n</tool_call>";
+    let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let m = Model { extra: json!({"browser": {"exe": exe}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids(&format!("Type.\n</think>{typ}")),
+                                  ids("Ok.\n</think>\n\nDone with the sign-in page.")], json!({"web_dir": web.to_str().unwrap()}));
+    println!("UI demo at {} (key {KEY})", s.base);
+    let secs = std::env::var("AM2_UI_DEMO_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
+    std::thread::sleep(std::time::Duration::from_secs(secs));
 }

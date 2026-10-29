@@ -69,6 +69,17 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             opts.media = Some(caps);
         }
     }
+    // the browser (computer use): only for a request that asks, never for another web page
+    if req.get("strata_browser") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+        if s.mgr.browser.get().is_some_and(|b| b.available()) {
+            let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
+            let own = own_names(prep);
+            let extra: Vec<Value> = crate::browser::Browsers::tools(vision).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+            if !extra.is_empty() {
+                add(prep, &mut offered, extra);
+            }
+        }
+    }
     // web_search / fetch_url: the queries leave this PC, so only for a request that asks
     if req.get("strata_web") == Some(&Value::Bool(true)) && !structured && !forced {
         if let Some(w) = s.mgr.web.get() {

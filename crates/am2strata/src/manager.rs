@@ -150,6 +150,8 @@ pub struct Manager {
     pub media_jobs: std::sync::OnceLock<Arc<crate::media_jobs::Jobs>>,
     /// web_search / fetch_url (web_tools.rs; set from the run config at start)
     pub web: std::sync::OnceLock<Arc<crate::web_tools::WebTools>>,
+    /// browser computer use (browser.rs; set from the run config at start)
+    pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -225,6 +227,7 @@ impl Manager {
             snapshots: Arc::new(crate::snapshots::Snapshots::open(&memory_dir)),
             media_jobs: std::sync::OnceLock::new(),
             web: std::sync::OnceLock::new(),
+            browser: std::sync::OnceLock::new(),
         }
     }
 

@@ -935,7 +935,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false, browser: false};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -955,9 +955,13 @@ let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
 let busy = null;                      // {controller, msg, cutoff?}
 
+// the browser's screenshots are not kept with the chat (each is ~100 KB; the page's storage holds a few MB)
+const noShots = (tools) => tools && tools.map((t) => (t.image ? {...t, image: undefined} : t));
 const slim = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
                                            files: (m.files || []).map((f) => ({name: f.name})),
-                                           media: (m.media || []).map((x) => ({kind: x.kind, name: x.name}))}));
+                                           media: (m.media || []).map((x) => ({kind: x.kind, name: x.name})),
+                                           tools: noShots(m.tools),
+                                           swipes: m.swipes && m.swipes.map((v) => ({...v, tools: noShots(v.tools)}))}));
 function chatTitle(list) {
   const first = list.find((m) => m.role === "user");
   if (!first) return "New chat";
@@ -1118,6 +1122,10 @@ function toolHtml(t, k) {
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
     (t.job ? `<div class="media-job" data-job="${esc(t.job.id)}">${jobCardHtml(t.job.id)}</div>` : "") +
+    (t.approve ? `<div class="tool-approve" data-approve="${esc(t.id)}"><span>${icon("warning", "st-icon st-icon--sm")} The browser wants to <b>${esc(t.approve.what)}</b>.</span>` +
+      (t.approve.answered == null ? `<button class="st-btn st-btn--primary" data-approve-ok="1">Allow</button><button class="st-btn st-btn--secondary" data-approve-ok="0">Deny</button>`
+        : `<span class="muted small">${t.approve.answered === true ? "Allowed" : t.approve.answered === false ? "Denied" : "Answered"}</span>`) + `</div>` : "") +
+    (t.image ? `<img class="tool-shot" src="${esc(t.image)}" alt="The browser's screenshot after ${esc(t.name || "")}">` : "") +
     (t.sources && t.sources.length ? `<div class="tool-sources">${t.sources.slice(0, 10).map((u, i) =>
       `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer" title="${esc(u.url)}">[${i + 1}] ${esc(u.title || u.url.replace(/^https?:\/\/([^/]+).*$/, "$1"))}</a>`).join("")}</div>` : "");
 }
@@ -1186,6 +1194,7 @@ function onTool(m, x) {
   m.tools = m.tools || [];
   let t = m.tools.find((y) => y.id === x.id);
   if (!t) { t = {id: x.id, name: x.name, at: m.text.length, rat: m.reasoning.length, state: "writing"}; m.tools.push(t); }
+  if (x.event === "approve") { t.approve = {what: x.what, answered: null}; t.state = "running"; return; }
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
@@ -1193,6 +1202,8 @@ function onTool(m, x) {
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
     if (x.job) { t.job = x.job; watchJob(x.job.id); }
     if (Array.isArray(x.sources)) t.sources = x.sources.filter((u) => /^https?:\/\//.test(u.url || ""));
+    if (typeof x.image === "string" && x.image.startsWith("data:image/jpeg;base64,")) t.image = x.image;   // the browser's screenshot
+    if (t.approve && t.approve.answered == null) t.approve.answered = "ended";
   }
 }
 function updateAssistant(el, m, streaming) {
@@ -1242,6 +1253,19 @@ function renderChat() {
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
 function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
 
+// a browser step that waits for the user's yes (a password, a form sent)
+$("chat").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-approve-ok]"); if (!b) return;
+  const box = b.closest("[data-approve]"), id = box.dataset.approve, ok = b.dataset.approveOk === "1";
+  const el = b.closest(".st-msg"), m = messages[+el.dataset.i];
+  const t = m && (m.tools || []).find((x) => x.id === id);
+  try {
+    const r = await fetch("api/tools/approve", {method: "POST", headers: headers(true), body: JSON.stringify({id, ok})});
+    if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+    if (t) t.approve.answered = ok;
+  } catch (err) { toast("error", "Not answered", String(err.message || err), 6000); if (t) t.approve.answered = "ended"; }
+  if (t && m) updateAssistant(el, m, busy && busy.msg === m);
+});
 $("chat").addEventListener("click", (e) => {
   const cv = e.target.closest("[data-canvas]");
   if (cv) { openCanvas(cv.dataset.canvas, cv.closest(".st-code").querySelector("pre").textContent); return; }
@@ -1448,6 +1472,7 @@ async function streamInto(m, el, signal) {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   if (settings.web === true) body.strata_web = true;                         // web_search / fetch_url, run by this server
+  if (settings.browser === true) body.strata_browser = true;                 // a browser on the server (computer use)
   if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
   if (store.get("media-chat", true) && (media.models || []).some((x) => x.downloaded && x.kind !== "3d")) body.strata_media = true;  // Settings > Models
 
@@ -1696,6 +1721,7 @@ function loadDrawer(s = settings) {
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-web").setAttribute("aria-checked", String(s.web === true));
+  $("s-browser").setAttribute("aria-checked", String(s.browser === true));
   $("s-flows").setAttribute("aria-checked", String(s.flows !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
   outputs();
@@ -1758,6 +1784,7 @@ $("s-apply").onclick = async () => {
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true",
               web: $("s-web").getAttribute("aria-checked") === "true",
+              browser: $("s-browser").getAttribute("aria-checked") === "true",
               flows: $("s-flows").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
   renderThinking(); loadDefaults();

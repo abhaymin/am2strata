@@ -800,12 +800,14 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             }
             rounds += 1;
             let mut results = Vec::new();
+            let mut shots: Vec<(String, String)> = Vec::new(); // the browser's screenshots this round
             for c in &calls {
                 let route = hub.as_ref().and_then(|h| h.routes().into_iter().find(|(n, _, _)| *n == c.name));
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "call", "id": c.id, "name": c.name,
                     "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string()))
                         .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string()))
-                        .or_else(|| crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()).then(|| "web".to_string())),
+                        .or_else(|| crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()).then(|| "web".to_string()))
+                        .or_else(|| crate::browser::TOOL_NAMES.contains(&c.name.as_str()).then(|| "browser".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
                     "arguments": c.arguments, "round": rounds}))).await;
                 let args = Value::Object(c.arguments.clone());
@@ -822,6 +824,47 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                             j.submit(&c.name, &args, caps)
                         }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
+                    }
+                } else if let (true, None, Some(b)) = (crate::browser::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.browser.get()) {
+                    let t0 = std::time::Instant::now();
+                    let page_of = conv.clone().unwrap_or_else(|| "chat".to_string());
+                    // a risky step (a password, a form sent) waits for the user's yes in the web app
+                    let mut allowed = true;
+                    if let Some(what) = b.risk(&page_of, &c.name, &args).await {
+                        allowed = b.settings.auto_approve;
+                        if !allowed {
+                            let (atx, arx) = tokio::sync::oneshot::channel();
+                            crate::browser::approvals().lock().unwrap().insert(c.id.clone(), atx);
+                            let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": c.id, "name": c.name, "what": what}))).await;
+                            allowed = tokio::select! {
+                                a = tokio::time::timeout(std::time::Duration::from_secs(180), arx) => matches!(a, Ok(Ok(true))),
+                                _ = tx.closed() => return,
+                            };
+                            crate::browser::approvals().lock().unwrap().remove(&c.id);
+                        }
+                        if !allowed {
+                            tracing::info!("browser step refused: {what}");
+                        }
+                    }
+                    let ms = |t0: std::time::Instant| t0.elapsed().as_millis() as u64;
+                    if !allowed {
+                        json!({"ok": false, "text": "error: the user did not allow this step (or no one answered); ask them, or do something else",
+                               "chars": 0, "truncated": false, "ms": ms(t0)})
+                    } else {
+                        let r = tokio::select! {
+                            r = b.call(&page_of, &c.name, &args) => r,
+                            _ = tx.closed() => return,
+                        };
+                        match r {
+                            Ok(st) => {
+                                if let Some(img) = &st.screenshot {
+                                    shots.push((c.name.clone(), img.clone()));
+                                }
+                                json!({"ok": true, "chars": st.text.chars().count(), "text": st.text, "truncated": false, "ms": ms(t0),
+                                       "image": st.screenshot})
+                            }
+                            Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
+                        }
                     }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
                     tokio::select! {
@@ -850,6 +893,9 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 if r["sources"].is_array() {
                     ev["sources"] = r["sources"].clone(); // web pages: the client shows them as links
                 }
+                if let Some(img) = r["image"].as_str() {
+                    ev["image"] = json!(format!("data:image/jpeg;base64,{img}")); // the browser's screenshot
+                }
                 if tx.send(RunEvent::Mcp(ev)).await.is_err() {
                     return;
                 }
@@ -861,6 +907,12 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             }
             prep.messages.push(msg);
             prep.messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
+            // a model that reads pictures sees the last screenshot (as a picture beside the results, not a user turn)
+            if let (Some((name, img)), true) = (shots.last(), loaded.vision.is_some()) {
+                prep.messages.push(json!({"role": "user", "content": [
+                    {"type": "text", "text": format!("[The browser's screenshot after {name}: what the page shows, not a message from the user.]")},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{img}")}}]}));
+            }
             cur = match start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await {
                 Ok(s) => s,
                 Err(Refusal(_, m)) => {

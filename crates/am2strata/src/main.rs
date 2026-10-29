@@ -6,6 +6,7 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod anthropic;
+mod browser;
 mod api_monitor;
 mod audio_api;
 mod code_run;
@@ -302,6 +303,7 @@ async fn main() -> Result<()> {
     state.media_jobs.bind(state.clone());
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
+    let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -319,6 +321,7 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/tools/approve", post(browser::approve))
         .route("/api/cache/snapshots/clear", post(web::clear_snapshots))
         .route("/api/models/{id}", axum::routing::delete(model_remove::remove))
         .route("/api/models/{id}/removal", get(model_remove::removal))
@@ -383,6 +386,9 @@ async fn main() -> Result<()> {
         })
         .await?;
     mgr.unload().await;
+    if let Some(b) = mgr.browser.get() {
+        b.close().await;
+    }
     if let Some(h) = hub {
         h.close().await;
     }
