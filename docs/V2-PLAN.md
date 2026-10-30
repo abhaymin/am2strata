@@ -170,8 +170,18 @@ Planned, in order. Nothing here is started unless it says so.
    serve a DeepSeek tokenizer as DeepSeek when the config names no arch (#4137), and counters for repaired tool arguments
    and stray `</think>` tags (logs, Prometheus).
 
-Optional, only if asked: the Coral Edge TPU (no driver loaded here; no engine uses it). The AMD NPU is detected
-and also unused. The USB4 card crashing the machine at boot when moved to OCuLink is not diagnosed; it needs a boot log.
+6. **Coral Edge TPU (optional).** am2Strata never requires it: without one, or without its driver, everything works and
+   Settings shows it as "no driver loaded". This PC has one on PCIe (`1ac1:089a`).
+   - Driver first: `gasket` / `apex` is not in the apt sources here and may need a fork to build on Linux 7. Needs root to
+     install, and a permission to test-build third-party source. Gate: `/dev/apex_0` appears and Settings shows it ready
+     with its temperature.
+   - Then a small, real job. It runs 8-bit models compiled for it, with about 8 MB of on-chip memory, so it cannot run the
+     language models. Candidates, each to be measured against the CPU: voice activity detection in front of Whisper, and
+     small embedding or classification models for the memory module. Reached from Rust through `libedgetpu`, used only
+     when it is present, with the CPU as the fallback.
+
+The AMD NPU is detected (`amdxdna`, `/dev/accel/accel0`) and unused; it is not planned yet. The USB4 card crashing the
+machine at boot when moved to OCuLink is not diagnosed; it needs a boot log.
 
 ## Alongside: the knowledge and memory cache
 
