@@ -31,6 +31,8 @@ struct Totals {
     decode_ms: f64,
     drafts_offered: u64,
     drafts_accepted: u64,
+    tool_args_repaired: u64,
+    stray_think_closers: u64,
 }
 
 struct Live {
@@ -108,6 +110,13 @@ impl Monitor {
                              progress: None, read_started: t, recent: VecDeque::new() });
         g.last_at = Some(t);
         Record { mon: self.clone(), id, prompt_tokens, done: false, outcome: "disconnect" }
+    }
+
+    /// What the output parser repaired in a request (Strata 0.2.8 #4427, #4077).
+    pub fn parser_repairs(&self, args: usize, stray: usize) {
+        let mut g = self.inner.lock().unwrap();
+        g.totals.tool_args_repaired += args as u64;
+        g.totals.stray_think_closers += stray as u64;
     }
 
     /// A media job starts; `media_step` reports its progress and `media_end` records it.
@@ -270,7 +279,7 @@ impl Monitor {
         let t = &g.totals;
         let read = t.prompt_tokens.saturating_sub(t.reused);
         let (ps, ds) = (t.prompt_ms / 1000.0, t.decode_ms / 1000.0);
-        let rows: [(&str, &str, &str, f64); 11] = [
+        let rows: [(&str, &str, &str, f64); 13] = [
             ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", read as f64),
             ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held", t.reused as f64),
             ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", ps),
@@ -281,6 +290,8 @@ impl Monitor {
             ("strata:requests_total", "counter", "Requests finished", t.requests as f64),
             ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t.drafts_offered as f64),
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t.drafts_accepted as f64),
+            ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written", t.tool_args_repaired as f64),
+            ("strata:stray_think_closers_total", "counter", "Extra closing think tags dropped from answers", t.stray_think_closers as f64),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", loaded as u8 as f64),
         ];
         rows.iter().map(|(n, k, h, v)| format!("# HELP {n} {h}\n# TYPE {n} {k}\n{n} {v}\n")).collect()
@@ -415,6 +426,11 @@ impl Record {
 
     pub fn progress(&self, done: u64, total: u64) {
         self.mon.with_live(self.id, |l| l.progress = Some((done, total)));
+    }
+
+    /// What the output parser repaired in this request.
+    pub fn parser_repairs(&self, args: usize, stray: usize) {
+        self.mon.parser_repairs(args, stray);
     }
 
     pub fn finish(mut self, finish: &str, n: u64, done: Option<&strata_protocol::Done>, timings: Value) {

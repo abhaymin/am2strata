@@ -439,6 +439,44 @@ impl Engine {
     }
 }
 
+/// Before an engine starts: end the ones a lost server left running, and wait for them to give their memory back
+/// (Strata #4051: a 40 GiB arena loaded beside 50 GiB the old engine still held put a 60 GiB PC into reclaim for good).
+/// Only an orphan of exactly this executable that is serving: its parent is PID 1 or a systemd user manager. Never fails;
+/// returns the PIDs still alive after `settle`.
+pub async fn end_leftover_engines(exe: &std::path::Path, settle: Duration) -> Vec<u32> {
+    let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let mut found = Vec::new();
+    for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(path) = std::fs::read_link(e.path().join("exe")) else { continue };
+        if path != want {
+            continue;
+        }
+        let cmd = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+        if !cmd.split(|b| *b == 0).any(|a| a == b"--serve") {
+            continue;
+        }
+        let stat = std::fs::read_to_string(e.path().join("stat")).unwrap_or_default();
+        let ppid = stat.rsplit(')').next().and_then(|r| r.split_whitespace().nth(1)).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let parent = std::fs::read_to_string(format!("/proc/{ppid}/comm")).unwrap_or_default();
+        if ppid == 1 || parent.trim() == "systemd" {
+            found.push(pid);
+        }
+    }
+    for pid in &found {
+        tracing::warn!("ending an engine left by an earlier run (process {pid})");
+        let _ = tokio::process::Command::new("kill").arg("-TERM").arg(pid.to_string()).status().await;
+    }
+    let t0 = std::time::Instant::now();
+    loop {
+        found.retain(|p| std::path::Path::new(&format!("/proc/{p}")).exists());
+        if found.is_empty() || t0.elapsed() >= settle {
+            return found;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 #[cfg(test)]
 mod expand_tests {
     use super::expand_str;

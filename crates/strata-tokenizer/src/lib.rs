@@ -120,6 +120,13 @@ struct Meta {
     pre: Option<String>,
     #[serde(default)]
     special_ids: HashMap<String, i64>,
+    /// spm: a space opens each stretch of text
+    #[serde(default = "yes")]
+    add_space_prefix: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub struct Tokenizer {
@@ -129,8 +136,11 @@ pub struct Tokenizer {
     token_types: Vec<i32>,
     pre: String,
     ignore_merges: bool,
-    /// gemma4: a vocabulary of UTF-8 pieces with byte fallback
+    /// gemma4, spm: a vocabulary of UTF-8 pieces with byte fallback
     raw: bool,
+    /// spm (Mistral 7B, Mixtral 8x7B, Llama 2): merges chosen by each token's score, as llama.cpp's SPM tokenizer
+    scores: Option<Vec<f32>>,
+    add_space_prefix: bool,
     /// DeepSeek V4: patterns applied one after the other
     sequence: Option<Vec<Regex>>,
     pattern: Regex,
@@ -201,7 +211,7 @@ impl Tokenizer {
             let p = dir.join("merges.json");
             parse(&p, &read(&p)?)?
         } else {
-            read(&dir.join("merges.txt"))?.split('\n').map(str::to_owned).collect()
+            read(&dir.join("merges.txt"))?.split('\n').filter(|m| !m.is_empty()).map(str::to_owned).collect()
         };
         let types_path = dir.join("token_type.json");
         let token_types: Vec<i32> = parse(&types_path, &read(&types_path)?)?;
@@ -211,7 +221,13 @@ impl Tokenizer {
         } else {
             Meta::default()
         };
-        Self::new(tokens, merges, token_types, meta.pre.unwrap_or_else(|| "qwen35".into()), meta.special_ids)
+        let mut tok = Self::new(tokens, merges, token_types, meta.pre.unwrap_or_else(|| "qwen35".into()), meta.special_ids)?;
+        if tok.pre == "spm" {
+            let p = dir.join("scores.json");
+            tok.scores = Some(parse(&p, &read(&p)?)?);
+            tok.add_space_prefix = meta.add_space_prefix;
+        }
+        Ok(tok)
     }
 
     pub fn new(
@@ -221,7 +237,7 @@ impl Tokenizer {
         pre: String,
         special_ids: HashMap<String, i64>,
     ) -> Result<Self> {
-        let raw = pre == "gemma4";
+        let raw = pre == "gemma4" || pre == "spm";
         let mut ids = HashMap::with_capacity(tokens.len());
         for (i, t) in tokens.iter().enumerate() {
             if ids.insert(t.clone(), i as u32).is_some() {
@@ -272,6 +288,8 @@ impl Tokenizer {
         Ok(Self {
             ignore_merges: matches!(pre.as_str(), "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "tekken"),
             raw,
+            scores: None,
+            add_space_prefix: true,
             sequence,
             tokens,
             ids,
@@ -413,7 +431,93 @@ impl Tokenizer {
         Ok(())
     }
 
+    /// llama.cpp's llm_tokenizer_spm: start from single characters and keep merging the neighbouring pair whose joined
+    /// text is the vocabulary's highest-scored token (the leftmost of equals). A character outside the vocabulary goes
+    /// byte by byte as <0xXX>.
+    fn encode_spm(&self, text: &str, scores: &[f32], out: &mut Vec<u32>) -> Result<()> {
+        use std::cmp::Ordering;
+        if text.is_empty() {
+            return Ok(());
+        }
+        struct Bigram {
+            score: f32,
+            left: usize,
+            right: usize,
+            size: usize,
+        }
+        impl PartialEq for Bigram {
+            fn eq(&self, o: &Self) -> bool {
+                self.cmp(o) == Ordering::Equal
+            }
+        }
+        impl Eq for Bigram {}
+        impl PartialOrd for Bigram {
+            fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+                Some(self.cmp(o))
+            }
+        }
+        impl Ord for Bigram {
+            fn cmp(&self, o: &Self) -> Ordering {
+                self.score.total_cmp(&o.score).then(o.left.cmp(&self.left))
+            }
+        }
+        let text = if self.add_space_prefix { format!(" {text}") } else { text.to_string() }.replace(' ', "\u{2581}");
+        let mut sym: Vec<(usize, usize)> = text.char_indices().map(|(i, c)| (i, c.len_utf8())).collect();
+        let n = sym.len();
+        let mut prev: Vec<isize> = (0..n as isize).map(|i| i - 1).collect();
+        let mut next: Vec<isize> = (1..=n as isize).map(|i| if i as usize == n { -1 } else { i }).collect();
+        let mut heap = std::collections::BinaryHeap::new();
+        let push = |heap: &mut std::collections::BinaryHeap<Bigram>, sym: &[(usize, usize)], l: isize, r: isize| {
+            if l < 0 || r < 0 {
+                return;
+            }
+            let (l, r) = (l as usize, r as usize);
+            let size = sym[l].1 + sym[r].1;
+            if let Some(id) = self.ids.get(&text[sym[l].0..sym[l].0 + size]) {
+                if let Some(score) = scores.get(*id as usize) {
+                    heap.push(Bigram { score: *score, left: l, right: r, size });
+                }
+            }
+        };
+        for i in 1..n {
+            push(&mut heap, &sym, i as isize - 1, i as isize);
+        }
+        while let Some(b) = heap.pop() {
+            // a pair one of whose sides has changed since is stale
+            if sym[b.left].1 == 0 || sym[b.right].1 == 0 || sym[b.left].1 + sym[b.right].1 != b.size {
+                continue;
+            }
+            sym[b.left].1 += sym[b.right].1;
+            sym[b.right].1 = 0;
+            next[b.left] = next[b.right];
+            if next[b.right] >= 0 {
+                prev[next[b.right] as usize] = b.left as isize;
+            }
+            push(&mut heap, &sym, prev[b.left], b.left as isize);
+            push(&mut heap, &sym, b.left as isize, next[b.left]);
+        }
+        let mut i: isize = 0;
+        while i >= 0 {
+            let (at, len) = sym[i as usize];
+            let piece = &text[at..at + len];
+            match self.ids.get(piece) {
+                Some(id) => out.push(*id),
+                None => {
+                    for b in piece.bytes() {
+                        let t = format!("<0x{b:02X}>");
+                        out.push(*self.ids.get(&t).ok_or_else(|| Error::Invalid(format!("no byte token {t}")))?);
+                    }
+                }
+            }
+            i = next[i as usize];
+        }
+        Ok(())
+    }
+
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
+        if let Some(s) = &self.scores {
+            return self.encode_spm(text, s, out);
+        }
         if self.raw {
             return self.encode_raw(text, out);
         }

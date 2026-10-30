@@ -243,25 +243,31 @@ fn py_json(v: &Value) -> String {
 
 /// GGUF tokenizer.ggml.model -> the pre-tokenizer it implies, if any (PolyStrata MODELS).
 fn implied_pre(model: &str) -> Option<&'static str> {
-    (model == "gemma4").then_some("gemma4")
+    match model {
+        "gemma4" => Some("gemma4"),
+        "llama" => Some("spm"), // SentencePiece: Mistral 7B, Mixtral 8x7B, Llama 2
+        _ => None,
+    }
 }
 
 /// Write `<out_dir>/tokenizer/` from the GGUF's tokenizer (as strata_tokenizer.py `extract`). Returns tokenizer.json.
 pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     let md = &gguf.metadata;
     let model = gguf.str("tokenizer.ggml.model").unwrap_or("");
-    if model != "gpt2" && model != "gemma4" {
-        return Err(Error::Format(format!("expected a BPE tokenizer (model 'gpt2' or 'gemma4'), got {model:?}")));
+    if !matches!(model, "gpt2" | "gemma4" | "llama") {
+        return Err(Error::Format(format!("expected a tokenizer of model 'gpt2', 'gemma4' or 'llama', got {model:?}")));
     }
     let tokens: Vec<String> = md.get("tokenizer.ggml.tokens").and_then(Value::as_array)
         .ok_or_else(|| Error::Format("the GGUF has no tokenizer.ggml.tokens; it does not carry a tokenizer".into()))?
         .iter().map(|t| t.as_str().unwrap_or("").to_string()).collect();
-    let merges: Vec<String> = md.get("tokenizer.ggml.merges").and_then(Value::as_array)
-        .ok_or_else(|| Error::Format("the GGUF has no tokenizer.ggml.merges".into()))?
-        .iter().map(|t| t.as_str().unwrap_or("").to_string()).collect();
+    let merges: Vec<String> = match md.get("tokenizer.ggml.merges").and_then(Value::as_array) {
+        Some(m) => m.iter().map(|t| t.as_str().unwrap_or("").to_string()).collect(),
+        None if model == "llama" => Vec::new(),
+        None => return Err(Error::Format("the GGUF has no tokenizer.ggml.merges".into())),
+    };
     let types: Vec<Value> = md.get("tokenizer.ggml.token_type").and_then(Value::as_array).cloned().unwrap_or_default();
     let pre = implied_pre(model).map(str::to_owned).unwrap_or_else(|| gguf.str("tokenizer.ggml.pre").unwrap_or("qwen35").to_string());
-    let raw = pre == "gemma4";
+    let raw = pre == "gemma4" || pre == "spm";
     let mut special = Map::new();
     for (k, v) in md {
         if k.starts_with("tokenizer.ggml.") && k.ends_with("_token_id") {
@@ -287,6 +293,7 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
         "model": if raw { "gemma4" } else { "gpt2" }, "pre": pre, "vocab_size": tokens.len(), "n_merges": merges.len(),
         "special_ids": special, "add_bos_token": false, "pre_pattern": pattern, "pre_sequence": sequence,
         "pre_pattern_source": source,
+        "add_space_prefix": md.get("tokenizer.ggml.add_space_prefix").and_then(Value::as_bool).unwrap_or(true),
         "ignore_merges": matches!(pre.as_str(), "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "tekken"),
     });
     let dir = out_dir.join("tokenizer");
@@ -311,6 +318,11 @@ pub fn extract_tokenizer(gguf: &Gguf, out_dir: &Path) -> Result<Value> {
     })?;
     if let Some(tpl) = gguf.str("tokenizer.chat_template").filter(|t| !t.is_empty()) {
         write("chat_template.jinja", tpl)?;
+    }
+    if pre == "spm" {
+        let scores = md.get("tokenizer.ggml.scores").and_then(Value::as_array)
+            .ok_or_else(|| Error::Format("a SentencePiece GGUF has no tokenizer.ggml.scores".into()))?;
+        write("scores.json", &Value::Array(scores.clone()).to_string())?;
     }
     // last (PolyStrata 5e16c627): vocab.json is the sign that the folder is complete, so an extraction that stops part
     // way is run again instead of leaving a tokenizer without its merges

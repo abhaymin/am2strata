@@ -149,27 +149,23 @@ packs (native_experts v5, Hadamard-folded) are refused by name, and am2Strata's 
 
 Planned, in order. Nothing here is started unless it says so.
 
+The long-term engine plan, one Rust engine for dense and MoE models, is [ENGINE-PLAN.md](ENGINE-PLAN.md).
+
 1. **Two GPUs across a reboot.** Done so far: Orca splits over both cards, am2Strata is the boot service, a card that
    is missing at load is dropped with a note. Still needed: install `deploy/gpu-usb4-recover.{sh,service}` (needs
    root) and pass a reboot test. Gate: after a cold boot both cards are up and Orca is split, with no hand steps.
-2. **Check poly.6 on real models.** The rebuilt `strata-poly` has not run a model yet. Load Sage (flash attention is now
-   on for the Qwen3.6 family), then try Clover. Gate: output and speed against the previous engine, kept in
-   `engine-poly-backup-20261030/`.
-3. **Two GPUs for the other models.** Sage, MiniCPM-V and LFM2 run on one card. Try `"gpu": [0, 1]` on each and measure
-   against one card. Media jobs on GPU 1 are the alternative to a split: Orca stays on GPU 0 instead of unloading for
+2. **Check poly.6 on real models.** Sage measured: the rebuilt `strata-poly` decodes at 150-155 tok/s, the same as the previous
+   engine at 149-156 tok/s. Clover is still to try; it needs a download.
+3. **Two GPUs for the other models.** Sage on both cards: 157-160 tok/s against 150-155 on one, about 5% more, and
+   it stays on both. MiniCPM-V and LFM2 run on one card: try `"gpu": [0, 1]` on each and measure. Media jobs on GPU 1 are the alternative to a split: Orca stays on GPU 0 instead of unloading for
    every image or video. Decide per model by measurement.
-4. **Strata 0.2's engine work.** PolyStrata carries Strata 0.1.45; Strata is at 0.2.8. Most of 0.2.7.1 to 0.2.8 is SYCL,
-   Metal and desktop-app work; what matters here has to be read out of the whole 0.1.45 to 0.2.8 range first (engine
-   speed, Hadamard-folded packs, wider batch windows). Two routes, decided after that survey:
-   - follow PolyStrata when it merges Strata 0.2, and rebuild;
-   - bring the wanted parts into am2Strata's own Rust engines (`am2strata-hybrid`, docs/GPU-PLAN.md), which is the
-     long-term direction but a far larger job.
-   Gate as for every engine: identical token ids at temperature 0 against the reference, then a live GPU check, run
-   only with the RAM free for it (no CUDA builds or model tests beside a loaded Orca without a memory cap).
-5. **Smaller ports left from Strata 0.2.8's server:** wait for an old engine to give its memory back before a start (#4051),
-   serve a DeepSeek tokenizer as DeepSeek when the config names no arch (#4137), and counters for repaired tool arguments
-   and stray `</think>` tags (logs, Prometheus).
-
+4. **Strata 0.2's engine work.** Surveyed: [STRATA-0.2-SURVEY.md](STRATA-0.2-SURVEY.md). The decision there is to follow
+   PolyStrata when it merges Strata 0.2 and rebuild, rather than rewrite CUDA engine work in Rust; `upstream-check` shows when.
+   `am2strata-hybrid` stays the long-term Rust engine (docs/GPU-PLAN.md) and can take ideas one at a time. Gate as for every
+   engine: identical token ids at temperature 0 against the reference, then a live GPU check.
+5. **Smaller ports from Strata 0.2.8's server: done.** Leftover engines are ended and waited for before a start (#4051), any
+   DeepSeek pre-tokenizer gets DSML calls (#4137), and repaired tool arguments and stray `</think>` tags are logged and counted
+   in `/metrics/prometheus`.
 6. **Coral Edge TPU (optional).** am2Strata never requires it: without one, or without its driver, everything works and
    Settings shows it as "no driver loaded". This PC has one on PCIe (`1ac1:089a`).
    - Driver first: `gasket` / `apex` is not in the apt sources here and may need a fork to build on Linux 7. Needs root to

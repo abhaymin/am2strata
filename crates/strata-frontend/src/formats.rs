@@ -23,7 +23,9 @@ impl CallFormat {
             // Flint 40B-A2.5B writes GLM's calls (PolyStrata 4f773df4)
             "glm4" | "glm5" | "flint" => CallFormat::Glm,
             "gemma4" => CallFormat::Gemma,
-            "joyai-llm" | "deepseek-v3" => CallFormat::Dsml,
+            // #4137: any DeepSeek pre-tokenizer, so a config that names no arch still gets DSML calls
+            "joyai-llm" => CallFormat::Dsml,
+            p if p.starts_with("deepseek") => CallFormat::Dsml,
             "lfm2" => CallFormat::Lfm2,
             _ => CallFormat::Function,
         }

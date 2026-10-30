@@ -1834,6 +1834,7 @@ function showSection(name) {
   if (section === "tools") loadMcp();
   if (section === "memory") loadMemory();
   if (section === "server") loadSystem();
+  if (section === "connect") renderAppSetup();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
@@ -2837,7 +2838,7 @@ async function readAloud(i, btn) {
 }
 
 // ------------------------------------------------------------------ Settings > Server and access: this PC (GET /api/system)
-let systemTimer = null;
+var systemTimer;   // var: start-up reaches loadSystem before this line when the page opens on this section
 async function loadSystem() {
   clearTimeout(systemTimer);
   if (tab !== "settings" || section !== "server") return;
@@ -2865,3 +2866,31 @@ async function loadSystem() {
   $("hw-list").innerHTML = rows.join("");
   systemTimer = setTimeout(loadSystem, 2000);
 }
+
+// ------------------------------------------------------------------ Settings > Connect: set up an application
+var APPS = {       // var: start-up reaches renderAppSetup before this line when the page opens on Connect
+  "Claude Code": (b, m) => ["In a terminal, before starting claude:",
+    `export ANTHROPIC_BASE_URL=${b}\nexport ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY\nexport ANTHROPIC_MODEL=${m}\nclaude`],
+  "Codex CLI": (b, m) => ["In ~/.codex/config.toml, with AM2STRATA_API_KEY set in your shell:",
+    `model = "${m}"\nmodel_provider = "am2strata"\n\n[model_providers.am2strata]\nname = "am2Strata"\nbase_url = "${b}/v1"\nenv_key = "AM2STRATA_API_KEY"\nwire_api = "responses"`],
+  "opencode": (b, m) => ["In opencode.json:",
+    JSON.stringify({provider: {am2strata: {npm: "@ai-sdk/openai-compatible", name: "am2Strata", options: {baseURL: `${b}/v1`, apiKey: "YOUR_API_KEY"}, models: {[m]: {name: m}}}}}, null, 2)],
+  "Continue": (b, m) => ["In ~/.continue/config.yaml:",
+    `models:\n  - name: am2Strata\n    provider: openai\n    model: ${m}\n    apiBase: ${b}/v1\n    apiKey: YOUR_API_KEY`],
+  "Cline / Roo Code": (b, m) => ["In the extension's settings, choose API provider: OpenAI Compatible, then:",
+    `Base URL: ${b}/v1\nAPI key:  YOUR_API_KEY\nModel ID: ${m}`],
+  "Open WebUI": (b) => ["As environment variables for Open WebUI:",
+    `OPENAI_API_BASE_URL=${b}/v1\nOPENAI_API_KEY=YOUR_API_KEY`],
+  "OpenAI SDK (Python)": (b, m) => ["In Python:",
+    `from openai import OpenAI\n\nclient = OpenAI(base_url="${b}/v1", api_key="YOUR_API_KEY")\nr = client.chat.completions.create(model="${m}", messages=[{"role": "user", "content": "Hello"}])\nprint(r.choices[0].message.content)`],
+};
+$("app-pick").innerHTML = Object.keys(APPS).map((a) => `<option>${esc(a)}</option>`).join("");
+function renderAppSetup() {
+  if (!APPS) return;
+  const model = (lastMetrics && lastMetrics.engine && (lastMetrics.engine.id || lastMetrics.engine.model)) || $("model-select").value || "MODEL";
+  const [where, text] = APPS[$("app-pick").value](location.origin, model);
+  $("app-where").textContent = where;
+  $("app-snippet").textContent = text;
+}
+$("app-pick").onchange = renderAppSetup;
+if (tab === "settings" && section === "connect") renderAppSetup();

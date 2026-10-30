@@ -520,6 +520,11 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         }
         None => None,
     };
+    let stuck = strata_engine::end_leftover_engines(&cfg.exe, Duration::from_secs(120)).await;
+    if !stuck.is_empty() {
+        tracing::warn!("the engine from an earlier run (process {stuck:?}) was told to stop but still holds its memory after 120 s; \
+                        starting beside it can leave this PC short of RAM");
+    }
     tracing::info!(model = %entry.id, family = ?family, "starting the engine");
     let engine = match Engine::start(&cfg, ready_timeout).await {
         Ok(e) => e,

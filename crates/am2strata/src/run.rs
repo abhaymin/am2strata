@@ -707,6 +707,14 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             prompt_ids.extend(extra);
         };
         let (finish, stop) = summary;
+        if !parser.notes.is_empty() || parser.stray_think > 0 {
+            let mut what: Vec<String> = parser.notes.clone();
+            what.sort();
+            what.dedup();
+            tracing::info!("output repaired: {} tool argument(s) ({}), {} extra closing think tag(s) dropped",
+                           parser.notes.len(), what.join("; "), parser.stray_think);
+            record.parser_repairs(parser.notes.len(), parser.stray_think);
+        }
         if preserve {
             lc.remember_reasoning(&answer_text, &reasoning_text);
         }
