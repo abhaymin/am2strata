@@ -11,6 +11,8 @@ mod cpu_dot;
 mod model;
 #[cfg(feature = "gpu")]
 mod gpu;
+#[cfg(feature = "gpu")]
+mod graph;
 mod pack;
 
 use std::io::{BufRead, Write};
@@ -151,6 +153,22 @@ fn main() {
     if arg("--devices").is_some() {
         fail("--devices: this am2strata-hybrid was built without the gpu feature".into());
     }
+    // --graph: a whole token on the device (dense attention models whose matrices are all on one device)
+    #[cfg(feature = "gpu")]
+    let graph = if args.iter().any(|a| a == "--graph") {
+        let g = graph::Graph::new(&m, max_ctx).unwrap_or_else(|e| fail(e));
+        placement = format!("{placement} graph=1");
+        Some(g)
+    } else {
+        None
+    };
+    let forward = |st: &mut model::State, t: u32| -> Vec<f32> {
+        #[cfg(feature = "gpu")]
+        if let Some(g) = &graph {
+            return g.forward(&m, st, t);
+        }
+        m.forward(st, t)
+    };
     let packed = match &pk {
         Some(p) => format!(" pack={} pack_floats={from_pack} pack_native={}", p.dir.display(), p.n_native()),
         None => String::new(),
@@ -223,7 +241,7 @@ fn main() {
         let mut logits = Vec::new();
         let todo = &ids[reused..];
         for (i, &t) in todo.iter().enumerate() {
-            logits = m.forward(&mut st, t);
+            logits = forward(&mut st, t);
             history.push(t);
             if (i + 1) % 16 == 0 || i + 1 == todo.len() {
                 out(&format!("PP {} {} {}", reused + i + 1, ids.len(), tp.elapsed().as_millis()));
@@ -266,7 +284,7 @@ fn main() {
                 finish = "eos";
                 break;
             }
-            logits = m.forward(&mut st, t);
+            logits = forward(&mut st, t);
         }
         // the expert loadings: how much of this request's routing the resident experts served, and the learned profile
         if let Some(r) = &res {

@@ -240,13 +240,13 @@ fn add_bias(v: &mut [f32], b: &Option<Vec<f32>>) {
 
 /// Rotary position embedding as ggml computes it, with YaRN and llama3-style frequency factors.
 pub struct Rope {
-    n_dims: usize,
+    pub(crate) n_dims: usize,
     base: f32,
     freq_scale: f32,
     ext_factor: f32,
     attn_factor: f32,
     corr: [f32; 2],
-    neox: bool,
+    pub(crate) neox: bool,
     factors: Option<Vec<f32>>,
 }
 
@@ -281,11 +281,11 @@ impl Rope {
         Rope { n_dims, base, freq_scale, ext_factor, attn_factor, corr, neox, factors }
     }
 
-    /// Rotates the first n_dims values of one head's vector for position `pos`.
-    fn apply(&self, x: &mut [f32], pos: usize) {
+    /// The (cos, sin) pairs of position `pos` (the device rotates with these).
+    pub(crate) fn table(&self, pos: usize) -> Vec<f32> {
         let theta_scale = self.base.powf(-2.0 / self.n_dims as f32);
         let mut theta = pos as f32;
-        let half = self.n_dims / 2;
+        let mut out = Vec::with_capacity(self.n_dims);
         for i0 in (0..self.n_dims).step_by(2) {
             let ff = self.factors.as_ref().map(|f| f[i0 / 2]).unwrap_or(1.0);
             let extrap = theta / ff;
@@ -297,12 +297,21 @@ impl Rope {
                 th = interp * (1.0 - ramp) + extrap * ramp;
                 mscale *= 1.0 + 0.1 * (1.0 / self.freq_scale).ln();
             }
-            let (c, s) = (th.cos() * mscale, th.sin() * mscale);
-            let (a, b) = if self.neox { (i0 / 2, i0 / 2 + half) } else { (i0, i0 + 1) };
-            let (x0, x1) = (x[a], x[b]);
-            x[a] = x0 * c - x1 * s;
-            x[b] = x0 * s + x1 * c;
+            out.push(th.cos() * mscale);
+            out.push(th.sin() * mscale);
             theta *= theta_scale;
+        }
+        out
+    }
+
+    /// Rotates the first n_dims values of one head's vector for position `pos`.
+    fn apply(&self, x: &mut [f32], pos: usize) {
+        let half = self.n_dims / 2;
+        for (p, cs) in self.table(pos).chunks_exact(2).enumerate() {
+            let (a, b) = if self.neox { (p, p + half) } else { (p * 2, p * 2 + 1) };
+            let (x0, x1) = (x[a], x[b]);
+            x[a] = x0 * cs[0] - x1 * cs[1];
+            x[b] = x0 * cs[1] + x1 * cs[0];
         }
     }
 }
@@ -321,10 +330,10 @@ pub enum Gating {
 
 /// A feed-forward: down(act(gate x) * up x), or down(act(up x)) without a gate.
 pub struct Dense {
-    gate: Option<QMat>,
-    up: QMat,
-    down: QMat,
-    act: Act,
+    pub(crate) gate: Option<QMat>,
+    pub(crate) up: QMat,
+    pub(crate) down: QMat,
+    pub(crate) act: Act,
 }
 
 impl Dense {
@@ -390,22 +399,22 @@ impl Experts {
 }
 
 pub struct Attn {
-    q: QMat,
-    k: QMat,
-    v: QMat,
-    o: QMat,
-    q_b: Option<Vec<f32>>,
-    k_b: Option<Vec<f32>>,
-    v_b: Option<Vec<f32>>,
-    o_b: Option<Vec<f32>>,
+    pub(crate) q: QMat,
+    pub(crate) k: QMat,
+    pub(crate) v: QMat,
+    pub(crate) o: QMat,
+    pub(crate) q_b: Option<Vec<f32>>,
+    pub(crate) k_b: Option<Vec<f32>>,
+    pub(crate) v_b: Option<Vec<f32>>,
+    pub(crate) o_b: Option<Vec<f32>>,
     /// per-head RMS norms of q and k before RoPE (Qwen3)
-    q_norm: Option<Vec<f32>>,
-    k_norm: Option<Vec<f32>>,
-    n_head: usize,
-    n_kv: usize,
-    head_dim: usize,
+    pub(crate) q_norm: Option<Vec<f32>>,
+    pub(crate) k_norm: Option<Vec<f32>>,
+    pub(crate) n_head: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) head_dim: usize,
     /// no positions at all (Nemotron-H)
-    rope: bool,
+    pub(crate) rope: bool,
 }
 
 /// DeepSeek's multi-head latent attention, with the K and V up-projections absorbed (as llama.cpp's is_mla path):
@@ -457,14 +466,14 @@ pub struct Model {
     n_ssm_head: usize,
     n_group: usize,
     d_conv: usize,
-    eps: f32,
-    rope: Option<Rope>,
+    pub(crate) eps: f32,
+    pub(crate) rope: Option<Rope>,
     /// Llama 4 / Mistral 3 attention temperature: (scale, floor) - q *= 1 + scale * ln(floor(pos / floor) + 1)
-    attn_temp: Option<(f32, f32)>,
+    pub(crate) attn_temp: Option<(f32, f32)>,
     pub stops: Vec<u32>,
-    embd: QMat,
-    out_norm: Vec<f32>,
-    output: QMat,
+    pub(crate) embd: QMat,
+    pub(crate) out_norm: Vec<f32>,
+    pub(crate) output: QMat,
     pub layers: Vec<Layer>,
     /// the expert profile's shape: one row per layer, `profile_experts` columns
     pub profile_experts: usize,
@@ -711,6 +720,10 @@ impl Model {
         st.pos += 1;
         let h = rms_norm(&x, &self.out_norm, self.eps);
         self.output.mul(&h)
+    }
+
+    pub(crate) fn temp_scale_at(&self, pos: usize) -> f32 {
+        self.temp_scale(pos)
     }
 
     fn temp_scale(&self, pos: usize) -> f32 {

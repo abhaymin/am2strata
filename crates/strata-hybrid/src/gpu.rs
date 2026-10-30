@@ -34,6 +34,15 @@ impl OnDevice {
     pub fn device(&self) -> usize {
         self.dev
     }
+
+    pub(crate) fn weights(&self) -> &strata_gpu::Weights {
+        &self.w
+    }
+}
+
+/// An open device, for code that chains kernels on it (graph.rs).
+pub(crate) fn device(d: usize) -> &'static strata_gpu::Gpu {
+    &DEVICES.get().expect("devices opened")[d]
 }
 
 /// `cuda:0=12,hip:0=6` -> [("cuda:0", 12 GiB), ("hip:0", 6 GiB)]; a device without `=` gets 1 TiB (all it takes).

@@ -262,3 +262,184 @@ pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, col
         y[(t * rows + row) as usize] = sum[UNIT_POS as usize];
     }
 }
+
+// ------------------------------------------------------------------ a whole token on the device (docs/ENGINE-PLAN.md phase 1)
+// These run between the matrix products, so the activations stay on the device and only the logits come back.
+
+/// y = x * w / sqrt(mean(x^2) + eps): the RMS norm of one vector of `n` values. One cube.
+#[cube(launch_unchecked)]
+pub fn rms_norm(x: &Array<f32>, w: &Array<f32>, y: &mut Array<f32>, n: u32, eps: f32) {
+    let mut sum = SharedMemory::<f32>::new(CUBE as usize);
+    let mut acc = f32::new(0.0);
+    let mut j = UNIT_POS;
+    while j < n {
+        let v = x[j as usize];
+        acc += v * v;
+        j += CUBE;
+    }
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(64);
+    while stride > 0 {
+        if UNIT_POS < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let k = f32::new(1.0) / f32::sqrt(sum[0usize] / f32::cast_from(n) + eps);
+    let mut j = UNIT_POS;
+    while j < n {
+        y[j as usize] = x[j as usize] * k * w[j as usize];
+        j += CUBE;
+    }
+}
+
+/// y += x, over `n` values.
+#[cube(launch_unchecked)]
+pub fn add_into(x: &Array<f32>, y: &mut Array<f32>, n: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    if j < n {
+        y[j as usize] = y[j as usize] + x[j as usize];
+    }
+}
+
+/// up *= silu(gate), over `n` values (the gated feed-forward).
+#[cube(launch_unchecked)]
+pub fn silu_gate(gate: &Array<f32>, up: &mut Array<f32>, n: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    if j < n {
+        let g = gate[j as usize];
+        up[j as usize] = up[j as usize] * (g / (f32::new(1.0) + f32::exp(-g)));
+    }
+}
+
+/// Rotates each of the head vectors of x (`hd` values each) by the (cos, sin) pairs of `tab`: `n_rot / 2` pairs for this
+/// position, adjacent values (`neox` 0) or the two halves (`neox` 1). A cube per head.
+#[cube(launch_unchecked)]
+pub fn rope(tab: &Array<f32>, x: &mut Array<f32>, hd: u32, n_rot: u32, neox: u32) {
+    let at = CUBE_POS_X * hd;
+    let p = UNIT_POS;
+    if p < n_rot / 2 {
+        let c = tab[(p * 2) as usize];
+        let s = tab[(p * 2 + 1) as usize];
+        let mut a = at + p * 2;
+        let mut b = a + 1;
+        if neox == 1 {
+            a = at + p;
+            b = a + n_rot / 2;
+        }
+        let x0 = x[a as usize];
+        let x1 = x[b as usize];
+        x[a as usize] = x0 * c - x1 * s;
+        x[b as usize] = x0 * s + x1 * c;
+    }
+}
+
+/// cache[at + i] = x[i], over `n` values: one position of a layer's K or V.
+#[cube(launch_unchecked)]
+pub fn kv_append(x: &Array<f32>, cache: &mut Array<f32>, at: u32, n: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    if j < n {
+        cache[(at + j) as usize] = x[j as usize];
+    }
+}
+
+/// Attention scores: s[hh * n + t] = (q_hh . k_t) * scale * ts for every query head and position (a cube per pair).
+/// K and V hold `n_kv` heads per position, and query head hh reads KV head hh / group.
+#[cube(launch_unchecked)]
+pub fn attn_scores(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32, scale: f32) {
+    let t = CUBE_POS_X;
+    let hh = CUBE_POS_Y;
+    let kh = hh / group;
+    let qo = hh * hd;
+    let ko = (t * n_kv + kh) * hd;
+    let mut acc = f32::new(0.0);
+    let mut j = UNIT_POS;
+    while j < hd {
+        acc += q[(qo + j) as usize] * k[(ko + j) as usize];
+        j += CUBE;
+    }
+    let mut sum = SharedMemory::<f32>::new(CUBE as usize);
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(64);
+    while stride > 0 {
+        if UNIT_POS < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if UNIT_POS == 0 {
+        s[(hh * n + t) as usize] = sum[0usize] * scale;
+    }
+}
+
+/// s[hh * n..] -> softmax in place, for one query head per cube.
+#[cube(launch_unchecked)]
+pub fn attn_softmax(s: &mut Array<f32>, n: u32) {
+    let hh = CUBE_POS_X;
+    let base = hh * n;
+    let mut m = SharedMemory::<f32>::new(CUBE as usize);
+    let mut top = f32::new(-1.0e30);
+    let mut t = UNIT_POS;
+    while t < n {
+        top = f32::max(top, s[(base + t) as usize]);
+        t += CUBE;
+    }
+    m[UNIT_POS as usize] = top;
+    sync_cube();
+    let mut stride = u32::new(64);
+    while stride > 0 {
+        if UNIT_POS < stride {
+            m[UNIT_POS as usize] = f32::max(m[UNIT_POS as usize], m[(UNIT_POS + stride) as usize]);
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let top = m[0usize];
+    sync_cube();
+    let mut acc = f32::new(0.0);
+    let mut t = UNIT_POS;
+    while t < n {
+        let e = f32::exp(s[(base + t) as usize] - top);
+        s[(base + t) as usize] = e;
+        acc += e;
+        t += CUBE;
+    }
+    m[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(64);
+    while stride > 0 {
+        if UNIT_POS < stride {
+            m[UNIT_POS as usize] = m[UNIT_POS as usize] + m[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let total = m[0usize];
+    let mut t = UNIT_POS;
+    while t < n {
+        s[(base + t) as usize] = s[(base + t) as usize] / total;
+        t += CUBE;
+    }
+}
+
+/// o[hh * hd + j] = sum over t of p[hh, t] * v[t, hh / group][j]: a cube per query head, a unit per `j % CUBE`.
+#[cube(launch_unchecked)]
+pub fn attn_blend(p: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32) {
+    let hh = CUBE_POS_X;
+    let kh = hh / group;
+    let mut j = UNIT_POS;
+    while j < hd {
+        let mut acc = f32::new(0.0);
+        let mut t = u32::new(0);
+        while t < n {
+            acc += p[(hh * n + t) as usize] * v[((t * n_kv + kh) * hd + j) as usize];
+            t += 1;
+        }
+        o[(hh * hd + j) as usize] = acc;
+        j += CUBE;
+    }
+}

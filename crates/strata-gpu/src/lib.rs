@@ -42,6 +42,19 @@ pub struct Weights {
     pub bytes: usize,
 }
 
+/// Values on the device, so that a chain of kernels needs no trip through the CPU.
+#[derive(Clone)]
+pub struct Buf {
+    handle: Handle,
+    pub len: usize,
+}
+
+impl Buf {
+    fn arg<R: Runtime>(&self) -> ArrayArg<R> {
+        unsafe { ArrayArg::from_raw_parts(self.handle.clone(), self.len) }
+    }
+}
+
 pub struct Gpu {
     client: Client,
     pub name: String,
@@ -191,6 +204,92 @@ impl Gpu {
             }).collect();
             outs.into_iter().map(|hy| f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()).collect()
         })
+    }
+
+    /// A buffer of f32 on the device.
+    pub fn buffer(&self, v: &[f32]) -> Buf {
+        Buf { handle: with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v))), len: v.len() }
+    }
+
+    /// An uninitialized buffer of `len` f32 on the device.
+    pub fn scratch(&self, len: usize) -> Buf {
+        Buf { handle: with_client!(self, c, R, c.empty(len * 4)), len }
+    }
+
+    /// Waits for the device and reads a buffer back. Only this waits: every call below just queues its kernel.
+    pub fn read(&self, b: &Buf) -> Vec<f32> {
+        with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.clone())).to_vec())
+    }
+
+    /// y = W x, queued; y stays on the device.
+    pub fn mv(&self, w: &Weights, x: &Buf) -> Buf {
+        let (be, bb, k) = w.geometry;
+        let cubes = w.rows.div_ceil(kernels::ROWS_PER_CUBE);
+        let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
+        with_client!(self, c, R, {
+            let hy = c.empty(w.rows as usize * 4);
+            unsafe {
+                kernels::matvec::launch_unchecked::<R>(c, CubeCount::Static(cx, cy, 1), CubeDim::new_1d(kernels::CUBE),
+                    ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts(x.handle.clone(), x.len),
+                    ArrayArg::from_raw_parts(hy.clone(), w.rows as usize), w.rows, w.cols, w.row_bytes, be, bb, k);
+            }
+            Buf { handle: hy, len: w.rows as usize }
+        })
+    }
+
+    /// y = x * w / sqrt(mean(x^2) + eps), queued.
+    pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
+        let y = self.scratch(x.len);
+        with_client!(self, c, R, unsafe {
+            kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), x.len as u32, eps);
+        });
+        y
+    }
+
+    /// y += x, queued.
+    pub fn add_into(&self, x: &Buf, y: &Buf) {
+        let n = x.len as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::add_into::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), y.arg(), n);
+        });
+    }
+
+    /// up *= silu(gate), queued.
+    pub fn silu_gate(&self, gate: &Buf, up: &Buf) {
+        let n = up.len as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::silu_gate::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), gate.arg(), up.arg(), n);
+        });
+    }
+
+    /// Rotates x, `hd` values per head, by a (cos, sin) table of `n_rot / 2` pairs, queued.
+    pub fn rope(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool) {
+        let heads = x.len as u32 / hd;
+        with_client!(self, c, R, unsafe {
+            kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, 1, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot, neox as u32);
+        });
+    }
+
+    /// cache[at..] = x, queued.
+    pub fn kv_append(&self, x: &Buf, cache: &Buf, at: usize) {
+        let n = x.len as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::kv_append::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), cache.arg(), at as u32, n);
+        });
+    }
+
+    /// Attention of q (`n_head` heads of `hd`) over `n` positions of K and V (`n_kv` heads each), queued; -> n_head * hd
+    /// values. `s` is scratch for n_head * n scores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        let o = self.scratch((n_head * hd) as usize);
+        let group = n_head / n_kv;
+        with_client!(self, c, R, unsafe {
+            kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
+            kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd);
+        });
+        o
     }
 
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).

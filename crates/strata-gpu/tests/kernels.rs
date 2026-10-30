@@ -77,3 +77,72 @@ fn every_kernel_matches_the_cpu_on_every_device() {
         }
     }
 }
+
+/// A token's chain of kernels against the same arithmetic on the CPU (docs/ENGINE-PLAN.md phase 1).
+#[test]
+fn the_chain_of_kernels_matches_the_cpu() {
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some()).collect();
+    let mut rng = Rng(42);
+    let (hd, n_head, n_kv, n) = (128usize, 8usize, 2usize, 37usize);
+    let q: Vec<f32> = (0..n_head * hd).map(|_| rng.unit()).collect();
+    let k: Vec<f32> = (0..n * n_kv * hd).map(|_| rng.unit()).collect();
+    let v: Vec<f32> = (0..n * n_kv * hd).map(|_| rng.unit()).collect();
+    let x: Vec<f32> = (0..3072).map(|_| rng.unit() * 3.0).collect();
+    let w: Vec<f32> = (0..3072).map(|_| rng.unit()).collect();
+    let scale = 1.0 / (hd as f32).sqrt();
+    // the CPU's answers
+    let ms = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let kk = 1.0 / (ms + 1e-5).sqrt();
+    let norm: Vec<f32> = x.iter().zip(&w).map(|(a, b)| a * kk * b).collect();
+    let group = n_head / n_kv;
+    let mut att = vec![0f32; n_head * hd];
+    for hh in 0..n_head {
+        let kh = hh / group;
+        let mut s: Vec<f32> = (0..n).map(|t| (0..hd).map(|j| q[hh * hd + j] * k[(t * n_kv + kh) * hd + j]).sum::<f32>() * scale).collect();
+        let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        s.iter_mut().for_each(|v| *v = (*v - m).exp());
+        let t: f32 = s.iter().sum();
+        for (tt, p) in s.iter().enumerate() {
+            for j in 0..hd {
+                att[hh * hd + j] += p / t * v[(tt * n_kv + kh) * hd + j];
+            }
+        }
+    }
+    for d in &devices {
+        let g = Gpu::open(&d.name).unwrap();
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            assert!(got.len() == want.len() && worst < 2e-4, "{} {what}: worst {worst}", d.name);
+        };
+        close(&g.read(&g.rms_norm(&g.buffer(&x), &g.buffer(&w), 1e-5)), &norm, "rms_norm");
+        let y = g.buffer(&x);
+        g.add_into(&g.buffer(&w), &y);
+        close(&g.read(&y), &x.iter().zip(&w).map(|(a, b)| a + b).collect::<Vec<_>>(), "add_into");
+        let up = g.buffer(&x);
+        g.silu_gate(&g.buffer(&w), &up);
+        close(&g.read(&up), &x.iter().zip(&w).map(|(u, g)| u * (g / (1.0 + (-g).exp()))).collect::<Vec<_>>(), "silu_gate");
+        let tab: Vec<f32> = (0..64).flat_map(|i| { let a = i as f32 * 0.1; [a.cos(), a.sin()] }).collect();
+        let r = g.buffer(&q);
+        g.rope(&g.buffer(&tab), &r, hd as u32, hd as u32, false);
+        let mut want = q.clone();
+        for h in want.chunks_mut(hd) {
+            for p in 0..64 {
+                let (c, s) = (tab[p * 2], tab[p * 2 + 1]);
+                let (a, b) = (h[p * 2], h[p * 2 + 1]);
+                h[p * 2] = a * c - b * s;
+                h[p * 2 + 1] = a * s + b * c;
+            }
+        }
+        close(&g.read(&r), &want, "rope");
+        let cache = g.scratch(k.len());
+        for t in 0..n {
+            let row = n_kv * hd;
+            g.kv_append(&g.buffer(&k[t * row..(t + 1) * row]), &cache, t * row);
+        }
+        close(&g.read(&cache), &k, "kv_append");
+        let s = g.scratch(n_head * n);
+        let o = g.attend(&g.buffer(&q), &cache, &g.buffer(&v), &s, n as u32, n_head as u32, n_kv as u32, hd as u32, scale);
+        close(&g.read(&o), &att, "attend");
+        eprintln!("{}: the chain matches", d.name);
+    }
+}

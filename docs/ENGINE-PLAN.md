@@ -75,3 +75,21 @@ that alters the tokens fails its phase.
 - CubeCL's compute model may limit phase 1. If so, phase 1 falls back to a thin CUDA layer for this card, with the Vulkan and
   HIP paths staying on CubeCL, and that is decided by measurement in phase 1.
 - Upstream keeps moving (STRATA-0.2-SURVEY.md): the C++ engines keep getting faster while this is built.
+
+## Phase 1 measured (2026-10-31)
+
+`--graph` runs a whole token on the device for dense attention models, with every matrix on one device. Ministral-3 3B Q4_K_M
+on one RTX 5060 Ti, 96 tokens:
+
+| Path | tok/s |
+|---|---|
+| CPU graph with products on the GPU (`--devices cuda:0=13`) | 15.6 |
+| `--graph` | 25.4 |
+
+- **Parity passes:** 23 of 24 steps identical plus 1 near-tie, worst logit difference 0.185.
+- **The 3x gate is not met:** 1.6x, so `--graph` stays opt-in.
+- **Where the time goes, per kernel class over 96 tokens:** the matrix products take about 3.3 s (feed-forward up and gate 1.5,
+  down 0.8, q/k/v 0.6, o 0.4); norm 0.29, attention 0.10, RoPE, KV, add and SiLU under 0.1 each. Each class was forced to wait for
+  the device, which added about 1.2 s across the run, and that overhead sits in those figures.
+- **What that means:** the limit is the product kernel, about 58 GB/s of weights read and decoded, not CubeCL's dispatch. The next
+  step is the kernel itself (its shared-memory sum and per-group layout) or the thin CUDA layer named under Risks.
