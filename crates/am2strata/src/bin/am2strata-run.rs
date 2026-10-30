@@ -128,6 +128,11 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+    /// wait until nvidia-smi sees every NVIDIA card on the PCI bus (a GPU on USB4 comes up after the boot); never fails
+    WaitGpus {
+        #[arg(long, default_value_t = 150)]
+        timeout: u64,
+    },
     /// a STRP expert profile (*.prof) as strata-poly's "layer expert count" text
     ProfileToCounts {
         #[arg(long = "in")]
@@ -398,9 +403,10 @@ fn install(s: &ServerArgs) -> ExitCode {
     let cmd = server_cmd(s).iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect::<Vec<_>>().join(" ");
     let text = format!(
         "[Unit]\nDescription=am2Strata server (port {port}); replaces {SERVICE} while installed\nAfter=network-online.target\n\
-         Conflicts={SERVICE}.service\n\n[Service]\nType=simple\nWorkingDirectory={root}\nExecStart={cmd}\nKillSignal=SIGINT\n\
+         Conflicts={SERVICE}.service\n\n[Service]\nType=simple\nWorkingDirectory={root}\nExecStartPre={wait} wait-gpus\n\
+         TimeoutStartSec=240\nExecStart={cmd}\nKillSignal=SIGINT\n\
          Restart=on-failure\nRestartSec=15\nTimeoutStopSec=90\n\n[Install]\nWantedBy=default.target\n",
-        port = s.port, root = root().display());
+        port = s.port, root = root().display(), wait = binary().with_file_name("am2strata-run").display());
     let path = unit_dir().join(format!("{BOOT_UNIT}.service"));
     if let Err(e) = std::fs::create_dir_all(unit_dir()).and_then(|_| std::fs::write(&path, text)) {
         say(format!("could not write {}: {e}", path.display()));
@@ -421,6 +427,29 @@ fn install(s: &ServerArgs) -> ExitCode {
     }
     say(format!("am2Strata now starts at boot ({BOOT_UNIT}); {SERVICE} is disabled. Undo: am2strata-run uninstall"));
     ExitCode::SUCCESS
+}
+
+/// The boot service starts after this, so a split config finds both cards; a card that never comes is the server's to
+/// report (it runs on the others), so this always succeeds.
+fn wait_gpus(timeout: u64) -> ExitCode {
+    let cards = || std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten().filter(|d| {
+        let read = |n: &str| std::fs::read_to_string(d.path().join(n)).unwrap_or_default();
+        read("vendor").trim() == "0x10de" && read("class").starts_with("0x03")
+    }).count();
+    let seen = || Command::new("nvidia-smi").arg("-L").output().map(|o| String::from_utf8_lossy(&o.stdout).lines().filter(|l| l.starts_with("GPU ")).count()).unwrap_or(0);
+    let t0 = std::time::Instant::now();
+    loop {
+        let (want, have) = (cards(), seen());
+        if have >= want {
+            say(format!("{have} of {want} GPU(s) ready"));
+            return ExitCode::SUCCESS;
+        }
+        if t0.elapsed().as_secs() >= timeout {
+            say(format!("only {have} of {want} GPU(s) after {timeout} s; going on without the others"));
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
 }
 
 fn uninstall() -> ExitCode {
@@ -523,6 +552,7 @@ fn main() -> ExitCode {
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
+        Cmd::WaitGpus { timeout } => wait_gpus(timeout),
         Cmd::ProfileToCounts { input, out } => done(std::fs::read(expand_path(&input)).map_err(|e| e.to_string())
             .and_then(|b| strata_hub::pull::strp_to_counts(&b))
             .and_then(|t| std::fs::write(expand_path(&out), t).map_err(|e| e.to_string()))),

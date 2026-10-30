@@ -426,7 +426,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false)
     };
     // the config's "tool_call_recovery" (Kolibri 1): a declared tool's call written as JSON inside <tool_call>
-    parser.set_recover(loaded.entry.cfg.rest.get("tool_call_recovery") == Some(&Value::Bool(true)));
+    parser.set_recover(loaded.entry.cfg.rest.get("tool_call_recovery") != Some(&Value::Bool(false)));
     let repeat_stop = loaded.entry.cfg.rest.get("repeat_stop_tokens").and_then(Value::as_u64).unwrap_or(REPEAT_STOP_TOKENS as u64) as usize;
     let mut opening = Vec::new();
     if let (Some(f), false) = (&force, thinking) {

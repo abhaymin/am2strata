@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use strata_gguf::{extract_tokenizer, Gguf};
 
 /// GGUF architectures strata-poly runs (src/poly/engine.cpp Engine::open), with their display family.
-pub const POLY_ARCHS: [(&str, &str); 8] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("glm5next", "GLM-5 Next"), ("glm5-next", "GLM-5 Next"),
+pub const POLY_ARCHS: [(&str, &str); 9] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("clover_moe", "Clover-35B-A3B"), ("glm5next", "GLM-5 Next"), ("glm5-next", "GLM-5 Next"),
                                            ("gemma4", "Gemma 4"), ("deepseek4", "DeepSeek V4"), ("lfm2moe", "LFM2 MoE"),
                                            ("flint", "Flint 40B-A2.5B"), ("kolibri1", "Kolibri 1")];
 

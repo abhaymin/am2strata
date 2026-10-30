@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
         .route("/v1/responses/{*rest}", get(responses::not_stored).post(responses::not_stored).delete(responses::not_stored))
         .route("/v1/messages", post(anthropic::messages))
         .route("/v1/messages/count_tokens", post(anthropic::count_tokens))
+        .route("/api/system", get(web::system))
         .route("/api/models", get(web::list_models))
         .route("/api/models/current", get(web::current_model))
         .route("/api/models/load", post(web::load_model))

@@ -2,9 +2,11 @@
 //! XML form (`<tool_call>\n<function=NAME>\n<parameter=P>\nVALUE\n</parameter>\n</function>\n</tool_call>`).
 //! A tag split across deltas is held back until it is complete, so clients never see `<tool_` or `</thi`.
 //!
-//! Port of PolyStrata serve/frontend.py `OutputParser` for call_format "function" with recovery off (the server's
-//! defaults), including streamed tool arguments, quoted `</think>` (#537), calls written inside the reasoning (#804,
-//! #1058) and openers inside code (#1058). GLM, Gemma, DeepSeek and LFM2 call formats are not ported yet.
+//! Port of Strata / PolyStrata serve/frontend.py `OutputParser` for call_format "function", including streamed tool
+//! arguments, quoted `</think>` (#537), calls written inside the reasoning (#804, #1058), openers inside code (#1058),
+//! and from Strata 0.2.8: values that quote a call (#4078), a left-out `</function>` or `</tool_call>` (#4427), damaged
+//! JSON arguments (#4427), a stray second `</think>` (#4077) and the recoveries (a bare `<function=`, `<parameter=NAME>`
+//! as the opener, several calls in one wrapper). The other call formats are in formats.rs.
 
 use crate::formats::CallFormat;
 use serde_json::{Map, Value};
@@ -85,21 +87,90 @@ fn find_from(s: &str, pat: &str, from: usize) -> Option<usize> {
     s.get(from..).and_then(|t| t.find(pat)).map(|i| i + from)
 }
 
+/// How many calls `text` quotes: `<function=NAME>` followed (after whitespace) by a `<parameter=` or `</function>`.
+fn quoted_opens(text: &str) -> usize {
+    let mut n = 0;
+    let mut at = 0;
+    while let Some(p) = find_from(text, FUNC_START, at) {
+        at = p + FUNC_START.len();
+        let rest = &text[at..];
+        let Some(gt) = rest.find(|c: char| c == '<' || c == '>' || c.is_whitespace()) else { break };
+        if gt > 0 && rest[gt..].starts_with('>') {
+            let after = rest[gt + 1..].trim_start();
+            if after.starts_with(PARAM_START) || after.starts_with(FUNC_END) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
-/// `<parameter=` or `</function>`. -1: none yet; -2: a candidate whose follower has not arrived (`fin` accepts it).
-fn param_end(text: &str, fin: bool) -> isize {
+/// `<parameter=` or `</function>`, or by `</tool_call>` when the call's `</function>` was left out (#4427). A close inside
+/// a call the value itself quotes, or one followed by the same parameter `name` again, is part of the value (#4078).
+/// -1: none yet; -2: a candidate whose follower has not arrived (`fin` accepts it).
+fn param_end(text: &str, fin: bool, name: Option<&str>) -> isize {
     let mut at = text.find(PARAM_END);
     while let Some(a) = at {
-        let after = text[a + PARAM_END.len()..].trim_start();
-        if after.starts_with(PARAM_START) || after.starts_with(FUNC_END) {
-            return a as isize;
-        }
-        if after.is_empty() || PARAM_START.starts_with(after) || FUNC_END.starts_with(after) {
-            return if fin { a as isize } else { -2 };
+        if quoted_opens(&text[..a]) <= text[..a].matches(FUNC_END).count() {
+            let after = text[a + PARAM_END.len()..].trim_start();
+            if after.starts_with(PARAM_START) {
+                let Some(gt) = after.find('>') else { return if fin { a as isize } else { -2 } };
+                if name.is_none_or(|n| after[PARAM_START.len()..gt].trim() != n) {
+                    return a as isize;
+                }
+            } else if after.starts_with(FUNC_END) || after.starts_with(CALL_END) {
+                return a as isize;
+            } else if after.is_empty() || PARAM_START.starts_with(after) || FUNC_END.starts_with(after) || CALL_END.starts_with(after) {
+                return if fin { a as isize } else { -2 };
+            }
         }
         at = find_from(text, PARAM_END, a + 1);
     }
     -1
+}
+
+/// The parameter name between `<parameter=` at `pos` and the `>` at `gt`.
+fn param_name(text: &str, pos: usize, gt: usize) -> &str {
+    text[pos..gt].split_once('=').map_or("", |x| x.1).trim()
+}
+
+/// Where a `<function=...>` body ends: just after its own `</function>`. -1: not complete, or not such a body.
+fn function_end(text: &str) -> isize {
+    let s = text.trim_start();
+    let mut pos = text.len() - s.len();
+    if !s.starts_with(FUNC_START) {
+        return -1;
+    }
+    let Some(gt) = find_from(text, ">", pos) else { return -1 };
+    pos = gt + 1;
+    loop {
+        let rest = &text[pos..];
+        let s = rest.trim_start();
+        pos += rest.len() - s.len();
+        if s.starts_with(PARAM_START) {
+            let Some(gt) = find_from(text, ">", pos) else { return -1 };
+            let end = param_end(&text[gt + 1..], false, Some(param_name(text, pos, gt)));
+            if end < 0 {
+                return -1;
+            }
+            pos = gt + 1 + end as usize + PARAM_END.len();
+        } else if s.starts_with(FUNC_END) {
+            return (pos + FUNC_END.len()) as isize;
+        } else {
+            return -1;
+        }
+    }
+}
+
+/// `<tool_call>` + `<function=NAME>` at the start of `text`: a following call, which confirms an omitted closer.
+fn next_wrapped_call(text: &str) -> bool {
+    let Some(r) = text.strip_prefix(CALL_START) else { return false };
+    let r = r.trim_start();
+    let Some(r) = r.strip_prefix(FUNC_START) else { return false };
+    let r = r.trim_start();
+    let n = r.find(|c: char| c == '<' || c == '>' || c.is_whitespace()).unwrap_or(r.len());
+    n > 0 && r[n..].trim_start().starts_with('>')
 }
 
 /// Where a tool call's body ends: the `</tool_call>` after the call's own `</function>`. -1: not complete yet.
@@ -117,7 +188,7 @@ fn call_end(text: &str) -> isize {
         pos += rest.len() - s.len();
         if s.starts_with(PARAM_START) {
             let Some(gt) = find_from(text, ">", pos) else { return -1 };
-            let end = param_end(&text[gt + 1..], false);
+            let end = param_end(&text[gt + 1..], false, Some(param_name(text, pos, gt)));
             if end < 0 {
                 return -1;
             }
@@ -139,16 +210,195 @@ fn call_end(text: &str) -> isize {
 
 /// A parameter's text as the type its schema declares.
 pub(crate) fn param_value(value: &str, declared: Option<&str>) -> Value {
+    coerce_value(value, declared, &mut Vec::new())
+}
+
+/// The longest value `lenient_json` tries.
+const LENIENT_MAX: usize = 1 << 20;
+/// A declared type list that holds "string" (a value that is not JSON is that string, never repaired).
+const TYPE_LIST_WITH_STRING: &str = "[string]";
+
+/// The JSON array or object `text` was meant to be, read past a model's slips (#4427): a trailing or doubled comma, single
+/// quotes, Python's True / False / None, a bare string between two members of an object, brackets left open at the end,
+/// extra closers at the end. It never guesses at a value. Err for anything else.
+pub fn lenient_json(text: &str) -> Result<Value, ()> {
+    let mut t = text.trim();
+    if let Some(rest) = strip_json_fence(t) {
+        t = rest.trim_end();
+        t = t.strip_suffix("```").map_or(t, str::trim_end);
+    }
+    if !(t.starts_with('[') || t.starts_with('{')) || t.len() > LENIENT_MAX {
+        return Err(());
+    }
+    let mut r = Lenient { s: t.chars().collect(), i: 0 };
+    let v = r.value(0)?;
+    let tail: String = r.s[r.i.min(r.s.len())..].iter().collect();
+    if tail.trim_matches(|c| matches!(c, ']' | '}' | ')' | ' ' | '\t' | '\r' | '\n')).is_empty() { Ok(v) } else { Err(()) }
+}
+
+/// What follows "```" + an optional `json` + a line break (and white space) at the start of `t`.
+fn strip_json_fence(t: &str) -> Option<&str> {
+    let r = t.strip_prefix("```")?.trim_start_matches([' ', '\t']);
+    let r = if r.len() >= 4 && r.is_char_boundary(4) && r[..4].eq_ignore_ascii_case("json") { &r[4..] } else { r };
+    let r = r.trim_start_matches([' ', '\t']);
+    let r = r.strip_prefix('\r').unwrap_or(r);
+    r.strip_prefix('\n').map(str::trim_start)
+}
+
+struct Lenient {
+    s: Vec<char>,
+    i: usize,
+}
+
+impl Lenient {
+    fn peek(&mut self) -> Option<char> {
+        while self.s.get(self.i).is_some_and(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
+            self.i += 1;
+        }
+        self.s.get(self.i).copied()
+    }
+
+    fn string(&mut self) -> Result<String, ()> {
+        let q = self.s[self.i];
+        self.i += 1;
+        let mut out = String::new();
+        while let Some(&c) = self.s.get(self.i) {
+            if c == q {
+                self.i += 1;
+                return Ok(out);
+            }
+            if c == '\\' {
+                self.i += 1;
+                let e = *self.s.get(self.i).ok_or(())?;
+                if e == 'u' {
+                    let hex: String = self.s.get(self.i + 1..self.i + 5).ok_or(())?.iter().collect();
+                    let cp = u32::from_str_radix(&hex, 16).map_err(|_| ())?;
+                    out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                    self.i += 5;
+                    continue;
+                }
+                out.push(match e {
+                    '"' | '\'' | '\\' | '/' => e,
+                    'b' => '\u{08}',
+                    'f' => '\u{0C}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    _ => return Err(()),
+                });
+            } else {
+                out.push(c);
+            }
+            self.i += 1;
+        }
+        Err(())
+    }
+
+    fn value(&mut self, depth: usize) -> Result<Value, ()> {
+        if depth > 64 {
+            return Err(());
+        }
+        match self.peek() {
+            Some('{') => return self.obj(depth + 1),
+            Some('[') => return self.arr(depth + 1),
+            Some('"' | '\'') => return self.string().map(Value::String),
+            _ => {}
+        }
+        let start = self.i;
+        while self.s.get(self.i).is_some_and(|c| !(c.is_whitespace() || matches!(c, ',' | ']' | '}' | ':'))) {
+            self.i += 1;
+        }
+        if self.i == start {
+            return Err(());
+        }
+        let word: String = self.s[start..self.i].iter().collect();
+        match word.as_str() {
+            "true" | "True" => Ok(Value::Bool(true)),
+            "false" | "False" => Ok(Value::Bool(false)),
+            "null" | "None" => Ok(Value::Null),
+            w => serde_json::from_str(w).map_err(|_| ()), // a number, or an error
+        }
+    }
+
+    fn obj(&mut self, depth: usize) -> Result<Value, ()> {
+        self.i += 1;
+        let mut out = Map::new();
+        loop {
+            match self.peek() {
+                None | Some('}') => {
+                    self.i += 1; // (no closer: the brackets were left open at the end)
+                    return Ok(Value::Object(out));
+                }
+                Some(',') => self.i += 1,
+                Some('"' | '\'') => {
+                    let key = self.string()?;
+                    match self.peek() {
+                        Some(':') => {
+                            self.i += 1;
+                            let v = self.value(depth)?;
+                            out.insert(key, v);
+                        }
+                        None | Some(',' | '}') => {} // a bare string where a member belongs is dropped
+                        _ => return Err(()),
+                    }
+                }
+                _ => return Err(()),
+            }
+        }
+    }
+
+    fn arr(&mut self, depth: usize) -> Result<Value, ()> {
+        self.i += 1;
+        let mut out = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some(']') => {
+                    self.i += 1;
+                    return Ok(Value::Array(out));
+                }
+                Some(',') => self.i += 1,
+                _ => {
+                    out.push(self.value(depth)?);
+                    if !matches!(self.peek(), None | Some(',' | ']')) {
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A non-string parameter's text -> its value by the declared type: JSON when it parses; else an array or object read
+/// with `lenient_json` (with a note in `notes`); else the text itself. An array or object that arrived as a JSON string
+/// of itself is decoded once more.
+pub(crate) fn coerce_value(value: &str, declared: Option<&str>, notes: &mut Vec<String>) -> Value {
     if declared == Some("string") {
         return Value::String(value.into());
     }
-    if let Ok(v) = serde_json::from_str::<Value>(value) {
-        return v;
+    match serde_json::from_str::<Value>(value) {
+        Ok(Value::String(v)) if matches!(declared, Some("array" | "object")) && v.trim_start().starts_with(['[', '{']) => {
+            match serde_json::from_str::<Value>(&v) {
+                Ok(inner) => inner,
+                Err(_) => coerce_value(&v, declared, notes),
+            }
+        }
+        Ok(v) => v,
+        Err(_) => {
+            if declared == Some("boolean") && matches!(value.trim().to_lowercase().as_str(), "true" | "false") {
+                return Value::Bool(value.trim().eq_ignore_ascii_case("true"));
+            }
+            if !value.trim_start().starts_with(['[', '{', '`']) || declared == Some(TYPE_LIST_WITH_STRING) {
+                return Value::String(value.into());
+            }
+            match lenient_json(value) {
+                Ok(v) => {
+                    notes.push(format!("a damaged JSON {} argument was read as written", if v.is_array() { "array" } else { "object" }));
+                    v
+                }
+                Err(()) => Value::String(value.into()),
+            }
+        }
     }
-    if declared == Some("boolean") && matches!(value.trim().to_lowercase().as_str(), "true" | "false") {
-        return Value::Bool(value.trim().eq_ignore_ascii_case("true"));
-    }
-    Value::String(value.into())
 }
 
 fn declared_types(schema: Option<&Value>) -> HashMap<String, Option<String>> {
@@ -157,7 +407,11 @@ fn declared_types(schema: Option<&Value>) -> HashMap<String, Option<String>> {
         .and_then(|p| p.get("properties"))
         .and_then(Value::as_object)
         .map(|props| {
-            props.iter().map(|(k, v)| (k.clone(), v.get("type").and_then(Value::as_str).map(str::to_owned))).collect()
+            props.iter().map(|(k, v)| {
+                let t = v.get("type");
+                let with_string = t.and_then(Value::as_array).is_some_and(|l| l.iter().any(|x| x == "string"));
+                (k.clone(), if with_string { Some(TYPE_LIST_WITH_STRING.to_string()) } else { t.and_then(Value::as_str).map(str::to_owned) })
+            }).collect()
         })
         .unwrap_or_default()
 }
@@ -193,6 +447,11 @@ fn json_call(inner: &str, schemas: &HashMap<String, Value>) -> Option<ToolCall> 
 
 /// `<function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>` -> ToolCall.
 pub fn parse_tool_call(body: &str, schema: Option<&Value>) -> Result<ToolCall, ParseError> {
+    parse_tool_call_noted(body, schema, &mut Vec::new())
+}
+
+/// `parse_tool_call`, with what was repaired in the arguments added to `notes`.
+pub fn parse_tool_call_noted(body: &str, schema: Option<&Value>, notes: &mut Vec<String>) -> Result<ToolCall, ParseError> {
     let body = body.trim();
     let malformed = || ParseError(format!("malformed tool call: {}", body.chars().take(80).collect::<String>()));
     if !body.starts_with(FUNC_START) || !body.contains('>') {
@@ -208,10 +467,10 @@ pub fn parse_tool_call(body: &str, schema: Option<&Value>) -> Result<ToolCall, P
         let gt = rest.find('>').ok_or_else(malformed)?;
         let pname = rest[..gt].to_string();
         rest = &rest[gt + 1..];
-        let end = param_end(rest, true);
+        let end = param_end(rest, true, Some(pname.trim()));
         let value = if end >= 0 { &rest[..end as usize] } else { rest };
         let next = if end >= 0 { &rest[end as usize + PARAM_END.len()..] } else { "" };
-        let v = param_value(strip_one_newline(value), types.get(&pname).and_then(|t| t.as_deref()));
+        let v = coerce_value(strip_one_newline(value), types.get(&pname).and_then(|t| t.as_deref()), notes);
         args.insert(pname, v);
         rest = next;
     }
@@ -269,6 +528,16 @@ pub struct OutputParser {
     /// the config's "tool_call_recovery": a declared tool's call written as JSON inside <tool_call> is the call
     recover: bool,
     pending: Vec<(String, Option<ToolCall>)>,
+    /// what was repaired in the arguments of the calls (a damaged JSON array or object)
+    pub notes: Vec<String>,
+    /// #4077: the reasoning ended at a bare `</think>`, so a second one at the start of a line in the answer is a stray...
+    after_think: bool,
+    /// ... and the strays of that kind dropped from the answer
+    pub stray_think: usize,
+    /// recover: the call being read opened with `<function=` alone, no `<tool_call>` around it
+    bare: bool,
+    /// recover: the next call follows in the same `<tool_call>`
+    batch: bool,
     pub rescued: usize,
     pub refused: usize,
     fence: String,
@@ -282,6 +551,8 @@ pub struct OutputParser {
     sval_started: bool,
     sdeclared: HashMap<String, Option<String>>,
     stype: Option<String>,
+    spname: Option<String>,
+    svstart: usize,
     format: CallFormat,
     call_start: &'static str,
     call_stop: &'static str,
@@ -326,6 +597,11 @@ impl OutputParser {
             stream_tools,
             recover: false,
             pending: Vec::new(),
+            notes: Vec::new(),
+            after_think: false,
+            stray_think: 0,
+            bare: false,
+            batch: false,
             rescued: 0,
             refused: 0,
             fence: String::new(),
@@ -339,6 +615,8 @@ impl OutputParser {
             sval_started: false,
             sdeclared: HashMap::new(),
             stype: None,
+            spname: None,
+            svstart: 0,
             format,
             call_start,
             call_stop,
@@ -361,6 +639,8 @@ impl OutputParser {
         self.sval_started = false;
         self.sdeclared.clear();
         self.stype = None;
+        self.spname = None;
+        self.svstart = 0;
     }
 
     /// Follow the text that has gone out: the open code fence, the current line, and the backticks of the paragraph.
@@ -392,6 +672,61 @@ impl OutputParser {
             }
         }
         text.to_string()
+    }
+
+    /// Whether an opener at buf[p] stands at the start of a line, outside code (the text before it decides).
+    fn ok_at(&mut self, p: usize) -> bool {
+        let snap = (self.fence.clone(), self.line.clone(), self.ticks);
+        let before = self.buf[..p].to_string();
+        self.track(&before);
+        let ok = self.opener_ok();
+        (self.fence, self.line, self.ticks) = snap;
+        ok
+    }
+
+    /// recover: the first `<function=` in buf that opens a call without the wrapper (start of a line, outside code, a
+    /// declared tool) -> (position, decided). A name still arriving is undecided.
+    fn bare_opener(&mut self) -> Option<(usize, bool)> {
+        let mut p = self.buf.find(FUNC_START);
+        while let Some(at) = p {
+            if self.ok_at(at) {
+                let from = at + FUNC_START.len();
+                let gt = find_from(&self.buf, ">", from);
+                let raw = &self.buf[from..gt.unwrap_or(self.buf.len())];
+                if gt.is_none() && !raw.trim().contains(|c: char| c == '<' || c.is_whitespace()) {
+                    return Some((at, false));
+                }
+                if gt.is_some() && self.schemas.contains_key(raw.trim()) {
+                    return Some((at, true));
+                }
+            }
+            p = find_from(&self.buf, FUNC_START, at + 1);
+        }
+        None
+    }
+
+    /// recover: `<parameter=NAME>` with a declared NAME where a call opens. None: not decided yet.
+    fn param_opener(&self, after: &str) -> Option<bool> {
+        let Some(gt) = after.find('>') else { return if after.contains('\n') { Some(false) } else { None } };
+        Some(self.schemas.contains_key(&after[PARAM_START.len()..gt]))
+    }
+
+    /// #4077: where buf has a `</think>` at the start of a line, in the answer of a turn whose reasoning already ended at
+    /// one. A fence or backtick is no reason to keep it: the reasoning may have left one open.
+    fn stray_think_at(&self) -> Option<usize> {
+        let mut k = self.buf.find(THINK_END);
+        while let Some(at) = k {
+            let before = &self.buf[..at];
+            let line = match before.rfind('\n') {
+                Some(n) => before[n + 1..].to_string(),
+                None => format!("{}{before}", self.line),
+            };
+            if line.trim().is_empty() {
+                return Some(at);
+            }
+            k = find_from(&self.buf, THINK_END, at + 1);
+        }
+        None
     }
 
     fn opener_ok(&self) -> bool {
@@ -508,6 +843,7 @@ impl OutputParser {
                         self.args(&mut out, format!("{lead}{}:", py_str(&pname, true)));
                         self.sfirst = false;
                         self.sp += b + 1;
+                        self.spname = Some(pname.trim().to_string());
                         if self.sdeclared.get(&pname).and_then(|t| t.as_deref()) == Some("string") {
                             self.args(&mut out, "\"".into());
                             self.ss = Scan::Str;
@@ -535,8 +871,20 @@ impl OutputParser {
                             rest = r;
                         }
                         self.sval_started = true;
+                        self.svstart = self.sp;
                     }
-                    let end = param_end(rest, false);
+                    // the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
+                    let mut end = if rest.contains(PARAM_END) {
+                        param_end(&self.buf[self.svstart..], false, self.spname.as_deref())
+                    } else {
+                        -1
+                    };
+                    if end >= 0 {
+                        end -= (self.sp - self.svstart) as isize;
+                        if end < 0 {
+                            end = -1;
+                        }
+                    }
                     if end >= 0 {
                         let value = &rest[..end as usize];
                         let value = value.strip_suffix('\n').unwrap_or(value);
@@ -562,12 +910,12 @@ impl OutputParser {
                     return out;
                 }
                 Scan::Raw => {
-                    let end = param_end(&rest, false);
+                    let end = param_end(&rest, false, self.spname.as_deref());
                     if end < 0 {
                         return out;
                     }
                     let value = strip_one_newline(&rest[..end as usize]);
-                    let v = param_value(value, self.stype.as_deref());
+                    let v = param_value(value, self.stype.as_deref()); // the note comes with the final call
                     self.args(&mut out, py_dumps(&v, false));
                     self.sp += end as usize + PARAM_END.len();
                     self.ss = Scan::Between;
@@ -595,10 +943,24 @@ impl OutputParser {
         out
     }
 
+    /// A whole call body -> its tool_call event. With recover, one that still does not parse is the text it is instead of
+    /// an error that ends the request.
     fn finish_call(&mut self, body: &str) -> Result<Vec<Event>, ParseError> {
         let t = body.trim();
         let name = t.get(FUNC_START.len()..).unwrap_or("").split('>').next().unwrap_or("").trim().to_string();
-        let mut call = parse_tool_call(body, self.schemas.get(&name))?;
+        let bare = std::mem::take(&mut self.bare);
+        let schema = self.schemas.get(&name).cloned();
+        let mut call = match parse_tool_call_noted(body, schema.as_ref(), &mut self.notes) {
+            Ok(c) => c,
+            Err(e) if !self.recover => return Err(e),
+            Err(_) => {
+                self.reset_scan();
+                self.state = State::Content;
+                let raw = if bare { body.to_string() } else { format!("{CALL_START}{body}{CALL_END}") };
+                let t = self.track(&raw);
+                return Ok(vec![Event::Content(t)]);
+            }
+        };
         if let Some(s) = &self.scall {
             call.id = s.id.clone();
         }
@@ -617,24 +979,29 @@ impl OutputParser {
             match self.state {
                 State::RCall => {
                     let body = self.buf[CALL_START.len()..].to_string();
-                    let end = call_end(&body);
+                    let mut end = call_end(&body);
+                    let mut drop = CALL_END.len();
+                    let f = function_end(&body); // #4427: as in the answer, a following call opener confirms an omitted closer
+                    if f >= 0 && (end < 0 || f < end) && next_wrapped_call(body[f as usize..].trim_start()) {
+                        (end, drop) = (f, 0);
+                    }
                     let think = body.find(THINK_END);
                     if end >= 0 && think.is_none_or(|t| t >= end as usize) {
                         let end = end as usize;
                         let mut call = None;
                         let head = body[..end].trim();
                         let name = head.get(FUNC_START.len()..).unwrap_or("").split('>').next().unwrap_or("").trim();
-                        if let Some(schema) = self.schemas.get(name) {
-                            call = parse_tool_call(&body[..end], Some(schema)).ok();
+                        if let Some(schema) = self.schemas.get(name).cloned() {
+                            call = parse_tool_call_noted(&body[..end], Some(&schema), &mut self.notes).ok();
                         }
-                        let raw = self.buf[..CALL_START.len() + end + CALL_END.len()].to_string();
+                        let raw = self.buf[..CALL_START.len() + end + drop].to_string();
                         if call.is_some() || !self.pending.is_empty() {
                             self.pending.push((raw, call));
                         } else {
                             let t = self.track(&raw);
                             out.push(Event::Reasoning(t));
                         }
-                        self.buf = body[end + CALL_END.len()..].to_string();
+                        self.buf = body[end + drop..].to_string();
                         self.state = State::Reasoning;
                     } else if let Some(think) = think {
                         out.extend(self.release(false));
@@ -733,6 +1100,7 @@ impl OutputParser {
                     self.buf = self.buf[i + think_end.len()..].to_string();
                     self.state = State::Content;
                     self.lead = true;
+                    self.after_think = self.format == CallFormat::Function;
                     self.fence.clear();
                     self.line.clear();
                     self.ticks = 0;
@@ -765,10 +1133,62 @@ impl OutputParser {
                         self.buf = stripped.to_string();
                         self.lead = false;
                     }
-                    let Some(i) = self.buf.find(self.call_start) else {
+                    let opener = self.buf.find(self.call_start);
+                    let stray = if self.after_think { self.stray_think_at() } else { None };
+                    if let Some(st) = stray.filter(|st| opener.is_none_or(|i| *st < i)) {
+                        // #4077: the reasoning ended at a `</think>` the model wrote while thinking, and this is the one
+                        // that ends it. What came between went out as the answer; the tag is dropped and the text after
+                        // it starts over, so a call that follows is not taken for a quote.
+                        if st > 0 {
+                            let head = self.buf[..st].to_string();
+                            let t = self.track(&head);
+                            out.push(Event::Content(t));
+                        }
+                        self.buf = self.buf[st + THINK_END.len()..].to_string();
+                        self.fence.clear();
+                        self.line.clear();
+                        self.ticks = 0;
+                        self.lead = true;
+                        self.stray_think += 1;
+                        continue;
+                    }
+                    let recovering = self.recover && tools;
+                    if let Some((b, decided)) = if recovering { self.bare_opener() } else { None }.filter(|(b, _)| opener.is_none_or(|i| *b < i)) {
+                        // recover: <function=NAME> alone at the start of a line, the call without its <tool_call>. Until
+                        // the name has arrived it is held.
+                        let mut j = b;
+                        while j > 0 && self.buf.as_bytes()[j - 1] == b'\n' {
+                            j -= 1;
+                        }
+                        if j > 0 && !self.buf[..j].trim().is_empty() {
+                            let head = self.buf[..j].to_string();
+                            let t = self.track(&head);
+                            out.push(Event::Content(t));
+                        }
+                        if !decided {
+                            self.buf = self.buf[j..].to_string();
+                            return Ok(out);
+                        }
+                        self.buf = self.buf[b..].to_string();
+                        self.state = State::Call;
+                        self.bare = true;
+                        continue;
+                    }
+                    let Some(i) = opener else {
                         let mut tags = vec![self.call_start];
                         tags.extend(self.noise);
+                        if self.after_think {
+                            tags.push(THINK_END);
+                        }
                         let mut j = self.buf.len() - Self::hold(&self.buf, &tags);
+                        if recovering {
+                            // a line that may be becoming a bare <function=
+                            let k = self.buf.rfind('\n').map_or(0, |n| n + 1);
+                            let tail = self.buf[k..].to_string();
+                            if !tail.is_empty() && FUNC_START.starts_with(tail.as_str()) && self.ok_at(k) {
+                                j = j.min(k);
+                            }
+                        }
                         while j > 0 && self.buf.as_bytes()[j - 1] == b'\n' {
                             j -= 1;
                         }
@@ -834,6 +1254,23 @@ impl OutputParser {
                             continue;
                         }
                     }
+                    if self.recover && tools && (after.starts_with(PARAM_START) || (!after.is_empty() && PARAM_START.starts_with(after.as_str()))) {
+                        let decided = if after.starts_with(PARAM_START) { self.param_opener(&after) } else { None };
+                        if decided.is_none() {
+                            return Ok(out); // the name is still arriving
+                        }
+                        if decided == Some(true) {
+                            // <parameter=NAME> as the opener: the call's <function=NAME>
+                            if i > 0 && !self.buf[..i].trim().is_empty() {
+                                let head = self.buf[..i].trim_end_matches('\n').to_string();
+                                let t = self.track(&head);
+                                out.push(Event::Content(t));
+                            }
+                            self.buf = format!("{FUNC_START}{}", &after[PARAM_START.len()..]);
+                            self.state = State::Call;
+                            continue;
+                        }
+                    }
                     if !after.is_empty() && !after.starts_with(FUNC_START) && !FUNC_START.starts_with(after.as_str()) {
                         let head = self.buf[..i + CALL_START.len()].to_string();
                         let t = self.track(&head);
@@ -889,11 +1326,46 @@ impl OutputParser {
                     self.lead = true;
                 }
                 State::Call => {
-                    let i = self.wrapped_call_end();
-                    let drop = (i >= 0).then_some(CALL_END.len());
+                    let (mut i, mut drop): (isize, Option<usize>);
+                    if self.bare {
+                        // no wrapper: the call ends at its </function>; a stray </tool_call> after it is the wrapper's closer
+                        i = function_end(&self.buf);
+                        drop = None;
+                        if i >= 0 {
+                            let tail = &self.buf[i as usize..];
+                            let after = tail.trim_start();
+                            if after.starts_with(CALL_END) {
+                                drop = Some(tail.len() - after.len() + CALL_END.len());
+                            } else if !after.is_empty() && !CALL_END.starts_with(after) {
+                                drop = Some(0);
+                            }
+                        }
+                    } else {
+                        i = self.wrapped_call_end();
+                        drop = (i >= 0).then_some(CALL_END.len());
+                        // only a following call opener confirms an omitted wrapper closer (#4427)
+                        let f = function_end(&self.buf);
+                        if f >= 0 {
+                            let at = self.buf.len() - self.buf[f as usize..].trim_start().len();
+                            if next_wrapped_call(&self.buf[at..]) {
+                                (i, drop) = (f, Some(0));
+                            }
+                            if self.recover {
+                                // a batch in one wrapper: the next call follows </function>
+                                let nxt = self.buf[at..].to_string();
+                                if nxt.starts_with(PARAM_START) && self.param_opener(&nxt) == Some(true) {
+                                    self.buf = format!("{}{FUNC_START}{}", &self.buf[..at], &nxt[PARAM_START.len()..]);
+                                }
+                                if self.buf[at..].starts_with(FUNC_START) {
+                                    (i, drop) = (f, Some(0));
+                                    self.batch = true;
+                                }
+                            }
+                        }
+                    }
                     if self.stream_tools {
                         if i >= 0 {
-                            let whole = std::mem::replace(&mut self.buf, String::new());
+                            let whole = std::mem::take(&mut self.buf);
                             self.buf = whole[..i as usize].to_string();
                             out.extend(self.scan());
                             out.extend(self.close_scan());
@@ -906,7 +1378,12 @@ impl OutputParser {
                     let i = i as usize;
                     let body = self.buf[..i].to_string();
                     self.buf = self.buf[i + drop..].to_string();
+                    let batch = std::mem::take(&mut self.batch);
                     out.extend(self.finish_call(&body)?);
+                    if batch && matches!(out.last(), Some(Event::ToolCall(_))) {
+                        self.state = State::Call;
+                        self.lead = false;
+                    }
                 }
             }
         }
@@ -941,14 +1418,54 @@ impl OutputParser {
     /// reasoning become real calls only on a natural stop.
     pub fn finish(&mut self, reason: Option<&str>) -> Vec<Event> {
         let mut out = Vec::new();
+        let natural = matches!(reason, None | Some("stop"));
+        if self.state == State::RCall && natural {
+            // #4427: a call in the reasoning whose `</function>` ends the output (the `</tool_call>` left out) is whole
+            let body = self.buf[CALL_START.len()..].to_string();
+            let f = function_end(&body);
+            if f >= 0 && body[f as usize..].trim().is_empty() {
+                let name = body.trim_start()[FUNC_START.len()..].split('>').next().unwrap_or("").trim().to_string();
+                if let Some(schema) = self.schemas.get(&name).cloned() {
+                    if let Ok(call) = parse_tool_call_noted(&body[..f as usize], Some(&schema), &mut self.notes) {
+                        let raw = std::mem::take(&mut self.buf);
+                        self.pending.push((raw, Some(call)));
+                        self.state = State::Reasoning;
+                    }
+                }
+            }
+        }
         if !self.pending.is_empty() {
             let deliver = matches!(reason, None | Some("stop")) && self.state == State::Reasoning && self.buf.is_empty();
             out.extend(self.release(deliver));
         }
+        if self.state == State::Call && self.bare && function_end(&self.buf) >= 0 {
+            // recover: a bare call is whole at its </function>
+            let i = function_end(&self.buf) as usize;
+            let (body, rest) = (self.buf[..i].to_string(), self.buf[i..].trim().to_string());
+            self.buf.clear();
+            if let Ok(events) = self.finish_call(&body) {
+                out.extend(events);
+            }
+            if !rest.is_empty() && !CALL_END.starts_with(rest.as_str()) {
+                let t = self.track(&rest);
+                out.push(Event::Content(t));
+            }
+            return out;
+        }
         if self.state == State::Call && self.stream_tools && self.scall.is_some() {
             out.extend(self.scan());
             if self.ss == Scan::Done {
-                out.push(Event::ToolCall(self.scall.clone().unwrap()));
+                if natural {
+                    // the final event carries the call's arguments, as the one finish_call sends does
+                    let mut call = self.scall.clone().unwrap();
+                    let schema = self.schemas.get(&call.name).cloned();
+                    if let Ok(c) = parse_tool_call_noted(&self.buf, schema.as_ref(), &mut self.notes) {
+                        call.arguments = c.arguments;
+                    }
+                    out.push(Event::ToolCall(call));
+                } else {
+                    out.push(Event::ToolCall(self.scall.clone().unwrap()));
+                }
             }
             self.buf.clear();
             self.reset_scan();

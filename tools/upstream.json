@@ -4,12 +4,12 @@
   "polystrata": {
    "github": "VecSzn/PolyStrata",
    "ref": "main",
-   "at": "504ff71d310a4a4d9dfcf9176978f68110814969",
+   "at": "20d839dbbaf34f28413e84d6e99301725f4f624b",
    "checkout": "${STRATA_HOME}"
   },
   "strata": {
    "github": "Niko1221/Strata",
-   "ref": "v0.2.7.1",
+   "ref": "v0.2.8",
    "latest_tags": true
   }
  },
@@ -39,7 +39,7 @@
   {
    "repo": "polystrata",
    "path": "serve/models.py",
-   "blob": "70c6c11223d2c0aed87abbe37a119a05d516f369",
+   "blob": "a8421234d002067b3922b7b02d646f5dcd4a28f6",
    "rust": [
     "crates/strata-engine/src/lib.rs"
    ]
@@ -65,7 +65,7 @@
   {
    "repo": "polystrata",
    "path": "tools/strata_mcp.py",
-   "blob": "1298edca6e7db751de4fc156cf3e39fe63ff8f7f",
+   "blob": "9c42d636c3d372b62a23227a8a983ff6f9a1e392",
    "rust": [
     "crates/am2strata/src/mcp.rs"
    ],
@@ -107,7 +107,7 @@
   {
    "repo": "polystrata",
    "path": "setup.py",
-   "blob": "ffa12b69872001e90f59ef14458265412a20f466",
+   "blob": "e62b3579ef84e65acabc9fe247dd7d9c3833f208",
    "rust": [
     "crates/strata-hub/src/config.rs",
     "crates/strata-hub/src/pull.rs"
@@ -130,6 +130,23 @@
     "crates/strata-pack/src/iq_pack.rs"
    ],
    "note": "only its native_experts v5 header (refused); the Hadamard packing itself is Strata 0.2's engine's"
+  },
+  {
+   "repo": "strata",
+   "path": "serve/frontend.py",
+   "blob": "3b3cdeb17a37e533a6f49f543de838d1f9387b22",
+   "rust": [
+    "crates/strata-frontend/src/output.rs"
+   ]
+  },
+  {
+   "repo": "strata",
+   "path": "serve/server.py",
+   "blob": "5614dbf1eaf3ba1820b61a13d7eb5cc22f4e791a",
+   "rust": [
+    "crates/am2strata/src/run.rs",
+    "crates/am2strata/src/manager.rs"
+   ]
   }
  ]
 }

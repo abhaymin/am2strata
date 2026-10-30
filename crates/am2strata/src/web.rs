@@ -255,6 +255,18 @@ pub async fn clear_snapshots(State(s): State<AppState>, headers: HeaderMap) -> R
     Json(json!({"freed_bytes": s.mgr.snapshots.clear()})).into_response()
 }
 
+/// GET /api/system: this machine for any client: every GPU, the CPU, the memory (each with its load now) and any NPU or TPU.
+pub async fn system(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let mon = s.mgr.monitor.clone();
+    match tokio::task::spawn_blocking(move || mon.system()).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    }
+}
+
 /// The GPUs am2strata-hybrid can put weights on here (its --list-devices, run once): their names are what
 /// "--devices" takes in a run config (e.g. "cuda:0=12,hip:0=6").
 pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {

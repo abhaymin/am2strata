@@ -102,6 +102,18 @@ pub async fn run(spec: &Spec, ev: &mut (dyn FnMut(Event) + Send)) -> Result<Outc
     let id = config::id_of(file_name);
     let display = format!("{} {tag}", g.str("general.name").filter(|n| !n.is_empty()).unwrap_or(&base));
     let w = config::write(&spec.models_dir, &spec.data_dir.join("packs"), &first, &g, mmproj.as_deref(), spec.context, &id, &display)?;
+    // a file without a chat template gets the model's own from the model's repository, pinned like the files (setup.py
+    // "template"): maternion's Clover files have none, DiffuSpace's repository has it
+    if arch == "clover_moe" {
+        let tpl = w.tokenizer.join("chat_template.jinja");
+        if !tpl.exists() {
+            let f = RepoFile { path: "chat_template.jinja".into(), size: 7912,
+                               sha256: Some("01094df7cd8905d1220ea8b31e4f1086dc9bedf0305d3c2fa6578b5fa33b6815".into()) };
+            let mut quiet = |_: u64, _: u64| {};
+            hub.download("Diffuspace/Clover-35B-A3B-Preview", "4b0402b65e523d0183a14c431955438714cb16ff", &f, &tpl, &mut quiet).await.map_err(|e| e.to_string())?;
+            ev(Event::Note("chat template: from Diffuspace/Clover-35B-A3B-Preview".into()));
+        }
+    }
     // a Strata expert profile published beside the model (*.prof, STRP): in the form its engine reads
     if let Some(pf) = all.iter().find(|f| f.path.ends_with(".prof") && f.size < (16 << 20)) {
         let pack = spec.data_dir.join("packs").join(&id);

@@ -307,10 +307,71 @@ impl Monitor {
                         "gpu": tel.stat.get("gpu_name").map(|n| json!({"name": n, "used_mib": mib("gpu_mem_used"),
                             "total_mib": mib("gpu_mem_total"), "util_pct": tel.now.get("gpu_util"),
                             "temp_c": tel.now.get("gpu_temp"), "power_w": tel.now.get("gpu_power")})),
+                        "gpus": tel.now.get("gpus"),
                         "ram": {"used_mib": mib("ram_used"), "total_mib": mib("ram_total")},
                         "cpu_pct": tel.now.get("cpu")},
         })
     }
+
+    /// This machine for GET /api/system and Settings: every GPU, the CPU, the memory, each with its load now.
+    pub fn system(&self) -> Value {
+        let tel = self.tel.lock().unwrap();
+        let mib = |k: &str| tel.now.get(k).and_then(Value::as_f64).map(|v| (v / 1048576.0).round());
+        let gpus: Vec<Value> = tel.now.get("gpus").and_then(Value::as_array).into_iter().flatten().map(|g| {
+            let m = |k: &str| g[k].as_f64().map(|v| (v / 1048576.0).round());
+            json!({"index": g["index"], "name": g["name"], "util_pct": g["util"], "memory_used_mib": m("mem_used"), "memory_total_mib": m("mem_total"),
+                   "temperature_c": g["temp"], "power_w": g["power"], "power_limit_w": g["power_limit"],
+                   "pcie": {"gen": g["pcie_gen"], "gen_max": g["pcie_gen_max"], "width": g["pcie_width"]}})
+        }).collect();
+        json!({"gpus": gpus, "gpu_driver": tel.stat.get("gpu_driver"), "gpu_note": tel.stat.get("gpu_note"),
+               "cpu": {"name": tel.stat.get("cpu_name"), "cores": tel.stat.get("cores"), "threads": tel.stat.get("threads"), "util_pct": tel.now.get("cpu")},
+               "memory": {"used_mib": mib("ram_used"), "total_mib": mib("ram_total")},
+               "accelerators": accelerators()})
+    }
+}
+
+/// NPUs, TPUs and other AI accelerators on this machine: PCI devices of the accelerator classes, or known to be one, and
+/// Coral's USB sticks. Most report no load to the OS: `util_pct` is then null and `state` says what can be seen.
+pub fn accelerators() -> Vec<Value> {
+    let mut out = Vec::new();
+    let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok().map(|t| t.trim().to_string());
+    let lspci = std::process::Command::new("lspci").args(["-D", "-nn"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    for line in lspci.lines() {
+        let l = line.to_lowercase();
+        let by_class = l.contains("processing accelerators") || l.contains("signal processing controller");
+        let by_name = l.contains("edge tpu") || l.contains(" npu") || l.contains(" ipu device") || l.contains("neural") || l.contains("ai boost") || l.contains("hailo");
+        if !by_class && !by_name {
+            continue;
+        }
+        let Some((addr, rest)) = line.split_once(' ') else { continue };
+        let dev = std::path::Path::new("/sys/bus/pci/devices").join(addr);
+        let driver = std::fs::read_link(dev.join("driver")).ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+        let name = rest.split_once(": ").map_or(rest, |x| x.1).trim();
+        let kind = if l.contains("tpu") { "TPU" } else if l.contains("npu") || l.contains("ipu") || l.contains("neural") || l.contains("ai boost") { "NPU" } else { "accelerator" };
+        // the device file the driver made: /dev/accel/accelN (NPUs), /dev/apex_N (Coral)
+        let node = std::fs::read_dir(dev.join("accel")).ok().and_then(|mut d| d.next()).and_then(|e| e.ok())
+            .map(|e| format!("/dev/accel/{}", e.file_name().to_string_lossy()))
+            .or_else(|| std::fs::read_dir(dev.join("apex")).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| format!("/dev/{}", e.file_name().to_string_lossy())));
+        let power = read(dev.join("power/runtime_status"));
+        let busy_us = read(dev.join("npu_busy_time_us")); // Intel's NPU counts its busy time
+        let temp = read(dev.join("apex").join("apex_0").join("temp")).and_then(|t| t.parse::<f64>().ok()).map(|t| t / 1000.0);
+        let state = match (&driver, &power) {
+            (None, _) => "no driver loaded".to_string(),
+            (Some(_), Some(p)) if p == "suspended" => "idle (powered down)".to_string(),
+            (Some(_), Some(p)) if p == "active" => "ready".to_string(),
+            _ => "ready".to_string(),
+        };
+        out.push(json!({"kind": kind, "name": name, "bus": "PCIe", "address": addr, "driver": driver, "device": node, "state": state,
+                        "util_pct": null, "temperature_c": temp, "busy_time_us": busy_us.and_then(|v| v.parse::<u64>().ok())}));
+    }
+    for d in std::fs::read_dir("/sys/bus/usb/devices").into_iter().flatten().flatten() {
+        let id = (read(d.path().join("idVendor")), read(d.path().join("idProduct")));
+        if matches!((id.0.as_deref(), id.1.as_deref()), (Some("1a6e"), Some("089a")) | (Some("18d1"), Some("9302"))) {
+            out.push(json!({"kind": "TPU", "name": "Coral USB Accelerator", "bus": "USB", "address": d.file_name().to_string_lossy(), "driver": null,
+                            "device": null, "state": "connected", "util_pct": null, "temperature_c": null, "busy_time_us": null}));
+        }
+    }
+    out
 }
 
 /// Counts a request waiting for the GPU while it lives.
@@ -479,14 +540,13 @@ mod sampler {
         s.insert("gpu_pcie_gen".into(), json!(num(rows[0], 8)));
         s.insert("gpu_pcie_gen_max".into(), json!(num(rows[0], 9)));
         s.insert("gpu_pcie_width".into(), json!(num(rows[0], 10)));
-        if rows.len() > 1 {
-            let per: Vec<Value> = rows
-                .iter()
-                .map(|r| json!({"index": num(r, 0), "util": num(r, 2), "mem_used": mib(num(r, 3)), "mem_total": mib(num(r, 4)),
-                                "temp": num(r, 5), "power": num(r, 6)}))
-                .collect();
-            s.insert("gpus".into(), json!(per));
-        }
+        let per: Vec<Value> = rows
+            .iter()
+            .map(|r| json!({"index": num(r, 0), "name": r.get(1), "util": num(r, 2), "mem_used": mib(num(r, 3)), "mem_total": mib(num(r, 4)),
+                            "temp": num(r, 5), "power": num(r, 6), "power_limit": num(r, 7), "pcie_gen": num(r, 8), "pcie_gen_max": num(r, 9),
+                            "pcie_width": num(r, 10)}))
+            .collect();
+        s.insert("gpus".into(), json!(per));
     }
 
     fn static_facts(m: &Monitor) {

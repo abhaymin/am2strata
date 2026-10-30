@@ -723,11 +723,6 @@ function renderAbout(eng, hw, st) {
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);
-  facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
-    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
-    ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
-  ]);
   const base = location.origin;
   facts($("facts-api"), [
     ["OpenAI base URL", `${base}/v1`, true],
@@ -1838,6 +1833,7 @@ function showSection(name) {
   if (section === "defaults") { loadShared().then(loadDefaults); }
   if (section === "tools") loadMcp();
   if (section === "memory") loadMemory();
+  if (section === "server") loadSystem();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
@@ -2838,4 +2834,34 @@ async function readAloud(i, btn) {
     audio.play();
   } catch (e) { btn.classList.remove("rec-on"); toast("error", "Not read aloud", String(e.message || e), 8000); }
   btn.disabled = false;
+}
+
+// ------------------------------------------------------------------ Settings > Server and access: this PC (GET /api/system)
+let systemTimer = null;
+async function loadSystem() {
+  clearTimeout(systemTimer);
+  if (tab !== "settings" || section !== "server") return;
+  let j;
+  try {
+    const r = await fetch("api/system", {headers: headers()});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    j = await r.json();
+  } catch (e) { $("hw-list").innerHTML = `<p class="muted small">Not read: ${esc(String(e.message || e))}</p>`; systemTimer = setTimeout(loadSystem, 5000); return; }
+  const bar = (pct, text) => `<div class="hw-bar"><div class="st-progress"><div class="st-progress__bar" style="width:${Math.min(100, pct || 0).toFixed(0)}%"></div></div><span class="mono small">${esc(text)}</span></div>`;
+  const row = (name, sub, bars) => `<div class="hw-row"><div class="hw-row__name"><b>${esc(name)}</b><span>${esc(sub)}</span></div><div class="hw-row__load">${bars}</div></div>`;
+  const gib = (m) => (m == null ? "–" : (m / 1024).toFixed(1));
+  const rows = (j.gpus || []).map((g) => row(`GPU ${g.index}: ${g.name || "GPU"}`,
+    [g.temperature_c != null ? `${fmt(g.temperature_c)} °C` : null, g.power_w != null ? `${fmt(g.power_w)} of ${fmt(g.power_limit_w)} W` : null,
+     g.pcie && g.pcie.width ? `PCIe x${fmt(g.pcie.width)}` : null].filter(Boolean).join(" · "),
+    bar(g.util_pct, `load ${fmt(g.util_pct)}%`) + bar(g.memory_total_mib ? 100 * g.memory_used_mib / g.memory_total_mib : 0, `VRAM ${gib(g.memory_used_mib)} of ${gib(g.memory_total_mib)} GB`)));
+  if (!(j.gpus || []).length) rows.push(row("GPU", j.gpu_note || "none found", ""));
+  const c = j.cpu || {}, m = j.memory || {};
+  rows.push(row(`CPU: ${c.name || "CPU"}`, [c.cores ? `${c.cores} cores` : null, c.threads ? `${c.threads} threads` : null].filter(Boolean).join(" · "), bar(c.util_pct, `load ${fmt(c.util_pct)}%`)));
+  rows.push(row("Memory", "RAM", bar(m.total_mib ? 100 * m.used_mib / m.total_mib : 0, `${gib(m.used_mib)} of ${gib(m.total_mib)} GB`)));
+  for (const a of j.accelerators || []) {
+    rows.push(row(`${a.kind}: ${a.name}`, [a.bus, a.driver ? `driver ${a.driver}` : null, a.device, a.temperature_c != null ? `${fmt(a.temperature_c)} °C` : null].filter(Boolean).join(" · "),
+      `<span class="st-badge">${esc(a.state)}</span>` + (a.util_pct == null ? ` <span class="muted small">load not reported by this device</span>` : bar(a.util_pct, `load ${fmt(a.util_pct)}%`))));
+  }
+  $("hw-list").innerHTML = rows.join("");
+  systemTimer = setTimeout(loadSystem, 2000);
 }
