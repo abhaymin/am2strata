@@ -15,7 +15,7 @@ pub async fn health(State(s): State<AppState>) -> Json<Value> {
         s.mgr.entry(&s.mgr.default_id).map(|e| e.display_name()).unwrap_or_default()
     });
     Json(json!({
-        "status": "ok", "model": model, "loaded": cur.is_some(),
+        "status": "ok", "alerts": s.mgr.monitor.alerts().len(), "model": model, "loaded": cur.is_some(),
         "images": cur.as_ref().is_some_and(|l| l.vision.is_some()),
         "video": crate::media::ffmpeg_available(),
         "image_generation": s.media.available(),
@@ -261,8 +261,15 @@ pub async fn system(State(s): State<AppState>, headers: HeaderMap) -> Response {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let mon = s.mgr.monitor.clone();
+    // a load that ran without a card of its config is a warning too (adapt() dropped it)
+    let dropped: Vec<String> = s.mgr.current().await.map(|l| l.adapted.iter().filter(|n| n.contains("are not available")).cloned().collect()).unwrap_or_default();
     match tokio::task::spawn_blocking(move || mon.system()).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            if let Some(a) = v["alerts"].as_array_mut() {
+                a.extend(dropped.into_iter().map(Value::String));
+            }
+            Json(v).into_response()
+        }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     }
 }

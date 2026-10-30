@@ -77,6 +77,8 @@ struct Telemetry {
 }
 
 pub struct Monitor {
+    /// the health watch: cards the driver cannot reach, driver errors since the start, the last one
+    health: Mutex<(Vec<String>, u64, Option<String>)>,
     inner: Mutex<Inner>,
     tel: Mutex<Telemetry>,
     pub started: f64,
@@ -85,6 +87,7 @@ pub struct Monitor {
 impl Monitor {
     pub fn new() -> Arc<Self> {
         let m = Arc::new(Monitor {
+            health: Mutex::new((Vec::new(), 0, None)),
             inner: Mutex::new(Inner { totals: Totals { since: now(), ..Default::default() }, ..Default::default() }),
             tel: Mutex::new(Telemetry::default()),
             started: now(),
@@ -110,6 +113,21 @@ impl Monitor {
                              progress: None, read_started: t, recent: VecDeque::new() });
         g.last_at = Some(t);
         Record { mon: self.clone(), id, prompt_tokens, done: false, outcome: "disconnect" }
+    }
+
+    fn set_health(&self, lost: Vec<String>, errors: u64, last: Option<String>) {
+        let mut h = self.health.lock().unwrap();
+        *h = (lost, errors, last);
+    }
+
+    /// Plain warnings for /health, /api/system and the web app: nothing means healthy.
+    pub fn alerts(&self) -> Vec<String> {
+        let h = self.health.lock().unwrap();
+        let mut out: Vec<String> = h.0.iter().map(|c| format!("GPU {c} is on the bus but the driver cannot reach it")).collect();
+        if h.1 > 0 {
+            out.push(format!("{} GPU driver error(s) since this server started; the last: {}", h.1, h.2.as_deref().unwrap_or("")));
+        }
+        out
     }
 
     /// What the output parser repaired in a request (Strata 0.2.8 #4427, #4077).
@@ -275,11 +293,16 @@ impl Monitor {
 
     /// GET /metrics/prometheus: llama-server's metric names, so its dashboards work unchanged.
     pub fn prometheus(&self, loaded: bool) -> String {
+        // read first: a lock taken in the table below would be held to the end of that statement
+        let (unreachable, driver_errors) = {
+            let h = self.health.lock().unwrap();
+            (h.0.len() as f64, h.1 as f64)
+        };
         let g = self.inner.lock().unwrap();
         let t = &g.totals;
         let read = t.prompt_tokens.saturating_sub(t.reused);
         let (ps, ds) = (t.prompt_ms / 1000.0, t.decode_ms / 1000.0);
-        let rows: [(&str, &str, &str, f64); 13] = [
+        let rows: [(&str, &str, &str, f64); 15] = [
             ("llamacpp:prompt_tokens_total", "counter", "Prompt tokens read", read as f64),
             ("llamacpp:prompt_tokens_cached_total", "counter", "Prompt tokens the conversation cache already held", t.reused as f64),
             ("llamacpp:prompt_seconds_total", "counter", "Prompt read time", ps),
@@ -292,6 +315,8 @@ impl Monitor {
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t.drafts_accepted as f64),
             ("strata:tool_args_repaired_total", "counter", "Tool call arguments (a JSON array or object) that were damaged and read as written", t.tool_args_repaired as f64),
             ("strata:stray_think_closers_total", "counter", "Extra closing think tags dropped from answers", t.stray_think_closers as f64),
+            ("strata:gpus_unreachable", "gauge", "NVIDIA cards on the bus that the driver cannot reach", unreachable),
+            ("strata:gpu_driver_errors_total", "counter", "GPU driver errors in the kernel log since this server started", driver_errors),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", loaded as u8 as f64),
         ];
         rows.iter().map(|(n, k, h, v)| format!("# HELP {n} {h}\n# TYPE {n} {k}\n{n} {v}\n")).collect()
@@ -334,7 +359,7 @@ impl Monitor {
                    "temperature_c": g["temp"], "power_w": g["power"], "power_limit_w": g["power_limit"],
                    "pcie": {"gen": g["pcie_gen"], "gen_max": g["pcie_gen_max"], "width": g["pcie_width"]}})
         }).collect();
-        json!({"gpus": gpus, "gpu_driver": tel.stat.get("gpu_driver"), "gpu_note": tel.stat.get("gpu_note"),
+        json!({"alerts": self.alerts(), "gpus": gpus, "gpu_driver": tel.stat.get("gpu_driver"), "gpu_note": tel.stat.get("gpu_note"),
                "cpu": {"name": tel.stat.get("cpu_name"), "cores": tel.stat.get("cores"), "threads": tel.stat.get("threads"), "util_pct": tel.now.get("cpu")},
                "memory": {"used_mib": mib("ram_used"), "total_mib": mib("ram_total")},
                "accelerators": accelerators()})
@@ -460,7 +485,55 @@ mod sampler {
     const GPU_FIELDS: &str = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,\
                               pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current";
 
+    /// NVIDIA display cards on the PCI bus, as `0000:08:00.0`.
+    fn cards_on_bus() -> Vec<String> {
+        let mut out = Vec::new();
+        for d in std::fs::read_dir("/sys/bus/pci/devices").into_iter().flatten().flatten() {
+            let read = |n: &str| std::fs::read_to_string(d.path().join(n)).unwrap_or_default();
+            if read("vendor").trim() == "0x10de" && read("class").starts_with("0x03") {
+                out.push(d.file_name().to_string_lossy().into_owned());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// What the health watch reports now: cards the driver cannot reach, and new driver errors since `since`.
+    pub(super) fn check(since: &str) -> (Vec<String>, u64, Vec<String>) {
+        let reach = std::process::Command::new("nvidia-smi").args(["--query-gpu=pci.bus_id", "--format=csv,noheader"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase()).unwrap_or_default();
+        let lost: Vec<String> = cards_on_bus().into_iter().filter(|c| !reach.lines().any(|l| l.trim().ends_with(c.as_str()))).collect();
+        let log = std::process::Command::new("journalctl").args(["-k", "--no-pager", "-q", "--since", since]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let errors: Vec<String> = log.lines().filter(|l| l.contains("NVRM: Xid") || l.contains("fallen off the bus"))
+            .map(|l| l.chars().take(200).collect()).collect();
+        (lost, errors.len() as u64, errors)
+    }
+
     pub fn start(m: Arc<Monitor>) {
+        // the health watch: a card lost, or a driver error, is seen within 30 s
+        let watch = m.clone();
+        tokio::spawn(async move {
+            let since = format!("@{}", now() as u64);
+            let mut known = (Vec::<String>::new(), 0u64);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let s = since.clone();
+                let Ok((lost, n, errors)) = tokio::task::spawn_blocking(move || check(&s)).await else { continue };
+                if lost != known.0 {
+                    if lost.is_empty() {
+                        tracing::info!("health: every GPU is reachable again");
+                    } else {
+                        tracing::warn!("health: GPU(s) on the bus that the driver cannot reach: {}", lost.join(", "));
+                    }
+                }
+                if n > known.1 {
+                    tracing::warn!("health: {} new GPU driver error(s): {}", n - known.1, errors.last().map(String::as_str).unwrap_or(""));
+                }
+                known = (lost.clone(), n);
+                watch.set_health(lost, n, errors.last().cloned());
+            }
+        });
         static_facts(&m);
         let gpus: Arc<Mutex<HashMap<u32, Vec<String>>>> = Arc::default();
         if let Ok(mut child) = tokio::process::Command::new("nvidia-smi")

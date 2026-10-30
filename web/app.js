@@ -2851,6 +2851,7 @@ async function loadSystem() {
   const bar = (pct, text) => `<div class="hw-bar"><div class="st-progress"><div class="st-progress__bar" style="width:${Math.min(100, pct || 0).toFixed(0)}%"></div></div><span class="mono small">${esc(text)}</span></div>`;
   const row = (name, sub, bars) => `<div class="hw-row"><div class="hw-row__name"><b>${esc(name)}</b><span>${esc(sub)}</span></div><div class="hw-row__load">${bars}</div></div>`;
   const gib = (m) => (m == null ? "–" : (m / 1024).toFixed(1));
+  const alerts = (j.alerts || []).map((t) => `<div class="hw-alert"><span class="st-badge st-badge--queued">Warning</span> ${esc(t)}</div>`).join("");
   const rows = (j.gpus || []).map((g) => row(`GPU ${g.index}: ${g.name || "GPU"}`,
     [g.temperature_c != null ? `${fmt(g.temperature_c)} °C` : null, g.power_w != null ? `${fmt(g.power_w)} of ${fmt(g.power_limit_w)} W` : null,
      g.pcie && g.pcie.width ? `PCIe x${fmt(g.pcie.width)}` : null].filter(Boolean).join(" · "),
@@ -2863,7 +2864,7 @@ async function loadSystem() {
     rows.push(row(`${a.kind}: ${a.name}`, [a.bus, a.driver ? `driver ${a.driver}` : null, a.device, a.temperature_c != null ? `${fmt(a.temperature_c)} °C` : null].filter(Boolean).join(" · "),
       `<span class="st-badge">${esc(a.state)}</span>` + (a.util_pct == null ? ` <span class="muted small">load not reported by this device</span>` : bar(a.util_pct, `load ${fmt(a.util_pct)}%`))));
   }
-  $("hw-list").innerHTML = rows.join("");
+  $("hw-list").innerHTML = alerts + rows.join("");
   systemTimer = setTimeout(loadSystem, 2000);
 }
 

@@ -1446,3 +1446,14 @@ fn web_ui_demo_browser() {
     let secs = std::env::var("AM2_UI_DEMO_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
     std::thread::sleep(std::time::Duration::from_secs(secs));
 }
+
+#[test]
+fn the_health_watch_reports_through_health_system_and_prometheus() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let h = s.get("/health", false).1;
+    assert_eq!((h["status"].as_str(), h["alerts"].as_u64()), (Some("ok"), Some(0)), "{h}");
+    let (c, sys) = s.get("/api/system", true);
+    assert_eq!(c, 200, "{sys}");
+    assert!(sys["alerts"].is_array() && sys["gpus"].is_array() && sys["accelerators"].is_array(), "{sys}");
+    assert_eq!(s.get("/api/system", false).0, 401);
+}

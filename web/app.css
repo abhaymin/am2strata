@@ -503,3 +503,4 @@ body.resizing iframe { pointer-events: none; }
 .hw-row__load { display: grid; gap: 6px; min-width: 0; }
 .hw-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
 @media (max-width: 640px) { .hw-row { grid-template-columns: minmax(0, 1fr); } }
+.hw-alert { display: flex; gap: 8px; align-items: center; font-size: 13px; }
