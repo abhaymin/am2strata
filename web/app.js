@@ -2895,3 +2895,134 @@ function renderAppSetup() {
 }
 $("app-pick").onchange = renderAppSetup;
 if (tab === "settings" && section === "connect") renderAppSetup();
+
+// ------------------------------------------------------------------ the media viewer
+// Every picture and video in the chat, Media Generation, attachments and tool results: a click opens it large, with zoom,
+// pan, rotate, previous / next and save. Video clicks belong to the video's own controls, so "Open large" appears on hover.
+(() => {
+  const AREAS = "#view-chat, #view-images";
+  const v = {items: [], at: 0, el: null, s: 1, fit: 1, x: 0, y: 0, rot: 0, last: null};
+  const box = $("viewer"), stage = $("viewer-stage"), openBtn = $("viewer-open");
+  const viewable = (el) => {
+    if (!el || !(el instanceof HTMLElement) || !el.closest(AREAS) || el.closest("button, .st-icon, .composer-tools")) return false;
+    if (el.tagName === "VIDEO") return true;
+    return el.tagName === "IMG" && el.src && (el.naturalWidth >= 48 || !el.complete);
+  };
+  const size = () => {
+    const w = v.el.naturalWidth || v.el.videoWidth || 640, h = v.el.naturalHeight || v.el.videoHeight || 360;
+    return v.rot % 180 ? [h, w] : [w, h];
+  };
+  const paint = () => {
+    const [w, h] = [v.el.naturalWidth || v.el.videoWidth || 640, v.el.naturalHeight || v.el.videoHeight || 360];
+    // rotate about the picture's centre, then scale and place it
+    v.el.style.width = `${w}px`; v.el.style.height = `${h}px`;
+    const [rw, rh] = size();
+    const t = `translate(${v.x}px, ${v.y}px) scale(${v.s}) translate(${rw / 2}px, ${rh / 2}px) rotate(${v.rot}deg) translate(${-w / 2}px, ${-h / 2}px)`;
+    v.el.style.transform = t;
+    $("viewer-zoom").textContent = `${Math.round(v.s * 100)}%`;
+  };
+  const fit = () => {
+    const [w, h] = size(), r = stage.getBoundingClientRect();
+    v.fit = Math.min(r.width / w, r.height / h, 1);
+    v.s = v.fit; v.x = (r.width - w * v.s) / 2; v.y = (r.height - h * v.s) / 2;
+    paint();
+  };
+  const zoomAt = (factor, px, py) => {
+    const r = stage.getBoundingClientRect();
+    const cx = px == null ? r.width / 2 : px - r.left, cy = py == null ? r.height / 2 : py - r.top;
+    const s = Math.min(32, Math.max(0.05, v.s * factor));
+    v.x = cx - (cx - v.x) * (s / v.s); v.y = cy - (cy - v.y) * (s / v.s); v.s = s;
+    paint();
+  };
+  const show = () => {
+    const src = v.items[v.at];
+    stage.textContent = "";
+    v.rot = 0;
+    const video = src.tagName === "VIDEO";
+    const el = document.createElement(video ? "video" : "img");
+    el.src = src.currentSrc || src.src;
+    if (video) { el.controls = true; el.loop = src.loop; el.playsInline = true; el.currentTime = src.currentTime || 0; if (!src.paused) el.autoplay = true; src.pause(); }
+    else { el.alt = src.alt || ""; el.draggable = false; }
+    v.el = el;
+    el.addEventListener(video ? "loadedmetadata" : "load", fit, {once: true});
+    stage.append(el);
+    fit();
+    $("viewer-count").textContent = v.items.length > 1 ? `${v.at + 1} / ${v.items.length}` : "";
+    for (const k of ["prev", "next"]) box.querySelector(`[data-v="${k}"]`).hidden = v.items.length < 2;
+    const save = $("viewer-save");
+    save.href = el.src;
+    save.download = `am2strata-${Date.now()}.${video ? "mp4" : "png"}`;
+  };
+  const open = (el) => {
+    const scope = el.closest(".img-results, .st-msg") || el.parentElement;
+    v.items = [...scope.querySelectorAll("img, video")].filter(viewable);
+    if (!v.items.includes(el)) v.items = [el];
+    v.at = v.items.indexOf(el);
+    v.last = document.activeElement;
+    box.hidden = false;
+    openBtn.hidden = true;
+    show();
+    box.querySelector('[data-v="close"]').focus();
+  };
+  const close = () => {
+    if (v.el && v.el.pause) v.el.pause();
+    box.hidden = true; stage.textContent = ""; v.el = null;
+    if (v.last && v.last.focus) v.last.focus();
+  };
+  const step = (d) => { if (v.items.length > 1) { v.at = (v.at + d + v.items.length) % v.items.length; show(); } };
+  const act = {prev: () => step(-1), next: () => step(1), in: () => zoomAt(1.25), out: () => zoomAt(0.8), fit,
+               one: () => { const r = stage.getBoundingClientRect(); const [w, h] = size(); v.s = 1; v.x = (r.width - w) / 2; v.y = (r.height - h) / 2; paint(); },
+               rotate: () => { v.rot = (v.rot + 90) % 360; fit(); }, close};
+
+  document.addEventListener("click", (e) => {
+    if (e.target.tagName === "IMG" && viewable(e.target) && !e.target.closest("a")) { e.preventDefault(); open(e.target); }
+  });
+  document.addEventListener("mouseover", (e) => {
+    if (e.target.tagName === "IMG" && viewable(e.target)) e.target.classList.add("viewable");
+    if (e.target === openBtn) return;
+    if (e.target.tagName === "VIDEO" && viewable(e.target) && box.hidden) {
+      const r = e.target.getBoundingClientRect();
+      openBtn.style.left = `${r.right - 96}px`; openBtn.style.top = `${r.top + 8}px`;
+      openBtn.hidden = false; openBtn.video = e.target;
+    } else openBtn.hidden = true;
+  });
+  openBtn.onclick = () => openBtn.video && open(openBtn.video);
+  box.querySelector(".viewer__bar").addEventListener("click", (e) => { const b = e.target.closest("[data-v]"); if (b) act[b.dataset.v](); });
+  stage.addEventListener("wheel", (e) => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY); }, {passive: false});
+  stage.addEventListener("dblclick", (e) => { if (v.s > v.fit * 1.01) fit(); else zoomAt(2.5, e.clientX, e.clientY); });
+  // drag to pan, two fingers to pinch
+  const touches = new Map();
+  let drag = null, pinch = 0, moved = false;
+  stage.addEventListener("pointerdown", (e) => {
+    const onVideoBar = v.el && v.el.tagName === "VIDEO" && e.clientY > v.el.getBoundingClientRect().bottom - 48;
+    if (onVideoBar) return;
+    touches.set(e.pointerId, [e.clientX, e.clientY]);
+    stage.setPointerCapture(e.pointerId);
+    drag = {x: e.clientX - v.x, y: e.clientY - v.y}; moved = false; pinch = 0;
+    stage.classList.add("is-dragging");
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (!touches.has(e.pointerId)) return;
+    touches.set(e.pointerId, [e.clientX, e.clientY]);
+    if (touches.size === 2) {
+      const [a, b] = [...touches.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      if (pinch) zoomAt(d / pinch, (a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+      pinch = d;
+    } else if (drag) {
+      v.x = e.clientX - drag.x; v.y = e.clientY - drag.y; moved = true; paint();
+    }
+  });
+  const up = (e) => {
+    touches.delete(e.pointerId); pinch = 0;
+    if (touches.size === 1) { const [p] = touches.values(); drag = {x: p[0] - v.x, y: p[1] - v.y}; }
+    if (!touches.size) { drag = null; stage.classList.remove("is-dragging"); }
+  };
+  stage.addEventListener("pointerup", (e) => { up(e); if (!moved && e.target === stage) close(); });
+  stage.addEventListener("pointercancel", up);
+  document.addEventListener("keydown", (e) => {
+    if (box.hidden) return;
+    const k = {Escape: "close", ArrowLeft: "prev", ArrowRight: "next", "+": "in", "=": "in", "-": "out", 0: "fit", 1: "one", r: "rotate"}[e.key];
+    if (k) { e.preventDefault(); act[k](); }
+  });
+  window.addEventListener("resize", () => { if (!box.hidden) fit(); });
+})();

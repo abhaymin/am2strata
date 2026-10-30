@@ -632,6 +632,26 @@
 </aside>
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
+  <!-- ============================ Media viewer ============================ -->
+  <div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Media viewer" hidden>
+    <div class="viewer__stage" id="viewer-stage"></div>
+    <div class="viewer__bar" role="toolbar" aria-label="Viewer controls">
+      <button type="button" data-v="prev" title="Previous (Left arrow)" aria-label="Previous">&#8249;</button>
+      <span class="viewer__count" id="viewer-count"></span>
+      <button type="button" data-v="next" title="Next (Right arrow)" aria-label="Next">&#8250;</button>
+      <span class="viewer__sep"></span>
+      <button type="button" data-v="out" title="Zoom out (-)" aria-label="Zoom out">&minus;</button>
+      <span class="viewer__zoom" id="viewer-zoom">100%</span>
+      <button type="button" data-v="in" title="Zoom in (+)" aria-label="Zoom in">+</button>
+      <button type="button" data-v="fit" title="Fit to the window (0)">Fit</button>
+      <button type="button" data-v="one" title="Actual size (1)">1:1</button>
+      <button type="button" data-v="rotate" title="Rotate (R)" aria-label="Rotate">&#8635;</button>
+      <span class="viewer__sep"></span>
+      <a id="viewer-save" title="Save" aria-label="Save">Save</a>
+      <button type="button" data-v="close" title="Close (Esc)" aria-label="Close">&times;</button>
+    </div>
+  </div>
+  <button type="button" class="viewer-open" id="viewer-open" hidden>Open large</button>
 <script src="web/app.js"></script>
 </body>
 </html>
