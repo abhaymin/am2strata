@@ -1,0 +1,12 @@
+[Unit]
+Description=Bring up NVIDIA GPUs that failed at boot (USB4 link dropped during driver load)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=240
+ExecStart=/usr/local/sbin/gpu-usb4-recover.sh
+
+[Install]
+WantedBy=multi-user.target

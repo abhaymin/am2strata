@@ -234,7 +234,7 @@ impl RunConfig {
     }
 
     /// The GPUs to show the engine, numbered as nvidia-smi numbers them.
-    fn gpus(&self) -> Vec<u64> {
+    pub fn gpus(&self) -> Vec<u64> {
         match &self.gpu {
             Some(serde_json::Value::Number(n)) => n.as_u64().into_iter().collect(),
             Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_u64()).collect(),

@@ -173,12 +173,60 @@ pub fn scan(dir: &Path) -> Vec<ModelEntry> {
     out
 }
 
+/// The config's "layer_split" as the engine's --layer-split value: "auto" (the default), or the first layer of each
+/// later GPU's share, one rising number per GPU after the first, as a string or a list (serve/server.py
+/// layer_split_value).
+pub fn layer_split_value(v: Option<&Value>, n_gpus: usize) -> Result<String, String> {
+    let items: Vec<String> = match v {
+        None | Some(Value::Null) => return Ok("auto".into()),
+        Some(Value::String(t)) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("auto") => return Ok("auto".into()),
+        Some(Value::String(t)) => t.split(',').map(|x| x.trim().to_string()).collect(),
+        Some(Value::Number(n)) => vec![n.to_string()],
+        Some(Value::Array(a)) => a.iter().map(|x| x.to_string()).collect(),
+        Some(other) => return Err(format!("\"layer_split\" must be \"auto\" or rising first layers, not {other}")),
+    };
+    let want = n_gpus.saturating_sub(1).max(1);
+    let hint = format!("\"layer_split\" is the first layer of each later GPU, one rising number per GPU after the first ({want} for \
+                        {n_gpus} GPUs), not a count of layers per card, or \"auto\"");
+    let vals: Vec<u64> = items.iter().map(|x| x.parse::<u64>()).collect::<Result<_, _>>().map_err(|_| format!("{hint}; got {items:?}"))?;
+    if vals.is_empty() || (n_gpus > 1 && vals.len() != want) {
+        return Err(format!("{hint}; got {} number(s)", vals.len()));
+    }
+    if vals[0] < 2 || vals.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!("{hint}; {vals:?} does not rise from 2 or more"));
+    }
+    Ok(vals.iter().map(u64::to_string).collect::<Vec<_>>().join(","))
+}
+
 /// Launch settings for this machine. The engine sizes its expert cache to the free VRAM by itself; here: the
 /// engine binary must be built for this GPU, and the image encoder goes to the CPU below 15.5 GB of VRAM so a
 /// 12 GB card keeps its VRAM for experts (PolyStrata setup's rule).
 pub fn adapt(cfg: &RunConfig, hw: &Hardware) -> Result<(RunConfig, bool, Vec<String>)> {
     let mut cfg = cfg.clone();
     let mut notes = Vec::new();
+    // a GPU of the config that is not here now (an external card that failed to come up): run on the others
+    let listed = cfg.gpus();
+    if !hw.gpus.is_empty() && listed.len() > 1 {
+        let here: Vec<u64> = listed.iter().copied().filter(|i| hw.gpu(Some(*i as u32)).is_some()).collect();
+        if here.is_empty() {
+            bail!("none of the GPUs in this config ({listed:?}) is available");
+        }
+        if here.len() < listed.len() {
+            notes.push(format!("GPU(s) {:?} of this config are not available: running on {here:?}",
+                               listed.iter().filter(|i| !here.contains(i)).collect::<Vec<_>>()));
+            cfg.gpu = Some(serde_json::json!(here));
+        }
+    }
+    // several GPUs are a layer split, unless --peer-device gives the later card another use (serve/server.py engine_args)
+    let split = cfg.gpus().len() > 1 && !cfg.args.iter().any(|a| a == "--peer-device");
+    if split && !cfg.args.iter().any(|a| a == "--layer-split") {
+        let value = layer_split_value(cfg.rest.get("layer_split"), cfg.gpus().len()).map_err(|e| anyhow!(e))?;
+        notes.push(format!("layer split across GPUs {:?}: {value}", cfg.gpus()));
+        cfg.args.extend(["--layer-split".to_string(), value]);
+    }
+    if split && cfg.rest.get("split_skip_if_fits") == Some(&Value::Bool(true)) && !cfg.args.iter().any(|a| a == "--split-skip-if-fits") {
+        cfg.args.push("--split-skip-if-fits".to_string());
+    }
     let gpu = hw.gpu(cfg.first_gpu());
     if let Some(g) = gpu {
         let archs = engine_archs(&cfg.exe);
@@ -411,7 +459,9 @@ async fn stop(l: &Loaded) {
 }
 
 async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Result<Loaded> {
-    let (cfg, vision_gpu, adapted) = adapt(&entry.cfg, hw)?;
+    // a config with several GPUs looks again: an external card may have come up after this server started
+    let fresh = (entry.cfg.gpus().len() > 1).then(Hardware::detect);
+    let (cfg, vision_gpu, adapted) = adapt(&entry.cfg, fresh.as_ref().unwrap_or(hw))?;
     for n in &adapted {
         tracing::info!(model = %entry.id, "{n}");
     }
@@ -539,4 +589,22 @@ fn ensure_tokenizer(cfg: &strata_engine::RunConfig) -> Result<()> {
     let g = strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))?;
     strata_gguf::extract_tokenizer(&g, pack).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::layer_split_value as v;
+    use serde_json::json;
+
+    #[test]
+    fn layer_split_values() {
+        assert_eq!(v(None, 2).unwrap(), "auto");
+        assert_eq!(v(Some(&json!("Auto")), 2).unwrap(), "auto");
+        assert_eq!(v(Some(&json!("24")), 2).unwrap(), "24");
+        assert_eq!(v(Some(&json!(24)), 2).unwrap(), "24");
+        assert_eq!(v(Some(&json!([24, 36, 42])), 4).unwrap(), "24,36,42");
+        assert!(v(Some(&json!("24,16,12,12")), 4).is_err(), "counts per card are refused");
+        assert!(v(Some(&json!("24,36")), 2).is_err(), "too many numbers");
+        assert!(v(Some(&json!("1")), 2).is_err(), "from 2 up");
+    }
 }
