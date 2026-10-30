@@ -137,9 +137,41 @@ checkout (default ~/Development/am2strata).
 ## Upstream
 
 `am2strata-run upstream-check` compares the ports with PolyStrata and Strata (`tools/upstream.json`). As of
-2026-10-26 they are current with PolyStrata main (b561a3b1) and with Strata 0.2.6's mtp_fetch and pack header;
-Strata 0.2's Hadamard-folded packs (native_experts v5) are refused by name until PolyStrata carries Strata 0.2's
-engine, and am2Strata's per-layer pruned packs are `am2strata native experts p1`.
+2026-10-30 they are current with PolyStrata main (20d839db, v0.1.45-poly.6) and with Strata 0.2.8's server files
+(serve/frontend.py, serve/server.py). Strata's `main` is that tag. Every upstream update is meant to reach am2Strata:
+run the check when working here, port what changed, then update `tools/upstream.json`.
+
+What the check does not cover is the engines. PolyStrata and its engines still carry Strata 0.1.45, so Strata 0.2's
+packs (native_experts v5, Hadamard-folded) are refused by name, and am2Strata's per-layer pruned packs are
+`am2strata native experts p1`.
+
+## Roadmap: Strata's engine work and two GPUs
+
+Planned, in order. Nothing here is started unless it says so.
+
+1. **Two GPUs across a reboot.** Done so far: Orca splits over both cards, am2Strata is the boot service, a card that
+   is missing at load is dropped with a note. Still needed: install `deploy/gpu-usb4-recover.{sh,service}` (needs
+   root) and pass a reboot test. Gate: after a cold boot both cards are up and Orca is split, with no hand steps.
+2. **Check poly.6 on real models.** The rebuilt `strata-poly` has not run a model yet. Load Sage (flash attention is now
+   on for the Qwen3.6 family), then try Clover. Gate: output and speed against the previous engine, kept in
+   `engine-poly-backup-20261030/`.
+3. **Two GPUs for the other models.** Sage, MiniCPM-V and LFM2 run on one card. Try `"gpu": [0, 1]` on each and measure
+   against one card. Media jobs on GPU 1 are the alternative to a split: Orca stays on GPU 0 instead of unloading for
+   every image or video. Decide per model by measurement.
+4. **Strata 0.2's engine work.** PolyStrata carries Strata 0.1.45; Strata is at 0.2.8. Most of 0.2.7.1 to 0.2.8 is SYCL,
+   Metal and desktop-app work; what matters here has to be read out of the whole 0.1.45 to 0.2.8 range first (engine
+   speed, Hadamard-folded packs, wider batch windows). Two routes, decided after that survey:
+   - follow PolyStrata when it merges Strata 0.2, and rebuild;
+   - bring the wanted parts into am2Strata's own Rust engines (`am2strata-hybrid`, docs/GPU-PLAN.md), which is the
+     long-term direction but a far larger job.
+   Gate as for every engine: identical token ids at temperature 0 against the reference, then a live GPU check, run
+   only with the RAM free for it (no CUDA builds or model tests beside a loaded Orca without a memory cap).
+5. **Smaller ports left from Strata 0.2.8's server:** wait for an old engine to give its memory back before a start (#4051),
+   serve a DeepSeek tokenizer as DeepSeek when the config names no arch (#4137), and counters for repaired tool arguments
+   and stray `</think>` tags (logs, Prometheus).
+
+Optional, only if asked: the Coral Edge TPU (no driver loaded here; no engine uses it). The AMD NPU is detected
+and also unused. The USB4 card crashing the machine at boot when moved to OCuLink is not diagnosed; it needs a boot log.
 
 ## Alongside: the knowledge and memory cache
 
