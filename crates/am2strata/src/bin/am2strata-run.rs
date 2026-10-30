@@ -420,7 +420,9 @@ fn install(s: &ServerArgs) -> ExitCode {
     systemctl(&["disable", SERVICE]);
     systemctl(&["stop", SERVICE]);
     std::thread::sleep(Duration::from_secs(3));
-    systemctl(&["enable", "--now", BOOT_UNIT]);
+    // restart, not `enable --now`: a boot unit already running would keep the old binary and unit
+    systemctl(&["enable", BOOT_UNIT]);
+    systemctl(&["restart", BOOT_UNIT]);
     if !wait_ready(s, || active(BOOT_UNIT)) {
         say(format!("{BOOT_UNIT} did not become ready; see journalctl --user -u {BOOT_UNIT}. `am2strata-run uninstall` restores {SERVICE}"));
         return ExitCode::FAILURE;
