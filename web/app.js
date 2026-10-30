@@ -1781,6 +1781,8 @@ for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
+$("s-web").onclick = () => $("s-web").setAttribute("aria-checked", String($("s-web").getAttribute("aria-checked") !== "true"));
+$("s-browser").onclick = () => $("s-browser").setAttribute("aria-checked", String($("s-browser").getAttribute("aria-checked") !== "true"));
 $("s-flows").onclick = () => $("s-flows").setAttribute("aria-checked", String($("s-flows").getAttribute("aria-checked") !== "true"));
 $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
