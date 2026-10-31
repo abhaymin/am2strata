@@ -76,20 +76,28 @@ that alters the tokens fails its phase.
   HIP paths staying on CubeCL, and that is decided by measurement in phase 1.
 - Upstream keeps moving (STRATA-0.2-SURVEY.md): the C++ engines keep getting faster while this is built.
 
-## Phase 1 measured (2026-10-31)
+## Phase 1 measured (2026-10-31): gate passed
 
 `--graph` runs a whole token on the device for dense attention models, with every matrix on one device. Ministral-3 3B Q4_K_M
-on one RTX 5060 Ti, 96 tokens:
+on one RTX 5060 Ti, 96 tokens, the median of 3 runs:
 
 | Path | tok/s |
 |---|---|
-| CPU graph with products on the GPU (`--devices cuda:0=13`) | 15.6 |
-| `--graph` | 25.4 |
+| Products on the GPU, one round trip each (before) | 15.6 |
+| The same, with the new kernel (`--devices cuda:0=13`) | 27.9 |
+| `--graph`, old kernel | 25.4 |
+| `--graph`, new kernel | **47.2** (3.0x) |
+| llama.cpp CUDA, one GPU (`llama-bench`, same file) | 163 |
+| llama.cpp CUDA, two GPUs | 160 |
 
-- **Parity passes:** 23 of 24 steps identical plus 1 near-tie, worst logit difference 0.185.
-- **The 3x gate is not met:** 1.6x, so `--graph` stays opt-in.
-- **Where the time goes, per kernel class over 96 tokens:** the matrix products take about 3.3 s (feed-forward up and gate 1.5,
-  down 0.8, q/k/v 0.6, o 0.4); norm 0.29, attention 0.10, RoPE, KV, add and SiLU under 0.1 each. Each class was forced to wait for
-  the device, which added about 1.2 s across the run, and that overhead sits in those figures.
-- **What that means:** the limit is the product kernel, about 58 GB/s of weights read and decoded, not CubeCL's dispatch. The next
-  step is the kernel itself (its shared-memory sum and per-group layout) or the thin CUDA layer named under Risks.
+- **Parity passes:** 23 of 24 steps identical plus 1 near-tie, worst logit difference 0.185, the same as before the kernel change.
+- **What was wrong:** the time was in the product kernel, and memory bandwidth was not the limit (llama.cpp's 163 tok/s on this
+  card shows that). `matvec` loaded x from device memory once per weight. `matvec_q4k` holds x and each group's sum in shared
+  memory, read once per cube of 32 rows, and reads block heads a word at a time. Products went from 53 to 142 GB/s of weights.
+- **Keep the units spread:** one unit per row reached 80 GB/s and no more, because too few units run at once. Below 256 rows the
+  plain kernel is faster, so `WIDE_ROWS` picks.
+- **Only Q4_K has this kernel.** Q5_K, Q6_K, Q4_0, Q8_0, F16 and F32 still load x per weight.
+- **Still 3.5x behind llama.cpp.** Passing this gate does not meet phase 8's "within 10%". About 440 kernels are queued per token,
+  which is the next thing to measure.
+- **Two GPUs do not speed up one chat.** Layers run one after another, so a layer split gains nothing on a single stream
+  (llama.cpp: 160 against 163; Sage: about 5%). It holds more model and helps batches, so phase 6's gate needs that wording.

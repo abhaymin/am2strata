@@ -48,7 +48,12 @@ fn byte(w: &Array<u32>, off: u32) -> u32 {
 /// The f16 at byte `off` (little-endian), as f32.
 #[cube]
 fn half(w: &Array<u32>, off: u32) -> f32 {
-    let h = byte(w, off) | (byte(w, off + 1) << 8);
+    half_bits(byte(w, off) | (byte(w, off + 1) << 8))
+}
+
+/// An f16's bits as f32.
+#[cube]
+fn half_bits(h: u32) -> f32 {
     let e = (h >> 10) & 31;
     let m = h & 1023;
     let mut v = f32::new(0.0);
@@ -225,8 +230,6 @@ fn group_dot(w: &Array<u32>, o: u32, g: u32, x: &Array<f32>, xo: u32, #[comptime
 pub const ROWS_PER_CUBE: u32 = CUBE / 32;
 
 /// y[t * rows + r] = W[r] . x[t * cols ..], for `tokens` vectors at once (1 for decoding, the prompt's for prefill).
-/// One cube per (row, token); its units take the row's blocks in turn and sum in shared memory.
-/// y[t * rows + r] = W[r] . x[t * cols ..], for `tokens` vectors at once (1 for decoding, the prompt's for prefill).
 /// A cube takes ROWS_PER_CUBE rows; each row's 32-value groups are spread over 32 units, summed in shared memory.
 #[cube(launch_unchecked)]
 pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, cols: u32, row_bytes: u32,
@@ -248,6 +251,82 @@ pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, col
         }
     }
     let mut sum = SharedMemory::<f32>::new(CUBE as usize);
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(16);
+    while stride > 0 {
+        if lane < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if lane == 0 && row < rows {
+        y[(t * rows + row) as usize] = sum[UNIT_POS as usize];
+    }
+}
+
+/// Units in a cube of [`matvec_q4k`]: 32 rows of 32 units.
+pub const WIDE_CUBE: u32 = 1024;
+/// Rows from which [`matvec_q4k`] takes a Q4_K product.
+pub const WIDE_ROWS: u32 = 256;
+
+/// The dot products of up to 32 rows of a Q4_K matrix, as in [`matvec`], with x and each group's sum in shared memory: read once
+/// per cube, not once per weight. A load of x per weight is what limits [`matvec`] on a big matrix.
+#[cube(launch_unchecked)]
+pub fn matvec_q4k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, row_bytes: u32, #[comptime] cols: u32) {
+    let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 32 + UNIT_POS / 32;
+    let lane = UNIT_POS % 32;
+    let t = CUBE_POS_Z;
+    let n_groups = comptime![cols / 32];
+    let mut sx = SharedMemory::<f32>::new(comptime![cols as usize]);
+    let mut gs = SharedMemory::<f32>::new(comptime![(cols / 32) as usize]);
+    let mut sum = SharedMemory::<f32>::new(WIDE_CUBE as usize);
+    let mut at = UNIT_POS;
+    while at < n_groups {
+        let mut all = f32::new(0.0);
+        for l in 0..32u32 {
+            let v = x[(t * n_groups * 32 + at * 32 + l) as usize];
+            sx[(at * 32 + l) as usize] = v;
+            all += v;
+        }
+        gs[at as usize] = all;
+        at += WIDE_CUBE;
+    }
+    sync_cube();
+    let mut acc = f32::new(0.0);
+    if row < rows {
+        let mut gi = lane;
+        while gi < n_groups {
+            let o = row * row_bytes + (gi / 8) * 144;
+            let g = gi % 8;
+            // the block's head, a word at a time: d and dmin, then the 6-bit scales and mins (blocks are whole words)
+            let head = w[(o / 4) as usize];
+            let d = half_bits(head & 0xffff);
+            let dmin = half_bits(head >> 16);
+            let at = (g % 4) * 8;
+            let lo = (w[(o / 4 + 1) as usize] >> at) & 0xff;
+            let hi = (w[(o / 4 + 2) as usize] >> at) & 0xff;
+            let mut sc = lo & 0x3f;
+            let mut mn = hi & 0x3f;
+            if g >= 4 {
+                let more = (w[(o / 4 + 3) as usize] >> at) & 0xff;
+                sc = (more & 0x0f) | ((lo >> 2) & 0x30);
+                mn = (more >> 4) | ((hi >> 2) & 0x30);
+            }
+            let qs = (o + 16 + (g / 2) * 32) / 4;
+            let sh = (g % 2) * 4;
+            let mut part = f32::new(0.0);
+            for i in 0..8u32 {
+                let word = w[(qs + i) as usize];
+                for c in 0..4u32 {
+                    part += f32::cast_from((word >> (c * 8 + sh)) & 0x0f) * sx[(gi * 32 + i * 4 + c) as usize];
+                }
+            }
+            acc += d * f32::cast_from(sc) * part - dmin * f32::cast_from(mn) * gs[gi as usize];
+            gi += 32;
+        }
+    }
     sum[UNIT_POS as usize] = acc;
     sync_cube();
     let mut stride = u32::new(16);

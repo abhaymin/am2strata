@@ -74,6 +74,31 @@ macro_rules! with_client {
     };
 }
 
+/// From this many rows a Q4_K product takes `matvec_q4k` (a variable so a test can force either kernel).
+pub static WIDE_ROWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(kernels::WIDE_ROWS);
+
+/// Queues y = W x for `tokens` vectors with the kernel that suits the matrix.
+macro_rules! product {
+    ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $tokens:expr) => {{
+        let w = $w;
+        let (be, bb, k) = w.geometry;
+        let wide = k == kernels::kind::Q4_K && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
+        let cubes = w.rows.div_ceil(if wide { 32 } else { kernels::ROWS_PER_CUBE });
+        let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
+        let count = CubeCount::Static(cx, cy, $tokens);
+        unsafe {
+            let y = ArrayArg::from_raw_parts($hy, $tokens as usize * w.rows as usize);
+            let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
+            if wide {
+                kernels::matvec_q4k::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::WIDE_CUBE), wa, xa, y, w.rows, w.row_bytes, w.cols);
+            } else {
+                kernels::matvec::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::CUBE), wa, xa, y, w.rows, w.cols, w.row_bytes, be, bb, k);
+            }
+        }
+    }};
+}
+
 /// A runtime that works here: a tiny kernel runs and gives the right answer (a missing driver or runtime library
 /// panics inside CubeCL; that is caught and the device left out).
 fn works<R: Runtime>(dev: R::Device) -> Option<ComputeClient<R>> {
@@ -189,17 +214,8 @@ impl Gpu {
         with_client!(self, c, R, {
             let hx = c.create_from_slice(f32::as_bytes(x));
             let outs: Vec<_> = ws.iter().map(|w| {
-                let (be, bb, k) = w.geometry;
-                let cubes = w.rows.div_ceil(kernels::ROWS_PER_CUBE);
-                let cx = cubes.min(65535);
-                let cy = cubes.div_ceil(cx);
                 let hy = c.empty(tokens as usize * w.rows as usize * 4);
-                unsafe {
-                    kernels::matvec::launch_unchecked::<R>(c, CubeCount::Static(cx, cy, tokens), CubeDim::new_1d(kernels::CUBE),
-                        ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts(hx.clone(), x.len()),
-                        ArrayArg::from_raw_parts(hy.clone(), tokens as usize * w.rows as usize),
-                        w.rows, w.cols, w.row_bytes, be, bb, k);
-                }
+                product!(c, R, *w, hx.clone(), x.len(), hy.clone(), tokens);
                 hy
             }).collect();
             outs.into_iter().map(|hy| f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()).collect()
@@ -223,16 +239,9 @@ impl Gpu {
 
     /// y = W x, queued; y stays on the device.
     pub fn mv(&self, w: &Weights, x: &Buf) -> Buf {
-        let (be, bb, k) = w.geometry;
-        let cubes = w.rows.div_ceil(kernels::ROWS_PER_CUBE);
-        let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
         with_client!(self, c, R, {
             let hy = c.empty(w.rows as usize * 4);
-            unsafe {
-                kernels::matvec::launch_unchecked::<R>(c, CubeCount::Static(cx, cy, 1), CubeDim::new_1d(kernels::CUBE),
-                    ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts(x.handle.clone(), x.len),
-                    ArrayArg::from_raw_parts(hy.clone(), w.rows as usize), w.rows, w.cols, w.row_bytes, be, bb, k);
-            }
+            product!(c, R, w, x.handle.clone(), x.len, hy.clone(), 1u32);
             Buf { handle: hy, len: w.rows as usize }
         })
     }
@@ -295,20 +304,10 @@ impl Gpu {
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).
     pub fn matvec(&self, w: &Weights, x: &[f32]) -> Vec<f32> {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;
-        let (be, bb, k) = w.geometry;
-        // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
-        let cubes = w.rows.div_ceil(kernels::ROWS_PER_CUBE);
-        let cx = cubes.min(65535);
-        let cy = cubes.div_ceil(cx);
         with_client!(self, c, R, {
             let hx = c.create_from_slice(f32::as_bytes(x));
             let hy = c.empty(tokens as usize * w.rows as usize * 4);
-            unsafe {
-                kernels::matvec::launch_unchecked::<R>(c, CubeCount::Static(cx, cy, tokens), CubeDim::new_1d(kernels::CUBE),
-                    ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts(hx, x.len()),
-                    ArrayArg::from_raw_parts(hy.clone(), tokens as usize * w.rows as usize),
-                    w.rows, w.cols, w.row_bytes, be, bb, k);
-            }
+            product!(c, R, w, hx, x.len(), hy.clone(), tokens);
             f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()
         })
     }

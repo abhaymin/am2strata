@@ -152,8 +152,7 @@ Planned, in order. Nothing here is started unless it says so.
 The long-term engine plan, one Rust engine for dense and MoE models, is [ENGINE-PLAN.md](ENGINE-PLAN.md).
 
 1. **Two GPUs across a reboot.** Done so far: Orca splits over both cards, am2Strata is the boot service, a card that
-   is missing at load is dropped with a note. Still needed: install `deploy/gpu-usb4-recover.{sh,service}` (needs
-   root) and pass a reboot test. Gate: after a cold boot both cards are up and Orca is split, with no hand steps.
+   is missing at load is dropped with a note. `gpu-usb4-recover` is installed. Still needed: a reboot test. Gate: after a cold boot both cards are up and Orca is split, with no hand steps.
 2. **Check poly.6 on real models.** Sage measured: the rebuilt `strata-poly` decodes at 150-155 tok/s, the same as the previous
    engine at 149-156 tok/s. Clover is still to try; it needs a download.
 3. **Two GPUs for the other models.** Sage on both cards: 157-160 tok/s against 150-155 on one, about 5% more, and

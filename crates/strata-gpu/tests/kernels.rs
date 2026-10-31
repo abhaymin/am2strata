@@ -1,7 +1,8 @@
 //! Every kernel against the CPU's dequantizer (strata_pack::quants), on every device here: the phase 2 gate
 //! (docs/GPU-PLAN.md) - within 1e-3 of the sum of |w x|, so only the order of the sums differs.
 
-use strata_gpu::{list, Gpu};
+use std::sync::atomic::Ordering;
+use strata_gpu::{list, Gpu, WIDE_ROWS};
 
 /// A tiny deterministic generator (no rand dependency).
 struct Rng(u64);
@@ -69,11 +70,14 @@ fn every_kernel_matches_the_cpu_on_every_device() {
         for d in &devices {
             let g = Gpu::open(&d.name).unwrap();
             let wt = g.upload(ty, &w, rows, cols).unwrap();
-            let got = g.matvec(&wt, &x);
-            assert_eq!(got.len(), rows * tokens);
-            let worst = got.iter().zip(&want).zip(&scale).map(|((g, w), s)| ((*g - *w).abs() as f64) / s.max(1e-12)).fold(0f64, f64::max);
-            eprintln!("{ty:5} on {:18} worst relative error {worst:.2e}", d.name);
-            assert!(worst < 1e-3, "{ty} on {}: {worst}", d.name);
+            for (kernel, limit) in [("plain", u32::MAX), ("wide", 0)] {
+                WIDE_ROWS.store(limit, Ordering::Relaxed);
+                let got = g.matvec(&wt, &x);
+                assert_eq!(got.len(), rows * tokens);
+                let worst = got.iter().zip(&want).zip(&scale).map(|((g, w), s)| ((*g - *w).abs() as f64) / s.max(1e-12)).fold(0f64, f64::max);
+                eprintln!("{ty:5} on {:18} {kernel:6} worst relative error {worst:.2e}", d.name);
+                assert!(worst < 1e-3, "{ty} on {} ({kernel}): {worst}", d.name);
+            }
         }
     }
 }
@@ -144,5 +148,31 @@ fn the_chain_of_kernels_matches_the_cpu() {
         let o = g.attend(&g.buffer(&q), &cache, &g.buffer(&v), &s, n as u32, n_head as u32, n_kv as u32, hd as u32, scale);
         close(&g.read(&o), &att, "attend");
         eprintln!("{}: the chain matches", d.name);
+    }
+}
+
+/// The product kernels' speed on one device: AM2_DEVICE=cuda:0 cargo test --release product_speed -- --ignored --nocapture
+#[test]
+#[ignore]
+fn product_speed() {
+    let g = Gpu::open(&std::env::var("AM2_DEVICE").unwrap_or("cuda:0".into())).unwrap();
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    for (rows, cols) in [(5120, 2048), (2048, 2048), (512, 2048), (64, 2048)] {
+        let w = weights("Q4_K", rows, cols, &mut rng);
+        let wt = g.upload("Q4_K", &w, rows, cols).unwrap();
+        let x = g.buffer(&(0..cols).map(|_| rng.unit()).collect::<Vec<f32>>());
+        for (kernel, limit) in [("plain", u32::MAX), ("wide", 0)] {
+            WIDE_ROWS.store(limit, Ordering::Relaxed);
+            g.read(&g.mv(&wt, &x)); // compiled and warm
+            let t = std::time::Instant::now();
+            let n = 400;
+            let mut y = g.mv(&wt, &x);
+            for _ in 1..n {
+                y = g.mv(&wt, &x);
+            }
+            g.read(&y);
+            let s = t.elapsed().as_secs_f64();
+            eprintln!("{rows}x{cols} {kernel:6} {:7.1} us/product {:6.1} GB/s", s * 1e6 / n as f64, (w.len() * n) as f64 / s / 1e9);
+        }
     }
 }
