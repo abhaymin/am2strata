@@ -3,7 +3,7 @@
 //! (`"web_search": {"searxng_url": "http://..."}`), else DuckDuckGo's HTML results page; `fetch_url(url)` reads a
 //! page's main text. Pages are fetched like any media source (media::fetch_public: public addresses only, every
 //! redirect checked, unless "allow_private_urls"); what they say goes to the model marked as data from the web.
-//! Queries leave this PC (to SearXNG or DuckDuckGo), so it is off unless a request asks.
+//! Queries leave this PC (to SearXNG or DuckDuckGo), so it is off unless a request asks. Safe search is off on both.
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -113,7 +113,7 @@ impl WebTools {
         match &self.searxng {
             // the address the config names (often on this PC or the LAN: the config's own choice)
             Some(base) => {
-                let url = reqwest::Url::parse_with_params(&format!("{base}/search"), &[("q", q), ("format", "json")])
+                let url = reqwest::Url::parse_with_params(&format!("{base}/search"), &[("q", q), ("format", "json"), ("safesearch", "0")])
                     .map_err(|e| format!("searxng_url: {e}"))?;
                 let r = Self::client()?.get(url).send().await.map_err(|e| format!("SearXNG: {e}"))?;
                 if !r.status().is_success() {
@@ -127,7 +127,7 @@ impl WebTools {
                 }).filter(|h| !h.url.is_empty()).collect())
             }
             None => {
-                let url = reqwest::Url::parse_with_params("https://html.duckduckgo.com/html/", &[("q", q)]).map_err(|e| e.to_string())?;
+                let url = duckduckgo_url(q)?;
                 let r = Self::client()?.get(url).send().await.map_err(|e| format!("DuckDuckGo: {e}"))?;
                 if !r.status().is_success() {
                     return Err(format!("DuckDuckGo answered {} (it limits automated searches; a SearXNG of your own does not)", r.status()));
@@ -167,6 +167,11 @@ impl WebTools {
         let cut = text.chars().count() > PAGE_CHARS;
         Ok((title, if cut { text.chars().take(PAGE_CHARS).collect() } else { text }, cut))
     }
+}
+
+/// The results page with safe search off (kp=-2): nothing is filtered out of a search.
+fn duckduckgo_url(q: &str) -> Result<reqwest::Url, String> {
+    reqwest::Url::parse_with_params("https://html.duckduckgo.com/html/", &[("q", q), ("kp", "-2")]).map_err(|e| e.to_string())
 }
 
 /// DuckDuckGo's HTML results: each result's title link (its address in the uddg parameter of DuckDuckGo's redirect)
@@ -275,6 +280,11 @@ pub fn page_text(html: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn safe_search_is_off() {
+        assert!(duckduckgo_url("a b").unwrap().query_pairs().any(|(k, v)| k == "kp" && v == "-2"));
+    }
 
     #[test]
     fn duckduckgo_results_are_read_and_ads_left_out() {
