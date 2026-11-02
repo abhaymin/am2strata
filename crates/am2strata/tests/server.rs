@@ -1272,7 +1272,10 @@ fn a_downloaded_model_is_removed_from_the_disk_keeping_what_others_use() {
     // a download folder that is a link to a cache elsewhere: the link goes, the cache stays
     let outside = std::env::temp_dir().join(format!("am2strata-outside-{}", uuid::Uuid::new_v4().simple()));
     mk(&outside.join("cached.gguf"));
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, d.join("models/linked")).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&outside, d.join("models/linked")).unwrap();
     let edit = |id: &str, k: &str, v: Value| {
         let p = d.join(format!("strata-{id}.json"));
         let mut c: Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();

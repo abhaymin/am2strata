@@ -20,7 +20,7 @@ env:
 jobs:
   build:
     strategy:
-      fail-fast: true       # one platform failing stops the others, rather than finishing work that cannot ship
+      fail-fast: false      # one platform's failure does not hide another's: a run shows everything to fix at once
       matrix:
         include:
           # the oldest supported Ubuntu: a binary built there also runs on newer Linux, not the other way round

@@ -126,8 +126,8 @@ its draft block is not run.
 GDN's sigmoid gate. `strata-pack` gained IQ2_S, which matches ggml's decoder bit for bit on Orca's own bytes.
 
 - **Passed:** Orca IQ3_XXS, 16 of 16 steps identical on a 34-token prompt, worst logit difference 1.37.
-- **Not proven: QSA.** Its top-k is 2048, so it starts past 2,051 tokens and that prompt never reached it. Until a longer prompt
-  passes parity, `qsa_cells` is unverified, and the gate for this architecture stays open. When the budget ends inside a block
+- **Failed: QSA.** Its top-k is 2048, so it starts past 2,051 tokens. On a 2,333-token prompt 11 of 12 steps match, but step 1 picks
+  a different token (271 against 198, worst logit difference 2.58), so the gate for this architecture stays open. When the budget ends inside a block
   it keeps that block's lowest cells, where ggml's order among equal scores is unspecified.
 - **Speed, CPU, 10 threads:** about 0.4 tok/s. `--devices` is not measured.
 
@@ -136,7 +136,7 @@ GDN's sigmoid gate. `strata-pack` gained IQ2_S, which matches ggml's decoder bit
 | Item | State |
 |---|---|
 | `qwen35moe` | passed (text) |
-| `qwen4exp` | passed below 2,051 tokens; QSA not proven |
+| `qwen4exp` | passed below 2,051 tokens; fails past them (QSA) |
 | `gemma4`, `glm4moe`, `deepseek4` | not started; no GGUF here for any of them, so each needs a download first |
 | vision through this engine | not started |
 
