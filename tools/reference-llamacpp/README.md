@@ -32,6 +32,9 @@ layers, 496 in the header) keep each layer's expert count only in the tensor sha
   `STRATA_MODELS=a.gguf:b.gguf`: the tokenizer test (am2Strata's tokenizer, extracted from each GGUF, against
   llama.cpp's ids on a set of texts) and the forward test (parity.sh per model).
 
+The oracle runs without llama.cpp's CPU repack (`use_extra_bufts = false`), which would copy the whole model into RAM: Orca's
+85 GB does not fit. Its batch takes prompts up to 8192 tokens.
+
 Why not bit-identical logits: llama.cpp's CPU backend quantizes the activations before each matrix product (Q8_K,
 Q8_0, F16 or BF16, by the weight's type), keeps the KV cache in F16 and accumulates flash attention in F16. The engine
 does the first two the same way; what remains is float rounding, about 0.1-1 logit (GLM-4.7-Flash's logits are
@@ -51,6 +54,7 @@ does the first two the same way; what remains is float rounding, about 0.1-1 log
 | Cyber-Tiel Coder 35B-A3B UD-Q8_K_XL, with its pack (105-token prompt, 24 steps) | qwen35moe (gated delta nets) | 24 | 0 | 2.60 |
 | the same, 5-token prompt, 12 steps | | 11 | 1 | 0.34 |
 | Strata-Sage A1.5 Q4_K_M (105-token prompt) | qwen35moe | 16 | 0 | 0.97 |
+| Qwen3.8 Flash Next Uncensored IQ3_XXS, Orca (34-token prompt: QSA not active) | qwen4exp | 16 | 0 | 1.37 |
 | Qwen3 8B Q8_0 (12 steps) | qwen3 | 12 | 0 | 0.31 |
 
 Tokenizers (7 texts each, identical ids): tekken (Ministral 3, Devstral), glm4 (GLM-4.7-Flash), pixtral

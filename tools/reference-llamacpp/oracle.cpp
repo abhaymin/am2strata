@@ -15,6 +15,7 @@ int main(int argc, char ** argv) {
     if (argc < 4) { fprintf(stderr, "usage: oracle model.gguf n_new ids\n"); return 2; }
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
+    mp.use_extra_bufts = false;   // no CPU repack: a copy of the whole model, which Orca's 85 GB would not fit in RAM
     mp.n_gpu_layers = 0;
     const bool vocab_only = std::atoi(argv[2]) < 0;
     mp.vocab_only = vocab_only;
@@ -37,7 +38,7 @@ int main(int argc, char ** argv) {
     }
     if (vocab_only) { llama_model_free(model); return 0; }
     llama_context_params cp = llama_context_default_params();
-    cp.n_ctx = 4096; cp.n_batch = 512; cp.n_ubatch = 512;
+    cp.n_ctx = 8192; cp.n_batch = 8192; cp.n_ubatch = 512;
     llama_context * ctx = llama_init_from_model(model, cp);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     int n_new = std::atoi(argv[2]);

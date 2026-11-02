@@ -9,7 +9,9 @@
 //!   - `deepseek2` (GLM-4.7-Flash, DeepSeek V2/V3 and their family: MLA attention with the absorbed K/V
 //!     projections, leading dense layers, then sigmoid- or softmax-routed experts with a shared expert),
 //!   - `qwen35moe` (Qwen3.5/3.6, Ornith, Tiel, Sage: one layer in four is attention with a gate on its heads, the others
-//!     are recurrent gated delta nets; softmax-routed experts with a sigmoid-gated shared expert; text only).
+//!     are recurrent gated delta nets; softmax-routed experts with a sigmoid-gated shared expert; text only),
+//!   - `qwen4exp` (Qwen3.8 Flash Next, Orca: the same layers over hyper-connections, which keep parallel residual streams;
+//!     the n-gram embedding of one layer (PLE), and attention over the top blocks an indexer scores (QSA); text only).
 //! Each layer is a list of (norm, block) pairs applied as x += block(rms_norm(x)); every formula follows llama.cpp,
 //! which the parity tests compare against (tools/reference-llamacpp).
 
@@ -425,6 +427,46 @@ pub struct Attn {
     pub(crate) rope: bool,
     /// q carries a gate per head after its query: the attention's output is multiplied by its sigmoid (Qwen3.5)
     pub(crate) gated: bool,
+    pub(crate) qsa: Option<Qsa>,
+}
+
+/// QSA: past `top` cells, attention reads the blocks of `r` tokens that an indexer scores best, and the unfinished tail.
+pub struct Qsa {
+    q: QMat,
+    k: QMat,
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
+    r: usize,
+    dim: usize,
+    top: usize,
+}
+
+/// One hyper-connection mixer: the grouped norm, a low-rank gate over the streams, and the weights of the block's output
+/// per stream (`inject`; the head's mixer has none).
+pub struct HcMix {
+    norm: Vec<f32>,
+    down: QMat,
+    up: QMat,
+    inject: Option<QMat>,
+}
+
+/// The n-gram embedding: hashes of the last tokens pick rows of one big table, and a gated value plus a dilated causal
+/// conv of it add to the residual streams.
+pub struct Ple {
+    table: QMat,
+    key: QMat,
+    value: QMat,
+    norm_key: Vec<f32>,
+    norm_query: Vec<f32>,
+    norm_conv: Vec<f32>,
+    conv: Vec<f32>,
+    kern: usize,
+    gram: usize,
+    per_gram: usize,
+    eos: u64,
+    mult: Vec<u64>,
+    offsets: Vec<u64>,
+    vocabs: Vec<u64>,
 }
 
 /// DeepSeek's multi-head latent attention, with the K and V up-projections absorbed (as llama.cpp's is_mla path):
@@ -468,6 +510,8 @@ pub struct Gdn {
     a: Vec<f32>,
     ssm_norm: Vec<f32>,
     ssm_out: QMat,
+    /// the output gate: sigmoid in Qwen3.8, silu in Qwen3.5
+    z_sigmoid: bool,
 }
 
 pub enum Block {
@@ -481,6 +525,9 @@ pub enum Block {
 
 pub struct Layer {
     pub parts: Vec<(Vec<f32>, Block)>,
+    /// hyper-connections' mixers before the two blocks: `parts`' norms are then empty
+    hc: Option<[HcMix; 2]>,
+    ple: Option<Ple>,
 }
 
 pub struct Model {
@@ -499,6 +546,9 @@ pub struct Model {
     pub(crate) embd: QMat,
     pub(crate) out_norm: Vec<f32>,
     pub(crate) output: QMat,
+    /// streams of the hyper-connections (0: none) and the mixer that ends them
+    hc: usize,
+    hc_head: Option<HcMix>,
     pub layers: Vec<Layer>,
     /// the expert profile's shape: one row per layer, `profile_experts` columns
     pub profile_experts: usize,
@@ -513,6 +563,10 @@ pub struct State {
     kv: HashMap<usize, (Vec<f32>, Vec<f32>)>,
     conv: HashMap<usize, Vec<f32>>,
     ssm: HashMap<usize, Vec<f32>>,
+    /// per QSA layer: the unfinished block's raw keys, and the finished blocks' keys
+    idx: HashMap<usize, (Vec<f32>, Vec<f32>)>,
+    ple_win: Vec<f32>,
+    prev: Vec<u32>,
 }
 
 fn arr_u64(g: &Gguf, key: &str, i: usize) -> u64 {
@@ -523,7 +577,7 @@ fn arr_u64(g: &Gguf, key: &str, i: usize) -> u64 {
     }
 }
 
-pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2", "qwen35moe"];
+pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2", "qwen35moe", "qwen4exp"];
 
 impl Model {
     /// Loads the GGUF (memory-mapped); with a pack, its float tensors replace the GGUF's. Also returns how many
@@ -575,7 +629,13 @@ impl Model {
             _ => Gating::Softmax,
         };
         let nemotron = arch.starts_with("nemotron_h");
-        let qwen35 = arch == "qwen35moe";
+        let qwen4 = arch == "qwen4exp";
+        let qwen35 = arch == "qwen35moe" || qwen4;
+        let hc = if qwen4 { u("hyper_connection.count")? as usize } else { 0 };
+        let mixer = |n: &str, d: &str, up: &str, inj: Option<String>| -> Result<HcMix, String> {
+            Ok(HcMix { norm: vecf(n)?, down: take(d)?, up: take(up)?, inject: inj.map(|i| take(&i)).transpose()? })
+        };
+        let ple_layer = if qwen4 { Some(arr_u64(&g, &k("ple.layers"), 0) as usize) } else { None };
         let full_attn = u("full_attention_interval").unwrap_or(4).max(1) as usize;
         let mut layers = Vec::with_capacity(n_layer);
         let mut max_expert = 0usize;
@@ -591,6 +651,14 @@ impl Model {
                     o: take(&p("attn_output.weight"))?, q_b: optf(&p("attn_q.bias")), k_b: optf(&p("attn_k.bias")),
                     v_b: optf(&p("attn_v.bias")), o_b: optf(&p("attn_output.bias")), q_norm: optf(&p("attn_q_norm.weight")),
                     k_norm: optf(&p("attn_k_norm.weight")), n_head, n_kv, head_dim, rope, gated: qwen35,
+                    qsa: match arr_u64(&g, &k("attention.compress_ratios"), l) as usize {
+                        0 => None,
+                        r => Some(Qsa {
+                            q: take(&p("indexer.q_proj.weight"))?, k: take(&p("indexer.k_proj.weight"))?,
+                            q_norm: vecf(&p("indexer.q_norm.weight"))?, k_norm: vecf(&p("indexer.k_norm.weight"))?, r,
+                            dim: u("attention.indexer.key_length")? as usize, top: u("attention.indexer.top_k")? as usize,
+                        }),
+                    },
                 }))
             };
             // the feed-forward of a layer that has one: experts when there is a router, else dense
@@ -629,7 +697,7 @@ impl Model {
                     gating: if nemotron { Gating::Sigmoid } else if arch == "deepseek2" { gating } else { Gating::Softmax },
                     n_expert, top_k: arr_u64(&g, &k("expert_used_count"), l) as usize,
                     // llama.cpp: the llama family always renormalizes the chosen experts' weights
-                    w_norm: if matches!(arch.as_str(), "llama" | "mistral3" | "qwen3moe" | "qwen35moe") { true } else { w_norm_meta.unwrap_or(false) },
+                    w_norm: if matches!(arch.as_str(), "llama" | "mistral3" | "qwen3moe" | "qwen35moe" | "qwen4exp") { true } else { w_norm_meta.unwrap_or(false) },
                     w_scale, latent, gate_exps, up_exps, down_exps, act: act_, shared,
                     shared_gate: optf(&p("ffn_gate_inp_shexp.weight")),
                 }))
@@ -681,22 +749,46 @@ impl Model {
                 };
                 parts.push((vecf(&p("ffn_norm.weight"))?, f));
             } else if qwen35 {
-                let mixer = if (l + 1) % full_attn == 0 {
+                let block = if (l + 1) % full_attn == 0 {
                     attn(true)?
                 } else {
                     Block::Gdn(Gdn {
                         qkv: take(&p("attn_qkv.weight"))?, z: take(&p("attn_gate.weight"))?, alpha: take(&p("ssm_alpha.weight"))?,
                         beta: take(&p("ssm_beta.weight"))?, conv_w: vecf(&p("ssm_conv1d.weight"))?, dt_b: vecf(&p("ssm_dt.bias"))?,
-                        a: vecf(&p("ssm_a"))?, ssm_norm: vecf(&p("ssm_norm.weight"))?, ssm_out: take(&p("ssm_out.weight"))?,
+                        a: vecf(&p("ssm_a"))?, ssm_norm: vecf(&p("ssm_norm.weight"))?, ssm_out: take(&p("ssm_out.weight"))?, z_sigmoid: qwen4,
                     })
                 };
-                parts.push((vecf(&p("attn_norm.weight"))?, mixer));
-                parts.push((vecf(&p("post_attention_norm.weight"))?, ffn(Act::Silu, &mut max_expert)?));
+                let norm = |n: &str| if qwen4 { Ok(vec![]) } else { vecf(&p(n)) };
+                parts.push((norm("attn_norm.weight")?, block));
+                parts.push((norm("post_attention_norm.weight")?, ffn(Act::Silu, &mut max_expert)?));
             } else {
                 parts.push((vecf(&p("attn_norm.weight"))?, attn(true)?));
                 parts.push((vecf(&p("ffn_norm.weight"))?, ffn(Act::Silu, &mut max_expert)?));
             }
-            layers.push(Layer { parts });
+            let hc_layer = if qwen4 {
+                Some([
+                    mixer(&p("hc_attn_norm.weight"), &p("hc_attn_down.weight"), &p("hc_attn_up.weight"), Some(p("hc_attn_inject.weight")))?,
+                    mixer(&p("hc_ffn_norm.weight"), &p("hc_ffn_down.weight"), &p("hc_ffn_up.weight"), Some(p("hc_ffn_inject.weight")))?,
+                ])
+            } else {
+                None
+            };
+            let ple = if ple_layer == Some(l) {
+                let list = |n: &str, c: usize| (0..c).map(|i| arr_u64(&g, &k(n), i)).collect::<Vec<u64>>();
+                let (gram, per_gram) = (u("ple.ngram_size")? as usize, u("ple.heads_per_ngram")? as usize);
+                let n_heads = (gram - 1) * per_gram;
+                Some(Ple {
+                    table: take("per_layer_token_embd.weight")?, key: take(&p("ple_key.weight"))?, value: take(&p("ple_value.weight"))?,
+                    norm_key: vecf(&p("ple_norm_key.weight"))?, norm_query: vecf(&p("ple_norm_query.weight"))?,
+                    norm_conv: vecf(&p("ple_norm_conv.weight"))?, conv: vecf(&p("ple_conv1d.weight"))?,
+                    kern: u("ple.conv_kernel")? as usize, gram, per_gram, eos: u("ple.eos_token_id")?,
+                    mult: list("ple.layer_multipliers", gram), offsets: list("ple.head_offsets", n_heads),
+                    vocabs: list("ple.head_vocab_sizes", n_heads),
+                })
+            } else {
+                None
+            };
+            layers.push(Layer { parts, hc: hc_layer, ple });
         }
         let rope = if nemotron {
             None
@@ -727,23 +819,27 @@ impl Model {
         let embd = take("token_embd.weight")?;
         let output = opt("output.weight").unwrap_or_else(|| embd.clone());
         let profile_experts = (u("expert_count").unwrap_or(0) as usize).max(max_expert);
+        let hc_head = if qwen4 { Some(mixer("output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", None)?) } else { None };
         Ok((Model {
             n_embd,
             d_inner: u("ssm.inner_size").unwrap_or(0) as usize, d_state: u("ssm.state_size").unwrap_or(0) as usize,
             n_ssm_head: u("ssm.time_step_rank").unwrap_or(0) as usize, n_group: u("ssm.group_count").unwrap_or(1) as usize,
             d_conv: u("ssm.conv_kernel").unwrap_or(0) as usize, eps, rope, attn_temp, stops,
-            embd, out_norm: vecf("output_norm.weight")?, output,
+            embd, out_norm: optf("output_norm.weight").unwrap_or_default(), output, hc, hc_head,
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
             profile_experts, layers, arch,
         }, from_pack))
     }
 
     pub fn new_state(&self) -> State {
-        State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new() }
+        State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![] }
     }
 
     /// One token through the model: the logits of the next one.
     pub fn forward(&self, st: &mut State, token: u32) -> Vec<f32> {
+        if self.hc > 0 {
+            return self.forward_hc(st, token);
+        }
         let mut x = self.embd.row(token as usize);
         for (l, layer) in self.layers.iter().enumerate() {
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
@@ -762,6 +858,150 @@ impl Model {
         st.pos += 1;
         let h = rms_norm(&x, &self.out_norm, self.eps);
         self.output.mul(&h)
+    }
+
+    /// The same with hyper-connections: the residual is `hc` streams, mixed down for each block and given its output
+    /// by per-stream weights.
+    fn forward_hc(&self, st: &mut State, token: u32) -> Vec<f32> {
+        let mut res = self.embd.row(token as usize).repeat(self.hc);
+        for (l, layer) in self.layers.iter().enumerate() {
+            let [before_attn, before_ffn] = layer.hc.as_ref().expect("hc layer");
+            if let Some(p) = &layer.ple {
+                self.ple(p, token, &mut res, st);
+            }
+            let (cur, inject) = self.hc_mix(&res, before_attn);
+            let out = match &layer.parts[0].1 {
+                Block::Gdn(b) => self.gdn(l, b, &cur, st),
+                Block::Attn(b) => self.attention(l * 2, b, &cur, st),
+                _ => unreachable!("a mixer"),
+            };
+            self.hc_combine(&mut res, &out, &inject);
+            let (cur, inject) = self.hc_mix(&res, before_ffn);
+            let Block::Moe(m) = &layer.parts[1].1 else { unreachable!("a feed-forward") };
+            let out = self.moe(m, &cur);
+            self.hc_combine(&mut res, &out, &inject);
+        }
+        st.pos += 1;
+        st.prev.push(token);
+        let (h, _) = self.hc_mix(&res, self.hc_head.as_ref().expect("hc head"));
+        self.output.mul(&h)
+    }
+
+    fn grouped_norm(&self, x: &[f32], w: &[f32]) -> Vec<f32> {
+        x.chunks(self.n_embd).zip(w.chunks(self.n_embd)).flat_map(|(s, g)| rms_norm(s, g, self.eps)).collect()
+    }
+
+    fn hc_mix(&self, x: &[f32], m: &HcMix) -> (Vec<f32>, Vec<f32>) {
+        let (d, hc) = (self.n_embd, self.hc as f32);
+        let xn = self.grouped_norm(x, &m.norm);
+        let mut lo = m.down.mul(&xn);
+        lo.iter_mut().for_each(|v| *v = silu(*v / hc));
+        let gate = m.up.mul(&lo);
+        let mut mixed = vec![0f32; d];
+        for (s, g) in xn.chunks(d).zip(gate.chunks(d)) {
+            for (i, o) in mixed.iter_mut().enumerate() {
+                *o += s[i] * sigmoid(g[i]);
+            }
+        }
+        mixed.iter_mut().for_each(|v| *v /= hc);
+        (mixed, m.inject.as_ref().map(|q| q.mul(&xn)).unwrap_or_default())
+    }
+
+    /// 2 sigmoid(inject / hc) is centred on 1: an injection of zero is a plain residual addition.
+    fn hc_combine(&self, res: &mut [f32], out: &[f32], inject: &[f32]) {
+        for (s, inj) in res.chunks_mut(self.n_embd).zip(inject) {
+            let w = 2.0 * sigmoid(*inj / self.hc as f32);
+            s.iter_mut().zip(out).for_each(|(r, o)| *r += o * w);
+        }
+    }
+
+    fn ple(&self, p: &Ple, token: u32, res: &mut [f32], st: &mut State) {
+        let (d, hc_dim) = (self.n_embd, self.hc * self.n_embd);
+        // an EOS or the start of the conversation in the window reads as EOS from there back
+        let mut ctx = vec![token as u64];
+        let mut cut = false;
+        for s in 1..p.gram {
+            let t = st.prev.len().checked_sub(s).map(|i| st.prev[i] as u64);
+            cut = cut || t.is_none() || t == Some(p.eos);
+            ctx.push(if cut { p.eos } else { t.unwrap() });
+        }
+        let mut emb = Vec::with_capacity(p.offsets.len() * p.table.cols);
+        for n in 2..=p.gram {
+            let mixed = (1..n).fold(ctx[0].wrapping_mul(p.mult[0]), |h, j| h ^ ctx[j].wrapping_mul(p.mult[j]));
+            for g in 0..p.per_gram {
+                let h = (n - 2) * p.per_gram + g;
+                emb.extend(p.table.row((mixed % p.vocabs[h] + p.offsets[h]) as usize));
+            }
+        }
+        let key = self.grouped_norm(&p.key.mul(&emb), &p.norm_key);
+        let value = p.value.mul(&emb);
+        let query = self.grouped_norm(res, &p.norm_query);
+        // per stream, a dot product through a signed square root
+        let gates: Vec<f32> = key.chunks(d).zip(query.chunks(d)).map(|(k, q)| {
+            let s = k.iter().zip(q).map(|(a, b)| a * b).sum::<f32>() / (d as f32).sqrt();
+            let sgn = if s > 0.0 { 1.0 } else if s < 0.0 { -1.0 } else { 0.0 };
+            sigmoid(sgn * s.abs().max(1e-6).sqrt())
+        }).collect();
+        let gated: Vec<f32> = gates.iter().flat_map(|g| value.iter().map(move |v| v * g)).collect();
+        let normalized = self.grouped_norm(&gated, &p.norm_conv);
+        // depthwise, causal, dilated by the n-gram size: the window holds the last (kern - 1) * gram rows, oldest first
+        let hist = (p.kern - 1) * p.gram;
+        if st.ple_win.is_empty() {
+            st.ple_win = vec![0f32; hist * hc_dim];
+        }
+        let mut conv = vec![0f32; hc_dim];
+        for k in 0..p.kern {
+            let back = (p.kern - 1 - k) * p.gram;
+            for (c, o) in conv.iter_mut().enumerate() {
+                let x = if back == 0 { normalized[c] } else { st.ple_win[(hist - back) * hc_dim + c] };
+                *o += x * p.conv[c * p.kern + k];
+            }
+        }
+        st.ple_win.copy_within(hc_dim.., 0);
+        st.ple_win[(hist - 1) * hc_dim..].copy_from_slice(&normalized);
+        for i in 0..hc_dim {
+            res[i] += gated[i] + silu(conv[i]);
+        }
+    }
+
+    /// The cells attention reads for this token, in order: None while the budget still covers them all.
+    fn qsa_cells(&self, slot: usize, q: &Qsa, h: &[f32], st: &mut State) -> Option<Vec<usize>> {
+        let rope = self.rope.as_ref().expect("rope");
+        let (pos, r, dim) = (st.pos, q.r, q.dim);
+        let mut raw = q.k.mul(h);
+        f16_round(&mut raw);
+        let (open, done) = st.idx.entry(slot).or_default();
+        open.extend_from_slice(&raw);
+        if open.len() == r * dim {
+            // a finished block: its mean key, normalized and turned to the block's first position
+            let mut mean = vec![0f32; dim];
+            open.chunks(dim).for_each(|k| mean.iter_mut().zip(k).for_each(|(m, v)| *m += v));
+            mean.iter_mut().for_each(|v| *v /= r as f32);
+            let mut key = rms_norm(&mean, &q.k_norm, self.eps);
+            rope.apply(&mut key, pos + 1 - r);
+            done.extend_from_slice(&key);
+            open.clear();
+        }
+        let width = q.top + r - 1;
+        if pos < width {
+            return None;
+        }
+        let mut qv = q.q.mul(h);
+        qv.chunks_mut(dim).for_each(|c| {
+            let n = rms_norm(c, &q.q_norm, self.eps);
+            c.copy_from_slice(&n);
+            rope.apply(c, pos);
+        });
+        let blocks = done.len() / dim;
+        let scores: Vec<f32> = done.par_chunks(dim).map(|k| qv.chunks(dim).map(|qh| dot(k, qh).max(0.0)).sum()).collect();
+        let mut order: Vec<usize> = (0..blocks).collect();
+        order.sort_unstable_by(|a, b| scores[*b].total_cmp(&scores[*a]).then(a.cmp(b)));
+        // the tail is always read; the rest of the budget is the best blocks, the last one possibly in part
+        let tail = blocks * r;
+        let mut cells: Vec<usize> = order.iter().flat_map(|b| (b * r)..(b * r + r)).take(width - (pos + 1 - tail)).collect();
+        cells.extend(tail..=pos);
+        cells.sort_unstable();
+        Some(cells)
     }
 
     pub(crate) fn temp_scale_at(&self, pos: usize) -> f32 {
@@ -838,7 +1078,7 @@ impl Model {
     }
 
     fn gdn(&self, l: usize, b: &Gdn, h: &[f32], st: &mut State) -> Vec<f32> {
-        let Gdn { qkv, z, alpha, beta, conv_w, dt_b, a, ssm_norm, ssm_out } = b;
+        let Gdn { qkv, z, alpha, beta, conv_w, dt_b, a, ssm_norm, ssm_out, z_sigmoid } = b;
         let (nk, sk, nv, dc) = (self.n_group, self.d_state, self.n_ssm_head, self.d_conv);
         let sv = self.d_inner / nv;
         let key = nk * sk;
@@ -888,7 +1128,7 @@ impl Model {
         });
         for ((yh, nw), zh) in y.chunks_mut(sv).zip(std::iter::repeat(ssm_norm)).zip(z.chunks(sv)) {
             let n = rms_norm(yh, nw, self.eps);
-            yh.iter_mut().zip(n.iter().zip(zh)).for_each(|(o, (n, g))| *o = n * silu(*g));
+            yh.iter_mut().zip(n.iter().zip(zh)).for_each(|(o, (n, g))| *o = n * if *z_sigmoid { sigmoid(*g) } else { silu(*g) });
         }
         ssm_out.mul(&y)
     }
@@ -896,6 +1136,7 @@ impl Model {
     fn attention(&self, slot: usize, a: &Attn, h: &[f32], st: &mut State) -> Vec<f32> {
         let hd = a.head_dim;
         let pos = st.pos;
+        let top = a.qsa.as_ref().and_then(|q| self.qsa_cells(slot, q, h, st));
         let (mut qv, mut kv, mut vv) = {
             let mut v = QMat::mul_many(&[&a.q, &a.k, &a.v], h);
             let vv = v.pop().unwrap();
@@ -942,9 +1183,14 @@ impl Model {
         att.par_chunks_mut(hd).enumerate().for_each(|(hh, oh)| {
             let kh = hh / group;
             let qh = &qv[hh * hd..(hh + 1) * hd];
-            let mut scores: Vec<f32> = (0..n).map(|t| dot(qh, &kc[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd]) * scale).collect();
+            let score = |t: usize| dot(qh, &kc[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd]) * scale;
+            let mut scores: Vec<f32> = match &top {
+                Some(cells) => cells.iter().map(|&t| score(t)).collect(),
+                None => (0..n).map(score).collect(),
+            };
             softmax(&mut scores);
-            for (t, p) in scores.iter().enumerate() {
+            for (i, p) in scores.iter().enumerate() {
+                let t = top.as_ref().map_or(i, |c| c[i]);
                 let vt = &vc[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd];
                 oh.iter_mut().zip(vt).for_each(|(o, v)| *o += p * v);
             }
@@ -1068,7 +1314,6 @@ impl Model {
     /// slices stay on the CPU.
     #[allow(clippy::type_complexity)]
     pub fn matrices_mut(&mut self) -> (Vec<&mut QMat>, HashMap<(usize, usize), Vec<&mut QMat>>) {
-        let mut every: Vec<&mut QMat> = vec![&mut self.output];
         let mut experts: HashMap<(usize, usize), Vec<&mut QMat>> = HashMap::new();
         fn dense<'a>(d: &'a mut Dense, out: &mut Vec<&'a mut QMat>) {
             let Dense { gate, up, down, .. } = d;
@@ -1078,8 +1323,21 @@ impl Model {
             out.push(up);
             out.push(down);
         }
-        for layer in self.layers.iter_mut() {
-            for (_, b) in layer.parts.iter_mut() {
+        let Model { output, hc_head, layers, .. } = self;
+        let mut every: Vec<&mut QMat> = vec![output];
+        if let Some(HcMix { down, up, .. }) = hc_head.as_mut() {
+            every.extend([down, up]);
+        }
+        for layer in layers.iter_mut() {
+            let Layer { parts, hc, ple } = layer;
+            for HcMix { down, up, inject, .. } in hc.iter_mut().flatten() {
+                every.extend([down, up]);
+                every.extend(inject.as_mut());
+            }
+            if let Some(Ple { key, value, .. }) = ple.as_mut() {
+                every.extend([key, value]);
+            }
+            for (_, b) in parts.iter_mut() {
                 match b {
                     Block::Mamba(m) => {
                         let Mamba { ssm_in, ssm_out, .. } = m;

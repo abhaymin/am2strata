@@ -22,7 +22,7 @@ gets through degrades (one GPU, the previous engine, the previous model) and doe
 
 | | PolyStrata C++ (`strata`, `strata-poly`) | `am2strata-hybrid` (Rust) |
 |---|---|---|
-| Models | Qwen3.5/3.6/3.8, Gemma 4, GLM 5, DeepSeek V4, LFM2, Clover and others | Nemotron-H, GLM-4.7-Flash / DeepSeek V2-V3, Llama, Mistral, Mixtral, Qwen3, Qwen3-MoE and Qwen3.5/3.6 MoE (text) |
+| Models | Qwen3.5/3.6/3.8, Gemma 4, GLM 5, DeepSeek V4, LFM2, Clover and others | Nemotron-H, GLM-4.7-Flash / DeepSeek V2-V3, Llama, Mistral, Mixtral, Qwen3, Qwen3-MoE, Qwen3.5/3.6 MoE and Qwen3.8 (text) |
 | Dense models | no | yes |
 | Correctness | reference | matches llama.cpp, per model (tools/reference-llamacpp) |
 | Decode, this PC | Sage A1.5: 150-160 tok/s. Orca on two GPUs: 63 tok/s | GLM-4.7-Flash: 9.1 tok/s. Ministral 3 3B: 15.7 tok/s |
@@ -119,3 +119,23 @@ its draft block is not run.
 - **Speed, CPU, 14 threads:** 4.6 tok/s on UD-Q8_K_XL and 2.6 on Sage. `strata-poly` runs UD-Q8_K_XL at 66-72 tok/s on two
   GPUs, so phase 8's "within 10%" is far off and the C++ config stays the default. The Rust config is a separate model entry.
 - **Not measured yet:** `--devices` on this architecture; prompts past a few hundred tokens.
+
+## Phase 7: `qwen4exp` ported, its gate still open
+
+`model.rs` runs Qwen3.8 Flash Next: hyper-connection streams, the PLE n-gram embedding, QSA over indexer-scored blocks, and the
+GDN's sigmoid gate. `strata-pack` gained IQ2_S, which matches ggml's decoder bit for bit on Orca's own bytes.
+
+- **Passed:** Orca IQ3_XXS, 16 of 16 steps identical on a 34-token prompt, worst logit difference 1.37.
+- **Not proven: QSA.** Its top-k is 2048, so it starts past 2,051 tokens and that prompt never reached it. Until a longer prompt
+  passes parity, `qsa_cells` is unverified, and the gate for this architecture stays open. When the budget ends inside a block
+  it keeps that block's lowest cells, where ggml's order among equal scores is unspecified.
+- **Speed, CPU, 10 threads:** about 0.4 tok/s. `--devices` is not measured.
+
+## Phase 7: what is left
+
+| Item | State |
+|---|---|
+| `qwen35moe` | passed (text) |
+| `qwen4exp` | passed below 2,051 tokens; QSA not proven |
+| `gemma4`, `glm4moe`, `deepseek4` | not started; no GGUF here for any of them, so each needs a download first |
+| vision through this engine | not started |

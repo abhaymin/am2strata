@@ -6,8 +6,8 @@ use crate::grids::*;
 use crate::num::f16_to_f32;
 
 /// The encodings this module dequantizes.
-pub const SUPPORTED: [&str; 16] = ["Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS",
-                                   "IQ2_XS", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS"];
+pub const SUPPORTED: [&str; 17] = ["Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "IQ2_XXS",
+                                   "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS"];
 
 fn h(b: &[u8], at: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]))
@@ -201,6 +201,20 @@ fn block(t: &str, b: &[u8], y: &mut [f32]) -> Result<(), String> {
                 let grid = IQ2XS_GRID[(q & 511) as usize].to_le_bytes();
                 for j in 0..8 {
                     y[i * 8 + j] = db * grid[j] as f32 * sign((ks >> j) & 1);
+                }
+            }
+        }
+        "IQ2_S" => {
+            let d = h(b, 0);
+            let (qs, signs, qh, sc) = (&b[2..34], &b[34..66], &b[66..74], &b[74..82]);
+            for ib in 0..8 {
+                let db = [d * (0.5f32 + (sc[ib] & 0x0f) as f32) * 0.25f32, d * (0.5f32 + (sc[ib] >> 4) as f32) * 0.25f32];
+                for l in 0..4 {
+                    let g = qs[ib * 4 + l] as usize | ((qh[ib] as usize) << (8 - 2 * l)) & 0x300;
+                    let grid = IQ2S_GRID[g].to_le_bytes();
+                    for j in 0..8 {
+                        y[(ib * 4 + l) * 8 + j] = db[l / 2] * grid[j] as f32 * sign((signs[ib * 4 + l] >> j) & 1);
+                    }
                 }
             }
         }
