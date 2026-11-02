@@ -259,3 +259,24 @@ Logs: each model's engine log is the config's `log` file. The server logs to the
 - **`deploy/make-release.sh`:** the NVIDIA download, built on a PC with the engines. It needs the CUDA 13 runtime and glibc 2.43.
 
 Neither download holds the media engine, whose audio and video codecs have their own terms (NOTICE), or any run config.
+
+## The browser tool: your own Chrome
+
+"Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your
+logins. To have the model drive **your own browser** instead, with your sessions, so it reaches pages you are signed in to
+and you clear any site check yourself, start Chrome with a debugging port and a profile folder of its own:
+
+```bash
+google-chrome --remote-debugging-port=9222 --user-data-dir="$HOME/.am2strata-chrome"
+```
+
+Then add to the run config (`strata-<model>.json`):
+
+```json
+"browser": { "connect": "http://127.0.0.1:9222" }
+```
+
+am2Strata attaches to that Chrome: it opens and drives tabs there, and when it stops it closes only the tabs it opened,
+never your browser. Downloads are still denied, private and LAN addresses are still blocked unless `allow_private_urls`,
+and typing a password or submitting a form still waits for your Allow. Sign in to that Chrome once and the sessions stay in
+its profile folder. This is your own session, used by your choice; am2Strata does nothing to defeat a site's checks.

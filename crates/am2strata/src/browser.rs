@@ -40,6 +40,10 @@ const IDLE: Duration = Duration::from_secs(600);
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub exe: Option<PathBuf>,
+    /// attach to a Chrome the user already runs (`"browser": {"connect": "http://127.0.0.1:9222"}`): its DevTools
+    /// endpoint. The model then drives that browser's tabs, with the user's own logins, and the server neither starts
+    /// nor closes it. The user launches it themselves: `chrome --remote-debugging-port=9222 --user-data-dir=<a folder>`.
+    pub connect: Option<String>,
     pub auto_approve: bool,
     pub private_urls: bool,
 }
@@ -55,8 +59,15 @@ impl Settings {
             ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"].iter()
                 .find_map(|n| std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(n)).find(|p| p.is_file()))
         });
-        Settings { exe, auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
+        Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
+                   auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
                    private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false) }
+    }
+
+    /// Whether a started or attached browser carries the user's own logins (so the tool descriptions, and the risk
+    /// prompts, tell the model the truth about which session it is driving).
+    fn user_session(&self) -> bool {
+        self.connect.is_some()
     }
 }
 
@@ -94,8 +105,9 @@ fn spawn_kept(mut cmd: std::process::Command) -> std::io::Result<std::process::C
 
 struct Running {
     browser: Browser,
-    child: std::process::Child,
-    profile: PathBuf,
+    /// None when attached to a browser the user runs: the server did not start it and must not end it.
+    child: Option<std::process::Child>,
+    profile: Option<PathBuf>,
     tabs: HashMap<String, Tab>,
 }
 
@@ -141,13 +153,20 @@ impl Browsers {
     }
 
     pub fn available(&self) -> bool {
-        self.settings.exe.is_some()
+        self.settings.exe.is_some() || self.settings.connect.is_some()
     }
 
-    pub fn tools(vision: bool) -> Vec<Value> {
+    /// Whether the browser it drives carries the user's own logins (the `connect` mode).
+    pub fn user_session(&self) -> bool {
+        self.settings.user_session()
+    }
+
+    /// `user_session`: the browser carries the user's logins (the `connect` mode), so say so instead of "no logins".
+    pub fn tools(vision: bool, user_session: bool) -> Vec<Value> {
         let shot = if vision { " You get a screenshot of the page after each step." } else { "" };
+        let whose = if user_session { "the user's own browser, with their logins" } else { "a browser on the server (no logins of the user's)" };
         vec![
-            json!({"name": "browser_open", "description": format!("Open a web page in a browser on the server (no logins of the user's). Returns its title, address and the start of its text.{shot}"),
+            json!({"name": "browser_open", "description": format!("Open a web page in {whose}. Returns its title, address and the start of its text.{shot}"),
                    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}),
             json!({"name": "browser_click", "description": format!("Click on the page: at x, y (pixels of the {WIDTH}x{HEIGHT} screenshot) or on the link or button whose visible text is `text`."),
                    "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"},
@@ -168,7 +187,18 @@ impl Browsers {
         if run.is_some() {
             return Ok(());
         }
-        let exe = self.settings.exe.clone().ok_or("no browser here: put chrome-headless-shell in Strata-data/browser, or set \"browser\": {\"exe\": ...}")?;
+        // attach to the browser the user runs (their logins), rather than start one: no child, no profile to remove
+        if let Some(endpoint) = self.settings.connect.clone() {
+            let ws = devtools_ws(&endpoint).await?;
+            let (browser, mut handler) = Browser::connect(&ws).await
+                .map_err(|e| format!("could not attach to the browser at {endpoint}: {e}. Start it with \
+                                      --remote-debugging-port and --user-data-dir, then try again"))?;
+            tokio::spawn(async move { while handler.next().await.is_some() {} });
+            tracing::info!(%endpoint, "attached to the user's browser (its own logins)");
+            *run = Some(Running { browser, child: None, profile: None, tabs: HashMap::new() });
+            return Ok(());
+        }
+        let exe = self.settings.exe.clone().ok_or("no browser here: put chrome-headless-shell in Strata-data/browser, set \"browser\": {\"exe\": ...}, or attach to your own with \"browser\": {\"connect\": \"http://127.0.0.1:9222\"}")?;
         // profiles a killed server left behind (a day old: not one another running server uses)
         for e in std::fs::read_dir(std::env::temp_dir()).into_iter().flatten().flatten() {
             let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|d| d > Duration::from_secs(86_400));
@@ -201,7 +231,7 @@ impl Browsers {
             .args(["--no-first-run", "--disable-extensions", "--disable-sync", "--disable-background-networking",
                    "--disable-default-apps", "--mute-audio", "--hide-scrollbars", "--disable-features=Translate", "about:blank"])
             .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        let child = spawn_kept(cmd).map_err(|e| format!("starting the browser {}: {e}", exe.display()))?;
+        let child = Some(spawn_kept(cmd).map_err(|e| format!("starting the browser {}: {e}", exe.display()))?);
         let port_file = profile.join("DevToolsActivePort");
         let t0 = Instant::now();
         let ws = loop {
@@ -219,7 +249,7 @@ impl Browsers {
         let (browser, mut handler) = Browser::connect(ws).await.map_err(|e| format!("connecting to the browser: {e}"))?;
         tokio::spawn(async move { while handler.next().await.is_some() {} });
         tracing::info!(exe = %exe.display(), "browser started (headless, a fresh profile)");
-        *run = Some(Running { browser, child, profile, tabs: HashMap::new() });
+        *run = Some(Running { browser, child, profile: Some(profile), tabs: HashMap::new() });
         Ok(())
     }
 
@@ -387,16 +417,39 @@ impl Browsers {
         Ok(Step { text, screenshot: shot })
     }
 
-    /// The browser closes (the server stops).
+    /// The server stops: a browser the server started is closed, one the user runs is only let go of (its tabs stay,
+    /// and the tabs this opened in it are closed first so none are left behind).
     pub async fn close(&self) {
         if let Some(mut r) = self.run.lock().await.take() {
-            let _ = r.browser.close().await;
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let _ = r.child.kill();
-            let _ = r.child.wait();
-            let _ = std::fs::remove_dir_all(&r.profile);
+            match r.child {
+                Some(mut child) => {
+                    let _ = r.browser.close().await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(p) = &r.profile {
+                        let _ = std::fs::remove_dir_all(p);
+                    }
+                }
+                None => {
+                    for (_, t) in r.tabs.drain() {
+                        let _ = t.page.close().await;
+                    }
+                    // dropping `browser` ends the DevTools connection without closing the user's browser
+                }
+            }
         }
     }
+}
+
+/// The WebSocket debugger URL of a running Chrome from its HTTP endpoint (`http://host:port` -> /json/version).
+async fn devtools_ws(endpoint: &str) -> Result<String, String> {
+    let url = format!("{endpoint}/json/version");
+    let v: Value = reqwest::Client::new().get(&url).timeout(Duration::from_secs(5)).send().await
+        .map_err(|e| format!("no browser at {endpoint}: {e}. Start Chrome with --remote-debugging-port and --user-data-dir"))?
+        .json().await.map_err(|e| format!("{endpoint} did not answer as a DevTools endpoint: {e}"))?;
+    v["webSocketDebuggerUrl"].as_str().map(str::to_string)
+        .ok_or_else(|| format!("{endpoint} gave no webSocketDebuggerUrl"))
 }
 
 /// Steps waiting for the user's yes: the tool loop waits on its receiver; POST /api/tools/approve answers.
