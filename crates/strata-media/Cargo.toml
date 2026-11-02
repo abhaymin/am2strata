@@ -43,3 +43,5 @@ incremental = true
 # mold's own patch, which its candle fork needs (CUDA preflight and async-allocation calls): the same cudarc fork revision
 [patch.crates-io]
 cudarc = { git = "https://github.com/utensils/cudarc", rev = "9b3b1bc276bc27c3e99343ee82db7f99705b9ed5" }
+# zip 9.2.2 for CVE-2026-115905: the forks above pin ^8.6 (vendor/zip/AM2STRATA.md)
+zip = { path = "vendor/zip" }
