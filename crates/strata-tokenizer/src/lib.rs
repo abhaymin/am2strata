@@ -211,7 +211,9 @@ impl Tokenizer {
             let p = dir.join("merges.json");
             parse(&p, &read(&p)?)?
         } else {
-            read(&dir.join("merges.txt"))?.split('\n').filter(|m| !m.is_empty()).map(str::to_owned).collect()
+            // split on '\n' and drop a trailing '\r': a merges.txt saved with Windows line endings keeps "a b", not "a b\r"
+            read(&dir.join("merges.txt"))?.split('\n').map(|m| m.strip_suffix('\r').unwrap_or(m))
+                .filter(|m| !m.is_empty() && !m.starts_with("#version")).map(str::to_owned).collect()
         };
         let types_path = dir.join("token_type.json");
         let token_types: Vec<i32> = parse(&types_path, &read(&types_path)?)?;

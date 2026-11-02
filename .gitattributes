@@ -1,0 +1,5 @@
+
+# Tokenizer fixtures and golden data are parsed byte-for-byte: keep LF on every platform (a CRLF checkout breaks merges.txt and the golden comparisons).
+crates/am2strata/testdata/** -text
+crates/*/testdata/** -text
+golden/** -text
