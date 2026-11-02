@@ -219,7 +219,7 @@ fn binary() -> PathBuf {
 
 fn expand(p: &str) -> String {
     match p.strip_prefix("~/") {
-        Some(rest) => format!("{}/{rest}", std::env::var("HOME").unwrap_or_default()),
+        Some(rest) => format!("{}/{rest}", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default()),
         None => p.to_string(),
     }
 }

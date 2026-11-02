@@ -45,12 +45,16 @@ pub(crate) fn device(d: usize) -> &'static strata_gpu::Gpu {
     &DEVICES.get().expect("devices opened")[d]
 }
 
-/// `cuda:0=12,hip:0=6` -> [("cuda:0", 12 GiB), ("hip:0", 6 GiB)]; a device without `=` gets 1 TiB (all it takes).
+/// The most one device holds. Past 11-12 GiB on a 16 GB card, CubeCL's memory manager panics on its stream thread
+/// ("Memory page 0 doesn't exist"), measured with Cyber-Tiel UD-Q8_K_XL.
+const MAX_PER_DEVICE: u64 = 11 << 30;
+
+/// `cuda:0=12,hip:0=6` -> [("cuda:0", 11 GiB), ("hip:0", 6 GiB)]; a device without `=` gets the most it can hold.
 pub fn parse(spec: &str) -> Result<Vec<(String, u64)>, String> {
     spec.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| {
         let (name, gib) = s.split_once('=').unwrap_or((s, "1024"));
         let g: f64 = gib.parse().map_err(|_| format!("--devices: {s:?}: the budget is GiB, e.g. cuda:0=12"))?;
-        Ok((name.to_string(), (g * (1u64 << 30) as f64) as u64))
+        Ok((name.to_string(), ((g * (1u64 << 30) as f64) as u64).min(MAX_PER_DEVICE)))
     }).collect()
 }
 

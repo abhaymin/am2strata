@@ -232,12 +232,36 @@ fn expert_ranges(m: &Moe, e: usize) -> Vec<&'static [u8]> {
     v
 }
 
+#[cfg(unix)]
 fn advise(b: &[u8], advice: libc::c_int) -> bool {
     // madvise wants page-aligned starts: round the start down, the length up
     let page = 4096usize;
     let start = b.as_ptr() as usize & !(page - 1);
     let len = (b.as_ptr() as usize + b.len() - start).div_ceil(page) * page;
     unsafe { libc::madvise(start as *mut libc::c_void, len, advice) == 0 }
+}
+
+// Residency is a hint: without these, the operating system's page cache decides and the model still runs.
+#[cfg(unix)]
+fn pin(b: &[u8]) -> bool {
+    unsafe { libc::mlock(b.as_ptr() as *const libc::c_void, b.len()) == 0 }
+}
+
+#[cfg(not(unix))]
+fn pin(_: &[u8]) -> bool {
+    false
+}
+
+fn wanted(_b: &[u8]) {
+    #[cfg(unix)]
+    advise(_b, libc::MADV_WILLNEED);
+}
+
+fn cold(_b: &[u8]) {
+    #[cfg(target_os = "linux")]
+    advise(_b, libc::MADV_COLD);
+    #[cfg(unix)]
+    advise(_b, libc::MADV_RANDOM);
 }
 
 /// Keeps the hottest experts (profile order, else layer order) within `budget` bytes in RAM; marks the rest cold.
@@ -271,11 +295,9 @@ pub fn place(model: &Model, profile: Option<&Profile>, budget: u64) -> Residency
             break;
         }
         for r in &ranges {
-            if locked && unsafe { libc::mlock(r.as_ptr() as *const libc::c_void, r.len()) } != 0 {
-                locked = false;
-            }
+            locked = locked && pin(r);
             if !locked {
-                advise(r, libc::MADV_WILLNEED);
+                wanted(r);
             }
         }
         resident[l * ne + e] = true;
@@ -286,10 +308,7 @@ pub fn place(model: &Model, profile: Option<&Profile>, budget: u64) -> Residency
     for m in model.moes() {
         for e in 0..m.n_expert {
             if !resident[m.layer * ne + e] {
-                for r in expert_ranges(m, e) {
-                    advise(r, libc::MADV_COLD);
-                    advise(r, libc::MADV_RANDOM);
-                }
+                expert_ranges(m, e).iter().for_each(|r| cold(r));
             }
         }
     }

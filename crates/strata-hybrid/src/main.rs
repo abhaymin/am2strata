@@ -94,6 +94,12 @@ fn mem_available() -> u64 {
 }
 
 fn main() {
+    // a device thread that panics leaves wrong numbers behind it: the engine stops, and the server says so
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        report(info);
+        std::process::exit(101);
+    }));
     let args: Vec<String> = std::env::args().collect();
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
     // the GPUs this engine can use here, as JSON (am2strata's Settings and --devices take these names)

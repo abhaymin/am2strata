@@ -6,12 +6,14 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["gpu"]
+default = ["gpu", "vendor-gpus"]
 # weights on GPUs: NVIDIA (CUDA), AMD (ROCm), any Vulkan GPU - strata-gpu's CubeCL kernels (tools/build-hybrid.sh)
-gpu = ["dep:strata-gpu"]
+gpu = ["dep:strata-gpu", "strata-gpu/wgpu"]
+# and NVIDIA's and AMD's own runtimes, which need their toolkits to build: the releases leave them out and use wgpu
+vendor-gpus = ["gpu", "strata-gpu/cuda", "strata-gpu/hip"]
 
 [dependencies]
-strata-gpu = { path = "../strata-gpu", optional = true }
+strata-gpu = { path = "../strata-gpu", optional = true, default-features = false }
 strata-gguf = { path = "../strata-gguf" }
 strata-pack = { path = "../strata-pack" }
 serde_json = { version = "1", features = ["preserve_order"] }

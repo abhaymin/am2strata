@@ -144,7 +144,7 @@ pub fn child_env(cfg: &RunConfig) -> Vec<(String, String)> {
 /// packs) and `${AM2STRATA_HOME}` (this checkout: the Rust engines) default to ~/Development/PolyStrata,
 /// ~/Development/Strata-data and ~/Development/am2strata. Absolute paths are left as they are.
 pub fn expand_str(s: &str) -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
     let var = |name: &str| -> Option<String> {
         std::env::var(name).ok().filter(|v| !v.is_empty()).or_else(|| match name {
             "STRATA_HOME" => Some(format!("{home}/Development/PolyStrata")),

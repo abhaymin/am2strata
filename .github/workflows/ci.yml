@@ -1,0 +1,37 @@
+# Runs on Linux only, and only when code changes: Windows and macOS build in release.yml, on a version tag.
+name: CI
+on:
+  push:
+    branches: [main]
+    paths: ["crates/**", "!crates/**/*.md", "Cargo.toml", "Cargo.lock", "golden/**", ".github/workflows/ci.yml"]
+  pull_request:
+    paths: ["crates/**", "!crates/**/*.md", "Cargo.toml", "Cargo.lock", "golden/**", ".github/workflows/ci.yml"]
+
+# A newer push replaces a run still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/strata-hybrid
+          # pull requests read the cache and do not add to it
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo test --locked --workspace
+      - run: cargo test --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu --bin am2strata-hybrid

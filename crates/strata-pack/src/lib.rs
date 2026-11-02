@@ -5,6 +5,7 @@
 //! - [`mtp_pack`]: the MTP draft block as a GGUF, experts in Q2_0 / Q4_0 / Q8_0 (tools/mtp_pack.py)
 //! - [`mtp_rt`]: the MTP draft layer's runtime files (tools/mtp_rt.py)
 
+mod pos;
 pub mod grids;
 pub mod gguf_write;
 pub mod iq_pack;

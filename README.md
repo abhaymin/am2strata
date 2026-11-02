@@ -10,6 +10,12 @@ server can run on the same machine (one at a time).
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
 support) behind OpenAI-, Anthropic- and Responses-compatible APIs, with a web app for chat, monitoring and settings.
 
+## Download
+
+Take the file for your system from [Releases](https://github.com/abhaymin/am2strata/releases): Linux, Windows or macOS (Apple
+Silicon). Nothing else to install, and `QUICKSTART.md` inside takes a few minutes. These run on the CPU, so they suit small
+models; the setup below is the fast path, for NVIDIA cards.
+
 ## Requirements
 
 - Linux and an NVIDIA GPU, with PolyStrata's engines built (`strata`, `strata-poly`, `strata-vision`) and its run

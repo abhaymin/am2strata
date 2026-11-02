@@ -12,6 +12,7 @@
 //!
 //! Every file is the one iq_pack.py writes, byte for byte (tests/iq_pack_golden.rs).
 
+use crate::pos::ReadAt;
 use crate::num::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16, jf, py_json};
 use crate::quants;
 use serde_json::{json, Map, Value};
@@ -19,7 +20,6 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use strata_gguf::{Gguf, TensorInfo};
 

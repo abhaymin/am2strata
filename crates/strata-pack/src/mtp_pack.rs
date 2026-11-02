@@ -3,12 +3,12 @@
 //! the last axis to Q2_0 (a per-block MSE scale search over the grid {-1, 0, 1, 2}·d), Q4_0 or Q8_0 (ggml reference).
 //! The GGUF is the one mtp_pack.py writes, byte for byte; the report's numbers too (its "seconds" is a timing).
 
+use crate::pos::ReadAt;
 use crate::gguf_write::{TensorSpec, Writer};
 use crate::num::{f16_to_f32, f32_to_f16, jf, pairwise_f32, pairwise_f64, py_json, py_round, rint_f32};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 

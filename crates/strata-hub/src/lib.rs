@@ -53,7 +53,7 @@ pub fn token(given: Option<&str>) -> Option<String> {
             return Some(t.trim().to_string());
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
     let hf_home = std::env::var("HF_HOME").unwrap_or_else(|_| format!("{home}/.cache/huggingface"));
     std::fs::read_to_string(format!("{hf_home}/token")).ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }

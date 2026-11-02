@@ -1,0 +1,59 @@
+#!/bin/sh
+# am2Strata from a release: runs from this folder and keeps models and settings in $AM2STRATA_DATA.
+#   ./am2strata                          start the server (http://127.0.0.1:8000)
+#   ./am2strata pull <repo> [<quant>]    download a model from Hugging Face; no quant lists what the repository has
+#   ./am2strata doctor                   check this PC (the NVIDIA download)
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+DATA=${AM2STRATA_DATA:-$HOME/.local/share/am2strata}
+mkdir -p "$DATA"
+for d in engine engine-poly; do
+    if [ -d "$HERE/$d" ]; then ln -sfn "$HERE/$d" "$DATA/$d"; fi
+done
+
+doctor() {
+    [ -e "$HERE/engine-poly/strata-poly" ] || { echo "This download runs on the CPU, or any GPU through --devices: nothing to check."; return 0; }
+    ok=1
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/GPU: /'
+    else
+        echo "No NVIDIA driver found (nvidia-smi): these engines need an RTX 30 or RTX 50 card and its driver."
+        ok=0
+    fi
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/bin:${LD_LIBRARY_PATH:-}" ldd "$HERE/engine-poly/strata-poly" > "$DATA/.ldd" 2>&1 || true
+    if grep -q 'GLIBC.*not found' "$DATA/.ldd"; then
+        echo "These engines were built on Ubuntu 26.04 and this Linux has an older glibc: use the portable download."
+        ok=0
+    fi
+    missing=$(grep 'not found' "$DATA/.ldd" | grep -v GLIBC | awk '{print $1}' | sort -u | tr '\n' ' ')
+    if [ -n "$missing" ]; then
+        echo "Missing: $missing"
+        echo "Install the CUDA 13 toolkit: https://developer.nvidia.com/cuda-downloads"
+        ok=0
+    fi
+    rm -f "$DATA/.ldd"
+    [ "$ok" = 1 ] && echo "This PC is ready."
+    [ "$ok" = 1 ]
+}
+
+case "${1:-serve}" in
+    doctor) doctor ;;
+    pull)
+        shift
+        [ $# -ge 1 ] || { echo "usage: ./am2strata pull <repo> [<quant>]" >&2; exit 2; }
+        repo=$1
+        shift
+        if [ $# -ge 1 ]; then quant=$1; shift; set -- --quant "$quant" "$@"; fi
+        exec "$HERE/bin/am2strata-run" pull "$repo" "$@" --models-dir "$DATA" --data-dir "$DATA/data"
+        ;;
+    serve)
+        [ $# -ge 1 ] && shift
+        doctor || echo "Starting anyway: a model will not load until that is fixed."
+        if ! ls "$DATA"/strata-*.json >/dev/null 2>&1; then
+            echo "No model yet. See QUICKSTART.md for a small one to start with."
+            exit 1
+        fi
+        exec "$HERE/bin/am2strata" --models-dir "$DATA" "$@"
+        ;;
+    *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | doctor]" >&2; exit 2 ;;
+esac

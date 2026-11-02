@@ -6,10 +6,10 @@
 //!   hyper-connection and router weights kept BF16, the RMSNorm weights as F32 with the Gemma "+1" applied.
 //! - `dense.txt`: one line per tensor: name kind rows cols offset bytes.
 
+use crate::pos::ReadAt;
 use crate::num::f32_to_f16;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use strata_gguf::Gguf;
 

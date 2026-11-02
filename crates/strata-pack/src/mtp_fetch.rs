@@ -446,8 +446,7 @@ pub fn lock_folder(out: &Path, wait: Duration) -> Result<std::fs::File, String> 
     let end = Instant::now() + wait;
     let mut told = false;
     loop {
-        use std::os::fd::AsRawFd;
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if f.try_lock().is_ok() {
             return Ok(f);
         }
         if Instant::now() > end {
@@ -463,6 +462,10 @@ pub fn lock_folder(out: &Path, wait: Duration) -> Result<std::fs::File, String> 
 
 /// STRATA_EXIT_WITH_PARENT=1 (set by a setup that runs this): end when the process that started this one ends, so a
 /// cancelled setup does not leave a download running on its own.
+#[cfg(not(unix))]
+pub fn exit_with_parent() {}
+
+#[cfg(unix)]
 pub fn exit_with_parent() {
     if std::env::var("STRATA_EXIT_WITH_PARENT").map(|v| v.trim() != "1").unwrap_or(true) {
         return;
@@ -498,8 +501,7 @@ pub fn verify(src: &Source, out: &Path) -> Vec<String> {
             bad.push(name.to_string());
             continue;
         };
-        use std::os::unix::fs::MetadataExt;
-        let mtime_ns = md.mtime() as i128 * 1_000_000_000 + md.mtime_nsec() as i128;
+        let mtime_ns = md.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
         let key = json!([md.len(), mtime_ns as i64, want]);
         if stamps.get(*name) != Some(&key) && sha256_of(&path).ok().as_deref() != Some(*want) {
             bad.push(name.to_string());

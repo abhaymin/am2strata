@@ -248,3 +248,14 @@ One model is in memory at a time; switching (web app, `POST /api/models/load`) s
 
 Logs: each model's engine log is the config's `log` file. The server logs to the terminal, or to
 `journalctl --user -u am2strata-boot` for the service.
+
+## Releases and CI
+
+- **`.github/workflows/ci.yml`:** Linux tests, on code changes only. A new push cancels the run it replaces.
+- **`.github/workflows/release.yml`:** builds and tests Linux, Windows and macOS on a `v*` tag, then leaves a draft release to
+  publish by hand. Linux builds on Ubuntu 22.04 so that its binaries run on older systems. Run it by hand from the Actions tab to
+  check all three before tagging; that publishes nothing.
+- **The portable downloads** hold the server and the Rust engine with wgpu, built without CUDA or ROCm, so they need no toolkit.
+- **`deploy/make-release.sh`:** the NVIDIA download, built on a PC with the engines. It needs the CUDA 13 runtime and glibc 2.43.
+
+Neither download holds the media engine, whose audio and video codecs have their own terms (NOTICE), or any run config.

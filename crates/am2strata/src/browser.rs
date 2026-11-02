@@ -81,6 +81,7 @@ fn spawn_kept(mut cmd: std::process::Command) -> std::io::Result<std::process::C
     });
     let (back, got) = std::sync::mpsc::channel();
     // SAFETY: prctl is async-signal-safe; it only sets this child's parent-death signal
+    #[cfg(target_os = "linux")]
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);

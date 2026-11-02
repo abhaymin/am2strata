@@ -200,7 +200,7 @@ async fn check_host(axum::extract::State(hosts): axum::extract::State<Hosts>, re
 
 fn expand(p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
-        Some(rest) => std::env::var("HOME").map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|_| PathBuf::from(p)),
+        Some(rest) => std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|_| PathBuf::from(p)),
         None => PathBuf::from(p),
     }
 }

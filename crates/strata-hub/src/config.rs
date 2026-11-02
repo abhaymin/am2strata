@@ -14,6 +14,15 @@ pub const POLY_ARCHS: [(&str, &str); 9] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("c
 pub const HYBRID_ARCHS: [(&str, &str); 7] = [("nemotron_h_moe", "Nemotron-H MoE"), ("nemotron_h", "Nemotron-H"), ("deepseek2", "GLM-4.7-Flash / DeepSeek"),
                                              ("llama", "Llama / Mistral / Mixtral"), ("mistral3", "Mistral 3"), ("qwen3", "Qwen3"), ("qwen3moe", "Qwen3 MoE")];
 
+/// Architectures the Rust engine also runs, which it runs only when strata-poly and strata are not here: a release without them.
+pub const RUST_FALLBACK_ARCHS: [(&str, &str); 2] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("qwen4exp", "Qwen3.8 Flash Next")];
+
+/// The Rust engine beside this program, as a release lays them out.
+fn bundled_engine() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?.with_file_name(format!("am2strata-hybrid{}", std::env::consts::EXE_SUFFIX));
+    exe.exists().then_some(exe)
+}
+
 pub struct Plan {
     pub id: String,
     pub display: String,
@@ -27,6 +36,11 @@ pub fn inspect(first_shard: &Path) -> Result<Gguf, String> {
 }
 
 pub fn supported(arch: &str) -> Result<&'static str, String> {
+    if bundled_engine().is_some() {
+        if let Some((_, fam)) = RUST_FALLBACK_ARCHS.iter().find(|(a, _)| *a == arch) {
+            return Ok(fam);
+        }
+    }
     if let Some((_, fam)) = POLY_ARCHS.iter().find(|(a, _)| *a == arch) {
         return Ok(fam);
     }
@@ -98,7 +112,9 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
     }
     let native = g.arch_u64("context_length");
     let ctx = context.or(native).unwrap_or(32768).min(native.unwrap_or(u64::MAX));
-    if HYBRID_ARCHS.iter().any(|(a, _)| *a == arch) {
+    let bundled = bundled_engine();
+    let no_poly = !poly.join(format!("strata-poly{}", std::env::consts::EXE_SUFFIX)).exists();
+    if HYBRID_ARCHS.iter().any(|(a, _)| *a == arch) || (no_poly && bundled.is_some() && RUST_FALLBACK_ARCHS.iter().any(|(a, _)| *a == arch)) {
         // the Rust engine: its pack is built on the first load (am2Strata runs iq-pack before starting the engine), the
         // expert profile is learned while it runs, and the hottest experts stay in RAM
         let ctx = context.unwrap_or(ctx.min(32768));
@@ -109,11 +125,16 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
         }
         // weights on the NVIDIA card when there is one: its memory less 2 GiB (the attention cache, the runtime);
         // what does not fit stays on the CPU (docs/GPU-PLAN.md). Other GPUs are added by hand ("hip:0=6").
-        if let Some(gib) = nvidia_gib().filter(|g| *g > 4.0) {
+        // A release's engine has no CUDA: it starts on the CPU, and --devices vulkan:discrete=8 puts weights on any GPU.
+        if let Some(gib) = nvidia_gib().filter(|g| *g > 4.0 && bundled.is_none()) {
             args.extend([json!("--devices"), json!(format!("cuda:0={:.0}", gib - 2.0))]);
         }
+        let (exe, cwd) = match &bundled {
+            Some(e) => (json!(e), json!(models_dir)),
+            None => (json!("${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid"), json!("${AM2STRATA_HOME}")),
+        };
         let cfg = json!({
-            "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid", "args": args, "cwd": "${AM2STRATA_HOME}",
+            "exe": exe, "args": args, "cwd": cwd,
             "tokenizer": pack.join("tokenizer"), "model_name": id, "display_name": display,
             "log": models_dir.join(format!("strata-{id}.log")), "pulled_by": "am2strata",
         });

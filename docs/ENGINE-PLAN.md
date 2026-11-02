@@ -139,3 +139,19 @@ GDN's sigmoid gate. `strata-pack` gained IQ2_S, which matches ggml's decoder bit
 | `qwen4exp` | passed below 2,051 tokens; QSA not proven |
 | `gemma4`, `glm4moe`, `deepseek4` | not started; no GGUF here for any of them, so each needs a download first |
 | vision through this engine | not started |
+
+## Two GPUs on `qwen35moe`: correct, and no faster (2026-11-03)
+
+Cyber-Tiel UD-Q8_K_XL with `--devices cuda:0=11,cuda:1=11`, 6,225 experts on the cards, the same 105-token prompt:
+
+| Path | Decode, tok/s |
+|---|---|
+| CPU, 14 threads | 4.6 |
+| Rust, products on two GPUs | 4.9 |
+| `strata-poly` on the same two GPUs | 66-71 |
+
+- **Why:** each product is a round trip to a card, and the GDN, routing and attention stay on the CPU. Phase 1's `--graph` covers
+  dense attention models only. Reaching 60 tok/s takes a whole `qwen35moe` token on the GPU: GDN, routing and experts as kernels.
+- **The limit:** past 11-12 GiB on a card, CubeCL panics on its stream thread. The engine carried on and gave wrong tokens. Budgets
+  are now capped at 11 GiB, and any panic stops the engine.
+
