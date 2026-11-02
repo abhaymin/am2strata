@@ -1707,10 +1707,20 @@ for (const id of ["chat-scroll", "composer"]) {
   });
 }
 $("file").onchange = () => { addFiles($("file").files); $("file").value = ""; };
+// A screenshot or a copied file attaches as a dropped one does. Long text attaches too: the model reads all of it, and the
+// message box stays readable.
+const PASTE_AS_FILE = 2000;
+let pastes = 0;
 $("input").addEventListener("paste", (e) => {
-  if (!health.images) return;
-  const files = [...(e.clipboardData || {}).files || []].filter((f) => f.type.startsWith("image/"));
-  if (files.length) { e.preventDefault(); addFiles(files); }
+  const data = e.clipboardData;
+  if (!data) return;
+  if (data.files.length) { e.preventDefault(); addFiles(data.files); return; }
+  const text = data.getData("text/plain");
+  if (text.length <= PASTE_AS_FILE) return;
+  e.preventDefault();
+  if (text.length > MAX_TEXT_FILE) { toast("warn", "Paste too large", "Text over 512 KB: save it to a file and split it."); return; }
+  attachments.push({kind: "file", name: `pasted text ${++pastes}`, text});
+  renderAttachments();
 });
 
 // ------------------------------------------------------------------ the sampling drawer
