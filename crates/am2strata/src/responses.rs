@@ -810,7 +810,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     if let Err(e) = media::expand_videos(&mut chat).await {
         return RespError::new(e.to_string(), None).into_response();
     }
-    let (loaded, early_pass) = match s.mgr.ensure_with_turn().await {
+    let (loaded, early_pass) = match s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await {
         Ok(l) => l,
         Err(e) => {
             let mut r = RespError::new(format!("{e:#}"), None);

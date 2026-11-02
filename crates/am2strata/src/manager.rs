@@ -141,6 +141,9 @@ pub struct Manager {
     /// one job at a time on the GPU - chat requests, model switches, media jobs - in the queue's order (queue.rs)
     pub queue: Arc<crate::queue::Queue>,
     pub ready_timeout: Duration,
+    /// "switch_on_request" of the config the server starts with: /v1/models lists every installed model and a request
+    /// naming one loads it
+    pub switch_on_request: std::sync::atomic::AtomicBool,
     pub monitor: Arc<crate::monitor::Monitor>,
     /// facts and conversation archives (memory.rs), under <data>/memory
     pub memory: Arc<crate::memory::Memory>,
@@ -270,6 +273,7 @@ impl Manager {
             current: RwLock::new(None),
             queue: crate::queue::Queue::new(queue_max_wait),
             ready_timeout,
+            switch_on_request: std::sync::atomic::AtomicBool::new(false),
             monitor: crate::monitor::Monitor::new(),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
             snapshots: Arc::new(crate::snapshots::Snapshots::open(&memory_dir)),
@@ -324,6 +328,40 @@ impl Manager {
             return Ok((l, None));
         }
         let id = self.default_id.clone();
+        self.load_in_turn(id, on_position).await
+    }
+
+    /// #38 ("switch_on_request"): the other installed model a request names, by its whole name or config file. A
+    /// client's own name for a model stays with the loaded one, so Claude Code's model names never stop it.
+    fn requested(&self, name: Option<&str>) -> Option<ModelEntry> {
+        let name = name.filter(|_| self.switch_on_request.load(std::sync::atomic::Ordering::Relaxed))?;
+        self.models().into_iter().find(|m| m.id == name || m.path.file_name().and_then(|f| f.to_str()) == Some(name))
+    }
+
+    /// True when a request naming `name` has a model to load before it runs.
+    pub async fn must_load(&self, name: Option<&str>) -> bool {
+        match (self.current().await, self.requested(name)) {
+            (None, _) => true,
+            (Some(l), Some(e)) => l.entry.id != e.id,
+            _ => false,
+        }
+    }
+
+    /// ensure_with_turn for a request naming `name`.
+    pub async fn ensure_for(&self, name: Option<&str>) -> Result<(Arc<Loaded>, Option<crate::queue::Pass>)> {
+        self.ensure_for_told(name, |_| {}).await
+    }
+
+    /// ensure_for, telling `on_position` the request's place while it waits.
+    pub async fn ensure_for_told(&self, name: Option<&str>, on_position: impl FnMut(usize)) -> Result<(Arc<Loaded>, Option<crate::queue::Pass>)> {
+        let Some(e) = self.requested(name) else { return self.ensure_with_turn_told(on_position).await };
+        if let Some(l) = self.current().await.filter(|l| l.entry.id == e.id) {
+            return Ok((l, None));
+        }
+        self.load_in_turn(e.id, on_position).await
+    }
+
+    async fn load_in_turn(&self, id: String, on_position: impl FnMut(usize)) -> Result<(Arc<Loaded>, Option<crate::queue::Pass>)> {
         let w = self.monitor.waiting();
         let p = self.queue.enter(crate::queue::Need::Text(id.clone()), "chat", &format!("{id} (loads it)"), on_position).await
             .map_err(|t| anyhow!("{t}"))?;

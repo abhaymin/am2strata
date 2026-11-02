@@ -19,13 +19,20 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let cur = s.mgr.current().await.map(|l| l.entry.id.clone());
+    // only the models a request can reach: another name in a client's list would be answered by the loaded model
+    let every = s.mgr.switch_on_request.load(std::sync::atomic::Ordering::Relaxed);
+    let shown = cur.clone().unwrap_or_else(|| s.mgr.default_id.clone());
     let data: Vec<Value> = s
         .mgr
         .models()
         .iter()
-        .map(|m| json!({"id": m.id, "object": "model", "created": now(), "owned_by": "am2strata",
-                        "meta": {"n_ctx": m.cfg.max_context()},
-                        "status": {"value": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "unloaded" }}}))
+        .filter(|m| every || m.id == shown)
+        .map(|m| {
+            let loaded = cur.as_deref() == Some(m.id.as_str());
+            json!({"id": m.id, "object": "model", "created": now(), "owned_by": "am2strata",
+                   "meta": {"n_ctx": m.cfg.max_context()}, "context_length": m.cfg.max_context(), "loaded": loaded,
+                   "status": {"value": if loaded { "loaded" } else { "unloaded" }}})
+        })
         .collect();
     Json(json!({"object": "list", "data": data})).into_response()
 }
@@ -45,7 +52,7 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     // a stream that must wait for the model to load again (stopped for a media job) behind other jobs starts at once
     // and says its place (SSE comments); the answer follows on the same stream once the model is loaded
-    if stream && s.mgr.current().await.is_none() && s.mgr.queue.busy() {
+    if stream && s.mgr.must_load(req.get("model").and_then(Value::as_str)).await && s.mgr.queue.busy() {
         return waiting_stream(s, headers, req);
     }
     chat_with(s, headers, req, None).await
@@ -59,7 +66,7 @@ fn waiting_stream(s: AppState, headers: HeaderMap, req: Value) -> Response {
         let txp = tx.clone();
         // a client that leaves while it waits takes its place out of the queue
         let got = tokio::select! {
-            g = s.mgr.ensure_with_turn_told(move |p| {
+            g = s.mgr.ensure_for_told(req.get("model").and_then(Value::as_str), move |p| {
                 let _ = txp.try_send(format!(": queued: {} ahead\n\n", p.saturating_sub(1)).into());
             }) => g,
             _ = tx.closed() => return,
@@ -109,7 +116,7 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     }
     let got = match pre {
         Some(l) => Ok(l),
-        None => s.mgr.ensure_with_turn().await,
+        None => s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await,
     };
     let (loaded, early_pass) = match got {
         Ok(l) => l,

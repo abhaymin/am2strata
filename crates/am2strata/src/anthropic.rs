@@ -39,7 +39,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
     if let Err(e) = media::expand_videos(&mut req).await {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
-    let (loaded, early_pass) = match s.mgr.ensure_with_turn().await {
+    let (loaded, early_pass) = match s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await {
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };

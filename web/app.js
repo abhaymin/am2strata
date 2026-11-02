@@ -2874,6 +2874,8 @@ async function loadSystem() {
 var APPS = {       // var: start-up reaches renderAppSetup before this line when the page opens on Connect
   "Claude Code": (b, m) => ["In a terminal, before starting claude:",
     `export ANTHROPIC_BASE_URL=${b}\nexport ANTHROPIC_AUTH_TOKEN=YOUR_API_KEY\nexport ANTHROPIC_MODEL=${m}\nclaude`],
+  "Unsloth": (b) => ["In a terminal, to start an agent (claude, codex, opencode, hermes, openclaw, pi or dsh) on this server. For Unsloth Studio's own chat: Settings > Connections > Add Provider > llama.cpp, with the same address followed by /v1 and the same key.",
+    `export UNSLOTH_STUDIO_URL=${b}\nexport UNSLOTH_API_KEY=YOUR_API_KEY\nunsloth start claude`],
   "Codex CLI": (b, m) => ["In ~/.codex/config.toml, with AM2STRATA_API_KEY set in your shell:",
     `model = "${m}"\nmodel_provider = "am2strata"\n\n[model_providers.am2strata]\nname = "am2Strata"\nbase_url = "${b}/v1"\nenv_key = "AM2STRATA_API_KEY"\nwire_api = "responses"`],
   "opencode": (b, m) => ["In opencode.json:",

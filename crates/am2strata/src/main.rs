@@ -28,6 +28,7 @@ mod server_tools;
 mod settings;
 mod snapshots;
 mod structured;
+mod unsloth;
 mod web;
 mod web_tools;
 
@@ -256,6 +257,8 @@ async fn main() -> Result<()> {
     // queue_max_wait_s (the default model's run config): how long a job may wait for its turn before it is refused
     let max_wait = first.cfg.rest.get("queue_max_wait_s").and_then(|v| v.as_f64()).filter(|v| *v > 0.0).map(Duration::from_secs_f64);
     let mgr = Arc::new(Manager::new(models, dir.clone(), default.clone(), Duration::from_secs(args.ready_timeout), expand(&args.data_dir), max_wait));
+    let switch = first.cfg.rest.get("switch_on_request") == Some(&serde_json::Value::Bool(true));
+    mgr.switch_on_request.store(switch, std::sync::atomic::Ordering::Relaxed);
     for g in &mgr.hw.gpus {
         tracing::info!("GPU {}: {} ({} MiB, sm_{})", g.index, g.name, g.vram_mib, g.arch);
     }
@@ -310,6 +313,10 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .route("/health", get(web::health))
+        .route("/api/health", get(unsloth::health))
+        .route("/api/inference/loaded-models", get(unsloth::loaded_models))
+        .route("/api/inference/status", get(unsloth::status))
+        .route("/api/inference/load", post(unsloth::load))
         .route("/v1/models", get(openai::models))
         .route("/v1/chat/completions", post(openai::chat))
         .route("/v1/responses", post(responses::responses))

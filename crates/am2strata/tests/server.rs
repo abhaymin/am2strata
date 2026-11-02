@@ -22,7 +22,8 @@ fn health_models_and_auth() {
     let (c, m) = s.get("/v1/models", true);
     assert_eq!(c, 200);
     let names: Vec<&str> = m["data"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap()).collect();
-    assert_eq!(names, ["mock-a", "mock-b"]);
+    assert_eq!(names, ["mock-a"], "only what a request can reach");
+    assert_eq!((&m["data"][0]["loaded"], &m["data"][0]["context_length"]), (&json!(true), &json!(8192)));
     let (_, l) = s.get("/api/models", true);
     assert_eq!(l["models"][0]["current"], true);
     assert_eq!(l["models"][1]["current"], false);
@@ -599,7 +600,66 @@ fn a_model_added_while_running_is_listed_and_loads() {
     assert_eq!(ids, ["mock-a", "mock-new"]);
     let (c, r) = s.post("/api/models/load", &json!({"model": "mock-new"}));
     assert_eq!(c, 200, "{r}");
-    assert_eq!(s.get("/v1/models", true).1["data"].as_array().unwrap().len(), 2);
+    assert_eq!(s.get("/v1/models", true).1["data"][0]["id"], "mock-new");
+}
+
+fn listed(s: &Server) -> Vec<(String, bool)> {
+    s.get("/v1/models", true).1["data"].as_array().unwrap().iter()
+        .map(|m| (m["id"].as_str().unwrap().to_string(), m["loaded"].as_bool().unwrap())).collect()
+}
+
+#[test]
+fn switch_on_request_loads_the_model_a_request_names() {
+    let on = json!({"switch_on_request": true});
+    let s = Server::start(&[Model { extra: on, ..Model::default() }, Model { id: "mock-b", ..Model::default() }], &[ids("a"), ids("b"), ids("c")], json!({}));
+    assert_eq!(listed(&s), [("mock-a".to_string(), true), ("mock-b".to_string(), false)]);
+    let chat = |model: &str| s.post("/v1/chat/completions", &json!({"model": model, "messages": [user("hi")], "max_tokens": 4}));
+    assert_eq!(chat("mock").0, 200);
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a", "a part of a name loads nothing");
+    assert_eq!(chat("gpt-4o").0, 200);
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a", "nor does a client's own name");
+    let (c, r) = chat("mock-b");
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-b");
+}
+
+#[test]
+fn a_request_loads_nothing_unless_the_config_says_so() {
+    let s = Server::start(&[Model::default(), Model { id: "mock-b", ..Model::default() }], &[ids("a")], json!({}));
+    assert_eq!(s.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "max_tokens": 4})).0, 200);
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a");
+}
+
+/// What unsloth_cli's commands/start.py asks before it starts an agent, read from Unsloth 2026.9.11.
+#[test]
+fn unsloth_start_finds_this_server() {
+    let s = Server::start(&[Model::default(), Model { id: "mock-b", ..Model::default() }], &[ids("a")], json!({}));
+    let (c, h) = s.get("/api/health", false);
+    assert_eq!((c, &h["status"], &h["service"]), (200, &json!("healthy"), &json!("Unsloth UI Backend")));
+    assert_eq!(s.get("/api/inference/loaded-models", false).0, 401);
+    assert_eq!(s.get("/api/inference/status", false).0, 401);
+
+    let (c, m) = s.get("/api/inference/loaded-models", true);
+    assert_eq!(c, 200);
+    assert_eq!(m["data"].as_array().unwrap().len(), 1);
+    assert_eq!((&m["data"][0]["id"], &m["data"][0]["loaded"], &m["data"][0]["context_length"]),
+               (&json!("mock-a"), &json!(true), &json!(8192)));
+    let (_, st) = s.get("/api/inference/status", true);
+    assert_eq!((&st["active_model"], &st["is_gguf"]), (&json!("mock-a"), &json!(true)));
+
+    let (c, r) = s.post("/api/inference/load", &json!({"model_path": "mock-a"}));
+    assert_eq!((c, &r["status"], &r["model"]), (200, &json!("already_loaded"), &json!("mock-a")), "{r}");
+    let (c, r) = s.post("/api/inference/load", &json!({"model_path": "mock-b", "max_seq_length": 4096}));
+    assert_eq!(c, 400);
+    assert!(r["error"]["message"].as_str().unwrap().contains("max_seq_length"), "{r}");
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a", "refused before anything stops");
+    assert_eq!(s.post("/api/inference/load", &json!({"model_path": "unsloth/none"})).0, 400);
+    let (c, r) = s.post("/api/inference/load", &json!({"model_path": "mock-b", "max_seq_length": 0, "load_in_4bit": true}));
+    assert_eq!((c, &r["status"], &r["model"]), (200, &json!("loaded"), &json!("mock-b")), "{r}");
+
+    assert_eq!(s.post("/api/models/unload", &json!({})).0, 200);
+    let (_, m) = s.get("/api/inference/loaded-models", true);
+    assert_eq!(m["data"][0]["id"], "mock-a", "the default model: the agent's first request loads it again");
 }
 
 /// A one-page PDF with `text` on it (Helvetica), xref offsets computed.
@@ -1061,7 +1121,8 @@ fn one_answer_queues_at_most_three_media_jobs() {
     assert_eq!(s.get("/api/jobs/mj-4", true).0, 404);
 }
 
-/// Every route in main.rs but the public ones (health, the web app's files, sandboxed previews) refuses a request
+/// Every route in main.rs but the public ones (health, for people and for the unsloth CLI, which asks before it has
+/// a key; the web app's files; sandboxed previews) refuses a request
 /// without the key, or with a wrong key of the same length.
 #[test]
 fn security_every_route_needs_the_key() {
@@ -1075,7 +1136,7 @@ fn security_every_route_needs_the_key() {
     for cap in &caps {
         let cap = [String::new(), cap.0.clone(), cap.1.clone()];
         let path = cap[1].replace("{*rest}", "x").replace("{id}", "mj-1");
-        if matches!(path.as_str(), "/health" | "/preview/mj-1") {
+        if matches!(path.as_str(), "/health" | "/api/health" | "/preview/mj-1") {
             continue;
         }
         for (m, method) in [("get(", reqwest::Method::GET), ("post(", reqwest::Method::POST), ("delete(", reqwest::Method::DELETE)] {

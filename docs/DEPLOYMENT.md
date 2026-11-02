@@ -129,6 +129,23 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Authorization: Bearer $KEY" -
   -d '{"model": "tiel-coder-35b-a3b-mtp-ud-q6_k_xl", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+`/v1/models` lists the model a request reaches. With `"switch_on_request": true` in the config the server starts with, it lists every installed model and a request giving one's whole name loads it, the loaded one stopped first. Other names go to the loaded model.
+
+**Unsloth:** am2Strata works as an external endpoint for Unsloth, in two ways.
+
+- **Unsloth Studio's chat:** Settings › Connections › Add Provider › llama.cpp, with base URL `http://<host>:8000/v1` and the server's API key.
+- **`unsloth start`:** the agent runs on am2Strata instead of Studio:
+
+  ```bash
+  export UNSLOTH_STUDIO_URL=http://127.0.0.1:8000
+  export UNSLOTH_API_KEY=<the server's API key>
+  unsloth start claude
+  ```
+
+  Unsloth remembers the key per server, so later runs need only `UNSLOTH_STUDIO_URL`. A server without an API key still needs some `UNSLOTH_API_KEY` value, because Unsloth's automatic key works only with its own server. `--model <name>` loads another installed model. Context length and the other load settings come from the run config, so `unsloth start` flags for them are refused. When the agent exits, Unsloth's message about `unsloth studio stop` doesn't apply: am2Strata keeps running.
+
+  This relies on what the `unsloth` CLI checks in `/api/health` (`crates/am2strata/src/unsloth.rs`, read from Unsloth 2026.9.11). If an Unsloth update reports no running server, look there first.
+
 **Service commands:**
 
 | Command | What it does |
