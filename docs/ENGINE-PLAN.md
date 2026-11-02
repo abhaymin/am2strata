@@ -22,7 +22,7 @@ gets through degrades (one GPU, the previous engine, the previous model) and doe
 
 | | PolyStrata C++ (`strata`, `strata-poly`) | `am2strata-hybrid` (Rust) |
 |---|---|---|
-| Models | Qwen3.5/3.6/3.8, Gemma 4, GLM 5, DeepSeek V4, LFM2, Clover and others | Nemotron-H, GLM-4.7-Flash / DeepSeek V2-V3, Llama, Mistral, Mixtral, Qwen3 and Qwen3-MoE |
+| Models | Qwen3.5/3.6/3.8, Gemma 4, GLM 5, DeepSeek V4, LFM2, Clover and others | Nemotron-H, GLM-4.7-Flash / DeepSeek V2-V3, Llama, Mistral, Mixtral, Qwen3, Qwen3-MoE and Qwen3.5/3.6 MoE (text) |
 | Dense models | no | yes |
 | Correctness | reference | matches llama.cpp, per model (tools/reference-llamacpp) |
 | Decode, this PC | Sage A1.5: 150-160 tok/s. Orca on two GPUs: 63 tok/s | GLM-4.7-Flash: 9.1 tok/s. Ministral 3 3B: 15.7 tok/s |
@@ -101,3 +101,21 @@ on one RTX 5060 Ti, 96 tokens, the median of 3 runs:
   which is the next thing to measure.
 - **Two GPUs do not speed up one chat.** Layers run one after another, so a layer split gains nothing on a single stream
   (llama.cpp: 160 against 163; Sage: about 5%). It holds more model and helps batches, so phase 6's gate needs that wording.
+
+## Phase 7 measured (2026-11-02): `qwen35moe` passes its gate
+
+`model.rs` runs Qwen3.5/3.6 MoE models from their GGUF, with or without an `iq-pack` pack: the attention layers' gate on each
+head, the gated delta net layers, and the shared expert's sigmoid gate. Text only: vision is still open. An MTP file loads, and
+its draft block is not run.
+
+| Model | Prompt | Steps identical | Near-ties | Worst logit difference |
+|---|---|---|---|---|
+| Cyber-Tiel Coder UD-Q8_K_XL, pack | 105 tokens | 24 of 24 | 0 | 2.60 |
+| the same | 5 tokens | 11 of 12 | 1 | 0.34 |
+| Strata-Sage A1.5 Q4_K_M | 105 tokens | 16 of 16 | 0 | 0.97 |
+
+- **Tokenizer:** 7 of 7 texts match llama.cpp on both models.
+- **The 2.60:** one step (step 4), where the top-5 logits all shift upward and the top token stays about 9 logits clear.
+- **Speed, CPU, 14 threads:** 4.6 tok/s on UD-Q8_K_XL and 2.6 on Sage. `strata-poly` runs UD-Q8_K_XL at 66-72 tok/s on two
+  GPUs, so phase 8's "within 10%" is far off and the C++ config stays the default. The Rust config is a separate model entry.
+- **Not measured yet:** `--devices` on this architecture; prompts past a few hundred tokens.

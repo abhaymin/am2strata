@@ -48,6 +48,9 @@ does the first two the same way; what remains is float rounding, about 0.1-1 log
 | Devstral Small 2507 Q4_K_M (Mistral Small 3.1) | llama | 16 | 0 | 0.33 |
 | Ministral 3 3B Q4_K_M (24 steps) | mistral3 (YaRN) | 23 | 1 | 0.15 |
 | Qwen3-Coder 30B-A3B Q4_K_M (Mixtral's softmax MoE) | qwen3moe | 15 | 1 | 0.73 |
+| Cyber-Tiel Coder 35B-A3B UD-Q8_K_XL, with its pack (105-token prompt, 24 steps) | qwen35moe (gated delta nets) | 24 | 0 | 2.60 |
+| the same, 5-token prompt, 12 steps | | 11 | 1 | 0.34 |
+| Strata-Sage A1.5 Q4_K_M (105-token prompt) | qwen35moe | 16 | 0 | 0.97 |
 | Qwen3 8B Q8_0 (12 steps) | qwen3 | 12 | 0 | 0.31 |
 
 Tokenizers (7 texts each, identical ids): tekken (Ministral 3, Devstral), glm4 (GLM-4.7-Flash), pixtral

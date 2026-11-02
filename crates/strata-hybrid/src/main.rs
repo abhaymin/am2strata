@@ -1,5 +1,5 @@
-//! am2strata-hybrid: an engine in Rust for the architectures in model.rs (Nemotron-H, Mistral / Mixtral, GLM-4.7-Flash
-//! and the DeepSeek family), speaking the strata
+//! am2strata-hybrid: an engine in Rust for the architectures in model.rs (Nemotron-H, Mistral / Mixtral, GLM-4.7-Flash,
+//! the DeepSeek family and Qwen3.5/3.6 MoE), speaking the strata
 //! engine protocol (docs/PROTOCOL.md) so am2Strata's server drives it like `strata` and `strata-poly`:
 //!   am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]
 //!       [--pack DIR] [--expert-profile FILE] [--expert-profile-save FILE] [--resident-experts [--expert-ram-gib N]]

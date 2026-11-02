@@ -7,7 +7,9 @@
 //!   - `qwen3` / `qwen3moe` (Qwen3 dense and MoE: per-head q/k RMS norms, NEOX RoPE; the MoE is Mixtral's softmax
 //!     routing, so these models also test that path),
 //!   - `deepseek2` (GLM-4.7-Flash, DeepSeek V2/V3 and their family: MLA attention with the absorbed K/V
-//!     projections, leading dense layers, then sigmoid- or softmax-routed experts with a shared expert).
+//!     projections, leading dense layers, then sigmoid- or softmax-routed experts with a shared expert),
+//!   - `qwen35moe` (Qwen3.5/3.6, Ornith, Tiel, Sage: one layer in four is attention with a gate on its heads, the others
+//!     are recurrent gated delta nets; softmax-routed experts with a sigmoid-gated shared expert; text only).
 //! Each layer is a list of (norm, block) pairs applied as x += block(rms_norm(x)); every formula follows llama.cpp,
 //! which the parity tests compare against (tools/reference-llamacpp).
 
@@ -223,6 +225,10 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
@@ -380,6 +386,8 @@ pub struct Moe {
     pub down_exps: Experts,
     act: Act,
     shared: Option<Dense>,
+    /// the shared expert's output is multiplied by the sigmoid of this row's product with the input (Qwen3.5)
+    shared_gate: Option<Vec<f32>>,
 }
 
 /// One projection of every expert in a layer, a matrix per expert: sliced from the stacked tensor
@@ -415,6 +423,8 @@ pub struct Attn {
     pub(crate) head_dim: usize,
     /// no positions at all (Nemotron-H)
     pub(crate) rope: bool,
+    /// q carries a gate per head after its query: the attention's output is multiplied by its sigmoid (Qwen3.5)
+    pub(crate) gated: bool,
 }
 
 /// DeepSeek's multi-head latent attention, with the K and V up-projections absorbed (as llama.cpp's is_mla path):
@@ -446,8 +456,23 @@ pub struct Mamba {
     ssm_out: QMat,
 }
 
+/// The gated delta net of Qwen3.5 (llama.cpp's build_layer_attn_linear): per value head, a matrix state that decays,
+/// takes a delta rule step toward the value for the key, and is read by the query.
+pub struct Gdn {
+    qkv: QMat,
+    z: QMat,
+    alpha: QMat,
+    beta: QMat,
+    conv_w: Vec<f32>,
+    dt_b: Vec<f32>,
+    a: Vec<f32>,
+    ssm_norm: Vec<f32>,
+    ssm_out: QMat,
+}
+
 pub enum Block {
     Mamba(Mamba),
+    Gdn(Gdn),
     Attn(Attn),
     Mla(Mla),
     Dense(Dense),
@@ -498,7 +523,7 @@ fn arr_u64(g: &Gguf, key: &str, i: usize) -> u64 {
     }
 }
 
-pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2"];
+pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2", "qwen35moe"];
 
 impl Model {
     /// Loads the GGUF (memory-mapped); with a pack, its float tensors replace the GGUF's. Also returns how many
@@ -539,7 +564,8 @@ impl Model {
         let opt = |name: &str| tensors.get(name).cloned();
         let vecf = |name: &str| take(name).map(|t| t.all_f32());
         let optf = |name: &str| opt(name).map(|t| t.all_f32());
-        let n_layer = u("block_count")? as usize;
+        // an MTP file's draft block counts in block_count, and the forward pass does not run it
+        let n_layer = (u("block_count")? - u("nextn_predict_layers").unwrap_or(0)) as usize;
         let n_embd = u("embedding_length")? as usize;
         let eps = fl("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let w_scale = fl("expert_weights_scale").unwrap_or(0.0);
@@ -549,6 +575,8 @@ impl Model {
             _ => Gating::Softmax,
         };
         let nemotron = arch.starts_with("nemotron_h");
+        let qwen35 = arch == "qwen35moe";
+        let full_attn = u("full_attention_interval").unwrap_or(4).max(1) as usize;
         let mut layers = Vec::with_capacity(n_layer);
         let mut max_expert = 0usize;
         let dense_lead = u("leading_dense_block_count").unwrap_or(0) as usize;
@@ -562,7 +590,7 @@ impl Model {
                     q: take(&p("attn_q.weight"))?, k: take(&p("attn_k.weight"))?, v: take(&p("attn_v.weight"))?,
                     o: take(&p("attn_output.weight"))?, q_b: optf(&p("attn_q.bias")), k_b: optf(&p("attn_k.bias")),
                     v_b: optf(&p("attn_v.bias")), o_b: optf(&p("attn_output.bias")), q_norm: optf(&p("attn_q_norm.weight")),
-                    k_norm: optf(&p("attn_k_norm.weight")), n_head, n_kv, head_dim, rope,
+                    k_norm: optf(&p("attn_k_norm.weight")), n_head, n_kv, head_dim, rope, gated: qwen35,
                 }))
             };
             // the feed-forward of a layer that has one: experts when there is a router, else dense
@@ -601,8 +629,9 @@ impl Model {
                     gating: if nemotron { Gating::Sigmoid } else if arch == "deepseek2" { gating } else { Gating::Softmax },
                     n_expert, top_k: arr_u64(&g, &k("expert_used_count"), l) as usize,
                     // llama.cpp: the llama family always renormalizes the chosen experts' weights
-                    w_norm: if matches!(arch.as_str(), "llama" | "mistral3" | "qwen3moe") { true } else { w_norm_meta.unwrap_or(false) },
+                    w_norm: if matches!(arch.as_str(), "llama" | "mistral3" | "qwen3moe" | "qwen35moe") { true } else { w_norm_meta.unwrap_or(false) },
                     w_scale, latent, gate_exps, up_exps, down_exps, act: act_, shared,
+                    shared_gate: optf(&p("ffn_gate_inp_shexp.weight")),
                 }))
             };
             let mut parts = Vec::new();
@@ -651,6 +680,18 @@ impl Model {
                     ffn(Act::Silu, &mut max_expert)?
                 };
                 parts.push((vecf(&p("ffn_norm.weight"))?, f));
+            } else if qwen35 {
+                let mixer = if (l + 1) % full_attn == 0 {
+                    attn(true)?
+                } else {
+                    Block::Gdn(Gdn {
+                        qkv: take(&p("attn_qkv.weight"))?, z: take(&p("attn_gate.weight"))?, alpha: take(&p("ssm_alpha.weight"))?,
+                        beta: take(&p("ssm_beta.weight"))?, conv_w: vecf(&p("ssm_conv1d.weight"))?, dt_b: vecf(&p("ssm_dt.bias"))?,
+                        a: vecf(&p("ssm_a"))?, ssm_norm: vecf(&p("ssm_norm.weight"))?, ssm_out: take(&p("ssm_out.weight"))?,
+                    })
+                };
+                parts.push((vecf(&p("attn_norm.weight"))?, mixer));
+                parts.push((vecf(&p("post_attention_norm.weight"))?, ffn(Act::Silu, &mut max_expert)?));
             } else {
                 parts.push((vecf(&p("attn_norm.weight"))?, attn(true)?));
                 parts.push((vecf(&p("ffn_norm.weight"))?, ffn(Act::Silu, &mut max_expert)?));
@@ -709,6 +750,7 @@ impl Model {
                 let h = rms_norm(&x, norm, self.eps);
                 let out = match block {
                     Block::Mamba(b) => self.mamba(l, b, &h, st),
+                    Block::Gdn(b) => self.gdn(l, b, &h, st),
                     Block::Attn(b) => self.attention(l * 2 + pi, b, &h, st),
                     Block::Mla(b) => self.mla(l * 2 + pi, b, &h, st),
                     Block::Dense(b) => b.forward(&h),
@@ -795,6 +837,62 @@ impl Model {
         ssm_out.mul(&y)
     }
 
+    fn gdn(&self, l: usize, b: &Gdn, h: &[f32], st: &mut State) -> Vec<f32> {
+        let Gdn { qkv, z, alpha, beta, conv_w, dt_b, a, ssm_norm, ssm_out } = b;
+        let (nk, sk, nv, dc) = (self.n_group, self.d_state, self.n_ssm_head, self.d_conv);
+        let sv = self.d_inner / nv;
+        let key = nk * sk;
+        let n_conv = 2 * key + nv * sv;
+        let (mix, z) = {
+            let mut v = QMat::mul_many(&[qkv, z], h);
+            let z = v.pop().unwrap();
+            (v.pop().unwrap(), z)
+        };
+        let (al, be) = (alpha.mul(h), beta.mul(h));
+        // the same causal conv1d as Mamba's, without a bias
+        let win = st.conv.entry(l).or_insert_with(|| vec![0f32; (dc - 1) * n_conv]);
+        let mut conv = vec![0f32; n_conv];
+        for c in 0..n_conv {
+            let mut s = 0f32;
+            for t in 0..dc - 1 {
+                s += win[t * n_conv + c] * conv_w[c * dc + t];
+            }
+            s += mix[c] * conv_w[c * dc + dc - 1];
+            conv[c] = silu(s);
+        }
+        win.copy_within(n_conv.., 0);
+        let last = (dc - 2) * n_conv;
+        win[last..last + n_conv].copy_from_slice(&mix);
+        // q and k per key head, L2 normalized as build_gdn_l2_norm: an RMS norm with eps / n, over sqrt(n)
+        let l2 = |x: &mut [f32]| {
+            x.chunks_mut(sk).for_each(|hd| {
+                let ms = hd.iter().map(|v| v * v).sum::<f32>() / sk as f32;
+                let f = 1.0 / (ms + self.eps / sk as f32).sqrt() / (sk as f32).sqrt();
+                hd.iter_mut().for_each(|v| *v *= f);
+            });
+        };
+        let (q, rest) = conv.split_at_mut(key);
+        let (k, v) = rest.split_at_mut(key);
+        l2(q);
+        l2(k);
+        let (q, k, v) = (&*q, &*k, &*v);
+        let scale = 1.0 / (sv as f32).sqrt();
+        let state = st.ssm.entry(l).or_insert_with(|| vec![0f32; nv * sv * sv]);
+        let mut y = vec![0f32; nv * sv];
+        // a value head reads key head (head % key heads), as ggml_gated_delta_net does
+        y.par_chunks_mut(sv).zip(state.par_chunks_mut(sv * sv)).enumerate().for_each(|(hh, (out, s))| {
+            let (qh, kh) = (&q[(hh % nk) * sk..(hh % nk + 1) * sk], &k[(hh % nk) * sk..(hh % nk + 1) * sk]);
+            let vh = &v[hh * sv..(hh + 1) * sv];
+            let decay = (softplus(al[hh] + dt_b[hh]) * a[hh]).exp();
+            delta_step(s, kh, vh, qh, decay, sigmoid(be[hh]), scale, out);
+        });
+        for ((yh, nw), zh) in y.chunks_mut(sv).zip(std::iter::repeat(ssm_norm)).zip(z.chunks(sv)) {
+            let n = rms_norm(yh, nw, self.eps);
+            yh.iter_mut().zip(n.iter().zip(zh)).for_each(|(o, (n, g))| *o = n * silu(*g));
+        }
+        ssm_out.mul(&y)
+    }
+
     fn attention(&self, slot: usize, a: &Attn, h: &[f32], st: &mut State) -> Vec<f32> {
         let hd = a.head_dim;
         let pos = st.pos;
@@ -804,6 +902,12 @@ impl Model {
             let kv = v.pop().unwrap();
             (v.pop().unwrap(), kv, vv)
         };
+        // [query | gate] per head
+        let gate: Option<Vec<f32>> = a.gated.then(|| {
+            let g = qv.chunks_exact(hd * 2).flat_map(|c| c[hd..].iter().copied()).collect();
+            qv = qv.chunks_exact(hd * 2).flat_map(|c| c[..hd].iter().copied()).collect();
+            g
+        });
         add_bias(&mut qv, &a.q_b);
         add_bias(&mut kv, &a.k_b);
         add_bias(&mut vv, &a.v_b);
@@ -845,6 +949,9 @@ impl Model {
                 oh.iter_mut().zip(vt).for_each(|(o, v)| *o += p * v);
             }
         });
+        if let Some(g) = &gate {
+            att.iter_mut().zip(g).for_each(|(o, g)| *o *= sigmoid(*g));
+        }
         let mut out = a.o.mul(&att);
         add_bias(&mut out, &a.o_b);
         out
@@ -948,7 +1055,8 @@ impl Model {
             None => acc,
         };
         if let Some(sh) = &m.shared {
-            out.iter_mut().zip(&sh.forward(h)).for_each(|(a, b)| *a += b);
+            let gate = m.shared_gate.as_ref().map_or(1.0, |w| sigmoid(dot(w, h)));
+            out.iter_mut().zip(&sh.forward(h)).for_each(|(a, b)| *a += b * gate);
         }
         out
     }
@@ -977,6 +1085,10 @@ impl Model {
                         let Mamba { ssm_in, ssm_out, .. } = m;
                         every.push(ssm_in);
                         every.push(ssm_out);
+                    }
+                    Block::Gdn(g) => {
+                        let Gdn { qkv, z, ssm_out, .. } = g;
+                        every.extend([qkv, z, ssm_out]);
                     }
                     Block::Attn(a) => {
                         let Attn { q, k, v, o, .. } = a;
@@ -1028,6 +1140,7 @@ impl Model {
         for (_, b) in self.layers.iter().flat_map(|l| l.parts.iter()) {
             let name = match b {
                 Block::Mamba(_) => "mamba",
+                Block::Gdn(_) => "gdn",
                 Block::Attn(_) => "attention",
                 Block::Mla(_) => "mla",
                 Block::Dense(_) => "dense_ffn",
@@ -1039,6 +1152,18 @@ impl Model {
             }
         }
         c.iter().map(|(n, k)| format!("{n}_layers={k}")).collect::<Vec<_>>().join(" ")
+    }
+}
+
+/// One step of a gated delta net's head. `s` holds the state by columns, as ggml keeps it: it decays, moves toward
+/// `v` for key `k` by the delta rule, and is read by query `q`.
+#[allow(clippy::too_many_arguments)]
+fn delta_step(s: &mut [f32], k: &[f32], v: &[f32], q: &[f32], decay: f32, beta: f32, scale: f32, out: &mut [f32]) {
+    s.iter_mut().for_each(|x| *x *= decay);
+    for (j, row) in s.chunks_exact_mut(v.len()).enumerate() {
+        let delta = (v[j] - dot(row, k)) * beta;
+        row.iter_mut().zip(k).for_each(|(r, ki)| *r += delta * ki);
+        out[j] = dot(row, q) * scale;
     }
 }
 
@@ -1084,6 +1209,23 @@ mod tests {
         assert_eq!((y[0], y[1]), (127.0, 1.0));
         // a length that is not whole blocks passes through
         assert_eq!(Vdt::Q8K.round_trip(&[0.3, 0.7]), vec![0.3, 0.7]);
+    }
+
+    #[test]
+    fn delta_rule_recalls_the_value_of_a_unit_key() {
+        // with beta 1 and a unit key the state maps the key to the value at once, and later keys can be taken back
+        let (k, v) = ([1.0f32, 0.0], [3.0f32, -2.0]);
+        let mut s = vec![0f32; 4];
+        let mut out = [0f32; 2];
+        delta_step(&mut s, &k, &v, &k, 1.0, 1.0, 1.0, &mut out);
+        assert_eq!(out, v);
+        // half the state decays away, and beta 0.5 moves it halfway back
+        delta_step(&mut s, &k, &v, &k, 0.5, 0.5, 1.0, &mut out);
+        assert_eq!(out, [2.25, -1.5]);
+        // a read does not depend on the scale of the state's other key
+        let k2 = [0.0f32, 1.0];
+        delta_step(&mut s, &k2, &[7.0, 9.0], &k, 1.0, 1.0, 2.0, &mut out);
+        assert_eq!(out, [4.5, -3.0]);
     }
 
     #[test]
