@@ -43,3 +43,4 @@ jobs:
           $out
           if ($out -notmatch "No model yet") { exit 1 }
           if (-not (Test-Path "$env:LOCALAPPDATA\am2strata\app\am2strata-*\poppler\bin\pdftotext.exe")) { throw "no bundled poppler" }
+          exit 0   # the launcher's "no model yet" exits 1, which the step would otherwise report
