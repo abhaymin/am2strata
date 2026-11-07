@@ -26,7 +26,7 @@ jobs:
         include:
           # the oldest supported Ubuntu: a binary built there also runs on newer Linux, not the other way round
           - { os: ubuntu-22.04, label: linux-x86_64 }
-          - { os: macos-14, label: macos-arm64 }
+          - { os: macos-15, label: macos-arm64 }
           - { os: windows-2022, label: windows-x86_64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -52,7 +52,7 @@ jobs:
           exe=$(bash deploy/fetch-chrome.sh "$RUNNER_TEMP/browser" | tail -1)
           [ "$RUNNER_OS" = Windows ] && exe=$(cygpath -w "$exe")
           echo "AM2STRATA_TEST_CHROME=$exe" >> "$GITHUB_ENV"
-      - run: cargo test --release --locked --workspace
+      - run: cargo test --release --locked --workspace --no-fail-fast
         env:
           AM2STRATA_TEST_TOOLS: "1"     # a missing tool fails the test instead of skipping it
       - run: cargo build --release --locked -p am2strata

@@ -93,7 +93,7 @@ fn iq_pack_writes_the_python_pack() {
     for f in ["index.txt", "native_experts.txt", "conversions.json", "dense.bin", "experts.bin", "experts.bin.src.json"] {
         same_file(&out.join(f), &want.join(f));
     }
-    let got = std::fs::read_to_string(out.join("compat-bf16.json")).unwrap().replace(&src.display().to_string(), "@SRC@");
+    let got = std::fs::read_to_string(out.join("compat-bf16.json")).unwrap().replace(serde_json::to_string(&src.display().to_string()).unwrap().trim_matches('"'), "@SRC@"); // as JSON writes it (Windows: \\)
     assert_eq!(got, std::fs::read_to_string(want.join("compat-bf16.json")).unwrap());
     // without --compat-bf16 the quantized projections are refused, and nothing of the pack changes
     let out2 = tmp("iq-refuse");
