@@ -48,17 +48,54 @@ pub struct Settings {
     pub private_urls: bool,
 }
 
+/// Chrome for Testing's folder and file for this system's chrome-headless-shell (what the installers fetch).
+pub fn headless_shell_name() -> (&'static str, &'static str) {
+    if cfg!(windows) {
+        ("chrome-headless-shell-win64", "chrome-headless-shell.exe")
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        ("chrome-headless-shell-mac-arm64", "chrome-headless-shell")
+    } else if cfg!(target_os = "macos") {
+        ("chrome-headless-shell-mac-x64", "chrome-headless-shell")
+    } else {
+        ("chrome-headless-shell-linux64", "chrome-headless-shell")
+    }
+}
+
+/// The browser to start: chrome-headless-shell in <data>/browser (the installers put it there), else a Chrome, Edge
+/// or Chromium installed on this system.
+fn find_chrome(data_dir: &std::path::Path) -> Option<PathBuf> {
+    let (dir, file) = headless_shell_name();
+    let own = data_dir.join("browser").join(dir).join(file);
+    if own.is_file() {
+        return Some(own);
+    }
+    let names: &[&str] = if cfg!(windows) { &["chrome.exe", "msedge.exe"] }
+        else { &["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] };
+    let on_path = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path).find_map(|d| names.iter().map(|n| d.join(n)).find(|p| p.is_file()))
+    });
+    on_path.or_else(|| {
+        let mut known: Vec<PathBuf> = Vec::new();
+        if cfg!(windows) {
+            for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+                if let Some(base) = std::env::var_os(var).map(PathBuf::from) {
+                    known.push(base.join("Google/Chrome/Application/chrome.exe"));
+                    known.push(base.join("Microsoft/Edge/Application/msedge.exe"));
+                }
+            }
+        } else if cfg!(target_os = "macos") {
+            known.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
+            known.push("/Applications/Chromium.app/Contents/MacOS/Chromium".into());
+            known.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".into());
+        }
+        known.into_iter().find(|p| p.is_file())
+    })
+}
+
 impl Settings {
     pub fn from_config(rest: &std::collections::BTreeMap<String, Value>, data_dir: &std::path::Path) -> Settings {
         let c = rest.get("browser").cloned().unwrap_or(Value::Null);
-        let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| {
-            let own = data_dir.join("browser/chrome-headless-shell-linux64/chrome-headless-shell");
-            if own.is_file() {
-                return Some(own);
-            }
-            ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"].iter()
-                .find_map(|n| std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(n)).find(|p| p.is_file()))
-        });
+        let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| find_chrome(data_dir));
         Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
                    auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
                    private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false) }
@@ -198,7 +235,7 @@ impl Browsers {
             *run = Some(Running { browser, child: None, profile: None, tabs: HashMap::new() });
             return Ok(());
         }
-        let exe = self.settings.exe.clone().ok_or("no browser here: put chrome-headless-shell in Strata-data/browser, set \"browser\": {\"exe\": ...}, or attach to your own with \"browser\": {\"connect\": \"http://127.0.0.1:9222\"}")?;
+        let exe = self.settings.exe.clone().ok_or("no browser here: install Chrome (or run the installer with its browser option), put chrome-headless-shell in <data>/browser, set \"browser\": {\"exe\": ...}, or attach to your own with \"browser\": {\"connect\": \"http://127.0.0.1:9222\"}")?;
         // profiles a killed server left behind (a day old: not one another running server uses)
         for e in std::fs::read_dir(std::env::temp_dir()).into_iter().flatten().flatten() {
             let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|d| d > Duration::from_secs(86_400));

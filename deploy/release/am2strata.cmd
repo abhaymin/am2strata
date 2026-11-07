@@ -12,7 +12,7 @@ if not exist "%AM2STRATA_DATA%\strata-*.json" (
     echo No model yet. See QUICKSTART.md for a small one to start with.
     exit /b 1
 )
-"%HERE%bin\am2strata.exe" --models-dir "%AM2STRATA_DATA%" %1 %2 %3 %4 %5 %6
+"%HERE%bin\am2strata.exe" --models-dir "%AM2STRATA_DATA%" --data-dir "%AM2STRATA_DATA%\data" %1 %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %ERRORLEVEL%
 :pull
 if "%~2"=="" (

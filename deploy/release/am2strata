@@ -53,7 +53,7 @@ case "${1:-serve}" in
             echo "No model yet. See QUICKSTART.md for a small one to start with."
             exit 1
         fi
-        exec "$HERE/bin/am2strata" --models-dir "$DATA" "$@"
+        exec "$HERE/bin/am2strata" --models-dir "$DATA" --data-dir "$DATA/data" "$@"
         ;;
     *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | doctor]" >&2; exit 2 ;;
 esac

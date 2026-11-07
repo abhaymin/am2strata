@@ -1,4 +1,5 @@
-# Builds for Linux, Windows and macOS on a version tag, and leaves a draft release for a person to publish.
+# Builds and tests Linux, Windows and macOS on a version tag, and leaves a draft release (notes from
+# docs/releases/<tag>.md, the downloads and the installers) for a person to publish.
 #   git tag v0.2.0 && git push origin v0.2.0
 name: Release
 on:
@@ -37,7 +38,23 @@ jobs:
           workspaces: |
             .
             crates/strata-hybrid
+      # what PDFs and the browser tool need, so their tests run here instead of skipping
+      - name: Poppler and Chrome for the tests
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get install -y --no-install-recommends poppler-utils >/dev/null ;;
+            macOS) brew install --quiet poppler ;;
+            Windows)
+              bash deploy/fetch-poppler-windows.sh "$RUNNER_TEMP"
+              cygpath -w "$RUNNER_TEMP/poppler/bin" >> "$GITHUB_PATH" ;;
+          esac
+          exe=$(bash deploy/fetch-chrome.sh "$RUNNER_TEMP/browser" | tail -1)
+          [ "$RUNNER_OS" = Windows ] && exe=$(cygpath -w "$exe")
+          echo "AM2STRATA_TEST_CHROME=$exe" >> "$GITHUB_ENV"
       - run: cargo test --release --locked --workspace
+        env:
+          AM2STRATA_TEST_TOOLS: "1"     # a missing tool fails the test instead of skipping it
       - run: cargo build --release --locked -p am2strata
       - run: cargo build --release --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu
       - run: bash deploy/package-portable.sh ${{ matrix.label }}
@@ -62,4 +79,7 @@ jobs:
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --generate-notes
+        run: |
+          notes=docs/releases/$GITHUB_REF_NAME.md
+          gh api "repos/$GITHUB_REPOSITORY/contents/$notes?ref=$GITHUB_REF_NAME" -q .content | base64 -d > notes.md || echo "" > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --notes-file notes.md --generate-notes

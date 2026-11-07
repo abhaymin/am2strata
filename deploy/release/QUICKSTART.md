@@ -33,6 +33,10 @@ read.
   Cyber-Tiel runs at about 4 words a second on a 16-thread desktop CPU, and bigger ones are slower still.
 - **Your GPU:** add `--devices vulkan:discrete=8` to the model's run config to try weights on any GPU. This is new and less tested.
 - **Fast on NVIDIA:** the Linux NVIDIA download runs large models at 60-160 tokens a second with PolyStrata's engines.
+- **PDFs in chats:** the Windows download carries Poppler. On Linux and macOS install poppler (`sudo apt install
+  poppler-utils`, `brew install poppler`), or run the installer with `--pdf`.
+- **The browser tool** uses a Chrome, Edge or Chromium already on this PC, or Chrome for Testing's headless shell, which
+  the Linux and macOS installer fetches when there is none.
 - **Not in this download:** image, video and voice generation, and pictures in chats. Build from source for image, video and voice.
 
 By default the server only answers this PC. Before using `--host 0.0.0.0`, set an API key.

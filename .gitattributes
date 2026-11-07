@@ -3,3 +3,6 @@
 crates/am2strata/testdata/** -text
 crates/*/testdata/** -text
 golden/** -text
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf

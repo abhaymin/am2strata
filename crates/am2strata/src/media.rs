@@ -217,15 +217,25 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
 /// Page images sent with a document's text (the rest of the pages go as text only).
 pub const MAX_PAGE_IMAGES: usize = 20;
 
+/// Poppler's `name`: the copy a release bundles (poppler/bin beside or above this binary's folder: the Windows
+/// download carries one), else the one on PATH.
+fn pdf_tool(name: &str) -> PathBuf {
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?.to_path_buf();
+        [dir.join("poppler/bin"), dir.join("../poppler/bin")].into_iter().map(|d| d.join(&file)).find(|p| p.is_file())
+    }).unwrap_or_else(|| PathBuf::from(name))
+}
+
 pub fn pdftools_available() -> bool {
-    Command::new("pdftotext").arg("-v").output().is_ok() && Command::new("pdftoppm").arg("-v").output().is_ok()
+    Command::new(pdf_tool("pdftotext")).arg("-v").output().is_ok() && Command::new(pdf_tool("pdftoppm")).arg("-v").output().is_ok()
 }
 
 /// A PDF -> (its text, page by page, and up to `max_images` page images as JPEG; none when `images` is false).
 pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(Vec<String>, Vec<Vec<u8>>)> {
     if !pdftools_available() {
         bail!("this server cannot read PDF files: install {}", if cfg!(windows) {
-            "Poppler for Windows (winget install oschwartz10612.Poppler, or choco install poppler) and put its bin folder on PATH"
+            "Poppler for Windows: the release download carries it in poppler\\bin; otherwise winget install oschwartz10612.Poppler and put its bin folder on PATH"
         } else if cfg!(target_os = "macos") {
             "poppler (brew install poppler)"
         } else {
@@ -238,7 +248,7 @@ pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(V
     let dir = tempdir()?;
     let input = dir.join("in.pdf");
     std::fs::write(&input, pdf)?;
-    let out = Command::new("pdftotext").args(["-layout", "-enc", "UTF-8"]).arg(&input).arg("-").output()?;
+    let out = Command::new(pdf_tool("pdftotext")).args(["-layout", "-enc", "UTF-8"]).arg(&input).arg("-").output()?;
     if !out.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
         bail!("the PDF could not be read ({})", String::from_utf8_lossy(&out.stderr).trim());
@@ -251,7 +261,7 @@ pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(V
     }
     let mut imgs = Vec::new();
     if images && max_images > 0 {
-        let status = Command::new("pdftoppm")
+        let status = Command::new(pdf_tool("pdftoppm"))
             .args(["-jpeg", "-jpegopt", "quality=80", "-r", "110", "-l", &max_images.to_string()])
             .arg(&input)
             .arg(dir.join("p"))

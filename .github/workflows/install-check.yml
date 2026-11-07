@@ -1,0 +1,45 @@
+# Runs the one-line installers on fresh Linux, macOS and Windows runners against a published release, as a new user
+# would: install, then the launcher answers. Only when a release is published, or by hand.
+name: Install check
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "release tag (empty: the latest)"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    env:
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
+    steps:
+      - name: Install (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ -n "$VERSION" ]; then base=download/$VERSION; else base=latest/download; fi
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/$base/install.sh" \
+            | sh -s -- ${VERSION:+--version $VERSION} --no-browser
+          out=$("$HOME/.local/bin/am2strata" 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "No model yet"
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $base = if ($env:VERSION) { "download/$env:VERSION" } else { "latest/download" }
+          & ([scriptblock]::Create((irm "https://github.com/${{ github.repository }}/releases/$base/install.ps1"))) -Version $env:VERSION
+          $out = & "$env:LOCALAPPDATA\am2strata\bin\am2strata.cmd" 2>&1 | Out-String
+          $out
+          if ($out -notmatch "No model yet") { exit 1 }
+          if (-not (Test-Path "$env:LOCALAPPDATA\am2strata\app\am2strata-*\poppler\bin\pdftotext.exe")) { throw "no bundled poppler" }

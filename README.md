@@ -10,13 +10,35 @@ server can run on the same machine (one at a time).
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
 support) behind OpenAI-, Anthropic- and Responses-compatible APIs, with a web app for chat, monitoring and settings.
 
-## Download
+## Install
 
-Take the file for your system from [Releases](https://github.com/abhaymin/am2strata/releases): Linux, Windows or macOS (Apple
-Silicon). Nothing else to install, and `QUICKSTART.md` inside takes a few minutes. These run on the CPU, so they suit small
-models; the setup below is the fast path, for NVIDIA cards.
+**Linux (x86_64) and macOS (Apple Silicon):**
 
-## Requirements
+```bash
+curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh
+```
+
+**Windows (x64), in PowerShell:**
+
+```powershell
+irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
+```
+
+Then pull a small model and start the server:
+
+```bash
+am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M
+am2strata                      # open http://127.0.0.1:8000
+```
+
+The installers check each download's SHA-256 and need no admin rights. You can also take the archive for your system
+from [Releases](https://github.com/abhaymin/am2strata/releases); `QUICKSTART.md` inside takes a few minutes. These
+downloads run models on the CPU, or on any GPU through wgpu, so they suit small models. The build from source below is
+the fast path, for NVIDIA cards.
+
+## Build from source (the NVIDIA fast path)
+
+### Requirements
 
 - Linux and an NVIDIA GPU, with PolyStrata's engines built (`strata`, `strata-poly`, `strata-vision`) and its run
   configs (`strata-*.json`). By default am2Strata looks in `~/Development/PolyStrata`, and for models in
@@ -24,7 +46,7 @@ models; the setup below is the fast path, for NVIDIA cards.
 - Rust (stable). Optional: `ffmpeg` (video from API clients), `poppler-utils` (PDFs), `bubblewrap` (to run Python
   code from the chat in a sandbox).
 
-## Deploy
+### Deploy
 
 Step by step, with ready run configs for Tiel Coder, MiniCPM-V 4.7 and Qwen3.8 Flash Next (Orca):
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short:
@@ -96,7 +118,7 @@ expert cache as under PolyStrata (3,985 slots, 8.27 GB).
 
 ## Not yet
 
-Image generation (`/v1/images/generations`). Parallel batch slots and replicas (PolyStrata's opt-ins) are not ported
+Image, video and voice generation are in the build from source only (`crates/strata-media`, NVIDIA). Parallel batch slots and replicas (PolyStrata's opt-ins) are not ported
 either; this box runs one slot.
 
 The PolyStrata engines here are built for sm_86 and sm_120 (RTX 30 and RTX 50 cards) since 2026-10-20, so the same

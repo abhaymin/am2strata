@@ -689,7 +689,9 @@ fn tiny_pdf(text: &str) -> Vec<u8> {
 
 fn pdftools() -> bool {
     // both: Git for Windows puts a pdftotext on PATH without pdftoppm
-    ["pdftotext", "pdftoppm"].iter().all(|t| std::process::Command::new(t).arg("-v").output().is_ok())
+    let found = ["pdftotext", "pdftoppm"].iter().all(|t| std::process::Command::new(t).arg("-v").output().is_ok());
+    assert!(found || std::env::var_os("AM2STRATA_TEST_TOOLS").is_none(), "AM2STRATA_TEST_TOOLS is set and poppler is not on PATH");
+    found
 }
 
 #[test]
@@ -1477,10 +1479,15 @@ fn a_snapshot_the_engine_refuses_is_dropped_and_the_request_goes_on() {
     assert!(!std::path::Path::new(&file.replace(".sess", ".ids")).exists(), "the refused snapshot was dropped");
 }
 
-/// The headless Chrome these tests drive (skipped where there is none).
+/// The headless Chrome these tests drive: $AM2STRATA_TEST_CHROME (CI fetches one with deploy/fetch-chrome.sh), else
+/// the one in this PC's Strata-data; skipped where there is none, unless $AM2STRATA_TEST_TOOLS says they must run.
 fn chrome() -> Option<String> {
-    let p = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell");
-    p.is_file().then(|| p.display().to_string())
+    let found = std::env::var_os("AM2STRATA_TEST_CHROME").map(std::path::PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(std::path::PathBuf::from(home).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell"))
+    }).filter(|p| p.is_file());
+    assert!(found.is_some() || std::env::var_os("AM2STRATA_TEST_TOOLS").is_none(), "AM2STRATA_TEST_TOOLS is set and there is no Chrome");
+    found.map(|p| p.display().to_string())
 }
 
 #[test]

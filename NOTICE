@@ -4,6 +4,8 @@ PolyStrata's code and web app (MIT, Copyright (c) 2026 Niko1221 and the Strata c
 Bundled third-party files keep their own licenses:
 - web/vendor/mermaid.min.js: Mermaid 11.4.1, MIT (web/vendor/LICENSE-mermaid.txt)
 - web/fonts: the Outfit font, SIL Open Font License 1.1 (web/fonts/OFL.txt)
+- poppler/ (the Windows download only): Poppler's pdftotext and pdftoppm, GPL-2.0-or-later, run as separate
+  programs to read PDFs (poppler/README.txt says where their source is)
 
 The media engine (crates/strata-media, built only on request) links, through mold (MIT):
 - OpenH264 (BSD-2-Clause, Cisco) for MP4 / H.264 video output;

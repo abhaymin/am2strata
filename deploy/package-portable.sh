@@ -18,6 +18,7 @@ cd "$ROOT/dist"
 case "$LABEL" in
     windows*)
         cp "$ROOT/deploy/release/am2strata.cmd" "$OUT/"
+        bash "$ROOT/deploy/fetch-poppler-windows.sh" "$OUT"     # PDFs in chats: Windows has no poppler of its own
         7z a -tzip -bd "$NAME.zip" "$NAME" >/dev/null
         FILE=$NAME.zip
         ;;
@@ -29,4 +30,6 @@ case "$LABEL" in
 esac
 rm -rf "$NAME"
 if command -v sha256sum >/dev/null; then sha256sum "$FILE" > "$FILE.sha256"; else shasum -a 256 "$FILE" > "$FILE.sha256"; fi
+# the one-line installers ride along with every platform's download (the same files; the release keeps one copy)
+cp "$ROOT/deploy/release/install.sh" "$ROOT/deploy/release/install.ps1" "$ROOT/dist/"
 ls -la "$FILE"
