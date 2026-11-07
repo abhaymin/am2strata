@@ -1074,8 +1074,14 @@ fn a_chat_waits_behind_a_media_job_in_the_queue_and_says_its_place() {
     let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
         .json(&json!({"messages": [user("hi")], "stream": true})).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
-    let q = s.get("/api/queue", true).1;
-    assert_eq!(q["waiting"][0]["kind"], "chat", "{q}");
+    // the headers come first: the chat takes its place in the queue a moment after (slow runners show the gap)
+    let t0 = std::time::Instant::now();
+    loop {
+        let q = s.get("/api/queue", true).1;
+        if q["waiting"][0]["kind"] == "chat" { break; }
+        assert!(t0.elapsed().as_secs() < 10, "{q}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let body = r.text().unwrap();
     assert!(body.contains(": queued: 0 ahead"), "{body}");
     let content: String = body.lines().filter_map(|l| l.strip_prefix("data: ")).filter(|d| *d != "[DONE]")
