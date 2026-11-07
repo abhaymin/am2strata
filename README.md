@@ -1,6 +1,20 @@
 # am2Strata
 
+![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows](docs/media/banner.webp)
+
+[![Release](https://img.shields.io/github/v/release/abhaymin/am2strata)](https://github.com/abhaymin/am2strata/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/abhaymin)
+
+Free and open source (MIT). Built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors,
+and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
+
+| Chat | Monitor | Models |
+| --- | --- | --- |
+| ![The chat page](docs/media/screenshot-chat-empty.webp) | ![The live monitor: speed, GPU, VRAM, power](docs/media/screenshot-monitor.webp) | ![Settings: the installed models](docs/media/screenshot-settings.webp) |
+
+<sub>Screenshots of the web app on a PC with two RTX 5060 Ti cards. The banner's background was made with am2Strata's media engine
+(Z-Image Turbo, Apache-2.0).</sub>
 
 am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
 tokenizer, chat templates, output parsing, the Hugging Face downloader, the launcher and every test. PolyStrata's
