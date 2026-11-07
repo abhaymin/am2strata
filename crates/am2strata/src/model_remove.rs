@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// Every absolute path a run config names (args, the vision block, the tokenizer...).
 fn paths_in(v: &Value, out: &mut Vec<PathBuf>) {
     match v {
-        Value::String(s) if s.starts_with('/') => out.push(PathBuf::from(s)),
+        Value::String(s) if Path::new(s).is_absolute() => out.push(PathBuf::from(s)),
         Value::Array(a) => a.iter().for_each(|x| paths_in(x, out)),
         Value::Object(o) => o.values().for_each(|x| paths_in(x, out)),
         _ => {}

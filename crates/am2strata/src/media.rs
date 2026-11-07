@@ -224,7 +224,13 @@ pub fn pdftools_available() -> bool {
 /// A PDF -> (its text, page by page, and up to `max_images` page images as JPEG; none when `images` is false).
 pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(Vec<String>, Vec<Vec<u8>>)> {
     if !pdftools_available() {
-        bail!("this server cannot read PDF files: install poppler-utils (sudo apt install poppler-utils)");
+        bail!("this server cannot read PDF files: install {}", if cfg!(windows) {
+            "Poppler for Windows (winget install oschwartz10612.Poppler, or choco install poppler) and put its bin folder on PATH"
+        } else if cfg!(target_os = "macos") {
+            "poppler (brew install poppler)"
+        } else {
+            "poppler-utils (sudo apt install poppler-utils)"
+        });
     }
     if !pdf.starts_with(b"%PDF") {
         bail!("the document is not a PDF file");

@@ -688,13 +688,14 @@ fn tiny_pdf(text: &str) -> Vec<u8> {
 }
 
 fn pdftools() -> bool {
-    std::process::Command::new("pdftotext").arg("-v").output().is_ok()
+    // both: Git for Windows puts a pdftotext on PATH without pdftoppm
+    ["pdftotext", "pdftoppm"].iter().all(|t| std::process::Command::new(t).arg("-v").output().is_ok())
 }
 
 #[test]
 fn pdf_documents_become_text_and_page_pictures() {
     if !pdftools() {
-        eprintln!("skipped: poppler-utils not installed");
+        eprintln!("skipped: poppler's pdftotext and pdftoppm are not both on PATH");
         return;
     }
     use base64::Engine as _;
@@ -1341,8 +1342,8 @@ fn a_downloaded_model_is_removed_from_the_disk_keeping_what_others_use() {
     assert_eq!(c, 200, "{p}");
     assert!(p["blocked"].is_null(), "{p}");
     let paths: Vec<&str> = p["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
-    assert!(paths.iter().any(|x| x.ends_with("models/B-dl")) && paths.iter().any(|x| x.ends_with("packs/mock-b"))
-            && paths.iter().any(|x| x.ends_with("models/linked")) && !paths.iter().any(|x| x.contains("shared-dl")), "{p}");
+    let has = |end: &str| paths.iter().any(|x| std::path::Path::new(x).ends_with(end));
+    assert!(has("models/B-dl") && has("packs/mock-b") && has("models/linked") && !paths.iter().any(|x| x.contains("shared-dl")), "{p}");
     assert!(p["kept"].to_string().contains("also used by mock-a"), "{p}");
     let (c, r) = del("mock-b", None);
     assert_eq!(c, 200, "{r}");
@@ -1441,7 +1442,7 @@ fn a_long_conversation_goes_to_the_ssd_when_the_model_stops_and_comes_back_after
     let cmds = s.commands();
     let save = cmds.iter().position(|c| c.starts_with("SAVE ")).expect("SAVE before the stop");
     let file = cmds[save]["SAVE ".len()..].to_string();
-    assert!(std::path::Path::new(&file).is_file() && file.contains("/cache/kv/mock-a/"), "{file}");
+    assert!(std::path::Path::new(&file).is_file() && std::path::Path::new(&file).parent().unwrap().ends_with("cache/kv/mock-a"), "{file}");
     assert!(std::path::Path::new(&file.replace(".sess", ".ids")).is_file());
     // the next turn of the same conversation: the model loads again, the snapshot is read back, then GEN
     let mut msgs = first["messages"].as_array().unwrap().clone();
@@ -1478,7 +1479,7 @@ fn a_snapshot_the_engine_refuses_is_dropped_and_the_request_goes_on() {
 
 /// The headless Chrome these tests drive (skipped where there is none).
 fn chrome() -> Option<String> {
-    let p = std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell");
+    let p = std::path::PathBuf::from(std::env::var_os("HOME")?).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell");
     p.is_file().then(|| p.display().to_string())
 }
 
