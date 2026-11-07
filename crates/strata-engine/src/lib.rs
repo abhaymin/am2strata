@@ -483,7 +483,7 @@ mod expand_tests {
 
     #[test]
     fn shareable_paths_expand() {
-        let home = std::env::var("HOME").unwrap();
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap();
         assert_eq!(expand_str("~/x/y"), format!("{home}/x/y"));
         assert_eq!(expand_str("/abs/path"), "/abs/path");
         assert_eq!(expand_str("${HOME}/a"), format!("{home}/a"));

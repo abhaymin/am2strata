@@ -11,7 +11,7 @@ use std::process::Command;
 fn oracle() -> PathBuf {
     std::env::var_os("ORACLE").map(PathBuf::from).unwrap_or_else(|| {
         let data = std::env::var_os("STRATA_DATA").map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join("Development/Strata-data"));
+            .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap()).join("Development/Strata-data"));
         data.join("oracle/oracle2")
     })
 }

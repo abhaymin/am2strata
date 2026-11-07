@@ -6,7 +6,7 @@ use std::path::Path;
 use strata_gguf::{extract_tokenizer, Gguf};
 
 fn data() -> String {
-    format!("{}/Development/Strata-data", std::env::var("HOME").unwrap())
+    format!("{}/Development/Strata-data", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap())
 }
 
 fn check(gguf: &str, pack: &str) {

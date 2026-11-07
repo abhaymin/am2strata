@@ -6,7 +6,7 @@ use strata_pack::{iq_pack, mtp_pack, mtp_rt};
 
 fn data() -> PathBuf {
     std::env::var("STRATA_DATA").map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(format!("{}/Development/Strata-data", std::env::var("HOME").unwrap())))
+        .unwrap_or_else(|_| PathBuf::from(format!("{}/Development/Strata-data", std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap())))
 }
 
 fn scratch(tag: &str) -> PathBuf {
