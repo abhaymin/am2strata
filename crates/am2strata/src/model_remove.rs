@@ -168,7 +168,12 @@ pub async fn remove(State(s): State<AppState>, headers: HeaderMap, UrlPath(id): 
             Ok(m) => m,
             Err(_) => continue,
         };
-        let r = if meta.is_dir() && !meta.file_type().is_symlink() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        let r = if meta.is_dir() && !meta.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            // Windows removes a link to a folder with remove_dir (the link only, not what it points at)
+            std::fs::remove_file(&path).or_else(|e| if cfg!(windows) && meta.file_type().is_symlink() { std::fs::remove_dir(&path) } else { Err(e) })
+        };
         match r {
             Ok(()) => {
                 freed += f["bytes"].as_u64().unwrap_or(0);
