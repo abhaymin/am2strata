@@ -172,7 +172,8 @@ impl Media {
             };
             match v["event"].as_str().unwrap_or("") {
                 "error" => anyhow::bail!("{}", v["message"].as_str().unwrap_or("the media engine failed")),
-                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "removal" | "removed" => return Ok(v),
+                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "removal" | "removed"
+                | "accepted" => return Ok(v),
                 _ => on_event(&v),
             }
         }
@@ -184,6 +185,114 @@ fn bad(msg: impl Into<String>) -> Response {
 }
 
 pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    images(s, headers, req, Vec::new()).await
+}
+
+/// The most images one edit takes: the one edited and its references (Qwen Image 2.1 takes up to 3 in all).
+const MAX_EDIT_IMAGES: usize = 3;
+
+/// The size an edit draws at when none is asked: the first image's shape at about a megapixel, in multiples of 16.
+fn edit_size(png_or_jpeg: &[u8]) -> Option<(u32, u32)> {
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(png_or_jpeg)).with_guessed_format().ok()?.into_dimensions().ok()?;
+    let k = (1024.0 * 1024.0 / (w as f64 * h as f64)).sqrt();
+    let side = |x: u32| (((x as f64 * k) / 16.0).round() as u32 * 16).clamp(256, 2048);
+    Some((side(w), side(h)))
+}
+
+/// POST /v1/images/edits: OpenAI's images edit API. Multipart as OpenAI's clients send it (`image` or `image[]`, one
+/// to three files, `prompt`, `size`, `n`, `model`), or JSON with `images` (or `image`) as base64 / data URLs. The first
+/// image is edited, the others are references; drawn by an image model that takes edits (Qwen Image 2.1).
+pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::extract::Request) -> Response {
+    use axum::extract::FromRequest;
+    use base64::Engine as _;
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let ct =req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let (mut fields, mut files) = (json!({}), Vec::<Vec<u8>>::new());
+    if ct.starts_with("multipart/form-data") {
+        let mut mp = match axum::extract::Multipart::from_request(req, &s).await {
+            Ok(m) => m,
+            Err(e) => return bad(format!("multipart: {e}")),
+        };
+        loop {
+            let field = match mp.next_field().await {
+                Ok(Some(f)) => f,
+                Ok(None) => break,
+                Err(e) => return bad(format!("multipart: {e}")),
+            };
+            let name = field.name().unwrap_or("").trim_end_matches("[]").to_string();
+            match name.as_str() {
+                "image" => match field.bytes().await {
+                    Ok(b) => files.push(b.to_vec()),
+                    Err(e) => return bad(format!("the image: {e}")),
+                },
+                "mask" => return bad("mask is not supported: describe the change in the prompt (the whole image is edited)"),
+                _ => {
+                    let v = field.text().await.unwrap_or_default();
+                    fields[name] = v.parse::<u64>().map(Value::from).unwrap_or(Value::String(v));
+                }
+            }
+        }
+    } else {
+        let Json(v): Json<Value> = match Json::from_request(req, &s).await {
+            Ok(j) => j,
+            Err(e) => return bad(format!("send multipart/form-data, or JSON: {e}")),
+        };
+        if v.get("mask").is_some_and(|m| !m.is_null()) {
+            return bad("mask is not supported: describe the change in the prompt (the whole image is edited)");
+        }
+        let list: Vec<Value> = match (&v["images"], &v["image"]) {
+            (Value::Array(a), _) => a.clone(),
+            (_, Value::Array(a)) => a.clone(),
+            (_, Value::String(one)) => vec![Value::String(one.clone())],
+            _ => Vec::new(),
+        };
+        for (i, item) in list.iter().enumerate() {
+            // a string, or {"image_url": ...} / {"b64_json": ...} as OpenAI's newer clients send
+            let raw = item.as_str().or_else(|| item["image_url"].as_str()).or_else(|| item["b64_json"].as_str()).unwrap_or("");
+            let b64 = raw.split_once(";base64,").map(|(_, b)| b).unwrap_or(raw);
+            match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                Ok(b) if !b.is_empty() => files.push(b),
+                _ => return bad(format!("images[{i}]: base64 or a data: URL")),
+            }
+        }
+        fields = v;
+    }
+    if files.is_empty() {
+        return bad("send the image to edit: multipart `image`, or JSON {\"images\": [\"data:image/png;base64,...\"]}");
+    }
+    if files.len() > MAX_EDIT_IMAGES {
+        return bad(format!("at most {MAX_EDIT_IMAGES} images: the one edited and up to {} references", MAX_EDIT_IMAGES - 1));
+    }
+    if fields["size"].as_str().is_none_or(|z| z == "auto") {
+        match edit_size(&files[0]) {
+            Some((w, h)) => fields["size"] = json!(format!("{w}x{h}")),
+            None => return bad("the image is not a PNG, JPEG or WebP"),
+        }
+    }
+    let b64 = files.iter().map(|f| base64::engine::general_purpose::STANDARD.encode(f)).collect();
+    images(s, headers, fields, b64).await
+}
+
+/// POST /api/media/licenses/accept {"id": "qwen-research"}: the user agreed to a model licence in the app (the
+/// download it gates then goes ahead). This server's own page only.
+pub async fn accept_license(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("a licence can be accepted");
+    }
+    let Some(id) = req["id"].as_str() else { return bad("send {\"id\": \"<licence id>\"} from GET /api/media/models") };
+    match s.media.call(json!({"op": "accept_license", "id": id}), |_| {}).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => bad(format!("{e:#}")),
+    }
+}
+
+/// Generations and edits: `edit_images` (base64) empty for a text-to-image request.
+async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<String>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
@@ -208,9 +317,24 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
     if req["response_format"].as_str().is_some_and(|f| f != "b64_json") {
         return bad("response_format: only b64_json for now");
     }
-    let steps = req["steps"].as_u64().unwrap_or(8).clamp(1, 100);
+    // steps, guidance and the negative prompt a request leaves out are the model's own (the engine fills them in)
+    let steps = req["steps"].as_u64().map(|n| n.clamp(1, 100));
+    let guidance = req["guidance"].as_f64().filter(|g| (0.0..=20.0).contains(g));
+    let negative = req["negative_prompt"].as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.model());
+    if !edit_images.is_empty() {
+        // a model that cannot take edit images would draw from the prompt alone: say so instead
+        let takes = match s.media.call(json!({"op": "list"}), |_| {}).await {
+            Ok(r) => r["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model.as_str())).map(|m| m["edits"] == true),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
+        };
+        match takes {
+            None => return bad(format!("{model} is not in the media catalog")),
+            Some(false) => return bad(format!("{model} cannot edit images; choose one that can, such as chatr-omni-qwen-image-2.1:q8 or qwen-image-2.1:q8 (\"model\")")),
+            Some(true) => {}
+        }
+    }
     let t0 = Instant::now();
     let label = s.media_jobs.label(&req["strata_label"]);
     let _gpu = match s.mgr.gpu_exclusive_as(!s.media.keep_text_model, "media", &label).await {
@@ -218,19 +342,33 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),
     };
     let mon = s.mgr.monitor.clone();
-    let job = mon.media_begin("image", &model);
+    let job = mon.media_begin(if edit_images.is_empty() { "image" } else { "image edit" }, &model);
     let mut data = Vec::new();
     let mut failure = None;
+    let mut ran = steps.unwrap_or(0);
     for i in 0..n {
-        let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": 0.0,
-                       "seed": seed + i, "batch_size": 1});
+        let mut r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "seed": seed + i, "batch_size": 1});
+        if let Some(st) = steps {
+            r["steps"] = json!(st);
+        }
+        if let Some(g) = guidance {
+            r["guidance"] = json!(g);
+        }
+        if let Some(neg) = negative {
+            r["negative_prompt"] = json!(neg);
+        }
+        if !edit_images.is_empty() {
+            r["edit_images"] = json!(edit_images);
+        }
         let mut png = None;
         let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
             if ev["event"] == "image" && png.is_none() {
                 png = ev["png"].as_str().map(str::to_owned);
             }
             if ev["event"] == "step" {
-                mon.media_step(job, ev["step"].as_u64().unwrap_or(0) + i * steps, ev["total"].as_u64().unwrap_or(steps) * n);
+                let total = ev["total"].as_u64().unwrap_or(1);
+                ran = total;
+                mon.media_step(job, ev["step"].as_u64().unwrap_or(0) + i * total, total * n);
             }
         }).await;
         match (res, png) {
@@ -255,7 +393,8 @@ pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req
     }
     mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
     Json(json!({"created": crate::now(), "data": data, "size": format!("{w}x{h}"),
-                "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
+                "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": ran, "model": model,
+                           "edit_images": edit_images.len(),
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
 }
 

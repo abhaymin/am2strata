@@ -238,9 +238,16 @@
         <label class="st-field">Model
           <select class="st-input media-model" id="img-model" data-kind="image" aria-label="Image model"></select></label>
         <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
+        <div class="img-row" id="img-edit-row" hidden>
+          <label class="st-field">Image to edit (optional; up to 3, the first is edited)
+            <input class="st-input" id="img-edit" type="file" accept="image/png,image/jpeg,image/webp" multiple></label>
+          <button type="button" class="st-btn st-btn--secondary" id="img-edit-clear" hidden>Clear</button>
+        </div>
+        <div class="img-edit-thumbs" id="img-edit-thumbs"></div>
         <div class="img-row">
           <label class="st-field">Size
             <select class="st-input" id="img-size">
+              <option value="auto" id="img-size-auto" hidden>same shape as the image</option>
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
               <option>768x768</option><option>512x512</option></select></label>
           <label class="st-field">Seed

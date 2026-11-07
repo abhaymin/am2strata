@@ -224,7 +224,8 @@ function renderMediaModels() {
   $("mm-list").innerHTML = rows.length ? rows.map((m) => {
     const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model) ||
       (m.kind === "audio" && (m.task === "tts" ? m.name === media.tts_model : m.name === media.stt_model));
-    const facts = [m.family, m.size_gb ? `${m.size_gb} GB` : null, m.gated ? "licence to accept on Hugging Face" : null, m.description]
+    const facts = [m.family, m.size_gb ? `${m.size_gb} GB` : null, m.gated ? "licence to accept on Hugging Face" : null,
+      m.license ? `${m.license.name}${m.license.accepted ? " (accepted)" : ""}` : null, m.edits ? "edits images" : null, m.description]
       .filter(Boolean).join(" · ");
     const badge = m.planned ? `<span class="st-badge">Planned (${esc(m.planned)})</span>`
       : inUse ? `<span class="st-badge st-badge--generating">In use</span>`
@@ -261,6 +262,12 @@ $("mm-list").addEventListener("click", async (e) => {
   try {
     if (pull) {
       const m = media.models.find((x) => x.name === pull.dataset.mpull);
+      if (m.license && !m.license.accepted) {
+        // the licence the weights carry, accepted by you here before the download (mold records it)
+        if (!confirm(`${m.name} is under the ${m.license.name}:\n\n${m.license.summary}\n\nFull text: ${m.license.url}\n\nDo you accept it?`)) return;
+        const r = await fetch("api/media/licenses/accept", {method: "POST", headers: headers(true), body: JSON.stringify({id: m.license.id})});
+        if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
+      }
       if (!confirm(`Download ${m.name} (${m.size_gb} GB)?${m.gated ? "\n\nIts licence must be accepted on Hugging Face first, with your token saved." : ""}`)) return;
       await post("api/media/models/pull", m.name);
       toast("info", "Downloading", `${m.name}: resumable, in the background.`);
@@ -295,7 +302,39 @@ function fillModelPickers() {
     sel.innerHTML = opts.join("");
   }
   fillVideoSizes();
+  fillEditRow();
 }
+// Image > edit: shown for a model that takes edit images; the files picked (or a result sent back to it)
+let editImages = [];
+function fillEditRow() {
+  const m = (media.models || []).find((x) => x.name === $("img-model").value);
+  const can = !!(m && m.edits);
+  $("img-edit-row").hidden = !can;
+  if (!can) editImages = [];
+  const n = editImages.length;
+  $("img-edit-thumbs").innerHTML = editImages.map((u, i) => `<img src="${u}" alt="${i ? "reference" : "image to edit"} ${i + 1}" title="${i ? "reference" : "edited"}">`).join("");
+  $("img-edit-clear").hidden = !n;
+  $("img-size-auto").hidden = !n;
+  if (n && !$("img-size").dataset.touched) $("img-size").value = "auto";
+  if (!n && $("img-size").value === "auto") $("img-size").value = "1024x1024";
+  $("img-go").textContent = n ? "Edit" : "Generate";
+  $("img-prompt").placeholder = n ? "Describe the change\u2026" : "Describe the image\u2026";
+}
+const asDataUrl = (f) => new Promise((ok, no) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = no; r.readAsDataURL(f); });
+$("img-edit").onchange = async () => {
+  const files = [...$("img-edit").files].slice(0, 3);
+  editImages = await Promise.all(files.map(asDataUrl));
+  $("img-edit").value = "";
+  fillEditRow();
+};
+$("img-edit-clear").onclick = () => { editImages = []; fillEditRow(); };
+$("img-size").onchange = () => { $("img-size").dataset.touched = "1"; };
+$("img-results").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-edit-this]"); if (!b) return;
+  editImages = [b.closest("figure").querySelector("img").src];
+  fillEditRow();
+  $("img-prompt").focus();
+});
 for (const sel of document.querySelectorAll(".media-model")) {
   sel.onchange = async () => {
     if (sel.value === "__more") { fillModelPickers(); showTab("settings"); return; }
@@ -2586,13 +2625,15 @@ $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
+  const editing = editImages.length > 0 && !$("img-edit-row").hidden;
   const body = {prompt, size: $("img-size").value, response_format: "b64_json", model: $("img-model").value};
+  if (editing) body.images = editImages;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   $("img-go").disabled = true;
   const t0 = performance.now();
-  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
+  $("img-hint").textContent = (editing ? "Editing" : "Generating") + "\u2026 (a minute or more on a small GPU)";
   try {
-    const r = await fetch("v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const r = await fetch(editing ? "v1/images/edits" : "v1/images/generations", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
     const j = await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {
@@ -2601,8 +2642,13 @@ $("img-form").onsubmit = async (ev) => {
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      cap.textContent = `${editing ? "edit, " : ""}${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
+      if (!$("img-edit-row").hidden) {
+        const again = document.createElement("button");
+        again.type = "button"; again.className = "st-btn st-btn--secondary"; again.dataset.editThis = "1"; again.textContent = "Edit this";
+        cap.append(" ", again);
+      }
       $("img-results").prepend(fig);
     }
     $("img-hint").textContent = "Done. Right-click an image to save it.";

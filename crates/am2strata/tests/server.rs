@@ -823,6 +823,46 @@ fn image_requests_are_checked_and_failures_reported() {
 }
 
 #[test]
+fn images_are_edited_by_a_model_that_takes_edit_images() {
+    use base64::Engine as _;
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    // a 64x32 PNG: with no size the edit keeps its shape at about a megapixel
+    let mut png = Vec::new();
+    image::RgbImage::new(64, 32).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&png));
+    let model = "chatr-omni-qwen-image-2.1:q8";
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "make it night", "model": model, "images": [url, url], "seed": 1}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!((r["size"].as_str(), r["strata"]["edit_images"].as_u64()), (Some("1456x720"), Some(2)), "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let gen: Vec<Value> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|v| v["op"] == "generate").collect();
+    let req = &gen[0]["request"];
+    assert_eq!(req["edit_images"].as_array().map(Vec::len), Some(2), "both images go to the engine: {req}");
+    assert!(req.get("steps").is_none() && req.get("guidance").is_none(), "the model's own defaults, filled in by the engine: {req}");
+    // OpenAI's multipart form
+    let form = reqwest::blocking::multipart::Form::new().text("prompt", "add a moon").text("model", model).text("size", "512x512")
+        .part("image[]", reqwest::blocking::multipart::Part::bytes(png.clone()).file_name("a.png").mime_str("image/png").unwrap());
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/images/edits", s.base)).bearer_auth(KEY).multipart(form).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.json::<Value>().unwrap()["size"], "512x512");
+    // refused plainly: a model without edits, a mask, no image, too many
+    for (body, what) in [(json!({"prompt": "p", "images": [url]}), "cannot edit images"),
+                         (json!({"prompt": "p", "model": model, "images": [url], "mask": url}), "mask is not supported"),
+                         (json!({"prompt": "p", "model": model}), "send the image"),
+                         (json!({"prompt": "p", "model": model, "images": [url, url, url, url]}), "at most 3")] {
+        let (c, r) = s.post("/v1/images/edits", &body);
+        assert_eq!(c, 400, "{body}: {r}");
+        assert!(r["error"]["message"].as_str().unwrap().contains(what), "{r}");
+    }
+    // the licence is accepted through the server, never from another page
+    let (c, r) = s.post("/api/media/licenses/accept", &json!({"id": "qwen-research"}));
+    assert_eq!((c, r["id"].as_str()), (200, Some("qwen-research")), "{r}");
+    let r = reqwest::blocking::Client::new().post(format!("{}/api/media/licenses/accept", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").json(&json!({"id": "qwen-research"})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}
+
+#[test]
 fn media_models_are_listed_pulled_and_chosen() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
     let (c, r) = s.get("/api/media/models", true);

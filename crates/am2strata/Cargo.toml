@@ -36,6 +36,8 @@ ego-tree = "0.6.3"
 # browser computer use: Chrome's DevTools protocol, pure Rust
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 libc = "0.2"
+# an edit's default size: the dimensions of the uploaded image
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }

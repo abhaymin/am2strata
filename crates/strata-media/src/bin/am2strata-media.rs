@@ -9,6 +9,8 @@
 //!                                                         <- {"event":"done","ms":...}
 //!   -> {"op":"unload"}                                    <- {"event":"unloaded"}
 //!   -> {"op":"list"}                                      <- {"event":"models","models":[{name,kind,family,...}]}
+//!   -> {"op":"accept_license","id":"qwen-research"}       <- {"event":"accepted","id":...}  (the user agreed, in the app)
+//!   a generate request's edit_images (base64 PNG/JPEG): the first is edited, the rest are references
 //!   -> {"op":"transcribe","model":"whisper-large-v3-turbo","audio":"<base64 file>","language"?,"translate"?,"device"?}
 //!                                                         <- {"event":"segment","start":..,"end":..,"text":..} ...
 //!                                                         <- {"event":"transcript","text":..,"language":..,"segments":[..],"duration":..}
@@ -114,9 +116,83 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
               "data": base64::engine::general_purpose::STANDARD.encode(audio::wav(&pcm, rate))}))
 }
 
+/// Models am2Strata adds to mold's catalog: another transformer on a family mold runs, with that family's shared
+/// files (text encoder, VAE, tokenizer) from the mold manifest named, and the licence those weights carry.
+struct Extra {
+    name: &'static str,
+    base: &'static str,
+    repo: &'static str,
+    file: &'static str,
+    size: u64,
+    sha256: &'static str,
+    description: &'static str,
+    steps: u32,
+    guidance: f64,
+    negative: &'static str,
+    license: &'static mold_core::license_acceptance::ThirdPartyLicense,
+}
+
+/// ChatR Labs' Omni LoRA merged into Qwen-Image 2.1 at strength 1.0 (text-to-image and editing). Their model card's
+/// settings: 35 steps, true CFG 5.0 with a single-space negative prompt (an empty one turns CFG off).
+const EXTRAS: &[Extra] = &[
+    Extra { name: "chatr-omni-qwen-image-2.1:q8", base: "qwen-image-2.1:q8", repo: "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+            file: "qwen-image-2.1-step90000-Q8_0.gguf", size: 7_687_183_136,
+            sha256: "58ab4d7baaa58ad7bdda18e6aafc22eebce1f494932d08c34667b88ab4fee5ca",
+            description: "ChatR Labs Uncensored Omni on Qwen Image 2.1, Q8_0: text to image and editing (Qwen Research License, non-commercial)",
+            steps: 35, guidance: 5.0, negative: " ", license: &mold_core::license_acceptance::QWEN_RESEARCH },
+    Extra { name: "chatr-omni-qwen-image-2.1:bf16", base: "qwen-image-2.1:q8", repo: "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized",
+            file: "qwen-image-2.1-step90000-BF16.gguf", size: 14_230_297_376,
+            sha256: "027501fd6abb571a2415e9728c128e96acdf3271222ea4fbf69f9efad4f136d3",
+            description: "ChatR Labs Uncensored Omni on Qwen Image 2.1, BF16: text to image and editing (Qwen Research License, non-commercial)",
+            steps: 35, guidance: 5.0, negative: " ", license: &mold_core::license_acceptance::QWEN_RESEARCH },
+];
+
+fn extra(model: &str) -> Option<&'static Extra> {
+    EXTRAS.iter().find(|e| e.name == model)
+}
+
+/// The extra's manifest: its base's, with the transformer swapped.
+fn extra_manifest(e: &Extra) -> Option<mold_core::manifest::ModelManifest> {
+    use mold_core::manifest::{ModelComponent, ModelFile};
+    let mut m = mold_core::manifest::find_manifest(e.base)?.clone();
+    m.files.retain(|f| !matches!(f.component, ModelComponent::Transformer | ModelComponent::TransformerShard));
+    m.files.insert(0, ModelFile { hf_repo: e.repo.to_string(), hf_filename: e.file.to_string(), component: ModelComponent::Transformer,
+                                  size_bytes: e.size, gated: false, sha256: Some(e.sha256) });
+    m.name = e.name.to_string();
+    m.description = e.description.to_string();
+    m.defaults.steps = e.steps;
+    m.defaults.guidance = e.guidance;
+    m.defaults.negative_prompt = Some(e.negative.to_string());
+    Some(m)
+}
+
+fn mold_home() -> Option<std::path::PathBuf> {
+    mold_core::Config::mold_dir()
+}
+
 fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
     if let Some(e) = audio::entry(model) {
         return audio::pull(e);
+    }
+    if let Some(e) = extra(model) {
+        // mold gates its own Qwen Image 2.1 tiers on this licence by name; an extra on the same weights asks the same
+        if !mold_home().is_some_and(|h| mold_core::license_acceptance::is_accepted(&h, e.license)) {
+            return Err(anyhow!("{model} needs the {} accepted first ({}): {}", e.license.name, e.license.canonical, e.license.summary));
+        }
+        let m = extra_manifest(e).ok_or_else(|| anyhow!("mold's catalog has no {}", e.base))?;
+        let paths = rt.block_on(mold_core::download::pull_model(&m, &mold_core::download::PullOptions::default()))
+            .map_err(|e| anyhow!("{e}"))?;
+        // the paths go into mold's config, where ModelPaths::resolve and the engine factory (by family) find them
+        let mut mc = m.to_model_config(&paths);
+        mc.family = Some(m.family.clone());
+        mc.default_steps = Some(e.steps);
+        mc.default_guidance = Some(e.guidance);
+        mc.negative_prompt = Some(e.negative.to_string());
+        mc.description = Some(e.description.to_string());
+        let mut config = mold_core::Config::load_or_default();
+        config.upsert_model(m.name.clone(), mc);
+        config.save().context("saving mold's config")?;
+        return Ok(());
     }
     let manifest = mold_core::manifest::find_manifest(model).ok_or_else(|| anyhow!("no model {model:?} in the catalog"))?;
     rt.block_on(mold_core::download::pull_model(manifest, &mold_core::download::PullOptions::default()))
@@ -127,8 +203,11 @@ fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
 /// The catalog: every generation model mold knows, with its kind (image or video) and whether it is downloaded.
 fn list(st: &mut State) -> Value {
     st.config = mold_core::Config::load_or_default();
-    let models: Vec<Value> = mold_core::manifest::visible_manifests()
-        .filter(|m| m.is_generation_model())
+    let extras: Vec<mold_core::manifest::ModelManifest> = EXTRAS.iter().filter_map(extra_manifest).collect();
+    let home = mold_home();
+    let mut all: Vec<&mold_core::manifest::ModelManifest> = mold_core::manifest::visible_manifests().filter(|m| m.is_generation_model()).collect();
+    all.extend(extras.iter());
+    let models: Vec<Value> = all.into_iter()
         .map(|m| {
             let f = m.family.to_lowercase();
             let kind = if f.starts_with("hunyuan3d") {
@@ -138,12 +217,23 @@ fn list(st: &mut State) -> Value {
             } else {
                 "image"
             };
-            json!({"name": m.name, "display_name": m.display_name(), "family": m.family, "kind": kind,
+            // the licence mold gates the download on (accepted here, not on Hugging Face)
+            let license = extra(&m.name).map(|e| e.license)
+                .or_else(|| mold_core::license_acceptance::licenses_for_manifest(m).into_iter().next());
+            let mut v = json!({"name": m.name, "display_name": m.display_name(), "family": m.family, "kind": kind,
                    "description": m.description, "size_gb": (m.total_size_bytes() as f64 / 1e8).round() / 10.0, "gated": m.is_gated(),
                    "downloaded": mold_core::ModelPaths::resolve(&m.name, &st.config).is_some(),
                    "loaded": st.model.as_deref() == Some(m.name.as_str()),
+                   // takes edit images: the first is edited, the rest are references
+                   "edits": m.family == "qwen-image21" || m.family.contains("edit") || m.name.contains("edit"),
                    "defaults": {"steps": m.defaults.steps, "guidance": m.defaults.guidance, "width": m.defaults.width,
-                                "height": m.defaults.height, "frames": m.defaults.frames, "fps": m.defaults.fps}})
+                                "height": m.defaults.height, "frames": m.defaults.frames, "fps": m.defaults.fps,
+                                "negative_prompt": m.defaults.negative_prompt}});
+            if let Some(l) = license {
+                v["license"] = json!({"id": l.id, "name": l.name, "url": l.canonical, "summary": l.summary,
+                                      "accepted": home.as_deref().is_some_and(|h| mold_core::license_acceptance::is_accepted(h, l))});
+            }
+            v
         })
         .collect();
     let mut models = models;
@@ -175,6 +265,22 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
         req["model"] = json!(st.model.clone().ok_or_else(|| anyhow!("no model loaded"))?);
     }
     let model = req["model"].as_str().unwrap_or_default().to_string();
+    // what the request leaves out comes from the model: its config entry (an extra), else its manifest
+    let mc = st.config.lookup_model_config(&model);
+    let man = mold_core::manifest::find_manifest(&model).cloned().or_else(|| extra(&model).and_then(extra_manifest));
+    if req.get("steps").is_none_or(Value::is_null) {
+        req["steps"] = json!(mc.as_ref().and_then(|c| c.default_steps).or(man.as_ref().map(|m| m.defaults.steps)).unwrap_or(20));
+    }
+    if req.get("guidance").is_none_or(Value::is_null) {
+        if let Some(g) = mc.as_ref().and_then(|c| c.default_guidance).or(man.as_ref().map(|m| m.defaults.guidance)) {
+            req["guidance"] = json!(g);
+        }
+    }
+    if req.get("negative_prompt").is_none_or(Value::is_null) {
+        if let Some(n) = mc.as_ref().and_then(|c| c.negative_prompt.clone()).or(man.and_then(|m| m.defaults.negative_prompt)) {
+            req["negative_prompt"] = json!(n);
+        }
+    }
     load(st, &model)?;
     let request: mold_core::GenerateRequest = serde_json::from_value(req).context("the request")?;
     let engine = st.engine.as_mut().unwrap();
@@ -238,6 +344,13 @@ fn main() {
                     emit(json!({"event": "unloaded"}));
                 }
                 "list" => emit(list(&mut st)),
+                "accept_license" => {
+                    let id = cmd["id"].as_str().unwrap_or_default();
+                    let l = mold_core::license_acceptance::license_by_id(id).ok_or_else(|| anyhow!("no licence {id:?}"))?;
+                    let home = mold_home().ok_or_else(|| anyhow!("no MOLD_HOME"))?;
+                    mold_core::license_acceptance::record_acceptance(&home, l).context("recording the acceptance")?;
+                    emit(json!({"event": "accepted", "id": l.id}));
+                }
                 "unload_audio" => {
                     st.whisper = None;
                     st.parler = None;
