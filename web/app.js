@@ -564,6 +564,15 @@ function setPill(state, text) {
   $("pill-text").textContent = text;
 }
 
+// what a running media job is doing, by its kind (the server's media_begin kinds)
+function mediaLabel(kind) {
+  return {"video": "Making a video", "image": "Making an image", "image edit": "Editing an image",
+          "text-to-speech": "Speaking", "speech-to-text": "Transcribing", "translation": "Translating speech"}[kind]
+    || "Media job";
+}
+// speech counts its parts (sentences); images and video their steps
+const mediaUnit = (kind) => /speech|translation/.test(kind || "") ? "part" : "step";
+
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
@@ -574,7 +583,7 @@ function render(m) {
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
   } else if (live.state === "media") {
-    setPill("generating", `Making ${live.kind === "video" ? "a video" : "an image"}${live.steps ? ` · step ${live.step}/${live.steps}` : ""}`);
+    setPill("generating", `${mediaLabel(live.kind)}${live.steps ? ` · ${mediaUnit(live.kind)} ${live.step}/${live.steps}` : ""}`);
   } else {
     setPill("idle", "Idle");
   }
@@ -652,10 +661,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${live.model ? `${live.model} · ` : ""}${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
   } else if (live.state === "media") {
-    label = `Making ${live.kind === "video" ? "a video" : "an image"}`;
+    label = mediaLabel(live.kind);
     delete prog.dataset.tone;
     pct = live.steps ? (100 * live.step) / live.steps : 0;
-    detail = `${live.model}${live.steps ? ` · step ${live.step} of ${live.steps}` : ""} · ${fmt(live.elapsed_s, 0)} s`;
+    detail = `${live.model}${live.steps ? ` · ${mediaUnit(live.kind)} ${live.step} of ${live.steps}` : ""} · ${fmt(live.elapsed_s, 0)} s`;
   } else if (last && last.kind) {
     delete prog.dataset.tone;
     detail = `last: ${last.kind}, ${last.output || ""} in ${fmt(last.duration_s, 0)} s`;
