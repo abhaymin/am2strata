@@ -10,6 +10,8 @@ license = "MIT AND Apache-2.0"
 default = []
 cuda = ["mold-ai-inference/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 cudnn = ["mold-ai-inference/cudnn"]
+# ONNX models (Chatterbox) through ONNX Runtime, loaded at run time: nothing is downloaded or linked at build time
+onnx = ["dep:ort"]
 
 [dependencies]
 # mold (MIT; LTX-2 parts Apache-2.0): candle-based diffusion models, pinned to one commit
@@ -27,6 +29,8 @@ candle-nn = { package = "candle-nn-mold", git = "https://github.com/utensils/can
 candle-transformers = { package = "candle-transformers-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 hf-hub = { version = "0.5", default-features = false, features = ["ureq", "rustls-tls"] }
+# ONNX Runtime 1.23 (API 23), opened with dlopen when an ONNX model loads
+ort = { version = "=2.0.0-rc.11", default-features = false, features = ["load-dynamic", "std"], optional = true }
 symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
 
 [[bin]]

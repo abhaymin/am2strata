@@ -15,6 +15,8 @@
 //!                                                         <- {"event":"segment","start":..,"end":..,"text":..} ...
 //!                                                         <- {"event":"transcript","text":..,"language":..,"segments":[..],"duration":..}
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
+//!      a chatterbox-* model (the onnx feature) also takes "voice_audio" (base64 clip of the voice), "language",
+//!      "exaggeration", "temperature", "threads"; a named voice is a clip Parler made once (audio/voices/<name>.wav)
 //!                                                         <- {"event":"part","done":1,"total":3} ...
 //!                                                         <- {"event":"speech","format":"wav","sample_rate":..,"seconds":..,"data":"<base64>"}
 //!   -> {"op":"unload_audio"}                              <- {"event":"unloaded"}  (Whisper and Parler only)
@@ -24,7 +26,7 @@
 //!
 //! Models and their files come from mold's catalog, stored under $MOLD_HOME (am2Strata sets <Strata-data>/media).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use mold_inference::engine::{InferenceEngine, LoadStrategy};
 use mold_inference::progress::ProgressEvent;
@@ -34,6 +36,9 @@ use std::sync::{Arc, Mutex};
 
 #[path = "../audio.rs"]
 mod audio;
+#[cfg(feature = "onnx")]
+#[path = "../chatterbox.rs"]
+mod chatterbox;
 
 fn emit(v: Value) {
     let mut out = std::io::stdout().lock();
@@ -47,6 +52,20 @@ struct State {
     model: Option<String>,
     whisper: Option<audio::Whisper>,
     parler: Option<audio::Parler>,
+    #[cfg(feature = "onnx")]
+    chatterbox: Option<chatterbox::Chatterbox>,
+}
+
+impl State {
+    /// Frees the speech models (Whisper, Parler, Chatterbox).
+    fn drop_audio(&mut self) {
+        self.whisper = None;
+        self.parler = None;
+        #[cfg(feature = "onnx")]
+        {
+            self.chatterbox = None;
+        }
+    }
 }
 
 /// What removing `model` deletes (its own files) and keeps (files another model also uses).
@@ -99,6 +118,9 @@ fn transcribe(st: &mut State, cmd: &Value) -> Result<Value> {
 fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
     let name = cmd["model"].as_str().unwrap_or("parler-tts-mini-v1");
     let e = audio::entry(name).filter(|e| e.task == "tts").ok_or_else(|| anyhow!("{name} is not a text-to-speech model"))?;
+    if e.family == "chatterbox" {
+        return speak_chatterbox(st, e, cmd);
+    }
     if st.parler.as_ref().is_none_or(|p| p.name != name) {
         st.parler = None;
         st.parler = Some(audio::Parler::load(e, cmd)?);
@@ -114,6 +136,67 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
     Ok(json!({"event": "speech", "format": "wav", "sample_rate": rate, "seconds": (pcm.len() as f64 / rate as f64 * 100.0).round() / 100.0,
               "ms": t0.elapsed().as_millis() as u64, "model": name,
               "data": base64::engine::general_purpose::STANDARD.encode(audio::wav(&pcm, rate))}))
+}
+
+/// The clip a named voice is cloned from: made once with Parler from the voice's description (seed 3), kept in
+/// audio/voices/<name>.wav, so "laura" sounds the same in every model that clones a voice.
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn voice_clip(st: &mut State, voice: &str, rate: u32) -> Result<Vec<f32>> {
+    let voice = voice.to_lowercase();
+    let (_, description) = audio::VOICES.iter().find(|v| v.0 == voice)
+        .ok_or_else(|| anyhow!("no voice {voice:?}: give one of {} or a clip of the voice (voice_audio)",
+                               audio::VOICES.iter().map(|v| v.0).collect::<Vec<_>>().join(", ")))?;
+    let path = audio::voices_dir().join(format!("{voice}.wav"));
+    if !path.exists() {
+        let parler = audio::entry("parler-tts-mini-v1").unwrap();
+        if !audio::downloaded(parler) {
+            bail!("the voice {voice:?} is made with Parler-TTS mini v1 the first time: download it, or give a clip of the voice (voice_audio)");
+        }
+        if st.parler.as_ref().is_none_or(|p| p.name != parler.name) {
+            st.parler = None;
+            st.parler = Some(audio::Parler::load(parler, &json!({"device": "cpu"}))?);
+        }
+        let line = "Hello, and welcome. This is a short sample of my natural speaking voice, recorded calmly and clearly for you today.";
+        let (pcm, r) = st.parler.as_mut().unwrap().speak(line, description, 3, 0.7, &mut |_, _| {})?;
+        std::fs::create_dir_all(audio::voices_dir())?;
+        std::fs::write(&path, audio::wav(&pcm, r))?;
+    }
+    let (pcm, r, _) = audio::decode(std::fs::read(&path)?)?;
+    Ok(audio::resample(&pcm, r, rate))
+}
+
+#[cfg(feature = "onnx")]
+fn speak_chatterbox(st: &mut State, e: &'static audio::Entry, cmd: &Value) -> Result<Value> {
+    let text = cmd["text"].as_str().filter(|t| !t.trim().is_empty()).ok_or_else(|| anyhow!("no text to speak"))?.to_string();
+    let clip = match cmd["voice_audio"].as_str().filter(|b| !b.is_empty()) {
+        Some(b64) => {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64).context("voice_audio: base64")?;
+            let (pcm, r, _) = audio::decode(bytes)?;
+            audio::resample(&pcm, r, chatterbox::RATE)
+        }
+        None => voice_clip(st, cmd["voice"].as_str().unwrap_or("laura"), chatterbox::RATE)?,
+    };
+    if st.chatterbox.as_ref().is_none_or(|c| c.name != e.name) {
+        st.chatterbox = None;
+        st.chatterbox = Some(chatterbox::Chatterbox::load(e, cmd["threads"].as_u64().unwrap_or(0) as usize)?);
+    }
+    let mut s = chatterbox::Sampling { seed: cmd["seed"].as_u64().unwrap_or(0), ..Default::default() };
+    if let Some(t) = cmd["temperature"].as_f64() {
+        s.temperature = t as f32;
+    }
+    let t0 = std::time::Instant::now();
+    let pcm = st.chatterbox.as_mut().unwrap().speak(&text, &clip, cmd["language"].as_str().filter(|l| !l.is_empty()),
+        cmd["exaggeration"].as_f64().unwrap_or(0.5) as f32, &s,
+        &mut |done, total| emit(json!({"event": "part", "done": done, "total": total})))?;
+    let rate = chatterbox::RATE;
+    Ok(json!({"event": "speech", "format": "wav", "sample_rate": rate, "seconds": (pcm.len() as f64 / rate as f64 * 100.0).round() / 100.0,
+              "ms": t0.elapsed().as_millis() as u64, "model": e.name,
+              "data": base64::engine::general_purpose::STANDARD.encode(audio::wav(&pcm, rate))}))
+}
+
+#[cfg(not(feature = "onnx"))]
+fn speak_chatterbox(_: &mut State, e: &'static audio::Entry, _: &Value) -> Result<Value> {
+    bail!("{} runs on ONNX Runtime: this media engine was built without it (build with --features onnx)", e.name)
 }
 
 /// Models am2Strata adds to mold's catalog: another transformer on a family mold runs, with that family's shared
@@ -311,7 +394,9 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
 
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
-    let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, whisper: None, parler: None };
+    let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, whisper: None, parler: None,
+                         #[cfg(feature = "onnx")]
+                         chatterbox: None };
     // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
     emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION"),
                 "video_formats": ["mp4", "apng", "gif"]}));
@@ -339,8 +424,7 @@ fn main() {
                         e.unload();
                     }
                     st.model = None;
-                    st.whisper = None;
-                    st.parler = None;
+                    st.drop_audio();
                     emit(json!({"event": "unloaded"}));
                 }
                 "list" => emit(list(&mut st)),
@@ -352,8 +436,7 @@ fn main() {
                     emit(json!({"event": "accepted", "id": l.id}));
                 }
                 "unload_audio" => {
-                    st.whisper = None;
-                    st.parler = None;
+                    st.drop_audio();
                     emit(json!({"event": "unloaded"}));
                 }
                 "transcribe" => {
@@ -374,8 +457,7 @@ fn main() {
                         st.model = None;
                     }
                     if let Some(e) = audio::entry(&model) {
-                        st.whisper = None;
-                        st.parler = None;
+                        st.drop_audio();
                         let dir = audio::folder(e);
                         let freed = audio::disk_bytes(&dir);
                         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;

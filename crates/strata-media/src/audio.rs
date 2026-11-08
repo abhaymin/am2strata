@@ -25,20 +25,36 @@ pub struct Entry {
     pub about: &'static str,
     pub licence: &'static str,
     pub size_gb: f64,
+    /// "whisper", "parler-tts" or "chatterbox"
+    pub family: &'static str,
+    /// the repo's files this engine reads (the first is what `downloaded` checks first)
+    pub files: &'static [&'static str],
 }
 
-const FILES: [&str; 3] = ["config.json", "tokenizer.json", "model.safetensors"];
+const HF3: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
+/// a Chatterbox ONNX export: the four graphs, each with its weights beside it
+const CHATTERBOX_ONNX: &[&str] = &["tokenizer.json",
+    "onnx/speech_encoder.onnx", "onnx/speech_encoder.onnx_data", "onnx/embed_tokens.onnx", "onnx/embed_tokens.onnx_data",
+    "onnx/language_model.onnx", "onnx/language_model.onnx_data", "onnx/conditional_decoder.onnx", "onnx/conditional_decoder.onnx_data"];
 
 pub const CATALOG: &[Entry] = &[
     Entry { name: "whisper-large-v3-turbo", display: "Whisper large-v3 turbo", repo: "openai/whisper-large-v3-turbo", task: "stt",
-            about: "speech to text in 99 languages, and translation to English; the best of these", licence: "MIT", size_gb: 1.62 },
+            about: "speech to text in 99 languages, and translation to English; the best of these", licence: "MIT", size_gb: 1.62, family: "whisper", files: HF3 },
     Entry { name: "whisper-small", display: "Whisper small", repo: "openai/whisper-small", task: "stt",
-            about: "speech to text, multilingual: faster on the CPU, a little less accurate", licence: "Apache-2.0", size_gb: 0.97 },
+            about: "speech to text, multilingual: faster on the CPU, a little less accurate", licence: "Apache-2.0", size_gb: 0.97,
+            family: "whisper", files: HF3 },
     Entry { name: "whisper-base", display: "Whisper base", repo: "openai/whisper-base", task: "stt",
-            about: "speech to text, multilingual: the fastest, for dictation", licence: "Apache-2.0", size_gb: 0.29 },
+            about: "speech to text, multilingual: the fastest, for dictation", licence: "Apache-2.0", size_gb: 0.29,
+            family: "whisper", files: HF3 },
     Entry { name: "parler-tts-mini-v1", display: "Parler-TTS mini v1", repo: "parler-tts/parler-tts-mini-v1", task: "tts",
             about: "text to speech in English; the voice is described in words (who speaks, how fast, how close)",
-            licence: "Apache-2.0", size_gb: 3.51 },
+            licence: "Apache-2.0", size_gb: 3.51, family: "parler-tts", files: HF3 },
+    Entry { name: "chatterbox-turbo", display: "Chatterbox Turbo (ONNX)", repo: "ResembleAI/chatterbox-turbo-ONNX", task: "tts",
+            about: "text to speech in English in the voice of a short reference clip; tags like [laugh] and [sigh] (ONNX Runtime)",
+            licence: "MIT", size_gb: 3.29, family: "chatterbox", files: CHATTERBOX_ONNX },
+    Entry { name: "chatterbox-multilingual", display: "Chatterbox Multilingual (ONNX)", repo: "onnx-community/chatterbox-multilingual-ONNX",
+            task: "tts", about: "text to speech in 20 languages (Hindi, Spanish, French and more) in the voice of a short reference clip (ONNX Runtime)",
+            licence: "MIT", size_gb: 3.27, family: "chatterbox", files: CHATTERBOX_ONNX },
 ];
 
 /// The voices offered by name (OpenAI's `voice`), as Parler-TTS descriptions; any other text is used as the description.
@@ -47,6 +63,14 @@ pub const VOICES: &[(&str, &str)] = &[
     ("jon", "Jon's voice is warm and steady, speaking at a moderate pace with a slightly low pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("lea", "Lea speaks in a bright, expressive and animated way, slightly fast, with a higher pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("gary", "Gary speaks slowly and deliberately with a deep voice, in a quiet room. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
+];
+
+/// Chatterbox Multilingual's languages whose text preparation this engine has: its 23 less Chinese (Cangjie codes with
+/// a word segmenter), Japanese (kana from kanji) and Hebrew (vowel points), which need models of their own first.
+pub const CHATTERBOX_LANGUAGES: &[(&str, &str)] = &[
+    ("ar", "Arabic"), ("da", "Danish"), ("de", "German"), ("el", "Greek"), ("en", "English"), ("es", "Spanish"), ("fi", "Finnish"),
+    ("fr", "French"), ("hi", "Hindi"), ("it", "Italian"), ("ko", "Korean"), ("ms", "Malay"), ("nl", "Dutch"), ("no", "Norwegian"),
+    ("pl", "Polish"), ("pt", "Portuguese"), ("ru", "Russian"), ("sv", "Swedish"), ("sw", "Swahili"), ("tr", "Turkish"),
 ];
 
 pub fn entry(name: &str) -> Option<&'static Entry> {
@@ -60,7 +84,12 @@ fn cache_dir() -> PathBuf {
 
 fn local(e: &Entry) -> Option<Vec<PathBuf>> {
     let repo = hf_hub::Cache::new(cache_dir()).model(e.repo.to_string());
-    FILES.iter().map(|f| repo.get(f)).collect()
+    e.files.iter().map(|f| repo.get(f)).collect()
+}
+
+/// Where the clips of the named voices are kept (a model that clones a voice reads them).
+pub fn voices_dir() -> PathBuf {
+    cache_dir().join("voices")
 }
 
 /// The model's whole Hugging Face cache folder (blobs, snapshots, refs): what removing it deletes.
@@ -80,15 +109,20 @@ pub fn disk_bytes(p: &std::path::Path) -> u64 {
     }
 }
 
+/// The model's files in the cache, in `e.files` order (None: not all downloaded).
+pub fn local_files(e: &Entry) -> Option<Vec<PathBuf>> {
+    local(e)
+}
+
 pub fn downloaded(e: &Entry) -> bool {
     local(e).is_some()
 }
 
-/// Downloads a model's three files (resumable by hf-hub; no progress bar: stdout is the protocol).
+/// Downloads a model's files (resumable by hf-hub; no progress bar: stdout is the protocol).
 pub fn pull(e: &Entry) -> Result<()> {
     let api = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(cache_dir()).with_progress(false).build()?;
     let repo = api.model(e.repo.to_string());
-    for f in FILES {
+    for f in e.files {
         repo.get(f).with_context(|| format!("{}: {f}", e.repo))?;
     }
     Ok(())
@@ -96,9 +130,11 @@ pub fn pull(e: &Entry) -> Result<()> {
 
 pub fn list() -> Vec<Value> {
     CATALOG.iter().map(|e| json!({
-        "name": e.name, "display_name": e.display, "kind": "audio", "task": e.task, "family": if e.task == "stt" { "whisper" } else { "parler-tts" },
+        "name": e.name, "display_name": e.display, "kind": "audio", "task": e.task, "family": e.family,
         "description": e.about, "licence": e.licence, "size_gb": e.size_gb, "gated": false, "downloaded": downloaded(e),
         "voices": if e.task == "tts" { json!(VOICES.iter().map(|v| v.0).collect::<Vec<_>>()) } else { Value::Null },
+        "languages": if e.name == "chatterbox-multilingual" { json!(CHATTERBOX_LANGUAGES.iter().map(|l| json!({"code": l.0, "name": l.1})).collect::<Vec<_>>()) } else { Value::Null },
+        "runtime": if e.family == "chatterbox" { json!("onnx") } else { json!("candle") },
     })).collect()
 }
 
@@ -750,7 +786,7 @@ pub fn spoken(text: &str) -> String {
 }
 
 /// RMS to about -18 dBFS, a soft limit at full scale.
-fn loudness(x: &[f32]) -> Vec<f32> {
+pub fn loudness(x: &[f32]) -> Vec<f32> {
     let rms = (x.iter().map(|v| v * v).sum::<f32>() / x.len().max(1) as f32).sqrt();
     if rms < 1e-4 {
         return x.to_vec();
