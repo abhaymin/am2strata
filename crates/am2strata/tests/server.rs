@@ -1636,3 +1636,40 @@ fn the_connect_page_lists_the_coding_agents_for_this_server_or_another() {
     assert!(pi["guide"].as_str().unwrap().contains("baseUrl: http://192.168.1.20:8000/v1"), "{pi}");
     assert_eq!(s.get("/api/agents", false).0, 401);
 }
+
+#[test]
+fn the_gemini_api_answers_as_gemini_with_its_own_key_header() {
+    let s = Server::start(&[Model::default()], &[ids("Adding.\n</think>\n\nThe answer is 4."), ids("Hm.\n</think>\n\nStreamed.")], json!({}));
+    let client = reqwest::blocking::Client::new();
+    let body = json!({"contents": [{"role": "user", "parts": [{"text": "2+2?"}]}], "generationConfig": {"maxOutputTokens": 20}});
+    // the CLI's own model name runs on the loaded model; the key comes as x-goog-api-key
+    let r = client.post(format!("{}/v1beta/models/gemini-2.5-pro:generateContent", s.base)).header("x-goog-api-key", KEY)
+        .json(&body).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let v: Value = r.json().unwrap();
+    let text = v["candidates"][0]["content"]["parts"].as_array().unwrap().iter().filter(|p| p["thought"] != true)
+        .filter_map(|p| p["text"].as_str()).collect::<String>();
+    assert!(text.contains("The answer is 4."), "{v}");
+    assert_eq!(v["candidates"][0]["content"]["parts"][0], json!({"text": "Adding.\n", "thought": true}), "the thinking, as a thought");
+    assert_eq!(v["candidates"][0]["finishReason"], "STOP");
+    assert!(v["usageMetadata"]["promptTokenCount"].as_u64().unwrap() > 0, "{v}");
+    // streamed, as server-sent events of the same shape; ?key= works too
+    let r = client.post(format!("{}/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key={KEY}", s.base))
+        .json(&body).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let sse = r.text().unwrap();
+    let chunks: Vec<Value> = sse.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect();
+    let streamed: String = chunks.iter().flat_map(|c| c["candidates"][0]["content"]["parts"].as_array().cloned().unwrap_or_default())
+        .filter(|p| p["thought"] != true).filter_map(|p| p["text"].as_str().map(str::to_string)).collect();
+    assert!(streamed.contains("Streamed."), "{sse}");
+    assert!(chunks.iter().any(|c| c["usageMetadata"].is_object()) && chunks.iter().any(|c| c["candidates"][0]["finishReason"] == "STOP"), "{sse}");
+    // countTokens and the model list
+    let r: Value = client.post(format!("{}/v1beta/models/x:countTokens", s.base)).header("x-goog-api-key", KEY).json(&body).send().unwrap().json().unwrap();
+    assert!(r["totalTokens"].as_u64().unwrap() > 0, "{r}");
+    let r: Value = client.get(format!("{}/v1beta/models", s.base)).header("x-goog-api-key", KEY).send().unwrap().json().unwrap();
+    assert_eq!(r["models"][0]["name"], format!("models/{}", Model::default().id));
+    // no key: Gemini's error shape
+    let r = client.post(format!("{}/v1beta/models/x:generateContent", s.base)).json(&body).send().unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert_eq!(r.json::<Value>().unwrap()["error"]["status"], "PERMISSION_DENIED");
+}

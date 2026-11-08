@@ -6,6 +6,7 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod agents;
+mod gemini;
 mod anthropic;
 mod browser;
 mod api_monitor;
@@ -378,6 +379,8 @@ async fn main() -> Result<()> {
         .route("/metrics", get(web::metrics))
         .route("/api/monitor/clear", post(web::monitor_clear))
         .route("/api/agents", get(web::agents))
+        .route("/v1beta/models", get(gemini::models))
+        .route("/v1beta/models/{target}", get(gemini::model).post(gemini::call))
         .route("/api/monitor/media/{name}", get(web::monitor_media))
         .route("/metrics/prometheus", get(web::prometheus))
         .route("/v1/status", get(web::status))

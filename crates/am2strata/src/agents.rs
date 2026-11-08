@@ -9,8 +9,9 @@
 //! - **guide**: what to enter, for agents whose config is a settings page or a format not written here.
 //!
 //! Each agent's format is from its own documentation; `checked` says how far it was tried here (opencode 1.19.5 ran
-//! with the config this writes). agy (Antigravity) and cursor-agent take no custom endpoint, so they are listed as
-//! not supported rather than reached by intercepting their traffic.
+//! with the config this writes). The Gemini CLI speaks the Gemini API, which gemini.rs serves. agy (Antigravity) and
+//! cursor-agent take no custom endpoint, so they are listed as not supported rather than reached by intercepting
+//! their traffic.
 
 // shared by the server (the Connect page's list and guides) and am2strata-run (start, setup, reset): each uses part
 #![allow(dead_code)]
@@ -65,6 +66,8 @@ pub const AGENTS: &[Agent] = &[
             checked: "Aider's OpenAI-compatible API docs (OPENAI_API_BASE, --model openai/<id>)" },
     Agent { name: "goose", label: "Goose", exe: "goose", api: "openai", support: Support::Start,
             checked: "Goose's OpenAI provider variables (OPENAI_HOST, OPENAI_BASE_PATH)" },
+    Agent { name: "gemini", label: "Gemini CLI", exe: "gemini", api: "gemini", support: Support::Start,
+            checked: "am2Strata's /v1beta Gemini API (tested with Google's request shapes); the CLI's GOOGLE_GEMINI_BASE_URL, as OmniRoute runs it" },
     Agent { name: "omp", label: "Oh My Pi", exe: "omp", api: "openai", support: Support::Guide,
             checked: "Oh My Pi's README (~/.omp/agent/models.yml)" },
     Agent { name: "crush", label: "Crush", exe: "crush", api: "openai", support: Support::Guide,
@@ -196,6 +199,19 @@ pub fn start(name: &str, t: &Target, tmp: &Path) -> Result<Plan, String> {
             p.env("OPENAI_API_BASE", t.v1());
             p.env("OPENAI_API_KEY", key);
             p.args = vec!["--model".into(), format!("openai/{}", t.model)];
+        }
+        "gemini" => {
+            // the CLI signs in with a Gemini API key from a home of its own for this run (its usual home keeps a Google
+            // sign-in, which would win); the workspace trust prompt stays the CLI's (--skip-trust skips it)
+            let home = tmp.join("gemini-home");
+            p.files.push((home.join(".gemini/settings.json"),
+                          json!({"security": {"auth": {"selectedType": "gemini-api-key"}}}).to_string()));
+            p.env("GEMINI_CLI_HOME", home.display().to_string());
+            p.env("GOOGLE_GEMINI_BASE_URL", t.root());
+            p.env("GEMINI_API_KEY", key);
+            p.env("GEMINI_DEFAULT_AUTH_TYPE", "gemini-api-key");
+            p.args = vec!["-m".into(), t.model.clone()];
+            p.notes.push("this run keeps the CLI's settings and history in a temporary home".into());
         }
         "goose" => {
             p.env("GOOSE_PROVIDER", "openai");
@@ -454,7 +470,7 @@ pub fn guide(name: &str, t: &Target) -> Result<String, String> {
             cmd("start"), a.name, cmd("setup"),
             if t.key.is_some() { format!("Both read the key from {KEY_VAR} in your shell.") } else { String::new() }),
         "droid" => format!("{}\nThen pick \"am2Strata: {}\" with /model in droid.", cmd("setup"), t.model),
-        "qwen" | "aider" | "goose" => {
+        "qwen" | "aider" | "goose" | "gemini" => {
             let p = start(a.name, t, Path::new("/tmp")).unwrap();
             let vars: Vec<String> = p.env.iter().filter(|(k, _)| k != KEY_VAR)
                 .map(|(k, v)| if k.contains("KEY") || k.contains("TOKEN") { format!("export {k}={key}") } else { format!("export {k}={v}") }).collect();

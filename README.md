@@ -22,7 +22,7 @@ C++/CUDA engines still do the inference. am2Strata uses PolyStrata's run configs
 server can run on the same machine (one at a time).
 
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
-support) behind OpenAI-, Anthropic- and Responses-compatible APIs, with a web app for chat, monitoring and settings.
+support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and settings.
 
 ## Install
 
@@ -58,7 +58,8 @@ am2strata agent setup codex --model <id>         # the agent's default from now 
 am2strata agent start opencode --url http://<other-pc>:8000 --api-key ...   # another am2Strata
 ```
 
-Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider and Goose are set up for you; Oh My Pi, Crush,
+Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider, Goose and the Gemini CLI (through am2Strata's
+Gemini API) are set up for you; Oh My Pi, Crush,
 Hermes, OpenClaw, Continue, Cline, Kilo Code, Zed and VS Code get the exact block to enter. See
 [docs/AGENTS.md](docs/AGENTS.md), or Settings › Connect › Coding agents.
 
