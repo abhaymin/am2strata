@@ -99,7 +99,11 @@ fn runtime() -> Result<()> {
 }
 
 fn session(path: &std::path::Path, threads: usize) -> Result<Session> {
-    let mut b = Session::builder()?;
+    // basic optimizations only and no memory pattern: the full set folds constants into new copies of the weights while
+    // loading, which about doubles the peak (6 GB and more for Turbo's 3.3 GB of fp32 weights)
+    let mut b = Session::builder()?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level1)?
+        .with_memory_pattern(false)?;
     if threads > 0 {
         b = b.with_intra_threads(threads)?;
     }

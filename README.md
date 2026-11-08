@@ -85,6 +85,30 @@ deploy/install.sh --host 0.0.0.0 --new-key        # configs in place, a new API 
 target/release/am2strata-run serve --port 8000 --model tiel
 ```
 
+### Images, video and speech (the media engine)
+
+```bash
+cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda,onnx
+```
+
+- **Speech to text:** Whisper (large-v3 turbo, small, base) on the CPU or the GPU.
+- **Text to speech:**
+  - **Parler-TTS mini v1:** a voice described in words, on the GPU.
+  - **Chatterbox Turbo** (English) and **Chatterbox Multilingual** (Resemble AI, MIT): the voice of a 5 to 10 second
+    clip. They run on the CPU, beside the text model, through ONNX Runtime (the `onnx` feature).
+    - Multilingual speaks 20 languages here, Hindi, Spanish and French among them. Chinese, Japanese and Hebrew
+      come later.
+    - Turbo reads tags such as `[laugh]` and `[sigh]`.
+    - The engine loads ONNX Runtime 1.23 when it starts: `sudo apt install libonnxruntime1.23` (Debian/Ubuntu), or
+      set `ORT_DYLIB_PATH`. Nothing is downloaded at build time.
+    - Measured on a Ryzen 7 7840HS (8 threads): faster than real time (9.2 s of speech in 10.7 s), 5 GB of RAM at
+      peak.
+- `POST /v1/audio/speech` takes OpenAI's fields. For Chatterbox it also takes:
+  - `voice_audio`: a clip, in base64 or as a data URL;
+  - `language`, `exaggeration`, `seed`, `temperature`.
+- `voice` names one of the built-in voices (laura, jon, lea, gary). Their clips are made once with Parler.
+- Clone only a voice whose speaker has agreed to it.
+
 ## Packing tools
 
 PolyStrata's model-preparation tools are ported too (crate `strata-pack`), writing the same files byte for byte:

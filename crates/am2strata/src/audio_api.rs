@@ -73,7 +73,19 @@ fn placement(s: &AppState, size_gb: f64, tts: bool) -> (&'static str, bool) {
 /// after a GPU job. `on_event` sees the engine's progress events.
 async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cmd: Value, mut on_event: impl FnMut(&Value))
              -> Result<(Value, &'static str, crate::monitor::MediaRow), Response> {
-    let (device, gpu) = placement(s, size_gb, kind == "text-to-speech");
+    // an ONNX model (Chatterbox) runs on the CPU, beside the text model: no GPU turn, but it must fit in the RAM left
+    let onnx = cmd["runtime"] == "onnx";
+    let (device, gpu) = if onnx { ("cpu", false) } else { placement(s, size_gb, kind == "text-to-speech") };
+    if onnx {
+        // measured (2026-11-09): Chatterbox Turbo's 3.3 GB of fp32 weights peak at 5.0 GB while loading
+        let need = size_gb * 1.5 + 0.5;
+        let free = mem_available_gb();
+        if free < need {
+            return Err(error(StatusCode::SERVICE_UNAVAILABLE, "busy",
+                format!("{model} needs about {need:.1} GB of free RAM on the CPU and {free:.1} GB is free: unload the text model or use a smaller speech model")));
+        }
+    }
+    cmd.as_object_mut().map(|o| o.remove("runtime"));
     cmd["device"] = json!(device);
     let _turn = if gpu {
         Some(s.mgr.gpu_exclusive(!s.media.keep_text_model).await
@@ -282,9 +294,29 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         "fable" | "ballad" => "lea",
         v => v,
     };
-    let mut cmd = json!({"op": "speak", "model": model, "text": text, "voice": voice, "seed": req["seed"].as_u64().unwrap_or(0)});
+    let mut cmd = json!({"op": "speak", "model": model, "text": text, "voice": voice, "seed": req["seed"].as_u64().unwrap_or(0),
+                         "runtime": m["runtime"]});
     if let Some(t) = req["temperature"].as_f64() {
         cmd["temperature"] = json!(t.clamp(0.0, 2.0)); // Parler samples at 0.7 unless told (0: greedy)
+    }
+    if m["family"] == "chatterbox" {
+        // the voice of a clip (base64, or a data URL) that the caller has the speaker's consent to use
+        if let Some(clip) = req["voice_audio"].as_str().filter(|c| !c.is_empty()) {
+            let b64 = clip.split_once(";base64,").map(|(_, b)| b).unwrap_or(clip);
+            if b64.len() > 8 * 1024 * 1024 {
+                return bad("voice_audio: at most 6 MB (5 to 10 seconds of one person speaking is enough)");
+            }
+            cmd["voice_audio"] = json!(b64);
+        }
+        if let Some(l) = req["language"].as_str().filter(|l| !l.is_empty()) {
+            cmd["language"] = json!(l.to_lowercase());
+        }
+        if let Some(x) = req["exaggeration"].as_f64() {
+            cmd["exaggeration"] = json!(x.clamp(0.0, 2.0));
+        }
+        cmd["threads"] = json!(std::thread::available_parallelism().map(|n| (n.get() / 2).max(1)).unwrap_or(4));
+    } else if req["voice_audio"].is_string() {
+        return bad(format!("voice_audio: {model} does not clone a voice; Chatterbox does"));
     }
     let (r, device, row) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
         Ok(x) => x,

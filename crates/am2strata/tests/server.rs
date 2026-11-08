@@ -1040,6 +1040,30 @@ fn speech_is_transcribed_and_spoken_in_openais_shapes() {
 }
 
 #[test]
+fn chatterbox_speaks_on_the_cpu_in_the_voice_of_a_clip_and_parler_refuses_a_clip() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));
+    let c = reqwest::blocking::Client::new();
+    let body = json!({"input": "Hola.", "model": "chatterbox-turbo", "voice_audio": "data:audio/wav;base64,UklGRg==",
+                      "language": "ES", "exaggeration": 3.0});
+    let w = c.post(format!("{}/v1/audio/speech", s.base)).bearer_auth(KEY).json(&body).send().unwrap();
+    assert_eq!(w.status().as_u16(), 200);
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let speak = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "speak").unwrap();
+    // the clip without its data-URL prefix, the language in lower case, the exaggeration in range, on the CPU, and
+    // no "runtime" field sent on to the engine
+    assert_eq!(speak["voice_audio"], "UklGRg==", "{speak}");
+    assert_eq!((speak["language"].as_str(), speak["exaggeration"].as_f64()), (Some("es"), Some(2.0)), "{speak}");
+    assert_eq!(speak["device"], "cpu", "{speak}");
+    assert!(speak.get("runtime").is_none(), "{speak}");
+    let (code, r) = s.post("/v1/audio/speech", &json!({"input": "x", "model": "parler-tts-mini-v1", "voice_audio": "UklGRg=="}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("Chatterbox"), "{r}");
+    // too little RAM free for it on the CPU: refused before the engine is asked, with the numbers
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 2}));
+    let (code, r) = s.post("/v1/audio/speech", &json!({"input": "x", "model": "chatterbox-turbo"}));
+    assert!(code == 503 && r["error"]["message"].as_str().unwrap().contains("free RAM"), "{r}");
+}
+
+#[test]
 fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
     for (mem, unloads) in [(1, true), (64, false)] {
         let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": mem}));

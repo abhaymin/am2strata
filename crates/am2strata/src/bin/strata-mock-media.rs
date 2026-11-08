@@ -70,6 +70,8 @@ fn main() {
                 {"name": "whisper-base", "kind": "audio", "task": "stt", "family": "whisper", "size_gb": 0.29, "downloaded": true, "gated": false},
                 {"name": "parler-tts-mini-v1", "kind": "audio", "task": "tts", "family": "parler-tts", "size_gb": 3.51, "downloaded": true, "gated": false},
                 {"name": "whisper-large-v3-turbo", "kind": "audio", "task": "stt", "family": "whisper", "size_gb": 1.62, "downloaded": false, "gated": false},
+                {"name": "chatterbox-turbo", "kind": "audio", "task": "tts", "family": "chatterbox", "runtime": "onnx", "size_gb": 3.29,
+                 "downloaded": true, "gated": false},
                 {"name": "wan22-ti2v-5b:q8", "kind": "video", "family": "wan", "size_gb": 16.9, "downloaded": true, "gated": false,
                  "defaults": {"steps": 30, "guidance": 5.0, "width": 1280, "height": 704, "frames": 121, "fps": 24}}]})),
             "remove_plan" if cmd["model"] == "z-image-turbo:q8" => emit(serde_json::json!({"event": "removal", "model": cmd["model"],

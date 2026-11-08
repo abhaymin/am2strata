@@ -12,3 +12,8 @@ The media engine (crates/strata-media, built only on request) links, through mol
 - the Fraunhofer FDK AAC codec (fdk-aac crate; "Software License for The Fraunhofer FDK AAC Codec Library for
   Android", a permissive licence with patent and naming conditions - not OSI-approved) for audio tracks in MP4 files.
 - Whisper's mel filter banks from candle's whisper example (MIT or Apache-2.0), crates/strata-media/assets.
+
+With the `onnx` feature, it also uses:
+- ort (MIT or Apache-2.0, pyke.io), and ONNX Runtime (MIT, Microsoft), which is loaded at run time and not bundled;
+- Chatterbox's text preparation and sampling, ported from resemble-ai/chatterbox (MIT, Copyright (c) 2025 Resemble
+  AI), whose ONNX exports it runs. The weights are downloaded from Hugging Face on request and are not bundled.
