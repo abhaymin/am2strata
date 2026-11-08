@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     // `am2strata agent ...`: the coding agents' command lives in am2strata-run, beside this binary
-    if std::env::args().nth(1).as_deref() == Some("agent") {
+    if matches!(std::env::args().nth(1).as_deref(), Some("agent" | "agentrun")) {
         let exe = std::env::current_exe()?.with_file_name(if cfg!(windows) { "am2strata-run.exe" } else { "am2strata-run" });
         let status = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).status()
             .map_err(|e| anyhow::anyhow!("{}: {e}", exe.display()))?;

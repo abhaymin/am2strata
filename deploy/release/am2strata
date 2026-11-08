@@ -4,6 +4,7 @@
 #   ./am2strata pull <repo> [<quant>]    download a model from Hugging Face; no quant lists what the repository has
 #   ./am2strata doctor                   check this PC (the NVIDIA download)
 #   ./am2strata agent list|start|setup|reset|show <agent>   coding agents on this server or another (--url)
+#   ./am2strata agentrun <agent> [options] [agent args]     run one, as `unsloth start <agent>` does
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 DATA=${AM2STRATA_DATA:-$HOME/.local/share/am2strata}
@@ -51,6 +52,10 @@ case "${1:-serve}" in
         shift
         exec "$HERE/bin/am2strata-run" agent --models-dir "$DATA" "$@"
         ;;
+    agentrun)
+        shift
+        exec "$HERE/bin/am2strata-run" agentrun --models-dir "$DATA" "$@"
+        ;;
     serve)
         [ $# -ge 1 ] && shift
         doctor || echo "Starting anyway: a model will not load until that is fixed."
@@ -60,5 +65,5 @@ case "${1:-serve}" in
         fi
         exec "$HERE/bin/am2strata" --models-dir "$DATA" --data-dir "$DATA/data" "$@"
         ;;
-    *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | agent <action> [<agent>] | doctor]" >&2; exit 2 ;;
+    *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | agent <action> [<agent>] | agentrun <agent> | doctor]" >&2; exit 2 ;;
 esac

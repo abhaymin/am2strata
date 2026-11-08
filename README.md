@@ -53,9 +53,9 @@ the fast path, for NVIDIA cards.
 ### Coding agents
 
 ```bash
-am2strata agent start claude                     # or codex, opencode, pi, qwen, aider, goose: one run, nothing changed
+am2strata agentrun opencode                      # or claude, codex, pi, qwen, aider, goose, gemini: one run, nothing changed
 am2strata agent setup codex --model <id>         # the agent's default from now on (its config backed up)
-am2strata agent start opencode --url http://<other-pc>:8000 --api-key ...   # another am2Strata
+am2strata agentrun claude --url http://<other-pc>:8000 --api-key ...   # another am2Strata
 ```
 
 Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider, Goose and the Gemini CLI (through am2Strata's

@@ -1624,7 +1624,7 @@ fn the_connect_page_lists_the_coding_agents_for_this_server_or_another() {
     let get = |n: &str| agents.iter().find(|a| a["name"] == n).unwrap_or_else(|| panic!("{n} in {r}")).clone();
     let claude = get("claude");
     assert_eq!(claude["support"], "start, setup");
-    assert!(claude["guide"].as_str().unwrap().contains("am2strata agent start claude"), "{claude}");
+    assert!(claude["guide"].as_str().unwrap().contains("am2strata agentrun claude"), "{claude}");
     assert_eq!(get("agy")["support"], "not supported");
     assert!(get("cursor-agent")["why"].as_str().is_some());
     assert_eq!(r["model"], Model::default().id, "the loaded model");

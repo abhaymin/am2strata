@@ -5,13 +5,18 @@ what `unsloth start` and OmniRoute's `run` / `setup-<tool>` do, for this server.
 in the web app shows the same list, with what to enter for each agent.
 
 ```bash
+am2strata agentrun opencode                            # one run on this PC's server, as `unsloth start opencode`
+am2strata agentrun claude --model tiel --continue      # --model etc. are am2Strata's; --continue goes to claude
+am2strata agentrun codex --url http://192.168.1.20:8000 exec "fix the failing test"   # another am2Strata
 am2strata agent list                                   # every agent, what it supports, which are installed
-am2strata agent start claude                           # one run on this PC's server; nothing of yours changes
-am2strata agent start codex --model tiel -- exec "fix the failing test"   # after --: the agent's own arguments
 am2strata agent setup opencode                         # opencode's default from now on (its config backed up)
 am2strata agent reset opencode                         # the backup back
 am2strata agent show omp                               # what to enter, for agents set up in their own settings
 ```
+
+`agentrun <agent>` is `agent start <agent>`: am2Strata's own options (`--model`, `--small-model`, `--url`,
+`--api-key`, `--dry-run`) can come anywhere, and every other argument goes to the agent in its order (all of them
+after `--`).
 
 Another am2Strata: `--url http://192.168.1.20:8000 --api-key ...` (or `AM2STRATA_URL` and `AM2STRATA_API_KEY`).
 Without `--model`, the agent gets the model the server has loaded; `--small-model` sets the small one (Claude Code's

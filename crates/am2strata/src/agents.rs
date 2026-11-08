@@ -359,7 +359,7 @@ pub fn setup(name: &str, t: &Target, home: &Path) -> Result<Vec<Change>, String>
         })?]),
         _ => Err(match a.support {
             Support::No(why) => format!("{} is not supported: {why}", a.label),
-            Support::Start => format!("{} is set up through variables: `am2strata agent start {}` runs it, and `agent show {}` gives them for a shell profile",
+            Support::Start => format!("{} is set up through variables: `am2strata agentrun {}` runs it, and `agent show {}` gives them for a shell profile",
                                       a.label, a.name, a.name),
             _ => format!("{} is set up in its own settings: `am2strata agent show {}` says what to enter", a.label, a.name),
         }),
@@ -463,7 +463,8 @@ pub fn reset(name: &str, home: &Path) -> Result<Vec<PathBuf>, String> {
 pub fn guide(name: &str, t: &Target) -> Result<String, String> {
     let a = find(name).ok_or_else(|| format!("no agent called {name:?}"))?;
     let key = if t.key.is_some() { format!("${KEY_VAR}") } else { "(none: this server has no API key)".into() };
-    let cmd = |s: &str| format!("am2strata agent {s} {}{}", a.name, remote_flags(t));
+    let cmd = |s: &str| if s == "start" { format!("am2strata agentrun {}{}", a.name, remote_flags(t)) }
+                        else { format!("am2strata agent {s} {}{}", a.name, remote_flags(t)) };
     Ok(match a.name {
         "claude" | "codex" | "opencode" | "pi" => format!(
             "For one run (nothing of yours changes):\n  {}\nAs the default from now on (your config is backed up; `agent reset {}` restores it):\n  {}\n{}",

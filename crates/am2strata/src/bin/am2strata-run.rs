@@ -68,6 +68,14 @@ enum Cmd {
     Pull(PullArgs),
     /// coding agents on am2Strata, this PC's or another's: list | start <agent> | setup <agent> | reset <agent> | show <agent>
     Agent(AgentArgs),
+    /// run a coding agent on am2Strata once, as `unsloth start <agent>` does: `agentrun opencode`,
+    /// `agentrun claude --model tiel --continue`; --model, --small-model, --url, --api-key and --dry-run are
+    /// am2Strata's, every other argument goes to the agent
+    #[command(disable_help_flag = true)]
+    Agentrun {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
     /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next): PolyStrata's tools/iq_pack.py
     IqPack {
         /// the model's shard 1
@@ -564,6 +572,10 @@ fn main() -> ExitCode {
         Cmd::Uninstall => uninstall(),
         Cmd::Pull(p) => pull(p),
         Cmd::Agent(a) => agent(a),
+        Cmd::Agentrun { args } => match agentrun_args(args) {
+            Ok(a) => agent(a),
+            Err(e) => { eprintln!("{e}"); ExitCode::from(2) }
+        },
         Cmd::IqPack { gguf, out, base, skip_experts, compat_bf16, experts_bin } => done(strata_pack::iq_pack::run(&strata_pack::iq_pack::Options {
             gguf: expand_path(&gguf), out: expand_path(&out), base: base.map(|b| expand_path(&b)), skip_experts, compat_bf16, experts_bin })),
         Cmd::MtpFetch { cmd, out, only } => {
@@ -918,5 +930,55 @@ fn agent(a: AgentArgs) -> ExitCode {
             eprintln!("{other}: list, start, setup, reset or show");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `agentrun <agent> [options] [agent arguments]`: am2Strata's own options wherever they are, the rest (and all after
+/// `--`) for the agent, in their order.
+fn agentrun_args(args: Vec<String>) -> Result<AgentArgs, String> {
+    const USAGE: &str = "usage: am2strata agentrun <agent> [--model M] [--small-model M] [--url U] [--api-key K] [--dry-run] [agent arguments]\n\
+                         (am2strata agent list shows the agents)";
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let mut a = AgentArgs { action: "start".into(), agent: None, url: env("AM2STRATA_URL"), api_key: env("AM2STRATA_API_KEY"),
+                            model: None, small_model: None, models_dir: "~/Development/PolyStrata".into(), dry_run: false, rest: Vec::new() };
+    let mut it = args.into_iter();
+    while let Some(x) = it.next() {
+        let (flag, inline) = match x.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (x.clone(), None),
+        };
+        let mut value = |name: &str| inline.clone().or_else(|| it.next()).ok_or_else(|| format!("{name} needs a value\n{USAGE}"));
+        match flag.as_str() {
+            "--" => { a.rest.extend(it.by_ref()); }
+            "--model" | "-m" => a.model = Some(value("--model")?),
+            "--small-model" => a.small_model = Some(value("--small-model")?),
+            "--url" => a.url = Some(value("--url")?),
+            "--api-key" => a.api_key = Some(value("--api-key")?),
+            "--models-dir" => a.models_dir = value("--models-dir")?,
+            "--dry-run" => a.dry_run = true,
+            "-h" | "--help" if a.agent.is_none() => return Err(USAGE.into()),
+            _ if a.agent.is_none() && !x.starts_with('-') => a.agent = Some(x),
+            _ => a.rest.push(x),
+        }
+    }
+    if a.agent.is_none() {
+        return Err(USAGE.into());
+    }
+    Ok(a)
+}
+
+#[cfg(test)]
+mod agentrun_tests {
+    use super::*;
+
+    #[test]
+    fn its_own_options_anywhere_and_the_rest_for_the_agent() {
+        let v = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+        let a = agentrun_args(v("claude --model tiel --continue -p hi --url=http://h:8000")).unwrap();
+        assert_eq!((a.agent.as_deref(), a.model.as_deref(), a.url.as_deref()), (Some("claude"), Some("tiel"), Some("http://h:8000")));
+        assert_eq!(a.rest, v("--continue -p hi"));
+        let a = agentrun_args(v("-m x opencode -- run --model y")).unwrap();
+        assert_eq!((a.agent.as_deref(), a.model.as_deref(), a.rest.clone()), (Some("opencode"), Some("x"), v("run --model y")));
+        assert!(agentrun_args(v("--model")).is_err() && agentrun_args(Vec::new()).is_err());
     }
 }
