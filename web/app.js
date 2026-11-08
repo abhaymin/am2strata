@@ -512,6 +512,32 @@ function setMetric(key, value, unit, sub) {
 }
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
+let reqSig = "";          // what the request table shows now (renderMonitor rebuilds it only when this changes)
+const reqMediaUrls = new Map();   // a media file of the history -> its blob URL (fetched once, with the API key)
+// what a media job made, in its history row: a thumbnail (opens full size), or a player
+async function showReqMedia(el) {
+  const name = el.dataset.name, type = el.dataset.type || "";
+  try {
+    let url = reqMediaUrls.get(name);
+    if (!url) {
+      const r = await fetch(`api/monitor/media/${encodeURIComponent(name)}`, {headers: headers()});
+      if (!r.ok) throw new Error(`${r.status}`);
+      url = URL.createObjectURL(await r.blob());
+      reqMediaUrls.set(name, url);
+    }
+    if (type.startsWith("image/")) {
+      el.innerHTML = `<a href="${url}" target="_blank" rel="noopener" title="Open full size"><img src="${url}" alt="the image made"></a>`;
+    } else if (type.startsWith("video/")) {
+      el.innerHTML = `<video src="${url}" controls preload="metadata" muted loop playsinline></video>`;
+    } else if (type.startsWith("audio/")) {
+      el.innerHTML = `<audio src="${url}" controls preload="metadata"></audio>`;
+    } else {
+      el.innerHTML = `<a href="${url}" download="${esc(name)}">${esc(name)}</a>`;
+    }
+  } catch (e) {
+    el.textContent = "(file gone)";
+  }
+}
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
 async function poll() {
   try {
@@ -619,11 +645,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     } else {
       detail = `${fmt(live.prompt_tokens)} tokens`;
     }
+    if (live.model) detail = `${live.model} · ${detail}`;
   } else if (live.state === "generating") {
     label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    detail = `${live.model ? `${live.model} · ` : ""}${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
   } else if (live.state === "media") {
     label = `Making ${live.kind === "video" ? "a video" : "an image"}`;
     delete prog.dataset.tone;
@@ -701,11 +728,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("temp-text").textContent = hw.gpu_temp == null ? "–" : `${fmt(hw.gpu_temp)} °C`;
   $("temp-bar").style.width = hw.gpu_temp == null ? "0%" : `${Math.min(100, hw.gpu_temp)}%`;
 
-  // recent requests
+  // recent requests: rebuilt only when a row comes or goes, so a playing video or speech keeps playing
   const body = $("req-body");
-  if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+  const sig = `${reqShowAll}|${requests.length}|${requests.slice(0, 1).map((r) => `${r.id}${r.time}`)}`;
+  if (sig === reqSig) {
+    // unchanged
+  } else if (!requests.length) {
+    reqSig = sig;
+    body.innerHTML = `<tr><td colspan="10" class="muted">No requests yet</td></tr>`;
   } else {
+    reqSig = sig;
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
@@ -713,8 +745,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       if (r.kind) {
         // a media job: kind, model and what it made across the token columns
         const tm = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
+        const media = (r.media || []).map((f) => `<span class="req-media" data-name="${esc(f.name)}" data-type="${esc(f.type)}"></span>`).join("");
         return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
-          <td colspan="6" class="muted">${esc(r.model || "")} · ${esc(r.output || "")}${r.steps ? ` · ${r.steps} steps` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td>
+          <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} steps` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
       }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
@@ -724,14 +758,17 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
-      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+      return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
+        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
+    for (const el of body.querySelectorAll(".req-media")) showReqMedia(el);
   }
   const all = $("req-all");
   kept = kept == null ? requests.length : kept;
   all.hidden = kept <= 12;
+  $("req-clear").hidden = !kept;
   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
   $("req-wrap").classList.toggle("all", reqShowAll);
   $("req-totals").textContent = renderTotals(totals);
@@ -784,6 +821,20 @@ document.addEventListener("click", (e) => {
   if (b) copyText(b.dataset.copy, b);
 });
 $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+$("req-clear").addEventListener("click", async () => {
+  if (!confirm("Clear the Monitor's request history? The images, videos and speech it kept are deleted too.")) return;
+  try {
+    const r = await fetch("api/monitor/clear", {method: "POST", headers: headers()});
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
+    const n = (await r.json()).cleared;
+    for (const u of reqMediaUrls.values()) URL.revokeObjectURL(u);
+    reqMediaUrls.clear();
+    reqSig = "";
+    toast("success", "History cleared", `${n} request${n === 1 ? "" : "s"} removed.`);
+  } catch (e) {
+    toast("error", "Could not clear the history", e.message);
+  }
+});
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,

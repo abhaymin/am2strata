@@ -1575,3 +1575,42 @@ fn the_health_watch_reports_through_health_system_and_prometheus() {
     assert!(sys["alerts"].is_array() && sys["gpus"].is_array() && sys["accelerators"].is_array(), "{sys}");
     assert_eq!(s.get("/api/system", false).0, 401);
 }
+
+#[test]
+fn the_monitor_keeps_its_history_with_the_model_and_the_media_until_cleared() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("x")], "max_tokens": 5}));
+    assert_eq!(c, 200);
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "seed": 7, "steps": 4}));
+    assert_eq!(c, 200, "{r}");
+    let (_, m) = s.get("/metrics?requests=all", true);
+    let rows = m["requests"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{m}");
+    // newest first: the image job, then the chat; each names its model
+    let (img, chat) = (&rows[0], &rows[1]);
+    assert_eq!((img["kind"].as_str(), chat["model"].as_str()), (Some("image"), Some(Model::default().id)), "{rows:?}");
+    assert!(img["model"].as_str().is_some_and(|m| !m.is_empty()), "{img}");
+    // what the job made is kept and served
+    let name = img["media"][0]["name"].as_str().expect("the image is saved with its row").to_string();
+    assert_eq!(img["media"][0]["type"], "image/png");
+    let r = reqwest::blocking::Client::new().get(format!("{}/api/monitor/media/{name}", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.bytes().unwrap().starts_with(b"\x89PNG"));
+    let r = reqwest::blocking::Client::new().get(format!("{}/api/monitor/media/{name}", s.base)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 401, "the key is needed");
+    for bad in ["..%2Fhistory.jsonl", "a.b.c", "history.jsonl.png"] {
+        let (c, _) = s.get(&format!("/api/monitor/media/{bad}"), true);
+        assert_eq!(c, 404, "{bad}");
+    }
+    // on disk, one row a line, so a restart reads them back
+    let file = std::fs::read_to_string(s.dir.join("monitor/history.jsonl")).unwrap();
+    assert_eq!(file.lines().count(), 2, "{file}");
+    // cleared only from the server's own page; then the rows, the file and the media are gone
+    let r = reqwest::blocking::Client::new().post(format!("{}/api/monitor/clear", s.base)).bearer_auth(KEY)
+        .header("Origin", "https://evil.example").send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+    let (c, r) = s.post("/api/monitor/clear", &json!({}));
+    assert_eq!((c, r["cleared"].as_u64()), (200, Some(2)), "{r}");
+    assert!(s.get("/metrics?requests=all", true).1["requests"].as_array().unwrap().is_empty());
+    assert!(!s.dir.join("monitor/history.jsonl").exists() && !s.dir.join("monitor/media").exists());
+}

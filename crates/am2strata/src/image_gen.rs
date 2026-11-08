@@ -391,6 +391,12 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
         mon.media_end(job, "error", &f);
         return error(StatusCode::BAD_GATEWAY, "image_error", f);
     }
+    for d in &data {
+        use base64::Engine as _;
+        if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d["b64_json"].as_str().unwrap_or("")) {
+            mon.media_file_add(job, "png", png);
+        }
+    }
     mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
     Json(json!({"created": crate::now(), "data": data, "size": format!("{w}x{h}"),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": ran, "model": model,
@@ -584,6 +590,12 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}"));
         }
     };
+    if let Ok(clip) = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or(""))
+    } {
+        mon.media_file_add(job, v["format"].as_str().unwrap_or("mp4"), clip);
+    }
     mon.media_end(job, "stop", &format!("{}x{}, {} frames at {} fps", v["width"], v["height"], v["frames"], v["fps"]));
     Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
                 "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"],

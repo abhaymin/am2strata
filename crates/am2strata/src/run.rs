@@ -437,7 +437,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     }
     let turn_at = strata_protocol::turn_at(&ids, &loaded.turn_ids);
     let prompt_tokens = ids.len();
-    let mut record = mgr.monitor.begin(prompt_tokens, max_new);
+    let mut record = mgr.monitor.begin(&loaded.entry.id, prompt_tokens, max_new);
     let (tx, events) = mpsc::channel(256);
     let model = loaded.entry.id.clone();
     let lc = loaded.clone();

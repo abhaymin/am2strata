@@ -274,7 +274,7 @@ impl Manager {
             queue: crate::queue::Queue::new(queue_max_wait),
             ready_timeout,
             switch_on_request: std::sync::atomic::AtomicBool::new(false),
-            monitor: crate::monitor::Monitor::new(),
+            monitor: crate::monitor::Monitor::new(Some(memory_dir.join("monitor"))),
             memory: Arc::new(crate::memory::Memory::open(&memory_dir)),
             snapshots: Arc::new(crate::snapshots::Snapshots::open(&memory_dir)),
             media_jobs: std::sync::OnceLock::new(),

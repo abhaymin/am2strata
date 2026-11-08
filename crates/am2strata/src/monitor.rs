@@ -1,14 +1,22 @@
 //! What the web app's Monitor tab shows (GET /metrics): the running request, the last requests, totals since the
 //! start, and the machine (GPU, CPU, RAM, disk) with a minute of history per series. Also /metrics/prometheus (the
 //! llama-server metric names) and /v1/status. Port of serve/server.py metrics() and serve/telemetry.py.
+//!
+//! The request history is kept on disk (<data>/monitor/history.jsonl, one finished request a line) until it is
+//! cleared (POST /api/monitor/clear), so it outlives a restart. Each row names the model that ran it. What a media
+//! job made (its images, video or speech) is saved beside it (<data>/monitor/media/) and listed in the row's `media`,
+//! for the Monitor to show; clearing removes those files too.
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Requests kept for the table (PolyStrata keeps the same order of magnitude).
-const HISTORY_KEEP: usize = 200;
+/// Requests kept for the table until cleared: past this the oldest go, from memory (the file is rewritten without
+/// them at the next start).
+const HISTORY_KEEP: usize = 5000;
 /// Samples per hardware series: one a second, a minute.
 const SERIES_KEEP: usize = 60;
 /// The live decode speed is measured over this many seconds.
@@ -37,6 +45,7 @@ struct Totals {
 
 struct Live {
     id: u64,
+    model: String,
     started: f64,
     first_token: Option<f64>,
     prompt_tokens: usize,
@@ -55,6 +64,8 @@ struct MediaLive {
     model: String,
     started: f64,
     step: Option<(u64, u64)>,
+    /// what the job made, saved with its row: (file extension, bytes)
+    files: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Default)]
@@ -82,18 +93,94 @@ pub struct Monitor {
     inner: Mutex<Inner>,
     tel: Mutex<Telemetry>,
     pub started: f64,
+    /// <data>/monitor: the history file and the media it lists (none: kept in memory only)
+    dir: Option<PathBuf>,
+}
+
+/// A saved media file's name: digits, letters, '-' and one '.' (what `save_media` writes), so a request cannot reach
+/// outside the folder.
+pub fn media_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() < 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && name.matches('.').count() == 1 && !name.starts_with('.')
 }
 
 impl Monitor {
-    pub fn new() -> Arc<Self> {
+    pub fn new(dir: Option<PathBuf>) -> Arc<Self> {
+        let history = dir.as_ref().map(|d| Self::load(d)).unwrap_or_default();
+        let next_id = history.iter().filter_map(|r| r["id"].as_u64()).max().unwrap_or(0);
         let m = Arc::new(Monitor {
             health: Mutex::new((Vec::new(), 0, None)),
-            inner: Mutex::new(Inner { totals: Totals { since: now(), ..Default::default() }, ..Default::default() }),
+            inner: Mutex::new(Inner { totals: Totals { since: now(), ..Default::default() }, history, next_id, ..Default::default() }),
             tel: Mutex::new(Telemetry::default()),
             started: now(),
+            dir,
         });
         sampler::start(m.clone());
         m
+    }
+
+    /// The history file's rows, the newest HISTORY_KEEP; a damaged line (a crash mid-write) is skipped.
+    fn load(dir: &std::path::Path) -> VecDeque<Value> {
+        let text = std::fs::read_to_string(dir.join("history.jsonl")).unwrap_or_default();
+        let mut rows: VecDeque<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        if rows.len() > HISTORY_KEEP {
+            rows.drain(..rows.len() - HISTORY_KEEP);
+            // the file keeps only what is shown: the rows past the limit (and their media) go
+            let keep: String = rows.iter().map(|r| format!("{r}\n")).collect();
+            let _ = std::fs::write(dir.join("history.jsonl"), keep);
+        }
+        rows
+    }
+
+    /// A finished row: into the table, and onto the end of the history file.
+    fn push(&self, g: &mut Inner, row: Value) {
+        if let Some(dir) = &self.dir {
+            let line = format!("{row}\n");
+            let ok = std::fs::create_dir_all(dir).and_then(|_| {
+                std::fs::OpenOptions::new().create(true).append(true).open(dir.join("history.jsonl"))?.write_all(line.as_bytes())
+            });
+            if let Err(e) = ok {
+                tracing::warn!("the Monitor's history file: {e}");
+            }
+        }
+        g.history.push_back(row);
+        while g.history.len() > HISTORY_KEEP {
+            g.history.pop_front();
+        }
+    }
+
+    /// Saves a media job's files; their names for the row ("/api/monitor/media/<name>" serves each).
+    fn save_media(&self, id: u64, started: f64, files: &[(String, Vec<u8>)]) -> Vec<Value> {
+        let Some(dir) = &self.dir else { return Vec::new() };
+        let media = dir.join("media");
+        if std::fs::create_dir_all(&media).is_err() {
+            return Vec::new();
+        }
+        files.iter().enumerate().filter_map(|(i, (ext, bytes))| {
+            let ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).take(5).collect();
+            let name = format!("{}-{id}-{i}.{ext}", (started * 1000.0) as u64);
+            std::fs::write(media.join(&name), bytes).ok()?;
+            Some(json!({"name": name, "type": media_type(&ext), "bytes": bytes.len()}))
+        }).collect()
+    }
+
+    /// POST /api/monitor/clear: the history, its file and its media go; the totals since the start stay.
+    pub fn clear(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        let n = g.history.len();
+        g.history.clear();
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_file(dir.join("history.jsonl"));
+            let _ = std::fs::remove_dir_all(dir.join("media"));
+        }
+        n
+    }
+
+    /// A saved media file (GET /api/monitor/media/<name>): its type and bytes.
+    pub fn media_file(&self, name: &str) -> Option<(&'static str, Vec<u8>)> {
+        let dir = self.dir.as_ref().filter(|_| media_name_ok(name))?;
+        let bytes = std::fs::read(dir.join("media").join(name)).ok()?;
+        Some((media_type(name.rsplit('.').next().unwrap_or("")), bytes))
     }
 
     /// A request is waiting for the GPU; the returned guard counts it until dropped.
@@ -104,12 +191,12 @@ impl Monitor {
 
     /// A request starts on the engine: the guard records it in the history when it ends (or is dropped: the client
     /// left).
-    pub fn begin(self: &Arc<Self>, prompt_tokens: usize, max_tokens: usize) -> Record {
+    pub fn begin(self: &Arc<Self>, model: &str, prompt_tokens: usize, max_tokens: usize) -> Record {
         let mut g = self.inner.lock().unwrap();
         g.next_id += 1;
         let id = g.next_id;
         let t = now();
-        g.live = Some(Live { id, started: t, first_token: None, prompt_tokens, generated: 0, max_tokens, reasoning: false,
+        g.live = Some(Live { id, model: model.to_string(), started: t, first_token: None, prompt_tokens, generated: 0, max_tokens, reasoning: false,
                              progress: None, read_started: t, recent: VecDeque::new() });
         g.last_at = Some(t);
         Record { mon: self.clone(), id, prompt_tokens, done: false, outcome: "disconnect" }
@@ -142,7 +229,7 @@ impl Monitor {
         let mut g = self.inner.lock().unwrap();
         g.next_id += 1;
         let id = g.next_id;
-        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None });
+        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, files: Vec::new() });
         g.last_at = Some(now());
         id
     }
@@ -158,16 +245,22 @@ impl Monitor {
         self.inner.lock().unwrap().media.as_ref().and_then(|m| m.step)
     }
 
+    /// What a media job made, to be saved with its row when it ends: `ext` names the type ("png", "mp4", "wav").
+    pub fn media_file_add(&self, id: u64, ext: &str, bytes: Vec<u8>) {
+        if let Some(m) = self.inner.lock().unwrap().media.as_mut().filter(|m| m.id == id) {
+            m.files.push((ext.to_string(), bytes));
+        }
+    }
+
     /// `finish`: "stop" (made) or "error"; `output`: what was made ("2 images, 1024x1024").
     pub fn media_end(&self, id: u64, finish: &str, output: &str) {
         let mut g = self.inner.lock().unwrap();
         let Some(m) = g.media.take_if(|m| m.id == id) else { return };
         let t = now();
-        g.history.push_back(json!({"time": m.started, "duration_s": ((t - m.started) * 10.0).round() / 10.0, "finish": finish,
-                                   "kind": m.kind, "model": m.model, "output": output, "steps": m.step.map(|s| s.1)}));
-        while g.history.len() > HISTORY_KEEP {
-            g.history.pop_front();
-        }
+        let media = self.save_media(m.id, m.started, &m.files);
+        let row = json!({"id": m.id, "time": m.started, "duration_s": ((t - m.started) * 10.0).round() / 10.0, "finish": finish,
+                         "kind": m.kind, "model": m.model, "output": output, "steps": m.step.map(|s| s.1), "media": media});
+        self.push(&mut g, row);
     }
 
     fn with_live(&self, id: u64, f: impl FnOnce(&mut Live)) {
@@ -190,17 +283,15 @@ impl Monitor {
         let decode_tok_s = (n > 0 && d.generated > 0 && d.decode_ms > 0.0)
             .then(|| (d.generated as f64 / (d.decode_ms / 1000.0) * 10.0).round() / 10.0);
         let hit_rate = d.lookups.filter(|l| *l > 0).map(|l| ((d.hits.unwrap_or(0) as f64 / l as f64) * 1000.0).round() / 1000.0);
-        g.history.push_back(json!({
-            "time": live.started, "duration_s": ((t - live.started) * 10.0).round() / 10.0, "finish": finish,
+        let row = json!({
+            "id": live.id, "model": live.model, "time": live.started, "duration_s": ((t - live.started) * 10.0).round() / 10.0, "finish": finish,
             "prompt_tokens": seen, "reused": d.reused, "output_tokens": n,
             "prompt_total": prompt_tokens, "prompt_read": read, "engine_generated": done.map(|d| d.generated),
             "prompt_ms": done.map(|d| d.prompt_ms), "decode_ms": done.map(|d| d.decode_ms), "decode_tok_s": decode_tok_s,
             "hit_rate": hit_rate, "pcie_share": null, "projection": null,
             "drafts_offered": d.drafts_offered, "drafts_accepted": d.drafts_accepted,
-        }));
-        while g.history.len() > HISTORY_KEEP {
-            g.history.pop_front();
-        }
+        });
+        self.push(&mut g, row);
         let tt = &mut g.totals;
         tt.requests += 1;
         tt.prompt_tokens += seen as u64;
@@ -246,7 +337,7 @@ impl Monitor {
                 let reading = l.first_token.is_none();
                 let (tok_s, mean) = Self::live_rates(l, t);
                 json!({
-                    "state": if reading { "reading" } else { "generating" }, "queued": g.queued,
+                    "state": if reading { "reading" } else { "generating" }, "queued": g.queued, "model": l.model,
                     "phase": if reading { Value::Null } else if l.reasoning { json!("thinking") } else { json!("answering") },
                     "prompt_tokens": l.prompt_tokens,
                     "prompt_read": if reading { l.progress.map(|p| p.0) } else { None },
@@ -408,6 +499,21 @@ pub fn accelerators() -> Vec<Value> {
         }
     }
     out
+}
+
+fn media_type(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "apng" => "image/apng",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
 }
 
 /// Counts a request waiting for the GPU while it lives.
@@ -697,5 +803,31 @@ mod sampler {
             }
         }
         Some((r, w))
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_history_file_is_read_back_at_the_next_start() {
+        let dir = std::env::temp_dir().join(format!("am2-monitor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = Monitor::new(Some(dir.clone()));
+        let id = m.media_begin("image", "z-image-turbo:q8");
+        m.media_file_add(id, "png", b"\x89PNG..".to_vec());
+        m.media_end(id, "stop", "1 image, 512x512");
+        std::fs::OpenOptions::new().append(true).open(dir.join("history.jsonl")).unwrap().write_all(b"{\"time\": 1, broken\n").unwrap();
+        // a new start: the row is back (the damaged line skipped), its file is served, and ids go on after it
+        let m = Monitor::new(Some(dir.clone()));
+        let rows = m.metrics(Value::Null, false, true)["requests"].clone();
+        assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+        assert_eq!(rows[0]["model"], "z-image-turbo:q8");
+        let name = rows[0]["media"][0]["name"].as_str().unwrap();
+        assert_eq!(m.media_file(name).map(|f| f.0), Some("image/png"));
+        assert!(m.media_begin("video", "wan") > rows[0]["id"].as_u64().unwrap());
+        assert!(m.media_file("../history.jsonl").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

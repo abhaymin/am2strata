@@ -368,6 +368,8 @@ async fn main() -> Result<()> {
         .route("/config", get(web::config_get).post(web::config_post))
         .route("/mcp", get(web::mcp))
         .route("/metrics", get(web::metrics))
+        .route("/api/monitor/clear", post(web::monitor_clear))
+        .route("/api/monitor/media/{name}", get(web::monitor_media))
         .route("/metrics/prometheus", get(web::prometheus))
         .route("/v1/status", get(web::status))
         // the web app: the page at /, its files under /web/ (as PolyStrata serves them), the monitor at /api-monitor

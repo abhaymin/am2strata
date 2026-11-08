@@ -215,6 +215,30 @@ pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Qu
     Json(m).into_response()
 }
 
+/// POST /api/monitor/clear: the Monitor's request history, its file and the media it kept. Only from this server's
+/// own page (or a trusted origin), as Settings.
+pub async fn monitor_clear(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the Monitor's history can be cleared");
+    }
+    Json(json!({"cleared": s.mgr.monitor.clear()})).into_response()
+}
+
+/// GET /api/monitor/media/<name>: an image, video or speech a media job made, as the Monitor's history lists it.
+pub async fn monitor_media(State(s): State<AppState>, headers: HeaderMap, axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    match s.mgr.monitor.media_file(&name) {
+        Some((kind, bytes)) => ([(axum::http::header::CONTENT_TYPE, kind), (axum::http::header::CACHE_CONTROL, "private, max-age=86400")],
+                                bytes).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not_found_error", "no such media in the Monitor's history"),
+    }
+}
+
 /// GET /api/queue: the job that has the GPU's turn and the ones waiting, in the order they will run.
 pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !authorized(&s, &headers) {

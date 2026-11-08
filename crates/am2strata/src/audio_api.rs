@@ -291,6 +291,7 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         Ok(b) => b,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "audio_error", "the media engine returned no audio"),
     };
+    s.mgr.monitor.media_file_add(id, "wav", wav.clone());
     s.mgr.monitor.media_end(id, "stop", &format!("{:.1} s of speech, {} characters, on the {device}", r["seconds"].as_f64().unwrap_or(0.0),
                                           text.chars().count()));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav")

@@ -165,6 +165,13 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); flex-wrap: wrap; }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
+.req-actions { display: flex; gap: var(--st-s-2); }
+#req-wrap .st-table td.req-model { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-family: var(--st-font); }
+#req-wrap .st-table td.req-out { white-space: normal; min-width: 220px; }
+.req-medias { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.req-media img { display: block; height: 72px; border-radius: 6px; border: 1px solid var(--st-line); }
+.req-media video { display: block; height: 96px; border-radius: 6px; background: #000; }
+.req-media audio { display: block; height: 32px; max-width: 260px; }
 .req-totals:empty { display: none; }
 .cc-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .cc-bars { display: grid; grid-template-columns: 1fr 1fr; gap: var(--st-s-2) var(--st-s-6); }
