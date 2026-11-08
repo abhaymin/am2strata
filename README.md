@@ -143,13 +143,18 @@ Live numbers on the RTX 5060 Ti 16 GB (warm, greedy, thinking off): Tiel Coder Q
 this server (PolyStrata: ~98, same expert placement: 3,713 experts in VRAM); Orca's engine came up with the same
 expert cache as under PolyStrata (3,985 slots, 8.27 GB).
 
+GPU builds: the PolyStrata engines on the developer's PC are compiled for sm_86 and sm_120 (RTX 30 and RTX 50
+cards). Only the RTX 5060 Ti has been tested; an RTX 3060 should run the same build, but it has not been tried.
+am2Strata refuses an engine that is not compiled for the card, and says how to rebuild it.
+
 ## Not yet
 
-Image, video and voice generation are in the build from source only (`crates/strata-media`, NVIDIA). Parallel batch slots and replicas (PolyStrata's opt-ins) are not ported
-either; this box runs one slot.
-
-The PolyStrata engines here are built for sm_86 and sm_120 (RTX 30 and RTX 50 cards) since 2026-10-20, so the same
-build runs on an RTX 3060 12 GB; warm speed on the 5060 Ti is unchanged (Orca 62 tok/s, Tiel Q6 99-110 tok/s).
+- **Media in the downloads:** image, video and voice generation come only with a build from source
+  (`crates/strata-media`); the release downloads do not hold the media engine (its audio and video codecs have
+  their own terms, see NOTICE). Images and video need an NVIDIA card (the `cuda` feature); speech to text and text
+  to speech also run on the CPU, slowly for speech out. Tested on Linux only.
+- **Parallel slots and replicas:** PolyStrata's opt-in batch slots and replicas are not ported. am2Strata runs one
+  request at a time on a model, and the others wait in its queue.
 
 ## Use
 
