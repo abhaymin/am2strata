@@ -40,7 +40,7 @@ axum = { version = "0.8", features = ["multipart"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4"] }
 
 strata-tokenizer = { path = "crates/strata-tokenizer" }

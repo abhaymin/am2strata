@@ -1614,3 +1614,25 @@ fn the_monitor_keeps_its_history_with_the_model_and_the_media_until_cleared() {
     assert!(s.get("/metrics?requests=all", true).1["requests"].as_array().unwrap().is_empty());
     assert!(!s.dir.join("monitor/history.jsonl").exists() && !s.dir.join("monitor/media").exists());
 }
+
+#[test]
+fn the_connect_page_lists_the_coding_agents_for_this_server_or_another() {
+    let s = Server::start(&[Model::default()], &[], json!({}));
+    let (c, r) = s.get("/api/agents", true);
+    assert_eq!(c, 200, "{r}");
+    let agents = r["agents"].as_array().unwrap();
+    let get = |n: &str| agents.iter().find(|a| a["name"] == n).unwrap_or_else(|| panic!("{n} in {r}")).clone();
+    let claude = get("claude");
+    assert_eq!(claude["support"], "start, setup");
+    assert!(claude["guide"].as_str().unwrap().contains("am2strata agent start claude"), "{claude}");
+    assert_eq!(get("agy")["support"], "not supported");
+    assert!(get("cursor-agent")["why"].as_str().is_some());
+    assert_eq!(r["model"], Model::default().id, "the loaded model");
+    assert!(!r.to_string().contains(KEY), "the key is never in a guide");
+    // another am2Strata, with another model
+    let (_, r) = s.get("/api/agents?url=http://192.168.1.20:8000/&model=tiel", true);
+    assert_eq!((r["url"].as_str(), r["model"].as_str()), (Some("http://192.168.1.20:8000"), Some("tiel")));
+    let pi = r["agents"].as_array().unwrap().iter().find(|a| a["name"] == "omp").unwrap().clone();
+    assert!(pi["guide"].as_str().unwrap().contains("baseUrl: http://192.168.1.20:8000/v1"), "{pi}");
+    assert_eq!(s.get("/api/agents", false).0, 401);
+}

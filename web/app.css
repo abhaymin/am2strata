@@ -532,3 +532,10 @@ body.resizing iframe { pointer-events: none; }
 .viewer-open { position: fixed; z-index: 900; padding: 5px 10px; border: 0; border-radius: 6px; background: rgba(6, 8, 12, .82); color: #fff; font: inherit; font-size: 12px; cursor: pointer; }
 .viewer-open[hidden] { display: none; }
 .viewable { cursor: zoom-in; }
+
+/* Settings > Connect > Coding agents */
+.agents-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--st-s-2); margin: var(--st-s-2) 0; }
+.agents-form label { display: flex; flex-direction: column; gap: 4px; font-size: var(--st-fs-sm); }
+.agent-row { border-top: 1px solid var(--st-line-soft); padding: 8px 0; }
+.agent-row summary { cursor: pointer; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.agent-row pre { margin: 8px 0 4px; white-space: pre-wrap; }

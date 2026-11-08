@@ -1936,7 +1936,7 @@ function showSection(name) {
   if (section === "tools") loadMcp();
   if (section === "memory") loadMemory();
   if (section === "server") loadSystem();
-  if (section === "connect") renderAppSetup();
+  if (section === "connect") { renderAppSetup(); renderAgents(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
@@ -3005,7 +3005,37 @@ function renderAppSetup() {
   $("app-snippet").textContent = text;
 }
 $("app-pick").onchange = renderAppSetup;
-if (tab === "settings" && section === "connect") renderAppSetup();
+
+// Settings > Connect > Coding agents: every agent, what it supports, and what to enter, from GET /api/agents
+let agentsTimer = null;
+async function renderAgents() {
+  const q = new URLSearchParams();
+  for (const [id, k] of [["agents-url", "url"], ["agents-model", "model"], ["agents-small", "small"]]) {
+    const v = $(id).value.trim();
+    if (v) q.set(k, v);
+  }
+  try {
+    const r = await fetch(`api/agents?${q}`, {headers: headers()});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const tone = {"start, setup": "", "start": "", "setup": "", "guide": "st-badge--queued", "not supported": "st-badge--error"};
+    $("agents-list").innerHTML = j.agents.map((a) => `<details class="agent-row">
+        <summary><b>${esc(a.label)}</b> <code>${esc(a.exe)}</code> <span class="st-badge ${tone[a.support] ?? ""}">${esc(a.support)}</span>
+          <span class="muted small">${esc(a.api === "-" ? "" : `${a.api} API`)}</span></summary>
+        <pre class="snippet">${esc(a.guide)}</pre>
+        <p class="muted small">${esc(a.why || `Format: ${a.checked}`)}</p></details>`).join("");
+  } catch (e) {
+    $("agents-list").innerHTML = `<p class="muted">Could not list the agents: ${esc(e.message)}</p>`;
+  }
+  try {
+    const m = await (await fetch("api/models", {headers: headers()})).json();
+    $("agents-models").innerHTML = (m.models || []).map((x) => `<option value="${esc(x.id)}"></option>`).join("");
+  } catch (e) { /* the model list is a convenience */ }
+}
+for (const id of ["agents-url", "agents-model", "agents-small"]) {
+  $(id).addEventListener("input", () => { clearTimeout(agentsTimer); agentsTimer = setTimeout(renderAgents, 400); });
+}
+if (tab === "settings" && section === "connect") { renderAppSetup(); renderAgents(); }
 
 // ------------------------------------------------------------------ the media viewer
 // Every picture and video in the chat, Media Generation, attachments and tool results: a click opens it large, with zoom,

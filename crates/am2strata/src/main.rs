@@ -5,6 +5,7 @@
 //! pictures and video frames, tool calls, and PolyStrata's web app. It drives the existing C++/CUDA engines over
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
+mod agents;
 mod anthropic;
 mod browser;
 mod api_monitor;
@@ -217,6 +218,13 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    // `am2strata agent ...`: the coding agents' command lives in am2strata-run, beside this binary
+    if std::env::args().nth(1).as_deref() == Some("agent") {
+        let exe = std::env::current_exe()?.with_file_name(if cfg!(windows) { "am2strata-run.exe" } else { "am2strata-run" });
+        let status = std::process::Command::new(&exe).args(std::env::args_os().skip(1)).status()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", exe.display()))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
     let args = Args::parse();
     let dir = expand(&args.models_dir);
     let models = manager::scan(&dir);
@@ -369,6 +377,7 @@ async fn main() -> Result<()> {
         .route("/mcp", get(web::mcp))
         .route("/metrics", get(web::metrics))
         .route("/api/monitor/clear", post(web::monitor_clear))
+        .route("/api/agents", get(web::agents))
         .route("/api/monitor/media/{name}", get(web::monitor_media))
         .route("/metrics/prometheus", get(web::prometheus))
         .route("/v1/status", get(web::status))

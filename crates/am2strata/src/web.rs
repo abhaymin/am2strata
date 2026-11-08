@@ -239,6 +239,27 @@ pub async fn monitor_media(State(s): State<AppState>, headers: HeaderMap, axum::
     }
 }
 
+/// GET /api/agents[?url=&model=&small=]: the coding agents, what each supports and what to enter, pointed at this
+/// server (the address the page was opened at) or at `url`; the model is the loaded one unless `model` names one.
+/// The guides name the key's variable, never the key.
+pub async fn agents(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("127.0.0.1:8000");
+    let url = q.get("url").filter(|u| u.starts_with("http://") || u.starts_with("https://")).cloned()
+        .unwrap_or_else(|| format!("http://{host}"));
+    let list = s.mgr.list().await;
+    let current = list["models"].as_array().and_then(|a| a.iter().find(|m| m["current"] == true)).and_then(|m| m["id"].as_str())
+        .map(str::to_string).unwrap_or_else(|| s.mgr.default_id.clone());
+    let model = q.get("model").filter(|m| !m.is_empty()).cloned().unwrap_or(current);
+    let remote = q.contains_key("url");
+    // a remote server's key is the user's to know; this one's: whether it has one
+    let key = (remote || s.api_key.as_deref().is_some_and(|k| !k.is_empty())).then(|| "set".to_string());
+    let t = crate::agents::Target { url: url.trim_end_matches('/').to_string(), key, model, small: q.get("small").filter(|m| !m.is_empty()).cloned() };
+    Json(json!({"url": t.url, "model": t.model, "key_var": crate::agents::KEY_VAR, "agents": crate::agents::list(&t)})).into_response()
+}
+
 /// GET /api/queue: the job that has the GPU's turn and the ones waiting, in the order they will run.
 pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !authorized(&s, &headers) {

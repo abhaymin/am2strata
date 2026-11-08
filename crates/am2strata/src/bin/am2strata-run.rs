@@ -18,6 +18,9 @@
 //!
 //! Everything after `--` on serve / temp-service / install goes to the am2strata server (`am2strata --help`).
 
+#[path = "../agents.rs"]
+mod agents;
+
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -63,6 +66,8 @@ enum Cmd {
     Test,
     /// download a model from Hugging Face and write its run config (no --quant: list what the repository offers)
     Pull(PullArgs),
+    /// coding agents on am2Strata, this PC's or another's: list | start <agent> | setup <agent> | reset <agent> | show <agent>
+    Agent(AgentArgs),
     /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next): PolyStrata's tools/iq_pack.py
     IqPack {
         /// the model's shard 1
@@ -182,6 +187,37 @@ struct PullArgs {
     /// the folder under <data-dir>/models for the files (default: the repository's name and the quantization)
     #[arg(long)]
     dir: Option<String>,
+}
+
+#[derive(Args)]
+struct AgentArgs {
+    /// list, start (one run, nothing of yours changes), setup (its config, backed up), reset (the backup back),
+    /// show (what to enter, and what start would set)
+    action: String,
+    /// claude, codex, opencode, pi, droid, qwen, aider, goose, omp, crush, hermes, openclaw, continue, cline,
+    /// kilocode, zed, vscode (agy and cursor-agent take no custom endpoint)
+    agent: Option<String>,
+    /// another am2Strata, e.g. http://192.168.1.20:8000 (default: this PC's, from the run configs)
+    #[arg(long, env = "AM2STRATA_URL")]
+    url: Option<String>,
+    /// that server's API key (default: this PC's run config's)
+    #[arg(long, env = "AM2STRATA_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+    /// the model the agent uses (default: the one the server has loaded)
+    #[arg(long, short)]
+    model: Option<String>,
+    /// a small, fast model for background work (Claude Code's haiku; default: --model)
+    #[arg(long)]
+    small_model: Option<String>,
+    /// the PolyStrata folder, for this PC's address and key
+    #[arg(long, default_value = "~/Development/PolyStrata")]
+    models_dir: String,
+    /// print what would run or be written, and stop
+    #[arg(long)]
+    dry_run: bool,
+    /// passed to the agent as they are (after --)
+    #[arg(last = true)]
+    rest: Vec<String>,
 }
 
 #[derive(Args, Clone)]
@@ -527,6 +563,7 @@ fn main() -> ExitCode {
         Cmd::Install { s } => install(&s),
         Cmd::Uninstall => uninstall(),
         Cmd::Pull(p) => pull(p),
+        Cmd::Agent(a) => agent(a),
         Cmd::IqPack { gguf, out, base, skip_experts, compat_bf16, experts_bin } => done(strata_pack::iq_pack::run(&strata_pack::iq_pack::Options {
             gguf: expand_path(&gguf), out: expand_path(&out), base: base.map(|b| expand_path(&b)), skip_experts, compat_bf16, experts_bin })),
         Cmd::MtpFetch { cmd, out, only } => {
@@ -708,4 +745,178 @@ fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
     }
     let _ = child.wait();
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// This PC's server from its run configs: the address (127.0.0.1 and the port) and the key.
+fn local_server(models_dir: &str) -> (String, Option<String>) {
+    let dir = expand_path(Path::new(models_dir));
+    let mut configs: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("strata-") && n.ends_with(".json"))).collect();
+    configs.sort();
+    let cfg: serde_json::Value = configs.first().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let port = cfg["port"].as_u64().unwrap_or(8080);
+    (format!("http://127.0.0.1:{port}"), cfg["api_key"].as_str().filter(|k| !k.is_empty()).map(str::to_string))
+}
+
+/// The model the server has loaded (else its first), as /api/models or /v1/models says.
+fn server_model(url: &str, key: Option<&str>) -> Result<String, String> {
+    let get = |path: &str| -> Result<serde_json::Value, String> {
+        let mut rb = reqwest::blocking::Client::new().get(format!("{url}{path}")).timeout(Duration::from_secs(10));
+        if let Some(k) = key {
+            rb = rb.bearer_auth(k);
+        }
+        let r = rb.send().map_err(|e| format!("{url} does not answer: {e}"))?;
+        if r.status().as_u16() == 401 {
+            return Err(format!("{url} wants an API key: --api-key or {}", agents::KEY_VAR));
+        }
+        r.json().map_err(|e| e.to_string())
+    };
+    if let Ok(v) = get("/api/models") {
+        let list = v["models"].as_array().cloned().unwrap_or_default();
+        if let Some(m) = list.iter().find(|m| m["current"] == true).or(list.first()).and_then(|m| m["id"].as_str()) {
+            return Ok(m.to_string());
+        }
+    }
+    let v = get("/v1/models")?;
+    v["data"][0]["id"].as_str().map(str::to_string).ok_or_else(|| format!("{url} lists no model"))
+}
+
+/// The agent's command on PATH (on Windows also its .cmd or .exe, as npm installs them).
+fn find_exe(exe: &str) -> Option<PathBuf> {
+    let exts: &[&str] = if cfg!(windows) { &[".exe", ".cmd", ".bat", ""] } else { &[""] };
+    std::env::split_paths(&std::env::var_os("PATH")?).flat_map(|d| exts.iter().map(move |e| d.join(format!("{exe}{e}"))))
+        .find(|p| p.is_file())
+}
+
+fn agent(a: AgentArgs) -> ExitCode {
+    if a.action == "list" {
+        for g in agents::AGENTS {
+            let what = match g.support {
+                agents::Support::Full => "start, setup".to_string(),
+                agents::Support::Start => "start".into(),
+                agents::Support::Setup => "setup".into(),
+                agents::Support::Guide => "guide (show)".into(),
+                agents::Support::No(why) => format!("not supported: {why}"),
+            };
+            let have = if find_exe(g.exe).is_some() { "installed" } else { "" };
+            println!("{:<13} {:<24} {:<10} {:<14} {have}", g.name, g.label, g.api, what);
+        }
+        return ExitCode::SUCCESS;
+    }
+    let Some(name) = a.agent.as_deref() else {
+        eprintln!("which agent? (am2strata agent list)");
+        return ExitCode::from(2);
+    };
+    let Some(info) = agents::find(name) else {
+        eprintln!("no agent called {name:?} (am2strata agent list)");
+        return ExitCode::from(2);
+    };
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_default();
+    if a.action == "reset" {
+        return match agents::reset(info.name, &home) {
+            Ok(v) if v.is_empty() => { say(format!("nothing of {} was set up by am2strata", info.label)); ExitCode::SUCCESS }
+            Ok(v) => { for p in v { say(format!("restored {}", p.display())); } ExitCode::SUCCESS }
+            Err(e) => { eprintln!("{e}"); ExitCode::FAILURE }
+        };
+    }
+    let (local_url, local_key) = local_server(&a.models_dir);
+    let url = a.url.clone().unwrap_or(local_url).trim_end_matches('/').to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        eprintln!("--url is an address such as http://192.168.1.20:8000");
+        return ExitCode::from(2);
+    }
+    let key = a.api_key.clone().filter(|k| !k.is_empty()).or(if a.url.is_none() { local_key } else { None });
+    let model = match a.model.clone() {
+        Some(m) => m,
+        None => match server_model(&url, key.as_deref()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("{e}; or name one with --model"); return ExitCode::FAILURE; }
+        },
+    };
+    let t = agents::Target { url, key, model, small: a.small_model.clone() };
+    match a.action.as_str() {
+        "show" => {
+            println!("{} on {} with {} ({}):\n", info.label, t.url, t.model, info.checked);
+            println!("{}", agents::guide(info.name, &t).unwrap_or_default());
+            ExitCode::SUCCESS
+        }
+        "setup" => match agents::setup(info.name, &t, &home) {
+            Ok(changes) => {
+                for c in &changes {
+                    if a.dry_run {
+                        println!("--- {}\n{}", c.path.display(), c.after);
+                    } else {
+                        say(format!("{} {} (backup: {}.am2strata-backup; `agent reset {}` restores it)",
+                                    if c.before.is_some() { "updated" } else { "wrote" }, c.path.display(), c.path.display(), info.name));
+                    }
+                }
+                if a.dry_run {
+                    return ExitCode::SUCCESS;
+                }
+                if let Err(e) = agents::apply(&changes) {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+                say(format!("{} now uses {} on {}", info.label, t.model, t.url));
+                if t.key.is_some() {
+                    say(format!("it reads the key from {} in your shell: set it in your shell profile", agents::KEY_VAR));
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => { eprintln!("{e}"); ExitCode::FAILURE }
+        },
+        "start" => {
+            let tmp = std::env::temp_dir().join(format!("am2strata-agent-{}-{}", info.name, std::process::id()));
+            let plan = match agents::start(info.name, &t, &tmp) {
+                Ok(p) => p,
+                Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
+            };
+            if a.dry_run {
+                for (k, v) in &plan.env {
+                    let shown = if k == agents::KEY_VAR || k.contains("KEY") || k.contains("TOKEN") { "***" } else { v };
+                    println!("{k}={shown}");
+                }
+                for (p, _) in &plan.files {
+                    println!("(file) {}", p.display());
+                }
+                println!("{} {}", plan.exe, plan.args.iter().chain(&a.rest).cloned().collect::<Vec<_>>().join(" "));
+                return ExitCode::SUCCESS;
+            }
+            let Some(exe) = find_exe(&plan.exe) else {
+                eprintln!("{} is not installed ({} is not on PATH)", info.label, plan.exe);
+                return ExitCode::from(127);
+            };
+            for (p, body) in &plan.files {
+                if let Some(d) = p.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                if let Err(e) = std::fs::write(p, body) {
+                    eprintln!("{}: {e}", p.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+            for n in &plan.notes {
+                say(n);
+            }
+            say(format!("{} on {} with {}", info.label, t.url, t.model));
+            let mut cmd = if exe.extension().is_some_and(|e| e == "cmd" || e == "bat") {
+                let mut c = Command::new("cmd");
+                c.arg("/C").arg(&exe);
+                c
+            } else {
+                Command::new(&exe)
+            };
+            let status = cmd.args(&plan.args).args(&a.rest).envs(plan.env.iter().map(|(k, v)| (k, v))).status();
+            let _ = std::fs::remove_dir_all(&tmp);
+            match status {
+                Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
+                Err(e) => { eprintln!("{}: {e}", exe.display()); ExitCode::FAILURE }
+            }
+        }
+        other => {
+            eprintln!("{other}: list, start, setup, reset or show");
+            ExitCode::from(2)
+        }
+    }
 }

@@ -50,6 +50,18 @@ from [Releases](https://github.com/abhaymin/am2strata/releases); `QUICKSTART.md`
 downloads run models on the CPU, or on any GPU through wgpu, so they suit small models. The build from source below is
 the fast path, for NVIDIA cards.
 
+### Coding agents
+
+```bash
+am2strata agent start claude                     # or codex, opencode, pi, qwen, aider, goose: one run, nothing changed
+am2strata agent setup codex --model <id>         # the agent's default from now on (its config backed up)
+am2strata agent start opencode --url http://<other-pc>:8000 --api-key ...   # another am2Strata
+```
+
+Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider and Goose are set up for you; Oh My Pi, Crush,
+Hermes, OpenClaw, Continue, Cline, Kilo Code, Zed and VS Code get the exact block to enter. See
+[docs/AGENTS.md](docs/AGENTS.md), or Settings › Connect › Coding agents.
+
 ## Build from source (the NVIDIA fast path)
 
 ### Requirements
