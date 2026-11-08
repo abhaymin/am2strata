@@ -72,7 +72,7 @@ fn placement(s: &AppState, size_gb: f64, tts: bool) -> (&'static str, bool) {
 /// One audio job on the media engine: the GPU taken when it runs there, the Monitor told, the engine's models freed
 /// after a GPU job. `on_event` sees the engine's progress events.
 async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cmd: Value, mut on_event: impl FnMut(&Value))
-             -> Result<(Value, &'static str, u64), Response> {
+             -> Result<(Value, &'static str, crate::monitor::MediaRow), Response> {
     let (device, gpu) = placement(s, size_gb, kind == "text-to-speech");
     cmd["device"] = json!(device);
     let _turn = if gpu {
@@ -83,6 +83,7 @@ async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cm
     };
     let mon = s.mgr.monitor.clone();
     let id = mon.media_begin(kind, model);
+    let row = crate::monitor::MediaRow::new(&mon, id);
     let r = s.media.call(cmd, |ev| {
         if ev["event"] == "part" {
             mon.media_step(id, ev["done"].as_u64().unwrap_or(0), ev["total"].as_u64().unwrap_or(1));
@@ -109,7 +110,7 @@ async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cm
         }));
     }
     match r {
-        Ok(v) => Ok((v, device, id)),
+        Ok(v) => Ok((v, device, row)),
         Err(e) => {
             mon.media_end(id, "error", &format!("{e:#}"));
             Err(error(StatusCode::BAD_GATEWAY, "audio_error", format!("{e:#}")))
@@ -183,10 +184,11 @@ async fn transcribe(s: AppState, headers: HeaderMap, req: Request, translate: bo
         cmd["language"] = json!(l.to_lowercase());
     }
     let kind = if translate { "translation" } else { "speech-to-text" };
-    let (r, device, id) = match job(&s, kind, &model, m["size_gb"].as_f64().unwrap_or(1.0), cmd, |_| {}).await {
+    let (r, device, row) = match job(&s, kind, &model, m["size_gb"].as_f64().unwrap_or(1.0), cmd, |_| {}).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    let id = row.id;
     let text = r["text"].as_str().unwrap_or("").to_string();
     let secs = r["duration"].as_f64().unwrap_or(0.0);
     let words: usize = text.split_whitespace().count();
@@ -223,6 +225,7 @@ pub async fn transcribe_for_chat(s: &AppState, b64: &str) -> Result<(String, f64
     let m = audio_model(s, &model, "stt").await.map_err(|_| format!("{model} is not downloaded (Settings > Models > Media models > Audio)"))?;
     let mon = s.mgr.monitor.clone();
     let id = mon.media_begin("speech-to-text", &model);
+    let _row = crate::monitor::MediaRow::new(&mon, id);
     let r = s.media.call(json!({"op": "transcribe", "model": model, "audio": b64, "translate": false, "device": "cpu"}), |_| {}).await;
     if mem_available_gb() < m["size_gb"].as_f64().unwrap_or(1.0) * 2.0 + 2.0 {
         let _ = s.media.call(json!({"op": "unload_audio"}), |_| {}).await;
@@ -283,10 +286,11 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     if let Some(t) = req["temperature"].as_f64() {
         cmd["temperature"] = json!(t.clamp(0.0, 2.0)); // Parler samples at 0.7 unless told (0: greedy)
     }
-    let (r, device, id) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
+    let (r, device, row) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
         Ok(x) => x,
         Err(r) => return r,
     };
+    let id = row.id;
     let wav = match base64::engine::general_purpose::STANDARD.decode(r["data"].as_str().unwrap_or("")) {
         Ok(b) => b,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "audio_error", "the media engine returned no audio"),

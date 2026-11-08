@@ -343,6 +343,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin(if edit_images.is_empty() { "image" } else { "image edit" }, &model);
+    let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut data = Vec::new();
     let mut failure = None;
     let mut ran = steps.unwrap_or(0);
@@ -567,6 +568,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
                    "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("video", &model);
+    let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut clip = None;
     let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
         if ev["event"] == "video" && clip.is_none() {

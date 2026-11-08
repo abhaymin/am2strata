@@ -526,6 +526,26 @@ impl Drop for Waiting {
     }
 }
 
+/// A running media job: recorded as "disconnect" when dropped before `media_end` (its client went away), so the
+/// live view does not show it running for ever.
+pub struct MediaRow {
+    mon: Arc<Monitor>,
+    pub id: u64,
+}
+
+impl MediaRow {
+    pub fn new(mon: &Arc<Monitor>, id: u64) -> Self {
+        Self { mon: mon.clone(), id }
+    }
+}
+
+impl Drop for MediaRow {
+    fn drop(&mut self) {
+        // a no-op when the job already ended
+        self.mon.media_end(self.id, "disconnect", "the client went away before it ended");
+    }
+}
+
 /// One running request; recorded in the history by `finish`, or as "disconnect" when dropped before.
 pub struct Record {
     mon: Arc<Monitor>,
@@ -809,6 +829,22 @@ mod sampler {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_media_job_whose_client_went_away_ends_as_a_disconnect() {
+        let m = Arc::new(Monitor::new(None));
+        let id = m.media_begin("text-to-speech", "parler-tts-mini-v1");
+        drop(MediaRow::new(&m, id));
+        let v = m.metrics(Value::Null, false, true);
+        assert_ne!(v["live"]["state"], "media", "{v}");
+        assert_eq!(v["requests"][0]["finish"], "disconnect");
+        // a job that ended first is not ended twice
+        let id = m.media_begin("image", "z-image-turbo:q8");
+        let row = MediaRow::new(&m, id);
+        m.media_end(id, "stop", "1 image, 512x512");
+        drop(row);
+        assert_eq!(m.metrics(Value::Null, false, true)["requests"].as_array().map(Vec::len), Some(2));
+    }
 
     #[tokio::test]
     async fn the_history_file_is_read_back_at_the_next_start() {
