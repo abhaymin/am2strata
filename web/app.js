@@ -757,7 +757,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
         const media = (r.media || []).map((f) => `<span class="req-media" data-name="${esc(f.name)}" data-type="${esc(f.type)}"></span>`).join("");
         return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
           <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td>
-          <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} steps` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
+          <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} ${mediaUnit(r.kind)}${r.steps === 1 ? "" : "s"}` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
       }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
