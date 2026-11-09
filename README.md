@@ -108,6 +108,16 @@ cargo build --release --manifest-path crates/strata-media/Cargo.toml --features 
 - `POST /v1/audio/speech` takes OpenAI's fields. For Chatterbox it also takes:
   - `voice_audio`: a clip, in base64 or as a data URL;
   - `language`, `exaggeration`, `seed`, `temperature`.
+- Speech is spoken in the language of the text:
+  - `language` is a code (`es`, `hi`, ...) or `auto`; it is `auto` when left out, and the server finds the
+    language from the text;
+  - a model that speaks only English hands other languages to Chatterbox Multilingual when it is downloaded, unless
+    the request names the model (`"switch_for_language": true` allows it anyway);
+  - the answer says what was spoken in `x-strata-language` and `x-strata-model`, and what was found in
+    `x-strata-language-found`. A language found but spoken by no model here is read as English; one asked for is
+    refused, with the download it needs.
+  - The web app's Text to speech has a Language picker (Auto by default), and Read aloud in the chat speaks each answer
+    in its own language.
 - `voice` names one of the built-in voices (laura, jon, lea, gary). Their clips are made once with Parler.
 - Clone only a voice whose speaker has agreed to it.
 

@@ -309,6 +309,7 @@ function fillModelPickers() {
   }
   fillVideoSizes();
   fillEditRow();
+  fillTtsLanguages();
 }
 // Image > edit: shown for a model that takes edit images; the files picked (or a result sent back to it)
 let editImages = [];
@@ -2848,10 +2849,37 @@ async function transcribe(blob, {model, language, translate} = {}) {
   if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
   return j;
 }
-async function speakText(text, {model, voice} = {}) {
-  const r = await fetch("v1/audio/speech", {method: "POST", headers: headers(true), body: JSON.stringify({input: text, model, voice})});
+// language: a code, or "auto" (the server finds it from the text and picks a model that speaks it)
+async function speakText(text, {model, voice, language = "auto"} = {}) {
+  const r = await fetch("v1/audio/speech", {method: "POST", headers: headers(true),
+    body: JSON.stringify({input: text, model, voice, language, switch_for_language: true})});
   if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error((j.error && j.error.message) || r.statusText); }
-  return {blob: await r.blob(), seconds: +(r.headers.get("x-strata-seconds") || 0)};
+  return {blob: await r.blob(), seconds: +(r.headers.get("x-strata-seconds") || 0), model: r.headers.get("x-strata-model") || model,
+          language: r.headers.get("x-strata-language") || "", found: r.headers.get("x-strata-language-found") || ""};
+}
+// language names for the picker and the notes: every language a downloaded speech model speaks
+function ttsLanguages() {
+  const seen = new Map();
+  for (const m of media.models || []) {
+    if (m.kind === "audio" && m.task === "tts" && m.downloaded) for (const l of m.languages || []) seen.set(l.code, l.name);
+  }
+  return [...seen].sort((a, b) => a[1].localeCompare(b[1]));
+}
+function langName(code) {
+  const n = {zh: "Chinese", ja: "Japanese", he: "Hebrew", th: "Thai", en: "English"};
+  return (ttsLanguages().find((l) => l[0] === code) || [])[1] || n[code] || code;
+}
+function fillTtsLanguages() {
+  const sel = $("tts-lang"), keep = sel.value || store.get("tts-lang", "auto");
+  const langs = ttsLanguages();
+  sel.innerHTML = `<option value="auto">Auto (from the text)</option>` +
+    (langs.length ? langs : [["en", "English"]]).map(([c, n]) => `<option value="${esc(c)}">${esc(n)}</option>`).join("");
+  sel.value = [...sel.options].some((o) => o.value === keep) ? keep : "auto";
+}
+$("tts-lang").onchange = () => store.set("tts-lang", $("tts-lang").value);
+// a note when the text was read in another language than the one found in it
+function langNote(r) {
+  return r.found && r.found !== r.language ? `Read in ${langName(r.language)}: no speech model here speaks ${langName(r.found)} yet.` : "";
 }
 let sttBlob = null;
 $("stt-rec").onclick = async () => {
@@ -2903,13 +2931,17 @@ $("tts-form").onsubmit = async (ev) => {
   const t0 = performance.now();
   $("tts-hint").textContent = "Speaking… (a sentence takes some seconds on the CPU)";
   try {
-    const {blob, seconds} = await speakText(text, {model: $("tts-model").value, voice});
+    const said = await speakText(text, {model: $("tts-model").value, voice, language: $("tts-lang").value});
+    const {blob, seconds} = said;
     const url = URL.createObjectURL(blob);
     const fig = document.createElement("figure");
     const a = document.createElement("audio");
     a.controls = true; a.src = url; a.autoplay = true;
     const cap = document.createElement("figcaption");
-    cap.innerHTML = `${fmt(seconds, 1)} s of speech in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(text.slice(0, 120))} · <a href="${url}" download="am2strata-speech.wav">save</a>`;
+    cap.innerHTML = `${fmt(seconds, 1)} s of speech in ${esc(langName(said.language))} (${esc(said.model)}) in ${((performance.now() - t0) / 1000).toFixed(0)} s: ` +
+      `${esc(text.slice(0, 120))} · <a href="${url}" download="am2strata-speech.wav">save</a>`;
+    const note = langNote(said);
+    if (note) toast("warn", "Another language", note, 8000);
     fig.append(a, cap);
     $("img-results").prepend(fig);
     $("img-results").hidden = false;
@@ -2957,7 +2989,11 @@ async function readAloud(i, btn) {
   if (!text) return;
   btn.classList.add("rec-on"); btn.disabled = true;
   try {
-    const {blob} = await speakText(text, {model: media.tts_model});
+    // the answer is read in its own language (found by the server), by a model that speaks it
+    const said = await speakText(text, {model: media.tts_model, language: "auto"});
+    const {blob} = said;
+    const note = langNote(said);
+    if (note) toast("warn", "Read in another language", note, 8000);
     const audio = new Audio(URL.createObjectURL(blob));
     speaking = {audio, button: btn};
     audio.onended = () => { btn.classList.remove("rec-on"); speaking = null; };

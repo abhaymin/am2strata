@@ -11,6 +11,7 @@ mod anthropic;
 mod browser;
 mod api_monitor;
 mod audio_api;
+mod langdetect;
 mod code_run;
 mod image_gen;
 mod preview;

@@ -224,10 +224,12 @@
             <label class="st-field">Voice
               <select class="st-input" id="tts-voice"><option value="laura">Laura: calm and clear</option><option value="jon">Jon: warm, steady</option>
                 <option value="lea">Lea: bright, expressive</option><option value="gary">Gary: slow, deep</option><option value="custom">described in words&hellip;</option></select></label>
+            <label class="st-field">Language
+              <select class="st-input" id="tts-lang"><option value="auto">Auto (from the text)</option></select></label>
             <button type="submit" class="st-btn st-btn--primary" id="tts-go">Speak</button>
           </div>
           <input class="st-input" id="tts-desc" placeholder="e.g. A woman speaks quickly and cheerfully, close to the microphone" hidden>
-          <span class="composer-hint" id="tts-hint">English. Long text is spoken sentence by sentence.</span>
+          <span class="composer-hint" id="tts-hint">Auto speaks the language of the text. English-only models hand other languages to Chatterbox Multilingual when it is downloaded. Long text is spoken sentence by sentence.</span>
         </form>
         <div class="st-card toggle-row"><span>Where speech runs<br><span class="muted small">Auto: on the CPU when the RAM has room for
           the model, else on the GPU with the text model stopped for the job (it loads again with the next chat).</span></span>

@@ -1043,7 +1043,7 @@ fn speech_is_transcribed_and_spoken_in_openais_shapes() {
 fn chatterbox_speaks_on_the_cpu_in_the_voice_of_a_clip_and_parler_refuses_a_clip() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));
     let c = reqwest::blocking::Client::new();
-    let body = json!({"input": "Hola.", "model": "chatterbox-turbo", "voice_audio": "data:audio/wav;base64,UklGRg==",
+    let body = json!({"input": "Hola.", "model": "chatterbox-multilingual", "voice_audio": "data:audio/wav;base64,UklGRg==",
                       "language": "ES", "exaggeration": 3.0});
     let w = c.post(format!("{}/v1/audio/speech", s.base)).bearer_auth(KEY).json(&body).send().unwrap();
     assert_eq!(w.status().as_u16(), 200);
@@ -1061,6 +1061,51 @@ fn chatterbox_speaks_on_the_cpu_in_the_voice_of_a_clip_and_parler_refuses_a_clip
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 2}));
     let (code, r) = s.post("/v1/audio/speech", &json!({"input": "x", "model": "chatterbox-turbo"}));
     assert!(code == 503 && r["error"]["message"].as_str().unwrap().contains("free RAM"), "{r}");
+}
+
+#[test]
+fn speech_is_spoken_in_the_language_of_the_text() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));
+    let c = reqwest::blocking::Client::new();
+    let speak = |body: Value| {
+        let r = c.post(format!("{}/v1/audio/speech", s.base)).bearer_auth(KEY).json(&body).send().unwrap();
+        let h = |k: &str| r.headers().get(k).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+        let (code, model, lang, found) = (r.status().as_u16(), h("x-strata-model"), h("x-strata-language"), h("x-strata-language-found"));
+        let text = r.text().unwrap();
+        (code, model, lang, found, text)
+    };
+    let last_speak = || {
+        let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+        rec.lines().rev().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "speak").unwrap()
+    };
+    // Spanish text, no model named: the multilingual model, in Spanish
+    let (code, model, lang, _, _) = speak(json!({"input": "El modelo está funcionando en tu propio ordenador y no sale nada."}));
+    assert_eq!((code, model.as_str(), lang.as_str()), (200, "chatterbox-multilingual", "es"));
+    assert_eq!((last_speak()["model"].as_str(), last_speak()["language"].as_str()), (Some("chatterbox-multilingual"), Some("es")));
+    // "auto" is the same; a language asked for wins over the text's
+    let (_, _, lang, _, _) = speak(json!({"input": "Le modèle tourne sur votre ordinateur, et rien ne sort.", "language": "auto"}));
+    assert_eq!(lang, "fr");
+    let (code, model, lang, _, _) = speak(json!({"input": "Hello there.", "language": "HI"}));
+    assert_eq!((code, model.as_str(), lang.as_str()), (200, "chatterbox-multilingual", "hi"));
+    // English stays on the default model
+    let (code, model, lang, _, _) = speak(json!({"input": "The model runs on your own computer."}));
+    assert!(code == 200 && model != "chatterbox-multilingual" && lang == "en", "{model} {lang}");
+    // a named English-only model and a language it does not speak: refused, with the way out
+    let (code, _, _, _, body) = speak(json!({"input": "Bonjour.", "model": "chatterbox-turbo", "language": "fr"}));
+    assert!(code == 400 && body.contains("does not speak French"), "{body}");
+    // the web app names its picker's model and allows the swap
+    let (code, model, lang, _, _) = speak(json!({"input": "Hola, ¿cómo estás? El modelo está en tu ordenador.", "model": "chatterbox-turbo",
+                                                 "switch_for_language": true}));
+    assert_eq!((code, model.as_str(), lang.as_str()), (200, "chatterbox-multilingual", "es"));
+    // a language no model here speaks: found only, read as English and said so; asked for, refused
+    let (code, _, lang, found, _) = speak(json!({"input": "模型在你自己的电脑上运行。"}));
+    assert_eq!((code, lang.as_str(), found.as_str()), (200, "en", "zh"));
+    let (code, _, _, _, body) = speak(json!({"input": "模型在你自己的电脑上运行。", "language": "zh"}));
+    assert!(code == 400 && body.contains("speaks Chinese yet"), "{body}");
+    // the multilingual model not downloaded: the message says which download it takes
+    let s2 = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64, "no_multilingual": true}));
+    let (code, r) = s2.post("/v1/audio/speech", &json!({"input": "Hola.", "language": "es"}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("download"), "{r}");
 }
 
 #[test]

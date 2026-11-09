@@ -48,6 +48,19 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
     Ok(m)
 }
 
+/// A language's English name, for messages ("Chinese" for "zh"); the code itself when it is not known here.
+fn language_name(code: &str) -> String {
+    let names = [("zh", "Chinese"), ("ja", "Japanese"), ("he", "Hebrew"), ("th", "Thai"), ("en", "English")];
+    strata_names(code).or_else(|| names.iter().find(|n| n.0 == code).map(|n| n.1.to_string())).unwrap_or_else(|| code.to_string())
+}
+
+fn strata_names(code: &str) -> Option<String> {
+    const L: &[(&str, &str)] = &[("ar", "Arabic"), ("da", "Danish"), ("de", "German"), ("el", "Greek"), ("es", "Spanish"),
+        ("fi", "Finnish"), ("fr", "French"), ("hi", "Hindi"), ("it", "Italian"), ("ko", "Korean"), ("ms", "Malay"), ("nl", "Dutch"),
+        ("no", "Norwegian"), ("pl", "Polish"), ("pt", "Portuguese"), ("ru", "Russian"), ("sv", "Swedish"), ("sw", "Swahili"), ("tr", "Turkish")];
+    L.iter().find(|l| l.0 == code).map(|l| l.1.to_string())
+}
+
 /// Where this job runs, and whether it holds the GPU (the text model stopped meanwhile).
 fn placement(s: &AppState, size_gb: f64, tts: bool) -> (&'static str, bool) {
     // an engine without CUDA computes on the CPU whatever the setting
@@ -281,11 +294,46 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     if let Some(f) = req["response_format"].as_str().filter(|f| *f != "wav") {
         return bad(format!("response_format {f:?}: this server makes wav (WAVE, 16-bit PCM) only"));
     }
-    let model = openai_name(req["model"].as_str(), s.media.tts_model(), &["tts-1", "tts-1-hd"]);
-    let m = match audio_model(&s, &model, "tts").await {
+    let mut model = openai_name(req["model"].as_str(), s.media.tts_model(), &["tts-1", "tts-1-hd"]);
+    let mut m = match audio_model(&s, &model, "tts").await {
         Ok(m) => m,
         Err(r) => return r,
     };
+    // The language: the one asked for, or found from the text ("auto", or none given). A model that does not speak
+    // it is swapped for a downloaded one that does, unless the caller named the model.
+    // the web app names its picker's model and allows the swap ("switch_for_language": true)
+    let named = req["model"].as_str().is_some_and(|n| n == model) && req["switch_for_language"] != true;
+    let asked = req["language"].as_str().map(|l| l.trim().to_lowercase()).filter(|l| !l.is_empty() && l != "auto");
+    let language = asked.clone().unwrap_or_else(|| crate::langdetect::detect(text).to_string());
+    let speaks = |m: &Value, l: &str| match m["languages"].as_array() {
+        Some(a) => a.iter().any(|x| x["code"] == l),
+        None => l == "en",   // Chatterbox Turbo and Parler speak English
+    };
+    let detected = language.clone();
+    let mut language = language;
+    if !speaks(&m, &language) {
+        let list = s.media.list().await.unwrap_or_default();
+        let other = list["models"].as_array().and_then(|a| a.iter().find(|x| x["kind"] == "audio" && x["task"] == "tts"
+            && x["downloaded"] == true && speaks(x, &language)).cloned());
+        let name = language_name(&language);
+        match other {
+            Some(o) if !named => {
+                model = o["name"].as_str().unwrap_or_default().to_string();
+                m = o;
+            }
+            // only found, not asked for: read as English, as before, and the header says what was found
+            _ if asked.is_none() => language = "en".into(),
+            Some(_) => return bad(format!("{model} does not speak {name}; leave out \"model\", or name {}", "chatterbox-multilingual")),
+            None => {
+                let any = list["models"].as_array().and_then(|a| a.iter().find(|x| x["kind"] == "audio" && speaks(x, &language)).cloned());
+                return bad(match any {
+                    Some(x) => format!("{} needs {} ({} GB): download it in Settings > Models > Media models > Audio",
+                                       name, x["name"].as_str().unwrap_or("?"), x["size_gb"]),
+                    None => format!("no speech model here speaks {name} yet"),
+                });
+            }
+        }
+    }
     // OpenAI's voice names map to this model's voices; a sentence describing a voice is taken as it is
     let voice = req["voice"].as_str().unwrap_or("laura");
     let voice = match voice {
@@ -308,8 +356,8 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
             }
             cmd["voice_audio"] = json!(b64);
         }
-        if let Some(l) = req["language"].as_str().filter(|l| !l.is_empty()) {
-            cmd["language"] = json!(l.to_lowercase());
+        if m["languages"].is_array() {
+            cmd["language"] = json!(language);
         }
         if let Some(x) = req["exaggeration"].as_f64() {
             cmd["exaggeration"] = json!(x.clamp(0.0, 2.0));
@@ -331,7 +379,7 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     s.mgr.monitor.media_end(id, "stop", &format!("{:.1} s of speech, {} characters, on the {device}", r["seconds"].as_f64().unwrap_or(0.0),
                                           text.chars().count()));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav")
-        .header("x-strata-seconds", r["seconds"].to_string()).header("x-strata-model", model)
+        .header("x-strata-seconds", r["seconds"].to_string()).header("x-strata-model", model).header("x-strata-language", language).header("x-strata-language-found", detected)
         .body(Body::from(wav)).unwrap()
 }
 
