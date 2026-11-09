@@ -144,6 +144,19 @@ pub fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
     same(bearer) || same(x_key)
 }
 
+/// The key in use when the default model's run config has none: the newest other run config's `api_key` (the key the
+/// server ran with before its default model changed), so a new default never leaves the server open by accident.
+fn other_key(models: &[manager::ModelEntry], default: &str) -> Option<String> {
+    let mut with_key: Vec<&manager::ModelEntry> = models.iter()
+        .filter(|m| m.id != default && m.cfg.api_key.as_deref().is_some_and(|k| !k.is_empty())).collect();
+    with_key.sort_by_key(|m| std::cmp::Reverse(std::fs::metadata(&m.path).and_then(|md| md.modified()).ok()));
+    let m = with_key.first()?;
+    let distinct: std::collections::HashSet<_> = with_key.iter().filter_map(|m| m.cfg.api_key.as_deref()).collect();
+    tracing::warn!("{default}'s run config has no api_key: using the one in {} (set \"api_key\" there to choose){}",
+                   m.path.display(), if distinct.len() > 1 { "; the run configs hold different keys, the newest was taken" } else { "" });
+    m.cfg.api_key.clone()
+}
+
 /// The names this server answers to: IP addresses, localhost, this PC's name (and name.local), the hosts of the
 /// trusted origins and the config's `allowed_hosts`. A request for any other Host is refused: a web page that points
 /// its own domain at this PC (DNS rebinding) would otherwise pass for this server's own page.
@@ -259,7 +272,8 @@ async fn main() -> Result<()> {
     }
     let host = args.host.or(first.cfg.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
     let port = args.port.or(first.cfg.port).unwrap_or(8080);
-    let api_key = args.api_key.or(first.cfg.api_key.clone());
+    let api_key = args.api_key.or(first.cfg.api_key.clone()).filter(|k| !k.is_empty())
+        .or_else(|| other_key(&models, &default));
     for m in &models {
         tracing::info!(id = %m.id, context = m.cfg.max_context(), images = m.cfg.vision.is_some(), "installed model");
     }

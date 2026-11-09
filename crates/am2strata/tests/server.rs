@@ -1064,6 +1064,16 @@ fn chatterbox_speaks_on_the_cpu_in_the_voice_of_a_clip_and_parler_refuses_a_clip
 }
 
 #[test]
+fn a_default_model_without_a_key_uses_the_key_of_another_run_config() {
+    // the default model's run config has no api_key; another model's has one: the server takes it, never runs open
+    let a = Model { id: "mock-a", extra: json!({"api_key": ""}), ..Model::default() };
+    let b = Model { id: "mock-b", ..Model::default() };
+    let s = Server::start(&[a, b], &[ids("x")], json!({}));
+    assert_eq!(s.get("/v1/models", false).0, 401, "no key: refused");
+    assert_eq!(s.get("/v1/models", true).0, 200, "the other run config's key works");
+}
+
+#[test]
 fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
     for (mem, unloads) in [(1, true), (64, false)] {
         let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": mem}));
