@@ -1,0 +1,48 @@
+# ACE-Step 1.5 in Rust (songs in am2Strata)
+
+Owner's decision (2026-11-09): songs are made inside am2Strata, in Rust (candle), not by calling ACE-Step's Python, and
+they get their own section in the web app, with songs in many languages. The Python install in
+`~/Development/ref/ACE-Step-1.5` is only the reference the port is checked against.
+
+## What ACE-Step 1.5 is made of (the checkpoints downloaded here)
+
+| Part | Checkpoint | Size | Rust |
+| --- | --- | --- | --- |
+| Caption encoder | `Qwen3-Embedding-0.6B` (Qwen3, 28 layers, hidden 1024) | 1.2 GB | candle's `qwen3` |
+| Song planner (optional) | `acestep-5Hz-lm-1.7B` (Qwen3, 28 layers, hidden 2048; vocab 217,204 with the audio-code tokens) | 3.5 GB | candle's `qwen3` and its sampling loop |
+| DiT (turbo, 8 steps) | `acestep-v15-turbo`: lyric encoder (8 layers), timbre encoder (4), attention pooler, FSQ audio tokenizer and detokenizer, 24-layer diffusion transformer (hidden 2048, 16 heads, 8 KV heads, sliding window 128, patch 2), timestep embedding | 4.5 GB | new: `crates/strata-media/src/acestep/` |
+| Audio decoder | `vae`: AutoencoderOobleck (Stable Audio), 64 latent channels at 25 Hz, 48 kHz stereo, strides 2·4·4·6·10 | 0.3 GB | new, close to candle's DAC (Snake, weight-normed convs) |
+
+Plus the sampler: flow-matching ODE (Euler) on the turbo schedule (shift 3: 1.0, 0.955, 0.9, 0.833, 0.75, 0.643, 0.5,
+0.3), and the "DCW" wavelet correction it applies by default (Haar). Turbo has classifier-free guidance distilled
+in: one forward pass a step.
+
+The planner is optional: without it (ACE-Step's own low-VRAM mode) the DiT sings the given lyrics from the caption.
+So the first milestone leaves it out.
+
+## Stages, each with a gate against the Python reference
+
+0. **Golden files** (`~/Development/ref/acestep-golden.py`): one 10 s song, fixed seed, planner off. Saved per stage
+   (safetensors): caption and lyric token ids, caption encoder output, condition encoder output, initial noise,
+   the latent after each of the 8 steps, the final latent, the decoded audio.
+1. **Audio decoder (Oobleck):** final latent → audio. Gate: SNR above 40 dB against the reference audio (f32, CPU).
+2. **Caption encoder (Qwen3-Embedding) and the text preparation** (ACE-Step's prompt format for caption and lyrics,
+   per language). Gate: hidden states within 1e-3.
+3. **DiT:** condition encoder (lyric, timbre, pooler), the 24 layers with sliding-window attention, timestep
+   embedding, the Euler steps and DCW. Gate: each step's latent within 1e-2 (bf16 weights), the final audio SNR
+   above 25 dB.
+4. **Engine and server:** a `music` kind in the media catalog (download, size, GPU placement; the text model stops
+   for the job like an image), `POST /v1/audio/music` (`lyrics`, `style`, `language`, `duration`, `seed`), a
+   job with progress, the chat tool `make_song`, a Monitor row with a player. A lyric check: Whisper hears the vocals,
+   and a take that misses too many lyric words is made again with another seed (the Hindi test needed it).
+5. **Web app: a Songs tab under Media Generation** (beside Image, Video and Audio; owner's choice):
+   - lyrics with structure tags (verse, chorus, bridge), a style description with presets, the vocal language
+     (ACE-Step sings 50+; the picker lists them by name), duration, seed;
+   - the player, Save, and "make another take";
+   - a note that songs are AI-made.
+6. **The planner (Qwen3 1.7B):** audio codes at 5 Hz for song structure, and "write the lyrics for me" from a
+   description. Gate: the same codes as Python for greedy sampling.
+7. **Measured and documented:** time and VRAM on the RTX 5060 Ti against the Python numbers (about 12 s and 9.85 GB
+   for 60 s), README, NOTICE (MIT, ACE-Step).
+
+Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.

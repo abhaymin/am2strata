@@ -38,6 +38,9 @@ use std::sync::{Arc, Mutex};
 mod audio;
 #[path = "../parler_hf.rs"]
 mod parler_hf;
+#[path = "../acestep/mod.rs"]
+#[allow(dead_code)]
+mod acestep;
 #[cfg(feature = "onnx")]
 #[path = "../chatterbox.rs"]
 mod chatterbox;
