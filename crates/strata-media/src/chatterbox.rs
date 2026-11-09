@@ -31,6 +31,10 @@ const HEAD_DIM: usize = 64;
 /// the decoder's reference: at most 10 s of the clip (chatterbox's DEC_COND_LEN)
 const REF_SECONDS: usize = 10;
 
+/// Takes of a part before the best is kept, and the score a take needs to be kept at once.
+pub const TAKES: usize = 3;
+pub const GOOD_TAKE: f32 = 0.75;
+
 /// How the next speech token is drawn. Greedy at temperature 0; else chatterbox's defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct Sampling {
@@ -322,8 +326,11 @@ impl Chatterbox {
 
     /// Speech for `text` in the voice of `clip` (24 kHz mono): part by part, joined with a short pause. `on_part` sees
     /// (done, total) parts.
+    /// `check` scores a part's speech against its text (0 to 1; None: no checker): a part scoring under
+    /// `GOOD_TAKE` is made again with another seed, up to `TAKES` times, and the best take is kept. Chatterbox sometimes
+    /// adds words at the start or end of a part, or drops some; this catches it.
     pub fn speak(&mut self, text: &str, clip: &[f32], language: Option<&str>, exaggeration: f32, s: &Sampling,
-                 on_part: &mut dyn FnMut(usize, usize)) -> Result<Vec<f32>> {
+                 on_part: &mut dyn FnMut(usize, usize), check: &mut dyn FnMut(&str, &[f32]) -> Option<f32>) -> Result<Vec<f32>> {
         let parts = audio::sentences(text, 300);
         if parts.is_empty() {
             bail!("nothing to say");
@@ -334,27 +341,41 @@ impl Chatterbox {
         for (k, p) in parts.iter().enumerate() {
             // 25 speech tokens a second; a generous bound for the words given (it stops at its own end)
             let max_new = ((p.chars().count() as f64 / 12.0 + 3.0) * 25.0).min(1500.0) as usize;
-            let mut sk = *s;
-            sk.seed = s.seed.wrapping_add(k as u64);
-            let speech = self.tokens(p, key, language, exaggeration, &sk, max_new)?;
-            let v = &self.voices[&key];
-            let mut toks = v.prompt.clone();
-            toks.extend(&speech);
-            if !self.multilingual {
-                toks.extend([SILENCE; 3]);
+            let mut best: Option<(f32, Vec<f32>)> = None;
+            for t in 0..TAKES {
+                let mut sk = *s;
+                sk.seed = s.seed.wrapping_add(k as u64).wrapping_add(t as u64 * 1009);
+                let speech = self.tokens(p, key, language, exaggeration, &sk, max_new)?;
+                let v = &self.voices[&key];
+                let mut toks = v.prompt.clone();
+                toks.extend(&speech);
+                if !self.multilingual {
+                    toks.extend([SILENCE; 3]);
+                }
+                let (x, f) = (v.x_vector.clone(), v.features.clone());
+                let n = toks.len() as i64;
+                let wav = self.decoder.run(ort::inputs![
+                    "speech_tokens" => tensor(vec![1, n], toks)?,
+                    "speaker_embeddings" => tensor(vec![1, x.len() as i64], x)?,
+                    "speaker_features" => tensor(f.0, f.1)?,
+                ])?;
+                let (_, pcm) = take::<f32>(&wav["waveform"])?;
+                let pcm = pcm.to_vec();
+                let Some(score) = check(p, &pcm) else {
+                    best = Some((1.0, pcm));
+                    break;
+                };
+                if best.as_ref().is_none_or(|b| score > b.0) {
+                    best = Some((score, pcm));
+                }
+                if score >= GOOD_TAKE {
+                    break;
+                }
             }
-            let (x, f) = (v.x_vector.clone(), v.features.clone());
-            let n = toks.len() as i64;
-            let wav = self.decoder.run(ort::inputs![
-                "speech_tokens" => tensor(vec![1, n], toks)?,
-                "speaker_embeddings" => tensor(vec![1, x.len() as i64], x)?,
-                "speaker_features" => tensor(f.0, f.1)?,
-            ])?;
-            let (_, pcm) = take::<f32>(&wav["waveform"])?;
             if k > 0 {
                 out.extend_from_slice(&pause);
             }
-            out.extend(pcm);
+            out.extend(best.map(|b| b.1).unwrap_or_default());
             on_part(k + 1, parts.len());
         }
         Ok(audio::loudness(&out))

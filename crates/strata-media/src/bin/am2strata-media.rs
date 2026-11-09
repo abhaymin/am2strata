@@ -211,13 +211,31 @@ fn speak_chatterbox(st: &mut State, e: &'static audio::Entry, cmd: &Value) -> Re
     if let Some(t) = cmd["temperature"].as_f64() {
         s.temperature = t as f32;
     }
+    // the take check: Whisper (the model the request names, on the CPU) hears each part, and a part that does not
+    // match its text is made again (see Chatterbox::speak)
+    let language = cmd["language"].as_str().filter(|l| !l.is_empty());
+    let mut whisper = None;
+    if let Some(e) = cmd["check_model"].as_str().and_then(audio::entry).filter(|e| e.task == "stt" && audio::downloaded(e)) {
+        whisper = match st.whisper.take() {
+            Some(w) if w.name == e.name => Some(w),
+            _ => Some(audio::Whisper::load(e, &json!({"device": "cpu"}))?),
+        };
+    }
+    let mut takes = 0usize;
+    let mut check = |said: &str, pcm: &[f32]| -> Option<f32> {
+        let w = whisper.as_mut()?;
+        takes += 1;
+        let heard = w.run(&audio::resample(pcm, chatterbox::RATE, 16000), language, false, &mut |_| {}).ok()?;
+        Some(audio::words_score(said, heard["text"].as_str().unwrap_or("")))
+    };
     let t0 = std::time::Instant::now();
-    let pcm = st.chatterbox.as_mut().unwrap().speak(&text, &clip, cmd["language"].as_str().filter(|l| !l.is_empty()),
+    let pcm = st.chatterbox.as_mut().unwrap().speak(&text, &clip, language,
         cmd["exaggeration"].as_f64().unwrap_or(0.5) as f32, &s,
-        &mut |done, total| emit(json!({"event": "part", "done": done, "total": total})))?;
+        &mut |done, total| emit(json!({"event": "part", "done": done, "total": total})), &mut check)?;
+    st.whisper = whisper.or(st.whisper.take());
     let rate = chatterbox::RATE;
     Ok(json!({"event": "speech", "format": "wav", "sample_rate": rate, "seconds": (pcm.len() as f64 / rate as f64 * 100.0).round() / 100.0,
-              "ms": t0.elapsed().as_millis() as u64, "model": e.name,
+              "ms": t0.elapsed().as_millis() as u64, "model": e.name, "checked_takes": takes,
               "data": base64::engine::general_purpose::STANDARD.encode(audio::wav(&pcm, rate))}))
 }
 

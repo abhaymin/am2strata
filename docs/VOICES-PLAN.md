@@ -55,7 +55,10 @@ Swedish, Swahili and Turkish. For those, until a source is found:
 
   The voices are native and of the right gender. The babble is Chatterbox's own: some takes add words at the start or
   end (the narration needed several seeds per line for the same reason).
-- Next: a retake in the engine when Whisper hears words that are not in the text (a few seeds, the best kept).
+- Take check (built): Whisper hears each Chatterbox part; a part whose words do not line up with its text (score
+  under 0.75: words in order over the longer word list) is made again with another seed, up to 3 takes, the best
+  kept. On by default when a speech-to-text model is downloaded; `"check": false` skips it. The Spanish and German
+  lines above, again with the same seed: only the words of the text (Spanish 231 Hz, German 218 Hz).
 
 ## Phases
 

@@ -26,6 +26,21 @@ Others, and why not first:
 Exact melodies (lyrics plus notes) are a separate kind of model: **DiffSinger** (OpenVPI), which publishes ONNX
 exports. That is phase 4 below.
 
+## Phase 0: the reference run (2026-11-09)
+
+ACE-Step 1.5's own pipeline (PyTorch 2.10, CUDA 12.8) on one RTX 5060 Ti 16 GB, the 2B turbo DiT (8 steps) with the
+1.7B planner, script `~/Development/ref/acestep-phase0.py`:
+
+| Song | Made in | Peak VRAM | Whisper turbo heard |
+| --- | --- | --- | --- |
+| English, 60 s, seed 42 | 11.9 s | 9.85 GB | every line of the verse, and the chorus |
+| Spanish, 60 s, seed 7 | 11.6 s | 9.85 GB | every line ("un comando" heard as "un tomando") |
+| Hindi, 60 s, seed 11 | 11.7 s | 9.86 GB | a long hummed opening, then the chorus only |
+
+Loading: 131 s for the DiT (its first run included), 20 s for the planner; 9.35 GB of VRAM once loaded; 12 GB peak
+RAM. Output: 48 kHz stereo. So a song takes about a fifth of its length on one card. Hindi needs another look (other
+seeds; whether Whisper hears sung Hindi well).
+
 ## Phases
 
 0. **Reference run (needs the owner's yes for downloads):**

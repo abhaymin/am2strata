@@ -93,14 +93,15 @@ async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cm
     let (device, gpu) = if onnx { ("cpu", false) } else { placement(s, size_gb, kind == "text-to-speech") };
     if onnx {
         // measured (2026-11-09): Chatterbox Turbo's 3.3 GB of fp32 weights peak at 5.0 GB while loading
-        let need = size_gb * 1.5 + 0.5;
+        // the take check's Whisper too (measured: Whisper large-v3-turbo peaks at 5.0 GB for 1.6 GB of weights)
+        let need = size_gb * 1.5 + 0.5 + cmd["check_gb"].as_f64().unwrap_or(0.0) * 3.0;
         let free = mem_available_gb();
         if free < need {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE, "busy",
                 format!("{model} needs about {need:.1} GB of free RAM on the CPU and {free:.1} GB is free: unload the text model or use a smaller speech model")));
         }
     }
-    cmd.as_object_mut().map(|o| o.remove("runtime"));
+    cmd.as_object_mut().map(|o| { o.remove("runtime"); o.remove("check_gb") });
     cmd["device"] = json!(device);
     let _turn = if gpu {
         Some(s.mgr.gpu_exclusive(!s.media.keep_text_model).await
@@ -365,6 +366,15 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
             cmd["exaggeration"] = json!(x.clamp(0.0, 2.0));
         }
         cmd["threads"] = json!(std::thread::available_parallelism().map(|n| (n.get() / 2).max(1)).unwrap_or(4));
+        // each part is heard by the speech-to-text model and made again when it does not match its text (some takes
+        // add or drop words); "check": false skips it
+        if req["check"] != false {
+            let stt = s.media.stt_model();
+            if let Ok(w) = audio_model(&s, &stt, "stt").await {
+                cmd["check_model"] = json!(stt);
+                cmd["check_gb"] = w["size_gb"].clone();
+            }
+        }
     } else if req["voice_audio"].is_string() {
         return bad(format!("voice_audio: {model} does not clone a voice; Chatterbox does"));
     }

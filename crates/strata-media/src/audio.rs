@@ -695,6 +695,29 @@ impl Parler {
     }
 }
 
+/// How well `heard` (a transcript) matches `said`: the words they share in order (longest common subsequence) over
+/// the longer of the two, from 0 to 1. Added words (babble at the start or end of a take) and dropped words both lower
+/// it. Case and punctuation do not count; letters of any script do.
+pub fn words_score(said: &str, heard: &str) -> f32 {
+    let words = |t: &str| -> Vec<String> {
+        t.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' }).collect::<String>()
+            .split_whitespace().map(str::to_string).collect()
+    };
+    let (a, b) = (words(said), words(heard));
+    if a.is_empty() || b.is_empty() {
+        return if a.is_empty() && b.is_empty() { 1.0 } else { 0.0 };
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    for x in &a {
+        let mut cur = vec![0usize; b.len() + 1];
+        for (j, y) in b.iter().enumerate() {
+            cur[j + 1] = if x == y { prev[j] + 1 } else { cur[j].max(prev[j + 1]) };
+        }
+        prev = cur;
+    }
+    prev[b.len()] as f32 / a.len().max(b.len()) as f32
+}
+
 /// Text cut at sentence ends into parts of at most `max` characters (a long sentence at its commas, then its spaces).
 pub fn sentences(text: &str, max: usize) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
@@ -881,6 +904,16 @@ pub fn loudness(x: &[f32]) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_take_with_babble_or_missing_words_scores_low() {
+        use super::words_score;
+        let said = "Hola. Este modelo funciona en tu propio ordenador, y tus datos no salen de él.";
+        assert!(words_score(said, "Hola, este modelo funciona en tu propio ordenador y tus datos no salen de él.") > 0.99);
+        assert!(words_score(said, "¡Hola! Este modelo funciona en tu propio ordenador y tus datos no salen de él. Ya has testoiz esta app si para the space") < 0.75);
+        assert!(words_score(said, "Hola, este modelo funciona.") < 0.75);
+        assert!(words_score("नमस्ते। यह मॉडल आपके अपने कंप्यूटर पर चलता है।", "नमस्ते यह मॉडल आपके अपने कंप्यूटर पर चलता है") > 0.99);
+    }
+
     use super::*;
 
     #[test]
