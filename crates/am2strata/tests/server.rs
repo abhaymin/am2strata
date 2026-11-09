@@ -1102,6 +1102,11 @@ fn speech_is_spoken_in_the_language_of_the_text() {
     assert_eq!((code, lang.as_str(), found.as_str()), (200, "en", "zh"));
     let (code, _, _, _, body) = speak(json!({"input": "模型在你自己的电脑上运行。", "language": "zh"}));
     assert!(code == 400 && body.contains("speaks Chinese yet"), "{body}");
+    // long speech: past OpenAI's 4,096 characters, up to 20,000 (about 20 minutes)
+    let (code, _, _, _, _) = speak(json!({"input": "The model runs on your own computer. ".repeat(150)}));
+    assert_eq!(code, 200, "5,550 characters (about 5 minutes) are spoken");
+    let (code, _, _, _, body) = speak(json!({"input": "x".repeat(20_001)}));
+    assert!(code == 400 && body.contains("20000"), "{body}");
     // a speech model (a plain name, no ":variant") can be downloaded; an unknown name cannot
     let (code, r) = s.post("/api/media/models/pull", &json!({"model": "chatterbox-multilingual"}));
     assert_eq!(code, 202, "{r}");

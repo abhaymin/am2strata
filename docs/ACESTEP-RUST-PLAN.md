@@ -46,3 +46,19 @@ So the first milestone leaves it out.
    for 60 s), README, NOTICE (MIT, ACE-Step).
 
 Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.
+
+## Progress (2026-11-09)
+
+| Stage | State | Checked |
+| --- | --- | --- |
+| 0. Golden files | done | `~/Development/ref/acestep-golden.py` |
+| 1. Audio decoder (Oobleck) | done | SNR 39.5 to 40.7 dB on the 4 recorded chunks (reference bf16) |
+| 2. Caption encoder, lyric embeddings, prompts | done | same token ids; cosine 0.9992+ per token; lyrics exact |
+| 3. Condition encoder, DiT, sampler, DCW | done | DiT against ACE-Step in f32: cosine 1.000000; the 8 bf16 steps 0.9926 to 0.9999; final latent 0.996 |
+| Pipeline (`acestep/pipeline.rs`) | done | the golden song made again in Rust from its noise: final latent 0.995, and Whisper hears its lyrics as in Python's |
+| 6. The planner | next | — |
+
+A 20 s song entirely in Rust: 96 s on the CPU (f32). Its vocals, without the planner, are mostly "ooh"; ACE-Step's own
+Python without the planner does the same (seeds 1 to 3: one half-heard line, "Thank you.", "Ah, ah"). With the
+planner (the 60 s songs of phase 0) the lyrics are sung. So the planner (stage 6) comes before the server stage: it is
+what makes the vocals follow the lyrics.

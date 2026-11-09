@@ -14,6 +14,8 @@ cudnn = ["mold-ai-inference/cudnn"]
 onnx = ["dep:ort"]
 
 [dependencies]
+# ACE-Step's silence latent is a PyTorch zip (the patched zip below)
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # mold (MIT; LTX-2 parts Apache-2.0): candle-based diffusion models, pinned to one commit
 # features: mp4 - MP4 (H.264 by OpenH264) output for video, which also builds the FDK-AAC codec (see NOTICE)
 mold-ai-inference = { git = "https://github.com/utensils/mold.git", rev = "bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b", features = ["mp4"] }

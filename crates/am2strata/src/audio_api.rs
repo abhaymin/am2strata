@@ -48,6 +48,8 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
     Ok(m)
 }
 
+pub const MAX_SPEECH_CHARS: usize = 20_000;
+
 /// A language's English name, for messages ("Chinese" for "zh"); the code itself when it is not known here.
 fn language_name(code: &str) -> String {
     let names = [("zh", "Chinese"), ("ja", "Japanese"), ("he", "Hebrew"), ("th", "Thai"), ("en", "English"), ("bn", "Bengali"),
@@ -291,8 +293,10 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     let Some(text) = req["input"].as_str().filter(|t| !t.trim().is_empty()) else {
         return bad("send {\"input\": \"the text to speak\"}");
     };
-    if text.chars().count() > 4096 {
-        return bad("input: at most 4096 characters");
+    // OpenAI stops at 4,096 characters (about 4.5 minutes); speech is made part by part here, so a longer text only
+    // takes longer: 20,000 characters is about 20 minutes of speech
+    if text.chars().count() > MAX_SPEECH_CHARS {
+        return bad(format!("input: at most {MAX_SPEECH_CHARS} characters (about 20 minutes of speech)"));
     }
     if let Some(f) = req["response_format"].as_str().filter(|f| *f != "wav") {
         return bad(format!("response_format {f:?}: this server makes wav (WAVE, 16-bit PCM) only"));
