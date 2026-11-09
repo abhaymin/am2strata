@@ -17,6 +17,10 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 /* ---------------------------------------------------------------- header */
 .st-header { position: relative; z-index: 3; flex: none; }
 .st-header__brand:hover { text-decoration: none; }
+/* the version beside the name, so it is clear which am2Strata a page talks to */
+.brand-ver { margin-left: 6px; padding: 1px 7px; border: 1px solid var(--st-line-soft); border-radius: 999px; font-size: 11px;
+  font-weight: 600; color: var(--st-ink-muted); letter-spacing: .02em; align-self: center; }
+.brand-ver:empty { display: none; }
 .logo-tile { fill: var(--st-logo-tile); } .logo-bar { fill: var(--st-accent); } .logo-spark { fill: var(--st-logo-spark); }
 .main-tabs { margin-left: var(--st-s-2); }
 .seg { display: grid; gap: 2px; padding: 3px; background: var(--st-surface); border: 1px solid var(--st-line); border-radius: 8px; }
@@ -137,7 +141,7 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .badges .st-badge.on { opacity: 1; }
 .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
-.metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
 .metric-card { padding: var(--st-s-4); }
 .st-metric__value small { font-size: var(--st-fs-md); font-weight: var(--st-fw-medium); color: var(--st-ink-muted); margin-left: 4px; }
 .st-metric__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; min-height: 1em; }
@@ -444,7 +448,7 @@ body.resizing iframe { pointer-events: none; }
 .calls { max-width: none; }
 .calls-side { width: clamp(320px, 24vw, 460px); }
 @media (min-width: 1700px) {
-  .metrics { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+  .metrics { grid-template-columns: repeat(9, minmax(0, 1fr)); }
 }
 .board-mode, .wb-tools { display: inline-flex; grid-template-columns: none; }
 .board-mode button, .wb-tools button { flex: none; height: 32px; }

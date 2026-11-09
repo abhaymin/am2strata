@@ -193,6 +193,7 @@ function pickerNote(text) {
 }
 async function loadMediaModels() {
   pickerNote("Loading models\u2026 (the media engine starts on first use)");
+  if (media.engine === undefined) $("mm-status").textContent = "Loading the media models\u2026";
   try {
     const r = await fetch("api/media/models", {headers: headers()});
     if (!r.ok) {
@@ -216,11 +217,13 @@ function renderMediaModels() {
   rows.sort((a, b) => (b.downloaded - a.downloaded) || a.name.localeCompare(b.name));
   const p = media.pull || {};
   const n = (media.models || []).filter((m) => m.downloaded).length;
-  $("mm-status").textContent = !media.engine ? (media.note || "The media engine is not built.")
+  $("mm-status").textContent = media.engine === undefined ? "Loading the media models\u2026"
+    : !media.engine ? (media.note || "The media engine is not built.")
     : p.state === "pulling" ? `Downloading ${p.model}\u2026 (generation waits until it finishes)`
     : p.state === "error" ? `Download of ${p.model} failed: ${p.error}`
     : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model} · videos use ${media.video_model} · ` +
-      `speech to text ${media.stt_model} · text to speech ${media.tts_model}`;
+      `speech to text ${media.stt_model} · text to speech ${media.tts_model}` +
+      (media.busy ? " · the media engine is busy with a job: this list is from before it started" : "");
   $("mm-list").innerHTML = rows.length ? rows.map((m) => {
     const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model) ||
       (m.kind === "audio" && (m.task === "tts" ? m.name === media.tts_model : m.name === media.stt_model));
@@ -474,6 +477,7 @@ const METRICS = [
   {key: "speed", label: "Speed", icon: "gauge", unit: "t/s", series: "tok_s"},
   {key: "gpu", label: "GPU load", icon: "gpu", unit: "%", series: "gpu_util", max: 100},
   {key: "vram", label: "VRAM", icon: "layers", unit: "GB", series: "gpu_mem_used"},
+  {key: "ram", label: "System RAM", icon: "memory", unit: "GB", series: "ram_used"},
   {key: "temp", label: "GPU temp", icon: "thermometer", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "power", label: "Power", icon: "bolt", unit: "W", series: "gpu_power"},
   {key: "pcie", label: "PCIe", icon: "link", unit: "", series: "gpu_pcie_rx_mb", tone: "info"},
@@ -574,6 +578,7 @@ function mediaLabel(kind) {
 const mediaUnit = (kind) => /speech|translation/.test(kind || "") ? "part" : "step";
 
 function render(m) {
+  if (m.version && $("brand-ver").textContent !== `v${m.version}`) $("brand-ver").textContent = `v${m.version}`;
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
   // the header pill
@@ -696,6 +701,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
             multi ? per((g) => (g.mem_used == null ? "–" : `${gb(g.mem_used)} GB`))
                   : eng.expert_slots ? `${fmt(eng.expert_slots)} experts cached` : (st.gpu_note ? "not available on Windows AMD yet" : ""));
   spark("sp-vram", h.gpu_mem_used, hw.gpu_mem_total);
+  setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB",
+            hw.ram_total ? `${fmt((100 * hw.ram_used) / hw.ram_total)}% used · ${gb(hw.ram_total - hw.ram_used)} GB free` : "");
+  spark("sp-ram", h.ram_used, hw.ram_total);
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);

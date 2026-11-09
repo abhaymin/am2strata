@@ -212,6 +212,7 @@ pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Qu
     let mut m = s.mgr.monitor.metrics(engine, loaded, all);
     m["queue"] = s.mgr.queue.snapshot();
     m["prompt_snapshots"] = s.mgr.snapshots.stats();
+    m["version"] = json!(env!("CARGO_PKG_VERSION"));
     Json(m).into_response()
 }
 

@@ -114,7 +114,7 @@ impl Jobs {
         if !s.media.available() {
             return json!({"available": false, "kinds": {}, "note": "the media engine is not built"});
         }
-        let list = match s.media.call(json!({"op": "list"}), |_| {}).await {
+        let list = match s.media.list().await {
             Ok(l) => l,
             Err(e) => return json!({"available": false, "kinds": {}, "note": format!("{e:#}")}),
         };

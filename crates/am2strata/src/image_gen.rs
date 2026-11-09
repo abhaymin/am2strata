@@ -50,6 +50,8 @@ pub struct Media {
     pub keep_text_model: bool,
     mold_home: PathBuf,
     proc: Mutex<Option<Proc>>,
+    /// the engine's last catalog (its "models" event), answered while it is busy with a job instead of waiting minutes
+    catalog: std::sync::Mutex<Option<Value>>,
 }
 
 /// The media engine: $AM2STRATA_MEDIA_EXE, else crates/strata-media's release build beside this binary's checkout.
@@ -84,6 +86,7 @@ impl Media {
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
             proc: Mutex::new(None),
+            catalog: std::sync::Mutex::new(None),
         }
     }
 
@@ -153,6 +156,20 @@ impl Media {
     }
 
     /// One command; `on_event` sees every event until the one that ends it (done / loaded / pulled / unloaded / error).
+    /// The engine's catalog. While a job holds the engine (an image takes minutes), the last catalog is answered at once,
+    /// marked `"busy": true`, instead of waiting behind the job; a free engine is asked again and the answer kept.
+    pub async fn list(&self) -> anyhow::Result<Value> {
+        if self.proc.try_lock().is_err() {
+            if let Some(mut c) = self.catalog.lock().unwrap().clone() {
+                c["busy"] = json!(true);
+                return Ok(c);
+            }
+        }
+        let r = self.call(json!({"op": "list"}), |_| {}).await?;
+        *self.catalog.lock().unwrap() = Some(r.clone());
+        Ok(r)
+    }
+
     pub async fn call(&self, cmd: Value, mut on_event: impl FnMut(&Value)) -> anyhow::Result<Value> {
         let mut guard = self.proc.lock().await;
         if guard.as_mut().is_none_or(|p| p.child.try_wait().ok().flatten().is_some()) {
@@ -325,7 +342,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.model());
     if !edit_images.is_empty() {
         // a model that cannot take edit images would draw from the prompt alone: say so instead
-        let takes = match s.media.call(json!({"op": "list"}), |_| {}).await {
+        let takes = match s.media.list().await {
             Ok(r) => r["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model.as_str())).map(|m| m["edits"] == true),
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
         };
@@ -421,10 +438,11 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
         v["note"] = json!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
         return Json(v).into_response();
     }
-    match s.media.call(json!({"op": "list"}), |_| {}).await {
+    match s.media.list().await {
         Ok(r) => {
             let mut v = base;
             v["models"] = r["models"].clone();
+            v["busy"] = json!(r["busy"] == true);
             Json(v).into_response()
         }
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
@@ -476,7 +494,7 @@ pub async fn set_default(State(s): State<AppState>, headers: HeaderMap, Json(req
     let Some(model) = req["model"].as_str() else { return bad("send {\"model\": ...}") };
     let mut kind = "image".to_string();
     if s.media.available() {
-        let list = match s.media.call(json!({"op": "list"}), |_| {}).await {
+        let list = match s.media.list().await {
             Ok(r) => r,
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
         };
@@ -517,7 +535,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.video_model());
     // the model's own defaults (size, steps, guidance, frames, fps) fill what the request leaves out
-    let list = match s.media.call(json!({"op": "list"}), |_| {}).await {
+    let list = match s.media.list().await {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
     };

@@ -83,6 +83,26 @@ Turbo (`tts_turbo.py`, 350M, English) comes after.
     24 kHz and the WAV. The four sessions do the networks.
 - **The native candle port (the phases below)**, checked against the Python reference and against the ONNX path.
 
+## Devices in sequence or in parallel (owner's requirement, 2026-11-09)
+
+The engine must hold several CPUs, GPUs, NPUs or TPUs and use them in two ways:
+- **in parallel:** independent jobs on different devices at once (the lanes below);
+- **in sequence:** one job's stages on different devices, one after another. Example: Qwen-Image's text encoder and VAE on
+  GPU 1 while its transformer runs on GPU 0. Measured 2026-11-09: that job used only GPU 0 and peaked at 15.2 of
+  16.3 GB in the VAE decode while GPU 1 sat empty. The same job failed with CUDA_ERROR_OUT_OF_MEMORY at 01:01.
+
+So each device is described once and shared by both modes:
+- `{id: "cuda:0" | "cuda:1" | "cpu" | "npu:0" | "tpu:0", kind, memory, free}`, found at start and refreshed when a
+  card comes or goes (the USB4 card);
+- a job's **plan** names a device per stage (`text_encoder`, `transformer`, `vae`, `llm`, `decoder`, ...). The
+  scheduler gives the job the lanes of every device in its plan, in order (sequence), or splits jobs across free lanes
+  (parallel);
+- runtimes:
+  - candle (CPU, CUDA; Metal on macOS);
+  - ONNX Runtime execution providers: CPU, CUDA, Vitis AI for AMD NPUs, OpenVINO for Intel NPUs, CoreML on Apple;
+  - TPUs where a runtime exists (Edge TPU through its own delegate, Cloud TPU through PJRT). None on this PC, so it is
+    a slot in the design, not a claim.
+
 ## Lanes: CPU, GPU and NPU at once (owner's request, 2026-11-09)
 
 Today one turn covers everything:

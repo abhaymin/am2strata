@@ -1074,6 +1074,31 @@ fn a_default_model_without_a_key_uses_the_key_of_another_run_config() {
 }
 
 #[test]
+fn the_media_catalog_answers_at_once_while_an_image_is_made() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 3000}));
+    let (code, first) = s.get("/api/media/models", true);
+    assert!(code == 200 && first["models"].as_array().is_some_and(|m| !m.is_empty()), "{first}");
+    let base = s.base.clone();
+    let img = std::thread::spawn(move || {
+        reqwest::blocking::Client::new().post(format!("{base}/v1/images/generations")).bearer_auth(KEY)
+            .json(&json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2})).send().unwrap().status().as_u16()
+    });
+    let t0 = std::time::Instant::now();
+    while s.get("/api/queue", true).1["running"]["kind"] != "media" {
+        assert!(t0.elapsed().as_secs() < 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    // the engine is busy for seconds: the catalog comes back at once, the same models, marked busy
+    let t = std::time::Instant::now();
+    let (code, r) = s.get("/api/media/models", true);
+    assert!(t.elapsed().as_millis() < 1000, "waited {} ms behind the job", t.elapsed().as_millis());
+    assert_eq!((code, r["busy"].as_bool()), (200, Some(true)), "{r}");
+    assert_eq!(r["models"], first["models"]);
+    assert_eq!(img.join().unwrap(), 200);
+}
+
+#[test]
 fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
     for (mem, unloads) in [(1, true), (64, false)] {
         let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": mem}));

@@ -33,7 +33,7 @@ fn mem_available_gb() -> f64 {
 
 /// The catalog entry of an audio model (from the engine's list), checked for its task and download.
 async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Response> {
-    let list = s.media.call(json!({"op": "list"}), |_| {}).await
+    let list = s.media.list().await
         .map_err(|e| error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")))?;
     let Some(m) = list["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == name).cloned()) else {
         return Err(bad(format!("{name} is not an audio model here (Settings > Models > Media models > Audio)")));
