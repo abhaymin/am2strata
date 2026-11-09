@@ -479,6 +479,8 @@ impl Manager {
                     "id": m.id, "display_name": m.display_name(), "config": m.path.display().to_string(),
                     "context": m.cfg.max_context(), "multimodal": m.cfg.vision.is_some(),
                     "current": cur.as_deref() == Some(m.id.as_str()),
+                    // the model a request loads when none is (after a media job, or before the first chat)
+                    "default": m.id == self.default_id,
                     "status": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "available" },
                     "problem": Value::Null,
                 })

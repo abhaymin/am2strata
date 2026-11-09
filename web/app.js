@@ -130,8 +130,11 @@ async function loadModels() {
     const r = await fetch("api/models", {headers: headers()});
     if (r.ok) models = (await r.json()).models || [];
   } catch (e) { return; }
+  // nothing loaded (a media job stopped it): the server's default, which a request loads; never the first in the list,
+  // which a chat would load by name (it loaded the Rust CPU edition of the default model on 2026-11-09)
+  const pick = models.find((m) => m.current) || models.find((m) => m.default);
   sel.innerHTML = models.map((m) =>
-    `<option value="${esc(m.id)}"${m.current ? " selected" : ""}${m.status === "unavailable" ? " disabled" : ""}>` +
+    `<option value="${esc(m.id)}"${pick && m.id === pick.id ? " selected" : ""}${m.status === "unavailable" ? " disabled" : ""}>` +
     `${esc(m.display_name && m.display_name !== m.id ? `${m.display_name} (${m.id})` : m.id)}` +
     `${m.status === "unavailable" ? " - unavailable" : ""}</option>`).join("");
   sel.hidden = models.length < 2;
