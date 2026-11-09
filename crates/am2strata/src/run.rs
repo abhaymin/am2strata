@@ -740,13 +740,47 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     Ok(Started { events, prompt_tokens, model })
 }
 
+/// The most tool rounds a request may ask for (strata_max_rounds).
+pub const MAX_ROUNDS_ASKED: usize = 500;
+
+/// Keeps a tool loop's conversation within about three quarters of `context` tokens (about 3.5 characters a token):
+/// tool results older than the newest four are shortened to their first 1,200 characters, with a note, oldest first,
+/// until it fits. Returns how many were shortened. The model can call the tool again for what was cut.
+pub fn compact_tool_results(messages: &mut [Value], context: usize) -> usize {
+    const KEEP_WHOLE: usize = 4;
+    const SHORT: usize = 1200;
+    let size = |m: &[Value]| m.iter().map(|x| x.to_string().len()).sum::<usize>();
+    let budget = (context as f64 * 0.75 * 3.5) as usize;
+    if context == 0 || size(messages) <= budget {
+        return 0;
+    }
+    let tools: Vec<usize> = messages.iter().enumerate().filter(|(_, m)| m["role"] == "tool").map(|(i, _)| i).collect();
+    let mut cut = 0;
+    for &i in tools.iter().take(tools.len().saturating_sub(KEEP_WHOLE)) {
+        if size(messages) <= budget {
+            break;
+        }
+        let Some(text) = messages[i]["content"].as_str().map(str::to_string) else { continue };
+        if text.chars().count() <= SHORT + 200 {
+            continue;
+        }
+        let head: String = text.chars().take(SHORT).collect();
+        messages[i]["content"] = json!(format!("{head}\n[shortened to keep the conversation within the model's context: \
+            the full result was {} characters; call the tool again if more of it is needed]", text.chars().count()));
+        cut += 1;
+    }
+    cut
+}
+
 /// `start` with the MCP tools run here: the model writes a call to an MCP tool, the server runs it, adds the call
 /// and its result to the conversation and lets the model continue, up to `max_rounds` times. `names`: the MCP tools
 /// this request offered; any other call is the request's own and ends the turn as always (the client answers it),
 /// and MCP calls written beside it are then not run. Port of serve/server.py run_with_mcp.
 pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts,
                        hub: Option<Arc<crate::mcp::McpHub>>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
-    let max_rounds = hub.as_ref().map(|h| h.settings.max_rounds).unwrap_or(8);
+    // the run config's mcp.max_rounds (100 by default), or the request's own (strata_max_rounds, at most 500)
+    let max_rounds = req["strata_max_rounds"].as_u64().map(|n| (n as usize).clamp(1, MAX_ROUNDS_ASKED))
+        .unwrap_or_else(|| hub.as_ref().map(|h| h.settings.max_rounds).unwrap_or(100));
     let conv = crate::memory::conversation_id(&prep.messages);
     let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
     let (model, prompt_tokens) = (first.model.clone(), first.prompt_tokens);
@@ -921,6 +955,11 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                     {"type": "text", "text": format!("[The browser's screenshot after {name}: what the page shows, not a message from the user.]")},
                     {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{img}")}}]}));
             }
+            // a long run stays inside the model's context: older tool results are shortened (the newest kept whole)
+            let cut = compact_tool_results(&mut prep.messages, loaded.max_context);
+            if cut > 0 {
+                let _ = tx.send(RunEvent::Mcp(json!({"event": "compacted", "results": cut}))).await;
+            }
             cur = match start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await {
                 Ok(s) => s,
                 Err(Refusal(_, m)) => {
@@ -974,5 +1013,30 @@ mod loop_tests {
         assert_eq!(reasoning_repeat_coverage(&"12345678901".repeat(300)), 1.0, "#1753: one long periodic word");
         let varied: String = (0..3000).map(|i| format!("w{i} ")).collect();
         assert_eq!(reasoning_repeat_coverage(&varied), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::compact_tool_results;
+    use serde_json::json;
+
+    #[test]
+    fn older_tool_results_are_shortened_when_the_context_fills_and_the_newest_stay_whole() {
+        let big = "x".repeat(20_000);
+        let mut m = vec![json!({"role": "user", "content": "research this"})];
+        for _ in 0..8 {
+            m.push(json!({"role": "assistant", "content": "", "tool_calls": []}));
+            m.push(json!({"role": "tool", "content": big.clone()}));
+        }
+        // 160,000 characters of results in a 16,000-token context (42,000 characters at three quarters)
+        let cut = compact_tool_results(&mut m, 16_000);
+        assert!(cut >= 4 && cut <= 4, "cut {cut}");
+        let tools: Vec<&str> = m.iter().filter(|x| x["role"] == "tool").map(|x| x["content"].as_str().unwrap()).collect();
+        assert!(tools[0].contains("shortened") && tools[0].len() < 1500);
+        assert!(tools[4..].iter().all(|t| t.len() == 20_000), "the newest four stay whole");
+        // a conversation that fits is left alone
+        let mut small = vec![json!({"role": "tool", "content": "short"})];
+        assert_eq!(compact_tool_results(&mut small, 16_000), 0);
     }
 }

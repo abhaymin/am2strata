@@ -29,7 +29,9 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { timeout_s: 60.0, max_result_chars: 20000, max_rounds: 8, start_timeout_s: 120.0 }
+        // 100 tool rounds an answer: enough for long research and multi-step work (the conversation is kept inside
+        // the model's context by shortening older tool results, see run::compact_tool_results)
+        Settings { timeout_s: 60.0, max_result_chars: 20000, max_rounds: 100, start_timeout_s: 120.0 }
     }
 }
 
