@@ -561,6 +561,12 @@ async fn pull_async(p: PullArgs) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
+    // a closed pipe (`am2strata agent list | head`) ends the program quietly, as other command-line tools do; Rust's
+    // default ignores SIGPIPE, and the next print then panicked with "failed printing to stdout: Broken pipe"
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match Cli::parse().cmd {
         Cmd::Serve { s, take_over } => serve(&s, take_over),
         Cmd::TempService { s } => temp_service(&s),
