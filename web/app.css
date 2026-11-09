@@ -434,8 +434,13 @@ body.resizing iframe { pointer-events: none; }
 }
 /* Monitor and API calls use the whole window: full width, the requests table grows to the bottom */
 .monitor { max-width: none; min-height: 100%; }
-.monitor-row { flex: 1; min-height: 380px; grid-template-columns: minmax(280px, 1fr) minmax(0, 3fr); }
+.monitor-row { flex: 1; min-height: 560px; grid-template-columns: minmax(280px, 1fr) minmax(0, 3fr); }
 .req-card .table-wrap { flex: 1; min-height: 0; overflow: auto; }
+/* the row's cards keep to the row's height: a grid item's min-height is its content by default, so a long history (or
+   its media players) grew the table past the row and under the cards below; now the table scrolls inside its card */
+.monitor-row > .st-card { min-height: 0; }
+.monitor-row > .req-card { overflow: hidden; }
+.monitor-row > .ctx-card { overflow: auto; }
 .calls { max-width: none; }
 .calls-side { width: clamp(320px, 24vw, 460px); }
 @media (min-width: 1700px) {
