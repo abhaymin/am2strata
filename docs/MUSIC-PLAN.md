@@ -41,6 +41,10 @@ Loading: 131 s for the DiT (its first run included), 20 s for the planner; 9.35 
 RAM. Output: 48 kHz stereo. So a song takes about a fifth of its length on one card. Hindi needs another look (other
 seeds; whether Whisper hears sung Hindi well).
 
+Hindi again, seeds 1 to 4 (10.5 to 12.2 s each): seed 1 sings every line of the verse and the chorus; seed 4 nearly
+all; seeds 2 and 3 mostly hum. So the lyrics come out, but per seed: the song job gets the same check as speech
+(Whisper hears the vocals; a take that misses too many lyric words is made again with another seed, the best kept).
+
 ## Phases
 
 0. **Reference run (needs the owner's yes for downloads):**
@@ -56,7 +60,7 @@ seeds; whether Whisper hears sung Hindi well).
    - a candle port of the LM (Qwen3, already close to what candle has), the DiT and the audio decoder: weeks of work,
      checked against the golden files.
    Long songs: stages split across both cards, as Qwen-Image's are.
-2. **API:** `POST /v1/audio/music` (OpenAI has no such endpoint): `lyrics`, `style`, `duration`, `seed`, `format`. A job
+2. **API** (with the lyric check above): `POST /v1/audio/music` (OpenAI has no such endpoint): `lyrics`, `style`, `duration`, `seed`, `format`. A job
    with progress (`/api/jobs/{id}`); the chat tool `make_song(lyrics, style, duration)`, queued like `generate_image`,
    so chats and remote agents can ask for one; a Monitor row with a player.
 3. **Web app:** Audio › Song: lyrics, style with presets, duration, seed; player and Save; a note that songs are
