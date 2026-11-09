@@ -2866,7 +2866,8 @@ function ttsLanguages() {
   return [...seen].sort((a, b) => a[1].localeCompare(b[1]));
 }
 function langName(code) {
-  const n = {zh: "Chinese", ja: "Japanese", he: "Hebrew", th: "Thai", en: "English"};
+  const n = {zh: "Chinese", ja: "Japanese", he: "Hebrew", th: "Thai", en: "English", bn: "Bengali", ta: "Tamil", te: "Telugu",
+             gu: "Gujarati", kn: "Kannada", ml: "Malayalam", or: "Odia", pa: "Punjabi", mr: "Marathi", as: "Assamese", ne: "Nepali"};
   return (ttsLanguages().find((l) => l[0] === code) || [])[1] || n[code] || code;
 }
 function fillTtsLanguages() {

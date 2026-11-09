@@ -1102,6 +1102,11 @@ fn speech_is_spoken_in_the_language_of_the_text() {
     assert_eq!((code, lang.as_str(), found.as_str()), (200, "en", "zh"));
     let (code, _, _, _, body) = speak(json!({"input": "模型在你自己的电脑上运行。", "language": "zh"}));
     assert!(code == 400 && body.contains("speaks Chinese yet"), "{body}");
+    // a speech model (a plain name, no ":variant") can be downloaded; an unknown name cannot
+    let (code, r) = s.post("/api/media/models/pull", &json!({"model": "chatterbox-multilingual"}));
+    assert_eq!(code, 202, "{r}");
+    let (code, _) = s.post("/api/media/models/pull", &json!({"model": "no-such-model"}));
+    assert_eq!(code, 400);
     // the multilingual model not downloaded: the message says which download it takes
     let s2 = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64, "no_multilingual": true}));
     let (code, r) = s2.post("/v1/audio/speech", &json!({"input": "Hola.", "language": "es"}));

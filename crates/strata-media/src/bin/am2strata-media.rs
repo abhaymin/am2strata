@@ -36,6 +36,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "../audio.rs"]
 mod audio;
+#[path = "../parler_hf.rs"]
+mod parler_hf;
 #[cfg(feature = "onnx")]
 #[path = "../chatterbox.rs"]
 mod chatterbox;
@@ -143,8 +145,31 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
 /// The clip a named voice is cloned from: made once with Parler from the voice's description (seed 3), kept in
 /// audio/voices/<name>.wav, so "laura" sounds the same in every model that clones a voice.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-fn voice_clip(st: &mut State, voice: &str, rate: u32) -> Result<Vec<f32>> {
+fn voice_clip(st: &mut State, voice: &str, rate: u32, language: Option<&str>) -> Result<Vec<f32>> {
     let voice = voice.to_lowercase();
+    // another language than English: the native voice of the named voice's gender, made once by a multilingual Parler
+    // model speaking that language (a synthetic voice), so the language is not spoken with an English accent
+    if let (Some(lang), Some((_, gender))) = (language.filter(|l| *l != "en"), audio::VOICE_GENDER.iter().find(|v| v.0 == voice)) {
+        let path = audio::voices_dir().join(format!("{lang}-{gender}.wav"));
+        if !path.exists() {
+            if let (Some(maker), Some((_, line)), Some((_, desc))) = (audio::native_maker(lang), audio::NATIVE_LINES.iter().find(|l| l.0 == lang),
+                                                                       audio::NATIVE_VOICES.iter().find(|v| v.0 == *gender)) {
+                if st.parler.as_ref().is_none_or(|p| p.name != maker.name) {
+                    st.parler = None;
+                    st.parler = Some(audio::Parler::load(maker, &json!({"device": "cpu"}))?);
+                }
+                let (pcm, r) = st.parler.as_mut().unwrap().speak(line, desc, 3, 0.7, &mut |_, _| {})?;
+                std::fs::create_dir_all(audio::voices_dir())?;
+                std::fs::write(&path, audio::wav(&pcm, r))?;
+            }
+        }
+        if path.exists() {
+            let (pcm, r, _) = audio::decode(std::fs::read(&path)?)?;
+            return Ok(audio::resample(&pcm, r, rate));
+        }
+        // no native voice for this language yet: the English clip of that gender
+    }
+    let voice = match voice.as_str() { "female" => "laura".to_string(), "male" => "jon".to_string(), _ => voice };
     let (_, description) = audio::VOICES.iter().find(|v| v.0 == voice)
         .ok_or_else(|| anyhow!("no voice {voice:?}: give one of {} or a clip of the voice (voice_audio)",
                                audio::VOICES.iter().map(|v| v.0).collect::<Vec<_>>().join(", ")))?;
@@ -176,7 +201,7 @@ fn speak_chatterbox(st: &mut State, e: &'static audio::Entry, cmd: &Value) -> Re
             let (pcm, r, _) = audio::decode(bytes)?;
             audio::resample(&pcm, r, chatterbox::RATE)
         }
-        None => voice_clip(st, cmd["voice"].as_str().unwrap_or("laura"), chatterbox::RATE)?,
+        None => voice_clip(st, cmd["voice"].as_str().unwrap_or("laura"), chatterbox::RATE, cmd["language"].as_str())?,
     };
     if st.chatterbox.as_ref().is_none_or(|c| c.name != e.name) {
         st.chatterbox = None;

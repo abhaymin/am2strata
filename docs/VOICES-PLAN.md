@@ -35,6 +35,28 @@ Swedish, Swahili and Turkish. For those, until a source is found:
 - if its ONNX graph exposes classifier-free guidance, a weight of 0 for these languages (its makers' advice against
   accent carry-over).
 
+## Built (2026-11-09), all in Rust
+
+- `crates/strata-media/src/parler_hf.rs`: the newer Parler checkpoints (mini multilingual v1.1, Indic) load into
+  candle's Parler model unchanged. Their names are remapped as they load (fused codebook heads split; transformers'
+  `DacModel` weights handed out as descript's weight-normed ones). All 301 codec tensors map; none are left over.
+- Catalog: `parler-tts-mini-multilingual` (downloaded here, 3.75 GB) and `indic-parler-tts` (gated: its terms must be
+  accepted on Hugging Face by the account whose token this PC uses).
+- `voice` takes `female` / `male`; Laura and Lea are female, Jon and Gary male. In another language than English the
+  engine clones `voices/<lang>-<gender>.wav`, made once by the multilingual Parler model from a description.
+- Measured (Chatterbox Multilingual speaking, clips by Parler multilingual on the CPU; Whisper turbo listening in that
+  language):
+
+  | Language, voice | Clip | Speech | Whisper heard |
+  | --- | --- | --- | --- |
+  | Spanish, female | 9.4 s, 224 Hz | 209 Hz | every word, then about 3 s of babble |
+  | Spanish, male | 12.5 s, 97 Hz | 109 Hz | every word |
+  | German, female | made, 218 Hz speech | 218 Hz | every word, after a few garbled words |
+
+  The voices are native and of the right gender. The babble is Chatterbox's own: some takes add words at the start or
+  end (the narration needed several seeds per line for the same reason).
+- Next: a retake in the engine when Whisper hears words that are not in the text (a few seeds, the best kept).
+
 ## Phases
 
 1. **Clips:** for each language, a female and a male reference clip of 8 to 12 s:

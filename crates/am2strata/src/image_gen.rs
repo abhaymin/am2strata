@@ -506,9 +506,14 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available", "the media engine is not built");
     }
-    let Some(model) = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string) else {
-        return bad("send {\"model\": \"<name>:<variant>\"} from GET /api/media/models");
-    };
+    // image and video models are "<name>:<variant>"; speech models are plain names from the catalog
+    let asked = req["model"].as_str().unwrap_or("").to_string();
+    let listed = !asked.is_empty() && !asked.contains(':') && s.media.list().await.ok()
+        .and_then(|l| l["models"].as_array().map(|a| a.iter().any(|x| x["name"] == asked.as_str()))).unwrap_or(false);
+    if !(asked.contains(':') || listed) {
+        return bad("send {\"model\": \"<name>\"} from GET /api/media/models");
+    }
+    let model = asked;
     {
         let mut job = s.media.pull_job.lock().unwrap();
         if job["state"] == "pulling" {

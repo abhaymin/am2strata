@@ -39,7 +39,15 @@ pub fn detect(text: &str) -> &'static str {
     for c in text.chars().filter(|c| c.is_alphabetic()) {
         letters += 1;
         let s = match c as u32 {
-            0x0900..=0x097F => "hi",
+            0x0900..=0x097F => "hi",   // Devanagari (Marathi and Nepali too: read as Hindi)
+            0x0980..=0x09FF => "bn",
+            0x0A00..=0x0A7F => "pa",
+            0x0A80..=0x0AFF => "gu",
+            0x0B00..=0x0B7F => "or",
+            0x0B80..=0x0BFF => "ta",
+            0x0C00..=0x0C7F => "te",
+            0x0C80..=0x0CFF => "kn",
+            0x0D00..=0x0D7F => "ml",
             0x0600..=0x06FF | 0x0750..=0x077F => "ar",
             0x0370..=0x03FF | 0x1F00..=0x1FFF => "el",
             0x0400..=0x04FF => "ru",
@@ -106,6 +114,9 @@ mod tests {
             ("Модель работает на вашем компьютере.", "ru"),
             ("Το μοντέλο τρέχει στον υπολογιστή σας.", "el"),
             ("모델이 당신의 컴퓨터에서 실행됩니다.", "ko"),
+            ("মডেলটি আপনার নিজের কম্পিউটারে চলে।", "bn"),
+            ("மாதிரி உங்கள் சொந்த கணினியில் இயங்குகிறது.", "ta"),
+            ("మోడల్ మీ సొంత కంప్యూటర్‌లో నడుస్తుంది.", "te"),
             ("模型在你自己的电脑上运行。", "zh"),
             ("モデルはあなたのコンピューターで動いています。", "ja"),
             ("Hola. Este modelo funciona en tu propio ordenador.", "es"),

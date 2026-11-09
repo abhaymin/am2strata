@@ -29,7 +29,17 @@ pub struct Entry {
     pub family: &'static str,
     /// the repo's files this engine reads (the first is what `downloaded` checks first)
     pub files: &'static [&'static str],
+    /// files from other repos it also reads: (repo, file)
+    pub extra: &'static [(&'static str, &'static str)],
+    /// the languages it speaks (ISO 639-1); empty: English
+    pub languages: &'static [&'static str],
 }
+
+/// Flan-T5's tokenizer: what the newer Parler checkpoints read the voice description with (their own tokenizer is for
+/// the words spoken)
+const FLAN_T5: &[(&str, &str)] = &[("google/flan-t5-large", "tokenizer.json")];
+const PARLER_ML_LANGUAGES: &[&str] = &["en", "fr", "es", "pt", "pl", "de", "it", "nl"];
+const INDIC_LANGUAGES: &[&str] = &["hi", "bn", "ta", "te", "mr", "gu", "kn", "ml", "or", "pa", "as", "ne", "en"];
 
 const HF3: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
 /// a Chatterbox ONNX export: the four graphs, each with its weights beside it
@@ -39,26 +49,69 @@ const CHATTERBOX_ONNX: &[&str] = &["tokenizer.json",
 
 pub const CATALOG: &[Entry] = &[
     Entry { name: "whisper-large-v3-turbo", display: "Whisper large-v3 turbo", repo: "openai/whisper-large-v3-turbo", task: "stt",
-            about: "speech to text in 99 languages, and translation to English; the best of these", licence: "MIT", size_gb: 1.62, family: "whisper", files: HF3 },
+            about: "speech to text in 99 languages, and translation to English; the best of these", licence: "MIT", size_gb: 1.62, family: "whisper", files: HF3, extra: &[], languages: &[] },
     Entry { name: "whisper-small", display: "Whisper small", repo: "openai/whisper-small", task: "stt",
             about: "speech to text, multilingual: faster on the CPU, a little less accurate", licence: "Apache-2.0", size_gb: 0.97,
-            family: "whisper", files: HF3 },
+            family: "whisper", files: HF3, extra: &[], languages: &[] },
     Entry { name: "whisper-base", display: "Whisper base", repo: "openai/whisper-base", task: "stt",
             about: "speech to text, multilingual: the fastest, for dictation", licence: "Apache-2.0", size_gb: 0.29,
-            family: "whisper", files: HF3 },
+            family: "whisper", files: HF3, extra: &[], languages: &[] },
     Entry { name: "parler-tts-mini-v1", display: "Parler-TTS mini v1", repo: "parler-tts/parler-tts-mini-v1", task: "tts",
             about: "text to speech in English; the voice is described in words (who speaks, how fast, how close)",
-            licence: "Apache-2.0", size_gb: 3.51, family: "parler-tts", files: HF3 },
+            licence: "Apache-2.0", size_gb: 3.51, family: "parler-tts", files: HF3, extra: &[], languages: &[] },
     Entry { name: "chatterbox-turbo", display: "Chatterbox Turbo (ONNX)", repo: "ResembleAI/chatterbox-turbo-ONNX", task: "tts",
             about: "text to speech in English in the voice of a short reference clip; tags like [laugh] and [sigh] (ONNX Runtime)",
-            licence: "MIT", size_gb: 3.29, family: "chatterbox", files: CHATTERBOX_ONNX },
+            licence: "MIT", size_gb: 3.29, family: "chatterbox", files: CHATTERBOX_ONNX, extra: &[], languages: &[] },
     Entry { name: "chatterbox-multilingual", display: "Chatterbox Multilingual (ONNX)", repo: "onnx-community/chatterbox-multilingual-ONNX",
             task: "tts", about: "text to speech in 20 languages (Hindi, Spanish, French and more) in the voice of a short reference clip (ONNX Runtime)",
-            licence: "MIT", size_gb: 3.27, family: "chatterbox", files: CHATTERBOX_ONNX },
+            licence: "MIT", size_gb: 3.27, family: "chatterbox", files: CHATTERBOX_ONNX, extra: &[], languages: &[] },
+    Entry { name: "parler-tts-mini-multilingual", display: "Parler-TTS mini multilingual v1.1",
+            repo: "parler-tts/parler-tts-mini-multilingual-v1.1", task: "tts",
+            about: "text to speech in 8 European languages; the voice is described in words. Makes the native female and male voices other models clone",
+            licence: "Apache-2.0", size_gb: 3.75, family: "parler-tts-hf", files: HF3, extra: FLAN_T5, languages: PARLER_ML_LANGUAGES },
+    Entry { name: "indic-parler-tts", display: "Indic Parler-TTS", repo: "ai4bharat/indic-parler-tts", task: "tts",
+            about: "text to speech in Hindi and 20 Indian languages; the voice is described in words. Gated: accept its terms on Hugging Face first",
+            licence: "Apache-2.0", size_gb: 3.75, family: "parler-tts-hf", files: HF3, extra: FLAN_T5, languages: INDIC_LANGUAGES },
 ];
+
+/// A language's English name ("Hindi" for "hi"); the code when it is not known here.
+pub fn language_name(code: &str) -> String {
+    const MORE: &[(&str, &str)] = &[("en", "English"), ("bn", "Bengali"), ("ta", "Tamil"), ("te", "Telugu"), ("mr", "Marathi"),
+        ("gu", "Gujarati"), ("kn", "Kannada"), ("ml", "Malayalam"), ("or", "Odia"), ("pa", "Punjabi"), ("as", "Assamese"), ("ne", "Nepali")];
+    CHATTERBOX_LANGUAGES.iter().chain(MORE).find(|l| l.0 == code).map(|l| l.1.to_string()).unwrap_or_else(|| code.to_string())
+}
+
+/// Each named voice's gender: in another language than English it is spoken by the native voice of that gender.
+pub const VOICE_GENDER: &[(&str, &str)] = &[("laura", "female"), ("lea", "female"), ("female", "female"),
+                                            ("jon", "male"), ("gary", "male"), ("male", "male")];
+
+/// The native voices' descriptions (for a multilingual Parler model; synthetic voices, no person's recording)
+pub const NATIVE_VOICES: &[(&str, &str)] = &[
+    ("female", "A female speaker with a clear, warm voice speaks at a moderate pace with a natural pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
+    ("male", "A male speaker with a clear, warm voice speaks at a moderate pace with a slightly low pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
+];
+
+/// What a native voice says for its reference clip (about 8 to 10 s), per language.
+pub const NATIVE_LINES: &[(&str, &str)] = &[
+    ("es", "Hola, bienvenidos. Esta es una breve muestra de mi voz natural, grabada con calma y claridad para ustedes hoy."),
+    ("fr", "Bonjour et bienvenue. Voici un court extrait de ma voix naturelle, enregistré calmement et clairement pour vous aujourd'hui."),
+    ("pt", "Olá, sejam bem-vindos. Esta é uma breve amostra da minha voz natural, gravada com calma e clareza para vocês hoje."),
+    ("pl", "Dzień dobry i witam. To jest krótka próbka mojego naturalnego głosu, nagrana spokojnie i wyraźnie specjalnie dla was."),
+    ("de", "Hallo und herzlich willkommen. Dies ist eine kurze Probe meiner natürlichen Stimme, ruhig und deutlich für Sie aufgenommen."),
+    ("it", "Ciao e benvenuti. Questo è un breve esempio della mia voce naturale, registrato con calma e chiarezza per voi oggi."),
+    ("nl", "Hallo en welkom. Dit is een korte opname van mijn natuurlijke stem, rustig en duidelijk voor u opgenomen."),
+    ("hi", "नमस्ते और स्वागत है। यह मेरी स्वाभाविक आवाज़ का एक छोटा सा नमूना है, जिसे आज आपके लिए शांति और स्पष्टता से रिकॉर्ड किया गया है।"),
+];
+
+/// The downloaded model that makes the native voices of `language`.
+pub fn native_maker(language: &str) -> Option<&'static Entry> {
+    CATALOG.iter().find(|e| e.family == "parler-tts-hf" && e.languages.contains(&language) && downloaded(e))
+}
 
 /// The voices offered by name (OpenAI's `voice`), as Parler-TTS descriptions; any other text is used as the description.
 pub const VOICES: &[(&str, &str)] = &[
+    ("female", "A female speaker with a clear, calm voice speaks at a moderate pace with a natural pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
+    ("male", "A male speaker with a clear, calm voice speaks at a moderate pace with a slightly low pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("laura", "Laura's voice is calm and clear, with a moderate speed and pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("jon", "Jon's voice is warm and steady, speaking at a moderate pace with a slightly low pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("lea", "Lea speaks in a bright, expressive and animated way, slightly fast, with a higher pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
@@ -83,8 +136,13 @@ fn cache_dir() -> PathBuf {
 }
 
 fn local(e: &Entry) -> Option<Vec<PathBuf>> {
-    let repo = hf_hub::Cache::new(cache_dir()).model(e.repo.to_string());
-    e.files.iter().map(|f| repo.get(f)).collect()
+    let cache = hf_hub::Cache::new(cache_dir());
+    let repo = cache.model(e.repo.to_string());
+    let mut files: Vec<PathBuf> = e.files.iter().map(|f| repo.get(f)).collect::<Option<_>>()?;
+    for (r, f) in e.extra {
+        files.push(cache.model(r.to_string()).get(f)?);
+    }
+    Some(files)
 }
 
 /// Where the clips of the named voices are kept (a model that clones a voice reads them).
@@ -123,7 +181,11 @@ pub fn pull(e: &Entry) -> Result<()> {
     let api = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(cache_dir()).with_progress(false).build()?;
     let repo = api.model(e.repo.to_string());
     for f in e.files {
-        repo.get(f).with_context(|| format!("{}: {f}", e.repo))?;
+        repo.get(f).with_context(|| format!("{}: {f}", e.repo))
+            .with_context(|| if e.name == "indic-parler-tts" { "Indic Parler-TTS is gated: accept its terms at https://huggingface.co/ai4bharat/indic-parler-tts with the account whose token this PC uses".to_string() } else { String::new() })?;
+    }
+    for (r, f) in e.extra {
+        api.model(r.to_string()).get(f).with_context(|| format!("{r}: {f}"))?;
     }
     Ok(())
 }
@@ -131,9 +193,12 @@ pub fn pull(e: &Entry) -> Result<()> {
 pub fn list() -> Vec<Value> {
     CATALOG.iter().map(|e| json!({
         "name": e.name, "display_name": e.display, "kind": "audio", "task": e.task, "family": e.family,
-        "description": e.about, "licence": e.licence, "size_gb": e.size_gb, "gated": false, "downloaded": downloaded(e),
+        "description": e.about, "licence": e.licence, "size_gb": e.size_gb, "downloaded": downloaded(e),
         "voices": if e.task == "tts" { json!(VOICES.iter().map(|v| v.0).collect::<Vec<_>>()) } else { Value::Null },
-        "languages": if e.name == "chatterbox-multilingual" { json!(CHATTERBOX_LANGUAGES.iter().map(|l| json!({"code": l.0, "name": l.1})).collect::<Vec<_>>()) } else { Value::Null },
+        "languages": if e.name == "chatterbox-multilingual" { json!(CHATTERBOX_LANGUAGES.iter().map(|l| json!({"code": l.0, "name": l.1})).collect::<Vec<_>>()) }
+                     else if !e.languages.is_empty() { json!(e.languages.iter().map(|c| json!({"code": c, "name": language_name(c)})).collect::<Vec<_>>()) }
+                     else { Value::Null },
+        "gated": e.name == "indic-parler-tts",
         "runtime": if e.family == "chatterbox" { json!("onnx") } else { json!("candle") },
     })).collect()
 }
@@ -563,6 +628,10 @@ pub struct Parler {
     pub name: String,
     model: candle_transformers::models::parler_tts::Model,
     tok: Tokenizer,
+    /// the description's tokenizer (the same as `tok` for Parler-TTS mini v1)
+    desc_tok: Tokenizer,
+    /// the words are read as English (numbers spelled out in English)
+    english_only: bool,
     rate: u32,
     device: Device,
 }
@@ -570,24 +639,39 @@ pub struct Parler {
 impl Parler {
     pub fn load(e: &Entry, req: &Value) -> Result<Parler> {
         let files = local(e).ok_or_else(|| anyhow!("{} is not downloaded (pull it first)", e.name))?;
-        let config: candle_transformers::models::parler_tts::Config = serde_json::from_reader(std::fs::File::open(&files[0])?)?;
+        let mut raw: Value = serde_json::from_reader(std::fs::File::open(&files[0])?)?;
+        let hf = e.family == "parler-tts-hf";
+        if hf {
+            // transformers' DacConfig, in candle's DAC fields
+            let d = crate::parler_hf::dac_config(&raw["audio_encoder"]);
+            raw["audio_encoder"] = json!({"num_codebooks": d.num_codebooks, "model_bitrate": d.model_bitrate, "codebook_size": d.codebook_size,
+                                          "latent_dim": d.latent_dim, "frame_rate": d.frame_rate, "sampling_rate": d.sampling_rate});
+        }
+        let config: candle_transformers::models::parler_tts::Config = serde_json::from_value(raw.clone())?;
         let tok = Tokenizer::from_file(&files[1]).map_err(|e| anyhow!("{e}"))?;
+        let desc_tok = Tokenizer::from_file(files.get(3).filter(|_| hf).unwrap_or(&files[1])).map_err(|e| anyhow!("{e}"))?;
         let device = device(req)?;
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&files[2]], DType::F32, &device)? };
+        let vb = if hf {
+            let rows = raw["decoder"]["vocab_size"].as_u64().unwrap_or(1088) as usize;
+            crate::parler_hf::var_builder(&files[2], rows, DType::F32, &device)?
+        } else {
+            unsafe { VarBuilder::from_mmaped_safetensors(&[&files[2]], DType::F32, &device)? }
+        };
         let rate = config.audio_encoder.sampling_rate;
         let model = candle_transformers::models::parler_tts::Model::new(&config, vb)?;
-        Ok(Parler { name: e.name.to_string(), model, tok, rate, device })
+        Ok(Parler { name: e.name.to_string(), model, tok, desc_tok, english_only: !hf, rate, device })
     }
 
     /// Speech for `text` in the voice `description`: sentence by sentence (each a short generation), joined with a
     /// short pause. `on_part` sees (done, total) parts.
     pub fn speak(&mut self, text: &str, description: &str, seed: u64, temperature: f64, on_part: &mut dyn FnMut(usize, usize)) -> Result<(Vec<f32>, u32)> {
-        // Parler reads words, not digits: numbers, times, prices and percentages spelled out first
-        let parts = sentences(&spoken(text), 220);
+        // Parler reads words, not digits: numbers, times, prices and percentages spelled out first (in English; the
+        // multilingual checkpoints get the text as it is)
+        let parts = sentences(&if self.english_only { spoken(text) } else { text.to_string() }, 220);
         if parts.is_empty() {
             bail!("nothing to say");
         }
-        let desc = self.tok.encode(description, true).map_err(|e| anyhow!("{e}"))?.get_ids().to_vec();
+        let desc = self.desc_tok.encode(description, true).map_err(|e| anyhow!("{e}"))?.get_ids().to_vec();
         let desc = Tensor::new(desc, &self.device)?.unsqueeze(0)?;
         let mut out = Vec::new();
         let pause = vec![0f32; (self.rate as f32 * 0.25) as usize];

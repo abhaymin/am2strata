@@ -50,7 +50,9 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
 
 /// A language's English name, for messages ("Chinese" for "zh"); the code itself when it is not known here.
 fn language_name(code: &str) -> String {
-    let names = [("zh", "Chinese"), ("ja", "Japanese"), ("he", "Hebrew"), ("th", "Thai"), ("en", "English")];
+    let names = [("zh", "Chinese"), ("ja", "Japanese"), ("he", "Hebrew"), ("th", "Thai"), ("en", "English"), ("bn", "Bengali"),
+                 ("ta", "Tamil"), ("te", "Telugu"), ("mr", "Marathi"), ("gu", "Gujarati"), ("kn", "Kannada"), ("ml", "Malayalam"),
+                 ("or", "Odia"), ("pa", "Punjabi"), ("as", "Assamese"), ("ne", "Nepali")];
     strata_names(code).or_else(|| names.iter().find(|n| n.0 == code).map(|n| n.1.to_string())).unwrap_or_else(|| code.to_string())
 }
 
