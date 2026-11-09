@@ -320,7 +320,7 @@ async fn main() -> Result<()> {
         }
     }
     let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
-                           api_monitor: api_monitor::ApiMonitor::new(monitor_on),
+                           api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),
                            code_run: Arc::new(code_run),
@@ -369,6 +369,7 @@ async fn main() -> Result<()> {
         .route("/api/models/updates", get(hub_api::updates))
         .route("/api/models/update", post(hub_api::update))
         .route("/api/requests", get(api_monitor::requests))
+        .route("/api/requests/clear", post(api_monitor::clear))
         .route("/api/hub/quants", post(hub_api::quants))
         .route("/api/hub/pull", get(hub_api::status).post(hub_api::pull))
         .route("/api/run", get(code_run::info).post(code_run::run))

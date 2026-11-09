@@ -1210,12 +1210,21 @@ fn the_media_catalog_answers_at_once_while_an_image_is_made() {
         assert!(t0.elapsed().as_secs() < 10);
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    // the engine is busy for seconds: the catalog comes back at once, the same models, marked busy
-    let t = std::time::Instant::now();
-    let (code, r) = s.get("/api/media/models", true);
-    assert!(t.elapsed().as_millis() < 1000, "waited {} ms behind the job", t.elapsed().as_millis());
-    assert_eq!((code, r["busy"].as_bool()), (200, Some(true)), "{r}");
+    // the engine is busy for seconds once the job reaches it (a moment after the job takes its turn: on a loaded
+    // machine longer): each answer comes back at once, and once the engine is busy it says so, with the same models
+    let t0 = std::time::Instant::now();
+    let r = loop {
+        let t = std::time::Instant::now();
+        let (code, r) = s.get("/api/media/models", true);
+        // the job takes 3 s: an answer within 2 s did not wait behind it
+        assert!(t.elapsed().as_millis() < 2000, "waited {} ms behind the job", t.elapsed().as_millis());
+        assert_eq!(code, 200, "{r}");
+        if r["busy"] == true || t0.elapsed().as_millis() > 2500 {
+            break r;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    assert_eq!(r["busy"].as_bool(), Some(true), "{r}");
     assert_eq!(r["models"], first["models"]);
     assert_eq!(img.join().unwrap(), 200);
 }

@@ -2124,7 +2124,12 @@ async function refreshCalls() {
     if (r.status === 404) { callsOn = false; $("calls-off").hidden = false; $("calls-list").innerHTML = ""; return; }
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     callsOn = true; $("calls-off").hidden = true;
-    calls = (await r.json()).requests || [];
+    const j = await r.json();
+    calls = j.requests || [];
+    $("calls-keep").textContent = j.persistent
+      ? `${calls.length} call${calls.length === 1 ? "" : "s"} · kept across restarts (the newest ${j.kept_on_disk || 2000} on disk)`
+      : `${calls.length} calls · not kept across restarts`;
+    $("calls-clear").hidden = !calls.length;
     renderCalls();
     if (callSel) await showCall(callSel, true);
   } catch (e) { /* the server restarts: try again */ }
@@ -2140,7 +2145,7 @@ function renderCalls() {
   $("calls-list").innerHTML = list.length ? list.map((r) => {
     const sp = r.timings && r.timings.predicted_per_second;
     return `<button type="button" class="call-item" data-call="${esc(r.id)}" aria-current="${r.id === callSel}">` +
-      `<span class="call-item__top"><span>${new Date(r.started_at * 1000).toLocaleTimeString()}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
+      `<span class="call-item__top"><span>${callWhen(r.started_at)}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
       `<span class="call-item__path">POST ${esc(r.path)}</span>` +
       `<span class="call-item__meta">${esc(r.model || "")} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
       `${r.stream ? " · stream" : ""}${r.http_status && r.http_status !== 200 ? ` · HTTP ${r.http_status}` : ""}</span></button>`;
@@ -2148,6 +2153,23 @@ function renderCalls() {
 }
 $("calls-list").addEventListener("click", (e) => { const b = e.target.closest("[data-call]"); if (b) showCall(b.dataset.call); });
 $("calls-search").oninput = renderCalls; $("calls-filter").onchange = renderCalls;
+// a call from another day shows its date too (the list is kept across restarts)
+function callWhen(t) {
+  const d = new Date(t * 1000);
+  return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString()
+    : d.toLocaleDateString([], {day: "numeric", month: "short"}) + " " + d.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+$("calls-clear").onclick = async () => {
+  if (!confirm("Clear all recorded API calls? They are removed here and from the disk, and cannot be brought back.")) return;
+  try {
+    const r = await fetch("api/requests/clear", {method: "POST", headers: headers(true), body: "{}"});
+    if (!r.ok) throw new Error(((await r.json().catch(() => ({}))).error || {}).message || `HTTP ${r.status}`);
+    const n = (await r.json()).cleared;
+    callSel = null; calls = []; callsStamp = ""; renderCalls();
+    toast("success", "Cleared", `${n} call${n === 1 ? "" : "s"} removed.`);
+    refreshCalls();
+  } catch (e) { toast("error", "Not cleared", String(e.message || e), 6000); }
+};
 async function showCall(id, quiet = false) {
   callSel = id; if (!quiet) renderCalls();
   let v;

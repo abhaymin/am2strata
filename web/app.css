@@ -453,6 +453,7 @@ body.resizing iframe { pointer-events: none; }
 .monitor-row > .req-card { overflow: hidden; }
 .monitor-row > .ctx-card { overflow: auto; }
 .calls { max-width: none; }
+.calls-keep { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-block: 6px; }
 .calls-side { width: clamp(320px, 24vw, 460px); }
 @media (min-width: 1700px) {
   .metrics { grid-template-columns: repeat(9, minmax(0, 1fr)); }

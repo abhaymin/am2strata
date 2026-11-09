@@ -27,6 +27,7 @@ chat). Newest decisions first in each row. Dates are when the row last changed.
 | Speech in the language of the text | `language: auto`, the detector (`langdetect.rs`), model switching, Language picker; 20,000 characters. | 2026-11-10 |
 | Chat depth | 100 tool rounds an answer (500 on request), older results shortened to stay in context. | 2026-11-10 |
 | Monitor | History in pages (25-200), the table scrolls in its card. | 2026-11-10 |
+| API calls | Kept across restarts (`<data>/api-calls/calls.jsonl`, newest 2,000), Clear all, dates on older calls (owner, 2026-11-10). | 2026-11-10 |
 | [Knowledge cache, part D](KNOWLEDGE-CACHE.md) | Shared memory and chats past the context. Parts A-C, E still planned there. | 2026-10-24 |
 
 ## Longer-running engine work (their own plans)

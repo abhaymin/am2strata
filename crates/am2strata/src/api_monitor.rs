@@ -19,7 +19,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const KEEP: usize = 100;
+/// Calls kept in memory (newest), and on disk (<data>/api-calls/calls.jsonl, trimmed to DISK_KEEP at start) so they
+/// survive restarts: old calls stay there to trace a problem until "Clear all".
+const KEEP: usize = 500;
+const DISK_KEEP: usize = 2000;
 const CAP: usize = 262144;
 
 struct Record {
@@ -31,6 +34,8 @@ struct Record {
 pub struct ApiMonitor {
     pub enabled: bool,
     records: Mutex<VecDeque<Record>>,
+    /// where finished calls are written (None: memory only, as in the tests)
+    dir: Option<std::path::PathBuf>,
 }
 
 fn now() -> f64 {
@@ -49,8 +54,47 @@ fn capped(s: &str) -> (String, bool) {
 }
 
 impl ApiMonitor {
-    pub fn new(enabled: bool) -> Arc<Self> {
-        Arc::new(ApiMonitor { enabled, records: Mutex::new(VecDeque::new()) })
+    pub fn new(enabled: bool, dir: Option<std::path::PathBuf>) -> Arc<Self> {
+        let mut records = VecDeque::new();
+        if let (true, Some(d)) = (enabled, &dir) {
+            let path = d.join("calls.jsonl");
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+            let keep = &lines[lines.len().saturating_sub(DISK_KEEP)..];
+            if keep.len() < lines.len() {
+                let _ = std::fs::write(&path, keep.join("\n") + "\n");
+            }
+            for l in &keep[keep.len().saturating_sub(KEEP)..] {
+                if let Ok(Value::Object(v)) = serde_json::from_str::<Value>(l) {
+                    records.push_back(Record { v, clock: Instant::now() });
+                }
+            }
+        }
+        Arc::new(ApiMonitor { enabled, records: Mutex::new(records), dir })
+    }
+
+    /// A finished call written to the file (one JSON line).
+    fn persist(&self, v: &Map<String, Value>) {
+        let Some(d) = &self.dir else { return };
+        use std::io::Write;
+        let line = format!("{}\n", Value::Object(v.clone()));
+        let r = std::fs::create_dir_all(d).and_then(|_| {
+            std::fs::OpenOptions::new().create(true).append(true).open(d.join("calls.jsonl"))?.write_all(line.as_bytes())
+        });
+        if let Err(e) = r {
+            tracing::warn!("the API calls file: {e}");
+        }
+    }
+
+    /// Clear all: memory and the file. Returns how many calls were removed.
+    pub fn clear(&self) -> usize {
+        let mut g = self.records.lock().unwrap();
+        let n = g.len();
+        g.clear();
+        if let Some(d) = &self.dir {
+            let _ = std::fs::remove_file(d.join("calls.jsonl"));
+        }
+        n
     }
 
     fn begin(&self, path: &str, body: &[u8], default_model: &str) -> String {
@@ -103,12 +147,17 @@ impl ApiMonitor {
     }
 
     fn finish(&self, id: &str, outcome: &str) {
+        let mut done = None;
         self.update(id, |r, clock| {
             r.insert("wallclock_s".into(), json!((clock.elapsed().as_secs_f64() * 1000.0).round() / 1000.0));
             r.insert("finished_at".into(), json!(now()));
             let state = if r.get("error").is_some_and(|e| !e.is_null()) { "error" } else { outcome };
             r.insert("state".into(), json!(state));
+            done = Some(r.clone());
         });
+        if let Some(v) = done {
+            self.persist(&v);
+        }
     }
 
     fn list(&self) -> Vec<Value> {
@@ -324,8 +373,20 @@ pub async fn requests(State(s): State<AppState>, headers: HeaderMap, Query(q): Q
         };
     }
     let loaded = s.mgr.current().await.is_some();
-    Json(json!({"requests": s.api_monitor.list(), "retention": KEEP, "persistent": false, "loaded": loaded, "auto_load": true}))
+    Json(json!({"requests": s.api_monitor.list(), "retention": KEEP, "kept_on_disk": DISK_KEEP,
+                "persistent": s.api_monitor.dir.is_some(), "loaded": loaded, "auto_load": true}))
         .into_response()
+}
+
+/// POST /api/requests/clear: Clear all (memory and the file). From this server's own page only, as Settings.
+pub async fn clear(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the API calls can be cleared");
+    }
+    Json(json!({"cleared": s.api_monitor.clear()})).into_response()
 }
 
 /// POST /load and /unload: the page's buttons (the default model; JSON from this server's own page only).
@@ -363,4 +424,30 @@ fn form_field(body: &[u8], name: &str) -> Option<String> {
     let start = rest.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
     let end = rest[start..].windows(2).position(|w| w == b"\r\n")?;
     String::from_utf8(rest[start..start + end].to_vec()).ok().map(|v| v.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiMonitor;
+
+    #[test]
+    fn calls_survive_a_restart_until_clear_all() {
+        let dir = std::env::temp_dir().join(format!("am2-api-calls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = ApiMonitor::new(true, Some(dir.clone()));
+        let id = m.begin("/v1/chat/completions", br#"{"model":"m","messages":[]}"#, "m");
+        m.append(&id, "hello", "");
+        m.finish(&id, "completed");
+        // the next start reads it back, with its output
+        let m = ApiMonitor::new(true, Some(dir.clone()));
+        let list = m.list();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(list[0]["state"], "completed");
+        assert_eq!(m.get(&id).unwrap()["output"], "hello");
+        // Clear all: memory and the file
+        assert_eq!(m.clear(), 1);
+        assert!(m.list().is_empty() && !dir.join("calls.jsonl").exists());
+        assert!(ApiMonitor::new(true, Some(dir.clone())).list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
