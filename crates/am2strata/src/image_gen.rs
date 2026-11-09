@@ -26,6 +26,18 @@ struct Proc {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+    /// commands sent whose ending event was not read: a caller dropped while it waited (a client that went away, the
+    /// idle unload's timer aborted). Their answers are still coming, and are read and dropped before the next command,
+    /// or every later answer would go to the command after the one it belongs to.
+    unread: usize,
+    /// a caller was dropped in the middle of writing its command: the engine has half a line, and the only way back
+    /// to a clean state is a new engine
+    writing: bool,
+}
+
+/// The events that end a command.
+fn ends(event: &str) -> bool {
+    matches!(event, "error" | "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "removal" | "removed" | "accepted")
 }
 
 pub struct Media {
@@ -152,7 +164,7 @@ impl Media {
             .unwrap_or_else(|| vec!["apng".into(), "gif".into()]);
         *self.video_formats.lock().unwrap() = formats;
         self.cuda.store(v["cuda"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
-        Ok(Proc { child, stdin, lines })
+        Ok(Proc { child, stdin, lines, unread: 0, writing: false })
     }
 
     /// One command; `on_event` sees every event until the one that ends it (done / loaded / pulled / unloaded / error).
@@ -172,12 +184,29 @@ impl Media {
 
     pub async fn call(&self, cmd: Value, mut on_event: impl FnMut(&Value)) -> anyhow::Result<Value> {
         let mut guard = self.proc.lock().await;
+        if guard.as_ref().is_some_and(|p| p.writing) {
+            tracing::warn!("a command to the media engine was cut off while it was written: starting the engine again");
+            *guard = None;
+        }
         if guard.as_mut().is_none_or(|p| p.child.try_wait().ok().flatten().is_some()) {
             *guard = Some(self.spawn().await?);
         }
         let p = guard.as_mut().unwrap();
+        // an earlier caller's answer still on its way: wait for it, and drop it
+        while p.unread > 0 {
+            let Some(line) = p.lines.next_line().await? else {
+                *guard = None;
+                anyhow::bail!("the media engine stopped unexpectedly");
+            };
+            if serde_json::from_str::<Value>(&line).is_ok_and(|v| ends(v["event"].as_str().unwrap_or(""))) {
+                p.unread -= 1;
+            }
+        }
+        p.unread += 1;
+        p.writing = true;
         p.stdin.write_all(format!("{cmd}\n").as_bytes()).await?;
         p.stdin.flush().await?;
+        p.writing = false;
         loop {
             let Some(line) = p.lines.next_line().await? else {
                 *guard = None;
@@ -187,12 +216,16 @@ impl Media {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            match v["event"].as_str().unwrap_or("") {
-                "error" => anyhow::bail!("{}", v["message"].as_str().unwrap_or("the media engine failed")),
-                "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "removal" | "removed"
-                | "accepted" => return Ok(v),
-                _ => on_event(&v),
+            let event = v["event"].as_str().unwrap_or("");
+            if !ends(event) {
+                on_event(&v);
+                continue;
             }
+            p.unread -= 1;
+            if event == "error" {
+                anyhow::bail!("{}", v["message"].as_str().unwrap_or("the media engine failed"));
+            }
+            return Ok(v);
         }
     }
 }

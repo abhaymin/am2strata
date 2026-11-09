@@ -1074,6 +1074,22 @@ fn a_default_model_without_a_key_uses_the_key_of_another_run_config() {
 }
 
 #[test]
+fn an_answer_for_a_client_that_went_away_does_not_go_to_the_next_request() {
+    // the image job takes 1.5 s; its client gives up after 0.3 s, while the engine is still working on it
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 1500, "mem_gb": 64}));
+    let gone = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_millis(300)).build().unwrap()
+        .post(format!("{}/v1/images/generations", s.base)).bearer_auth(KEY).json(&json!({"prompt": "a lighthouse"})).send();
+    assert!(gone.is_err(), "the client should have timed out");
+    // the next request waits for the engine, and gets its own answer, not the image's "done" (it did before)
+    let (code, r) = s.post("/api/media/models/default", &json!({"model": "whisper-base"}));
+    assert_eq!(code, 200, "{r}");
+    let (code, r) = s.post("/v1/audio/transcriptions", &json!({"file": "AQIDBA=="}));
+    assert_eq!((code, r["text"].as_str()), (200, Some("Hello world.")), "{r}");
+    let (code, r) = s.post("/v1/audio/transcriptions", &json!({"file": "AQIDBA==", "response_format": "verbose_json"}));
+    assert_eq!((code, r["task"].as_str()), (200, Some("transcribe")), "{r}");
+}
+
+#[test]
 fn the_media_catalog_answers_at_once_while_an_image_is_made() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 3000}));
     let (code, first) = s.get("/api/media/models", true);
