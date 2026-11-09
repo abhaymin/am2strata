@@ -169,7 +169,10 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); flex-wrap: wrap; }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
-.req-actions { display: flex; gap: var(--st-s-2); }
+.req-actions { display: flex; gap: var(--st-s-2); align-items: center; flex-wrap: wrap; }
+.req-pager { display: inline-flex; gap: 6px; align-items: center; }
+.req-pager .st-btn { padding-inline: 10px; }
+.req-pager select { width: auto; padding-block: 4px; }
 #req-wrap .st-table td.req-model { max-width: 220px; overflow: hidden; text-overflow: ellipsis; font-family: var(--st-font); }
 #req-wrap .st-table td.req-out { white-space: normal; min-width: 220px; }
 .req-medias { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
@@ -439,7 +442,11 @@ body.resizing iframe { pointer-events: none; }
 /* Monitor and API calls use the whole window: full width, the requests table grows to the bottom */
 .monitor { max-width: none; min-height: 100%; }
 .monitor-row { flex: 1; min-height: 560px; grid-template-columns: minmax(280px, 1fr) minmax(0, 3fr); }
-.req-card .table-wrap { flex: 1; min-height: 0; overflow: auto; }
+.req-card .table-wrap { flex: 1 1 0; min-height: 0; overflow: auto; }
+/* the row is as tall as the window leaves it (at least 560 px), so a long history scrolls inside the table, whose
+   header stays in view */
+.monitor-row { height: max(560px, calc(100vh - 330px)); }
+#req-wrap thead th { position: sticky; top: 0; z-index: 1; background: var(--st-surface); }
 /* the row's cards keep to the row's height: a grid item's min-height is its content by default, so a long history (or
    its media players) grew the table past the row and under the cards below; now the table scrolls inside its card */
 .monitor-row > .st-card { min-height: 0; }

@@ -323,7 +323,13 @@
         </div>
         <div class="st-card req-card">
           <div class="req-head"><span class="card-title">Recent requests</span>
-            <span class="req-actions"><button class="st-btn st-btn--secondary" id="req-all" hidden>Show all</button>
+            <span class="req-actions"><span class="req-pager" id="req-pager" hidden>
+                <button class="st-btn st-btn--secondary" data-page="first" title="The newest requests">&laquo; Newest</button>
+                <button class="st-btn st-btn--secondary" data-page="prev" aria-label="Newer requests">&lsaquo;</button>
+                <span class="muted small" id="req-page-label"></span>
+                <button class="st-btn st-btn--secondary" data-page="next" aria-label="Older requests">&rsaquo;</button>
+                <button class="st-btn st-btn--secondary" data-page="last" title="The oldest requests">Oldest &raquo;</button>
+                <select class="st-input" id="req-per" aria-label="Requests per page"><option>25</option><option selected>50</option><option>100</option><option>200</option></select></span>
               <button class="st-btn st-btn--secondary" id="req-clear" hidden title="Removes the saved request history and the media it kept">Clear history</button></span></div>
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">

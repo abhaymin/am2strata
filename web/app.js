@@ -546,10 +546,13 @@ async function showReqMedia(el) {
     el.textContent = "(file gone)";
   }
 }
-let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+// the Monitor's request table, in pages of the server's history (newest first): page 1 is the newest
+let reqPage = 1, reqPages = 1;
+let reqPer = (() => { const n = +store.get("req-per", 50); return [25, 50, 100, 200].includes(n) ? n : 50; })();
+let pollTimer = null;   // one poll loop: a page change polls at once and the loop goes on from there
 async function poll() {
   try {
-    const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
+    const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
       if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
@@ -564,7 +567,8 @@ async function poll() {
     if (++metricsFailures === 3) setPill("error", "Server not reachable");
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
-  setTimeout(poll, 1000);
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(poll, 1000);
 }
 
 function setPill(state, text) {
@@ -601,7 +605,7 @@ function render(m) {
     const r = q.running ? ` behind ${q.running.kind === "chat" ? "a chat" : `a ${q.running.kind} job`}` : "";
     setPill("queued", `${q.waiting.length} waiting${r}`);
   } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
-  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+  if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.requests_page);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);
 }
@@ -648,7 +652,7 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
@@ -751,7 +755,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   // recent requests: rebuilt only when a row comes or goes, so a playing video or speech keeps playing
   const body = $("req-body");
-  const sig = `${reqShowAll}|${requests.length}|${requests.slice(0, 1).map((r) => `${r.id}${r.time}`)}`;
+  const sig = `${reqPage}|${reqPer}|${requests.length}|${requests.slice(0, 1).map((r) => `${r.id}${r.time}`)}`;
   if (sig === reqSig) {
     // unchanged
   } else if (!requests.length) {
@@ -761,7 +765,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     reqSig = sig;
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                    disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
-    body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
+    body.innerHTML = requests.map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       if (r.kind) {
         // a media job: kind, model and what it made across the token columns
@@ -786,12 +790,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     }).join("");
     for (const el of body.querySelectorAll(".req-media")) showReqMedia(el);
   }
-  const all = $("req-all");
   kept = kept == null ? requests.length : kept;
-  all.hidden = kept <= 12;
   $("req-clear").hidden = !kept;
-  all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
-  $("req-wrap").classList.toggle("all", reqShowAll);
+  // the pager: the server says which page it sent (a page past the end comes back as the last one)
+  if (rp) { reqPage = rp.page; reqPages = rp.pages; }
+  $("req-pager").hidden = kept <= 25;
+  const first = (reqPage - 1) * reqPer + 1;
+  $("req-page-label").textContent = `Page ${reqPage} of ${reqPages} · ${first}–${Math.min(first + reqPer - 1, kept)} of ${kept.toLocaleString()}`;
+  for (const b of $("req-pager").querySelectorAll("[data-page]")) {
+    b.disabled = (b.dataset.page === "first" || b.dataset.page === "prev") ? reqPage <= 1 : reqPage >= reqPages;
+  }
   $("req-totals").textContent = renderTotals(totals);
 }
 
@@ -841,7 +849,14 @@ document.addEventListener("click", (e) => {
   const b = e.target.closest("[data-copy]");
   if (b) copyText(b.dataset.copy, b);
 });
-$("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+$("req-pager").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-page]"); if (!b || b.disabled) return;
+  reqPage = {first: 1, prev: reqPage - 1, next: reqPage + 1, last: reqPages}[b.dataset.page];
+  $("req-wrap").scrollTop = 0;
+  poll();
+});
+$("req-per").value = String(reqPer);
+$("req-per").onchange = () => { reqPer = +$("req-per").value; store.set("req-per", reqPer); reqPage = 1; poll(); };
 $("req-clear").addEventListener("click", async () => {
   if (!confirm("Clear the Monitor's request history? The images, videos and speech it kept are deleted too.")) return;
   try {

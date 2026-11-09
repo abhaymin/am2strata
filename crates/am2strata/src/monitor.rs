@@ -14,6 +14,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Requests per page of /metrics (`?page=N&per=M`, newest first); `?requests=all` lists every one kept.
+pub const PAGE_DEFAULT: usize = 50;
+pub const PAGE_MAX: usize = 500;
+
 /// Requests kept for the table until cleared: past this the oldest go, from memory (the file is rewritten without
 /// them at the next start).
 const HISTORY_KEEP: usize = 5000;
@@ -328,7 +332,8 @@ impl Monitor {
     }
 
     /// GET /metrics.
-    pub fn metrics(&self, engine: Value, loaded: bool, all_requests: bool) -> Value {
+    /// `page`: (page from 1, rows per page) of the request history, newest first; None: all of it.
+    pub fn metrics(&self, engine: Value, loaded: bool, page: Option<(usize, usize)>) -> Value {
         let g = self.inner.lock().unwrap();
         let t = now();
         let r1 = |v: f64| (v * 10.0).round() / 10.0;
@@ -361,7 +366,11 @@ impl Monitor {
                            "max_tokens": null, "elapsed_s": null, "tok_s": null, "tok_s_mean": null,
                            "prefill_tok_s_mean": null, "tok_s_window_s": null}),
         };
-        let hist: Vec<Value> = g.history.iter().rev().take(if all_requests { usize::MAX } else { 12 }).cloned().collect();
+        let total = g.history.len();
+        let (page, per) = page.map(|(p, n)| (p.max(1), n.clamp(1, PAGE_MAX))).unwrap_or((1, total.max(1)));
+        let pages = total.div_ceil(per).max(1);
+        let page = page.min(pages);
+        let hist: Vec<Value> = g.history.iter().rev().skip((page - 1) * per).take(per).cloned().collect();
         let tt = &g.totals;
         let totals = json!({"since": tt.since, "requests": tt.requests, "prompt_tokens": tt.prompt_tokens,
                             "reused": tt.reused, "output_tokens": tt.output_tokens, "prompt_ms": tt.prompt_ms,
@@ -378,7 +387,7 @@ impl Monitor {
         let history: serde_json::Map<String, Value> =
             tel.hist.iter().map(|(k, v)| (k.to_string(), Value::Array(v.iter().cloned().collect()))).collect();
         json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache,
-               "requests_kept": g.history.len(), "totals": totals, "hardware": tel.now, "hardware_static": tel.stat,
+               "requests_kept": total, "requests_page": {"page": page, "per": per, "pages": pages, "total": total}, "totals": totals, "hardware": tel.now, "hardware_static": tel.stat,
                "history": history, "time": t})
     }
 
@@ -835,7 +844,7 @@ mod history_tests {
         let m = Arc::new(Monitor::new(None));
         let id = m.media_begin("text-to-speech", "parler-tts-mini-v1");
         drop(MediaRow::new(&m, id));
-        let v = m.metrics(Value::Null, false, true);
+        let v = m.metrics(Value::Null, false, None);
         assert_ne!(v["live"]["state"], "media", "{v}");
         assert_eq!(v["requests"][0]["finish"], "disconnect");
         // a job that ended first is not ended twice
@@ -843,7 +852,25 @@ mod history_tests {
         let row = MediaRow::new(&m, id);
         m.media_end(id, "stop", "1 image, 512x512");
         drop(row);
-        assert_eq!(m.metrics(Value::Null, false, true)["requests"].as_array().map(Vec::len), Some(2));
+        assert_eq!(m.metrics(Value::Null, false, None)["requests"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[tokio::test]
+    async fn the_history_comes_in_pages_newest_first() {
+        let m = Arc::new(Monitor::new(None));
+        for k in 0..7 {
+            let id = m.media_begin("image", "z-image-turbo:q8");
+            m.media_end(id, "stop", &format!("image {k}"));
+        }
+        let page = |p, n| m.metrics(Value::Null, false, Some((p, n)));
+        let v = page(1, 3);
+        assert_eq!(v["requests_page"], json!({"page": 1, "per": 3, "pages": 3, "total": 7}));
+        let outs = |v: &Value| v["requests"].as_array().unwrap().iter().map(|r| r["output"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>();
+        assert_eq!(outs(&v), ["image 6", "image 5", "image 4"]);
+        assert_eq!(outs(&page(3, 3)), ["image 0"]);
+        // a page past the end is the last page; all of them with None
+        assert_eq!(page(9, 3)["requests_page"]["page"], 3);
+        assert_eq!(m.metrics(Value::Null, false, None)["requests"].as_array().map(Vec::len), Some(7));
     }
 
     #[tokio::test]
@@ -857,7 +884,7 @@ mod history_tests {
         std::fs::OpenOptions::new().append(true).open(dir.join("history.jsonl")).unwrap().write_all(b"{\"time\": 1, broken\n").unwrap();
         // a new start: the row is back (the damaged line skipped), its file is served, and ids go on after it
         let m = Monitor::new(Some(dir.clone()));
-        let rows = m.metrics(Value::Null, false, true)["requests"].clone();
+        let rows = m.metrics(Value::Null, false, None)["requests"].clone();
         assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
         assert_eq!(rows[0]["model"], "z-image-turbo:q8");
         let name = rows[0]["media"][0]["name"].as_str().unwrap();
