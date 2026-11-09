@@ -26,6 +26,8 @@ server can run on the same machine (one at a time).
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
 support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and settings.
 
+Plans and where each stands: [docs/LEDGER.md](docs/LEDGER.md).
+
 ## Install
 
 **Linux (x86_64) and macOS (Apple Silicon):**

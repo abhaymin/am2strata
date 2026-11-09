@@ -180,10 +180,14 @@ impl Jobs {
         }
         if let Some(m) = find(crate::music::MODEL) {
             let downloaded = m["downloaded"] == true;
+            // a GPU of 7 GB or more makes a minute of song in seconds; without one it runs on the CPU, slowly
+            let gpu = s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000);
             let mut k = json!({"model": crate::music::MODEL, "downloaded": downloaded, "size_gb": m["size_gb"], "fits": true,
-                               "usable": downloaded && s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000), "max_seconds": 600});
+                               "usable": downloaded, "gpu": gpu, "max_seconds": 600});
             if !downloaded {
                 k["note"] = json!(format!("{} is not downloaded (Settings > Models > Media models > Music)", crate::music::MODEL));
+            } else if !gpu {
+                k["note"] = json!("no GPU of 7 GB or more: songs are made on the CPU, about five times slower than they play");
             }
             kinds.insert("music".to_string(), k);
         }
