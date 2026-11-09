@@ -52,6 +52,14 @@ fn main() {
                     "duration": 1.5, "task": if cmd["translate"] == true { "translate" } else { "transcribe" }, "bytes_b64": n,
                     "device": cmd["device"], "segments": [{"id": 0, "start": 0.0, "end": 1.5, "text": text}]}));
             }
+            "song" => {
+                for s in 1..=8u64 {
+                    emit(serde_json::json!({"event": "step", "step": s, "total": 8}));
+                }
+                // a valid 1-sample stereo WAV at 48 kHz
+                emit(serde_json::json!({"event": "song", "format": "wav", "sample_rate": 48000, "seconds": cmd["duration"],
+                    "data": "UklGRigAAABXQVZFZm10IBAAAAABAAIAgLsAAADuAgAEABAAZGF0YQQAAAAAAAAA"}));
+            }
             "speak" => {
                 emit(serde_json::json!({"event": "part", "done": 1, "total": 1}));
                 // a valid 1-sample WAV
@@ -72,6 +80,8 @@ fn main() {
                 {"name": "whisper-large-v3-turbo", "kind": "audio", "task": "stt", "family": "whisper", "size_gb": 1.62, "downloaded": false, "gated": false},
                 {"name": "chatterbox-turbo", "kind": "audio", "task": "tts", "family": "chatterbox", "runtime": "onnx", "size_gb": 3.29,
                  "downloaded": true, "gated": false},
+                {"name": "ace-step-1.5-turbo", "kind": "music", "family": "ace-step", "size_gb": 6.3,
+                 "downloaded": std::env::var("MOCK_NO_MUSIC").is_err(), "gated": false},
                 {"name": "chatterbox-multilingual", "kind": "audio", "task": "tts", "family": "chatterbox", "runtime": "onnx", "size_gb": 3.27,
                  "downloaded": std::env::var("MOCK_NO_MULTILINGUAL").is_err(), "gated": false,
                  "languages": [{"code": "es", "name": "Spanish"}, {"code": "fr", "name": "French"}, {"code": "hi", "name": "Hindi"},

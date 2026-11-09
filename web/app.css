@@ -484,6 +484,7 @@ body.resizing iframe { pointer-events: none; }
 .media-kinds { align-self: flex-start; margin-bottom: 12px; }
 .media-soon { margin-bottom: 12px; }
 .seg--5 { grid-template-columns: repeat(5, auto); }
+.seg--6 { grid-template-columns: repeat(6, auto); }
 .set-sub { font-size: 14px; font-weight: 600; margin: 18px 0 8px; display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .media-models__bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 12px 14px 4px; }
 .media-models__bar .st-input { flex: 1 1 180px; min-width: 0; height: 36px; }

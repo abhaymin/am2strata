@@ -39,7 +39,6 @@ mod audio;
 #[path = "../parler_hf.rs"]
 mod parler_hf;
 #[path = "../acestep/mod.rs"]
-#[allow(dead_code)]
 mod acestep;
 #[cfg(feature = "onnx")]
 #[path = "../chatterbox.rs"]
@@ -61,6 +60,7 @@ struct State {
     parler: Option<audio::Parler>,
     #[cfg(feature = "onnx")]
     chatterbox: Option<chatterbox::Chatterbox>,
+    song: Option<acestep::pipeline::AceStep>,
 }
 
 impl State {
@@ -77,6 +77,14 @@ impl State {
 
 /// What removing `model` deletes (its own files) and keeps (files another model also uses).
 fn removal(st: &mut State, model: &str) -> Result<Value> {
+    if model == acestep::NAME {
+        let dir = acestep::folder();
+        if !dir.exists() {
+            return Err(anyhow!("{model} is not downloaded"));
+        }
+        let bytes = audio::disk_bytes(&dir);
+        return Ok(json!({"event": "removal", "model": model, "files": [{"path": dir, "bytes": bytes}], "kept": [], "bytes": bytes}));
+    }
     if let Some(e) = audio::entry(model) {
         let dir = audio::folder(e);
         if !dir.exists() {
@@ -305,6 +313,9 @@ fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
     if let Some(e) = audio::entry(model) {
         return audio::pull(e);
     }
+    if model == acestep::NAME {
+        return acestep::pull();
+    }
     if let Some(e) = extra(model) {
         // mold gates its own Qwen Image 2.1 tiers on this licence by name; an extra on the same weights asks the same
         if !mold_home().is_some_and(|h| mold_core::license_acceptance::is_accepted(&h, e.license)) {
@@ -369,7 +380,45 @@ fn list(st: &mut State) -> Value {
         .collect();
     let mut models = models;
     models.extend(audio::list());
+    models.push(acestep::entry());
     json!({"event": "models", "models": models})
+}
+
+/// A song (ACE-Step 1.5 in Rust): {"op":"song","caption","lyrics","language","duration","seed","bpm","key","time_signature",
+/// "steps","device"} -> {"event":"step",...}... then {"event":"song","format":"wav","data":<base64>,"seconds",...}.
+fn song(st: &mut State, cmd: &Value) -> Result<Value> {
+    let dir = acestep::local().ok_or_else(|| anyhow!("{} is not downloaded (pull it first)", acestep::NAME))?;
+    if st.song.is_none() {
+        // the image or video model leaves the card first
+        if let Some(mut e) = st.engine.take() {
+            e.unload();
+        }
+        st.model = None;
+        let device = match cmd["device"].as_str() {
+            Some("cpu") => candle_core::Device::Cpu,
+            _ if cfg!(feature = "cuda") => candle_core::Device::new_cuda(cmd["gpu"].as_u64().unwrap_or(0) as usize)?,
+            _ => candle_core::Device::Cpu,
+        };
+        st.song = Some(acestep::pipeline::AceStep::load(&dir, &device)?);
+    }
+    let text = |k: &str| cmd[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let duration = (cmd["duration"].as_u64().unwrap_or(60) as u32).clamp(acestep::pipeline::MIN_SECONDS, acestep::pipeline::MAX_SECONDS);
+    let s = acestep::pipeline::Song {
+        caption: text("caption").ok_or_else(|| anyhow!("caption: describe the song (genre, instruments, voice, mood)"))?,
+        lyrics: text("lyrics").unwrap_or_else(|| "[Instrumental]".into()),
+        language: text("language").unwrap_or_else(|| "en".into()),
+        metas: acestep::text::Metas { bpm: cmd["bpm"].as_u64().map(|b| b as u32), time_signature: text("time_signature"),
+                                      key_scale: text("key"), duration_s: duration },
+        seed: cmd["seed"].as_u64().unwrap_or(0),
+        steps: (cmd["steps"].as_u64().unwrap_or(8) as usize).clamp(1, 20),
+        shift: cmd["shift"].as_f64().unwrap_or(1.0) as f32,
+    };
+    let t0 = std::time::Instant::now();
+    let audio = st.song.as_mut().unwrap().song(&s, &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
+    let wav = acestep::pipeline::wav(&audio)?;
+    Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE, "seconds": duration,
+              "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME, "seed": s.seed,
+              "data": base64::engine::general_purpose::STANDARD.encode(wav)}))
 }
 
 fn load(st: &mut State, model: &str) -> Result<()> {
@@ -379,6 +428,8 @@ fn load(st: &mut State, model: &str) -> Result<()> {
 /// Loads `model`, with `request`'s placement when it has one (its components on the devices it names); a loaded model
 /// placed otherwise is loaded again.
 fn load_placed(st: &mut State, model: &str, request: Option<&mold_core::GenerateRequest>) -> Result<()> {
+    // a song model on the card goes first
+    st.song = None;
     let placement = request.and_then(|r| r.placement.as_ref()).map(|p| serde_json::to_value(p).unwrap_or(Value::Null));
     if st.model.as_deref() == Some(model) && st.placement == placement && st.engine.as_ref().is_some_and(|e| e.is_loaded()) {
         return Ok(());
@@ -455,7 +506,7 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
     let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, placement: None, whisper: None, parler: None,
                          #[cfg(feature = "onnx")]
-                         chatterbox: None };
+                         chatterbox: None, song: None };
     // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
     emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION"),
                 "video_formats": ["mp4", "apng", "gif"]}));
@@ -484,6 +535,7 @@ fn main() {
                     }
                     st.model = None;
                     st.drop_audio();
+                    st.song = None;
                     emit(json!({"event": "unloaded"}));
                 }
                 "list" => emit(list(&mut st)),
@@ -506,6 +558,10 @@ fn main() {
                     let r = speak(&mut st, &cmd)?;
                     emit(r)
                 }
+                "song" => {
+                    let r = song(&mut st, &cmd)?;
+                    emit(r)
+                }
                 "remove_plan" => emit(removal(&mut st, &model)?),
                 "remove" => {
                     // out of memory first: the engine (or the speech models) may hold it
@@ -514,6 +570,14 @@ fn main() {
                             e.unload();
                         }
                         st.model = None;
+                    }
+                    if model == acestep::NAME {
+                        st.song = None;
+                        let dir = acestep::folder();
+                        let bytes = audio::disk_bytes(&dir);
+                        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+                        emit(json!({"event": "removed", "model": model, "bytes": bytes}));
+                        return Ok(());
                     }
                     if let Some(e) = audio::entry(&model) {
                         st.drop_audio();

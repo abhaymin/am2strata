@@ -118,6 +118,7 @@ impl Server {
             .env("MOCK_MEDIA_RECORD", dir.join("media-record.txt"))
             .env("AM2_TEST_MEM_GB", extra.get("mem_gb").map(|v| v.to_string()).unwrap_or_else(|| "64".into()))
             .envs(extra.get("no_multilingual").map(|_| ("MOCK_NO_MULTILINGUAL", "1")))
+            .envs(extra.get("no_music").map(|_| ("MOCK_NO_MUSIC", "1")))
             .env("MOCK_MEDIA_DELAY_MS", extra.get("media_delay_ms").map(|v| v.to_string()).unwrap_or_else(|| "0".into()))
             .env("MOCK_SCRIPT", dir.join("script.json"))
             .env("MOCK_RECORD", &record)

@@ -182,8 +182,8 @@
   <!-- ============================ Media Generation ============================ -->
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
     <div class="about">
-      <div class="seg seg--3 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
-        <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button>
+      <div class="seg seg--4 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
+        <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="song">Song</button>
       </div>
       <div class="audio-forms" id="audio-forms" hidden>
         <form class="st-card img-form" id="stt-form">
@@ -277,6 +277,41 @@
           <button type="submit" class="st-btn st-btn--primary" id="vid-go">Generate</button>
         </div>
         <span class="composer-hint" id="vid-hint">Video takes minutes; the text model gives the GPU to it and loads again with the next chat.</span>
+      </form>
+      <form class="st-card img-form" id="song-form" hidden>
+        <span class="card-title">Make a song</span>
+        <label class="st-field">Model
+          <select class="st-input media-model" id="song-model" data-kind="music" aria-label="Song model"></select></label>
+        <div class="img-row">
+          <label class="st-field">Style
+            <select class="st-input" id="song-preset" aria-label="Style presets"><option value="">a preset&hellip;</option>
+              <option>warm indie pop, female vocal, acoustic guitar, soft drums, hopeful</option>
+              <option>soulful ballad, male vocal, piano and strings, slow, emotional</option>
+              <option>bollywood pop, female vocal, tabla, sitar and synth, cheerful, danceable</option>
+              <option>malayalam film melody, male vocal, violin and flute, gentle, nostalgic</option>
+              <option>carnatic fusion, female vocal, veena, mridangam and electronic beats</option>
+              <option>energetic rock anthem, male vocal, distorted guitars, big drums</option>
+              <option>lo-fi hip hop, mellow, vinyl crackle, soft keys, relaxed</option>
+              <option>upbeat edm, female vocal, synth leads, four-on-the-floor, festival</option>
+              <option>acoustic folk, duet, guitar and harmonica, warm, storytelling</option>
+            </select></label>
+        </div>
+        <textarea class="st-input img-prompt" id="song-style" rows="2" placeholder="The sound: genre, instruments, voice, mood (e.g. bollywood pop, female vocal, tabla and synth, cheerful)" aria-label="Song style"></textarea>
+        <textarea class="st-input img-prompt" id="song-lyrics" rows="8" aria-label="Lyrics" placeholder="[verse]&#10;Your first lines here&#10;&#10;[chorus]&#10;The lines that come back&#10;&#10;(leave empty, or write [Instrumental], for no singing)"></textarea>
+        <div class="img-row">
+          <label class="st-field">Vocal language
+            <select class="st-input" id="song-lang"><option value="">auto (from the lyrics)</option></select></label>
+          <label class="st-field">Length
+            <select class="st-input" id="song-duration"><option value="30">0:30</option><option value="60" selected>1:00</option>
+              <option value="120">2:00</option><option value="180">3:00</option><option value="240">4:00</option>
+              <option value="300">5:00</option><option value="480">8:00</option><option value="600">10:00</option></select></label>
+          <label class="st-field">BPM
+            <input class="st-input" id="song-bpm" type="number" min="30" max="300" placeholder="auto"></label>
+          <label class="st-field">Seed
+            <input class="st-input" id="song-seed" type="number" min="0" placeholder="random"></label>
+          <button type="submit" class="st-btn st-btn--primary" id="song-go">Make song</button>
+        </div>
+        <span class="composer-hint" id="song-hint">ACE-Step 1.5, on this PC's graphics card: a minute of song takes about a quarter of a minute. Early version: the song planner is still to come, so the music follows the style, but sung words do not yet always follow the lyrics; try another seed.</span>
       </form>
       <div class="img-results" id="img-results"></div>
     </div>
@@ -384,8 +419,8 @@
             <button class="st-toggle" id="media-chat" role="switch" aria-checked="true" aria-label="Let the chat make images, video and speech"></button></div>
           <div class="st-card list-card media-models" id="media-models">
             <div class="media-models__bar">
-              <div class="seg seg--5" role="tablist" aria-label="Kind" id="mm-kind">
-                <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="3d">3D</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="all">All</button>
+              <div class="seg seg--6" role="tablist" aria-label="Kind" id="mm-kind">
+                <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="3d">3D</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="music">Music</button><button type="button" role="tab" aria-selected="false" data-kind="all">All</button>
               </div>
               <input class="st-input" id="mm-search" placeholder="Search (flux, wan, q4&hellip;)" aria-label="Search media models" autocomplete="off">
               <label class="mm-check"><input type="checkbox" id="mm-downloaded"> Downloaded only</label>

@@ -1119,6 +1119,36 @@ fn speech_is_spoken_in_the_language_of_the_text() {
 }
 
 #[test]
+fn a_song_is_made_from_a_style_and_lyrics() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));
+    let c = reqwest::blocking::Client::new();
+    let body = json!({"style": "warm indie pop, female vocal", "lyrics": "[verse]\nनमस्ते दुनिया", "duration": 30, "seed": 7, "bpm": 100});
+    let r = c.post(format!("{}/v1/audio/music", s.base)).bearer_auth(KEY).json(&body).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.headers()["content-type"], "audio/wav");
+    // the vocal language found from the lyrics when not given
+    assert_eq!(r.headers()["x-strata-language"], "hi");
+    assert!(r.bytes().unwrap().starts_with(b"RIFF"));
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let op = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "song").unwrap();
+    assert_eq!((op["caption"].as_str(), op["duration"].as_u64(), op["seed"].as_u64(), op["bpm"].as_u64()),
+               (Some("warm indie pop, female vocal"), Some(30), Some(7), Some(100)), "{op}");
+    // the Monitor has the song with its file
+    let (_, m) = s.get("/metrics", true);
+    let row = m["requests"].as_array().unwrap().iter().find(|r| r["kind"] == "song").cloned().unwrap();
+    assert_eq!(row["media"][0]["type"], "audio/wav", "{row}");
+    // checked before the engine is asked
+    for (body, says) in [(json!({"lyrics": "la"}), "style"), (json!({"style": "pop", "duration": 601}), "duration"),
+                         (json!({"style": "pop", "response_format": "mp3"}), "wav")] {
+        let (code, r) = s.post("/v1/audio/music", &body);
+        assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains(says), "{body} -> {r}");
+    }
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"no_music": true}));
+    let (code, r) = s.post("/v1/audio/music", &json!({"style": "pop"}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("not downloaded"), "{r}");
+}
+
+#[test]
 fn a_default_model_without_a_key_uses_the_key_of_another_run_config() {
     // the default model's run config has no api_key; another model's has one: the server takes it, never runs open
     let a = Model { id: "mock-a", extra: json!({"api_key": ""}), ..Model::default() };

@@ -130,7 +130,7 @@ pub fn entry(name: &str) -> Option<&'static Entry> {
     CATALOG.iter().find(|e| e.name == name)
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     let home = std::env::var_os("MOLD_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     home.join("audio")
 }

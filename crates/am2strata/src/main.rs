@@ -12,6 +12,7 @@ mod browser;
 mod api_monitor;
 mod audio_api;
 mod langdetect;
+mod music;
 mod code_run;
 mod image_gen;
 mod preview;
@@ -376,6 +377,7 @@ async fn main() -> Result<()> {
         .route("/v1/audio/transcriptions", post(audio_api::transcriptions))
         .route("/v1/audio/translations", post(audio_api::translations))
         .route("/v1/audio/speech", post(audio_api::speech))
+        .route("/v1/audio/music", post(music::music))
         .route("/api/media/audio/device", post(audio_api::set_device))
         .route("/api/memory", get(memory::list).post(memory::add))
         .route("/api/memory/settings", post(memory::set_settings))

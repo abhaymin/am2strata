@@ -300,7 +300,8 @@ function fillVideoSizes() {
 function fillModelPickers() {
   for (const sel of document.querySelectorAll(".media-model")) {
     const kind = sel.dataset.kind, task = sel.dataset.task;
-    const current = kind === "video" ? media.video_model : kind === "audio" ? (task === "tts" ? media.tts_model : media.stt_model) : media.image_model;
+    const current = kind === "video" ? media.video_model : kind === "audio" ? (task === "tts" ? media.tts_model : media.stt_model)
+      : kind === "music" ? "ace-step-1.5-turbo" : media.image_model;
     const have = (media.models || []).filter((m) => m.kind === kind && m.downloaded && (!task || m.task === task));
     const opts = have.map((m) => `<option value="${esc(m.name)}"${m.name === current ? " selected" : ""}>${esc(m.display_name || m.name)} (${esc(m.name)}, ${m.size_gb} GB)</option>`);
     if (!have.some((m) => m.name === current)) opts.unshift(`<option value="${esc(current)}" selected>${esc(current)} - not downloaded</option>`);
@@ -310,7 +311,48 @@ function fillModelPickers() {
   fillVideoSizes();
   fillEditRow();
   fillTtsLanguages();
+  fillSongLanguages();
 }
+// Song: the vocal languages the song model lists
+function fillSongLanguages() {
+  const m = (media.models || []).find((x) => x.kind === "music");
+  const sel = $("song-lang"), keep = sel.value;
+  sel.innerHTML = `<option value="">auto (from the lyrics)</option>` +
+    ((m && m.languages) || []).map((l) => `<option value="${esc(l.code)}">${esc(l.name)}</option>`).join("");
+  sel.value = keep;
+}
+$("song-preset").onchange = () => { if ($("song-preset").value) $("song-style").value = $("song-preset").value; $("song-preset").value = ""; };
+$("song-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const style = $("song-style").value.trim();
+  if (!style) { toast("warn", "Describe the song", "Write a style, or pick a preset.", 5000); return; }
+  const body = {style, lyrics: $("song-lyrics").value.trim(), duration: Number($("song-duration").value)};
+  if ($("song-lang").value) body.language = $("song-lang").value;
+  if ($("song-bpm").value) body.bpm = Number($("song-bpm").value);
+  if ($("song-seed").value !== "") body.seed = Number($("song-seed").value);
+  $("song-go").disabled = true;
+  const hint = $("song-hint"), was = hint.textContent, t0 = performance.now();
+  const tick = setInterval(() => { hint.textContent = `Making the song… ${((performance.now() - t0) / 1000).toFixed(0)} s (the first one also loads the model)`; }, 1000);
+  try {
+    const r = await fetch("v1/audio/music", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error((j.error && j.error.message) || r.statusText); }
+    const url = URL.createObjectURL(await r.blob());
+    const fig = document.createElement("figure");
+    const a = document.createElement("audio");
+    a.controls = true; a.src = url; a.autoplay = true;
+    const cap = document.createElement("figcaption");
+    const secs = Number(r.headers.get("x-strata-seconds") || body.duration);
+    cap.innerHTML = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")} song in ${esc(langName(r.headers.get("x-strata-language") || ""))}, ` +
+      `seed ${esc(r.headers.get("x-strata-seed") || "")}, made in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(style.slice(0, 90))} · ` +
+      `<a href="${url}" download="am2strata-song.wav">save</a>`;
+    fig.append(a, cap);
+    $("img-results").prepend(fig);
+    $("img-results").hidden = false;
+  } catch (e) { toast("error", "No song", String(e.message || e), 8000); }
+  clearInterval(tick);
+  hint.textContent = was;
+  $("song-go").disabled = false;
+};
 // Image > edit: shown for a model that takes edit images; the files picked (or a result sent back to it)
 let editImages = [];
 function fillEditRow() {
@@ -358,6 +400,7 @@ $("media-kinds").addEventListener("click", (e) => {
   for (const x of $("media-kinds").children) x.setAttribute("aria-selected", String(x === b));
   const k = b.dataset.kind;
   $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
+  $("song-form").hidden = k !== "song";
 });
 $("vid-model").addEventListener("change", fillVideoSizes);
 $("vid-form").onsubmit = async (ev) => {
@@ -579,7 +622,8 @@ function setPill(state, text) {
 // what a running media job is doing, by its kind (the server's media_begin kinds)
 function mediaLabel(kind) {
   return {"video": "Making a video", "image": "Making an image", "image edit": "Editing an image",
-          "text-to-speech": "Speaking", "speech-to-text": "Transcribing", "translation": "Translating speech"}[kind]
+          "text-to-speech": "Speaking", "speech-to-text": "Transcribing", "translation": "Translating speech",
+          "song": "Making a song"}[kind]
     || "Media job";
 }
 // speech counts its parts (sentences); images and video their steps
