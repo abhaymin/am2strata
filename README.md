@@ -1,6 +1,6 @@
 # am2Strata
 
-![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows](docs/media/banner.webp)
+![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows; OpenAI, Anthropic and Gemini APIs, coding agents in one command, voice cloning](docs/media/banner.webp)
 
 [![Release](https://img.shields.io/github/v/release/abhaymin/am2strata)](https://github.com/abhaymin/am2strata/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -9,12 +9,14 @@
 Free and open source (MIT). Built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors,
 and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
 
-| Chat | Monitor | Models |
+| Chat | Canvas: an HTML page, live | Python, run in a sandbox |
 | --- | --- | --- |
-| ![The chat page](docs/media/screenshot-chat-empty.webp) | ![The live monitor: speed, GPU, VRAM, power](docs/media/screenshot-monitor.webp) | ![Settings: the installed models](docs/media/screenshot-settings.webp) |
+| ![A question and its answer, streamed at 68 tok/s](docs/media/screenshot-chat.webp) | ![A digital clock the model wrote, running in the canvas](docs/media/screenshot-canvas.webp) | ![Python from the chat run in the sandbox: no network, home folders hidden](docs/media/screenshot-python.webp) |
+| **Flows and the whiteboard** | **Monitor** | **Coding agents** |
+| ![A Mermaid flow, and shapes drawn on the whiteboard](docs/media/screenshot-whiteboard.webp) | ![The live monitor: speed, GPU load, VRAM, power, CPU](docs/media/screenshot-monitor.webp) | ![Settings › Connect: the coding agents and what each supports](docs/media/screenshot-agents.webp) |
 
-<sub>Screenshots of the web app on a PC with two RTX 5060 Ti cards. The banner's background was made with am2Strata's media engine
-(Z-Image Turbo, Apache-2.0).</sub>
+<sub>Real screenshots of the web app (v0.1.1) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
+banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
 am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
 tokenizer, chat templates, output parsing, the Hugging Face downloader, the launcher and every test. PolyStrata's
