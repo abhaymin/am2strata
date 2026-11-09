@@ -366,6 +366,9 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let mut ran = steps.unwrap_or(0);
     for i in 0..n {
         let mut r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "seed": seed + i, "batch_size": 1});
+        if let Some(p) = placement(&s, &model) {
+            r["placement"] = p;
+        }
         if let Some(st) = steps {
             r["steps"] = json!(st);
         }
@@ -420,6 +423,19 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": ran, "model": model,
                            "edit_images": edit_images.len(),
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
+}
+
+/// Where a GPU job's parts go when the PC has a second card and the text model is stopped for the job: the main model
+/// on GPU 0, its text encoder and VAE on GPU 1 (devices in sequence). Measured 2026-11-09: Qwen-Image 2.1 (Q8,
+/// 1024x768) on GPU 0 alone peaked at 15.2 of 16.3 GB in the VAE decode while GPU 1 stayed empty, and the same job
+/// failed with CUDA_ERROR_OUT_OF_MEMORY. For the families checked so far (Qwen-Image); others keep mold's own choice.
+fn placement(s: &AppState, model: &str) -> Option<Value> {
+    let qwen_image = model.contains("qwen-image");
+    if !qwen_image || s.mgr.hw.gpus.len() < 2 || s.media.keep_text_model {
+        return None;
+    }
+    let gpu = |n: usize| json!({"kind": "gpu", "ordinal": n});
+    Some(json!({"text_encoders": gpu(1), "advanced": {"transformer": gpu(0), "vae": gpu(1), "qwen": gpu(1)}}))
 }
 
 /// GET /api/media/models: the media engine's catalog (image, video, 3D) with what is downloaded, the image model in

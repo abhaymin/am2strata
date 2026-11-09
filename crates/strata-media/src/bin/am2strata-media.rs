@@ -50,6 +50,8 @@ struct State {
     config: mold_core::Config,
     engine: Option<Box<dyn InferenceEngine>>,
     model: Option<String>,
+    /// the device placement the loaded model was loaded with (a request's "placement"; None: mold's own choice)
+    placement: Option<Value>,
     whisper: Option<audio::Whisper>,
     parler: Option<audio::Parler>,
     #[cfg(feature = "onnx")]
@@ -325,7 +327,14 @@ fn list(st: &mut State) -> Value {
 }
 
 fn load(st: &mut State, model: &str) -> Result<()> {
-    if st.model.as_deref() == Some(model) && st.engine.as_ref().is_some_and(|e| e.is_loaded()) {
+    load_placed(st, model, None)
+}
+
+/// Loads `model`, with `request`'s placement when it has one (its components on the devices it names); a loaded model
+/// placed otherwise is loaded again.
+fn load_placed(st: &mut State, model: &str, request: Option<&mold_core::GenerateRequest>) -> Result<()> {
+    let placement = request.and_then(|r| r.placement.as_ref()).map(|p| serde_json::to_value(p).unwrap_or(Value::Null));
+    if st.model.as_deref() == Some(model) && st.placement == placement && st.engine.as_ref().is_some_and(|e| e.is_loaded()) {
         return Ok(());
     }
     if let Some(mut e) = st.engine.take() {
@@ -336,9 +345,13 @@ fn load(st: &mut State, model: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("{model} is not downloaded (pull it first)"))?;
     let mut engine = mold_inference::create_engine(model.to_string(), paths, &st.config, LoadStrategy::Eager, 0, false)
         .with_context(|| format!("creating the engine for {model}"))?;
-    engine.load().with_context(|| format!("loading {model}"))?;
+    match request.filter(|r| r.placement.is_some()) {
+        Some(r) => engine.load_for_request(r),
+        None => engine.load(),
+    }.with_context(|| format!("loading {model}"))?;
     st.engine = Some(engine);
     st.model = Some(model.to_string());
+    st.placement = placement;
     Ok(())
 }
 
@@ -364,8 +377,8 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
             req["negative_prompt"] = json!(n);
         }
     }
-    load(st, &model)?;
     let request: mold_core::GenerateRequest = serde_json::from_value(req).context("the request")?;
+    load_placed(st, &model, Some(&request))?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();
     let last = Arc::new(Mutex::new(0usize));
@@ -394,7 +407,7 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
 
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
-    let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, whisper: None, parler: None,
+    let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, placement: None, whisper: None, parler: None,
                          #[cfg(feature = "onnx")]
                          chatterbox: None };
     // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
