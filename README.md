@@ -103,7 +103,7 @@ cargo build --release --manifest-path crates/strata-media/Cargo.toml --features 
     - Turbo reads tags such as `[laugh]` and `[sigh]`.
     - The engine loads ONNX Runtime 1.23 when it starts: `sudo apt install libonnxruntime1.23` (Debian/Ubuntu), or
       set `ORT_DYLIB_PATH`. Nothing is downloaded at build time.
-    - Measured on a Ryzen 7 7840HS (8 threads): faster than real time (9.2 s of speech in 10.7 s), 5 GB of RAM at
+    - Measured on a Ryzen 7 7840HS (8 threads): about real time (9.2 s of speech in 10.7 s), 5 GB of RAM at
       peak.
 - `POST /v1/audio/speech` takes OpenAI's fields. For Chatterbox it also takes:
   - `voice_audio`: a clip, in base64 or as a data URL;
@@ -172,6 +172,44 @@ expert cache as under PolyStrata (3,985 slots, 8.27 GB).
 GPU builds: the PolyStrata engines on the developer's PC are compiled for sm_86 and sm_120 (RTX 30 and RTX 50
 cards). Only the RTX 5060 Ti has been tested; an RTX 3060 should run the same build, but it has not been tried.
 am2Strata refuses an engine that is not compiled for the card, and says how to rebuild it.
+
+## Tested on
+
+Everything above, the demo videos included, was built, tested and recorded on one PC. That PC also runs
+am2Strata day to day, as a user service that starts at boot.
+
+| Part | What it is |
+| --- | --- |
+| CPU | AMD Ryzen 7 7840HS (8 cores, 16 threads), with Radeon 780M graphics (not used) and an XDNA NPU (not used yet) |
+| RAM | 64 GB (about 60 GB visible to Linux; the integrated graphics keep the rest) |
+| GPUs | 2 × NVIDIA GeForce RTX 5060 Ti 16 GB (Blackwell, sm_120): one on OCuLink, one in a USB4 dock |
+| Storage | 2 TB NVMe SSD (WD Blue SN580) |
+| OS | Ubuntu 26.04.1 LTS, Linux 7.0 |
+| NVIDIA | driver 595.99.02 (CUDA 13.2), CUDA toolkit 13.1 |
+| Rust | 1.93.1 |
+| ONNX Runtime (for Chatterbox) | 1.23.2, Ubuntu's `libonnxruntime1.23` |
+
+How it runs there:
+- **Server:** `am2strata --host 0.0.0.0 --port 8000 --models-dir <the PolyStrata folder> --api-monitor`, behind an
+  API key, so other machines on the network can use it.
+- **Default model:** Cyber-Tiel Coder 35B-A3B UD-Q8_K_XL through PolyStrata's `strata-poly` engine, its layers split
+  across both cards.
+- **Media engine:** built with `--features cuda,onnx`.
+
+Measured there, in normal use:
+
+| What | Result |
+| --- | --- |
+| Tiel Coder Q8, split across both cards, in the web app | about 68 tokens/s |
+| Tiel Coder Q6 on one card | 104-106 tokens/s (median, warm, greedy, thinking off) |
+| An image with Z-Image Turbo, 1024×1024, one card | about 80 s |
+| An image with Qwen-Image | 186 s, its stages split across both cards (peak 8.7 GB on one, 10.7 GB on the other); on one card it ran out of memory |
+| Speech with Chatterbox Turbo (ONNX), on the CPU beside the loaded text model | about real time (9.2 s of speech in 10.7 s, 8 threads); 5 GB of RAM at the peak, while loading |
+| Speech to text with Whisper large-v3-turbo, on the CPU | 5 GB of RAM at the peak |
+
+Not tested yet on real hardware: macOS and Windows (the downloads are built for them, and the tests run there in
+CI), AMD and Intel GPUs, RTX 30 cards, and PCs with a single card under 16 GB. Reports from other machines are
+welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
 
 ## Not yet
 
