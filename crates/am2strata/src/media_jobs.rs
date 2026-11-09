@@ -1,4 +1,5 @@
-//! Media from a normal chat: the model gets `generate_image`, `generate_video` and `speak` as built-in tools (run here
+//! Media from a normal chat: the model gets `generate_image`, `generate_video`, `speak`, `make_song` (a sung song) and
+//! `compose_music` (instrumental) as built-in tools (run here
 //! in the tool loop, as the memory tools are) when the chat opts in with `"strata_media": true` and the capability
 //! check passes for that kind. A call does not block the answer: it queues a media job and returns its id at once;
 //! the job waits its place in the queue (behind the answer, so the text model is not stopped in the middle of it) and
@@ -16,7 +17,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const TOOL_NAMES: [&str; 3] = ["generate_image", "generate_video", "speak"];
+pub const TOOL_NAMES: [&str; 5] = ["generate_image", "generate_video", "speak", "make_song", "compose_music"];
 
 /// The most media jobs one answer may queue.
 pub const PER_ANSWER: usize = 3;
@@ -90,13 +91,36 @@ impl Jobs {
                     "frames": {"type": "integer", "description": "number of frames (default the model's)"},
                     "size": {"type": "string", "description": "WIDTHxHEIGHT"}}, "required": ["prompt"]}}));
         }
+        if ok("music") {
+            let genres: Vec<&str> = crate::music::GENRES.iter().map(|g| g.0).collect();
+            t.push(json!({"name": "make_song", "description":
+                "Make a sung song on this PC (music and vocals, a WAV file) from lyrics you write and a genre or style. \
+                 Write the lyrics in the song's language with structure tags ([verse], [chorus], [bridge]); for a longer \
+                 song write more verses and repeat the chorus. It is queued and appears in the chat as an audio player \
+                 after your answer: say that it is on its way. This sings; `speak` only reads aloud.",
+                "parameters": {"type": "object", "properties": {
+                    "lyrics": {"type": "string", "description": "the lyrics, with [verse] / [chorus] / [bridge] tags"},
+                    "genre": {"type": "string", "enum": genres, "description": "a genre (its instruments and mood are chosen for it)"},
+                    "style": {"type": "string", "description": "the sound in words, added to the genre: voice (female/male), instruments, mood, tempo"},
+                    "language": {"type": "string", "description": "the vocal language as a code: hi, en, ml, ta, es..."},
+                    "duration": {"type": "integer", "description": "length in seconds, 10 to 600 (3 minutes = 180)"}},
+                    "required": ["lyrics"]}}));
+            t.push(json!({"name": "compose_music", "description":
+                "Compose instrumental music on this PC (no singing, a WAV file) in a genre or style: background music, \
+                 a theme, a mood piece. Queued like make_song; it appears in the chat after your answer.",
+                "parameters": {"type": "object", "properties": {
+                    "genre": {"type": "string", "enum": genres},
+                    "style": {"type": "string", "description": "instruments, mood and tempo in words"},
+                    "duration": {"type": "integer", "description": "length in seconds, 10 to 600"}}}}));
+        }
         if ok("tts") {
             t.push(json!({"name": "speak", "description":
-                "Read a text aloud on this PC (text to speech, a WAV file). It is queued and appears in the chat as an \
-                 audio player after your answer.",
+                "Read a text aloud on this PC (text to speech, a WAV file), in the language of the text, in a native \
+                 female or male voice. It is queued and appears in the chat as an audio player after your answer. It \
+                 reads; to sing, use make_song.",
                 "parameters": {"type": "object", "properties": {
-                    "text": {"type": "string", "description": "what to say, at most 4096 characters"},
-                    "voice": {"type": "string", "description": "a voice name (laura, jon, lea...) or a sentence describing the voice"}},
+                    "text": {"type": "string", "description": "what to say, at most 20,000 characters (about 20 minutes)"},
+                    "voice": {"type": "string", "description": "female, male, or a voice name (laura, jon, lea, gary)"}},
                     "required": ["text"]}}));
         }
         t
@@ -144,7 +168,7 @@ impl Jobs {
                     k["max_frames"] = json!(if model.starts_with("wan21") { 81 } else { 121 });
                     k["frames"] = d["frames"].clone();
                 }
-                "tts" => k["max_chars"] = json!(4096),
+                "tts" => k["max_chars"] = json!(crate::audio_api::MAX_SPEECH_CHARS),
                 _ => {}
             }
             if !downloaded {
@@ -153,6 +177,15 @@ impl Jobs {
                 k["note"] = json!(format!("{model} needs {:.1} GB; this PC's GPUs have {vram_gb:.1} GB", size.unwrap_or(0.0)));
             }
             kinds.insert(kind.to_string(), k);
+        }
+        if let Some(m) = find(crate::music::MODEL) {
+            let downloaded = m["downloaded"] == true;
+            let mut k = json!({"model": crate::music::MODEL, "downloaded": downloaded, "size_gb": m["size_gb"], "fits": true,
+                               "usable": downloaded && s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000), "max_seconds": 600});
+            if !downloaded {
+                k["note"] = json!(format!("{} is not downloaded (Settings > Models > Media models > Music)", crate::music::MODEL));
+            }
+            kinds.insert("music".to_string(), k);
         }
         let v = json!({"available": true, "kinds": kinds});
         *self.caps.lock().unwrap() = Some((Instant::now(), v.clone()));
@@ -176,13 +209,17 @@ impl Jobs {
         let (kind, key) = match name {
             "generate_image" => ("image", "prompt"),
             "generate_video" => ("video", "prompt"),
+            "make_song" => ("song", "lyrics"),
+            "compose_music" => ("music", "genre"),
             _ => ("tts", "text"),
         };
         let fail = |t: String| json!({"ok": false, "text": t, "chars": t.len(), "truncated": false, "ms": 0});
-        let Some(prompt) = args[key].as_str().map(str::trim).filter(|p| !p.is_empty()) else {
-            return fail(format!("error: {name} needs \"{key}\""));
+        // instrumental music needs a genre or a style
+        let given = args[key].as_str().or_else(|| if kind == "music" { args["style"].as_str() } else { None });
+        let Some(prompt) = given.map(str::trim).filter(|p| !p.is_empty()) else {
+            return fail(format!("error: {name} needs \"{key}\"{}", if kind == "music" { " or \"style\"" } else { "" }));
         };
-        let k = &caps["kinds"][kind];
+        let k = &caps["kinds"][if kind == "song" { "music" } else { kind }];
         if k["usable"] != true {
             return fail(format!("error: {} cannot be made here: {}", kind, k["note"].as_str().unwrap_or("not available")));
         }
@@ -211,9 +248,31 @@ impl Jobs {
                 }
                 r
             }
+            "song" | "music" => {
+                let style = crate::music::style_for(args["genre"].as_str(), args["style"].as_str()
+                    .or(if kind == "song" { Some("clear vocals") } else { None }));
+                let style = match style {
+                    Ok(s) => s,
+                    Err(e) => return fail(format!("error: {e}")),
+                };
+                let duration = args["duration"].as_u64().unwrap_or(if kind == "song" { 120 } else { 60 });
+                if !(10..=600).contains(&duration) {
+                    return fail("error: duration is 10 to 600 seconds".into());
+                }
+                let mut r = json!({"style": style, "duration": duration,
+                                   "lyrics": if kind == "song" { prompt.to_string() } else { "[Instrumental]".into() }});
+                if kind == "song" {
+                    // a few takes, the one whose words come through best kept (until the song planner lands)
+                    r["takes"] = json!(3);
+                    if let Some(l) = args["language"].as_str() {
+                        r["language"] = json!(l);
+                    }
+                }
+                r
+            }
             _ => {
-                if prompt.chars().count() > 4096 {
-                    return fail("error: at most 4096 characters can be read aloud at once".into());
+                if prompt.chars().count() > crate::audio_api::MAX_SPEECH_CHARS {
+                    return fail(format!("error: at most {} characters can be read aloud at once", crate::audio_api::MAX_SPEECH_CHARS));
                 }
                 let mut r = json!({"input": prompt});
                 if let Some(v) = args["voice"].as_str() {
@@ -241,7 +300,7 @@ impl Jobs {
         }
         let s = self.app().clone();
         tokio::spawn(async move { run(s, n, kind, req).await });
-        let what = match kind { "image" => "image", "video" => "video", _ => "speech" };
+        let what = match kind { "image" => "image", "video" => "video", "song" => "song", "music" => "music", _ => "speech" };
         let eta = self.speeds.lock().unwrap().get(&model).map(|t| format!(", about {}", human(*t))).unwrap_or_default();
         let text = format!("{what} job {id} queued ({model}{eta}). It runs after this answer and appears in the chat by itself; \
                             tell the user it is on its way (do not describe the result, you will not see it).");
@@ -327,6 +386,7 @@ async fn run(s: AppState, n: u64, kind: &'static str, req: Value) {
     let r = match kind {
         "image" => crate::image_gen::generations(State(s.clone()), headers, Json(req)).await,
         "video" => crate::image_gen::video_generations(State(s.clone()), headers, Json(req)).await,
+        "song" | "music" => crate::music::music(State(s.clone()), headers, Json(req)).await,
         _ => crate::audio_api::speech(State(s.clone()), headers, Json(req)).await,
     };
     let status = r.status();

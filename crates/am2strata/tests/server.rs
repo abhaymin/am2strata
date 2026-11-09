@@ -1143,9 +1143,30 @@ fn a_song_is_made_from_a_style_and_lyrics() {
         let (code, r) = s.post("/v1/audio/music", &body);
         assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains(says), "{body} -> {r}");
     }
+    // a genre by name gives its style; an unknown one is refused with the list
+    let r = c.post(format!("{}/v1/audio/music", s.base)).bearer_auth(KEY)
+        .json(&json!({"genre": "ghazal", "lyrics": "[verse]\nचाँद", "duration": 20})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let op = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).filter(|v| v["op"] == "song").last().unwrap();
+    assert!(op["caption"].as_str().unwrap().starts_with("ghazal, soft male vocal"), "{op}");
+    let (code, r) = s.post("/v1/audio/music", &json!({"genre": "polka"}));
+    assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("bollywood"), "{r}");
+    let (_, g) = s.get("/api/media/genres", true);
+    assert!(g["genres"].as_array().unwrap().len() >= 30, "{g}");
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"no_music": true}));
     let (code, r) = s.post("/v1/audio/music", &json!({"style": "pop"}));
     assert!(code == 400 && r["error"]["message"].as_str().unwrap().contains("not downloaded"), "{r}");
+}
+
+#[test]
+fn the_chat_offers_make_song_and_compose_music_when_the_song_model_is_there() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));
+    let (_, caps) = s.get("/api/media/capabilities", true);
+    assert_eq!(caps["kinds"]["music"]["usable"], true, "{caps}");
+    let s2 = Server::start(&[Model::default()], &[ids("x")], json!({"no_music": true}));
+    let (_, caps) = s2.get("/api/media/capabilities", true);
+    assert_eq!(caps["kinds"]["music"]["usable"], false, "{caps}");
 }
 
 #[test]

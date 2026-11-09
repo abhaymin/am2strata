@@ -10,6 +10,95 @@ use serde_json::{json, Value};
 
 pub const MODEL: &str = "ace-step-1.5-turbo";
 
+/// Genres by name, each a style ACE-Step understands (instruments, voice, mood). `genre` picks one; `style` adds to it
+/// or replaces it. Indian genres first, then the world's.
+pub const GENRES: &[(&str, &str, &str)] = &[
+    ("bollywood", "Bollywood", "bollywood pop, tabla, dholak, sitar and synth, catchy hook, cheerful"),
+    ("festive", "Festive (Diwali, Holi)", "festive indian celebration song, dhol, shehnai, tabla and claps, joyful, energetic"),
+    ("bhajan", "Bhajan (devotional)", "devotional bhajan, harmonium, tabla, manjira, peaceful, spiritual"),
+    ("ghazal", "Ghazal", "ghazal, soft male vocal, harmonium, tabla and sarangi, romantic, slow"),
+    ("qawwali", "Qawwali", "qawwali, chorus claps, harmonium and tabla, rising energy, sufi"),
+    ("sufi", "Sufi", "sufi song, rubab, harmonium and tabla, soulful, mystical"),
+    ("hindustani", "Hindustani classical", "hindustani classical vocal, tanpura drone, tabla, raga, meditative"),
+    ("carnatic", "Carnatic fusion", "carnatic fusion, veena, mridangam, violin and electronic beats"),
+    ("malayalam-melody", "Malayalam film melody", "malayalam film melody, violin and flute, gentle, nostalgic"),
+    ("tamil-kuthu", "Tamil kuthu", "tamil kuthu, thappu drums, nadaswaram, fast, high energy, dance"),
+    ("bhangra", "Punjabi bhangra", "punjabi bhangra, dhol, tumbi, energetic, danceable"),
+    ("indie-pop", "Indie pop", "warm indie pop, acoustic guitar, soft drums, hopeful"),
+    ("pop", "Pop", "modern pop, synths, punchy drums, catchy chorus, bright"),
+    ("ballad", "Ballad", "soulful ballad, piano and strings, slow, emotional"),
+    ("rock", "Rock", "energetic rock anthem, distorted guitars, big drums"),
+    ("metal", "Metal", "heavy metal, fast double kick drums, distorted riffs, powerful"),
+    ("hip-hop", "Hip hop", "hip hop, boom bap drums, bass, rap vocal, confident"),
+    ("rnb", "R&B", "smooth r&b, soft keys, groove, sensual vocal"),
+    ("jazz", "Jazz", "smooth jazz, saxophone, upright bass, brushed drums, late night"),
+    ("blues", "Blues", "electric blues, slide guitar, shuffle rhythm, gritty"),
+    ("country", "Country", "country, acoustic guitar, banjo, fiddle, storytelling"),
+    ("folk", "Folk", "acoustic folk, guitar and harmonica, warm, storytelling"),
+    ("reggae", "Reggae", "reggae, offbeat guitar skank, deep bass, relaxed"),
+    ("latin", "Latin", "latin pop, guitar, congas and brass, sunny, danceable"),
+    ("kpop", "K-pop", "k-pop, polished synths, dance beat, bright vocals"),
+    ("edm", "EDM", "upbeat edm, synth leads, four-on-the-floor, festival drop"),
+    ("house", "House", "deep house, groovy bassline, four-on-the-floor, warm pads"),
+    ("lofi", "Lo-fi", "lo-fi hip hop, mellow, vinyl crackle, soft keys, relaxed"),
+    ("ambient", "Ambient", "ambient, evolving pads, soft textures, calm, spacious"),
+    ("cinematic", "Cinematic orchestral", "cinematic orchestral score, strings, brass, choir, epic, building"),
+    ("piano", "Solo piano", "solo piano, expressive, gentle, intimate"),
+    ("classical", "Western classical", "classical string quartet, elegant, flowing"),
+];
+
+/// The style for a request: the genre's, with the request's own style added (or the style alone).
+pub fn style_for(genre: Option<&str>, style: Option<&str>) -> Result<String, String> {
+    let g = match genre.map(|g| g.trim().to_lowercase()).filter(|g| !g.is_empty()) {
+        Some(g) => match GENRES.iter().find(|x| x.0 == g || x.1.to_lowercase() == g) {
+            Some(x) => Some(x.2),
+            None => return Err(format!("genre {g:?}: one of {}", GENRES.iter().map(|x| x.0).collect::<Vec<_>>().join(", "))),
+        },
+        None => None,
+    };
+    match (g, style.map(str::trim).filter(|s| !s.is_empty())) {
+        (Some(g), Some(s)) => Ok(format!("{g}, {s}")),
+        (Some(g), None) => Ok(g.to_string()),
+        (None, Some(s)) => Ok(s.to_string()),
+        (None, None) => Err("style or genre: describe the song (genre, instruments, voice, mood), or name a genre".into()),
+    }
+}
+
+/// GET /api/media/genres: the genres by name with their styles.
+pub async fn genres(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    use axum::response::IntoResponse;
+    Json(json!({"genres": GENRES.iter().map(|g| json!({"id": g.0, "name": g.1, "style": g.2})).collect::<Vec<_>>()})).into_response()
+}
+
+/// How much of `lyrics` a transcript holds: the words they share in order over the lyrics' words (0 to 1). Structure
+/// tags ([verse]) do not count.
+pub fn lyrics_heard(lyrics: &str, heard: &str) -> f64 {
+    let words = |t: &str| -> Vec<String> {
+        let mut out = String::new();
+        let mut depth = 0;
+        for c in t.to_lowercase().chars() {
+            match c { '[' => depth += 1, ']' => depth -= 1, _ if depth > 0 => {}, c if c.is_alphanumeric() => out.push(c), _ => out.push(' ') }
+        }
+        out.split_whitespace().map(str::to_string).collect()
+    };
+    let (a, b) = (words(lyrics), words(heard));
+    if a.is_empty() {
+        return 1.0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    for x in &a {
+        let mut cur = vec![0usize; b.len() + 1];
+        for (j, y) in b.iter().enumerate() {
+            cur[j + 1] = if x == y { prev[j] + 1 } else { cur[j].max(prev[j + 1]) };
+        }
+        prev = cur;
+    }
+    prev[b.len()] as f64 / a.len() as f64
+}
+
 fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
@@ -22,8 +111,9 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
         return error(StatusCode::NOT_IMPLEMENTED, "not_available", "the media engine is not built");
     }
     let text = |k: &str| req[k].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
-    let Some(style) = text("style").or_else(|| text("caption")).or_else(|| text("prompt")) else {
-        return bad("style: describe the song (genre, instruments, voice, mood), e.g. \"warm indie pop, female vocal, acoustic guitar\"");
+    let style = match style_for(req["genre"].as_str(), text("style").or_else(|| text("caption")).or_else(|| text("prompt")).as_deref()) {
+        Ok(s) => s,
+        Err(e) => return bad(e),
     };
     if style.chars().count() > 512 {
         return bad("style: at most 512 characters");
@@ -69,11 +159,43 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("song", MODEL);
     let _row = crate::monitor::MediaRow::new(&mon, job);
-    let res = s.media.call(cmd, |ev| {
-        if ev["event"] == "step" {
-            mon.media_step(job, ev["step"].as_u64().unwrap_or(0), ev["total"].as_u64().unwrap_or(steps));
+    // takes: a song is made again with other seeds until the speech-to-text model hears enough of its lyrics (the
+    // song planner is still to come, so sung words depend on the seed), the best take kept
+    let instrumental = lyrics.trim().eq_ignore_ascii_case("[instrumental]");
+    let takes = if instrumental { 1 } else { req["takes"].as_u64().unwrap_or(1).clamp(1, 4) };
+    let stt = s.media.stt_model();
+    let mut res: Result<Value, anyhow::Error> = Err(anyhow::anyhow!("no take"));
+    let mut best = -1.0f64;
+    let mut heard_note = String::new();
+    for t in 0..takes {
+        let mut c = cmd.clone();
+        c["seed"] = json!(seed.wrapping_add(t * 7919) % 4_294_967_295);
+        let r = s.media.call(c.clone(), |ev| {
+            if ev["event"] == "step" {
+                mon.media_step(job, ev["step"].as_u64().unwrap_or(0) + t * steps, steps * takes);
+            }
+        }).await;
+        let Ok(v) = r else {
+            if t == 0 { res = r; }
+            break;
+        };
+        if takes == 1 {
+            res = Ok(v);
+            break;
         }
-    }).await;
+        let heard = s.media.call(json!({"op": "transcribe", "model": stt, "audio": v["data"], "language": language,
+                                         "translate": false, "device": "cpu"}), |_| {}).await;
+        let score = heard.map(|h| lyrics_heard(&lyrics, h["text"].as_str().unwrap_or(""))).unwrap_or(0.0);
+        if score > best {
+            best = score;
+            heard_note = format!(", {:.0}% of the lyrics heard (take {} of {takes})", score * 100.0, t + 1);
+            res = Ok(v);
+        }
+        if score >= 0.75 {
+            break;
+        }
+    }
+    let _ = s.media.call(json!({"op": "unload_audio"}), |_| {}).await;
     if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {
         tracing::warn!("the media engine did not unload: {e:#}");
     }
@@ -92,10 +214,12 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
         }
     };
     mon.media_file_add(job, "wav", wav.clone());
-    mon.media_end(job, "stop", &format!("{duration} s song, {language}, seed {seed}, {steps} steps"));
+    let seed = v["seed"].as_u64().unwrap_or(seed);
+    mon.media_end(job, "stop", &format!("{duration} s {}, {language}, seed {seed}{heard_note}", if instrumental { "music" } else { "song" }));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav")
         .header("x-strata-seconds", duration.to_string()).header("x-strata-model", MODEL)
         .header("x-strata-language", language).header("x-strata-seed", seed.to_string())
         .header("x-strata-ms", t0.elapsed().as_millis().to_string())
+        .header("x-strata-lyrics-heard", if best >= 0.0 { format!("{best:.2}") } else { "-".into() })
         .body(Body::from(wav)).unwrap()
 }

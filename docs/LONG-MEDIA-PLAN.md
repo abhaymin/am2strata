@@ -11,6 +11,38 @@ that long, from one request.
 | Songs | not in am2Strata yet (ACE-Step in Rust: docs/ACESTEP-RUST-PLAN.md) | planned: **up to 10 min** | ACE-Step 1.5 makes 10 s to 10 min in one pass (8 min with its planner on a 16 GB card); measured 60 s in 12 s on one RTX 5060 Ti |
 | Video | 257 frames (about 10 to 16 s, model-dependent) | planned: **5 min and more** | segments chained: each next segment starts from the last frame of the one before (image-to-video), then joined |
 
+## Productions: am2Strata builds the whole piece itself (owner's requirement, 2026-11-10)
+
+A request like "a 25-minute Diwali music set in Hindi, with a spoken welcome, and a video for it" must come back as
+one finished file, made by am2Strata from start to end, with nobody stitching parts by hand. So:
+
+- **A production is one job made of parts.** `POST /v1/media/productions` (and the chat tool `produce`) takes a plan:
+  ```json
+  {"output": "audio" | "video", "parts": [
+     {"speak": {"text": "...", "voice": "female", "language": "hi"}},
+     {"song": {"lyrics": "...", "genre": "festive", "duration": 600}},
+     {"song": {"continue": true, "lyrics": "...", "duration": 600}},
+     {"music": {"genre": "ambient", "duration": 120}},
+     {"video": {"prompt": "...", "seconds": 600}},
+     {"image": {"prompt": "...", "seconds": 30}}]}
+  ```
+  or, from the chat, the model writes that plan from the user's words ("3 songs of 10 minutes, then a spoken thank you").
+- **Each part is made by the kind's own endpoint** (songs up to 10 minutes each, speech of any length, video segments,
+  still images held as video), queued and retried as any job, with the same checks (Whisper for words, the take rule).
+- **The parts are joined in the engine, in Rust:**
+  - audio: resampled to one rate (48 kHz stereo), joined with short crossfades (a song continued from the one before
+    uses ACE-Step's "complete" task from its last seconds, so the music flows on rather than restarting), loudness
+    evened out;
+  - video: segments joined (each next segment started from the frame before, as above), images shown for their
+    seconds, the audio track (the joined audio, or music made for it) laid under the video, then one MP4;
+  - one WAV/MP3 or one MP4 out, with chapters (a part per chapter) in its metadata and a list beside it.
+- **Long runs survive:** the production's state is saved part by part (a restart goes on from the last finished part),
+  the Monitor shows "part 4 of 9" with each part's own progress, and the finished file stays in the Monitor's history.
+- **No length limit** but the disk: 30 minutes of 48 kHz stereo WAV is about 350 MB; MP3 and MP4 are kept as well.
+- Tests: the mock engine for the plan (parts in order, a failed part retried, the join's length and crossfades, the
+  restart resuming); a real 12-minute song (two 6-minute parts continued) checked for its length, a seamless join
+  (no silence or click at the seam) and Whisper hearing the second part's words.
+
 ## Long jobs run in the background
 
 A 5-minute request takes minutes to make (speech on the CPU at about real time, video far longer), longer than many

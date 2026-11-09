@@ -40,6 +40,9 @@ So the first milestone leaves it out.
      (ACE-Step sings 50+; the picker lists them by name), duration, seed;
    - the player, Save, and "make another take";
    - a note that songs are AI-made.
+5b. **Longer than 10 minutes:** a song continues from the last seconds of the one before (ACE-Step's "complete" task:
+   the earlier audio's latents as the source with the chunk mask open after it), joined in one file. Part of the
+   productions in `docs/LONG-MEDIA-PLAN.md`.
 6. **The planner (Qwen3 1.7B):** audio codes at 5 Hz for song structure, and "write the lyrics for me" from a
    description. Gate: the same codes as Python for greedy sampling.
 7. **Measured and documented:** time and VRAM on the RTX 5060 Ti against the Python numbers (about 12 s and 9.85 GB

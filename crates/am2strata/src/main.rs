@@ -362,6 +362,7 @@ async fn main() -> Result<()> {
         .route("/api/media/models/{name}", axum::routing::delete(model_remove::media_remove))
         .route("/api/media/models/{name}/removal", get(model_remove::media_removal))
         .route("/api/media/capabilities", get(media_jobs::capabilities))
+        .route("/api/media/genres", get(music::genres))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

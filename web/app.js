@@ -321,7 +321,15 @@ function fillSongLanguages() {
     ((m && m.languages) || []).map((l) => `<option value="${esc(l.code)}">${esc(l.name)}</option>`).join("");
   sel.value = keep;
 }
-$("song-preset").onchange = () => { if ($("song-preset").value) $("song-style").value = $("song-preset").value; $("song-preset").value = ""; };
+// genres from the server (GET api/media/genres): picking one fills the style, which can then be changed
+setTimeout(async () => {
+  try {
+    const r = await fetch("api/media/genres", {headers: headers()});
+    const g = (await r.json()).genres || [];
+    $("song-genre").innerHTML = `<option value="">a genre&hellip;</option>` + g.map((x) => `<option value="${esc(x.style)}">${esc(x.name)}</option>`).join("");
+  } catch (e) { /* the form still takes a style in words */ }
+}, 0);   // after the whole script has run (headers() needs the key it reads)
+$("song-genre").onchange = () => { if ($("song-genre").value) $("song-style").value = $("song-genre").value; };
 $("song-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const style = $("song-style").value.trim();
@@ -330,6 +338,7 @@ $("song-form").onsubmit = async (ev) => {
   if ($("song-lang").value) body.language = $("song-lang").value;
   if ($("song-bpm").value) body.bpm = Number($("song-bpm").value);
   if ($("song-seed").value !== "") body.seed = Number($("song-seed").value);
+  if (body.lyrics && !/^\[instrumental\]$/i.test(body.lyrics)) body.takes = Number($("song-takes").value);
   $("song-go").disabled = true;
   const hint = $("song-hint"), was = hint.textContent, t0 = performance.now();
   const tick = setInterval(() => { hint.textContent = `Making the song… ${((performance.now() - t0) / 1000).toFixed(0)} s (the first one also loads the model)`; }, 1000);
@@ -343,7 +352,7 @@ $("song-form").onsubmit = async (ev) => {
     const cap = document.createElement("figcaption");
     const secs = Number(r.headers.get("x-strata-seconds") || body.duration);
     cap.innerHTML = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")} song in ${esc(langName(r.headers.get("x-strata-language") || ""))}, ` +
-      `seed ${esc(r.headers.get("x-strata-seed") || "")}, made in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(style.slice(0, 90))} · ` +
+      `seed ${esc(r.headers.get("x-strata-seed") || "")}${r.headers.get("x-strata-lyrics-heard") && r.headers.get("x-strata-lyrics-heard") !== "-" ? `, ${Math.round(100 * r.headers.get("x-strata-lyrics-heard"))}% of the lyrics heard` : ""}, made in ${((performance.now() - t0) / 1000).toFixed(0)} s: ${esc(style.slice(0, 90))} · ` +
       `<a href="${url}" download="am2strata-song.wav">save</a>`;
     fig.append(a, cap);
     $("img-results").prepend(fig);
@@ -1312,7 +1321,7 @@ const jobs = {};                       // id -> {state, position, ahead, step, s
 function jobCardHtml(id) {
   const j = jobs[id];
   if (!j) return `<span class="muted small">Media job ${esc(id)}…</span>`;
-  const what = {image: "Image", video: "Video", tts: "Speech"}[j.kind] || "Media";
+  const what = {image: "Image", video: "Video", tts: "Speech", song: "Song", music: "Music"}[j.kind] || "Media";
   if (j.state === "done" && j.url) {
     const u = esc(j.url);
     const el = j.mime.startsWith("video/") ? `<video src="${u}" controls loop playsinline></video>`
