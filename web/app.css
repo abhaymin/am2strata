@@ -570,3 +570,9 @@ body.resizing iframe { pointer-events: none; }
 .agent-row { border-top: 1px solid var(--st-line-soft); padding: 8px 0; }
 .agent-row summary { cursor: pointer; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .agent-row pre { margin: 8px 0 4px; white-space: pre-wrap; }
+
+/* the server's warnings (low memory, a busy queue, an engine restarted), at the top of every tab */
+.alert-banner { display: flex; align-items: center; gap: var(--st-s-2, 8px); padding: 8px 16px; font-size: var(--st-fs-sm, 14px);
+  background: var(--st-surface-2); border-bottom: 1px solid var(--st-line); color: var(--st-ink); }
+.alert-banner #alert-text { flex: 1; min-width: 0; }
+.alert-banner .st-btn--icon { width: 28px; height: 28px; font-size: 18px; }

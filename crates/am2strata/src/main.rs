@@ -398,6 +398,9 @@ async fn main() -> Result<()> {
     if !clients.is_empty() {
         tracing::info!("client profiles: {}", clients.names().join(", "));
     }
+    // the models to try, in order, when the one asked for cannot load
+    *mgr.preferences.write().unwrap() = first.cfg.rest.get("model_preferences").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     // quick switching: the switch costs learnt before, and the files of a model a job waits for warmed up
     mgr.seed_switch_costs();
     {

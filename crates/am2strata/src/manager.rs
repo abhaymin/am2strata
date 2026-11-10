@@ -159,9 +159,15 @@ pub struct Manager {
     pub needs: crate::mem::Needs,
     /// how long each model takes to load (seconds), under <data>/model-load-s.json: the queue's switch costs
     pub load_s: crate::mem::Needs,
+    /// the run config's "model_preferences": the models to try, in order, when the one asked for cannot load
+    pub preferences: std::sync::RwLock<Vec<String>>,
     /// models whose files were warmed up, and when (so each is read at most once in WARM_EVERY)
     warmed: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// Free memory a media job needs beside the system's margin (its weights stream to the GPU; buffers, the encoders
+/// and the frames or audio in RAM).
+const MEDIA_JOB_GB: f64 = 2.0;
 
 /// A model's files are warmed up at most this often.
 const WARM_EVERY: Duration = Duration::from_secs(600);
@@ -292,6 +298,7 @@ impl Manager {
             needs: crate::mem::Needs::open(&memory_dir),
             load_s: crate::mem::Needs::open_file(memory_dir.join("model-load-s.json")),
             warmed: Default::default(),
+            preferences: Default::default(),
         }
     }
 
@@ -451,8 +458,29 @@ impl Manager {
         let p = self.queue.enter(crate::queue::Need::Text(id.clone()), "chat", &format!("{id} (loads it)"), on_position).await
             .map_err(|t| anyhow!("{t}"))?;
         drop(w);
-        let l = self.load_locked(&id).await?;
+        let l = self.load_with_preferences(&id).await?;
         Ok((l, Some(p)))
+    }
+
+    /// Load `id`, or, when it cannot load (missing, does not fit, failed), the first of the model preferences that
+    /// does; the alerts say which answered.
+    async fn load_with_preferences(&self, id: &str) -> Result<Arc<Loaded>> {
+        let first = match self.load_locked(id).await {
+            Ok(l) => return Ok(l),
+            Err(e) => e,
+        };
+        let prefs: Vec<String> = self.preferences.read().unwrap().iter().filter(|m| *m != id).cloned().collect();
+        for m in prefs {
+            if self.entry(&m).is_none() {
+                continue;
+            }
+            if let Ok(l) = self.load_locked(&m).await {
+                tracing::warn!("{id} could not be loaded ({first:#}); {m} answers instead (model_preferences)");
+                self.monitor.notice(&format!("{id} could not be loaded: {m} answered instead (model_preferences)"));
+                return Ok(l);
+            }
+        }
+        Err(first)
     }
 
     /// The GPU's turn for one request with `model` loaded; held until the request ends. It waits its place in the
@@ -486,6 +514,14 @@ impl Manager {
                 stop(&l).await;
             }
             self.queue.set_resident(crate::queue::Resident::Gpu);
+        }
+        // the job needs some memory beside the media engine: waited for a little (a model that just stopped is still
+        // giving its memory back), then refused plainly instead of a job the system kills
+        if let Err(free) = crate::mem::wait_for(MEDIA_JOB_GB, crate::mem::LOAD_WAIT).await {
+            self.monitor.notice("a media job was refused: this PC is short of free memory");
+            return Err(anyhow!("not enough free memory for the {kind} job: {free:.1} GB is free, about {:.0} GB is needed \
+                                (with {:.0} GB kept for the system). Close other programs, or try again shortly",
+                               MEDIA_JOB_GB + crate::mem::MARGIN_GB, crate::mem::MARGIN_GB));
         }
         Ok(p)
     }

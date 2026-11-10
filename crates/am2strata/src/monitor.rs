@@ -408,7 +408,7 @@ impl Monitor {
             tel.hist.iter().map(|(k, v)| (k.to_string(), Value::Array(v.iter().cloned().collect()))).collect();
         json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache,
                "requests_kept": total, "requests_page": {"page": page, "per": per, "pages": pages, "total": total}, "totals": totals, "hardware": tel.now, "hardware_static": tel.stat,
-               "history": history, "time": t})
+               "history": history, "time": t, "alerts": self.alerts()})
     }
 
     /// GET /metrics/prometheus: llama-server's metric names, so its dashboards work unchanged.

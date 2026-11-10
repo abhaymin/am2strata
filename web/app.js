@@ -612,6 +612,7 @@ async function poll() {
       lastMetrics = await r.json();
       metricsFailures = 0;
       render(lastMetrics);
+      showAlerts(lastMetrics.alerts || []);
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -622,6 +623,16 @@ async function poll() {
   clearTimeout(pollTimer);
   pollTimer = setTimeout(poll, 1000);
 }
+
+// the server's warnings at the top of every tab; hidden by the user until they change
+let alertsHidden = "";
+function showAlerts(list) {
+  const key = list.join("\n");
+  const show = list.length > 0 && key !== alertsHidden;
+  $("alert-banner").hidden = !show;
+  if (show) $("alert-text").textContent = list.length === 1 ? list[0] : `${list[0]} (and ${list.length - 1} more: Monitor › This PC)`;
+}
+$("alert-close").onclick = () => { alertsHidden = ((lastMetrics && lastMetrics.alerts) || []).join("\n"); $("alert-banner").hidden = true; };
 
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;

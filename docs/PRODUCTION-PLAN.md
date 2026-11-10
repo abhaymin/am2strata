@@ -30,8 +30,13 @@ crashing, warns the user plainly when the PC is overloaded, and does not fail du
   - Every 503 and 429 gets `Retry-After`. API answers carry `x-strata-warning` while the PC is short of memory
     (under 3 GB or 5% free) or four or more requests wait, and the alerts say so.
   - Tested: `a_model_that_would_not_fit_is_refused_plainly` and `low_memory_is_told_with_every_answer`.
-  - Still to do: GPU media jobs checked against free RAM (CPU speech already waits); a banner at the top of the
-    web app (today the alerts show in the Monitor's hardware card).
+  - Media jobs too (2026-11-11): after a job takes its turn, it waits up to 60 s for 4 GB free (with the margin),
+    then is refused plainly. Tested: `a_media_job_short_of_memory_is_refused_plainly`.
+  - The web app shows the alerts in a banner under its header on every tab (from /metrics), hidden by the user
+    until they change.
+- **Step 5 is built (2026-11-11).** `"model_preferences": ["tiel", ...]` in the run config: when the model asked
+  for cannot load, the first of these that loads answers, and the alerts say which. Tested:
+  `model_preferences_answer_when_the_asked_model_cannot_load`.
 
 1. **A dead engine is noticed and replaced.**
    - The manager checks the engine process before each request (and when a request fails with "stopped").

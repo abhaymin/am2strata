@@ -650,6 +650,33 @@ fn a_model_that_would_not_fit_is_refused_plainly() {
     assert!(s.get("/api/system", true).1["alerts"].to_string().contains("mock-b was not loaded"));
 }
 
+/// Production, step 5: a model that cannot load is answered by the first of the model preferences that can, and the
+/// alerts say which.
+#[test]
+fn model_preferences_answer_when_the_asked_model_cannot_load() {
+    let on = json!({"switch_on_request": true, "model_preferences": ["mock-c", "mock-a"]});
+    let s = Server::start(&[Model { extra: on, ..Model::default() }, Model { id: "mock-b", ..Model::default() }],
+                          &[ids("Fallback.\n</think>\n\nfrom the preferred model")], json!({"model_memory": {"mock-b": 100.0}}));
+    // mock-a is loaded at the start; ask for mock-b (it does not fit): the preferences answer (mock-c is not installed)
+    let (c, r) = s.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "max_tokens": 8}));
+    assert_eq!(c, 200, "a preferred model answered: {r}");
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a");
+    assert!(s.get("/api/system", true).1["alerts"].to_string().contains("mock-a answered instead"));
+}
+
+/// Production, step 3: a media job on a PC short of free memory is refused plainly (with Retry-After), not started.
+#[test]
+fn a_media_job_short_of_memory_is_refused_plainly() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({"mem_gb": 2}));
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/images/generations", s.base)).bearer_auth(KEY)
+        .json(&json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    assert!(r.headers().contains_key("retry-after"));
+    let body: Value = r.json().unwrap();
+    assert!(body.to_string().contains("not enough free memory for the media job"), "{body}");
+    assert_eq!(s.post("/v1/chat/completions", &json!({"messages": [user("hi")], "max_tokens": 4})).0, 200, "chat still answers");
+}
+
 /// Production, step 4: answers made while the PC is short of memory carry x-strata-warning, and the alerts say so.
 #[test]
 fn low_memory_is_told_with_every_answer() {
