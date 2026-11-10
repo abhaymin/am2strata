@@ -1,5 +1,11 @@
 # MCP tool servers from the app (Settings › Tools)
 
+**State (2026-11-10): built.** `mcp_api.rs` (the routes), `mcp.rs` (a hub whose servers change live, the app's file,
+masking), Settings › Tools in the web app. Tested: `mcp_servers_are_managed_from_the_app` (add, test, conflict, tool
+switches, masked secrets kept, the file's 0600 mode, a pasted block, removal, 401 and 403) and unit tests for the
+address rule and masking; the page checked in a browser against a mock server. Not done: the per-server timeout field
+(the hub's `mcp.timeout_s` applies to all).
+
 Today the tool servers come only from the run config (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` pasted as
 is). Settings shows them read-only. With none, it shows a JSON snippet to paste into the file by hand: nothing can be
 added, edited, removed or tested from the app (owner's report, 2026-11-09).

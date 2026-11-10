@@ -1,6 +1,7 @@
 //! Tools from MCP (Model Context Protocol) servers for the web app's chats. Port of serve/mcp.py.
 //!
-//! The run config lists servers (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` block pasted as is). Each is a
+//! The run config lists servers (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` block pasted as is), and the web
+//! app adds its own (Settings › Tools, kept in `<data>/mcp-servers.json`, changed live: see mcp_api.rs). Each is a
 //! program this server starts (`command`, `args`, `env`, `cwd`: newline-delimited JSON-RPC 2.0 on its stdin/stdout)
 //! or an address (`url`, `headers`: Streamable HTTP, JSON-RPC POSTed, answered as JSON or an event stream). The hub
 //! starts them in the background, offers their tools to the model as `<server>__<tool>`, and routes a call back to
@@ -9,10 +10,11 @@
 //! becomes a result that starts with "error:".
 
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{oneshot, Mutex};
@@ -362,6 +364,13 @@ enum Transport {
 }
 
 impl Transport {
+    /// the last lines a command server wrote to stderr (none for an address)
+    fn log(&self) -> Vec<String> {
+        match self {
+            Transport::Stdio(t) => t.stderr.lock().unwrap().clone(),
+            Transport::Http(_) => Vec::new(),
+        }
+    }
     fn alive(&self) -> bool {
         match self {
             Transport::Stdio(t) => t.alive(),
@@ -403,18 +412,45 @@ struct ServerState {
     info: Map<String, Value>,
     transport: Option<Transport>,
     last_start: Option<Instant>,
+    /// the log's tail when it failed (its transport is gone by then)
+    log: Vec<String>,
 }
 
 pub struct McpServer {
     pub name: String,
     cfg: Value,
     kind: &'static str,
+    /// "config" (the run config's, read-only in the app) or "app" (added in Settings › Tools)
+    pub source: &'static str,
     state: StdMutex<ServerState>,
     /// one start at a time
     starting: Mutex<()>,
 }
 
 impl McpServer {
+    fn new(name: String, cfg: Value, source: &'static str) -> Arc<Self> {
+        Arc::new(McpServer {
+            kind: if cfg.get("url").is_some_and(|u| !u.is_null()) { "http" } else { "stdio" },
+            name,
+            cfg,
+            source,
+            state: StdMutex::new(ServerState { status: "idle", error: None, tools: Vec::new(), info: Map::new(), transport: None,
+                                               last_start: None, log: Vec::new() }),
+            starting: Mutex::new(()),
+        })
+    }
+
+    /// turned off in the app ("disabled": true): kept, never started
+    fn off(&self) -> bool {
+        self.cfg.get("disabled") == Some(&Value::Bool(true))
+    }
+
+    fn log_tail(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        let log = s.transport.as_ref().map(|t| t.log()).unwrap_or_else(|| s.log.clone());
+        log[log.len().saturating_sub(12)..].to_vec()
+    }
+
     fn snapshot(&self) -> (&'static str, Option<String>, Vec<Value>, Map<String, Value>) {
         let s = self.state.lock().unwrap();
         (s.status, s.error.clone(), s.tools.clone(), s.info.clone())
@@ -489,6 +525,7 @@ impl McpServer {
 
     async fn failed(&self, e: String, t: Option<Transport>) -> bool {
         if let Some(t) = t {
+            self.state.lock().unwrap().log = t.log();
             t.close().await;
         }
         tracing::warn!("MCP server {:?} did not start: {e}. Its tools are left out; the chat works without them.", self.name);
@@ -598,13 +635,24 @@ fn clean(name: &str) -> String {
 
 pub struct McpHub {
     pub settings: Settings,
-    pub servers: Vec<Arc<McpServer>>,
+    servers: RwLock<Vec<Arc<McpServer>>>,
+    /// `<data>/mcp-servers.json`: the app's servers and the tool switches (None: nothing is kept, as in tests of the
+    /// hub alone)
+    store: Option<PathBuf>,
+    /// server -> its tools turned off (their own names)
+    off_tools: StdMutex<HashMap<String, HashSet<String>>>,
+    /// the run config's `"mcp_remote_commands": true`: command servers may be added from another device
+    pub remote_commands: bool,
 }
 
+/// How a header or environment value is shown: never in full.
+pub const MASK: &str = "••••";
+
 impl McpHub {
-    /// The run config's `"mcp_servers"` / `"mcpServers"` (entries with `"disabled": true` left out) and its `"mcp"`
-    /// settings block. None when there are no servers; Err names a bad entry.
-    pub fn from_config(rest: &std::collections::BTreeMap<String, Value>) -> Result<Option<Arc<McpHub>>, String> {
+    /// The run config's `"mcp_servers"` / `"mcpServers"` (entries with `"disabled": true` left out), its `"mcp"`
+    /// settings block, and the app's servers from `store`. Err names a bad entry of the run config (a bad entry in
+    /// the app's file is left out with a warning).
+    pub fn from_config(rest: &std::collections::BTreeMap<String, Value>, store: Option<PathBuf>) -> Result<Arc<McpHub>, String> {
         let mut servers: Vec<(String, Value)> = Vec::new();
         for key in ["mcp_servers", "mcpServers"] {
             let Some(block) = rest.get(key).filter(|b| !b.is_null()) else { continue };
@@ -617,9 +665,6 @@ impl McpHub {
                 servers.retain(|(n, _)| n != name);
                 servers.push((name.clone(), c.clone()));
             }
-        }
-        if servers.is_empty() {
-            return Ok(None);
         }
         let mut settings = Settings::default();
         for (k, v) in rest.get("mcp").and_then(Value::as_object).into_iter().flatten() {
@@ -636,50 +681,80 @@ impl McpHub {
                 _ => tracing::warn!("config mcp.{k}={v}: unknown key, ignored"),
             }
         }
-        let servers = servers
-            .into_iter()
-            .map(|(name, cfg)| {
-                Arc::new(McpServer {
-                    kind: if cfg.get("url").is_some_and(|u| !u.is_null()) { "http" } else { "stdio" },
-                    name,
-                    cfg,
-                    state: StdMutex::new(ServerState { status: "idle", error: None, tools: Vec::new(), info: Map::new(), transport: None, last_start: None }),
-                    starting: Mutex::new(()),
-                })
-            })
-            .collect();
-        Ok(Some(Arc::new(McpHub { settings, servers })))
+        let mut list: Vec<Arc<McpServer>> = servers.into_iter().map(|(name, cfg)| McpServer::new(name, cfg, "config")).collect();
+        let mut off_tools = HashMap::new();
+        if let Some(saved) = store.as_ref().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
+            for (name, cfg) in saved["servers"].as_object().into_iter().flatten() {
+                if list.iter().any(|x| &x.name == name) {
+                    tracing::warn!("MCP server {name:?} of the app has the name of one in the run config: the run config's is used");
+                    continue;
+                }
+                match check_server(name, cfg, "mcp-servers.json") {
+                    Ok(()) => list.push(McpServer::new(name.clone(), cfg.clone(), "app")),
+                    Err(e) => tracing::warn!("{e}: left out"),
+                }
+            }
+            for (name, tools) in saved["disabled_tools"].as_object().into_iter().flatten() {
+                let set: HashSet<String> = tools.as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_owned)).collect();
+                off_tools.insert(name.clone(), set);
+            }
+        }
+        Ok(Arc::new(McpHub { settings, servers: RwLock::new(list), store, off_tools: StdMutex::new(off_tools),
+                             remote_commands: rest.get("mcp_remote_commands") == Some(&Value::Bool(true)) }))
+    }
+
+    pub fn servers(&self) -> Vec<Arc<McpServer>> {
+        self.servers.read().unwrap().clone()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.read().unwrap().is_empty()
+    }
+
+    fn launch(&self, s: &Arc<McpServer>) {
+        if s.off() {
+            s.state.lock().unwrap().status = "off";
+            return;
+        }
+        let (s, settings) = (s.clone(), self.settings.clone());
+        tokio::spawn(async move {
+            s.start(&settings).await;
+        });
     }
 
     /// Start every server in the background (npx may download a package first: that must not delay the chat).
     pub fn start(self: &Arc<Self>) {
-        for s in &self.servers {
-            let (s, settings) = (s.clone(), self.settings.clone());
-            tokio::spawn(async move {
-                s.start(&settings).await;
-            });
+        for s in self.servers() {
+            self.launch(&s);
         }
     }
 
     /// Wait (up to `timeout` in all) for servers that are still starting.
     pub async fn wait(&self, timeout: Duration) {
         let end = Instant::now() + timeout;
-        while Instant::now() < end && self.servers.iter().any(|s| matches!(s.snapshot().0, "starting" | "idle")) {
+        while Instant::now() < end && self.servers().iter().any(|s| matches!(s.snapshot().0, "starting" | "idle")) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
+    fn tool_on(&self, server: &str, tool: &str) -> bool {
+        !self.off_tools.lock().unwrap().get(server).is_some_and(|t| t.contains(tool))
+    }
+
     /// tool name the model sees -> (server, the tool's own name). A server that stopped keeps its tools: a call
-    /// starts it again.
+    /// starts it again. Tools turned off in the app are left out.
     pub fn routes(&self) -> Vec<(String, Arc<McpServer>, Value)> {
         let mut out: Vec<(String, Arc<McpServer>, Value)> = Vec::new();
-        for s in &self.servers {
+        for s in self.servers() {
             let (status, _, tools, _) = s.snapshot();
             if !matches!(status, "ready" | "stopped") {
                 continue;
             }
             for t in tools {
                 let tool = t["name"].as_str().unwrap_or("");
+                if !self.tool_on(&s.name, tool) {
+                    continue;
+                }
                 let mut name: String = format!("{}__{}", clean(&s.name), clean(tool)).chars().take(64).collect();
                 let mut n = 2;
                 while out.iter().any(|(x, _, _)| *x == name) {
@@ -692,11 +767,16 @@ impl McpHub {
         out
     }
 
-    /// The tools in the chat template's form; `exclude`: names the request brought itself (those win).
+    /// The tools in the chat template's form; `exclude`: names the request brought itself (those win); `servers`:
+    /// only these servers' tools (None: every server's).
     pub fn template_tools(&self, exclude: &[String]) -> Vec<Value> {
+        self.template_tools_of(exclude, None)
+    }
+
+    pub fn template_tools_of(&self, exclude: &[String], servers: Option<&dyn Fn(&McpServer) -> bool>) -> Vec<Value> {
         self.routes()
             .into_iter()
-            .filter(|(name, _, _)| !exclude.contains(name))
+            .filter(|(name, s, _)| !exclude.contains(name) && servers.is_none_or(|f| f(s)))
             .map(|(name, _, t)| {
                 let schema = t.get("inputSchema").filter(|s| s.as_object().is_some_and(|o| !o.is_empty())).cloned();
                 let desc = t.get("description").and_then(Value::as_str).filter(|d| !d.is_empty())
@@ -745,11 +825,12 @@ impl McpHub {
                "truncated": truncated, "ms": t0.elapsed().as_millis() as u64})
     }
 
-    /// GET /mcp: every server, its state and its tools.
+    /// GET /mcp and /api/mcp/servers: every server (its source, its configuration with header and environment
+    /// values masked, its state, the tail of its log) and its tools with their switches.
     pub fn status(&self) -> Value {
         let routes = self.routes();
         let servers: Vec<Value> = self
-            .servers
+            .servers()
             .iter()
             .map(|s| {
                 let (status, error, tools, info) = s.snapshot();
@@ -757,24 +838,174 @@ impl McpHub {
                     .iter()
                     .map(|t| {
                         let tool = t["name"].as_str().unwrap_or("");
-                        let name = routes.iter().find(|(_, srv, x)| Arc::ptr_eq(srv, s) && x["name"] == tool).map(|(n, _, _)| n.as_str()).unwrap_or(tool);
+                        let on = self.tool_on(&s.name, tool);
+                        let name = routes.iter().find(|(_, srv, x)| Arc::ptr_eq(srv, s) && x["name"] == tool).map(|(n, _, _)| n.clone())
+                            .unwrap_or_else(|| format!("{}__{}", clean(&s.name), clean(tool)));
                         let desc: String = t.get("description").and_then(Value::as_str).unwrap_or("").chars().take(300).collect();
-                        json!({"name": name, "tool": tool, "description": desc})
+                        json!({"name": name, "tool": tool, "description": desc, "on": on})
                     })
                     .collect();
-                json!({"name": s.name, "transport": s.kind, "status": status, "error": error, "info": info, "tools": tools})
+                json!({"name": s.name, "source": s.source, "transport": s.kind, "status": status, "error": error, "info": info,
+                       "tools": tools, "config": masked(&s.cfg), "log": s.log_tail()})
             })
             .collect();
-        json!({"servers": servers, "tools": routes.len(),
+        json!({"servers": servers, "tools": routes.len(), "remote_commands": self.remote_commands,
                "settings": {"timeout_s": self.settings.timeout_s, "max_result_chars": self.settings.max_result_chars,
                             "max_rounds": self.settings.max_rounds}})
     }
 
+    /// The stored configuration of the app's server `name`.
+    pub fn app_config(&self, name: &str) -> Option<Value> {
+        self.servers().into_iter().find(|s| s.name == name && s.source == "app").map(|s| s.cfg.clone())
+    }
+
+    pub fn source_of(&self, name: &str) -> Option<&'static str> {
+        self.servers().into_iter().find(|s| s.name == name).map(|s| s.source)
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let Some(path) = &self.store else { return Ok(()) };
+        let servers: Map<String, Value> = self.servers().iter().filter(|s| s.source == "app").map(|s| (s.name.clone(), s.cfg.clone())).collect();
+        let off: Map<String, Value> = self.off_tools.lock().unwrap().iter().filter(|(_, t)| !t.is_empty())
+            .map(|(k, t)| { let mut v: Vec<&String> = t.iter().collect(); v.sort(); (k.clone(), json!(v)) }).collect();
+        let body = serde_json::to_vec_pretty(&json!({"servers": servers, "disabled_tools": off})).map_err(|e| e.to_string())?;
+        if let Some(d) = path.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, body).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        // header and environment values may be secrets: the owner alone reads the file
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Add or replace the app's server `name` (a run config server's name is refused); the old one stops, the new one
+    /// starts in the background unless it is turned off.
+    pub async fn put_app(&self, name: &str, cfg: Value) -> Result<(), String> {
+        check_name(name)?;
+        check_server(name, &cfg, "server")?;
+        if self.source_of(name) == Some("config") {
+            return Err(format!("{name:?} is a server of the run config: change it there, or choose another name"));
+        }
+        let new = McpServer::new(name.to_string(), cfg, "app");
+        let old = {
+            let mut list = self.servers.write().unwrap();
+            let old = list.iter().position(|s| s.name == name).map(|i| list.remove(i));
+            list.push(new.clone());
+            old
+        };
+        if let Some(o) = old {
+            o.close().await;
+        }
+        self.save()?;
+        self.launch(&new);
+        Ok(())
+    }
+
+    /// Remove the app's server `name`.
+    pub async fn remove_app(&self, name: &str) -> Result<(), String> {
+        let old = {
+            let mut list = self.servers.write().unwrap();
+            match list.iter().position(|s| s.name == name) {
+                Some(i) if list[i].source == "config" => return Err(format!("{name:?} is a server of the run config: remove it there")),
+                Some(i) => list.remove(i),
+                None => return Err(format!("there is no MCP server {name:?}")),
+            }
+        };
+        old.close().await;
+        self.off_tools.lock().unwrap().remove(name);
+        self.save()
+    }
+
+    /// Turn tools of server `name` on or off ({tool: true/false}, the tools' own names).
+    pub fn set_tools(&self, name: &str, switches: &Map<String, Value>) -> Result<(), String> {
+        if self.source_of(name).is_none() {
+            return Err(format!("there is no MCP server {name:?}"));
+        }
+        {
+            let mut off = self.off_tools.lock().unwrap();
+            let set = off.entry(name.to_string()).or_default();
+            for (tool, on) in switches {
+                match on.as_bool() {
+                    Some(true) => { set.remove(tool); }
+                    Some(false) => { set.insert(tool.clone()); }
+                    None => return Err(format!("{tool}: expected true or false")),
+                }
+            }
+        }
+        self.save()
+    }
+
+    /// Start a server from `cfg` without keeping it: its tools, or why it did not start (and its log).
+    pub async fn test(&self, cfg: Value) -> Value {
+        if let Err(e) = check_server("test", &cfg, "server") {
+            return json!({"ok": false, "error": e, "tools": [], "log": []});
+        }
+        let s = McpServer::new("test".into(), cfg, "app");
+        let ok = s.start(&self.settings).await;
+        let (_, error, tools, info) = s.snapshot();
+        let log = s.log_tail();
+        s.close().await;
+        let tools: Vec<Value> = tools.iter().map(|t| json!({"tool": t["name"], "description": t.get("description").cloned().unwrap_or(json!(""))})).collect();
+        json!({"ok": ok, "error": error, "tools": tools, "info": info, "log": log})
+    }
+
     pub async fn close(&self) {
-        for s in &self.servers {
+        for s in self.servers() {
             s.close().await;
         }
     }
+}
+
+/// A server's configuration as the app shows it: header and environment values masked.
+pub fn masked(cfg: &Value) -> Value {
+    let mut c = cfg.clone();
+    for k in ["headers", "env"] {
+        if let Some(o) = c.get_mut(k).and_then(Value::as_object_mut) {
+            for v in o.values_mut() {
+                *v = json!(MASK);
+            }
+        }
+    }
+    c
+}
+
+/// `new` with masked values ("••••") taken from `old`: a change made in the app keeps the secrets it never saw.
+pub fn unmask(mut new: Value, old: Option<&Value>) -> Value {
+    for k in ["headers", "env"] {
+        if let Some(o) = new.get_mut(k).and_then(Value::as_object_mut) {
+            for (name, v) in o.iter_mut() {
+                if v.as_str() == Some(MASK) {
+                    *v = old.and_then(|c| c[k].get(name)).cloned().unwrap_or(json!(""));
+                }
+            }
+        }
+    }
+    new
+}
+
+/// The command line a command server runs, as the app shows it before saving.
+pub fn command_line(cfg: &Value) -> Option<String> {
+    let cmd = cfg.get("command")?.as_str()?;
+    let quote = |a: &str| if a.is_empty() || a.contains(|c: char| c.is_whitespace() || "'\"\\$`".contains(c)) {
+        format!("'{}'", a.replace('\'', "'\\''"))
+    } else {
+        a.to_string()
+    };
+    let mut parts = vec![quote(cmd)];
+    parts.extend(cfg.get("args").and_then(Value::as_array).into_iter().flatten().map(|a| quote(a.as_str().unwrap_or(&a.to_string()))));
+    Some(parts.join(" "))
+}
+
+fn check_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.chars().count() > 48 || !name.chars().all(|c| c.is_alphanumeric() || " _-.".contains(c)) {
+        return Err(format!("{name:?}: a name of 1 to 48 letters, digits, spaces, '_', '-' or '.'"));
+    }
+    Ok(())
 }
 
 fn check_server(name: &str, c: &Value, key: &str) -> Result<(), String> {
@@ -821,9 +1052,23 @@ mod tests {
     fn config_entries_are_checked() {
         let mut rest = std::collections::BTreeMap::new();
         rest.insert("mcp_servers".into(), json!({"a": {"command": "x"}, "b": {"url": "http://h/mcp"}, "c": {"command": "y", "disabled": true}}));
-        let hub = McpHub::from_config(&rest).unwrap().unwrap();
-        assert_eq!(hub.servers.len(), 2);
+        let hub = McpHub::from_config(&rest, None).unwrap();
+        assert_eq!(hub.servers().len(), 2);
         rest.insert("mcp_servers".into(), json!({"a": {"url": "http://h", "type": "sse"}}));
-        assert!(McpHub::from_config(&rest).is_err());
+        assert!(McpHub::from_config(&rest, None).is_err());
+    }
+
+    #[test]
+    fn secrets_are_masked_and_kept() {
+        let cfg = json!({"url": "http://h/mcp", "headers": {"Authorization": "Bearer s3cret"}});
+        let m = masked(&cfg);
+        assert_eq!(m["headers"]["Authorization"], MASK);
+        assert!(!m.to_string().contains("s3cret"));
+        let edited = json!({"url": "http://h2/mcp", "headers": {"Authorization": MASK, "X-New": "v"}});
+        let kept = unmask(edited, Some(&cfg));
+        assert_eq!(kept["headers"]["Authorization"], "Bearer s3cret");
+        assert_eq!(kept["headers"]["X-New"], "v");
+        assert_eq!(command_line(&json!({"command": "npx", "args": ["-y", "@x/server", "my dir"]})).unwrap(), "npx -y @x/server 'my dir'");
+        assert!(check_name("my server-2").is_ok() && check_name("").is_err() && check_name("a/b").is_err());
     }
 }

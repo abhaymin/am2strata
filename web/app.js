@@ -925,41 +925,187 @@ $("req-clear").addEventListener("click", async () => {
   }
 });
 
-// ------------------------------------------------------------------ MCP servers (GET /mcp)
-// Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
-// "strata_mcp": true, which only this page sends); the Monitor lists the servers and what they offer.
-let mcpInfo = {servers: [], tools: 0}, mcpRetry = null;
+// ------------------------------------------------------------------ MCP servers (Settings › Tools)
+// The run config's servers and the ones added here (GET/POST/PUT/DELETE api/mcp/servers, kept by the server in
+// <data>/mcp-servers.json). The chat offers their tools to the model (opt-in per request, "strata_mcp": true, which
+// only this page sends); a change applies at once. Header and environment values come back masked (••••): a change
+// that leaves them masked keeps the stored ones.
+let mcpInfo = {servers: [], tools: 0}, mcpRetry = null, mcpEditing = null;
+const MASK = "••••";
 async function loadMcp() {
   try {
-    const r = await fetch("mcp", {headers: headers()});
+    let r = await fetch("api/mcp/servers", {headers: headers()});
+    if (r.status === 404) r = await fetch("mcp", {headers: headers()});   // an older server
     if (!r.ok) return;
     mcpInfo = await r.json();
   } catch (e) { return; /* an older server: no MCP */ }
   renderMcp();
-  clearTimeout(mcpRetry);                          // right after the start, servers may still be starting (npx downloads)
-  if ((mcpInfo.servers || []).some((s) => s.status === "starting")) mcpRetry = setTimeout(loadMcp, 3000);
+}
+async function mcpCall(method, path, body) {
+  const r = await fetch(`api/mcp/servers${path}`, {method, headers: headers(true), body: body === undefined ? undefined : JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  if (j.mcp) { mcpInfo = j.mcp; renderMcp(); }
+  return j;
 }
 const MCP_STATE = {ready: ["st-badge--generating", "Connected"], starting: ["st-badge--reading", "Starting"],
-                   failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"]};
+                   failed: ["st-badge--error", "Failed"], stopped: ["st-badge--queued", "Stopped"], idle: ["", "Waiting"],
+                   off: ["st-badge--queued", "Turned off"]};
+const shQuote = (a) => (a === "" || /[\s'"\\$`]/.test(a)) ? `'${a.replace(/'/g, `'\\''`)}'` : a;
+function mcpCommandLine(c) {
+  return [c.command || "", ...(c.args || []).map(String)].map(shQuote).join(" ");
+}
+function mcpWhat(s) {
+  const c = s.config || {};
+  return c.url ? c.url : mcpCommandLine(c);
+}
 function renderMcp() {
   const servers = mcpInfo.servers || [];
-  $("mcp-card").hidden = !servers.length;
-  $("mcp-empty").hidden = !!servers.length;
+  $("mcp-none").hidden = !!servers.length;
   $("mcp-row").hidden = !servers.length;
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
   $("mcp-sum").textContent = servers.length ? `${fmt(mcpInfo.tools)} tools · ${ready.length} of ${servers.length} servers connected` : "";
   $("mcp-row-sub").textContent = mcpInfo.tools ? `${fmt(mcpInfo.tools)} tools from ${ready.map((s) => s.name).join(", ")}; the model calls them when it decides to`
-                                               : "no server is connected yet (see the Monitor)";
-  $("mcp-list").innerHTML = servers.map((s) => {
+                                               : "no server is connected yet (see Settings › Tools)";
+  $("mcp-list").innerHTML = servers.map((s, i) => {
     const [cls, text] = MCP_STATE[s.status] || ["", s.status];
     const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
+    const app = s.source === "app";
+    const off = s.config && s.config.disabled === true;
+    const btns = app ? `<span class="mcp-server__btns">` +
+        `<button type="button" class="st-btn st-btn--secondary" data-mcp="edit" data-i="${i}">Edit</button>` +
+        `<button type="button" class="st-btn st-btn--secondary" data-mcp="toggle" data-i="${i}">${off ? "Turn on" : "Turn off"}</button>` +
+        `<button type="button" class="st-btn st-btn--secondary" data-mcp="remove" data-i="${i}">Remove</button></span>`
+      : `<span class="mcp-server__btns muted small">from the run config: change it there</span>`;
+    const log = (s.status === "failed" && (s.log || []).length) ? `<pre class="mcp-log">${esc(s.log.join("\n"))}</pre>` : "";
     return `<div class="mcp-server"><div class="mcp-server__head"><span class="st-badge ${cls}">${esc(text)}</span>` +
-      `<strong>${esc(s.name)}</strong><span class="muted small">${esc(s.transport)} · ${fmt(s.tools.length)} tools${esc(info)}</span></div>` +
-      (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") +
-      (s.tools.length ? `<div class="mcp-server__tools">${s.tools.map((t) => `<span class="chip" title="${esc(t.description || "")}">${esc(t.tool)}</span>`).join("")}</div>` : "") +
+      `<strong>${esc(s.name)}</strong><span class="muted small">${s.transport === "http" ? "address" : "program"} · ${fmt((s.tools || []).length)} tools${esc(info)}</span>${btns}</div>` +
+      `<div class="mcp-server__what">${esc(mcpWhat(s))}</div>` +
+      (s.error ? `<div class="msg-error">${esc(s.error)}</div>` : "") + log +
+      ((s.tools || []).length ? `<div class="mcp-server__tools">${s.tools.map((t) =>
+        `<button type="button" class="chip mcp-tool" data-mcp="tool" data-i="${i}" data-tool="${esc(t.tool)}" aria-pressed="${t.on !== false}" aria-label="${esc(t.tool)}: ${t.on === false ? "off" : "on"}" title="${esc(t.description || "")}${t.on === false ? " (turned off)" : ""}">${esc(t.tool)}</button>`).join("")}</div>` : "") +
       `</div>`;
   }).join("");
+  clearTimeout(mcpRetry);                          // a server starting (npx downloads first): look again shortly
+  if (servers.some((s) => s.status === "starting" || s.status === "idle")) mcpRetry = setTimeout(loadMcp, 2000);
 }
+
+// the form: one server, added or changed
+const lines = (t) => t.split("\n").map((l) => l.trim()).filter(Boolean);
+function mcpKind(v) {
+  for (const b of $("mcp-kind").querySelectorAll("button")) b.setAttribute("aria-checked", String(b.dataset.v === v));
+  $("mcp-url-fields").hidden = v !== "url";
+  $("mcp-cmd-fields").hidden = v !== "command";
+}
+$("mcp-kind").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) mcpKind(b.dataset.v); });
+function mcpOpen(server) {
+  mcpEditing = server ? server.name : null;
+  const c = (server && server.config) || {};
+  $("mcp-form-title").textContent = server ? `Change ${server.name}` : "Add a tool server";
+  $("mcp-name").value = server ? server.name : "";
+  $("mcp-name").disabled = !!server;
+  $("mcp-url").value = c.url || "";
+  $("mcp-headers").value = Object.entries(c.headers || {}).map(([k, v]) => `${k}: ${v}`).join("\n");
+  $("mcp-command").value = c.command || "";
+  $("mcp-args").value = (c.args || []).join("\n");
+  $("mcp-env").value = Object.entries(c.env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+  $("mcp-cwd").value = c.cwd || "";
+  mcpKind(server && !c.url ? "command" : "url");
+  $("mcp-test-out").hidden = true;
+  $("mcp-paste").hidden = true;
+  $("mcp-form").hidden = false;
+  $("mcp-name").focus();
+}
+function mcpCollect() {
+  const cmd = $("mcp-kind").querySelector('[aria-checked="true"]').dataset.v === "command";
+  const old = mcpEditing && (mcpInfo.servers || []).find((s) => s.name === mcpEditing);
+  const cfg = {};
+  if (cmd) {
+    cfg.command = $("mcp-command").value.trim();
+    const args = lines($("mcp-args").value);
+    if (args.length) cfg.args = args;
+    const env = {};
+    for (const l of lines($("mcp-env").value)) { const i = l.indexOf("="); if (i > 0) env[l.slice(0, i).trim()] = l.slice(i + 1); }
+    if (Object.keys(env).length) cfg.env = env;
+    if ($("mcp-cwd").value.trim()) cfg.cwd = $("mcp-cwd").value.trim();
+  } else {
+    cfg.url = $("mcp-url").value.trim();
+    const h = {};
+    for (const l of lines($("mcp-headers").value)) { const i = l.indexOf(":"); if (i > 0) h[l.slice(0, i).trim()] = l.slice(i + 1).trim(); }
+    if (Object.keys(h).length) cfg.headers = h;
+  }
+  if (old && old.config && old.config.disabled) cfg.disabled = true;
+  return cfg;
+}
+function mcpTestShow(t) {
+  const out = $("mcp-test-out");
+  out.hidden = false;
+  out.innerHTML = t.ok
+    ? `<span class="st-badge st-badge--generating">Connected</span> ${fmt(t.tools.length)} tools: ${t.tools.map((x) => `<code>${esc(x.tool)}</code>`).join(", ") || "none"}`
+    : `<div class="msg-error">${esc(t.error || "it did not start")}</div>` + ((t.log || []).length ? `<pre class="mcp-log">${esc(t.log.join("\n"))}</pre>` : "");
+}
+$("mcp-add-btn").onclick = () => mcpOpen(null);
+$("mcp-cancel-btn").onclick = () => { $("mcp-form").hidden = true; mcpEditing = null; };
+$("mcp-test-btn").onclick = async () => {
+  const b = $("mcp-test-btn");
+  b.disabled = true; b.textContent = "Testing...";
+  try { mcpTestShow(await mcpCall("POST", "/test", {...mcpCollect(), name: mcpEditing || undefined})); }
+  catch (e) { mcpTestShow({ok: false, error: e.message}); }
+  finally { b.disabled = false; b.textContent = "Test"; }
+};
+$("mcp-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const name = mcpEditing || $("mcp-name").value.trim();
+  if (!name) { toast("error", "Give the server a name"); return; }
+  const cfg = mcpCollect();
+  if (cfg.command !== undefined) {
+    if (!cfg.command) { toast("error", "Give the program to run"); return; }
+    // a program on this PC: the exact command line, confirmed
+    if (!confirm(`This program will run on this PC with your rights:\n\n${mcpCommandLine(cfg)}\n\nSave and start it?`)) return;
+  } else if (!cfg.url) { toast("error", "Give the server's address"); return; }
+  try {
+    if (mcpEditing) await mcpCall("PUT", `/${encodeURIComponent(name)}`, cfg);
+    else await mcpCall("POST", "", {name, ...cfg});
+    $("mcp-form").hidden = true; mcpEditing = null;
+    toast("success", `Saved ${name}`, "It starts now; its tools join the chat when it is connected.");
+  } catch (err) { toast("error", "Not saved", err.message, 8000); }
+});
+$("mcp-list").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-mcp]");
+  if (!b) return;
+  const s = (mcpInfo.servers || [])[+b.dataset.i];
+  if (!s) return;
+  try {
+    if (b.dataset.mcp === "edit") mcpOpen(s);
+    else if (b.dataset.mcp === "toggle") {
+      const cfg = {...(s.config || {})};
+      if (cfg.disabled) delete cfg.disabled; else cfg.disabled = true;
+      await mcpCall("PUT", `/${encodeURIComponent(s.name)}`, cfg);
+    } else if (b.dataset.mcp === "remove") {
+      if (!confirm(`Remove the tool server "${s.name}"? Its tools leave the chat.`)) return;
+      await mcpCall("DELETE", `/${encodeURIComponent(s.name)}`);
+      toast("success", `Removed ${s.name}`);
+    } else if (b.dataset.mcp === "tool") {
+      await mcpCall("POST", `/${encodeURIComponent(s.name)}/tools`, {[b.dataset.tool]: b.getAttribute("aria-pressed") !== "true"});
+    }
+  } catch (err) { toast("error", "Not changed", err.message, 8000); }
+});
+// a pasted Claude Desktop / Cursor / VS Code block
+$("mcp-paste-btn").onclick = () => { $("mcp-form").hidden = true; $("mcp-paste").hidden = false; $("mcp-paste-text").focus(); };
+$("mcp-paste-cancel").onclick = () => { $("mcp-paste").hidden = true; };
+$("mcp-import-btn").onclick = async () => {
+  let j;
+  try { j = JSON.parse($("mcp-paste-text").value); } catch (e) { toast("error", "That is not JSON", e.message); return; }
+  const block = j.mcpServers || j.mcp_servers || j.servers || j;
+  if (!block || typeof block !== "object" || Array.isArray(block) || !Object.keys(block).length) { toast("error", "No servers in it"); return; }
+  const cmds = Object.entries(block).filter(([, c]) => c && !c.url).map(([n, c]) => `${n}: ${mcpCommandLine(c)}`);
+  if (cmds.length && !confirm(`These programs will run on this PC with your rights:\n\n${cmds.join("\n")}\n\nImport and start them?`)) return;
+  try {
+    const r = await mcpCall("POST", "", {mcpServers: block});
+    $("mcp-paste").hidden = true; $("mcp-paste-text").value = "";
+    toast("success", `Imported ${r.added.length} server${r.added.length === 1 ? "" : "s"}`, r.added.join(", "));
+  } catch (err) { toast("error", "Not imported", err.message, 8000); }
+};
 
 // ------------------------------------------------------------------ Model settings (GET / POST /config, #564)
 // A few documented keys of the run config (strata-<model>.json), for every client, from the next start on.  The

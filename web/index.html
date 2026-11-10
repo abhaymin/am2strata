@@ -530,21 +530,52 @@
 
         <section class="set-panel" id="sec-tools" aria-labelledby="h-tools" hidden>
           <h2 id="h-tools">Tools (MCP)</h2>
-          <div class="st-card mcp-card" id="mcp-card" hidden>
-            <div class="req-head"><span class="card-title">Tool servers</span><span class="muted small" id="mcp-sum"></span></div>
+          <div class="st-card mcp-card" id="mcp-card">
+            <div class="req-head"><span class="card-title">Tool servers</span><span class="muted small" id="mcp-sum"></span>
+              <span class="mcp-actions"><button type="button" class="st-btn st-btn--secondary" id="mcp-paste-btn">Paste a config</button>
+                <button type="button" class="st-btn st-btn--primary" id="mcp-add-btn">Add a server</button></span></div>
+            <p class="muted" id="mcp-none" hidden>No tool servers yet. Add one - an address (a URL) or a program on this PC (a command) - and
+              its tools join this page's chat at once, with no restart.</p>
             <div class="mcp-list" id="mcp-list"></div>
             <p class="muted small mcp-note">Their tools run on this PC with your rights, when the model decides to call them (in this
-              page's chat only; switch it off in the chat's sampling settings).</p>
+              page's chat only; switch it off in the chat's sampling settings). Click a tool to turn it off or on.</p>
           </div>
-          <div class="st-card empty-card" id="mcp-empty">
-            <span class="card-title">No tool servers yet</span>
-            <p class="muted">Add an MCP server - a program on this PC or an address - to the default model's run config and the chat
-              can use its tools:</p>
-            <pre class="snippet"><code>"mcp_servers": {
-  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/Documents"]},
-  "search": {"url": "http://127.0.0.1:9000/mcp"}
-}</code></pre>
-            <p class="muted small">Then restart am2Strata. Tools run with your rights on this PC, so only this page can use them.</p>
+          <form class="st-card mcp-form" id="mcp-form" hidden>
+            <span class="card-title" id="mcp-form-title">Add a tool server</span>
+            <label class="st-field">Name<input class="st-input" id="mcp-name" maxlength="48" placeholder="files" autocomplete="off"></label>
+            <div class="seg seg--2" id="mcp-kind" role="radiogroup" aria-label="Kind of server">
+              <button type="button" role="radio" data-v="url" aria-checked="true">Address (URL)</button><button type="button" role="radio" data-v="command" aria-checked="false">Program on this PC</button>
+            </div>
+            <div class="mcp-fields" id="mcp-url-fields">
+              <label class="st-field">Address<input class="st-input mono" id="mcp-url" placeholder="http://127.0.0.1:9000/mcp" autocomplete="off"></label>
+              <label class="st-field">Headers <span class="muted small">one per line, Name: value</span>
+                <textarea class="st-input mono" id="mcp-headers" rows="2" placeholder="Authorization: Bearer ..."></textarea></label>
+            </div>
+            <div class="mcp-fields" id="mcp-cmd-fields" hidden>
+              <label class="st-field">Program<input class="st-input mono" id="mcp-command" placeholder="npx" autocomplete="off"></label>
+              <label class="st-field">Arguments <span class="muted small">one per line</span>
+                <textarea class="st-input mono" id="mcp-args" rows="3" placeholder="-y&#10;@modelcontextprotocol/server-filesystem&#10;/home/you/Documents"></textarea></label>
+              <label class="st-field">Environment <span class="muted small">one per line, NAME=value</span>
+                <textarea class="st-input mono" id="mcp-env" rows="2"></textarea></label>
+              <label class="st-field">Working folder <span class="muted small">optional</span><input class="st-input mono" id="mcp-cwd" autocomplete="off"></label>
+              <p class="muted small">The program runs on this PC with your rights, so it can be added only from this PC (unless the run
+                config sets "mcp_remote_commands": true). Before it is saved you see the exact command line.</p>
+            </div>
+            <div class="mcp-test" id="mcp-test-out" hidden></div>
+            <div class="img-row">
+              <button type="button" class="st-btn st-btn--secondary" id="mcp-test-btn">Test</button>
+              <button type="submit" class="st-btn st-btn--primary" id="mcp-save-btn">Save</button>
+              <button type="button" class="st-btn st-btn--secondary" id="mcp-cancel-btn">Cancel</button>
+            </div>
+          </form>
+          <div class="st-card mcp-form" id="mcp-paste" hidden>
+            <span class="card-title">Paste a config</span>
+            <p class="muted small">A Claude Desktop, Cursor or VS Code "mcpServers" block. Each server in it becomes a row here.</p>
+            <textarea class="st-input mono" id="mcp-paste-text" rows="8" placeholder='{"mcpServers": {"files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/you/Documents"]}}}'></textarea>
+            <div class="img-row">
+              <button type="button" class="st-btn st-btn--primary" id="mcp-import-btn">Import</button>
+              <button type="button" class="st-btn st-btn--secondary" id="mcp-paste-cancel">Cancel</button>
+            </div>
           </div>
         </section>
 

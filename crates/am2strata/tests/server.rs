@@ -510,6 +510,109 @@ fn mcp_tools_run_on_the_server_and_the_model_continues() {
     assert_eq!(r.status().as_u16(), 403);
 }
 
+/// Settings › Tools: MCP servers added, tested, switched, changed and removed from the app, live, kept in
+/// <data>/mcp-servers.json with their secrets masked in every answer.
+#[test]
+fn mcp_servers_are_managed_from_the_app() {
+    let mock = env!("CARGO_BIN_EXE_strata-mock-mcp");
+    let m = Model { extra: json!({"mcp_servers": {"fromconfig": {"command": mock}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("ok")], json!({}));
+    let c = reqwest::blocking::Client::new();
+    let send = |method: reqwest::Method, path: &str, body: Option<Value>| -> (u16, Value) {
+        let mut r = c.request(method, format!("{}{path}", s.base)).bearer_auth(KEY);
+        if let Some(b) = body {
+            r = r.json(&b);
+        }
+        let r = r.send().unwrap();
+        (r.status().as_u16(), r.json().unwrap_or(Value::Null))
+    };
+    let wait_tools = |n: u64| {
+        let t0 = std::time::Instant::now();
+        loop {
+            let (_, st) = s.get("/api/mcp/servers", true);
+            if st["tools"] == n || t0.elapsed() > std::time::Duration::from_secs(10) {
+                return st;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    let st = wait_tools(1);
+    assert_eq!(st["servers"][0]["source"], "config", "{st}");
+
+    // a test connects and lists the tools, nothing kept
+    let (code, t) = send(reqwest::Method::POST, "/api/mcp/servers/test", Some(json!({"command": mock})));
+    assert_eq!(code, 200, "{t}");
+    assert_eq!(t["ok"], true);
+    assert_eq!(t["tools"][0]["tool"], "add");
+    let (_, t) = send(reqwest::Method::POST, "/api/mcp/servers/test", Some(json!({"command": "/nonexistent/mcp-server"})));
+    assert_eq!(t["ok"], false);
+    assert!(t["error"].as_str().unwrap().contains("could not start"), "{t}");
+    assert_eq!(s.get("/api/mcp/servers", true).1["servers"].as_array().unwrap().len(), 1, "the test kept nothing");
+
+    // a command server added from this PC starts at once; its tools join the chat's
+    let (code, r) = send(reqwest::Method::POST, "/api/mcp/servers", Some(json!({"name": "calc", "command": mock, "env": {"TOKEN": "s3cret"}})));
+    assert_eq!(code, 200, "{r}");
+    let st = wait_tools(2);
+    let calc = st["servers"].as_array().unwrap().iter().find(|x| x["name"] == "calc").unwrap().clone();
+    assert_eq!(calc["source"], "app");
+    assert_eq!(calc["status"], "ready", "{calc}");
+    assert_eq!(calc["config"]["env"]["TOKEN"], "••••");
+    assert!(!st.to_string().contains("s3cret"), "a secret came back");
+    let saved = std::fs::read_to_string(s.dir.join("mcp-servers.json")).unwrap();
+    assert!(saved.contains("s3cret"), "the secret is kept on disk");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(s.dir.join("mcp-servers.json")).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // the same name again is a conflict; the run config's names are not the app's to take
+    assert_eq!(send(reqwest::Method::POST, "/api/mcp/servers", Some(json!({"name": "calc", "command": mock}))).0, 409);
+    assert_eq!(send(reqwest::Method::POST, "/api/mcp/servers", Some(json!({"name": "fromconfig", "command": mock}))).0, 409);
+
+    // a tool turned off is not offered to the model
+    let (code, _) = send(reqwest::Method::POST, "/api/mcp/servers/calc/tools", Some(json!({"add": false})));
+    assert_eq!(code, 200);
+    let st = wait_tools(1);
+    assert_eq!(st["tools"], 1, "{st}");
+    let calc = st["servers"].as_array().unwrap().iter().find(|x| x["name"] == "calc").unwrap().clone();
+    assert_eq!(calc["tools"][0]["on"], false);
+    send(reqwest::Method::POST, "/api/mcp/servers/calc/tools", Some(json!({"add": true})));
+    wait_tools(2);
+
+    // a change with the masked value keeps the stored one; turning it off stops it
+    let (code, r) = send(reqwest::Method::PUT, "/api/mcp/servers/calc", Some(json!({"command": mock, "env": {"TOKEN": "••••"}, "disabled": true})));
+    assert_eq!(code, 200, "{r}");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(s.dir.join("mcp-servers.json")).unwrap()).unwrap();
+    assert_eq!(saved["servers"]["calc"]["env"]["TOKEN"], "s3cret");
+    let st = wait_tools(1);
+    assert_eq!(st["servers"].as_array().unwrap().iter().find(|x| x["name"] == "calc").unwrap()["status"], "off");
+    // the run config's servers cannot be changed or removed from the app
+    assert_eq!(send(reqwest::Method::PUT, "/api/mcp/servers/fromconfig", Some(json!({"command": mock}))).0, 409);
+    assert_eq!(send(reqwest::Method::DELETE, "/api/mcp/servers/fromconfig", None).0, 409);
+
+    // a pasted Claude Desktop block becomes rows; an address server too
+    let (code, r) = send(reqwest::Method::POST, "/api/mcp/servers", Some(json!({"mcpServers": {
+        "one": {"command": mock}, "web": {"url": "http://127.0.0.1:9/mcp", "headers": {"Authorization": "Bearer k"}}}})));
+    assert_eq!(code, 200, "{r}");
+    assert_eq!(r["added"], json!(["one", "web"]));
+    let st = s.get("/api/mcp/servers", true).1;
+    let web = st["servers"].as_array().unwrap().iter().find(|x| x["name"] == "web").unwrap().clone();
+    assert_eq!(web["config"]["headers"]["Authorization"], "••••");
+
+    // removed: gone, and gone from the file
+    assert_eq!(send(reqwest::Method::DELETE, "/api/mcp/servers/one", None).0, 200);
+    assert_eq!(send(reqwest::Method::DELETE, "/api/mcp/servers/one", None).0, 404);
+    let saved = std::fs::read_to_string(s.dir.join("mcp-servers.json")).unwrap();
+    assert!(!saved.contains("\"one\""));
+
+    // without the key, or from another web page: refused
+    let r = c.get(format!("{}/api/mcp/servers", s.base)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    let r = c.post(format!("{}/api/mcp/servers", s.base)).bearer_auth(KEY).header("Origin", "https://evil.example")
+        .json(&json!({"name": "x", "url": "http://h/mcp"})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}
+
 #[test]
 fn the_engine_gets_its_eight_token_margin() {
     let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));

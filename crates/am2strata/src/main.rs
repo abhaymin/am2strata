@@ -19,6 +19,7 @@ mod preview;
 mod queue;
 mod manager;
 mod hub_api;
+mod mcp_api;
 mod mcp;
 mod memory;
 mod media;
@@ -93,7 +94,7 @@ struct Args {
 pub struct AppState {
     pub mgr: Arc<Manager>,
     pub api_key: Option<String>,
-    /// the MCP servers of the default model's run config (the web app's chats can use their tools)
+    /// the MCP servers: the default model's run config's and the app's (always there; it may have none)
     pub mcp: Option<Arc<mcp::McpHub>>,
     /// web origins besides this server's own that may change settings and run tools (the config's trusted_origins)
     pub trusted_origins: Vec<String>,
@@ -292,10 +293,9 @@ async fn main() -> Result<()> {
     if !args.lazy {
         mgr.load(&default).await.with_context(|| format!("loading {default}"))?;
     }
-    let hub = mcp::McpHub::from_config(&first.cfg.rest).map_err(anyhow::Error::msg)?;
-    if let Some(h) = &hub {
-        h.start();
-    }
+    // the run config's MCP servers and the app's (Settings › Tools)
+    let hub = mcp::McpHub::from_config(&first.cfg.rest, Some(expand(&args.data_dir).join("mcp-servers.json"))).map_err(anyhow::Error::msg)?;
+    hub.start();
     let trusted_origins: Vec<String> = first.cfg.rest.get("trusted_origins").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim_end_matches('/').to_string())).collect()).unwrap_or_default();
     let monitor_on = args.api_monitor || first.cfg.rest.get("api_monitor") == Some(&serde_json::Value::Bool(true));
@@ -319,7 +319,7 @@ async fn main() -> Result<()> {
             code_run.needs_key = true;
         }
     }
-    let state = AppState { mgr: mgr.clone(), api_key, mcp: hub.clone(), trusted_origins,
+    let state = AppState { mgr: mgr.clone(), api_key, mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),
@@ -395,6 +395,10 @@ async fn main() -> Result<()> {
         .route("/settings", get(web::settings_get).post(web::settings_post))
         .route("/config", get(web::config_get).post(web::config_post))
         .route("/mcp", get(web::mcp))
+        .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))
+        .route("/api/mcp/servers/test", post(mcp_api::test))
+        .route("/api/mcp/servers/{name}", axum::routing::put(mcp_api::update).delete(mcp_api::remove))
+        .route("/api/mcp/servers/{name}/tools", post(mcp_api::tools))
         .route("/metrics", get(web::metrics))
         .route("/api/monitor/clear", post(web::monitor_clear))
         .route("/api/agents", get(web::agents))
@@ -424,7 +428,8 @@ async fn main() -> Result<()> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;
     tracing::info!("listening on http://{host}:{port}/ (web app from {}), API at /v1", web_dir.display());
-    axum::serve(listener, app)
+    // each request's address is known (adding a command MCP server is allowed only from this PC)
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -433,8 +438,6 @@ async fn main() -> Result<()> {
     if let Some(b) = mgr.browser.get() {
         b.close().await;
     }
-    if let Some(h) = hub {
-        h.close().await;
-    }
+    hub.close().await;
     Ok(())
 }
