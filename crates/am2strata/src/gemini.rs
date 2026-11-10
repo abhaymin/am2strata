@@ -148,6 +148,12 @@ pub fn to_openai(model: &str, g: &Value) -> Result<Value, String> {
         req["model"] = json!(model);
     }
     let mut tools = Vec::new();
+    // Gemini's own Google Search tool: the server's web search (allowed for a key whose profile has "web"), as
+    // Chat Completions' web_search_options
+    if g["tools"].as_array().into_iter().flatten().any(|t| ["google_search", "googleSearch", "google_search_retrieval", "googleSearchRetrieval"]
+        .iter().any(|k| t.get(*k).is_some())) {
+        req["web_search_options"] = json!({});
+    }
     for t in g["tools"].as_array().cloned().unwrap_or_default() {
         for f in t["functionDeclarations"].as_array().or_else(|| t["function_declarations"].as_array()).cloned().unwrap_or_default() {
             let params = f.get("parametersJsonSchema").cloned().or_else(|| f.get("parameters").map(schema))
@@ -428,6 +434,13 @@ pub async fn model(State(s): State<AppState>, headers: HeaderMap, Path(id): Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_search_becomes_the_server_s_web_search() {
+        let r = to_openai("m", &json!({"contents": [{"role": "user", "parts": [{"text": "news?"}]}], "tools": [{"google_search": {}}]})).unwrap();
+        assert_eq!(r["web_search_options"], json!({}));
+        assert!(r.get("tools").is_none(), "no function tools");
+    }
 
     #[test]
     fn a_gemini_turn_with_a_function_call_and_its_answer_becomes_openai_messages() {
