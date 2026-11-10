@@ -418,7 +418,10 @@ async fn main() -> Result<()> {
                            previews: Arc::new(preview::Previews::default()),
                            media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)),
                            media_jobs: Arc::new(media_jobs::Jobs::new()) };
+    // media jobs kept across restarts; the ones the server stopped in run again
+    let unfinished = state.media_jobs.open(expand(&args.data_dir).join("media-jobs"));
     state.media_jobs.bind(state.clone());
+    state.media_jobs.resume(unfinished);
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
@@ -453,6 +456,7 @@ async fn main() -> Result<()> {
         .route("/api/media/models/{name}/removal", get(model_remove::media_removal))
         .route("/api/media/capabilities", get(media_jobs::capabilities))
         .route("/api/media/genres", get(music::genres))
+        .route("/api/jobs", post(media_jobs::again))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

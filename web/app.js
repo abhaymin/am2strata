@@ -1476,21 +1476,44 @@ function jobCardHtml(id) {
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
       `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>`;
   }
-  if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>`;
+  // gone from the server (made before it kept jobs, or past the newest it keeps): made again from the same call
+  if (j.state === "gone") return `<div class="media-job__gone"><span class="muted small">This ${esc(what.toLowerCase())} is no longer on the server.</span>` +
+    (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Make it again</button>` : "") + `</div>`;
+  if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>` +
+    (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Try again</button>` : "");
   const where = j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
     : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
   return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
 }
+// "Make it again": the same tool call queued as a new job; the chat's tool call now points to it (kept with the chat)
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-redo]");
+  if (!b) return;
+  const old = b.dataset.redo, j = jobs[old];
+  if (!j || !j.tool) return;
+  b.disabled = true;
+  try {
+    const r = await fetch("api/jobs", {method: "POST", headers: headers(true), body: JSON.stringify({tool: j.tool.name, arguments: j.tool.arguments})});
+    const nj = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((nj.error && nj.error.message) || `HTTP ${r.status}`);
+    if (j.call) j.call.job = nj;
+    document.querySelectorAll(`.media-job[data-job="${CSS.escape(old)}"]`).forEach((el) => { el.dataset.job = nj.id; });
+    saveChat();
+    watchJob(nj.id, j.call);
+    paintJob(nj.id);
+  } catch (err) { b.disabled = false; toast("error", "Not queued", err.message, 6000); }
+});
 function paintJob(id) {
   document.querySelectorAll(`.media-job[data-job="${CSS.escape(id)}"]`).forEach((e) => { e.innerHTML = jobCardHtml(id); });
 }
-async function watchJob(id) {
-  if (jobs[id] && (jobs[id].watching || jobs[id].state === "done" || jobs[id].state === "error")) return;
+async function watchJob(id, t) {
+  if (t && t.name) jobs[id] = Object.assign(jobs[id] || {}, {tool: {name: t.name, arguments: t.arguments || {}}, call: t});
+  if (jobs[id] && (jobs[id].watching || jobs[id].state === "done" || jobs[id].state === "error" || jobs[id].state === "gone")) return;
   jobs[id] = Object.assign(jobs[id] || {}, {watching: true});
   try {
     for (;;) {
       const r = await fetch(`api/jobs/${encodeURIComponent(id)}`, {headers: headers()});
-      if (r.status === 404) { Object.assign(jobs[id], {state: "error", error: "no longer on the server (it keeps jobs until it restarts)"}); break; }
+      if (r.status === 404) { Object.assign(jobs[id], {state: "gone"}); break; }
       if (r.ok) {
         const j = await r.json();
         Object.assign(jobs[id], j);
@@ -1534,7 +1557,8 @@ function onTool(m, x) {
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
-    if (x.job) { t.job = x.job; watchJob(x.job.id); }
+    // a job this answer just queued: watched fresh (never a state the page kept for an older job of the same id)
+    if (x.job) { delete jobs[x.job.id]; t.job = x.job; watchJob(x.job.id, t); }
     if (Array.isArray(x.sources)) t.sources = x.sources.filter((u) => /^https?:\/\//.test(u.url || ""));
     if (typeof x.image === "string" && x.image.startsWith("data:image/jpeg;base64,")) t.image = x.image;   // the browser's screenshot
     if (t.approve && t.approve.answered == null) t.approve.answered = "ended";
@@ -1581,7 +1605,7 @@ function renderChat() {
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
-  for (const m of messages) for (const t of m.tools || []) if (t.job) watchJob(t.job.id);
+  for (const m of messages) for (const t of m.tools || []) if (t.job) watchJob(t.job.id, t);
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }

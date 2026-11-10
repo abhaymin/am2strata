@@ -1505,6 +1505,44 @@ fn a_chat_queues_an_image_with_its_media_tool_and_the_job_runs_after_the_answer(
     assert_eq!(s.get("/api/jobs/mj-9", true).0, 404);
 }
 
+/// Production, step 6: a media job survives a restart (its record and file are kept on disk), ids go on from the
+/// highest kept, and a gone job's tool call can be made again (POST /api/jobs).
+#[test]
+fn media_jobs_survive_a_restart_and_can_be_made_again() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
+    let mut s = Server::start(&[Model::default()], &[ids(&format!("Draw it.\n</think>{call}")), ids("Queued.\n</think>\n\nOn its way.")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("Draw a lighthouse.")], "strata_media": true}));
+    assert_eq!(c, 200);
+    let done = |s: &Server, id: &str| {
+        let t0 = std::time::Instant::now();
+        loop {
+            let (_, j) = s.get(&format!("/api/jobs/{id}"), true);
+            if j["state"] == "done" || j["state"] == "error" { return j; }
+            assert!(t0.elapsed().as_secs() < 15, "{j}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    assert_eq!(done(&s, "mj-1")["state"], "done");
+    assert!(s.dir.join("media-jobs/mj-1.json").is_file() && s.dir.join("media-jobs/mj-1.png").is_file(), "kept on disk");
+    s.restart();
+    let (c, j) = s.get("/api/jobs/mj-1", true);
+    assert_eq!((c, j["state"].as_str()), (200, Some("done")), "the job is still there after the restart: {j}");
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/mj-1/content", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(&r.bytes().unwrap()[1..4], b"PNG", "its file, read from disk");
+    // made again: a new id (after the kept one), the same tool call
+    let (c, nj) = s.post("/api/jobs", &json!({"tool": "generate_image", "arguments": {"prompt": "a lighthouse at dusk"}}));
+    assert_eq!(c, 200, "{nj}");
+    let kept: u64 = std::fs::read_dir(s.dir.join("media-jobs")).unwrap().filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str()?.strip_prefix("mj-")?.strip_suffix(".json")?.parse().ok()).max().unwrap();
+    let new: u64 = nj["id"].as_str().unwrap().strip_prefix("mj-").unwrap().parse().unwrap();
+    assert!(new >= kept, "ids go on past the ones kept before the restart (never reused): {new} after {kept}");
+    assert_eq!(done(&s, nj["id"].as_str().unwrap())["state"], "done");
+    let (c, e) = s.get("/api/jobs/mj-77", true);
+    assert_eq!(c, 404);
+    assert!(e.to_string().contains("make it again"), "{e}");
+}
+
 #[test]
 fn an_audio_attachment_in_a_chat_is_transcribed_into_the_prompt() {
     let s = Server::start(&[Model::default()], &[ids("Heard.\n</think>\n\nYou said hello world.")], json!({}));

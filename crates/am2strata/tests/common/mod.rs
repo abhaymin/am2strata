@@ -37,6 +37,9 @@ pub fn expected_prompt(req: &Value) -> Vec<u32> {
 
 pub struct Server {
     child: Child,
+    /// how it was started (restart() starts it again the same way, on the same data folder)
+    model: String,
+    extra: Value,
     pub port: u16,
     pub dir: PathBuf,
     pub record: PathBuf,
@@ -117,26 +120,8 @@ impl Server {
         }
         let record = dir.join("record.txt");
         let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_am2strata"))
-            .args(["--models-dir"]).arg(&dir)
-            .args(["--model", models[0].id, "--port", &port.to_string(), "--host", "127.0.0.1"])
-            .arg("--web-dir").arg(extra.get("web_dir").and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_else(|| testdata().join("web")))
-            .arg("--data-dir").arg(&dir)
-            .env("AM2STRATA_MEDIA_EXE", if extra.get("no_media").is_some() { PathBuf::from("/nonexistent/am2strata-media") }
-                                        else { PathBuf::from(env!("CARGO_BIN_EXE_strata-mock-media")) })
-            .env("MOCK_MEDIA_RECORD", dir.join("media-record.txt"))
-            .env("AM2_TEST_MEM_GB", extra.get("mem_gb").map(|v| v.to_string()).unwrap_or_else(|| "64".into()))
-            .envs(extra.get("no_multilingual").map(|_| ("MOCK_NO_MULTILINGUAL", "1")))
-            .envs(extra.get("no_music").map(|_| ("MOCK_NO_MUSIC", "1")))
-            .env("MOCK_MEDIA_DELAY_MS", extra.get("media_delay_ms").map(|v| v.to_string()).unwrap_or_else(|| "0".into()))
-            .env("MOCK_SCRIPT", dir.join("script.json"))
-            .env("MOCK_RECORD", &record)
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("start am2strata");
-        let s = Server { child, port, dir, record, base: format!("http://127.0.0.1:{port}") };
+        let child = spawn(&dir, port, models[0].id, &extra, &record);
+        let s = Server { child, model: models[0].id.to_string(), extra: extra.clone(), port, dir, record, base: format!("http://127.0.0.1:{port}") };
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(30) {
             if reqwest::blocking::get(format!("{}/health", s.base)).is_ok_and(|r| r.status().is_success()) {
@@ -199,6 +184,47 @@ impl Server {
 
     pub fn gen_lines(&self) -> Vec<String> {
         self.commands().into_iter().filter(|l| l.starts_with("GEN")).collect()
+    }
+}
+
+/// The server process over `dir` (its run configs, data and script).
+fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_am2strata"))
+            .args(["--models-dir"]).arg(&dir)
+            .args(["--model", model, "--port", &port.to_string(), "--host", "127.0.0.1"])
+            .arg("--web-dir").arg(extra.get("web_dir").and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_else(|| testdata().join("web")))
+            .arg("--data-dir").arg(&dir)
+            .env("AM2STRATA_MEDIA_EXE", if extra.get("no_media").is_some() { PathBuf::from("/nonexistent/am2strata-media") }
+                                        else { PathBuf::from(env!("CARGO_BIN_EXE_strata-mock-media")) })
+            .env("MOCK_MEDIA_RECORD", dir.join("media-record.txt"))
+            .env("AM2_TEST_MEM_GB", extra.get("mem_gb").map(|v| v.to_string()).unwrap_or_else(|| "64".into()))
+            .envs(extra.get("no_multilingual").map(|_| ("MOCK_NO_MULTILINGUAL", "1")))
+            .envs(extra.get("no_music").map(|_| ("MOCK_NO_MUSIC", "1")))
+            .env("MOCK_MEDIA_DELAY_MS", extra.get("media_delay_ms").map(|v| v.to_string()).unwrap_or_else(|| "0".into()))
+            .env("MOCK_SCRIPT", dir.join("script.json"))
+            .env("AM2_JOB_IDS_FROM", "1")
+            .env("MOCK_RECORD", record)
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start am2strata")
+}
+
+impl Server {
+    /// Stop the server and start it again on the same data folder and port (a restart, as the service does).
+    pub fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = spawn(&self.dir, self.port, &self.model, &self.extra, &self.record);
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(30) {
+            if reqwest::blocking::get(format!("{}/health", self.base)).is_ok_and(|r| r.status().is_success()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("am2strata did not start again");
     }
 }
 

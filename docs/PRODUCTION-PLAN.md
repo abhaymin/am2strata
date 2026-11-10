@@ -70,6 +70,20 @@ Each step gets a mock test:
 - an unloadable asked model falls back with the warning header;
 - a dropped music request's result is fetched afterwards.
 
+## 6. Delivery that survives (built 2026-11-11)
+
+- **Jobs on disk:** a chat's media jobs are kept in `<data>/media-jobs/`: each job's record and request
+  (`mj-N.json`) and its file. The newest 64 of the last 7 days are kept.
+- **After a restart:** a job that was queued or running when the server stopped runs again at the start, and a
+  finished one's file is served from disk.
+- **Ids never repeat:** they carry on from the highest kept, from a counter file, or from the clock at the first
+  start. An old chat's card can no longer show another job's result, and a new job never shows an old job's
+  cached failure (the web app watches a new job fresh).
+- **A lost job:** its card says so and offers **Make it again** (`POST /api/jobs` with the same tool call), or
+  **Try again** after an error.
+- **Tested:** `media_jobs_survive_a_restart_and_can_be_made_again` restarts the test server on the same data
+  folder.
+
 ## 7. Request routing and quick switching (owner, 2026-11-10: strong, performance oriented, predictable, smart switching)
 
 **Built (2026-11-10).** The rules are short and fixed, applied in this order; the same queue always runs in the same

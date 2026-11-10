@@ -4,6 +4,11 @@
 //! check passes for that kind. A call does not block the answer: it queues a media job and returns its id at once;
 //! the job waits its place in the queue (behind the answer, so the text model is not stopped in the middle of it) and
 //! runs after. GET /api/jobs/{id} (or /v1/media/jobs/{id}) follows it; /v1/media/jobs/{id}/content is the file.
+//!
+//! Jobs survive a restart (PRODUCTION-PLAN.md, step 6): each is kept in `<data>/media-jobs/` (mj-N.json, its request
+//! and state; mj-N.<ext>, its file), ids go on from the highest kept, and a job that was queued or running when the
+//! server stopped runs again at the start. The newest KEEP jobs of the last KEEP_DAYS days are kept.
+//! POST /api/jobs {"tool", "arguments"} queues a tool's job again (the web app's "Make it again").
 
 use crate::{error, AppState};
 use axum::body::Body;
@@ -25,8 +30,9 @@ pub const PER_ANSWER: usize = 3;
 /// Audio attachments one chat request may carry (each is transcribed).
 const MAX_AUDIO_PARTS: usize = 4;
 
-/// Jobs kept (the oldest finished ones go first).
+/// Jobs kept (the oldest finished ones go first), and for how long.
 const KEEP: usize = 64;
+const KEEP_DAYS: u64 = 7;
 
 struct Job {
     id: String,
@@ -41,6 +47,27 @@ struct Job {
     data: Option<Vec<u8>>,
     meta: Value,
     seconds: Option<f64>,
+    /// the request it runs (kept, so a job the server stopped in runs again at the start)
+    req: Value,
+    /// its file on disk once done (the content is read from it after a restart)
+    file: Option<std::path::PathBuf>,
+}
+
+impl Job {
+    fn record(&self) -> Value {
+        json!({"id": self.id, "kind": self.kind, "model": self.model, "prompt": self.prompt, "created": self.created,
+               "state": self.state, "error": self.error, "mime": self.mime, "meta": self.meta, "seconds": self.seconds,
+               "req": self.req, "file": self.file.as_ref().and_then(|f| f.file_name()).and_then(|f| f.to_str())})
+    }
+}
+
+fn kind_of(k: &str) -> &'static str {
+    match k { "image" => "image", "video" => "video", "song" => "song", "music" => "music", _ => "tts" }
+}
+
+fn ext_of(mime: &str) -> &'static str {
+    match mime { "image/png" | "image/apng" => "png", "video/mp4" => "mp4", "image/gif" => "gif", "image/webp" => "webp",
+                 m if m.starts_with("audio/") => "wav", _ => "bin" }
 }
 
 pub struct Jobs {
@@ -51,12 +78,94 @@ pub struct Jobs {
     caps: Mutex<Option<(Instant, Value)>>,
     /// seconds the last finished job of each model took, for the estimates
     speeds: Mutex<HashMap<String, f64>>,
+    /// <data>/media-jobs (set by `open`; without it nothing is kept on disk)
+    dir: OnceLock<std::path::PathBuf>,
 }
 
 impl Jobs {
     pub fn new() -> Jobs {
         Jobs { app: OnceLock::new(), jobs: Mutex::new(BTreeMap::new()), next: Mutex::new(1), caps: Mutex::new(None),
-               speeds: Mutex::new(HashMap::new()) }
+               speeds: Mutex::new(HashMap::new()), dir: OnceLock::new() }
+    }
+
+    /// The jobs kept in `dir` from before (the newest KEEP of the last KEEP_DAYS days; older files removed). Ids go on
+    /// from the highest kept. Returns the jobs that were queued or running when the server stopped (for `resume`).
+    pub fn open(&self, dir: std::path::PathBuf) -> Vec<(u64, &'static str, Value)> {
+        let _ = std::fs::create_dir_all(&dir);
+        let cutoff = crate::now().saturating_sub(KEEP_DAYS * 86400);
+        let mut found: Vec<(u64, Job)> = Vec::new();
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(v) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else { continue };
+            let Some(n) = v["id"].as_str().and_then(|i| i.strip_prefix("mj-")).and_then(|n| n.parse::<u64>().ok()) else { continue };
+            let file = v["file"].as_str().map(|f| dir.join(f)).filter(|f| f.is_file());
+            let state: &'static str = match v["state"].as_str() { Some("done") if file.is_some() => "done", Some("error") => "error",
+                                                                  Some("done") => "error", _ => "queued" };
+            let job = Job { id: format!("mj-{n}"), kind: kind_of(v["kind"].as_str().unwrap_or("")), model: v["model"].as_str().unwrap_or("").into(),
+                            prompt: v["prompt"].as_str().unwrap_or("").into(), created: v["created"].as_u64().unwrap_or(0), state,
+                            error: if state == "error" && v["state"] == "done" { Some("its file is gone".into()) } else { v["error"].as_str().map(str::to_string) },
+                            mime: v["mime"].as_str().map(str::to_string), data: None, meta: v["meta"].clone(),
+                            seconds: v["seconds"].as_f64(), req: v["req"].clone(), file };
+            found.push((n, job));
+        }
+        found.sort_by_key(|(n, _)| *n);
+        // ids never repeat across restarts (a chat's card for an old id would show another job): on from the highest
+        // kept or the counter file, and at the first start from the clock (AM2_JOB_IDS_FROM for the tests)
+        let counted = std::fs::read_to_string(dir.join("next")).ok().and_then(|t| t.trim().parse::<u64>().ok());
+        let first = std::env::var("AM2_JOB_IDS_FROM").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or_else(crate::now);
+        let next = found.last().map(|(n, _)| n + 1).into_iter().chain(counted).max().unwrap_or(first);
+        // too old, or beyond the newest KEEP: removed with their files
+        let total = found.len();
+        let mut resume = Vec::new();
+        let mut jobs = self.jobs.lock().unwrap();
+        for (i, (n, j)) in found.into_iter().enumerate() {
+            if j.created < cutoff || i + KEEP < total {
+                let _ = std::fs::remove_file(dir.join(format!("mj-{n}.json")));
+                if let Some(f) = &j.file {
+                    let _ = std::fs::remove_file(f);
+                }
+                continue;
+            }
+            if j.state == "queued" && !j.req.is_null() {
+                resume.push((n, j.kind, j.req.clone()));
+            }
+            jobs.insert(n, j);
+        }
+        drop(jobs);
+        {
+            let mut g = self.next.lock().unwrap();
+            *g = (*g).max(next);
+        }
+        let _ = self.dir.set(dir);
+        resume
+    }
+
+    /// Run again the jobs the server stopped in (after `bind`).
+    pub fn resume(&self, jobs: Vec<(u64, &'static str, Value)>) {
+        for (n, kind, req) in jobs {
+            tracing::info!("media job mj-{n} ({kind}) was not finished when the server stopped: it runs again");
+            let s = self.app().clone();
+            tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
+                         crate::queue::CLIENT.scope("media".to_string(), async move { run(s, n, kind, req).await })));
+        }
+    }
+
+    fn save(&self, j: &Job) {
+        if let Some(dir) = self.dir.get() {
+            let _ = std::fs::write(dir.join(format!("{}.json", j.id)), serde_json::to_vec_pretty(&j.record()).unwrap_or_default());
+        }
+    }
+
+    fn forget(&self, j: &Job) {
+        if let Some(dir) = self.dir.get() {
+            let _ = std::fs::remove_file(dir.join(format!("{}.json", j.id)));
+        }
+        if let Some(f) = &j.file {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     /// The server the jobs run on (set once it is built).
@@ -288,18 +397,25 @@ impl Jobs {
         let n = {
             let mut g = self.next.lock().unwrap();
             *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
             *g - 1
         };
         let id = format!("mj-{n}");
         req["strata_label"] = json!(id);
         let job = Job { id: id.clone(), kind, model: model.clone(), prompt: prompt.chars().take(300).collect(), created: crate::now(),
-                        state: "queued", error: None, mime: None, data: None, meta: Value::Null, seconds: None };
+                        state: "queued", error: None, mime: None, data: None, meta: Value::Null, seconds: None,
+                        req: req.clone(), file: None };
         {
             let mut jobs = self.jobs.lock().unwrap();
+            self.save(&job);
             jobs.insert(n, job);
             while jobs.len() > KEEP {
                 let Some(old) = jobs.iter().find(|(_, j)| j.state != "queued").map(|(k, _)| *k) else { break };
-                jobs.remove(&old);
+                if let Some(j) = jobs.remove(&old) {
+                    self.forget(&j);
+                }
             }
         }
         let s = self.app().clone();
@@ -322,6 +438,13 @@ impl Jobs {
         match r {
             Ok((mime, data, meta)) => {
                 j.state = "done";
+                // the file on disk, so a restart keeps it
+                if let Some(dir) = self.dir.get() {
+                    let f = dir.join(format!("{}.{}", j.id, ext_of(&mime)));
+                    if std::fs::write(&f, &data).is_ok() {
+                        j.file = Some(f);
+                    }
+                }
                 j.mime = Some(mime);
                 j.data = Some(data);
                 j.seconds = meta["seconds"].as_f64().or(Some(secs));
@@ -335,6 +458,7 @@ impl Jobs {
                 j.error = Some(e);
             }
         }
+        self.save(j);
     }
 
     /// The queue label a media request may carry: the id of one of these jobs still queued, else none (a client
@@ -356,7 +480,8 @@ impl Jobs {
                            "seconds": j.seconds});
         if j.state == "done" {
             v["url"] = json!(format!("/v1/media/jobs/{}/content", j.id));
-            v["bytes"] = json!(j.data.as_ref().map(|d| d.len()));
+            v["bytes"] = json!(j.data.as_ref().map(|d| d.len() as u64)
+                .or_else(|| j.file.as_ref().and_then(|f| std::fs::metadata(f).ok()).map(|m| m.len())));
         }
         if j.state == "queued" {
             // its place in the queue, or running with its step
@@ -433,6 +558,28 @@ pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Resp
     Json(s.media_jobs.capabilities().await).into_response()
 }
 
+/// POST /api/jobs {"tool": "make_song", "arguments": {...}}: the tool's job queued again (the web app's "Make it
+/// again", for a job the server no longer has). Only for the main key or a profile with that kind.
+pub async fn again(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let Some(profile) = crate::api_access(&s, &headers) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    };
+    let tool = req["tool"].as_str().unwrap_or("");
+    if !TOOL_NAMES.contains(&tool) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("tool: one of {}", TOOL_NAMES.join(", ")));
+    }
+    let set = match tool { "generate_image" => "image", "generate_video" => "video", "speak" => "speech", _ => "music" };
+    if profile.as_ref().is_some_and(|p| p.name != "default" && !p.has(set)) {
+        return error(StatusCode::FORBIDDEN, "permission_error", format!("this key's profile has no \"{set}\""));
+    }
+    let caps = s.media_jobs.capabilities().await;
+    let r = s.media_jobs.submit(tool, &req["arguments"], &caps);
+    if r["ok"] != true {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", r["text"].as_str().unwrap_or("not queued").to_string());
+    }
+    Json(r["job"].clone()).into_response()
+}
+
 /// GET /api/jobs/{id}, /v1/media/jobs/{id}
 pub async fn status(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     if !crate::api_authorized(&s, &headers) {
@@ -440,7 +587,8 @@ pub async fn status(State(s): State<AppState>, headers: HeaderMap, Path(id): Pat
     }
     match s.media_jobs.status(&id) {
         Some(v) => Json(v).into_response(),
-        None => error(StatusCode::NOT_FOUND, "not_found", format!("no media job {id} (jobs are kept in memory, the last {KEEP})")),
+        None => error(StatusCode::NOT_FOUND, "not_found",
+                      format!("no media job {id}: the server keeps the newest {KEEP} jobs of the last {KEEP_DAYS} days (jobs from before v0.1.4 were not kept); make it again")),
     }
 }
 
@@ -454,10 +602,12 @@ pub async fn content(State(s): State<AppState>, headers: HeaderMap, Path(id): Pa
         return error(StatusCode::NOT_FOUND, "not_found", format!("no media job {id}"));
     };
     let jobs = s.media_jobs.jobs.lock().unwrap();
+    // the file in memory, or on disk (a job finished before a restart)
+    let bytes = jobs.get(&n).and_then(|j| j.data.clone().or_else(|| j.file.as_ref().and_then(|f| std::fs::read(f).ok())));
     match jobs.get(&n) {
-        Some(Job { data: Some(d), mime: Some(m), .. }) => {
+        Some(Job { mime: Some(m), .. }) if bytes.is_some() => {
             Response::builder().header(header::CONTENT_TYPE, m.as_str()).header("x-content-type-options", "nosniff")
-                .header(header::CONTENT_DISPOSITION, "inline").body(Body::from(d.clone())).unwrap()
+                .header(header::CONTENT_DISPOSITION, "inline").body(Body::from(bytes.unwrap())).unwrap()
         }
         Some(j) => error(StatusCode::CONFLICT, "not_ready", format!("media job {id} is {}", j.state)),
         None => error(StatusCode::NOT_FOUND, "not_found", format!("no media job {id}")),

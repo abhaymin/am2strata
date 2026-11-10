@@ -524,6 +524,8 @@ body.resizing iframe { pointer-events: none; }
 .media-job { margin: 8px 0 12px; }
 .media-job img, .media-job video { display: block; max-width: min(100%, 512px); border-radius: var(--st-radius, 8px); }
 .media-job audio { width: min(100%, 420px); }
+.media-job__gone { display: flex; align-items: center; gap: var(--st-s-2, 8px); flex-wrap: wrap; }
+.media-job .st-btn { height: 30px; padding: 0 12px; margin-top: 6px; }
 .media-job__bar { display: flex; gap: 12px; align-items: center; margin-top: 4px; }
 
 /* the pages a web tool found or read */
