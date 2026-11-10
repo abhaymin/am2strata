@@ -78,7 +78,15 @@ fn main() {
             }
             "unload" | "unload_audio" => emit(serde_json::json!({"event": "unloaded"})),
             "load" => emit(serde_json::json!({"event": "loaded", "model": cmd["model"]})),
-            "pull" => emit(serde_json::json!({"event": "pulled", "model": cmd["model"]})),
+            "pull" => {
+                // a download's progress, as the engine reports it
+                for done in [0u64, 400_000_000, 1_000_000_000] {
+                    emit(serde_json::json!({"event": "progress", "model": cmd["model"], "file": "model.safetensors",
+                                            "file_index": 1, "files": 1, "done": done, "total": 1_000_000_000u64}));
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                emit(serde_json::json!({"event": "pulled", "model": cmd["model"]}))
+            }
             "accept_license" => emit(serde_json::json!({"event": "accepted", "id": cmd["id"]})),
             "list" => emit(serde_json::json!({"event": "models", "models": [
                 {"name": "z-image-turbo:q8", "kind": "image", "family": "z-image", "size_gb": 13.8, "downloaded": true, "gated": false},

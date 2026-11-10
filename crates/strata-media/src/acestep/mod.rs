@@ -40,11 +40,13 @@ pub fn local() -> Option<PathBuf> {
     files[0].parent()?.parent().map(PathBuf::from)
 }
 
-pub fn pull() -> anyhow::Result<()> {
+pub fn pull(on: crate::audio::OnBytes) -> anyhow::Result<()> {
     let api = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(crate::audio::cache_dir()).with_progress(false).build()?;
     let repo = api.model(REPO.to_string());
-    for f in FILES.iter().chain(PLANNER_FILES) {
-        repo.get(f).map_err(|e| anyhow::anyhow!("{REPO}: {f}: {e}"))?;
+    let cached = hf_hub::Cache::new(crate::audio::cache_dir()).model(REPO.to_string());
+    let mut f = crate::audio::Fetcher::new(FILES.len() + PLANNER_FILES.len(), SIZE_GB, on);
+    for file in FILES.iter().chain(PLANNER_FILES) {
+        f.get(&repo, &cached, file).map_err(|e| anyhow::anyhow!("{REPO}: {file}: {e}"))?;
     }
     Ok(())
 }

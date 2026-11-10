@@ -519,17 +519,102 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
         if job["state"] == "pulling" {
             return error(StatusCode::CONFLICT, "busy", format!("{} is downloading; one download at a time", job["model"].as_str().unwrap_or("")));
         }
-        *job = json!({"state": "pulling", "model": model, "started": chrono_now()});
+        *job = json!({"state": "pulling", "model": model, "started": chrono_now(), "done": 0, "total": 0, "left": 0,
+                      "percent": 0.0, "speed": 0, "eta_s": null, "file": null, "file_index": 0, "files": 0});
     }
     let media = s.media.clone();
     tokio::spawn(async move {
-        let r = media.call(json!({"op": "pull", "model": model}), |_| {}).await;
-        *media.pull_job.lock().unwrap() = match r {
-            Ok(_) => json!({"state": "done", "model": model}),
-            Err(e) => json!({"state": "error", "model": model, "error": format!("{e:#}")}),
-        };
+        let mut rate = Rate::default();
+        let job = &media.pull_job;
+        let r = media.call(json!({"op": "pull", "model": model}), |v| {
+            if v["event"] == "progress" {
+                let mut j = job.lock().unwrap();
+                rate.progress(&mut j, v);
+            }
+        }).await;
+        // the last progress stays, so the page can say how much came down
+        let mut j = media.pull_job.lock().unwrap();
+        j["model"] = json!(model);
+        j["eta_s"] = Value::Null;
+        match r {
+            Ok(_) => {
+                j["state"] = json!("done");
+                j["left"] = json!(0);
+                j["percent"] = json!(100.0);
+                j["done"] = j["total"].clone();
+            }
+            Err(e) => {
+                j["state"] = json!("error");
+                j["error"] = json!(format!("{e:#}"));
+            }
+        }
     });
     (StatusCode::ACCEPTED, Json(json!({"state": "pulling"}))).into_response()
+}
+
+/// A download's speed over the last 10 s (a resumed download starts from its bytes on disk, so the average since the
+/// start would mislead), and from it the bytes and the time left.
+#[derive(Default)]
+pub struct Rate {
+    samples: std::collections::VecDeque<(std::time::Instant, u64)>,
+}
+
+impl Rate {
+    pub fn progress(&mut self, j: &mut Value, v: &Value) {
+        let now = std::time::Instant::now();
+        let done = v["done"].as_u64().unwrap_or(0);
+        let total = v["total"].as_u64().unwrap_or(0).max(done);
+        // a new batch (bytes went back): start the window again
+        if self.samples.back().is_some_and(|s| s.1 > done) {
+            self.samples.clear();
+        }
+        self.samples.push_back((now, done));
+        while self.samples.len() > 2 && now.duration_since(self.samples[0].0).as_secs_f64() > 10.0 {
+            self.samples.pop_front();
+        }
+        let (t0, d0) = self.samples[0];
+        let secs = now.duration_since(t0).as_secs_f64();
+        let speed = if secs >= 0.1 { ((done - d0) as f64 / secs) as u64 } else { j["speed"].as_u64().unwrap_or(0) };
+        let left = total - done;
+        j["done"] = json!(done);
+        j["total"] = json!(total);
+        j["left"] = json!(left);
+        j["percent"] = json!(if total > 0 { (1000.0 * done as f64 / total as f64).round() / 10.0 } else { 0.0 });
+        j["speed"] = json!(speed);
+        j["eta_s"] = if speed > 0 { json!((left as f64 / speed as f64).round() as u64) } else { Value::Null };
+        if let Some(f) = v["file"].as_str() {
+            j["file"] = json!(f);
+        }
+        if let Some(i) = v["file_index"].as_u64().filter(|i| *i > 0) {
+            j["file_index"] = json!(i);
+        }
+        if let Some(n) = v["files"].as_u64().filter(|n| *n > 0) {
+            j["files"] = json!(n);
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn speed_left_and_time_left() {
+        let mut r = Rate::default();
+        let mut j = json!({});
+        let t = std::time::Instant::now() - std::time::Duration::from_secs(4);
+        r.samples.push_back((t, 0));
+        r.progress(&mut j, &json!({"done": 400_000_000u64, "total": 1_000_000_000u64, "file": "a.gguf", "file_index": 1, "files": 2}));
+        assert_eq!(j["left"], 600_000_000u64);
+        assert_eq!(j["percent"], 40.0);
+        let speed = j["speed"].as_u64().unwrap();
+        assert!((95_000_000..=101_000_000).contains(&speed), "{speed}");
+        let eta = j["eta_s"].as_u64().unwrap();
+        assert!((5..=7).contains(&eta), "{eta}");
+        // a later event without the file count keeps the one known
+        r.progress(&mut j, &json!({"done": 500_000_000u64, "total": 1_000_000_000u64, "file": "a.gguf", "file_index": 1, "files": 0}));
+        assert_eq!(j["files"], 2);
+    }
 }
 
 pub async fn pull_status(State(s): State<AppState>, headers: HeaderMap) -> Response {

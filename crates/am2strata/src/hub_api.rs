@@ -8,7 +8,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
-use std::time::Instant;
 use strata_hub::pull::{Event, Outcome, Spec};
 
 fn token_of(req: &Value) -> Option<String> {
@@ -57,7 +56,7 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
             return error(StatusCode::CONFLICT, "busy", format!("{} {} is still downloading", job["repo"].as_str().unwrap_or(""), job["quant"].as_str().unwrap_or("")));
         }
         *job = json!({"state": "running", "repo": strata_hub::pull::repo_name(repo), "quant": quant, "file": null, "done": 0, "total": 0,
-                      "speed": 0, "notes": [], "message": null, "model": null, "started": crate::now()});
+                      "speed": 0, "left": 0, "percent": 0.0, "eta_s": null, "notes": [], "message": null, "model": null, "started": crate::now()});
     }
     let spec = Spec { repo: repo.to_string(), revision: "main".into(), quant: Some(quant.to_string()), files: Vec::new(), token: token_of(&req),
                       mmproj: req.get("mmproj").and_then(Value::as_bool).unwrap_or(true), data_dir: s.data_dir.clone(),
@@ -70,17 +69,13 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
 /// marks the model's pack and tokenizer for rebuilding).
 fn run_job(job: std::sync::Arc<std::sync::Mutex<Value>>, spec: Spec, after: Option<Box<dyn FnOnce() -> Option<String> + Send>>) {
     tokio::spawn(async move {
-        let t0 = Instant::now();
+        let mut rate = crate::image_gen::Rate::default();
         let mut on = |e: Event| {
             let mut j = job.lock().unwrap();
             match e {
                 Event::Note(n) => j["notes"].as_array_mut().unwrap().push(json!(n)),
-                Event::Progress { file, done, total } => {
-                    j["file"] = json!(file);
-                    j["done"] = json!(done);
-                    j["total"] = json!(total);
-                    j["speed"] = json!((done as f64 / t0.elapsed().as_secs_f64().max(0.1)) as u64);
-                }
+                // the speed over the last 10 s, the bytes and the time left
+                Event::Progress { file, done, total } => rate.progress(&mut j, &json!({"file": file, "done": done, "total": total})),
                 Event::FileDone { file, checked } => j["notes"].as_array_mut().unwrap()
                     .push(json!(format!("{file}: done, SHA-256 {}", if checked { "checked" } else { "not published" }))),
             }

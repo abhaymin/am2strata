@@ -424,6 +424,10 @@
               <label class="mm-check"><input type="checkbox" id="mm-downloaded"> Downloaded only</label>
             </div>
             <p class="muted small" id="mm-status" role="status"></p>
+            <div class="hf-progress" id="mm-progress" hidden>
+              <div class="bar-row"><span class="mono" id="mm-file">&ndash;</span><span class="muted" id="mm-rate">&ndash;</span></div>
+              <div class="st-progress" data-tone="info" role="progressbar" aria-label="Download" aria-valuemin="0" aria-valuemax="100" id="mm-progressbar"><div class="st-progress__bar" id="mm-bar" style="width:0%"></div></div>
+            </div>
             <div id="mm-list"><p class="muted">Loading&hellip;</p></div>
           </div>
           <form class="st-card hf-card" id="hf-form">

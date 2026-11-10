@@ -211,7 +211,59 @@ async function loadMediaModels() {
   const sttReady = (media.models || []).some((m) => m.kind === "audio" && m.task === "stt" && m.downloaded);
   $("mic-btn").hidden = !sttReady;
   clearTimeout(mmTimer);
-  if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(loadMediaModels, 3000);
+  if (media.pull && media.pull.state === "pulling") mmTimer = setTimeout(pullTick, 1000);
+}
+// while a media model downloads: only its progress (GET .../pull), every second; the whole list again once it ends
+async function pullTick() {
+  clearTimeout(mmTimer);
+  let j;
+  try {
+    const r = await fetch("api/media/models/pull", {headers: headers()});
+    if (!r.ok) throw new Error(r.status);
+    j = await r.json();
+  } catch (e) { mmTimer = setTimeout(pullTick, 3000); return; }
+  const was = media.pull || {};
+  media.pull = j;
+  if (j.state === "pulling") {
+    dlBar("mm", j);
+    const btn = document.querySelector(`[data-mpull="${CSS.escape(j.model || "")}"]`);
+    if (btn && j.total) btn.textContent = `Downloading ${(j.percent || 0).toFixed(0)}%`;
+    if (j.total) $("mm-status").textContent = `Downloading ${j.model} \u2014 ${(j.percent || 0).toFixed(0)}% (generation waits until it finishes)`;
+    mmTimer = setTimeout(pullTick, 1000);
+    return;
+  }
+  if (was.state === "pulling") {
+    if (j.state === "done") toast("success", "Download finished", `${j.model} is ready`, 8000);
+    else if (j.state === "error") toast("error", "Download failed", `${j.model}: ${j.error || ""}`, 10000);
+  }
+  loadMediaModels();
+}
+// A download's progress for people: "7.6 of 18.2 GB · 42% · 31 MB/s · 10.6 GB left · about 6 min left"
+function dlSize(n) { return n >= 1e9 ? `${(n / 1e9).toFixed(n >= 1e11 ? 0 : 1)} GB` : n >= 1e6 ? `${Math.round(n / 1e6)} MB` : `${Math.round((n || 0) / 1e3)} kB`; }
+function dlTime(s) {
+  if (s == null) return "working out the time left";
+  if (s < 60) return "under a minute left";
+  if (s < 3600) return `about ${Math.round(s / 60)} min left`;
+  const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+  return `about ${h} h${m ? ` ${m} min` : ""} left`;
+}
+function dlLine(j) {
+  if (!j.total) return "starting\u2026";
+  const pct = j.percent != null ? j.percent : (100 * j.done / j.total);
+  return [`${dlSize(j.done)} of ${dlSize(j.total)}`, `${pct.toFixed(pct < 10 ? 1 : 0)}%`,
+          j.speed ? `${dlSize(j.speed)}/s` : null, `${dlSize(j.left != null ? j.left : j.total - j.done)} left`,
+          dlTime(j.eta_s)].filter(Boolean).join(" \u00b7 ");
+}
+function dlBar(prefix, j) {
+  const on = j && (j.state === "pulling" || j.state === "running");
+  $(`${prefix}-progress`).hidden = !on;
+  if (!on) return;
+  const pct = j.total ? (j.percent != null ? j.percent : 100 * j.done / j.total) : 0;
+  $(`${prefix}-file`).textContent = (j.file ? j.file : (j.model || `${j.repo || ""} ${j.quant || ""}`)) + (j.files > 1 ? ` (file ${j.file_index} of ${j.files})` : "");
+  $(`${prefix}-rate`).textContent = dlLine(j);
+  $(`${prefix}-bar`).style.width = `${pct.toFixed(1)}%`;
+  const pb = $(`${prefix}-progressbar`);
+  if (pb) pb.setAttribute("aria-valuenow", pct.toFixed(0));
 }
 function renderMediaModels() {
   const q = $("mm-search").value.trim().toLowerCase(), only = $("mm-downloaded").checked;
@@ -222,11 +274,12 @@ function renderMediaModels() {
   const n = (media.models || []).filter((m) => m.downloaded).length;
   $("mm-status").textContent = media.engine === undefined ? "Loading the media models\u2026"
     : !media.engine ? (media.note || "The media engine is not built.")
-    : p.state === "pulling" ? `Downloading ${p.model}\u2026 (generation waits until it finishes)`
+    : p.state === "pulling" ? `Downloading ${p.model}${p.total ? ` \u2014 ${(p.percent || 0).toFixed(0)}%` : "\u2026"} (generation waits until it finishes)`
     : p.state === "error" ? `Download of ${p.model} failed: ${p.error}`
     : `${n} downloaded · ${(media.models || []).length} in the catalog · images use ${media.image_model} · videos use ${media.video_model} · ` +
       `speech to text ${media.stt_model} · text to speech ${media.tts_model}` +
       (media.busy ? " · the media engine is busy with a job: this list is from before it started" : "");
+  dlBar("mm", p);
   $("mm-list").innerHTML = rows.length ? rows.map((m) => {
     const inUse = (m.kind === "image" && m.name === media.image_model) || (m.kind === "video" && m.name === media.video_model) ||
       (m.kind === "audio" && (m.task === "tts" ? m.name === media.tts_model : m.name === media.stt_model));
@@ -238,7 +291,7 @@ function renderMediaModels() {
       : m.downloaded ? `<span class="st-badge">Downloaded</span>` : `<span class="st-badge">Not downloaded</span>`;
     const pulling = p.state === "pulling";
     const btn = m.planned ? ""
-      : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? "Downloading\u2026" : "Download"}</button>`
+      : !m.downloaded ? `<button class="st-btn st-btn--secondary" data-mpull="${esc(m.name)}"${pulling || !media.engine ? " disabled" : ""}>${pulling && p.model === m.name ? (p.total ? `Downloading ${(p.percent || 0).toFixed(0)}%` : "Downloading\u2026") : "Download"}</button>`
       : (m.kind === "image" || m.kind === "video") && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.kind}s</button>`
       : m.kind === "audio" && !inUse ? `<button class="st-btn st-btn--primary" data-muse="${esc(m.name)}">Use for ${m.task === "tts" ? "speech" : "transcripts"}</button>` : "";
     const rm = m.downloaded && !m.planned ? `<button class="st-btn st-btn--danger" data-mremove="${esc(m.name)}"${pulling ? " disabled" : ""}>Remove</button>` : "";
@@ -2296,10 +2349,7 @@ async function hubStatus() {
   const running = j.state === "running";
   $("hf-progress").hidden = !running;
   if (running) {
-    const pct = j.total ? (100 * j.done / j.total) : 0;
-    $("hf-file").textContent = j.file || `${j.repo} ${j.quant}`;
-    $("hf-rate").textContent = j.total ? `${bytes(j.done)} of ${bytes(j.total)} · ${bytes(j.speed)}/s` : "starting…";
-    $("hf-bar").style.width = `${pct.toFixed(1)}%`;
+    dlBar("hf", j);
     $("hf-msg").textContent = `Downloading ${j.repo} ${j.quant}`;
     $("hf-pull").disabled = true;
     hubTimer = setTimeout(hubStatus, 1000);

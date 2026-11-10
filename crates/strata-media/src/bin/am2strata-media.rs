@@ -1,7 +1,8 @@
 //! am2strata-media: the media engine process (images now; video and voice next), driven by am2Strata's server over
 //! JSON lines on stdin/stdout, as the text engines are driven over their line protocol. One request at a time.
 //!
-//!   -> {"op":"pull","model":"z-image-turbo:q8"}           <- {"event":"pulled","model":...}
+//!   -> {"op":"pull","model":"z-image-turbo:q8"}           <- {"event":"progress","file","file_index","files","done","total"} ...
+//!                                                         <- {"event":"pulled","model":...}
 //!   -> {"op":"load","model":"z-image-turbo:q8"}           <- {"event":"loaded","model":...,"vram_bytes":...}
 //!   -> {"op":"generate","request":{prompt,width,...}}     <- {"event":"step","step":3,"total":8} ...
 //!                                                         <- {"event":"image","index":0,"width":..,"height":..,"png":"<base64>"}
@@ -309,12 +310,40 @@ fn mold_home() -> Option<std::path::PathBuf> {
     mold_core::Config::mold_dir()
 }
 
+/// A download's progress for the server (the Models page shows the percent, speed and time left from it): at most
+/// every half second, and at each file's end. Bytes are this download's only, without files already here.
+fn pull_progress(model: &str, file: &str, index: usize, files: usize, done: u64, total: u64, force: bool) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if !force && last.is_some_and(|t| t.elapsed().as_millis() < 500) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    emit(json!({"event": "progress", "model": model, "file": file, "file_index": index, "files": files, "done": done, "total": total}));
+}
+
+/// mold's download callback, as progress events.
+fn mold_progress(model: &str) -> mold_core::download::DownloadProgressCallback {
+    use mold_core::download::DownloadProgressEvent as E;
+    let model = model.to_string();
+    Arc::new(move |e| match e {
+        E::FileStart { filename, file_index, total_files, batch_bytes_downloaded, batch_bytes_total, .. } =>
+            pull_progress(&model, &filename, file_index + 1, total_files, batch_bytes_downloaded, batch_bytes_total, true),
+        E::FileProgress { filename, file_index, batch_bytes_downloaded, batch_bytes_total, .. } =>
+            pull_progress(&model, &filename, file_index + 1, 0, batch_bytes_downloaded, batch_bytes_total, false),
+        E::FileDone { filename, file_index, total_files, batch_bytes_downloaded, batch_bytes_total, .. } =>
+            pull_progress(&model, &filename, file_index + 1, total_files, batch_bytes_downloaded, batch_bytes_total, true),
+        E::Status { .. } => {}
+    })
+}
+
 fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
+    let mut on = |file: &str, index: usize, files: usize, done: u64, total: u64| pull_progress(model, file, index, files, done, total, false);
     if let Some(e) = audio::entry(model) {
-        return audio::pull(e);
+        return audio::pull(e, &mut on);
     }
     if model == acestep::NAME {
-        return acestep::pull();
+        return acestep::pull(&mut on);
     }
     if let Some(e) = extra(model) {
         // mold gates its own Qwen Image 2.1 tiers on this licence by name; an extra on the same weights asks the same
@@ -322,7 +351,7 @@ fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
             return Err(anyhow!("{model} needs the {} accepted first ({}): {}", e.license.name, e.license.canonical, e.license.summary));
         }
         let m = extra_manifest(e).ok_or_else(|| anyhow!("mold's catalog has no {}", e.base))?;
-        let paths = rt.block_on(mold_core::download::pull_model(&m, &mold_core::download::PullOptions::default()))
+        let paths = rt.block_on(mold_core::download::pull_model_with_callback(&m, mold_progress(model), &mold_core::download::PullOptions::default()))
             .map_err(|e| anyhow!("{e}"))?;
         // the paths go into mold's config, where ModelPaths::resolve and the engine factory (by family) find them
         let mut mc = m.to_model_config(&paths);
@@ -337,7 +366,7 @@ fn pull(rt: &tokio::runtime::Runtime, model: &str) -> Result<()> {
         return Ok(());
     }
     let manifest = mold_core::manifest::find_manifest(model).ok_or_else(|| anyhow!("no model {model:?} in the catalog"))?;
-    rt.block_on(mold_core::download::pull_model(manifest, &mold_core::download::PullOptions::default()))
+    rt.block_on(mold_core::download::pull_model_with_callback(manifest, mold_progress(model), &mold_core::download::PullOptions::default()))
         .map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }

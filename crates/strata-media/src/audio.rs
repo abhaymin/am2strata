@@ -176,16 +176,87 @@ pub fn downloaded(e: &Entry) -> bool {
     local(e).is_some()
 }
 
-/// Downloads a model's files (resumable by hf-hub; no progress bar: stdout is the protocol).
-pub fn pull(e: &Entry) -> Result<()> {
+/// Download progress: `(file, file_index, files, done_bytes, total_bytes)`, bytes of this download only (files already
+/// in the cache are left out of both).
+pub type OnBytes<'a> = &'a mut dyn FnMut(&str, usize, usize, u64, u64);
+
+/// Fetches files from Hugging Face into the cache, skipping cached ones, and tells `on` the bytes as they arrive.
+/// `estimate`: the whole model's size, the total until each file's real size is known.
+pub struct Fetcher<'a> {
+    on: OnBytes<'a>,
+    files: usize,
+    index: usize,
+    done: u64,
+    estimate: u64,
+}
+
+struct Tick<'a, 'b> {
+    f: &'b mut Fetcher<'a>,
+    name: String,
+    size: u64,
+    got: u64,
+}
+
+impl hf_hub::api::Progress for Tick<'_, '_> {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.size = size as u64;
+        self.name = filename.to_string();
+        self.report();
+    }
+    fn update(&mut self, size: usize) {
+        self.got += size as u64;
+        self.report();
+    }
+    fn finish(&mut self) {
+        self.got = self.size;
+        self.report();
+        // this file is in: the next one counts from here
+        self.f.done += self.size;
+        self.got = 0;
+        self.size = 0;
+    }
+}
+
+impl Tick<'_, '_> {
+    fn report(&mut self) {
+        let done = self.f.done + self.got;
+        let total = self.f.estimate.max(self.f.done + self.size);
+        (self.f.on)(&self.name, self.f.index, self.f.files, done, total);
+    }
+}
+
+impl<'a> Fetcher<'a> {
+    pub fn new(files: usize, estimate_gb: f64, on: OnBytes<'a>) -> Fetcher<'a> {
+        Fetcher { on, files, index: 0, done: 0, estimate: (estimate_gb * 1e9) as u64 }
+    }
+
+    pub fn get(&mut self, repo: &hf_hub::api::sync::ApiRepo, cached: &hf_hub::CacheRepo, file: &str) -> Result<PathBuf> {
+        self.index += 1;
+        if let Some(p) = cached.get(file) {
+            // already here: it is not part of this download
+            let have = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            self.estimate = self.estimate.saturating_sub(have);
+            return Ok(p);
+        }
+        let path = repo.download_with_progress(file, Tick { f: self, name: file.to_string(), size: 0, got: 0 })?;
+        self.estimate = self.estimate.max(self.done);
+        Ok(path)
+    }
+}
+
+/// Downloads a model's files (resumable by hf-hub), telling `on` the bytes as they arrive (stdout is the protocol, so
+/// no progress bar).
+pub fn pull(e: &Entry, on: OnBytes) -> Result<()> {
     let api = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(cache_dir()).with_progress(false).build()?;
+    let cache = hf_hub::Cache::new(cache_dir());
     let repo = api.model(e.repo.to_string());
-    for f in e.files {
-        repo.get(f).with_context(|| format!("{}: {f}", e.repo))
+    let mut f = Fetcher::new(e.files.len() + e.extra.len(), e.size_gb, on);
+    for file in e.files {
+        f.get(&repo, &cache.model(e.repo.to_string()), file).with_context(|| format!("{}: {file}", e.repo))
             .with_context(|| if e.name == "indic-parler-tts" { "Indic Parler-TTS is gated: accept its terms at https://huggingface.co/ai4bharat/indic-parler-tts with the account whose token this PC uses".to_string() } else { String::new() })?;
     }
-    for (r, f) in e.extra {
-        api.model(r.to_string()).get(f).with_context(|| format!("{r}: {f}"))?;
+    for (r, file) in e.extra {
+        f.get(&api.model(r.to_string()), &cache.model(r.to_string()), file).with_context(|| format!("{r}: {file}"))?;
     }
     Ok(())
 }

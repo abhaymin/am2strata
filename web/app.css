@@ -210,6 +210,9 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .tag { padding: 3px 8px; border-radius: var(--st-r-sm); background: var(--st-surface-2); font-size: var(--st-fs-xs); color: var(--st-ink-soft); font-family: var(--st-font-mono); }
 .model-row .st-btn { height: 36px; }
 .hf-progress { display: flex; flex-direction: column; gap: 6px; }
+.hf-progress .bar-row { flex-wrap: wrap; row-gap: 2px; }
+.hf-progress .bar-row .mono { overflow-wrap: anywhere; min-width: 0; }
+.hf-progress .bar-row .muted { font-weight: var(--st-fw-regular, 400); font-variant-numeric: tabular-nums; }
 .cfg-form { display: flex; flex-direction: column; gap: var(--st-s-4); }
 .cfg-group { border: 1px solid var(--st-line-soft); border-radius: var(--st-r-lg); padding: 4px 0; margin: 0; min-width: 0; }
 .cfg-group legend { padding: 0 8px; margin-left: 10px; font-size: 11px; font-weight: var(--st-fw-bold); letter-spacing: .06em;

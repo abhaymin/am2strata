@@ -1100,14 +1100,24 @@ fn media_models_are_listed_pulled_and_chosen() {
     let (c, r) = s.post("/api/media/models/pull", &json!({"model": "flux2-klein:q4"}));
     assert_eq!(c, 202, "{r}");
     let mut state = Value::Null;
-    for _ in 0..50 {
+    let mut midway = None;
+    for _ in 0..100 {
         state = s.get("/api/media/models/pull", true).1;
         if state["state"] == "done" {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        if state["done"] == 400_000_000u64 {
+            midway = Some(state.clone());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
     }
     assert_eq!((state["state"].as_str(), state["model"].as_str()), (Some("done"), Some("flux2-klein:q4")), "{state}");
+    // while it ran, the page could show the percent, the bytes left and the speed
+    let m = midway.expect("a progress report midway");
+    assert_eq!((m["percent"].as_f64(), m["left"].as_u64(), m["total"].as_u64()), (Some(40.0), Some(600_000_000), Some(1_000_000_000)), "{m}");
+    assert!(m["speed"].as_u64().unwrap() > 0 && m["eta_s"].as_u64().is_some(), "{m}");
+    assert_eq!((m["file"].as_str(), m["files"].as_u64()), (Some("model.safetensors"), Some(1)), "{m}");
+    assert_eq!((state["percent"].as_f64(), state["left"].as_u64()), (Some(100.0), Some(0)), "{state}");
 }
 
 #[test]
