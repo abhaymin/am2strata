@@ -203,3 +203,51 @@ fn files(work: &Path) -> Vec<Value> {
     }
     out
 }
+
+
+/// The model's tool for a client profile with "code" (clients.rs): the same sandbox as the canvas's Run (no network,
+/// the system read-only, home folders hidden, a fresh work folder, the time limit), Python only.
+pub const TOOL_NAMES: [&str; 1] = ["run_python"];
+
+pub fn tools(c: &CodeRun) -> Vec<Value> {
+    vec![json!({"name": "run_python", "description": format!(
+        "Run Python 3 code in a sandbox on the server: no network, a fresh empty work folder, at most {} s. \
+         Returns what it prints (stdout, stderr), its exit code and the files it wrote. Use print() to see results.",
+        c.timeout.as_secs()),
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "the Python program"},
+            "stdin": {"type": "string", "description": "text given to it on stdin (optional)"}}, "required": ["code"]}})]
+}
+
+/// Run one call -> the tool loop's result ({"ok", "text", "chars", "truncated", "ms"}).
+pub async fn call(c: &CodeRun, args: &Value) -> Value {
+    let t0 = Instant::now();
+    let fail = |t: String, t0: Instant| json!({"ok": false, "text": format!("error: {t}"), "chars": 0, "truncated": false,
+                                               "ms": t0.elapsed().as_millis() as u64});
+    if !c.enabled {
+        return fail("running code is off on this server".into(), t0);
+    }
+    let Some(code) = args["code"].as_str().filter(|c| !c.trim().is_empty()) else { return fail("give the code".into(), t0) };
+    if code.len() > MAX_CODE {
+        return fail("the code is longer than 200 KB".into(), t0);
+    }
+    match sandboxed(c, code, args["stdin"].as_str().unwrap_or("")).await {
+        Ok(v) => {
+            let files: Vec<String> = v["files"].as_array().into_iter().flatten()
+                .filter_map(|f| f["name"].as_str().map(|n| format!("{n} ({} bytes)", f["bytes"].as_u64().unwrap_or(0)))).collect();
+            let mut text = format!("exit code: {}{}\n", v["exit_code"], if v["timed_out"] == true { " (stopped at the time limit)" } else { "" });
+            for (k, label) in [("stdout", "stdout"), ("stderr", "stderr")] {
+                let t = v[k].as_str().unwrap_or("");
+                if !t.is_empty() {
+                    text.push_str(&format!("--- {label}\n{t}\n"));
+                }
+            }
+            if !files.is_empty() {
+                text.push_str(&format!("--- files written: {}\n", files.join(", ")));
+            }
+            json!({"ok": v["exit_code"] == 0, "chars": text.chars().count(), "text": text, "truncated": v["truncated"],
+                   "ms": t0.elapsed().as_millis() as u64})
+        }
+        Err(e) => fail(e, t0),
+    }
+}

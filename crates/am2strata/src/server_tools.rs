@@ -107,7 +107,7 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
         }
     }
     // the browser (computer use): only for a request that asks, never for another web page
-    if req.get("strata_browser") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+    if (req.get("strata_browser") == Some(&Value::Bool(true)) || has("browser")) && !structured && !forced && !crate::foreign_origin(s, headers) {
         if let Some(b) = s.mgr.browser.get().filter(|b| b.available()) {
             let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
             let own = own_names(prep);
@@ -115,6 +115,14 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             if !extra.is_empty() {
                 add(prep, &mut offered, extra);
             }
+        }
+    }
+    // run_python in the sandbox: only for a profile with "code" (a person on the page runs code with its Run button)
+    if has("code") && !structured && !forced && s.code_run.enabled && !crate::foreign_origin(s, headers) {
+        let own = own_names(prep);
+        let extra: Vec<Value> = crate::code_run::tools(&s.code_run).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+        if !extra.is_empty() {
+            add(prep, &mut offered, extra);
         }
     }
     // Chat Completions' web_search_options: web search for this request, which a key's profile must allow

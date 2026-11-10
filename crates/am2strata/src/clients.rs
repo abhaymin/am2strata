@@ -9,7 +9,8 @@
 //!   "default": {"tools": ["web"]}
 //! }
 //! ```
-//! - `tools`: memory, web, image, video, speech, music, and MCP servers by name (`mcp:search`) or every address
+//! - `tools`: memory, web, image, video, speech, music, browser (the browser on this PC), code (run_python in the
+//!   sandbox), and MCP servers by name (`mcp:search`) or every address
 //!   server (`mcp:*`). A program (stdio) MCP server runs on this PC, so a profile gets it only by name, never by `*`.
 //! - `memory`: the profile's memory space (default: the profile's name); two profiles naming the same space share it.
 //! - `default` (no key): what the main key gets; without it, the main key gets only what its requests ask for.
@@ -20,7 +21,7 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-pub const SETS: [&str; 6] = ["memory", "web", "image", "video", "speech", "music"];
+pub const SETS: [&str; 8] = ["memory", "web", "image", "video", "speech", "music", "browser", "code"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {
@@ -29,6 +30,8 @@ pub struct Profile {
     /// the tool sets: SETS and "mcp:<server>" / "mcp:*"
     pub tools: BTreeSet<String>,
     pub memory: Option<String>,
+    /// "limits": {"media_jobs_per_hour": N}: media jobs this key's chats may queue in an hour
+    pub media_jobs_per_hour: Option<u32>,
 }
 
 impl Profile {
@@ -99,7 +102,8 @@ impl Clients {
             let memory = o.get("memory").and_then(Value::as_str).map(|m| m.chars().filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c)).take(40).collect::<String>())
                 .filter(|m| !m.is_empty());
             let key = o.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
-            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory };
+            let media_jobs_per_hour = o.get("limits").and_then(|l| l.get("media_jobs_per_hour")).and_then(Value::as_u64).map(|n| n as u32);
+            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory, media_jobs_per_hour };
             if name == "default" {
                 if key.is_some() {
                     return Err("config clients.default: the default profile is the main key's; it has no key of its own".into());
@@ -126,6 +130,10 @@ impl Clients {
     /// The profile whose key is `given` (compared in constant time).
     pub fn by_key(&self, given: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.key.as_deref().is_some_and(|k| same(given, k)))
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.name == name)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -178,7 +186,7 @@ mod tests {
 
     #[test]
     fn the_header_narrows_and_never_widens() {
-        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None };
+        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None, media_jobs_per_hour: None };
         let n = p.narrowed("web, MCP:search").unwrap();
         assert_eq!(n.tools, ["mcp:search", "web"].iter().map(|s| s.to_string()).collect());
         assert!(p.narrowed("video").is_err());

@@ -449,3 +449,50 @@ pub async fn set_settings(State(s): State<AppState>, headers: HeaderMap, Json(re
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", e.to_string()),
     }
 }
+
+
+/// The memory space of a client's own /v1/memory call: its profile's (Err when the profile has no memory), or the
+/// "api" space for the main key.
+fn client_space(s: &AppState, headers: &HeaderMap) -> Result<String, Response> {
+    match crate::api_access(s, headers) {
+        None => Err(error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required")),
+        Some(Some(p)) if p.name != "default" => {
+            if p.has("memory") { Ok(p.memory_space()) } else {
+                Err(error(StatusCode::FORBIDDEN, "permission_error", "this key's client profile has no \"memory\""))
+            }
+        }
+        Some(_) => Ok("api".to_string()),
+    }
+}
+
+/// GET /v1/memory: the facts this client sees (its own space's, and the ones kept for everyone).
+pub async fn v1_list(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    let space = match client_space(&s, &headers) { Ok(x) => x, Err(r) => return r };
+    let facts: Vec<Value> = s.mgr.memory.visible(&space).iter().map(|f| f.to_json()).collect();
+    Json(json!({"object": "list", "space": space, "data": facts})).into_response()
+}
+
+/// POST /v1/memory {"fact": "..."}: a fact saved in this client's space.
+pub async fn v1_add(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let space = match client_space(&s, &headers) { Ok(x) => x, Err(r) => return r };
+    let Some(text) = req["fact"].as_str().or(req["text"].as_str()).map(str::trim).filter(|t| !t.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "send {\"fact\": \"...\"}");
+    };
+    match s.mgr.memory.add(text, &space, "api") {
+        Ok(f) => Json(f.to_json()).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", e.to_string()),
+    }
+}
+
+/// DELETE /v1/memory/{id}: a fact of this client's own space (the facts kept for everyone are the owner's).
+pub async fn v1_delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> Response {
+    let space = match client_space(&s, &headers) { Ok(x) => x, Err(r) => return r };
+    let own = s.mgr.memory.all().iter().any(|f| f.id == id && f.scope == space);
+    if !own {
+        return error(StatusCode::NOT_FOUND, "not_found", format!("no fact {id} in this client's memory"));
+    }
+    match s.mgr.memory.forget(&id, Some(&space)) {
+        Ok(_) => Json(json!({"id": id, "deleted": true})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", e.to_string()),
+    }
+}

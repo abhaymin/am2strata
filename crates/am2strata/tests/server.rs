@@ -1941,6 +1941,45 @@ fn api_calls_get_memory_by_default() {
     assert!(!p.contains("dog is called Bruno") && !p.contains("remember"), "opted out: {p}");
 }
 
+/// Every web app feature through the API (SERVER-TOOLS-PLAN part 5): a profile with "code" gets run_python in the
+/// sandbox; /v1/memory lists, adds and deletes a client's own facts; a profile's media_jobs_per_hour holds.
+#[test]
+fn a_client_gets_code_memory_and_its_limits_through_the_api() {
+    let run = "\n\n<tool_call>\n<function=run_python>\n<parameter=code>\nprint(6 * 7)\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"clients": {
+        "agent": {"key": LAPTOP, "tools": ["code", "memory", "image"], "memory": "agent", "limits": {"media_jobs_per_hour": 1}},
+        "phone": {"key": PHONE, "tools": ["web"]}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Run it.\n</think>{run}")), ids("Done.\n</think>\n\nIt printed 42.")], json!({}));
+    // run_python: offered by the profile, run in the sandbox when it is there (bubblewrap and python3)
+    let (_, info) = s.get("/api/run", true);
+    let (c, r) = post_as(&s, LAPTOP, "/v1/chat/completions", &json!({"messages": [user("What is 6 times 7? Use Python.")]}), &[]);
+    assert_eq!(c, 200, "{r}");
+    assert!(prompt_text(&s.gen_lines()[0]).contains("run_python"), "offered to the code profile");
+    if info["enabled"] == true {
+        assert!(prompt_text(&s.gen_lines()[1]).contains("42"), "the sandbox ran it: {}", prompt_text(&s.gen_lines()[1]));
+    }
+    // /v1/memory: a client's own space
+    let (c, f) = post_as(&s, LAPTOP, "/v1/memory", &json!({"fact": "The agent's build target is aarch64."}), &[]);
+    assert_eq!(c, 200, "{f}");
+    let id = f["id"].as_str().unwrap().to_string();
+    let list = |key: &str| reqwest::blocking::Client::new().get(format!("{}/v1/memory", s.base)).bearer_auth(key).send().unwrap();
+    let mine: Value = list(LAPTOP).json().unwrap();
+    assert_eq!(mine["space"], "agent");
+    assert!(mine["data"].to_string().contains("aarch64"));
+    assert_eq!(list(PHONE).status().as_u16(), 403, "a profile without memory has none");
+    let main: Value = list(KEY).json().unwrap();
+    assert!(!main["data"].to_string().contains("aarch64"), "the main key's api space does not see the agent's");
+    let del = |key: &str| reqwest::blocking::Client::new().delete(format!("{}/v1/memory/{id}", s.base)).bearer_auth(key).send().unwrap().status().as_u16();
+    assert_eq!(del(KEY), 404, "not the api space's to delete");
+    assert_eq!(del(LAPTOP), 200);
+    // the hourly limit on media jobs
+    let job = json!({"tool": "generate_image", "arguments": {"prompt": "a lighthouse", "size": "512x512"}});
+    assert_eq!(post_as(&s, LAPTOP, "/api/jobs", &job, &[]).0, 200);
+    let (c, r) = post_as(&s, LAPTOP, "/api/jobs", &job, &[]);
+    assert_eq!(c, 400, "{r}");
+    assert!(r.to_string().contains("1 media jobs an hour"), "{r}");
+}
+
 /// Claude Code's WebSearch: a request with Anthropic's web_search server tool gets server_tool_use and
 /// web_search_tool_result blocks, and the usage counts the search.
 #[test]

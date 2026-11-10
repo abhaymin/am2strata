@@ -11,7 +11,7 @@
 - **Next:**
   - the Responses `image_generation` and `mcp` hosted tools, and Gemini's `google_search`;
   - part 3, media inside the turn (speech on the CPU; `defer` / `swap`);
-  - the per-profile limits;
+  - the per-profile limits beyond media jobs an hour (`"limits": {"media_jobs_per_hour": N}`, built 2026-11-11);
   - Settings › Clients, and Settings › Connect saying which built-in tools am2Strata answers.
 
 The USP (owner, 2026-11-09): a client points at am2Strata, over the OpenAI, Anthropic or Responses API, locally or
@@ -120,12 +120,12 @@ or with `unsloth start codex`, reaches the same memory, web, media and MCP tools
 | Feature (web app) | Through the API | Next |
 | --- | --- | --- |
 | Chat with thinking, documents, pictures, video frames | all four APIs | - |
-| Memory (remember, recall, forget, facts in the prompt, chats past the context) | **on by default for the main key's API calls** ("api" space; `strata_memory: false` opts out); per profile for client keys | `/v1/memory` for a client to list, add and remove its own facts |
+| Memory (remember, recall, forget, facts in the prompt, chats past the context) | **on by default for the main key's API calls** ("api" space; `strata_memory: false` opts out); per profile for client keys; **`/v1/memory`** lists, adds and deletes a client's own facts (2026-11-11) | - |
 | Web search and page reading | `strata_web`, a profile's `web`, and the APIs' own web search tools | - |
 | MCP tools | own page (`strata_mcp`), or a profile naming servers | - |
 | Images, video, speech, songs as chat tools | `strata_media`, or a profile's sets | in the turn (part 3) |
 | Images, video, speech, transcription, songs as endpoints | `/v1/images`, `/v1/videos`, `/v1/audio/*` | jobs that survive a dropped client (PRODUCTION-PLAN.md) |
-| The browser (computer use) | `strata_browser` only | a profile set `browser` |
-| Running code (the canvas) | the page's Run button only | a profile set `code`: a `run_python` tool in the same sandbox, for profiles that name it |
+| The browser (computer use) | `strata_browser`, or a profile's `browser` set (2026-11-11) | - |
+| Running code (the canvas) | the page's Run button; a profile's `code` set gives the model `run_python` in the same sandbox (2026-11-11) | - |
 | Models (list, switch, load) | `/v1/models`, the request's `model` with `switch_on_request`, `/api/inference/load` | model preferences (PRODUCTION-PLAN.md) |
 | Monitor, API calls | `/metrics`, `/api/requests` (main key) | - |

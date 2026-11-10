@@ -71,7 +71,7 @@ fn current_priority() -> Priority {
     PRIORITY.try_with(|p| *p).unwrap_or(Priority::Normal)
 }
 
-fn current_client() -> String {
+pub fn current_client() -> String {
     CLIENT.try_with(|c| c.clone()).unwrap_or_default()
 }
 

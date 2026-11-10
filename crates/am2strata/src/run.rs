@@ -849,6 +849,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                     "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string()))
                         .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string()))
                         .or_else(|| crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()).then(|| "web".to_string()))
+                        .or_else(|| crate::code_run::TOOL_NAMES.contains(&c.name.as_str()).then(|| "sandbox".to_string()))
                         .or_else(|| crate::browser::TOOL_NAMES.contains(&c.name.as_str()).then(|| "browser".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
                     "arguments": c.arguments, "round": rounds}))).await;
@@ -907,6 +908,11 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                             }
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
                         }
+                    }
+                } else if let (true, None, Some(code)) = (crate::code_run::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.code.get()) {
+                    tokio::select! {
+                        r = crate::code_run::call(code, &args) => r,
+                        _ = tx.closed() => return,
                     }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
                     tokio::select! {

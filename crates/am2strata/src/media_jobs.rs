@@ -80,12 +80,15 @@ pub struct Jobs {
     speeds: Mutex<HashMap<String, f64>>,
     /// <data>/media-jobs (set by `open`; without it nothing is kept on disk)
     dir: OnceLock<std::path::PathBuf>,
+    /// when each client profile's recent jobs were queued (its media_jobs_per_hour limit)
+    recent: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
 }
 
 impl Jobs {
     pub fn new() -> Jobs {
         Jobs { app: OnceLock::new(), jobs: Mutex::new(BTreeMap::new()), next: Mutex::new(1), caps: Mutex::new(None),
-               speeds: Mutex::new(HashMap::new()), dir: OnceLock::new() }
+               speeds: Mutex::new(HashMap::new()), dir: OnceLock::new(),
+               recent: Mutex::new(HashMap::new()) }
     }
 
     /// The jobs kept in `dir` from before (the newest KEEP of the last KEEP_DAYS days; older files removed). Ids go on
@@ -337,6 +340,19 @@ impl Jobs {
             return fail(format!("error: {} cannot be made here: {}", kind, k["note"].as_str().unwrap_or("not available")));
         }
         let model = k["model"].as_str().unwrap_or("").to_string();
+        // a client profile's limit: media jobs an hour
+        let client = crate::queue::current_client();
+        if let Some(limit) = self.app.get().and_then(|a| a.clients.by_name(&client)).and_then(|p| p.media_jobs_per_hour) {
+            let mut recent = self.recent.lock().unwrap();
+            let q = recent.entry(client.clone()).or_default();
+            while q.front().is_some_and(|t| t.elapsed() > Duration::from_secs(3600)) {
+                q.pop_front();
+            }
+            if q.len() >= limit as usize {
+                return fail(format!("error: this key may queue {limit} media jobs an hour, and has; try again later"));
+            }
+            q.push_back(Instant::now());
+        }
         let mut req = match kind {
             "image" => {
                 let size = args["size"].as_str().unwrap_or("1024x1024");

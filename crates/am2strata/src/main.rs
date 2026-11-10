@@ -424,6 +424,7 @@ async fn main() -> Result<()> {
     // media jobs kept across restarts; the ones the server stopped in run again
     let unfinished = state.media_jobs.open(expand(&args.data_dir).join("media-jobs"));
     state.media_jobs.bind(state.clone());
+    let _ = mgr.code.set(state.code_run.clone());
     state.media_jobs.resume(unfinished);
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
@@ -479,6 +480,8 @@ async fn main() -> Result<()> {
         .route("/v1/audio/music", post(music::music))
         .route("/api/media/audio/device", post(audio_api::set_device))
         .route("/api/memory", get(memory::list).post(memory::add))
+        .route("/v1/memory", get(memory::v1_list).post(memory::v1_add))
+        .route("/v1/memory/{id}", axum::routing::delete(memory::v1_delete))
         .route("/api/memory/settings", post(memory::set_settings))
         .route("/api/memory/{id}", axum::routing::delete(memory::delete))
         .route("/api/media/models", get(image_gen::models))
