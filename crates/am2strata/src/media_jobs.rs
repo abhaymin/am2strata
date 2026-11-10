@@ -487,6 +487,18 @@ impl Jobs {
         }
     }
 
+    /// Wait for job `id` to finish (done or error), at most `max`: its status, or None if it is still going.
+    pub async fn wait_done(&self, id: &str, max: Duration) -> Option<Value> {
+        let t0 = Instant::now();
+        while t0.elapsed() < max {
+            if let Some(v) = self.status(id).filter(|v| v["state"] == "done" || v["state"] == "error") {
+                return Some(v);
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        None
+    }
+
     fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();

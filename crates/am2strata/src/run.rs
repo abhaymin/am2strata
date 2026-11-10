@@ -864,7 +864,28 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                             "text": format!("error: this answer already queued {media_jobs} media jobs, the most one answer may; they will appear in the chat. Finish the answer now.")}),
                         Some(j) => {
                             media_jobs += 1;
-                            j.submit(&c.name, &args, caps)
+                            let mut r = j.submit(&c.name, &args, caps);
+                            // speech on the CPU (Chatterbox, beside the text model, no GPU turn): finished inside the
+                            // answer, so the model can say it is ready; past the wait it stays queued as before
+                            let cpu_speech = c.name == "speak" && caps["kinds"]["tts"]["model"].as_str().is_some_and(|m| m.contains("chatterbox"));
+                            if let (true, true, Some(id)) = (cpu_speech, r["ok"] == true, r["job"]["id"].as_str().map(str::to_string)) {
+                                let done = tokio::select! {
+                                    d = j.wait_done(&id, std::time::Duration::from_secs(180)) => d,
+                                    _ = tx.closed() => return,
+                                };
+                                if let Some(d) = done {
+                                    let text = if d["state"] == "done" {
+                                        format!("speech job {id} is done ({} s of audio): it plays in the chat now; tell the user it is ready",
+                                                d["meta"]["seconds_of_audio"].as_f64().map(|x| format!("{x:.0}")).unwrap_or_else(|| "some".into()))
+                                    } else {
+                                        format!("error: speech job {id} failed: {}", d["error"].as_str().unwrap_or("unknown"))
+                                    };
+                                    r["ok"] = json!(d["state"] == "done");
+                                    r["chars"] = json!(text.len());
+                                    r["text"] = json!(text);
+                                }
+                            }
+                            r
                         }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
                     }

@@ -1254,6 +1254,20 @@ fn speech_is_transcribed_and_spoken_in_openais_shapes() {
     assert_eq!(calls["requests"][0]["model"], "whisper-base", "{}", calls["requests"][0]);
 }
 
+/// Media inside the turn (SERVER-TOOLS-PLAN part 3): speech on the CPU (Chatterbox, beside the text model) is
+/// finished inside the answer, so the model hears that it is ready instead of "on its way".
+#[test]
+fn speech_on_the_cpu_is_finished_inside_the_answer() {
+    let call = "\n\n<tool_call>\n<function=speak>\n<parameter=text>\nHello there.\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Say it.\n</think>{call}")), ids("Done.\n</think>\n\nIt is ready.")], json!({"mem_gb": 64}));
+    let (c, r) = s.post("/api/media/models/default", &json!({"model": "chatterbox-multilingual"}));
+    assert_eq!(c, 200, "{r}");
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Say hello out loud.")], "strata_media": true}));
+    assert_eq!(c, 200, "{r}");
+    let second = prompt_text(&s.gen_lines()[1]);
+    assert!(second.contains("is done") && second.contains("plays in the chat now"), "the model heard it is ready: {second}");
+}
+
 #[test]
 fn chatterbox_speaks_on_the_cpu_in_the_voice_of_a_clip_and_parler_refuses_a_clip() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"mem_gb": 64}));

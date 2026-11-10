@@ -10,7 +10,9 @@
 - **Tested:** `a_client_key_gets_its_profiles_tools_without_flags`, `anthropic_web_search_is_answered_by_the_server`, `anthropic_web_search_needs_a_profile_with_web` and `responses_web_search_gives_a_web_search_call_item`.
 - **Next:**
   - the Responses `image_generation` and `mcp` hosted tools, and Gemini's `google_search`;
-  - part 3, media inside the turn (speech on the CPU; `defer` / `swap`);
+  - part 3, media inside the turn: **speech on the CPU is built** (2026-11-11: a `speak` call with Chatterbox,
+    beside the text model, finishes inside the answer, waited for up to 3 minutes); image and video `swap` still
+    to do (they stay `defer`: queued, shown after the answer);
   - the per-profile limits beyond media jobs an hour (`"limits": {"media_jobs_per_hour": N}`, built 2026-11-11);
   - Settings › Clients, and Settings › Connect saying which built-in tools am2Strata answers.
 
