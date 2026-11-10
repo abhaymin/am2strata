@@ -20,8 +20,10 @@ With the `onnx` feature, it also uses:
 
 It also carries, ported to Rust (crates/strata-media/src/acestep, parler_hf.rs):
 - ACE-Step 1.5's model code (MIT, Copyright (c) ACE Studio and StepFun): the song model's condition encoder, diffusion
-  transformer, sampler and DCW correction; and Stable Audio's Oobleck decoder as diffusers implements it
-  (Apache-2.0, The HuggingFace Team). The weights (ACE-Step/Ace-Step1.5, MIT) are downloaded on request.
+  transformer, sampler and DCW correction, the song planner's prompts and guided sampling, the FSQ and the audio-code
+  detokenizer; and Stable Audio's Oobleck decoder as diffusers implements it
+  (Apache-2.0, The HuggingFace Team). The weights (ACE-Step/Ace-Step1.5, MIT, the planner acestep-5Hz-lm-1.7B
+  included) are downloaded on request.
 - The loading of Parler-TTS mini multilingual v1.1 (Apache-2.0, Hugging Face) and Indic Parler-TTS (Apache-2.0,
   AI4Bharat) into candle's Parler model; their weights and Flan-T5's tokenizer (Apache-2.0, Google) are downloaded on
   request.

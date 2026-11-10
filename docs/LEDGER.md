@@ -4,7 +4,7 @@ The one page to start from. Each plan has its own document; this page says where
 and is updated in the same commit as any work on a plan (a plan's state never lives only in someone's memory or a
 chat). Newest decisions first in each row. Dates are when the row last changed.
 
-**Release:** v0.1.3 (2026-11-10). Live on the developer's PC: `am2strata-boot`, Tiel Coder Q8 by default, media engine
+**Release:** v0.1.4 (2026-11-10). Live on the developer's PC: `am2strata-boot`, Tiel Coder Q8 by default, media engine
 `--features cuda,onnx`, song model and multilingual voices downloaded.
 
 ## In progress, in the order they are worked on
