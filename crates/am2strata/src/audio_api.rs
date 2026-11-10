@@ -21,14 +21,8 @@ fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
-/// MemAvailable in GB (0 when unknown). AM2_TEST_MEM_GB stands in for it in the tests.
 fn mem_available_gb() -> f64 {
-    if let Some(v) = std::env::var("AM2_TEST_MEM_GB").ok().and_then(|v| v.parse().ok()) {
-        return v;
-    }
-    std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|t| t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok()))
-        .map(|kb| kb / 1048576.0).unwrap_or(0.0)
+    crate::mem::available_gb()
 }
 
 /// The catalog entry of an audio model (from the engine's list), checked for its task and download.

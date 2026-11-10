@@ -21,6 +21,7 @@ mod queue;
 mod manager;
 mod hub_api;
 mod mcp_api;
+mod mem;
 mod mcp;
 mod memory;
 mod media;
@@ -128,6 +129,37 @@ pub fn foreign_origin(state: &AppState, headers: &HeaderMap) -> bool {
 pub fn not_own_page(what: &str) -> Response {
     error(StatusCode::FORBIDDEN, "permission_error",
           format!("{what} only from PolyStrata's own page (or an origin in the config's trusted_origins)"))
+}
+
+/// Requests waiting for the GPU's turn from which an answer carries a "busy" warning.
+const BUSY_WAITING: usize = 4;
+
+/// Every 503 and 429 gets a Retry-After (a client backs off instead of hammering a PC that is busy or short of
+/// memory); every API answer made while the PC is short of memory or the queue is long carries `x-strata-warning`.
+async fn overload_headers(axum::extract::State(s): axum::extract::State<AppState>, req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let api = { let p = req.uri().path(); p.starts_with("/v1") || p.starts_with("/api/inference") };
+    let mut r = next.run(req).await;
+    let st = r.status();
+    if (st == StatusCode::SERVICE_UNAVAILABLE || st == StatusCode::TOO_MANY_REQUESTS) && !r.headers().contains_key("retry-after") {
+        r.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("30"));
+    }
+    if api {
+        let (avail, total) = (mem::available_gb(), mem::total_gb());
+        let waiting = s.mgr.queue.waiting();
+        let mut w = Vec::new();
+        if mem::low(avail, total) {
+            w.push(format!("low memory: {avail:.1} GB free"));
+            s.mgr.monitor.notice("this PC is low on free memory: new models and media jobs may wait, or be refused");
+        }
+        if waiting >= BUSY_WAITING {
+            w.push(format!("busy: {waiting} requests waiting for their turn"));
+            s.mgr.monitor.notice("the server is busy: requests are waiting for their turn");
+        }
+        if let (false, Ok(v)) = (w.is_empty(), axum::http::HeaderValue::from_str(&w.join("; "))) {
+            r.headers_mut().insert("x-strata-warning", v);
+        }
+    }
+    r
 }
 
 /// A panic in a handler, as a 500 in the APIs' error shape (the panic itself is logged).
@@ -453,6 +485,9 @@ async fn main() -> Result<()> {
         .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
             axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
+        // overload told plainly: Retry-After on every refusal for load, a warning header while the PC is short of memory
+        // or the queue is long
+        .layer(axum::middleware::from_fn_with_state(state.clone(), overload_headers))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         // a handler that panics is answered with a JSON error, never a dropped connection
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))

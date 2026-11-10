@@ -23,6 +23,15 @@ crashing, warns the user plainly when the PC is overloaded, and does not fail du
     hears why and to send it again, and the alerts say so for 15 minutes. Tested: `a_dead_engine_is_replaced_for_the_next_request`.
   - A handler panic is answered as a JSON 500, and a stream that stops without its end sends an error event (the
     panic layer has no integration test: no handler can be made to panic from outside).
+- **Steps 3 and 4 are built in part.**
+  - What each model takes from free memory at its load is kept (`<data>/model-memory.json`).
+  - A load that cannot fit is refused before the model in memory is stopped. A load that is short waits up to
+    60 s for memory, then is refused with a plain message.
+  - Every 503 and 429 gets `Retry-After`. API answers carry `x-strata-warning` while the PC is short of memory
+    (under 3 GB or 5% free) or four or more requests wait, and the alerts say so.
+  - Tested: `a_model_that_would_not_fit_is_refused_plainly` and `low_memory_is_told_with_every_answer`.
+  - Still to do: GPU media jobs checked against free RAM (CPU speech already waits); a banner at the top of the
+    web app (today the alerts show in the Monitor's hardware card).
 
 1. **A dead engine is noticed and replaced.**
    - The manager checks the engine process before each request (and when a request fails with "stopped").

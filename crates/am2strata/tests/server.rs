@@ -631,6 +631,37 @@ fn a_dead_engine_is_replaced_for_the_next_request() {
     assert!(sys["alerts"].to_string().contains("stopped unexpectedly"), "the alerts tell the user: {}", sys["alerts"]);
 }
 
+/// Production, step 3: a model that would not fit in free memory is refused with a plain message and Retry-After,
+/// before the model in memory is stopped, which keeps answering; the alerts say so.
+#[test]
+fn a_model_that_would_not_fit_is_refused_plainly() {
+    let on = json!({"switch_on_request": true});
+    let s = Server::start(&[Model { extra: on, ..Model::default() }, Model { id: "mock-b", ..Model::default() }],
+                          &[ids("a"), ids("b")], json!({"model_memory": {"mock-b": 100.0}, "mem_gb": 64}));
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .json(&json!({"model": "mock-b", "messages": [user("hi")], "max_tokens": 4})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 503);
+    assert!(r.headers().contains_key("retry-after"), "a client is told when to try again");
+    let body: Value = r.json().unwrap();
+    assert!(body.to_string().contains("not enough free memory to load mock-b"), "{body}");
+    assert_eq!(s.get("/health", false).1["model"], "Mock mock-a", "the model in memory was not stopped");
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("hi")], "max_tokens": 4}));
+    assert_eq!(c, 200, "and it keeps answering");
+    assert!(s.get("/api/system", true).1["alerts"].to_string().contains("mock-b was not loaded"));
+}
+
+/// Production, step 4: answers made while the PC is short of memory carry x-strata-warning, and the alerts say so.
+#[test]
+fn low_memory_is_told_with_every_answer() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({"mem_gb": 2}));
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY)
+        .json(&json!({"messages": [user("hi")], "max_tokens": 4})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let w = r.headers().get("x-strata-warning").map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
+    assert!(w.contains("low memory"), "{w:?}");
+    assert!(s.get("/api/system", true).1["alerts"].to_string().contains("low on free memory"));
+}
+
 #[test]
 fn the_engine_gets_its_eight_token_margin() {
     let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));

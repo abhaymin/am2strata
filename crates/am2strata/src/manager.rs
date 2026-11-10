@@ -155,6 +155,8 @@ pub struct Manager {
     pub web: std::sync::OnceLock<Arc<crate::web_tools::WebTools>>,
     /// browser computer use (browser.rs; set from the run config at start)
     pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
+    /// what each model took from free memory when it loaded (mem.rs), under <data>/model-memory.json
+    pub needs: crate::mem::Needs,
 }
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
@@ -280,7 +282,29 @@ impl Manager {
             media_jobs: std::sync::OnceLock::new(),
             web: std::sync::OnceLock::new(),
             browser: std::sync::OnceLock::new(),
+            needs: crate::mem::Needs::open(&memory_dir),
         }
+    }
+
+    /// Start `entry`'s engine when this PC has the memory it took last time (waiting a little for memory a model
+    /// just stopped is still giving back), and note what it takes now. Short of memory: a plain error, no load.
+    async fn start_checked(&self, entry: &ModelEntry) -> Result<Loaded> {
+        if let Some(need) = self.needs.get(&entry.id) {
+            if let Err(free) = crate::mem::wait_for(need, crate::mem::LOAD_WAIT).await {
+                let msg = format!("not enough free memory to load {}: it needs about {need:.0} GB, {free:.1} GB is free \
+                                   (with {:.0} GB kept for the system). Close other programs, wait for a media job to end, \
+                                   or choose a smaller model", entry.id, crate::mem::MARGIN_GB);
+                self.monitor.notice(&format!("{} was not loaded: not enough free memory", entry.id));
+                return Err(anyhow!(msg));
+            }
+        }
+        let before = crate::mem::available_gb();
+        let l = start(entry, &self.hw, self.ready_timeout).await?;
+        let after = crate::mem::available_gb();
+        if before > 0.0 && after > 0.0 {
+            self.needs.record(&entry.id, before - after);
+        }
+        Ok(l)
     }
 
     /// The installed models, scanned again (a config pulled or edited meanwhile is seen without a restart).
@@ -453,13 +477,25 @@ impl Manager {
                 return Ok(l);
             }
         }
+        // a model that cannot fit even with the one in memory stopped is refused before that one is stopped
+        if let Some(need) = self.needs.get(&entry.id) {
+            let freed = match self.current().await { Some(l) => self.needs.get(&l.entry.id).unwrap_or(0.0), None => 0.0 };
+            let free = crate::mem::available_gb();
+            if free > 0.0 && free + freed < need + crate::mem::MARGIN_GB {
+                self.monitor.notice(&format!("{} was not loaded: not enough free memory", entry.id));
+                return Err(anyhow!("not enough free memory to load {}: it needs about {need:.0} GB, {free:.1} GB is free and \
+                                    the model in memory would give back about {freed:.0} GB (with {:.0} GB kept for the system). \
+                                    Close other programs, or choose a smaller model; the model in memory keeps answering",
+                                   entry.id, crate::mem::MARGIN_GB));
+            }
+        }
         let before = self.current.write().await.take();
         let before_id = before.as_ref().map(|l| l.entry.id.clone());
         if let Some(l) = before {
             self.snapshots.save(&l, "before the model stops").await;
             stop(&l).await;
         }
-        match start(&entry, &self.hw, self.ready_timeout).await {
+        match self.start_checked(&entry).await {
             Ok(l) => {
                 let l = Arc::new(l);
                 *self.current.write().await = Some(l.clone());
@@ -469,7 +505,7 @@ impl Manager {
             Err(e) => {
                 if let Some(prev) = before_id.and_then(|id| self.entry(&id)) {
                     tracing::warn!("loading {} failed ({e:#}); starting {} again", entry.id, prev.id);
-                    if let Ok(l) = start(&prev, &self.hw, self.ready_timeout).await {
+                    if let Ok(l) = self.start_checked(&prev).await {
                         *self.current.write().await = Some(Arc::new(l));
                         self.queue.set_resident(crate::queue::Resident::Text(prev.id.clone()));
                     }

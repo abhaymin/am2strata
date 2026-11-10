@@ -106,6 +106,10 @@ impl Server {
             s.extend(e.clone());
         }
         std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
+        // what models took from free memory at earlier loads (mem.rs), for the memory guard's tests
+        if let Some(m) = extra.get("model_memory") {
+            std::fs::write(dir.join("model-memory.json"), m.to_string()).unwrap();
+        }
         // API calls get memory by default; the tests that check exact prompts run without it unless they ask
         if extra.get("memory_api").is_none() {
             std::fs::create_dir_all(dir.join("memory")).unwrap();
