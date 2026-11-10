@@ -17,6 +17,7 @@ mod music;
 mod code_run;
 mod image_gen;
 mod preview;
+mod production;
 mod queue;
 mod manager;
 mod hub_api;
@@ -461,6 +462,7 @@ async fn main() -> Result<()> {
         .route("/api/media/capabilities", get(media_jobs::capabilities))
         .route("/api/media/genres", get(music::genres))
         .route("/api/jobs", post(media_jobs::again))
+        .route("/v1/media/productions", post(media_jobs::productions))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

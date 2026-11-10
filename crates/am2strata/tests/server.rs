@@ -1584,6 +1584,45 @@ fn media_jobs_survive_a_restart_and_can_be_made_again() {
     assert!(e.to_string().contains("make it again"), "{e}");
 }
 
+/// Productions (LONG-MEDIA-PLAN.md): one request, parts made in order by their endpoints, one WAV with a chapter per
+/// part; a bad plan is refused at once.
+#[test]
+fn a_production_makes_its_parts_in_order_and_joins_them() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let plan = json!({"name": "Welcome set", "parts": [{"speak": {"text": "Welcome to the set."}},
+                                                       {"song": {"lyrics": "[verse]\nLights on the river", "genre": "festive", "duration": 30}},
+                                                       {"music": {"genre": "ambient", "duration": 20}}], "crossfade_s": 0.5});
+    let (c, j) = s.post("/v1/media/productions", &plan);
+    assert_eq!(c, 200, "{j}");
+    assert_eq!(j["parts"], 3);
+    let id = j["id"].as_str().unwrap().to_string();
+    let t0 = std::time::Instant::now();
+    let done = loop {
+        let (_, v) = s.get(&format!("/api/jobs/{id}"), true);
+        if v["state"] == "done" || v["state"] == "error" { break v; }
+        assert!(t0.elapsed().as_secs() < 20, "{v}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(done["state"], "done", "{done}");
+    assert_eq!(done["kind"], "production");
+    let ch = done["meta"]["chapters"].as_array().unwrap();
+    assert_eq!(ch.len(), 3);
+    assert!(ch[0]["title"].as_str().unwrap().contains("Welcome") && ch[1]["title"].as_str().unwrap().contains("Song: Lights"), "{ch:?}");
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/{id}/content", s.base)).bearer_auth(KEY).send().unwrap();
+    let b = r.bytes().unwrap();
+    assert_eq!(&b[0..4], b"RIFF");
+    assert_eq!(u32::from_le_bytes([b[24], b[25], b[26], b[27]]), 48_000, "one 48 kHz file");
+    // the engine saw the parts in order
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let ops: Vec<String> = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter_map(|v| v["op"].as_str().map(str::to_string))
+        .filter(|o| o == "speak" || o == "song").collect();
+    assert_eq!(ops.first().map(String::as_str), Some("speak"), "{ops:?}");
+    assert!(ops.iter().filter(|o| *o == "song").count() >= 2, "the song and the music: {ops:?}");
+    // a part over 10 minutes is refused at once
+    let (c, e) = s.post("/v1/media/productions", &json!({"parts": [{"song": {"lyrics": "la", "duration": 1200}}]}));
+    assert_eq!(c, 400, "{e}");
+}
+
 #[test]
 fn an_audio_attachment_in_a_chat_is_transcribed_into_the_prompt() {
     let s = Server::start(&[Model::default()], &[ids("Heard.\n</think>\n\nYou said hello world.")], json!({}));

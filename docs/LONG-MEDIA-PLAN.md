@@ -13,6 +13,22 @@ that long, from one request.
 
 ## Productions: am2Strata builds the whole piece itself (owner's requirement, 2026-11-10)
 
+**State (2026-11-11): audio productions built.** `POST /v1/media/productions` and the chat tool `produce` take a
+plan of speak, song and music parts.
+- **Making the parts:** each part is made by its kind's own endpoint, in order (songs with 2 takes by default), and
+  kept on disk as it is finished, so a restart goes on from the last finished part.
+- **Joining** (`production.rs`): the parts are resampled to 48 kHz stereo, their loudness evened (-18 dBFS RMS,
+  peak 0.98) and joined with equal-power crossfades (`crossfade_s`, default 1 s).
+- **The result:** one WAV, with a chapter per part in the job's meta. The web app shows "part 3 of 9" while it is
+  made, then the player and the chapters.
+- **Tested:** `a_production_makes_its_parts_in_order_and_joins_them` and the join's unit test.
+- **Not yet:**
+  - songs continued from the one before (ACE-Step's "complete" task needs the Oobleck encoder ported): a long song
+    is joined with a crossfade today;
+  - video productions;
+  - MP3 output;
+  - chapters in the file's own metadata.
+
 A request like "a 25-minute Diwali music set in Hindi, with a spoken welcome, and a video for it" must come back as
 one finished file, made by am2Strata from start to end, with nobody stitching parts by hand. So:
 

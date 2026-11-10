@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const TOOL_NAMES: [&str; 5] = ["generate_image", "generate_video", "speak", "make_song", "compose_music"];
+pub const TOOL_NAMES: [&str; 6] = ["generate_image", "generate_video", "speak", "make_song", "compose_music", "produce"];
 
 /// The most media jobs one answer may queue.
 pub const PER_ANSWER: usize = 3;
@@ -62,7 +62,7 @@ impl Job {
 }
 
 fn kind_of(k: &str) -> &'static str {
-    match k { "image" => "image", "video" => "video", "song" => "song", "music" => "music", _ => "tts" }
+    match k { "image" => "image", "video" => "video", "song" => "song", "music" => "music", "production" => "production", _ => "tts" }
 }
 
 fn ext_of(mime: &str) -> &'static str {
@@ -225,6 +225,18 @@ impl Jobs {
                     "style": {"type": "string", "description": "instruments, mood and tempo in words"},
                     "duration": {"type": "integer", "description": "length in seconds, 10 to 600"}}}}));
         }
+        if ok("music") || ok("tts") {
+            t.push(json!({"name": "produce", "description":
+                "Make one long audio piece on this PC from several parts, joined into one file with a chapter per part: \
+                 spoken parts (speak), sung songs (song, up to 10 minutes each: a longer song is several song parts) and \
+                 instrumental music (music). Use it for anything longer than one song, or speech and songs together \
+                 (\"a 25-minute Diwali set with a spoken welcome\"). Queued; it appears in the chat when all parts are made.",
+                "parameters": {"type": "object", "properties": {
+                    "name": {"type": "string", "description": "a title for the piece"},
+                    "parts": {"type": "array", "description": "the parts in order, each one of {\"speak\": {\"text\", \"voice\"?, \"language\"?}}, \
+                              {\"song\": {\"lyrics\", \"genre\"?, \"style\"?, \"language\"?, \"duration\"}}, {\"music\": {\"genre\" or \"style\", \"duration\"}}",
+                              "items": {"type": "object"}}}, "required": ["parts"]}}));
+        }
         if ok("tts") {
             t.push(json!({"name": "speak", "description":
                 "Read a text aloud on this PC (text to speech, a WAV file), in the language of the text, in a native \
@@ -322,6 +334,16 @@ impl Jobs {
 
     /// A tool call: the job queued, and the tool result for the model and the client (the job in `job`).
     pub fn submit(&self, name: &str, args: &Value, caps: &Value) -> Value {
+        if name == "produce" {
+            return match self.submit_production(args, caps) {
+                Ok(job) => {
+                    let text = format!("production job {} queued ({} parts). It is made part by part after this answer and \
+                                        appears in the chat as one file; tell the user it is on its way.", job["id"].as_str().unwrap_or(""), job["parts"]);
+                    json!({"ok": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0, "job": job})
+                }
+                Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": e.len() + 7, "truncated": false, "ms": 0}),
+            };
+        }
         let (kind, key) = match name {
             "generate_image" => ("image", "prompt"),
             "generate_video" => ("video", "prompt"),
@@ -477,6 +499,45 @@ impl Jobs {
         self.save(j);
     }
 
+    /// A production (production.rs): its plan checked, one job queued that makes its parts in order and joins them.
+    pub fn submit_production(&self, plan: &Value, caps: &Value) -> Result<Value, String> {
+        let parts = crate::production::parts_of(plan)?;
+        for (kind, _) in &parts {
+            let k = if *kind == "speak" { "tts" } else { "music" };
+            if caps["kinds"][k]["usable"] != true {
+                return Err(format!("{kind} parts cannot be made here: {}", caps["kinds"][k]["note"].as_str().unwrap_or("not available")));
+            }
+        }
+        let n = {
+            let mut g = self.next.lock().unwrap();
+            *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
+            *g - 1
+        };
+        let id = format!("mj-{n}");
+        let name = plan["name"].as_str().map(str::trim).filter(|x| !x.is_empty()).unwrap_or("production").chars().take(120).collect::<String>();
+        let job = Job { id: id.clone(), kind: "production", model: "production".into(), prompt: name, created: crate::now(),
+                        state: "queued", error: None, mime: None, data: None, meta: json!({"part": 0, "parts": parts.len()}),
+                        seconds: None, req: plan.clone(), file: None };
+        self.save(&job);
+        self.jobs.lock().unwrap().insert(n, job);
+        let s = self.app().clone();
+        let req = plan.clone();
+        tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
+                     crate::queue::CLIENT.scope("media".to_string(), async move { run(s, n, "production", req).await })));
+        Ok(json!({"id": id, "kind": "production", "model": "production", "parts": parts.len(), "url": format!("/api/jobs/{id}")}))
+    }
+
+    fn set_meta(&self, n: u64, meta: Value) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(j) = jobs.get_mut(&n) {
+            j.meta = meta;
+            self.save(j);
+        }
+    }
+
     /// The queue label a media request may carry: the id of one of these jobs still queued, else none (a client
     /// cannot make its job look like someone else's in the queue).
     pub fn label(&self, asked: &Value) -> String {
@@ -536,6 +597,11 @@ fn human(s: f64) -> String {
 
 /// The job, run through the same handler as the API (with the server's own key), its answer kept.
 async fn run(s: AppState, n: u64, kind: &'static str, req: Value) {
+    if kind == "production" {
+        let out = run_production(&s, n, &req).await;
+        s.media_jobs.finish(n, out);
+        return;
+    }
     let mut headers = HeaderMap::new();
     if let Some(k) = &s.api_key {
         if let Ok(v) = HeaderValue::from_str(&format!("Bearer {k}")) {
@@ -577,6 +643,85 @@ async fn run(s: AppState, n: u64, kind: &'static str, req: Value) {
         }
     };
     s.media_jobs.finish(n, out);
+}
+
+fn own_key(s: &AppState) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(k) = &s.api_key {
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {k}")) {
+            headers.insert(header::AUTHORIZATION, v);
+        }
+    }
+    headers
+}
+
+/// A production's parts, made in order by their kinds' endpoints (each kept on disk as it is finished, so a restart
+/// goes on from the last one), then joined into one WAV with a chapter per part.
+async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, Vec<u8>, Value), String> {
+    let parts = crate::production::parts_of(plan)?;
+    let total = parts.len();
+    let dir = s.media_jobs.dir.get().cloned();
+    let id = format!("mj-{n}");
+    let mut audio: Vec<Vec<f32>> = Vec::new();
+    let mut chapters = Vec::new();
+    for (i, (kind, body)) in parts.iter().enumerate() {
+        s.media_jobs.set_meta(n, json!({"part": i + 1, "parts": total, "now": kind}));
+        let kept = dir.as_ref().map(|d| d.join(format!("{id}.part-{}.wav", i + 1)));
+        let bytes = match kept.as_ref().and_then(|f| std::fs::read(f).ok()) {
+            Some(b) => b,
+            None => {
+                let mut b = body.clone();
+                b["strata_label"] = json!(id);
+                let r = match *kind {
+                    "speak" => crate::audio_api::speech(State(s.clone()), own_key(s), Json(b)).await,
+                    _ => crate::music::music(State(s.clone()), own_key(s), Json(b)).await,
+                };
+                let ok = r.status().is_success();
+                let body_bytes = axum::body::to_bytes(r.into_body(), 1 << 30).await.map(|b| b.to_vec()).unwrap_or_default();
+                if !ok {
+                    let v: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+                    return Err(format!("part {} of {total} ({kind}): {}", i + 1,
+                                       v["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| String::from_utf8_lossy(&body_bytes).into_owned())));
+                }
+                if let Some(f) = &kept {
+                    let _ = std::fs::write(f, &body_bytes);
+                }
+                body_bytes
+            }
+        };
+        let (rate, ch, samples) = crate::production::read_wav(&bytes).map_err(|e| format!("part {}: {e}", i + 1))?;
+        let mut st = crate::production::to_stereo_48k(rate, ch, &samples);
+        crate::production::even_loudness(&mut st);
+        audio.push(st);
+        chapters.push(crate::production::title(kind, body, i));
+    }
+    let cross = plan["crossfade_s"].as_f64().unwrap_or(1.0).clamp(0.0, 8.0);
+    let (joined, starts) = crate::production::join(&audio, cross);
+    let secs = (joined.len() / 2) as f64 / crate::production::RATE as f64;
+    let marks: Vec<Value> = chapters.iter().zip(&starts).map(|(t, at)| json!({"title": t, "start_s": (at * 10.0).round() / 10.0})).collect();
+    // the parts' files are no longer needed once the whole is kept
+    if let Some(d) = &dir {
+        for i in 1..=total {
+            let _ = std::fs::remove_file(d.join(format!("{id}.part-{i}.wav")));
+        }
+    }
+    Ok(("audio/wav".into(), crate::production::wav(&joined), json!({"chapters": marks, "parts": total, "seconds_of_audio": secs})))
+}
+
+/// POST /v1/media/productions {"name", "parts": [...], "crossfade_s"}: one job for the whole piece (GET /api/jobs/{id}
+/// follows it, part by part; /v1/media/jobs/{id}/content is the WAV, its meta the chapters).
+pub async fn productions(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let Some(profile) = crate::api_access(&s, &headers) else {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    };
+    if profile.as_ref().is_some_and(|p| p.name != "default" && !(p.has("music") || p.has("speech"))) {
+        return error(StatusCode::FORBIDDEN, "permission_error", "this key's profile has neither \"music\" nor \"speech\"");
+    }
+    let caps = s.media_jobs.capabilities().await;
+    match s.media_jobs.submit_production(&req, &caps) {
+        Ok(job) => Json(job).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    }
 }
 
 pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Response {

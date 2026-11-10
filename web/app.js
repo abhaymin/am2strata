@@ -1478,21 +1478,23 @@ const jobs = {};                       // id -> {state, position, ahead, step, s
 function jobCardHtml(id) {
   const j = jobs[id];
   if (!j) return `<span class="muted small">Media job ${esc(id)}…</span>`;
-  const what = {image: "Image", video: "Video", tts: "Speech", song: "Song", music: "Music"}[j.kind] || "Media";
+  const what = {image: "Image", video: "Video", tts: "Speech", song: "Song", music: "Music", production: "Production"}[j.kind] || "Media";
   if (j.state === "done" && j.url) {
     const u = esc(j.url);
     const el = j.mime.startsWith("video/") ? `<video src="${u}" controls loop playsinline></video>`
       : j.mime.startsWith("audio/") ? `<audio src="${u}" controls></audio>` : `<img src="${u}" alt="${esc(j.prompt || what)}">`;
     const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
+    const chapters = (j.meta && j.meta.chapters || []).map((c) => `<li><span class="muted">${fmtClock(c.start_s)}</span> ${esc(c.title)}</li>`).join("");
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
-      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>`;
+      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "");
   }
   // gone from the server (made before it kept jobs, or past the newest it keeps): made again from the same call
   if (j.state === "gone") return `<div class="media-job__gone"><span class="muted small">This ${esc(what.toLowerCase())} is no longer on the server.</span>` +
     (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Make it again</button>` : "") + `</div>`;
   if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>` +
     (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Try again</button>` : "");
-  const where = j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
+  const where = j.kind === "production" && j.meta && j.meta.part ? `part ${j.meta.part} of ${j.meta.parts}${j.meta.now ? ` (${j.meta.now})` : ""}`
+    : j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
     : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
   return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
 }
@@ -1514,6 +1516,7 @@ document.addEventListener("click", async (e) => {
     paintJob(nj.id);
   } catch (err) { b.disabled = false; toast("error", "Not queued", err.message, 6000); }
 });
+const fmtClock = (t) => { t = Math.round(+t || 0); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`; };
 function paintJob(id) {
   document.querySelectorAll(`.media-job[data-job="${CSS.escape(id)}"]`).forEach((e) => { e.innerHTML = jobCardHtml(id); });
 }
