@@ -170,6 +170,10 @@ pub struct Manager {
 /// Free memory a media job needs beside the system's margin (its weights stream to the GPU; buffers, the encoders
 /// and the frames or audio in RAM).
 const MEDIA_JOB_GB: f64 = 2.0;
+/// A video job's RAM: Wan's UMT5-XXL encoder (11.4 GB in FP16) goes to the CPU when the card is short of room, where
+/// candle computes in F32: about 22.7 GB. Measured 2026-11-11: a Wan 2.2 job beside other programs reached 34.9 GB in
+/// the service and the kernel's OOM killer ran.
+pub const VIDEO_JOB_GB: f64 = 24.0;
 
 /// A model's files are warmed up at most this often.
 const WARM_EVERY: Duration = Duration::from_secs(600);
@@ -503,6 +507,11 @@ impl Manager {
     }
 
     pub async fn gpu_exclusive_as(&self, unload_text: bool, kind: &str, label: &str) -> Result<crate::queue::Pass> {
+        self.gpu_exclusive_needing(unload_text, kind, label, MEDIA_JOB_GB).await
+    }
+
+    /// As gpu_exclusive_as, for a job that needs `gb` of free RAM beside the media engine.
+    pub async fn gpu_exclusive_needing(&self, unload_text: bool, kind: &str, label: &str, gb: f64) -> Result<crate::queue::Pass> {
         let w = self.monitor.waiting();
         let need = if unload_text { crate::queue::Need::Gpu } else { crate::queue::Need::Any };
         let p = self.queue.enter(need, kind, label, |_| {}).await
@@ -520,11 +529,11 @@ impl Manager {
         }
         // the job needs some memory beside the media engine: waited for a little (a model that just stopped is still
         // giving its memory back), then refused plainly instead of a job the system kills
-        if let Err(free) = crate::mem::wait_for(MEDIA_JOB_GB, crate::mem::LOAD_WAIT).await {
+        if let Err(free) = crate::mem::wait_for(gb, crate::mem::LOAD_WAIT).await {
             self.monitor.notice("a media job was refused: this PC is short of free memory");
             return Err(anyhow!("not enough free memory for the {kind} job: {free:.1} GB is free, about {:.0} GB is needed \
                                 (with {:.0} GB kept for the system). Close other programs, or try again shortly",
-                               MEDIA_JOB_GB + crate::mem::MARGIN_GB, crate::mem::MARGIN_GB));
+                               gb + crate::mem::MARGIN_GB, crate::mem::MARGIN_GB));
         }
         Ok(p)
     }

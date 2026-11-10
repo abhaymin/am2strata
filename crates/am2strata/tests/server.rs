@@ -677,6 +677,18 @@ fn a_media_job_short_of_memory_is_refused_plainly() {
     assert_eq!(s.post("/v1/chat/completions", &json!({"messages": [user("hi")], "max_tokens": 4})).0, 200, "chat still answers");
 }
 
+/// A video needs far more RAM than an image (Wan's text encoder widens to F32 on the CPU, about 22.7 GB): with 20 GB
+/// free an image is made and a video is refused plainly, before it runs, instead of the system killing programs.
+#[test]
+fn a_video_is_refused_when_the_pc_lacks_its_memory() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({"mem_gb": 20}));
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2}));
+    assert_eq!(c, 200, "{r}");
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "a lighthouse", "frames": 33}));
+    assert_eq!(c, 503, "{r}");
+    assert!(r.to_string().contains("not enough free memory") && r.to_string().contains("26 GB is needed"), "{r}");
+}
+
 /// Production, step 4: answers made while the PC is short of memory carry x-strata-warning, and the alerts say so.
 #[test]
 fn low_memory_is_told_with_every_answer() {
@@ -1495,7 +1507,7 @@ fn a_long_video_is_made_as_a_chain_of_clips() {
     let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
     let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["op"] == "chain").expect("a chain command");
     assert_eq!((chain["request"]["total_frames"].as_u64(), chain["request"]["clip_frames"].as_u64(), chain["request"]["motion_tail_frames"].as_u64()),
-               (Some(480), Some(81), Some(17)));
+               (Some(480), Some(81), Some(1)), "a Wan chain carries one frame from clip to clip (LTX: 17)");
     // one clip's worth: an ordinary generate
     let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "a lighthouse", "frames": 33}));
     assert_eq!(c, 200, "{r}");

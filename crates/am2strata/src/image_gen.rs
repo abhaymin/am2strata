@@ -719,19 +719,21 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let t0 = Instant::now();
     let label = s.media_jobs.label(&req["strata_label"]);
-    let _gpu = match s.mgr.gpu_exclusive_as(!s.media.keep_text_model, "media", &label).await {
+    let _gpu = match s.mgr.gpu_exclusive_needing(!s.media.keep_text_model, "media", &label, crate::manager::VIDEO_JOB_GB).await {
         Ok(g) => g,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "busy", format!("{e:#}")),
     };
     let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance, "seed": seed,
                    "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
-    // longer than one clip: a chain (the clip's frames each, a 17-frame motion tail: 4n+1 for Wan, 8n+1 for LTX)
+    // longer than one clip: a chain of clips. The carry between clips is the family's: Wan continues from the last
+    // frame alone (mold's WAN_HANDOFF_DUPLICATED_FRAMES), LTX from a 17-frame motion tail
+    let tail = if m["family"].as_str().unwrap_or("").starts_with("wan") { 1 } else { 17 };
     let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64))
         .map(|t| t.min(MAX_CHAIN_FRAMES));
     let (op, r) = match total.filter(|t| *t > frames) {
         Some(t) => ("chain", json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
                                     "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
-                                    "motion_tail_frames": 17})),
+                                    "motion_tail_frames": tail})),
         None => ("generate", r),
     };
     let mon = s.mgr.monitor.clone();

@@ -492,6 +492,17 @@ fn load_placed(st: &mut State, model: &str, request: Option<&mold_core::Generate
     Ok(())
 }
 
+/// mold's own messages (where each part was placed, what it loaded, how long it took) go to stderr, which the server's
+/// log keeps: without them a slow or failed video cannot be told apart.
+fn log_progress(ev: &ProgressEvent) {
+    match ev {
+        ProgressEvent::Info { message } => eprintln!("[media] {message}"),
+        ProgressEvent::StageStart { name } => eprintln!("[media] {name}..."),
+        ProgressEvent::StageDone { name, elapsed } => eprintln!("[media] {name}: {:.1} s", elapsed.as_secs_f64()),
+        _ => {}
+    }
+}
+
 fn generate(st: &mut State, req: &Value) -> Result<()> {
     let mut req = req.clone();
     if req.get("model").is_none() {
@@ -524,6 +535,8 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
         if let ProgressEvent::DenoiseStep { step, total, .. } = ev {
             *seen.lock().unwrap() = step;
             emit(json!({"event": "step", "step": step, "total": total}));
+        } else {
+            log_progress(&ev);
         }
     }));
     let resp = engine.generate(&request);
@@ -562,6 +575,7 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
     load_placed(st, &model, None)?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();
+    engine.set_on_progress(Box::new(|ev| log_progress(&ev)));
     let renderer = engine.as_chain_renderer().ok_or_else(|| anyhow!("{model} cannot chain clips"))?;
     let stages = request.stages.len() as u64;
     let mut progress = |ev: mold_core::ChainProgressEvent| {
@@ -571,7 +585,9 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
         }
     };
     let out = mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))
-        .map_err(|e| anyhow!("the chain: {e:?}"))?;
+        .map_err(|e| anyhow!("the chain: {e:?}"));
+    engine.clear_on_progress();
+    let out = out?;
     let n = out.stage_frames.len();
     let boundaries: Vec<mold_core::TransitionMode> = request.stages.iter().skip(1).map(|s| s.transition).collect();
     let fade_lens: Vec<u32> = request.stages.iter().skip(1).map(|s| s.fade_frames.unwrap_or(8)).collect();
