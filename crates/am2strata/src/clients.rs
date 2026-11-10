@@ -136,6 +136,15 @@ impl Clients {
         self.profiles.iter().find(|p| p.name == name)
     }
 
+    /// Settings › Clients: each profile without its key (the key's last 4 characters only).
+    pub fn view(&self) -> Value {
+        let show = |p: &Profile| serde_json::json!({"name": p.name, "tools": p.tools, "memory": p.memory_space(),
+            "media_jobs_per_hour": p.media_jobs_per_hour,
+            "key": p.key.as_deref().map(|k| format!("••••{}", &k[k.len().saturating_sub(4)..]))});
+        serde_json::json!({"profiles": self.profiles.iter().map(show).collect::<Vec<_>>(),
+                           "default": self.default.as_ref().map(show)})
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.profiles.iter().map(|p| p.name.clone()).collect()
     }

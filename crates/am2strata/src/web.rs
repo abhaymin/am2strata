@@ -354,3 +354,11 @@ pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {
     }
     Json(v).into_response()
 }
+
+/// GET /api/clients: the run config's client profiles (keys masked), for Settings › Clients.
+pub async fn clients(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    Json(s.clients.view()).into_response()
+}

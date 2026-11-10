@@ -14,7 +14,7 @@
     beside the text model, finishes inside the answer, waited for up to 3 minutes); image and video `swap` still
     to do (they stay `defer`: queued, shown after the answer);
   - the per-profile limits beyond media jobs an hour (`"limits": {"media_jobs_per_hour": N}`, built 2026-11-11);
-  - Settings › Clients, and Settings › Connect saying which built-in tools am2Strata answers.
+  - Settings › Clients is built (2026-11-11, read only: profiles with masked keys, from GET /api/clients); Settings › Connect saying which built-in tools am2Strata answers is still to do.
 
 The USP (owner, 2026-11-09): a client points at am2Strata, over the OpenAI, Anthropic or Responses API, locally or
 from another PC. It gets memory, web search, image, video and speech generation and the configured MCP tools,

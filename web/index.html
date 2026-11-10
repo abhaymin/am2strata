@@ -400,6 +400,7 @@
         <button type="button" data-sec="memory"><b>Memory</b><span>Facts kept on this PC, chats past the context</span></button>
         <button type="button" data-sec="appearance"><b>Appearance</b><span>Light, dark or system; accent</span></button>
         <button type="button" data-sec="connect"><b>Connect</b><span>Base URLs for your apps</span></button>
+        <button type="button" data-sec="clients"><b>Clients</b><span>Keys with their own tools</span></button>
       </nav>
       <div class="set-body">
 
@@ -601,6 +602,23 @@
               <button type="button" role="radio" data-v="#F2B84B" style="background:#F2B84B" aria-label="Amber"></button>
               <button type="button" role="radio" data-v="#C297FF" style="background:#C297FF" aria-label="Violet"></button>
             </span></div>
+        </section>
+
+        <section class="set-panel" id="sec-clients" aria-labelledby="h-clients" hidden>
+          <h2 id="h-clients">Clients</h2>
+          <div class="st-card"><span class="card-title">Client profiles</span>
+            <p class="muted small">Each client (a laptop, an agent, a phone app) gets its own API key with its own tools and memory. An
+              agent that sends only the address and the key gets these tools with no other setting. They are set in the run
+              config, and used from its next start.</p>
+            <div class="mcp-list" id="clients-list"></div></div>
+          <div class="st-card"><span class="card-title">Add one in the run config</span>
+            <pre class="snippet"><code>"clients": {
+  "laptop": {"key": "a-long-random-key", "tools": ["memory", "web", "image", "speech", "mcp:*"], "memory": "laptop",
+             "limits": {"media_jobs_per_hour": 20}},
+  "default": {"tools": ["web"]}
+}</code></pre>
+            <p class="muted small">Tools: memory, web, image, video, speech, music, browser, code (run_python in the sandbox), and MCP
+              servers by name (mcp:files) or every address server (mcp:*). "default" is what the main key gets.</p></div>
         </section>
 
         <section class="set-panel" id="sec-connect" aria-labelledby="h-connect" hidden>

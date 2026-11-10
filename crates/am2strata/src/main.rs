@@ -502,6 +502,7 @@ async fn main() -> Result<()> {
         .route("/metrics", get(web::metrics))
         .route("/api/monitor/clear", post(web::monitor_clear))
         .route("/api/agents", get(web::agents))
+        .route("/api/clients", get(web::clients))
         .route("/v1beta/models", get(gemini::models))
         .route("/v1beta/models/{target}", get(gemini::model).post(gemini::call))
         .route("/api/monitor/media/{name}", get(web::monitor_media))

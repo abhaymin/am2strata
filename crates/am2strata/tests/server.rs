@@ -1933,6 +1933,12 @@ fn a_client_key_gets_its_profiles_tools_without_flags() {
     assert_eq!(get(PHONE, "/settings"), 401);
     assert_eq!(get(PHONE, "/api/mcp/servers"), 401);
     assert_eq!(get("not-a-key-at-all-00000", "/v1/models"), 401);
+    // Settings › Clients: the profiles, their keys masked; a client key cannot read them
+    let (c, v) = s.get("/api/clients", true);
+    assert_eq!(c, 200);
+    assert_eq!(v["profiles"][0]["key"], "••••6789");
+    assert!(!v.to_string().contains(LAPTOP), "no key in full");
+    assert_eq!(get(PHONE, "/api/clients"), 401);
 }
 
 /// Memory for API calls (on by default): a client with the main key and no flag gets remember / recall / forget,

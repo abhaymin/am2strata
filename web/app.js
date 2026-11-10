@@ -2201,7 +2201,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ Settings: sections
 let section = store.get("settings-section", "models");
 function showSection(name) {
-  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect"].includes(name) ? name : "models";
+  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients"].includes(name) ? name : "models";
   store.set("settings-section", section);
   for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
   for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
@@ -2212,9 +2212,26 @@ function showSection(name) {
   if (section === "memory") loadMemory();
   if (section === "server") loadSystem();
   if (section === "connect") { renderAppSetup(); renderAgents(); }
+  if (section === "clients") loadClients();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
+
+// Settings › Clients: the run config's client profiles (keys masked), read only
+async function loadClients() {
+  try {
+    const r = await fetch("api/clients", {headers: headers()});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const row = (p, main) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(p.name)}</strong>` +
+      `<span class="muted small">${main ? "the main key" : `key ${esc(p.key || "")}`} · memory: ${esc(p.memory)}` +
+      `${p.media_jobs_per_hour != null ? ` · ${fmt(p.media_jobs_per_hour)} media jobs an hour` : ""}</span></div>` +
+      `<div class="mcp-server__tools">${(p.tools || []).map((t) => `<span class="chip">${esc(t)}</span>`).join("") || '<span class="muted small">no tools</span>'}</div></div>`;
+    const rows = (j.profiles || []).map((p) => row(p, false));
+    if (j.default) rows.unshift(row(j.default, true));
+    $("clients-list").innerHTML = rows.join("") || '<p class="muted">No client profiles yet: add one in the run config (below).</p>';
+  } catch (e) { $("clients-list").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
+}
 
 // Settings › Chat defaults: the same settings as the drawer (this browser), optionally shared with other apps
 function loadDefaults() {
