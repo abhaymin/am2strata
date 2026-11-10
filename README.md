@@ -12,10 +12,12 @@ and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
 | Chat | Canvas: an HTML page, live | Python, run in a sandbox |
 | --- | --- | --- |
 | ![A question and its answer, streamed at 68 tok/s](docs/media/screenshot-chat.webp) | ![A digital clock the model wrote, running in the canvas](docs/media/screenshot-canvas.webp) | ![Python from the chat run in the sandbox: no network, home folders hidden](docs/media/screenshot-python.webp) |
-| **Flows and the whiteboard** | **Monitor** | **Coding agents** |
-| ![A Mermaid flow, and shapes drawn on the whiteboard](docs/media/screenshot-whiteboard.webp) | ![The live monitor: speed, GPU load, VRAM, power, CPU](docs/media/screenshot-monitor.webp) | ![Settings › Connect: the coding agents and what each supports](docs/media/screenshot-agents.webp) |
+| **Flows and the whiteboard** | **Monitor: the history, in pages** | **Coding agents** |
+| ![A Mermaid flow, and shapes drawn on the whiteboard](docs/media/screenshot-whiteboard.webp) | ![The Monitor's request history in pages: songs with their players and how much of the lyrics was heard, a video clip and an image](docs/media/screenshot-monitor.webp) | ![Settings › Connect: the coding agents and what each supports](docs/media/screenshot-agents.webp) |
+| **Songs** | | |
+| ![Media Generation › Song: a festive Hindi Diwali song, 3 minutes, 3 takes](docs/media/screenshot-songs.webp) | | |
 
-<sub>Real screenshots of the web app (v0.1.1) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
+<sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
 banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
 am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
