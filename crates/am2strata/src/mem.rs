@@ -154,11 +154,15 @@ mod tests {
     #[test]
     fn low_memory_and_needs() {
         assert!(low(2.0, 64.0) && low(3.5, 128.0) && !low(10.0, 64.0) && !low(0.0, 64.0));
-        let dir = std::env::temp_dir().join(format!("am2-mem-{}", std::process::id()));
+        // a folder of its own for this run (a CI runner may keep an earlier run's temporary files)
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("am2-mem-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let n = Needs::open(&dir);
         n.record("a", 12.0);
         n.record("a", 9.0);
         assert_eq!(Needs::open(&dir).get("a"), Some(12.0), "the largest seen, kept on disk");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
