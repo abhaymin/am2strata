@@ -200,7 +200,7 @@ async function loadMediaModels() {
   try {
     const r = await fetch("api/media/models", {headers: headers()});
     if (!r.ok) {
-      const why = r.status === 401 ? "An API key is needed (About > Settings)." : `The server answered ${r.status}.`;
+      const why = r.status === 401 ? "An API key is needed (Settings › Server and access › API key)." : `The server answered ${r.status}.`;
       $("mm-status").textContent = why; pickerNote(`Models not loaded: ${why}`); return;
     }
     media = await r.json();
@@ -607,7 +607,7 @@ async function poll() {
     const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under Settings › Server and access › API key.", 6000); }
     } else if (r.ok) {
       lastMetrics = await r.json();
       metricsFailures = 0;
@@ -1819,7 +1819,7 @@ async function streamInto(m, el, signal) {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = "This server needs an API key: add it under Settings › Server and access › API key.";
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
