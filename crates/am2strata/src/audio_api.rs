@@ -50,6 +50,9 @@ async fn audio_model(s: &AppState, name: &str, task: &str) -> Result<Value, Resp
 
 pub const MAX_SPEECH_CHARS: usize = 20_000;
 
+/// How long a CPU speech job waits for RAM to come free before it gives up.
+const RAM_WAIT_S: u64 = 600;
+
 /// A language's English name, for messages ("Chinese" for "zh"); the code itself when it is not known here.
 fn language_name(code: &str) -> String {
     let names = [("zh", "Chinese"), ("ja", "Japanese"), ("he", "Hebrew"), ("th", "Thai"), ("en", "English"), ("bn", "Bengali"),
@@ -97,10 +100,19 @@ async fn job(s: &AppState, kind: &'static str, model: &str, size_gb: f64, mut cm
         // measured (2026-11-09): Chatterbox Turbo's 3.3 GB of fp32 weights peak at 5.0 GB while loading
         // the take check's Whisper too (measured: Whisper large-v3-turbo peaks at 5.0 GB for 1.6 GB of weights)
         let need = size_gb * 1.5 + 0.5 + cmd["check_gb"].as_f64().unwrap_or(0.0) * 3.0;
-        let free = mem_available_gb();
+        // in sequence when the RAM is short: the job waits (up to 10 minutes) for what runs beside it to finish and
+        // free its memory, instead of starting and pushing the PC out of RAM, or failing at once
+        let t0 = std::time::Instant::now();
+        let mut free = mem_available_gb();
+        // (with the tests' fixed RAM figure there is nothing to wait for)
+        let wait = if std::env::var("AM2_TEST_MEM_GB").is_ok() { 0 } else { RAM_WAIT_S };
+        while free < need && t0.elapsed() < std::time::Duration::from_secs(wait) {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            free = mem_available_gb();
+        }
         if free < need {
             return Err(error(StatusCode::SERVICE_UNAVAILABLE, "busy",
-                format!("{model} needs about {need:.1} GB of free RAM on the CPU and {free:.1} GB is free: unload the text model or use a smaller speech model")));
+                format!("{model} needs about {need:.1} GB of free RAM on the CPU and {free:.1} GB stayed free for {} minutes: unload the text model or use a smaller speech model", RAM_WAIT_S / 60)));
         }
     }
     cmd.as_object_mut().map(|o| { o.remove("runtime"); o.remove("check_gb") });
