@@ -20,6 +20,10 @@ and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
 <sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
 banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
+**Watch:** [what's new in v0.1.4](https://youtu.be/HP4ztKaqOyo) (4 min: songs that sing their lyrics, MCP servers from
+the app, tools for every app, request routing) · [the full tour](https://youtu.be/OIHOplZPTmE) (10 min) ·
+[Peace and Harmony](https://youtu.be/37CjQ2mGrWo), a music video whose song, words and pictures am2Strata made.
+
 am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
 tokenizer, chat templates, output parsing, the Hugging Face downloader, the launcher and every test. PolyStrata's
 C++/CUDA engines still do the inference. am2Strata uses PolyStrata's run configs and models as they are, so either
