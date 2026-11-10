@@ -426,6 +426,9 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
     let wav = acestep::pipeline::wav(&audio)?;
     Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE, "seconds": duration,
               "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME, "seed": s.seed, "planner": planned,
+              // what the planner's reasoning wrote for a song asked without them
+              "planned": st.song.as_ref().unwrap().last_thought().map(|t| json!({"bpm": t.bpm, "key": t.key_scale,
+                                                                                 "time_signature": t.time_signature})),
               "data": base64::engine::general_purpose::STANDARD.encode(wav)}))
 }
 

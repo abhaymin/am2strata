@@ -78,6 +78,53 @@ pub fn prompts(caption: &str, lyrics: &str, m: &Metas, language: Option<&str>) -
     (chat(&format!("# Caption\n{caption}\n\n# Lyric\n{lyrics}\n"), &reasoning(m, language)), chat(NEGATIVE_PROMPT, "<think>\n\n</think>"))
 }
 
+/// What the planner's reasoning gave for a song without them (ACE-Step's phase 1, `parse_lm_output`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Thought {
+    pub bpm: Option<u32>,
+    pub key_scale: Option<String>,
+    pub time_signature: Option<String>,
+}
+
+/// The reasoning's `key: value` lines (a value may go on over indented lines): the tempo, key and time signature, each
+/// kept only when it reads as one (30-300 bpm; "<note> major/minor"; 2, 3, 4 or 6 beats).
+pub fn parse_thought(text: &str) -> Thought {
+    let body = text.split("</think>").next().unwrap_or(text);
+    let body = body.rsplit("<think>").next().unwrap_or(body);
+    let mut t = Thought::default();
+    for line in body.lines() {
+        let Some((k, v)) = line.split_once(':') else { continue };
+        if line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let v = v.trim().trim_matches(|c| c == '\'' || c == '"');
+        match k.trim().to_ascii_lowercase().as_str() {
+            "bpm" => t.bpm = v.parse::<f64>().ok().map(|b| b.round() as u32).filter(|b| (30..=300).contains(b)),
+            "keyscale" => {
+                let ok = {
+                    let mut w = v.split_whitespace();
+                    let note = w.next().unwrap_or("");
+                    let mode = w.next().unwrap_or("").to_ascii_lowercase();
+                    let n = note.as_bytes();
+                    !n.is_empty() && (b'A'..=b'G').contains(&n[0].to_ascii_uppercase())
+                        && note.len() <= 2 && matches!(mode.as_str(), "major" | "minor") && w.next().is_none()
+                };
+                if ok {
+                    t.key_scale = Some(v.to_string());
+                }
+            }
+            "timesignature" => {
+                let n = v.split('/').next().unwrap_or("").trim();
+                if matches!(n, "2" | "3" | "4" | "6") {
+                    t.time_signature = Some(n.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    t
+}
+
 pub struct Planner {
     model: qwen3::ModelForCausalLM,
     tok: Tokenizer,
@@ -132,6 +179,40 @@ impl Planner {
             u_off += 1;
         }
         Ok(out)
+    }
+
+    /// The planner's own reasoning for a song (ACE-Step's phase 1, without guidance): written after the caption and
+    /// lyrics until `</think>` (at most 400 tokens), sampled among the text tokens only; its tempo, key and time signature.
+    pub fn think(&mut self, caption: &str, lyrics: &str, s: &Sampling) -> Result<(Thought, String)> {
+        let prompt = format!("<|im_start|>system\n# Instruction\n{INSTRUCTION}\n\n<|im_end|>\n<|im_start|>user\n\
+                              # Caption\n{caption}\n\n# Lyric\n{lyrics}\n<|im_end|>\n<|im_start|>assistant\n");
+        let ids = self.ids(&prompt)?;
+        self.model.clear_kv_cache();
+        let mut m = self.model.clone();
+        let text_vocab = FIRST_CODE_TOKEN as usize;
+        let logits = |m: &mut qwen3::ModelForCausalLM, ids: &[u32], off: usize, dev: &Device| -> Result<Vec<f32>> {
+            let x = Tensor::new(ids, dev)?.unsqueeze(0)?;
+            Ok(m.forward(&x, off)?.flatten_all()?.narrow(0, 0, text_vocab)?.to_dtype(DType::F32)?.to_vec1()?)
+        };
+        let mut l = logits(&mut m, &ids, 0, &self.device)?;
+        let mut off = ids.len();
+        let mut rng = SplitMix(s.seed ^ 0x5DEE_CE66_D1CE_4E5B);
+        let mut out: Vec<u32> = Vec::new();
+        for _ in 0..400 {
+            let t = choose(&l, s, &mut rng);
+            if t == 151_645 || t == 151_643 {
+                break; // <|im_end|>, <|endoftext|>
+            }
+            out.push(t);
+            let so_far = self.tok.decode(&out, false).map_err(|e| anyhow!("{e}"))?;
+            if so_far.contains("</think>") {
+                break;
+            }
+            l = logits(&mut m, &[t], off, &self.device)?;
+            off += 1;
+        }
+        let text = self.tok.decode(&out, false).map_err(|e| anyhow!("{e}"))?;
+        Ok((parse_thought(&text), text))
     }
 
     /// `n` codes for the prompts; `on_code` sees each (done, n).
@@ -244,6 +325,16 @@ mod tests {
                    "<think>\nduration: 30\nlanguage: hi\ntimesignature: 3\n</think>");
         assert_eq!(yaml_scalar("yes"), "'yes'");
         assert_eq!(yaml_scalar("F# minor"), "F# minor");
+    }
+
+    #[test]
+    fn the_reasoning_s_values_are_read_and_checked() {
+        let t = parse_thought("<think>\nbpm: 96\ncaption: a warm pop song with\n  acoustic guitar\nduration: 60\nkeyscale: F# minor\n\
+                               language: en\ntimesignature: 4\n</think>");
+        assert_eq!(t, Thought { bpm: Some(96), key_scale: Some("F# minor".into()), time_signature: Some("4".into()) });
+        let bad = parse_thought("bpm: 900\nkeyscale: H dorian\ntimesignature: 7/8");
+        assert_eq!(bad, Thought::default());
+        assert_eq!(parse_thought("timesignature: '3/4'").time_signature.as_deref(), Some("3"));
     }
 
     #[test]

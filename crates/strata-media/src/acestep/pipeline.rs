@@ -82,6 +82,7 @@ pub struct AceStep {
     /// the planner, loaded at its first song (3.4 GB in bf16); its folder, if downloaded
     planner: Option<planner::Planner>,
     planner_dir: Option<std::path::PathBuf>,
+    thought: Option<planner::Thought>,
     dtype: DType,
     device: Device,
 }
@@ -106,19 +107,29 @@ impl AceStep {
         let vbv = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("vae/diffusion_pytorch_model.safetensors")], DType::F32, device)? };
         let vae = oobleck::Decoder::new(vbv.pp("decoder"))?;
         let silence = silence_latent(&ck.join("silence_latent.pt"), device)?.to_dtype(dtype)?;
-        Ok(Self { text, cond, dit, vae, silence, detok, planner: None, planner_dir, dtype, device: device.clone() })
+        Ok(Self { text, cond, dit, vae, silence, detok, planner: None, planner_dir, thought: None, dtype, device: device.clone() })
     }
 
     pub fn has_planner(&self) -> bool {
         self.planner_dir.is_some()
     }
 
-    /// The planner's codes for the song (`secs` * 5 of them); `on_code` sees each.
-    pub fn plan(&mut self, s: &Song, sampling: &planner::Sampling, secs: usize, on_code: &mut dyn FnMut(usize, usize)) -> Result<Vec<u32>> {
+    fn ensure_planner(&mut self) -> Result<()> {
         if self.planner.is_none() {
             let d = self.planner_dir.as_ref().ok_or_else(|| anyhow!("the song planner ({PLANNER_DIR}) is not downloaded"))?;
             self.planner = Some(planner::Planner::load(d, &self.device)?);
         }
+        Ok(())
+    }
+
+    /// What the planner's reasoning filled in for the last song (None: nothing was missing, or no planner).
+    pub fn last_thought(&self) -> Option<planner::Thought> {
+        self.thought.clone()
+    }
+
+    /// The planner's codes for the song (`secs` * 5 of them); `on_code` sees each.
+    pub fn plan(&mut self, s: &Song, sampling: &planner::Sampling, secs: usize, on_code: &mut dyn FnMut(usize, usize)) -> Result<Vec<u32>> {
+        self.ensure_planner()?;
         // the vocal language in the planner's reasoning for every language but English: measured on this PC
         // (Whisper, lyric words heard in order), 3-minute Hindi songs went from 32% to 60% with it, 60 s English
         // songs from 91% to 76%; ACE-Step itself leaves it out when the other values are all given
@@ -130,9 +141,26 @@ impl AceStep {
     /// The song's latent [1, frames, 64]: `on_step` sees each step (done, total): the planner's codes, if it is used,
     /// then the diffusion steps.
     pub fn latent(&mut self, s: &Song, on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
+        self.thought = None;
         let secs = s.metas.duration_s.clamp(MIN_SECONDS, MAX_SECONDS) as usize;
         let frames = secs * FRAMES_PER_SECOND;
         let plan = s.plan.clone().filter(|_| self.has_planner());
+        // a song without its tempo, key or time signature: the planner's reasoning writes them first (ACE-Step's phase
+        // 1), and both the planner and the DiT get them
+        let mut s = s.clone();
+        if let Some(sampling) = &plan {
+            let m = &s.metas;
+            if m.bpm.is_none() || m.key_scale.is_none() || m.time_signature.is_none() {
+                self.ensure_planner()?;
+                let (t, text) = self.planner.as_mut().unwrap().think(&s.caption, &s.lyrics, sampling)?;
+                eprintln!("the planner's reasoning: {t:?} ({} characters)", text.len());
+                if s.metas.bpm.is_none() { s.metas.bpm = t.bpm; }
+                if s.metas.key_scale.is_none() { s.metas.key_scale = t.key_scale.clone(); }
+                if s.metas.time_signature.is_none() { s.metas.time_signature = t.time_signature.clone(); }
+                self.thought = Some(t);
+            }
+        }
+        let s = &s;
         let n_codes = if plan.is_some() { secs * planner::CODES_PER_SECOND } else { 0 };
         let total = n_codes + s.steps;
         // the planner's codes as the source (ACE-Step's "cover" of the planned song), else silence
@@ -276,7 +304,8 @@ mod tests {
                  [chorus]\nOne command and it begins\nA voice of mine, a song within".into()
             }),
             language: env("ACESTEP_LANG").unwrap_or_else(|| "en".into()),
-            metas: text::Metas { bpm: Some(100), time_signature: Some("4".into()), key_scale: Some("C major".into()), duration_s: secs },
+            metas: if std::env::var("ACESTEP_NO_METAS").is_ok() { text::Metas { duration_s: secs, ..Default::default() } }
+                   else { text::Metas { bpm: Some(100), time_signature: Some("4".into()), key_scale: Some("C major".into()), duration_s: secs } },
             seed: std::env::var("ACESTEP_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(42), steps: 8, shift: 1.0,
             plan: (std::env::var("ACESTEP_PLANNER").as_deref() != Ok("0"))
                 .then(|| planner::Sampling { seed: 42, ..Default::default() }),

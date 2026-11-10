@@ -224,5 +224,7 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
         .header("x-strata-language", language).header("x-strata-seed", seed.to_string())
         .header("x-strata-ms", t0.elapsed().as_millis().to_string())
         .header("x-strata-lyrics-heard", if best >= 0.0 { format!("{best:.2}") } else { "-".into() })
+        // the planner's tempo, key and time signature, for a song asked without them
+        .header("x-strata-planned", v["planned"].to_string())
         .body(Body::from(wav)).unwrap()
 }
