@@ -6,7 +6,7 @@
 //! Unsloth install, so an agent gets this server's key from UNSLOTH_API_KEY or --api-key.
 
 use crate::manager::ModelEntry;
-use crate::{authorized, error, AppState};
+use crate::{error, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -31,7 +31,7 @@ async fn resident(s: &AppState) -> Option<ModelEntry> {
 
 /// GET /api/inference/loaded-models. `context_length` becomes the agent's context window.
 pub async fn loaded_models(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let data: Vec<Value> = resident(&s).await.iter()
@@ -44,7 +44,7 @@ pub async fn loaded_models(State(s): State<AppState>, headers: HeaderMap) -> Res
 /// GET /api/inference/status. `is_gguf` opens Codex, which Unsloth keeps to llama-server's GGUF models because its
 /// other back end has no Responses API; this server has one for every model.
 pub async fn status(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let m = resident(&s).await;
@@ -56,7 +56,7 @@ pub async fn status(State(s): State<AppState>, headers: HeaderMap) -> Response {
 /// POST /api/inference/load, for `unsloth start --model`. The model's run config decides how it loads, so a setting
 /// this load would not apply is refused rather than dropped.
 pub async fn load(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let Some(name) = req.get("model_path").and_then(Value::as_str) else {

@@ -1,5 +1,19 @@
 # Server tools for every client: memory, web, media and MCP, run by am2Strata
 
+**State (2026-11-10):**
+- **Built:**
+  - part 1, client profiles: `clients.rs`; the key picks the profile; `x-strata-tools` narrows it and never widens it; each profile has its own memory space; a client key opens the model APIs, not the settings;
+  - part 2, Anthropic's `web_search_*` and `web_fetch_*` server tools: `server_tool_use`, `web_search_tool_result` and `web_fetch_tool_result` blocks, `usage.server_tool_use`;
+  - part 2, the Responses `web_search` tool: `web_search_call` items;
+  - part 2, Chat Completions' `web_search_options`;
+  - part 4, `agentrun --tools`: the header through Claude Code's `ANTHROPIC_CUSTOM_HEADERS`, Codex's `http_headers` and OpenCode's `headers`.
+- **Tested:** `a_client_key_gets_its_profiles_tools_without_flags`, `anthropic_web_search_is_answered_by_the_server`, `anthropic_web_search_needs_a_profile_with_web` and `responses_web_search_gives_a_web_search_call_item`.
+- **Next:**
+  - the Responses `image_generation` and `mcp` hosted tools, and Gemini's `google_search`;
+  - part 3, media inside the turn (speech on the CPU; `defer` / `swap`);
+  - the per-profile limits;
+  - Settings › Clients, and Settings › Connect saying which built-in tools am2Strata answers.
+
 The USP (owner, 2026-11-09): a client points at am2Strata, over the OpenAI, Anthropic or Responses API, locally or
 from another PC. It gets memory, web search, image, video and speech generation and the configured MCP tools,
 without setting up any of them. **The server runs the tools inside the call.** The client's configuration lives on

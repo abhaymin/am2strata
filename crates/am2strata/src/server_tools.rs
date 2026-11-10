@@ -1,6 +1,8 @@
 //! The tools this server runs itself, for every API (OpenAI chat, Anthropic messages, Responses): the config's MCP
 //! servers (`"strata_mcp": true`, this server's own page only), the memory tools (a request with memory, when the
-//! settings allow them), the media tools (`"strata_media": true`) and web search (`"strata_web": true`). They are added to the request's tool list;
+//! settings allow them), the media tools (`"strata_media": true`) and web search (`"strata_web": true`), or, with no
+//! flag at all, the sets of the key's client profile (clients.rs; `x-strata-tools` narrows them for one request).
+//! They are added to the request's tool list;
 //! the model's calls to them are run in run::start_mcp's loop and the rest of the turn goes on. The request's own
 //! tools win a name clash, and a forced tool_choice is left alone.
 
@@ -33,13 +35,34 @@ fn add(prep: &mut Prepared, offered: &mut Offered, extra: Vec<Value>) {
 pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Prepared, opts: &mut RunOpts, structured: bool)
                    -> Result<Offered, Response> {
     let mut offered: Offered = None;
-    // MCP tools run with the user's rights on this PC, so only for this server's own page
-    if let (Some(true), Some(hub)) = (req.get("strata_mcp").and_then(Value::as_bool), s.mcp.clone()) {
+    // the key's client profile (the main key's "default" one, if the run config has it), narrowed by x-strata-tools
+    let mut profile = crate::api_access(s, headers).flatten();
+    if let Some(h) = headers.get("x-strata-tools").and_then(|v| v.to_str().ok()) {
+        profile = match profile {
+            Some(p) => Some(p.narrowed(h).map_err(|e| error(StatusCode::FORBIDDEN, "permission_error", e))?),
+            None => return Err(error(StatusCode::FORBIDDEN, "permission_error",
+                                     "x-strata-tools: this key has no client profile (the run config's \"clients\" gives keys their tools)")),
+        };
+    }
+    let has = |set: &str| profile.as_ref().is_some_and(|p| p.has(set));
+    let client = profile.as_ref().filter(|p| p.name != "default");
+    // memory: a client profile's requests use its own space, and only when the profile has memory
+    if let Some(p) = client {
+        opts.memory = p.has("memory").then(|| p.memory_space());
+    } else if opts.memory.is_none() && has("memory") {
+        opts.memory = Some(profile.as_ref().map(|p| p.memory_space()).filter(|m| m != "default").unwrap_or_else(|| "api".into()));
+    }
+    // MCP tools run with the user's rights on this PC: every server for this server's own page (strata_mcp), or the
+    // servers a profile names (address servers with mcp:*; a program server only by its name); never another web page
+    let flag_mcp = req.get("strata_mcp").and_then(Value::as_bool) == Some(true);
+    let (mcp_names, mcp_all) = profile.as_ref().map(|p| p.mcp()).unwrap_or_default();
+    if let (true, Some(hub)) = (flag_mcp || !mcp_names.is_empty() || mcp_all, s.mcp.clone()) {
         if crate::foreign_origin(s, headers) {
             return Err(crate::not_own_page("MCP tools can be used"));
         }
         hub.wait(Duration::from_secs(10)).await; // servers still starting (only right after the start)
-        let extra = hub.template_tools(&own_names(prep));
+        let allowed = |srv: &crate::mcp::McpServer| flag_mcp || mcp_names.contains(&srv.name) || (mcp_all && !srv.is_command());
+        let extra = hub.template_tools_of(&own_names(prep), Some(&allowed));
         if !extra.is_empty() {
             if forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref()).is_some() {
                 return Err(error(StatusCode::BAD_REQUEST, "invalid_request_error", "a forced tool_choice with MCP tools is not supported"));
@@ -58,10 +81,20 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             add(prep, &mut offered, extra);
         }
     }
-    // generate_image / generate_video / speak, for the kinds this PC can make; never for another web page
-    if req.get("strata_media") == Some(&Value::Bool(true)) && !structured && !forced && s.media.available()
-        && !crate::foreign_origin(s, headers) {
-        let caps = s.media_jobs.capabilities().await;
+    // generate_image / generate_video / speak / make_song, for the kinds this PC can make (all with strata_media,
+    // else the profile's); never for another web page
+    let flag_media = req.get("strata_media") == Some(&Value::Bool(true));
+    let kinds: Vec<&str> = [("image", "image"), ("video", "video"), ("speech", "tts"), ("music", "music")].iter()
+        .filter(|(set, _)| flag_media || has(set)).map(|(_, k)| *k).collect();
+    if !kinds.is_empty() && !structured && !forced && s.media.available() && !crate::foreign_origin(s, headers) {
+        let mut caps = s.media_jobs.capabilities().await;
+        if let Some(all) = caps["kinds"].as_object_mut() {
+            for (k, v) in all.iter_mut() {
+                if !kinds.contains(&k.as_str()) {
+                    v["usable"] = Value::Bool(false);
+                }
+            }
+        }
         let own = own_names(prep);
         let extra: Vec<Value> = crate::media_jobs::Jobs::tools(&caps).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
         if !extra.is_empty() {
@@ -80,8 +113,13 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             }
         }
     }
-    // web_search / fetch_url: the queries leave this PC, so only for a request that asks
-    if req.get("strata_web") == Some(&Value::Bool(true)) && !structured && !forced {
+    // Chat Completions' web_search_options: web search for this request, which a key's profile must allow
+    if req.get("web_search_options").is_some_and(|o| !o.is_null()) && !has("web") && req.get("strata_web") != Some(&Value::Bool(true)) {
+        return Err(error(StatusCode::BAD_REQUEST, "invalid_request_error",
+                         "web_search_options: web search is answered for a key whose client profile has \"web\" (the run config's \"clients\")"));
+    }
+    // web_search / fetch_url: the queries leave this PC, so only for a request that asks (or a profile with "web")
+    if (req.get("strata_web") == Some(&Value::Bool(true)) || has("web")) && !structured && !forced {
         if let Some(w) = s.mgr.web.get() {
             let own = own_names(prep);
             let extra: Vec<Value> = w.tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();

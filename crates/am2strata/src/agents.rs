@@ -120,6 +120,8 @@ pub struct Target {
     pub model: String,
     /// the small, fast one (Claude Code's haiku and background work); the main model when not given
     pub small: Option<String>,
+    /// the server tools this run asks for (sent as the x-strata-tools header: "web,image"), within the key's profile
+    pub tools: Option<String>,
 }
 
 impl Target {
@@ -176,6 +178,9 @@ pub fn start(name: &str, t: &Target, tmp: &Path) -> Result<Plan, String> {
             p.env("ANTHROPIC_DEFAULT_SONNET_MODEL", &t.model);
             p.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", t.small());
             p.env("CLAUDE_CODE_SUBAGENT_MODEL", &t.model);
+            if let Some(tools) = &t.tools {
+                p.env("ANTHROPIC_CUSTOM_HEADERS", format!("x-strata-tools: {tools}"));
+            }
         }
         "codex" => {
             p.args = codex_overrides(t);
@@ -227,6 +232,9 @@ pub fn start(name: &str, t: &Target, tmp: &Path) -> Result<Plan, String> {
             _ => format!("{} is set up in its own settings: `am2strata agent show {}` says what to enter", a.label, a.name),
         }),
     }
+    if t.tools.is_some() && !matches!(a.name, "claude" | "codex" | "opencode") {
+        p.notes.push(format!("{} sends no extra headers: --tools is left out, and the key's client profile alone picks the server's tools", a.label));
+    }
     Ok(p)
 }
 
@@ -234,6 +242,9 @@ fn codex_provider_toml(t: &Target) -> String {
     let mut s = format!("name = \"am2Strata\", base_url = \"{}\", wire_api = \"responses\"", t.v1());
     if t.key.is_some() {
         s.push_str(&format!(", env_key = \"{KEY_VAR}\""));
+    }
+    if let Some(tools) = &t.tools {
+        s.push_str(&format!(", http_headers = {{ \"x-strata-tools\" = \"{}\" }}", tools.replace('"', "")));
     }
     s
 }
@@ -245,6 +256,14 @@ fn codex_overrides(t: &Target) -> Vec<String> {
          "-m".into(), t.model.clone()]
 }
 
+fn opencode_options(t: &Target) -> Value {
+    let mut o = json!({"baseURL": t.v1(), "apiKey": t.key_or(&format!("{{env:{KEY_VAR}}}"))});
+    if let Some(tools) = &t.tools {
+        o["headers"] = json!({"x-strata-tools": tools});
+    }
+    o
+}
+
 fn opencode_config(t: &Target) -> Value {
     let mut models = Map::new();
     for m in [Some(t.model.as_str()), t.small.as_deref()].into_iter().flatten() {
@@ -252,7 +271,7 @@ fn opencode_config(t: &Target) -> Value {
     }
     json!({"$schema": "https://opencode.ai/config.json",
            "provider": {PROVIDER: {"npm": "@ai-sdk/openai-compatible", "name": "am2Strata",
-                                   "options": {"baseURL": t.v1(), "apiKey": t.key_or(&format!("{{env:{KEY_VAR}}}"))},
+                                   "options": opencode_options(t),
                                    "models": models}},
            "model": format!("{PROVIDER}/{}", t.model),
            "small_model": format!("{PROVIDER}/{}", t.small())})
@@ -514,11 +533,30 @@ pub fn list(t: &Target) -> Value {
 }
 
 #[cfg(test)]
+mod tools_header_tests {
+    use super::*;
+
+    #[test]
+    fn tools_become_the_x_strata_tools_header() {
+        let t = Target { url: "http://h:8000".into(), key: Some("k".into()), model: "m".into(), small: None, tools: Some("web,image".into()) };
+        let tmp = std::env::temp_dir();
+        let c = start("claude", &t, &tmp).unwrap();
+        assert!(c.env.contains(&("ANTHROPIC_CUSTOM_HEADERS".into(), "x-strata-tools: web,image".into())));
+        let x = start("codex", &t, &tmp).unwrap();
+        assert!(x.args.iter().any(|a| a.contains(r#"http_headers = { "x-strata-tools" = "web,image" }"#)), "{:?}", x.args);
+        let o = start("opencode", &t, &tmp).unwrap();
+        assert!(o.env.iter().any(|(k, v)| k == "OPENCODE_CONFIG_CONTENT" && v.contains(r#""x-strata-tools":"web,image""#)));
+        let q = start("qwen", &t, &tmp).unwrap();
+        assert!(q.notes.iter().any(|n| n.contains("no extra headers")));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     fn t(key: bool) -> Target {
-        Target { url: "http://10.0.0.5:8000".into(), key: key.then(|| "sk-test".into()), model: "tiel".into(), small: Some("lfm2".into()) }
+        Target { url: "http://10.0.0.5:8000".into(), key: key.then(|| "sk-test".into()), model: "tiel".into(), small: Some("lfm2".into()), tools: None }
     }
 
     #[test]

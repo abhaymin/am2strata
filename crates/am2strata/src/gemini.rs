@@ -247,7 +247,7 @@ pub fn from_openai(r: &Value, model: &str) -> Value {
 pub async fn call(State(s): State<AppState>, headers: HeaderMap, Path(target): Path<String>, Query(q): Query<HashMap<String, String>>,
                   body: Bytes) -> Response {
     let headers = with_key(&headers, &q);
-    if !crate::authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return gerror(StatusCode::UNAUTHORIZED, "a valid API key is required (x-goog-api-key or ?key=)");
     }
     let Some((model, method)) = target.rsplit_once(':') else {
@@ -404,7 +404,7 @@ fn model_entry(id: &str, name: &str) -> Value {
 /// GET /v1beta/models: the installed models, in Gemini's list.
 pub async fn models(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let headers = with_key(&headers, &q);
-    if !crate::authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return gerror(StatusCode::UNAUTHORIZED, "a valid API key is required (x-goog-api-key or ?key=)");
     }
     let list = s.mgr.list().await;
@@ -416,7 +416,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap, Query(q): Que
 /// GET /v1beta/models/<model>
 pub async fn model(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Query(q): Query<HashMap<String, String>>) -> Response {
     let headers = with_key(&headers, &q);
-    if !crate::authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return gerror(StatusCode::UNAUTHORIZED, "a valid API key is required (x-goog-api-key or ?key=)");
     }
     match s.mgr.entry(&id) {

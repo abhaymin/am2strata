@@ -1,7 +1,7 @@
 //! Anthropic Messages: /v1/messages (streaming and not) and /v1/messages/count_tokens.
 
 use crate::run::{self, RunEvent};
-use crate::{authorized, media, AppState};
+use crate::{media, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -19,7 +19,7 @@ fn anthropic_error(status: StatusCode, kind: &str, msg: impl Into<String>) -> Re
 }
 
 pub async fn count_tokens(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let (loaded, _early_pass) = match s.mgr.ensure_with_turn().await {
@@ -33,12 +33,27 @@ pub async fn count_tokens(State(s): State<AppState>, headers: HeaderMap, Json(re
 }
 
 pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return anthropic_error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if let Err(e) = media::expand_videos(&mut req).await {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
+    // the API's own server tools (Claude Code's WebSearch: web_search_20250305; web_fetch_*), answered by this server's
+    // web search for a key whose client profile has "web"
+    let web = match server_tools_of(&mut req) {
+        Some(w) => {
+            let profile = crate::api_access(&s, &headers).flatten();
+            if !profile.is_some_and(|p| p.has("web")) || s.mgr.web.get().is_none() {
+                return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error",
+                    "web_search / web_fetch: this server answers them for a key whose client profile has \"web\" \
+                     (the run config's \"clients\", e.g. \"default\": {\"tools\": [\"web\"]})");
+            }
+            req["strata_web"] = json!(true);
+            w
+        }
+        None => WebServerTools::default(),
+    };
     let (loaded, early_pass) = match s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await {
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
@@ -86,10 +101,40 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         let mut index: i64 = -1;
         let mut open: Option<&'static str> = None;
         let mut used_tool = false;
+        // the server tool calls shown to the client: the loop's call id -> the API's tool name
+        let mut srv: std::collections::HashMap<String, &'static str> = std::collections::HashMap::new();
+        let (mut searches, mut fetches) = (0u64, 0u64);
         let (mut streamed, mut finished) = (HashSet::new(), HashSet::new());
         while let Some(ev) = events.recv().await {
             let mut out: Vec<Option<(String, Value)>> = Vec::new();
             match ev {
+                RunEvent::Mcp(v) if web.shows(&v, &srv) => {
+                    if open.take().is_some() {
+                        out.push(send("content_block_stop", json!({"type": "content_block_stop", "index": index})));
+                    }
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    let use_id = format!("srvtoolu_{}", id.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>());
+                    index += 1;
+                    if v["event"] == "call" {
+                        let name: &'static str = if v["name"] == "web_search" { "web_search" } else { "web_fetch" };
+                        srv.insert(id, name);
+                        let input = if name == "web_search" { json!({"query": v["arguments"]["query"]}) } else { json!({"url": v["arguments"]["url"]}) };
+                        out.push(send("content_block_start", json!({"type": "content_block_start", "index": index,
+                            "content_block": {"type": "server_tool_use", "id": use_id, "name": name, "input": {}}})));
+                        out.push(send("content_block_delta", json!({"type": "content_block_delta", "index": index,
+                            "delta": {"type": "input_json_delta", "partial_json": input.to_string()}})));
+                    } else {
+                        let block = if srv.get(&id) == Some(&"web_search") {
+                            searches += 1;
+                            web_search_result(&use_id, &v)
+                        } else {
+                            fetches += 1;
+                            web_fetch_result(&use_id, &v)
+                        };
+                        out.push(send("content_block_start", json!({"type": "content_block_start", "index": index, "content_block": block})));
+                    }
+                    out.push(send("content_block_stop", json!({"type": "content_block_stop", "index": index})));
+                }
                 RunEvent::Ping | RunEvent::Mcp(_) => out.push(None),
                 RunEvent::Event(Event::ToolArgs { text, .. }) => out.push(send("content_block_delta", json!({
                     "type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": text}}))),
@@ -156,10 +201,13 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
                         match sum.finish.as_str() { "length" => "max_tokens", _ => "end_turn" }
                     };
                     let reused = sum.reused.min(n_prompt.saturating_sub(1));
+                    let mut usage = json!({"input_tokens": n_prompt - reused, "cache_read_input_tokens": reused,
+                                           "output_tokens": sum.completion_tokens});
+                    if searches + fetches > 0 {
+                        usage["server_tool_use"] = json!({"web_search_requests": searches, "web_fetch_requests": fetches});
+                    }
                     out.push(send("message_delta", json!({"type": "message_delta",
-                        "delta": {"stop_reason": stop, "stop_sequence": sum.stop_sequence},
-                        "usage": {"input_tokens": n_prompt - reused, "cache_read_input_tokens": reused,
-                                  "output_tokens": sum.completion_tokens}})));
+                        "delta": {"stop_reason": stop, "stop_sequence": sum.stop_sequence}, "usage": usage})));
                     out.push(send("message_stop", json!({"type": "message_stop"})));
                     for o in out {
                         let _ = tx.send(o).await;
@@ -189,6 +237,65 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         return Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(10))).into_response();
     }
     collect(rx).await
+}
+
+/// Which of the API's own server tools a request asked for (taken out of its tool list: they are not the client's).
+#[derive(Default, Clone, Copy)]
+struct WebServerTools {
+    search: bool,
+    fetch: bool,
+}
+
+impl WebServerTools {
+    /// Is this tool-loop event one to show the client as a server tool block?
+    fn shows(&self, v: &Value, seen: &std::collections::HashMap<String, &'static str>) -> bool {
+        match v["event"].as_str() {
+            Some("call") => (self.search && v["name"] == "web_search") || (self.fetch && v["name"] == "fetch_url"),
+            Some("result") => v["id"].as_str().is_some_and(|id| seen.contains_key(id)),
+            _ => false,
+        }
+    }
+}
+
+fn server_tools_of(req: &mut Value) -> Option<WebServerTools> {
+    let tools = req.get_mut("tools").and_then(Value::as_array_mut)?;
+    let kind = |t: &Value| t.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut w = WebServerTools::default();
+    tools.retain(|t| {
+        let k = kind(t);
+        if k.starts_with("web_search_") {
+            w.search = true;
+            false
+        } else if k.starts_with("web_fetch_") {
+            w.fetch = true;
+            false
+        } else {
+            true
+        }
+    });
+    (w.search || w.fetch).then_some(w)
+}
+
+/// A web search's result block: the pages found, as Anthropic's `web_search_tool_result`.
+fn web_search_result(use_id: &str, v: &Value) -> Value {
+    if v["ok"] != true {
+        return json!({"type": "web_search_tool_result", "tool_use_id": use_id,
+                      "content": {"type": "web_search_tool_result_error", "error_code": "unavailable"}});
+    }
+    let pages: Vec<Value> = v["sources"].as_array().into_iter().flatten().map(|p| json!({
+        "type": "web_search_result", "url": p["url"], "title": p["title"], "encrypted_content": "", "page_age": null})).collect();
+    json!({"type": "web_search_tool_result", "tool_use_id": use_id, "content": pages})
+}
+
+/// A page read, as Anthropic's `web_fetch_tool_result`.
+fn web_fetch_result(use_id: &str, v: &Value) -> Value {
+    let src = v["sources"].get(0).cloned().unwrap_or(json!({}));
+    if v["ok"] != true {
+        return json!({"type": "web_fetch_tool_result", "tool_use_id": use_id,
+                      "content": {"type": "web_fetch_tool_error", "error_code": "unavailable"}});
+    }
+    json!({"type": "web_fetch_tool_result", "tool_use_id": use_id, "content": {"type": "web_fetch_result", "url": src["url"],
+           "content": {"type": "document", "title": src["title"], "source": {"type": "text", "media_type": "text/plain", "data": v["text"]}}}})
 }
 
 /// The events merged into one message (serve/server.py anthropic_collect).

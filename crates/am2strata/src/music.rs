@@ -5,7 +5,7 @@
 //!  "response_format": "wav"} -> audio/wav (48 kHz stereo).
 //! A GPU job like an image: the text model stops for it and loads again with the next chat.
 
-use crate::{authorized, error, AppState};
+use crate::{error, AppState};
 use axum::{body::Body, extract::State, http::{header, HeaderMap, StatusCode}, response::Response, Json};
 use serde_json::{json, Value};
 
@@ -67,7 +67,7 @@ pub fn style_for(genre: Option<&str>, style: Option<&str>) -> Result<String, Str
 
 /// GET /api/media/genres: the genres by name with their styles.
 pub async fn genres(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     use axum::response::IntoResponse;
@@ -105,7 +105,7 @@ fn bad(msg: impl Into<String>) -> Response {
 }
 
 pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {

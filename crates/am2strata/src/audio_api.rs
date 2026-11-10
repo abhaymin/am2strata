@@ -197,7 +197,7 @@ fn stamp(t: f64, sep: char) -> String {
 }
 
 async fn transcribe(s: AppState, headers: HeaderMap, req: Request, translate: bool) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {
@@ -296,7 +296,7 @@ pub async fn translations(State(s): State<AppState>, headers: HeaderMap, req: Re
 
 /// POST /v1/audio/speech
 pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {

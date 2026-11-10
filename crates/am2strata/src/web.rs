@@ -260,7 +260,8 @@ pub async fn agents(State(s): State<AppState>, headers: HeaderMap, Query(q): Que
     let remote = q.contains_key("url");
     // a remote server's key is the user's to know; this one's: whether it has one
     let key = (remote || s.api_key.as_deref().is_some_and(|k| !k.is_empty())).then(|| "set".to_string());
-    let t = crate::agents::Target { url: url.trim_end_matches('/').to_string(), key, model, small: q.get("small").filter(|m| !m.is_empty()).cloned() };
+    let t = crate::agents::Target { url: url.trim_end_matches('/').to_string(), key, model, small: q.get("small").filter(|m| !m.is_empty()).cloned(),
+                                    tools: q.get("tools").filter(|t| !t.is_empty()).cloned() };
     Json(json!({"url": t.url, "model": t.model, "key_var": crate::agents::KEY_VAR, "agents": crate::agents::list(&t)})).into_response()
 }
 

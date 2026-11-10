@@ -5,7 +5,7 @@
 //! the job waits its place in the queue (behind the answer, so the text model is not stopped in the middle of it) and
 //! runs after. GET /api/jobs/{id} (or /v1/media/jobs/{id}) follows it; /v1/media/jobs/{id}/content is the file.
 
-use crate::{authorized, error, AppState};
+use crate::{error, AppState};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -425,7 +425,7 @@ async fn run(s: AppState, n: u64, kind: &'static str, req: Value) {
 }
 
 pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     Json(s.media_jobs.capabilities().await).into_response()
@@ -433,7 +433,7 @@ pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Resp
 
 /// GET /api/jobs/{id}, /v1/media/jobs/{id}
 pub async fn status(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     match s.media_jobs.status(&id) {
@@ -445,7 +445,7 @@ pub async fn status(State(s): State<AppState>, headers: HeaderMap, Path(id): Pat
 /// GET /v1/media/jobs/{id}/content: the finished file. The web app's <img>/<video>/<audio> elements cannot send the
 /// key, so a page of this server's own origin may fetch it as it fetches everything else (with the key) and use a blob.
 pub async fn content(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let Some(n) = id.strip_prefix("mj-").and_then(|n| n.parse::<u64>().ok()) else {

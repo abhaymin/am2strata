@@ -440,6 +440,11 @@ impl McpServer {
         })
     }
 
+    /// a program on this PC (stdio), not an address
+    pub fn is_command(&self) -> bool {
+        self.kind == "stdio"
+    }
+
     /// turned off in the app ("disabled": true): kept, never started
     fn off(&self) -> bool {
         self.cfg.get("disabled") == Some(&Value::Bool(true))

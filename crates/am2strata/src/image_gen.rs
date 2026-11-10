@@ -255,7 +255,7 @@ fn edit_size(png_or_jpeg: &[u8]) -> Option<(u32, u32)> {
 pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::extract::Request) -> Response {
     use axum::extract::FromRequest;
     use base64::Engine as _;
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let ct =req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
@@ -343,7 +343,7 @@ pub async fn accept_license(State(s): State<AppState>, headers: HeaderMap, Json(
 
 /// Generations and edits: `edit_images` (base64) empty for a text-to-image request.
 async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<String>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {
@@ -577,7 +577,7 @@ fn chrono_now() -> u64 {
 /// one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an image. The answer is the clip
 /// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
 pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {

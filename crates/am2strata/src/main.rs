@@ -6,6 +6,7 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod agents;
+mod clients;
 mod gemini;
 mod anthropic;
 mod browser;
@@ -94,6 +95,8 @@ struct Args {
 pub struct AppState {
     pub mgr: Arc<Manager>,
     pub api_key: Option<String>,
+    /// the run config's client profiles: other API keys, each with its tools (clients.rs)
+    pub clients: Arc<clients::Clients>,
     /// the MCP servers: the default model's run config's and the app's (always there; it may have none)
     pub mcp: Option<Arc<mcp::McpHub>>,
     /// web origins besides this server's own that may change settings and run tools (the config's trusted_origins)
@@ -145,6 +148,20 @@ pub fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
         a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
     });
     same(bearer) || same(x_key)
+}
+
+/// Who may use the model APIs (chat, messages, responses, Gemini, media): the main key (Some(the "default" profile,
+/// if the run config has one)), or a client profile's key (Some(Some(that profile))). None: neither. The server's
+/// settings stay the main key's (`authorized`).
+pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<clients::Profile>> {
+    if authorized(state, headers) {
+        return Some(state.clients.default.clone());
+    }
+    clients::given_key(headers).and_then(|k| state.clients.by_key(k)).map(|p| Some(p.clone()))
+}
+
+pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    api_access(state, headers).is_some()
 }
 
 /// The key in use when the default model's run config has none: the newest other run config's `api_key` (the key the
@@ -319,7 +336,12 @@ async fn main() -> Result<()> {
             code_run.needs_key = true;
         }
     }
-    let state = AppState { mgr: mgr.clone(), api_key, mcp: Some(hub.clone()), trusted_origins,
+    // client profiles: an API key per client, with its tools (clients.rs)
+    let clients = clients::Clients::from_config(&first.cfg.rest, api_key.as_deref()).map_err(anyhow::Error::msg)?;
+    if !clients.is_empty() {
+        tracing::info!("client profiles: {}", clients.names().join(", "));
+    }
+    let state = AppState { mgr: mgr.clone(), api_key, clients: Arc::new(clients), mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),

@@ -488,6 +488,17 @@ pub fn anthropic_to_messages(req: &Value, orders: &ToolOrders, think_unasked: bo
                     }
                     calls.push(Value::Object(call));
                 }
+                // an earlier turn's server web search (Anthropic's server tools): the pages it found, as text the
+                // model reads again
+                Some("web_search_tool_result") => {
+                    let pages: Vec<String> = block.get("content").and_then(Value::as_array).into_iter().flatten()
+                        .filter_map(|p| Some(format!("- {} ({})", p.get("title")?.as_str().unwrap_or(""), p.get("url")?.as_str()?)))
+                        .collect();
+                    if !pages.is_empty() {
+                        text.push_str(&format!("\n[web search results]\n{}\n", pages.join("\n")));
+                        any_text = true;
+                    }
+                }
                 Some("tool_result") => {
                     let mut t = Map::new();
                     t.insert("role".into(), json!("tool"));

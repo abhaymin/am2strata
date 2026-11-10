@@ -7,7 +7,7 @@
 //! answers.
 
 use crate::run::{self, RunEvent, Summary};
-use crate::{authorized, media, now, AppState};
+use crate::{media, now, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -467,6 +467,8 @@ pub struct Assembler {
     json_text: String,
     /// a tool call was made: this turn is not the final answer (its text goes out as written)
     called: bool,
+    /// the server's web searches shown as items: the tool loop's call id -> the item's index in output
+    searches: std::collections::HashMap<String, usize>,
 }
 
 impl Assembler {
@@ -488,7 +490,8 @@ impl Assembler {
             "top_p": g("top_p"), "truncation": "disabled", "usage": null, "user": null,
             "metadata": req.get("metadata").filter(|t| !t.is_null()).cloned().unwrap_or(json!({})),
         });
-        Assembler { names, encrypted, prompt_tokens, seq: 0, open: None, response, validator: None, json_text: String::new(), called: false }
+        Assembler { names, encrypted, prompt_tokens, seq: 0, open: None, response, validator: None, json_text: String::new(), called: false,
+                    searches: std::collections::HashMap::new() }
     }
 
     fn event(&mut self, kind: &str, data: Value) -> Value {
@@ -519,6 +522,42 @@ impl Assembler {
     }
 
     /// A keep-alive a client counts as activity (Codex's idle timer ignores SSE comments).
+    /// A web search the server runs (the tool loop's call or result event) as a `web_search_call` item?
+    pub fn is_web_search(&self, v: &Value) -> bool {
+        match v["event"].as_str() {
+            Some("call") => v["name"] == "web_search",
+            Some("result") => v["id"].as_str().is_some_and(|id| self.searches.contains_key(id)),
+            _ => false,
+        }
+    }
+
+    /// The events of a server-run web search: the item added and searching at the call, completed at the result.
+    pub fn web_search(&mut self, v: &Value) -> Vec<Value> {
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        let mut out = Vec::new();
+        if v["event"] == "call" {
+            out.extend(self.close("completed"));
+            let item = json!({"type": "web_search_call", "id": new_id("ws"), "status": "in_progress",
+                              "action": {"type": "search", "query": v["arguments"]["query"]}});
+            self.output().push(item.clone());
+            let at = self.response["output"].as_array().unwrap().len() - 1;
+            self.searches.insert(id, at);
+            let item_id = item["id"].clone();
+            out.push(self.event("response.output_item.added", json!({"output_index": at, "item": item})));
+            out.push(self.event("response.web_search_call.in_progress", json!({"output_index": at, "item_id": item_id})));
+            out.push(self.event("response.web_search_call.searching", json!({"output_index": at, "item_id": item_id})));
+        } else if let Some(at) = self.searches.get(&id).copied() {
+            let sources: Vec<Value> = v["sources"].as_array().into_iter().flatten().map(|p| json!({"type": "url", "url": p["url"]})).collect();
+            let item = &mut self.response["output"][at];
+            item["status"] = json!(if v["ok"] == true { "completed" } else { "failed" });
+            item["action"]["sources"] = json!(sources);
+            let (item, item_id) = (item.clone(), item["id"].clone());
+            out.push(self.event("response.web_search_call.completed", json!({"output_index": at, "item_id": item_id})));
+            out.push(self.event("response.output_item.done", json!({"output_index": at, "item": item})));
+        }
+        out
+    }
+
     pub fn in_progress(&mut self) -> Value {
         let snap = self.response.clone();
         self.event("response.in_progress", json!({"response": snap}))
@@ -771,7 +810,7 @@ fn append(v: &mut Value, t: &str) {
 
 /// GET/DELETE /v1/responses/{id} and friends: nothing is stored.
 pub async fn not_stored(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return unauthorized();
     }
     (StatusCode::NOT_FOUND, Json(error_body(
@@ -784,7 +823,7 @@ fn unauthorized() -> Response {
 }
 
 pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return unauthorized();
     }
     // documents (input_file) become text and page pictures before the request is read
@@ -807,6 +846,15 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         Ok(c) => c,
         Err(e) => return e.into_response(),
     };
+    // the hosted web search (Codex's web_search): answered by this server's search, for a key whose client profile
+    // has "web"; each search shows as a web_search_call item
+    let hosted_search = req["tools"].as_array().into_iter().flatten()
+        .any(|t| matches!(t["type"].as_str(), Some("web_search" | "web_search_preview" | "web_search_2025_08_26")));
+    let web_items = hosted_search && s.mgr.web.get().is_some()
+        && crate::api_access(&s, &headers).flatten().is_some_and(|p| p.has("web"));
+    if web_items {
+        req["strata_web"] = json!(true);
+    }
     if let Err(e) = media::expand_videos(&mut chat).await {
         return RespError::new(e.to_string(), None).into_response();
     }
@@ -865,6 +913,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         }
         while let Some(ev) = events.recv().await {
             let out = match ev {
+                RunEvent::Mcp(v) if web_items && asm.is_web_search(&v) => asm.web_search(&v),
                 RunEvent::Ping | RunEvent::Mcp(_) => vec![asm.in_progress()],
                 RunEvent::Event(e) => asm.feed(e),
                 RunEvent::Done(sum) => {

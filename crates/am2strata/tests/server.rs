@@ -1717,6 +1717,125 @@ fn a_chat_searches_the_web_and_reads_a_page_when_it_opts_in() {
     assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("web_search"));
 }
 
+const LAPTOP: &str = "laptop-key-0123456789";
+const PHONE: &str = "phone-key-0123456789";
+
+fn post_as(s: &Server, key: &str, path: &str, body: &Value, extra: &[(&str, &str)]) -> (u16, Value) {
+    let mut r = reqwest::blocking::Client::new().post(format!("{}{path}", s.base)).bearer_auth(key).json(body);
+    for (k, v) in extra {
+        r = r.header(*k, *v);
+    }
+    let r = r.send().unwrap();
+    (r.status().as_u16(), r.json().unwrap_or(Value::Null))
+}
+
+/// Client profiles (SERVER-TOOLS-PLAN part 1): a profile's key gets its tools with no flag; the header narrows and
+/// never widens; a client key opens the model APIs, not the settings; each profile's memory is its own.
+#[test]
+fn a_client_key_gets_its_profiles_tools_without_flags() {
+    let port = fake_web();
+    let remember = "\n\n<tool_call>\n<function=remember>\n<parameter=fact>\nThe laptop's cat is called Tomasz.\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")},
+        "clients": {"laptop": {"key": LAPTOP, "tools": ["web", "memory"], "memory": "laptop"},
+                    "phone": {"key": PHONE, "tools": ["memory"]}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("Hi.\n</think>\n\nhello"), ids("Hi.\n</think>\n\nhello"), ids("Hi.\n</think>\n\nhello"),
+                                  ids(&format!("Noted.\n</think>{remember}")), ids("Saved.\n</think>\n\nI will remember."),
+                                  ids("Ok.\n</think>\n\nTomasz."), ids("Ok.\n</think>\n\nI do not know.")], json!({}));
+    let chat = |q: &str| json!({"messages": [user(q)]});
+    // the laptop's key: web and memory tools, no flag
+    let (c, r) = post_as(&s, LAPTOP, "/v1/chat/completions", &chat("hi"), &[]);
+    assert_eq!(c, 200, "{r}");
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(p.contains("web_search") && p.contains("remember"), "the profile's tools: {p}");
+    // the main key without a default profile: none
+    s.post("/v1/chat/completions", &chat("hi"));
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("web_search"));
+    // narrowed by the header to memory; widening past the profile is refused
+    post_as(&s, LAPTOP, "/v1/chat/completions", &chat("hi"), &[("x-strata-tools", "memory")]);
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(!p.contains("web_search") && p.contains("remember"), "{p}");
+    let (c, r) = post_as(&s, LAPTOP, "/v1/chat/completions", &chat("hi"), &[("x-strata-tools", "web,image")]);
+    assert_eq!(c, 403, "{r}");
+    // the laptop remembers; the phone (another memory space) does not recall it
+    let (c, r) = post_as(&s, LAPTOP, "/v1/chat/completions", &chat("Remember my cat"), &[]);
+    assert_eq!(c, 200, "{r}");
+    post_as(&s, LAPTOP, "/v1/chat/completions", &chat("What is my cat called? Tomasz?"), &[]);
+    assert!(prompt_text(s.gen_lines().last().unwrap()).contains("The laptop's cat is called Tomasz."), "the laptop's memory");
+    post_as(&s, PHONE, "/v1/chat/completions", &chat("What is my cat called? Tomasz?"), &[]);
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("cat is called Tomasz"), "the phone's memory is its own");
+    // a client key opens the model APIs, not the server's settings; an unknown key opens nothing
+    let get = |key: &str, path: &str| reqwest::blocking::Client::new().get(format!("{}{path}", s.base)).bearer_auth(key).send().unwrap().status().as_u16();
+    assert_eq!(get(PHONE, "/v1/models"), 200);
+    assert_eq!(get(PHONE, "/settings"), 401);
+    assert_eq!(get(PHONE, "/api/mcp/servers"), 401);
+    assert_eq!(get("not-a-key-at-all-00000", "/v1/models"), 401);
+}
+
+/// Claude Code's WebSearch: a request with Anthropic's web_search server tool gets server_tool_use and
+/// web_search_tool_result blocks, and the usage counts the search.
+#[test]
+fn anthropic_web_search_is_answered_by_the_server() {
+    let port = fake_web();
+    let search = "\n\n<tool_call>\n<function=web_search>\n<parameter=query>\ntallest lighthouse\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")},
+                                  "clients": {"default": {"tools": ["web"]}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Search.\n</think>{search}")), ids("Found.\n</think>\n\nIt is in Jeddah."),
+                                  ids(&format!("Search.\n</think>{search}")), ids("Found.\n</think>\n\nIt is in Jeddah.")], json!({}));
+    let req = json!({"model": "mock-a", "max_tokens": 200, "messages": [{"role": "user", "content": "Perform a web search for the query: tallest lighthouse"}],
+                     "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}]});
+    let (c, r) = s.post("/v1/messages", &req);
+    assert_eq!(c, 200, "{r}");
+    let blocks = r["content"].as_array().unwrap();
+    let kinds: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["thinking", "server_tool_use", "web_search_tool_result", "thinking", "text"], "{r}");
+    assert_eq!(blocks[1]["name"], "web_search");
+    assert_eq!(blocks[1]["input"]["query"], "tallest lighthouse");
+    assert_eq!(blocks[2]["tool_use_id"], blocks[1]["id"]);
+    assert_eq!(blocks[2]["content"][0]["type"], "web_search_result");
+    assert_eq!(blocks[2]["content"][0]["title"], "Lighthouse facts");
+    assert_eq!(blocks[4]["text"], "It is in Jeddah.");
+    assert_eq!(r["usage"]["server_tool_use"]["web_search_requests"], 1);
+    assert_eq!(r["stop_reason"], "end_turn");
+    // streamed: the same blocks as events
+    let mut st = req.clone();
+    st["stream"] = json!(true);
+    let ev = s.stream("/v1/messages", &st);
+    let started: Vec<String> = ev.iter().filter(|(n, _)| n == "content_block_start").map(|(_, v)| v["content_block"]["type"].as_str().unwrap().to_string()).collect();
+    assert!(started.contains(&"server_tool_use".to_string()) && started.contains(&"web_search_tool_result".to_string()), "{started:?}");
+}
+
+/// Without a profile that has "web", the server tool is refused as unsupported.
+#[test]
+fn anthropic_web_search_needs_a_profile_with_web() {
+    let port = fake_web();
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    let (c, r) = s.post("/v1/messages", &json!({"model": "mock-a", "max_tokens": 50, "messages": [{"role": "user", "content": "q"}],
+                                                "tools": [{"type": "web_search_20250305", "name": "web_search"}]}));
+    assert_eq!(c, 400, "{r}");
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("q")], "web_search_options": {}}));
+    assert_eq!(c, 400);
+}
+
+/// Codex's web search: a Responses request with {"type": "web_search"} gets a web_search_call item.
+#[test]
+fn responses_web_search_gives_a_web_search_call_item() {
+    let port = fake_web();
+    let search = "\n\n<tool_call>\n<function=web_search>\n<parameter=query>\ntallest lighthouse\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")},
+                                  "clients": {"default": {"tools": ["web"]}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Search.\n</think>{search}")), ids("Found.\n</think>\n\nIt is in Jeddah.")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"model": "mock-a", "input": "Where is the tallest lighthouse?", "tools": [{"type": "web_search"}]}));
+    assert_eq!(c, 200, "{r}");
+    let out = r["output"].as_array().unwrap();
+    let call = out.iter().find(|i| i["type"] == "web_search_call").expect("a web_search_call item");
+    assert_eq!(call["status"], "completed");
+    assert_eq!(call["action"]["query"], "tallest lighthouse");
+    assert!(call["action"]["sources"][0]["url"].as_str().unwrap().ends_with("/page"));
+    let msg = out.iter().find(|i| i["type"] == "message").unwrap();
+    assert_eq!(msg["content"][0]["text"], "It is in Jeddah.");
+}
+
 #[test]
 fn fetch_url_keeps_out_of_the_private_network_by_default() {
     let port = fake_web();

@@ -1,7 +1,7 @@
 //! OpenAI Chat Completions: /v1/chat/completions (streaming and not) and /v1/models.
 
 use crate::run::{self, RunEvent, Summary};
-use crate::{authorized, error, media, now, AppState};
+use crate::{error, media, now, AppState};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -15,7 +15,7 @@ use strata_frontend::openai_to_messages;
 use strata_frontend::output::{py_dumps, Event};
 
 pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let cur = s.mgr.current().await.map(|l| l.entry.id.clone());
@@ -46,7 +46,7 @@ fn finish_reason(sum: &Summary, calls: usize, streamed_open: bool) -> &'static s
 }
 
 pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);

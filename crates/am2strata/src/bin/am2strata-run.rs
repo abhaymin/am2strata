@@ -217,6 +217,10 @@ struct AgentArgs {
     /// a small, fast model for background work (Claude Code's haiku; default: --model)
     #[arg(long)]
     small_model: Option<String>,
+    /// the server's tools this run asks for, within the key's client profile: web, memory, image, video, speech,
+    /// music, mcp:<server> (sent as the x-strata-tools header by Claude Code, Codex and OpenCode)
+    #[arg(long)]
+    tools: Option<String>,
     /// the PolyStrata folder, for this PC's address and key
     #[arg(long, default_value = "~/Development/PolyStrata")]
     models_dir: String,
@@ -852,7 +856,7 @@ fn agent(a: AgentArgs) -> ExitCode {
             Err(e) => { eprintln!("{e}; or name one with --model"); return ExitCode::FAILURE; }
         },
     };
-    let t = agents::Target { url, key, model, small: a.small_model.clone() };
+    let t = agents::Target { url, key, model, small: a.small_model.clone(), tools: a.tools.clone().filter(|t| !t.trim().is_empty()) };
     match a.action.as_str() {
         "show" => {
             println!("{} on {} with {} ({}):\n", info.label, t.url, t.model, info.checked);
@@ -942,11 +946,11 @@ fn agent(a: AgentArgs) -> ExitCode {
 /// `agentrun <agent> [options] [agent arguments]`: am2Strata's own options wherever they are, the rest (and all after
 /// `--`) for the agent, in their order.
 fn agentrun_args(args: Vec<String>) -> Result<AgentArgs, String> {
-    const USAGE: &str = "usage: am2strata agentrun <agent> [--model M] [--small-model M] [--url U] [--api-key K] [--dry-run] [agent arguments]\n\
+    const USAGE: &str = "usage: am2strata agentrun <agent> [--model M] [--small-model M] [--url U] [--api-key K] [--tools web,image] [--dry-run] [agent arguments]\n\
                          (am2strata agent list shows the agents)";
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
     let mut a = AgentArgs { action: "start".into(), agent: None, url: env("AM2STRATA_URL"), api_key: env("AM2STRATA_API_KEY"),
-                            model: None, small_model: None, models_dir: "~/Development/PolyStrata".into(), dry_run: false, rest: Vec::new() };
+                            model: None, small_model: None, tools: None, models_dir: "~/Development/PolyStrata".into(), dry_run: false, rest: Vec::new() };
     let mut it = args.into_iter();
     while let Some(x) = it.next() {
         let (flag, inline) = match x.split_once('=') {
@@ -958,6 +962,7 @@ fn agentrun_args(args: Vec<String>) -> Result<AgentArgs, String> {
             "--" => { a.rest.extend(it.by_ref()); }
             "--model" | "-m" => a.model = Some(value("--model")?),
             "--small-model" => a.small_model = Some(value("--small-model")?),
+            "--tools" => a.tools = Some(value("--tools")?),
             "--url" => a.url = Some(value("--url")?),
             "--api-key" => a.api_key = Some(value("--api-key")?),
             "--models-dir" => a.models_dir = value("--models-dir")?,
