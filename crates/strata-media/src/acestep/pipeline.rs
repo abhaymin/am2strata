@@ -1,8 +1,10 @@
 //! A song from a caption and lyrics, all in Rust: the caption encoder and lyric embeddings (text.rs), the condition
-//! encoder and the turbo DiT (dit.rs), the Oobleck decoder (oobleck.rs). Without the song planner (ACE-Step's
-//! low-VRAM mode): the DiT sings the given lyrics in the given style.
+//! encoder and the turbo DiT (dit.rs), the Oobleck decoder (oobleck.rs), and, when its files are there, the song
+//! planner (planner.rs): its 5 Hz codes, through the detokenizer, are the DiT's source, so the song follows the
+//! lyrics and the structure the planner wrote. Without it (ACE-Step's low-VRAM mode) the DiT starts from silence and
+//! its vocals follow the lyrics only sometimes.
 
-use super::{dit, oobleck, text};
+use super::{dit, oobleck, planner, text};
 use anyhow::{anyhow, bail, Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -27,6 +29,8 @@ pub struct Song {
     pub seed: u64,
     pub steps: usize,
     pub shift: f32,
+    /// the song planner's sampling, or None for no planner
+    pub plan: Option<planner::Sampling>,
 }
 
 /// ACE-Step's silence latent ([1, 15000, 64]: 10 minutes at 25 Hz), the source a new song starts from and the timbre
@@ -74,9 +78,16 @@ pub struct AceStep {
     dit: dit::Dit,
     vae: oobleck::Decoder,
     silence: Tensor,
+    detok: dit::Detokenizer,
+    /// the planner, loaded at its first song (3.4 GB in bf16); its folder, if downloaded
+    planner: Option<planner::Planner>,
+    planner_dir: Option<std::path::PathBuf>,
     dtype: DType,
     device: Device,
 }
+
+/// The planner's folder in ACE-Step's checkpoints.
+pub const PLANNER_DIR: &str = "acestep-5Hz-lm-1.7B";
 
 impl AceStep {
     /// `dir`: ACE-Step's checkpoints folder (`Qwen3-Embedding-0.6B`, `acestep-v15-turbo`, `vae`). bf16 on a GPU, f32
@@ -89,26 +100,58 @@ impl AceStep {
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[ck.join("model.safetensors")], dtype, device)? };
         let cond = dit::ConditionEncoder::new(&cfg, vb.pp("encoder"))?;
         let dit = dit::Dit::new(&cfg, vb.pp("decoder"))?;
+        let detok = dit::Detokenizer::new(&cfg, vb.clone())?;
+        let planner_dir = Some(dir.join(PLANNER_DIR)).filter(|d| d.join("model.safetensors").exists());
         // the decoder in f32: its Snake activations and long convolutions lose detail in bf16
         let vbv = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("vae/diffusion_pytorch_model.safetensors")], DType::F32, device)? };
         let vae = oobleck::Decoder::new(vbv.pp("decoder"))?;
         let silence = silence_latent(&ck.join("silence_latent.pt"), device)?.to_dtype(dtype)?;
-        Ok(Self { text, cond, dit, vae, silence, dtype, device: device.clone() })
+        Ok(Self { text, cond, dit, vae, silence, detok, planner: None, planner_dir, dtype, device: device.clone() })
     }
 
-    /// The song's latent [1, frames, 64]: `on_step` sees each diffusion step (done, total).
+    pub fn has_planner(&self) -> bool {
+        self.planner_dir.is_some()
+    }
+
+    /// The planner's codes for the song (`secs` * 5 of them); `on_code` sees each.
+    pub fn plan(&mut self, s: &Song, sampling: &planner::Sampling, secs: usize, on_code: &mut dyn FnMut(usize, usize)) -> Result<Vec<u32>> {
+        if self.planner.is_none() {
+            let d = self.planner_dir.as_ref().ok_or_else(|| anyhow!("the song planner ({PLANNER_DIR}) is not downloaded"))?;
+            self.planner = Some(planner::Planner::load(d, &self.device)?);
+        }
+        // the vocal language in the planner's reasoning for every language but English: measured on this PC
+        // (Whisper, lyric words heard in order), 3-minute Hindi songs went from 32% to 60% with it, 60 s English
+        // songs from 91% to 76%; ACE-Step itself leaves it out when the other values are all given
+        let lang = Some(s.language.as_str()).filter(|l| !l.eq_ignore_ascii_case("en"));
+        let (c, u) = planner::prompts(&s.caption, &s.lyrics, &s.metas, lang);
+        self.planner.as_mut().unwrap().codes(&c, &u, secs * planner::CODES_PER_SECOND, sampling, on_code)
+    }
+
+    /// The song's latent [1, frames, 64]: `on_step` sees each step (done, total): the planner's codes, if it is used,
+    /// then the diffusion steps.
     pub fn latent(&mut self, s: &Song, on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
         let secs = s.metas.duration_s.clamp(MIN_SECONDS, MAX_SECONDS) as usize;
         let frames = secs * FRAMES_PER_SECOND;
-        let caption = self.text.caption(&text::caption_prompt(&s.caption, &s.metas))?.to_dtype(self.dtype)?;
+        let plan = s.plan.clone().filter(|_| self.has_planner());
+        let n_codes = if plan.is_some() { secs * planner::CODES_PER_SECOND } else { 0 };
+        let total = n_codes + s.steps;
+        // the planner's codes as the source (ACE-Step's "cover" of the planned song), else silence
+        let src = match &plan {
+            Some(sampling) => {
+                let codes = self.plan(s, sampling, secs, &mut |i, _| on_step(i, total))?;
+                self.detok.hints(&codes, self.dtype, &self.device)?.narrow(1, 0, frames)?
+            }
+            None => self.silence.narrow(1, 0, frames)?,
+        };
+        let instruction = if plan.is_some() { text::PLANNED_INSTRUCTION } else { text::DIT_INSTRUCTION };
+        let caption = self.text.caption(&text::caption_prompt_for(instruction, &s.caption, &s.metas))?.to_dtype(self.dtype)?;
         let lyrics = self.text.lyrics(&text::lyric_prompt(&s.lyrics, &s.language))?.to_dtype(self.dtype)?;
         let timbre = self.silence.narrow(1, 0, 750)?;
         let cond = self.cond.forward(&caption, &lyrics, &timbre)?;
-        // text to song: the source is silence, every frame to be made (chunk mask 1)
-        let src = self.silence.narrow(1, 0, frames)?;
+        // every frame to be made (chunk mask 1)
         let context = Tensor::cat(&[&src, &src.ones_like()?], 2)?;
         let x = noise(s.seed, frames, &self.device)?.to_dtype(self.dtype)?;
-        Ok(dit::sample(&self.dit, &x, &context, &cond, &dit::schedule(s.steps, s.shift), on_step)?)
+        Ok(dit::sample(&self.dit, &x, &context, &cond, &dit::schedule(s.steps, s.shift), &mut |i, _| on_step(n_codes + i, total))?)
     }
 
     /// Stereo audio [2, samples] at 48 kHz from a latent [1, frames, 64], decoded in overlapping chunks (so a 10-minute
@@ -224,13 +267,19 @@ mod tests {
         let mut a = AceStep::load(&r.join("ACE-Step-1.5/checkpoints"), &dev).unwrap();
         eprintln!("loaded in {:.1} s", t0.elapsed().as_secs_f64());
         let secs: u32 = std::env::var("ACESTEP_SECONDS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+        // the defaults, or a song from ACESTEP_CAPTION, ACESTEP_LYRICS_FILE and ACESTEP_LANG
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let song = Song {
-            caption: "warm indie pop, female vocal, acoustic guitar, soft drums, hopeful".into(),
-            lyrics: "[verse]\nLate at night the city hums\nA little light, a server runs\nNo cloud above, just you and me\nA quiet hum of melody\n\n\
-                     [chorus]\nOne command and it begins\nA voice of mine, a song within".into(),
-            language: "en".into(),
+            caption: env("ACESTEP_CAPTION").unwrap_or_else(|| "warm indie pop, female vocal, acoustic guitar, soft drums, hopeful".into()),
+            lyrics: env("ACESTEP_LYRICS_FILE").map(|f| std::fs::read_to_string(f).unwrap()).unwrap_or_else(|| {
+                "[verse]\nLate at night the city hums\nA little light, a server runs\nNo cloud above, just you and me\nA quiet hum of melody\n\n\
+                 [chorus]\nOne command and it begins\nA voice of mine, a song within".into()
+            }),
+            language: env("ACESTEP_LANG").unwrap_or_else(|| "en".into()),
             metas: text::Metas { bpm: Some(100), time_signature: Some("4".into()), key_scale: Some("C major".into()), duration_s: secs },
             seed: std::env::var("ACESTEP_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(42), steps: 8, shift: 1.0,
+            plan: (std::env::var("ACESTEP_PLANNER").as_deref() != Ok("0"))
+                .then(|| planner::Sampling { seed: 42, ..Default::default() }),
         };
         let t0 = std::time::Instant::now();
         let audio = a.song(&song, &mut |i, n| eprintln!("step {i} of {n} at {:.1} s", t0.elapsed().as_secs_f64())).unwrap();
@@ -239,6 +288,7 @@ mod tests {
         assert_eq!((c, n), (2, secs as usize * 25 * 1920));
         let peak = audio.abs().unwrap().max_keepdim(1).unwrap().max_keepdim(0).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
         assert!(peak > 0.05, "silent: peak {peak}");
-        std::fs::write(r.join(format!("acestep-golden/rust-song-{}.wav", song.seed)), wav(&audio).unwrap()).unwrap();
+        let out = env("ACESTEP_OUT").map(std::path::PathBuf::from).unwrap_or_else(|| r.join(format!("acestep-golden/rust-song-{}.wav", song.seed)));
+        std::fs::write(out, wav(&audio).unwrap()).unwrap();
     }
 }

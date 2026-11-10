@@ -1,7 +1,8 @@
 //! POST /v1/audio/music: a song with vocals from a style and lyrics (ACE-Step 1.5, in the media engine, in Rust).
 //! OpenAI has no such endpoint; the fields follow /v1/audio/speech's spirit:
 //! {"style" (or "caption" / "prompt"), "lyrics", "language", "duration" (s, 10 to 600), "seed", "bpm", "key",
-//!  "time_signature", "steps", "response_format": "wav"} -> audio/wav (48 kHz stereo).
+//!  "time_signature", "steps", "planner" (default true: ACE-Step's song planner sets the song's structure first),
+//!  "response_format": "wav"} -> audio/wav (48 kHz stereo).
 //! A GPU job like an image: the text model stops for it and loads again with the next chat.
 
 use crate::{authorized, error, AppState};
@@ -145,7 +146,9 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     let steps = req["steps"].as_u64().unwrap_or(8).clamp(1, 20);
     let mut cmd = json!({"op": "song", "caption": style, "lyrics": lyrics, "language": language, "duration": duration,
                          "seed": seed, "steps": steps, "device": "cuda"});
-    for k in ["bpm", "key", "time_signature"] {
+    // "planner": false makes the song without ACE-Step's song planner (faster, lyrics followed less often);
+    // its sampling can be set with planner_temperature, planner_cfg and planner_top_p
+    for k in ["bpm", "key", "time_signature", "planner", "planner_temperature", "planner_cfg", "planner_top_p"] {
         if !req[k].is_null() {
             cmd[k] = req[k].clone();
         }
@@ -159,8 +162,8 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("song", MODEL);
     let _row = crate::monitor::MediaRow::new(&mon, job);
-    // takes: a song is made again with other seeds until the speech-to-text model hears enough of its lyrics (the
-    // song planner is still to come, so sung words depend on the seed), the best take kept
+    // takes: a song is made again with other seeds until the speech-to-text model hears enough of its lyrics (even
+    // with the song planner, sung words vary with the seed), the best take kept
     let instrumental = lyrics.trim().eq_ignore_ascii_case("[instrumental]");
     let takes = if instrumental { 1 } else { req["takes"].as_u64().unwrap_or(1).clamp(1, 4) };
     let stt = s.media.stt_model();

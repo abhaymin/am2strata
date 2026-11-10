@@ -266,7 +266,7 @@ impl Jobs {
                 let mut r = json!({"style": style, "duration": duration,
                                    "lyrics": if kind == "song" { prompt.to_string() } else { "[Instrumental]".into() }});
                 if kind == "song" {
-                    // a few takes, the one whose words come through best kept (until the song planner lands)
+                    // a few takes, the one whose words come through best kept (sung words still vary with the seed)
                     r["takes"] = json!(3);
                     if let Some(l) = args["language"].as_str() {
                         r["language"] = json!(l);

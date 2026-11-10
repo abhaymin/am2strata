@@ -50,7 +50,7 @@ So the first milestone leaves it out.
 
 Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.
 
-## Progress (2026-11-09)
+## Progress (2026-11-10)
 
 | Stage | State | Checked |
 | --- | --- | --- |
@@ -59,9 +59,25 @@ Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.
 | 2. Caption encoder, lyric embeddings, prompts | done | same token ids; cosine 0.9992+ per token; lyrics exact |
 | 3. Condition encoder, DiT, sampler, DCW | done | DiT against ACE-Step in f32: cosine 1.000000; the 8 bf16 steps 0.9926 to 0.9999; final latent 0.996 |
 | Pipeline (`acestep/pipeline.rs`) | done | the golden song made again in Rust from its noise: final latent 0.995, and Whisper hears its lyrics as in Python's |
-| 6. The planner | next | — |
+| 6. The planner (codes) | done (2026-11-10) | `planner.rs`, `dit::Detokenizer`; prompts and token ids the same as ACE-Step's; FSQ output cosine 0.99997, hints (detokenizer) 0.99999; teacher-forced on ACE-Step's greedy codes, its code is in Rust's top 5 at 47 of 50 steps, never more than 0.3 logits from the best (Python bf16 on a GPU, Rust f32 on the CPU: near ties in a flat 64,000-way choice) |
+| 6b. "Write the lyrics for me" | next | the planner's own reasoning phase (caption, language and missing metadata written by it) |
 
 A 20 s song entirely in Rust: 96 s on the CPU (f32). Its vocals, without the planner, are mostly "ooh"; ACE-Step's own
 Python without the planner does the same (seeds 1 to 3: one half-heard line, "Thank you.", "Ah, ah"). With the
 planner (the 60 s songs of phase 0) the lyrics are sung. So the planner (stage 6) comes before the server stage: it is
 what makes the vocals follow the lyrics.
+
+### The planner, measured (2026-11-10, one RTX 5060 Ti, ACE-Step's sampling: temperature 0.85, guidance 2.0, top-p 0.9)
+
+Lyric words heard in order by Whisper (whisper.cpp large-v3-turbo), each seed made with and without the planner:
+
+| Song | Without the planner | With it |
+| --- | --- | --- |
+| English, 60 s, 4 seeds | 47%, 56%, 22%, 61% (mean 47%) | 97%, 94%, 83%, 89% (mean 91%) |
+| Hindi, 3 minutes, 5 seeds | 64%, 43%, 51%, 34%, 50% (mean 48%) | language left out of the reasoning (as ACE-Step does when the other values are given): mean 32%; with `language: hi` in it: 56%, 64%, 60%, 41%, 79% (mean 60%) |
+| Malayalam, 60 s, 3 seeds | not measurable: Whisper writes Malayalam badly (in other scripts); by consonants heard after transliteration, 41%, 30%, 29% | 43%, 11%, 20% |
+
+So the reasoning has the vocal language for every language but English (English with it: mean 76%). Time and memory:
+a 60 s song in 26.7 s with the planner (its 300 codes about 19 s, the first load included), 7.5 s without; a
+3-minute song in 62 s with it, 26 s without; 10.9 GB of VRAM at 60 s with it, 7.4 GB without. Malayalam and the
+other languages Whisper hears badly need a better judge than Whisper (a native listener, or a better recogniser).

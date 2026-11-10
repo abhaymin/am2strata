@@ -170,6 +170,73 @@ impl EncoderLayer {
     }
 }
 
+/// FSQ levels of ACE-Step's audio codes (`fsq_input_levels`): a code is 6 digits in these bases, 64,000 codes.
+pub const FSQ_LEVELS: [u32; 6] = [8, 8, 8, 5, 5, 5];
+pub const CODEBOOK_SIZE: u32 = 8 * 8 * 8 * 5 * 5 * 5;
+/// 25 Hz latent frames per 5 Hz code (`pool_window_size`)
+pub const POOL: usize = 5;
+
+/// The planner's codes [n] back to 25 Hz latents [1, n * 5, 64], the DiT's source when the planner sets the song's
+/// structure: the residual FSQ's code values (symmetric: each digit d of level L as d * 2 / (L - 1) - 1; one quantizer, scale 1)
+/// and its output projection, then the detokenizer (each code as 5 frames: the projected code plus learnt per-frame
+/// tokens, 2 encoder layers within those 5, a norm, a projection to 64 channels).
+pub struct Detokenizer {
+    project_out: Linear,
+    embed: Linear,
+    special: Tensor,
+    layers: Vec<EncoderLayer>,
+    norm: RmsNorm,
+    proj_out: Linear,
+    cfg: Config,
+}
+
+impl Detokenizer {
+    /// `vb`: the turbo checkpoint's root (`tokenizer.quantizer.*`, `detokenizer.*`).
+    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        let d = vb.pp("detokenizer");
+        Ok(Self {
+            project_out: linear(FSQ_LEVELS.len(), cfg.hidden_size, vb.pp("tokenizer.quantizer.project_out"))?,
+            embed: linear(cfg.hidden_size, cfg.hidden_size, d.pp("embed_tokens"))?,
+            special: d.get((1, POOL, cfg.hidden_size), "special_tokens")?,
+            layers: (0..2).map(|i| EncoderLayer::new(cfg, i, d.pp(format!("layers.{i}")))).collect::<Result<_>>()?,
+            norm: rms(cfg.hidden_size, cfg.rms_norm_eps, d.pp("norm"))?,
+            proj_out: linear(cfg.hidden_size, cfg.audio_acoustic_hidden_dim, d.pp("proj_out"))?,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// The quantizer's output for `codes` [1, n, 2048].
+    pub fn quantized(&self, codes: &[u32], dtype: DType, dev: &Device) -> Result<Tensor> {
+        let mut v = Vec::with_capacity(codes.len() * FSQ_LEVELS.len());
+        for &c in codes {
+            let mut basis = 1u32;
+            for &l in &FSQ_LEVELS {
+                let digit = (c / basis) % l;
+                v.push(digit as f32 * 2.0 / (l - 1) as f32 - 1.0);
+                basis *= l;
+            }
+        }
+        let z = Tensor::from_vec(v, (1, codes.len(), FSQ_LEVELS.len()), dev)?.to_dtype(dtype)?;
+        self.project_out.forward(&z)
+    }
+
+    /// The 25 Hz hints [1, n * 5, 64] for `codes`.
+    pub fn hints(&self, codes: &[u32], dtype: DType, dev: &Device) -> Result<Tensor> {
+        let q = self.quantized(codes, dtype, dev)?;
+        let n = codes.len();
+        let h = self.cfg.hidden_size;
+        // [1, n, h] -> [n, 5, h]: every code repeated over its 5 frames, plus the frame tokens
+        let x = self.embed.forward(&q)?.squeeze(0)?.unsqueeze(1)?.expand((n, POOL, h))?;
+        let mut x = x.broadcast_add(&self.special.to_dtype(x.dtype())?)?.contiguous()?;
+        let rope = Rope::new(&self.cfg, POOL, x.dtype(), dev)?;
+        for layer in &self.layers {
+            x = layer.forward(&x, &rope, None)?;
+        }
+        let x = self.proj_out.forward(&x.apply(&self.norm)?)?;
+        x.reshape((1, n * POOL, self.cfg.audio_acoustic_hidden_dim))
+    }
+}
+
 /// The lyric or the timbre encoder: a projection in, encoder layers, a final norm.
 struct Encoder {
     embed: Linear,

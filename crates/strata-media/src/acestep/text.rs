@@ -33,9 +33,18 @@ impl Metas {
     }
 }
 
+/// The DiT's instruction when the song planner's codes give the song's structure (ACE-Step's "cover" task: the
+/// codes stand in for a source song).
+pub const PLANNED_INSTRUCTION: &str = "Generate audio semantic tokens based on the given conditions:";
+
 /// The caption encoder's prompt.
 pub fn caption_prompt(caption: &str, metas: &Metas) -> String {
-    format!("# Instruction\n{DIT_INSTRUCTION}\n\n# Caption\n{caption}\n\n# Metas\n{}<|endoftext|>\n", metas.text())
+    caption_prompt_for(DIT_INSTRUCTION, caption, metas)
+}
+
+/// The caption encoder's prompt with `instruction` (DIT_INSTRUCTION, or PLANNED_INSTRUCTION with the planner).
+pub fn caption_prompt_for(instruction: &str, caption: &str, metas: &Metas) -> String {
+    format!("# Instruction\n{instruction}\n\n# Caption\n{caption}\n\n# Metas\n{}<|endoftext|>\n", metas.text())
 }
 
 /// The lyric prompt: the language code (as ACE-Step names it, e.g. "en", "hi") and the lyrics with their structure tags.

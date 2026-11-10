@@ -385,7 +385,7 @@ fn list(st: &mut State) -> Value {
 }
 
 /// A song (ACE-Step 1.5 in Rust): {"op":"song","caption","lyrics","language","duration","seed","bpm","key","time_signature",
-/// "steps","device"} -> {"event":"step",...}... then {"event":"song","format":"wav","data":<base64>,"seconds",...}.
+/// "steps","device","planner" (default true),"planner_temperature","planner_cfg","planner_top_p"} -> {"event":"step",...}... then {"event":"song","format":"wav","data":<base64>,"seconds",...}.
 fn song(st: &mut State, cmd: &Value) -> Result<Value> {
     let dir = acestep::local().ok_or_else(|| anyhow!("{} is not downloaded (pull it first)", acestep::NAME))?;
     if st.song.is_none() {
@@ -412,12 +412,20 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         seed: cmd["seed"].as_u64().unwrap_or(0),
         steps: (cmd["steps"].as_u64().unwrap_or(8) as usize).clamp(1, 20),
         shift: cmd["shift"].as_f64().unwrap_or(1.0) as f32,
+        // the song planner unless asked not to ("planner": false), when its files are downloaded
+        plan: (cmd["planner"].as_bool() != Some(false)).then(|| acestep::planner::Sampling {
+            temperature: cmd["planner_temperature"].as_f64().unwrap_or(0.85) as f32,
+            cfg_scale: cmd["planner_cfg"].as_f64().unwrap_or(2.0) as f32,
+            top_p: cmd["planner_top_p"].as_f64().unwrap_or(0.9) as f32,
+            seed: cmd["seed"].as_u64().unwrap_or(0),
+        }),
     };
+    let planned = s.plan.is_some() && st.song.as_ref().unwrap().has_planner();
     let t0 = std::time::Instant::now();
     let audio = st.song.as_mut().unwrap().song(&s, &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
     let wav = acestep::pipeline::wav(&audio)?;
     Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE, "seconds": duration,
-              "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME, "seed": s.seed,
+              "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME, "seed": s.seed, "planner": planned,
               "data": base64::engine::general_purpose::STANDARD.encode(wav)}))
 }
 
