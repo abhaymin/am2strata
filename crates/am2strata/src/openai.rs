@@ -62,12 +62,14 @@ fn waiting_stream(s: AppState, headers: HeaderMap, req: Value) -> Response {
     use futures::StreamExt;
     let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(256);
     let keep = tx.clone();
-    tokio::spawn(async move {
+    let queue = s.mgr.queue.clone();
+    tokio::spawn(crate::queue::carry(async move {
         let txp = tx.clone();
         // a client that leaves while it waits takes its place out of the queue
         let got = tokio::select! {
             g = s.mgr.ensure_for_told(req.get("model").and_then(Value::as_str), move |p| {
-                let _ = txp.try_send(format!(": queued: {} ahead\n\n", p.saturating_sub(1)).into());
+                let eta = queue.eta_at(p).map(|e| format!(", about {} s", e.round())).unwrap_or_default();
+                let _ = txp.try_send(format!(": queued: {} ahead{eta}\n\n", p.saturating_sub(1)).into());
             }) => g,
             _ = tx.closed() => return,
         };
@@ -91,7 +93,7 @@ fn waiting_stream(s: AppState, headers: HeaderMap, req: Value) -> Response {
             let v: Value = serde_json::from_slice(&all).unwrap_or_else(|_| json!({"error": {"message": String::from_utf8_lossy(&all)}}));
             let _ = tx.send(format!("data: {v}\n\ndata: [DONE]\n\n").into()).await;
         }
-    });
+    }));
     // keep-alives while it waits (the answer's stream has its own); they stop when the answer's stream ends
     let weak = keep.downgrade();
     drop(keep);
@@ -167,12 +169,14 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     if stream && validator.is_none() && !has_pass && s.mgr.queue.busy() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Value>>(256);
         let mgr = s.mgr.clone();
-        tokio::spawn(async move {
+        let queue = s.mgr.queue.clone();
+        tokio::spawn(crate::queue::carry(async move {
             let txp = tx.clone();
             let label = format!("{model_id} chat (stream)");
             let pass = tokio::select! {
                 p = mgr.take_turn(&model_id, &label, move |p| {
-                    let _ = txp.try_send(Some(json!({"__comment": format!("queued: {} ahead", p.saturating_sub(1))})));
+                    let _ = txp.try_send(Some(json!({"__comment": format!("queued: {} ahead{}", p.saturating_sub(1),
+                        queue.eta_at(p).map(|e| format!(", about {} s", e.round())).unwrap_or_default())})));
                 }) => p,
                 _ = tx.closed() => return, // the client left while it waited: its place goes
             };
@@ -190,7 +194,7 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
                     let _ = tx.send(Some(json!({"error": {"type": "invalid_request_error", "message": msg}}))).await;
                 }
             }
-        });
+        }));
         return sse(rx);
     }
     let started = match run_it.await {

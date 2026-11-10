@@ -662,6 +662,42 @@ fn low_memory_is_told_with_every_answer() {
     assert!(s.get("/api/system", true).1["alerts"].to_string().contains("low on free memory"));
 }
 
+/// Production, step 7: requests run by priority. While one answer runs, a low-priority API call and a person on the
+/// web app's own page wait; the person goes first, and /api/queue shows the classes and wait estimates.
+#[test]
+fn a_person_at_the_web_app_goes_before_background_calls() {
+    let long: String = "word ".repeat(60);
+    let s = Server::start(&[Model::default()], &[ids(&format!("Long.\n</think>\n\n{long}")), ids("x"), ids("x")], json!({"delay_ms": 40}));
+    let base = s.base.clone();
+    let post = move |body: Value, hdrs: Vec<(&'static str, String)>| {
+        let base = base.clone();
+        std::thread::spawn(move || {
+            let mut r = reqwest::blocking::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(KEY).json(&body);
+            for (k, v) in hdrs {
+                r = r.header(k, v);
+            }
+            r.send().unwrap().status().as_u16()
+        })
+    };
+    let first = post(json!({"messages": [user("first job")], "max_tokens": 200}), vec![]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let low = post(json!({"messages": [user("background job")], "max_tokens": 4}), vec![("x-strata-priority", "low".into())]);
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let host = s.base.trim_start_matches("http://").to_string();
+    let high = post(json!({"messages": [user("person waiting")], "max_tokens": 4}), vec![("origin", format!("http://{host}"))]);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (_, q) = s.get("/api/queue", true);
+    let waiting = q["waiting"].as_array().cloned().unwrap_or_default();
+    assert_eq!(waiting.len(), 2, "{q}");
+    assert_eq!(waiting[0]["priority"], "high", "the person is next: {q}");
+    assert_eq!(waiting[1]["priority"], "low");
+    assert!(waiting[1]["eta_s"].as_f64().unwrap() >= waiting[0]["eta_s"].as_f64().unwrap(), "estimates in order: {q}");
+    assert_eq!((first.join().unwrap(), high.join().unwrap(), low.join().unwrap()), (200, 200, 200));
+    let order: Vec<String> = s.gen_lines().iter().map(|l| prompt_text(l)).collect();
+    let at = |w: &str| order.iter().position(|p| p.contains(w)).unwrap();
+    assert!(at("first job") < at("person waiting") && at("person waiting") < at("background job"), "run order");
+}
+
 #[test]
 fn the_engine_gets_its_eight_token_margin() {
     let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));

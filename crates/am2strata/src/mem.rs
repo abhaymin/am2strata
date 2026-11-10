@@ -45,7 +45,11 @@ pub struct Needs {
 
 impl Needs {
     pub fn open(data_dir: &Path) -> Needs {
-        let path = data_dir.join("model-memory.json");
+        Self::open_file(data_dir.join("model-memory.json"))
+    }
+
+    /// Another per-model record (model-load-s.json: how long each model takes to load).
+    pub fn open_file(path: PathBuf) -> Needs {
         let map = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<BTreeMap<String, f64>>(&b).ok()).unwrap_or_default();
         Needs { path, map: std::sync::Mutex::new(map) }
     }
@@ -65,6 +69,67 @@ impl Needs {
     pub fn view(&self) -> Value {
         json!(*self.map.lock().unwrap())
     }
+
+    /// A moving average instead of the largest (a load time).
+    pub fn record_mean(&self, id: &str, v: f64) {
+        let mut m = self.map.lock().unwrap();
+        let x = m.entry(id.to_string()).or_insert(v);
+        *x = *x * 0.5 + v * 0.5;
+        let _ = std::fs::write(&self.path, serde_json::to_vec_pretty(&*m).unwrap_or_default());
+    }
+
+    pub fn all(&self) -> Vec<(String, f64)> {
+        self.map.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+}
+
+/// A model's files (a split GGUF's parts too) and their size in GB.
+pub fn model_files(first: &Path) -> (Vec<PathBuf>, f64) {
+    let name = first.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let mut files = vec![first.to_path_buf()];
+    if let (Some(dir), Some(i)) = (first.parent(), name.find("-00001-of-")) {
+        let stem = &name[..i];
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            files = rd.flatten().map(|e| e.path())
+                .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(stem) && n.contains("-of-") && n.ends_with(".gguf")))
+                .collect();
+            files.sort();
+        }
+    }
+    let gb = files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len() as f64).sum::<f64>() / 1073741824.0;
+    (files, gb)
+}
+
+/// Read files once so they are in the file cache (the next load reads RAM, not the SSD): a plain sequential read,
+/// in 8 MiB steps, at the lowest I/O and CPU priority the process can ask for.
+pub fn warm(files: &[PathBuf]) -> std::io::Result<u64> {
+    use std::io::Read;
+    #[cfg(unix)]
+    unsafe {
+        // nice 19 for this thread (the read competes with nothing that matters)
+        let _ = libc_nice();
+    }
+    let mut total = 0u64;
+    let mut buf = vec![0u8; 8 << 20];
+    for f in files {
+        let mut file = std::fs::File::open(f)?;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(unix)]
+unsafe fn libc_nice() -> i32 {
+    extern "C" {
+        fn nice(inc: i32) -> i32;
+    }
+    nice(19)
 }
 
 /// Wait up to `wait` for `need` GB (plus the margin) to be free; Err says how much is free.

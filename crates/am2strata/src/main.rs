@@ -131,6 +131,23 @@ pub fn not_own_page(what: &str) -> Response {
           format!("{what} only from PolyStrata's own page (or an origin in the config's trusted_origins)"))
 }
 
+/// The priority and client of a request, for the queue: high for this server's own page (a person waiting), normal
+/// for API calls, or what `x-strata-priority` asks (a client profile's key may ask normal or low, not high).
+async fn priority_scope(axum::extract::State(s): axum::extract::State<AppState>, req: axum::extract::Request,
+                        next: axum::middleware::Next) -> axum::response::Response {
+    use crate::queue::Priority;
+    let h = req.headers();
+    let own_page = h.contains_key("origin") && !foreign_origin(&s, h);
+    let client_profile = if authorized(&s, h) { None } else { clients::given_key(h).and_then(|k| s.clients.by_key(k)).map(|p| p.name.clone()) };
+    let asked = h.get("x-strata-priority").and_then(|v| v.to_str().ok()).and_then(Priority::parse);
+    let mut p = asked.unwrap_or(if own_page { Priority::High } else { Priority::Normal });
+    if client_profile.is_some() && p == Priority::High {
+        p = Priority::Normal;
+    }
+    let client = client_profile.unwrap_or_else(|| if own_page { "web".into() } else { "api".into() });
+    crate::queue::PRIORITY.scope(p, crate::queue::CLIENT.scope(client, next.run(req))).await
+}
+
 /// Requests waiting for the GPU's turn from which an answer carries a "busy" warning.
 const BUSY_WAITING: usize = 4;
 
@@ -381,6 +398,17 @@ async fn main() -> Result<()> {
     if !clients.is_empty() {
         tracing::info!("client profiles: {}", clients.names().join(", "));
     }
+    // quick switching: the switch costs learnt before, and the files of a model a job waits for warmed up
+    mgr.seed_switch_costs();
+    {
+        let mgr = mgr.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                mgr.warm_wanted();
+            }
+        });
+    }
     let state = AppState { mgr: mgr.clone(), api_key, clients: Arc::new(clients), mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
@@ -488,6 +516,8 @@ async fn main() -> Result<()> {
         // overload told plainly: Retry-After on every refusal for load, a warning header while the PC is short of memory
         // or the queue is long
         .layer(axum::middleware::from_fn_with_state(state.clone(), overload_headers))
+        // each request's priority and client, for the queue (queue.rs)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), priority_scope))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         // a handler that panics is answered with a JSON error, never a dropped connection
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))

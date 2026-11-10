@@ -69,3 +69,35 @@ Each step gets a mock test:
 - a full queue answers 429;
 - an unloadable asked model falls back with the warning header;
 - a dropped music request's result is fetched afterwards.
+
+## 7. Request routing and quick switching (owner, 2026-11-10: strong, performance oriented, predictable, smart switching)
+
+**Built (2026-11-10).** The rules are short and fixed, applied in this order; the same queue always runs in the same
+order:
+
+1. One job runs at a time, taken from the best class waiting:
+   - high: a person at the web app;
+   - normal: API calls;
+   - low: media jobs a chat queued.
+
+   `x-strata-priority` asks for a class; a client profile's key may ask normal or low only.
+2. Every 60 s of waiting raises a job one class, so a low job waits at most 2 minutes behind newer high ones.
+3. Within the class, jobs run in arrival order, with one exception that saves a model switch: when the first job
+   needs another model, the jobs for the model already loaded go first.
+   - at most 4 of them in a row;
+   - none once the first job has waited 90 s.
+4. Of two clients with equal jobs, the one that did not just run goes first.
+5. Smart switching:
+   - **Warm files:** while a job waits for a model that is not loaded, its GGUF files are read into the file cache,
+     when free memory has room for them, so the switch loads from RAM.
+   - **Learnt times:** each model's load time is learnt and kept (`<data>/model-load-s.json`), as is each kind of
+     job's running time.
+   - **Estimates:** `/api/queue` gives each waiting job its class, client and estimated wait, and a waiting stream
+     hears "queued: N ahead, about S s".
+
+Tested:
+- the order of the classes, client turns, aging and the estimates (unit tests);
+- a person at the web app going before a background API call (`a_person_at_the_web_app_goes_before_background_calls`).
+
+Found and fixed on the way: the queue told a job its place while holding its own lock, so a listener that asked the
+queue anything deadlocked it. The media path no longer holds the model's lock while the model stops.

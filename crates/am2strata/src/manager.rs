@@ -157,7 +157,14 @@ pub struct Manager {
     pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
     /// what each model took from free memory when it loaded (mem.rs), under <data>/model-memory.json
     pub needs: crate::mem::Needs,
+    /// how long each model takes to load (seconds), under <data>/model-load-s.json: the queue's switch costs
+    pub load_s: crate::mem::Needs,
+    /// models whose files were warmed up, and when (so each is read at most once in WARM_EVERY)
+    warmed: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// A model's files are warmed up at most this often.
+const WARM_EVERY: Duration = Duration::from_secs(600);
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
 pub fn scan(dir: &Path) -> Vec<ModelEntry> {
@@ -283,6 +290,43 @@ impl Manager {
             web: std::sync::OnceLock::new(),
             browser: std::sync::OnceLock::new(),
             needs: crate::mem::Needs::open(&memory_dir),
+            load_s: crate::mem::Needs::open_file(memory_dir.join("model-load-s.json")),
+            warmed: Default::default(),
+        }
+    }
+
+    /// The queue starts with the switch costs learnt before (model-load-s.json).
+    pub fn seed_switch_costs(&self) {
+        for (m, secs) in self.load_s.all() {
+            self.queue.set_switch_cost(&m, secs);
+        }
+    }
+
+    /// Quick switching: while a job waits for a model that is not loaded, its files are read into the file cache
+    /// (when this PC has the memory for them beside what runs), so the switch loads from RAM. Called every few seconds.
+    pub fn warm_wanted(&self) {
+        for m in self.queue.wanted_models() {
+            let Some(e) = self.entry(&m) else { continue };
+            let Some(first) = e.cfg.model_file() else { continue };
+            {
+                let mut w = self.warmed.lock().unwrap();
+                if w.get(&m).is_some_and(|t| t.elapsed() < WARM_EVERY) {
+                    continue;
+                }
+                let (files, gb) = crate::mem::model_files(&first);
+                if files.is_empty() || crate::mem::available_gb() < gb + crate::mem::MARGIN_GB + 2.0 {
+                    continue;
+                }
+                w.insert(m.clone(), std::time::Instant::now());
+                tracing::info!(model = %m, "warming up its files ({gb:.1} GB) for a quicker switch: a job is waiting for it");
+                std::thread::spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    match crate::mem::warm(&files) {
+                        Ok(n) => tracing::info!(model = %m, "its files are warm ({:.1} GB in {:.0} s)", n as f64 / 1073741824.0, t0.elapsed().as_secs_f64()),
+                        Err(e) => tracing::warn!(model = %m, "warming its files failed: {e}"),
+                    }
+                });
+            }
         }
     }
 
@@ -299,7 +343,11 @@ impl Manager {
             }
         }
         let before = crate::mem::available_gb();
+        let t0 = std::time::Instant::now();
         let l = start(entry, &self.hw, self.ready_timeout).await?;
+        let secs = t0.elapsed().as_secs_f64();
+        self.load_s.record_mean(&entry.id, secs);
+        self.queue.set_switch_cost(&entry.id, secs);
         let after = crate::mem::available_gb();
         if before > 0.0 && after > 0.0 {
             self.needs.record(&entry.id, before - after);
@@ -430,7 +478,9 @@ impl Manager {
             .map_err(|t| anyhow!("{t}"))?;
         drop(w);
         if unload_text {
-            if let Some(l) = self.current.write().await.take() {
+            // taken out first: the lock is not held while the model stops (up to 30 s)
+            let old = self.current.write().await.take();
+            if let Some(l) = old {
                 tracing::info!(model = %l.entry.id, "stopping the text model for a media job (it loads again with the next request)");
                 self.snapshots.save(&l, "before the model stops").await;
                 stop(&l).await;

@@ -303,7 +303,9 @@ impl Jobs {
             }
         }
         let s = self.app().clone();
-        tokio::spawn(async move { run(s, n, kind, req).await });
+        // background work: a chat's media job waits behind people and API calls (raised as it waits)
+        tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
+                     crate::queue::CLIENT.scope("media".to_string(), async move { run(s, n, kind, req).await })));
         let what = match kind { "image" => "image", "video" => "video", "song" => "song", "music" => "music", _ => "speech" };
         let eta = self.speeds.lock().unwrap().get(&model).map(|t| format!(", about {}", human(*t))).unwrap_or_default();
         let text = format!("{what} job {id} queued ({model}{eta}). It runs after this answer and appears in the chat by itself; \

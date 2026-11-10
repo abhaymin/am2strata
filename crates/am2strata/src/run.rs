@@ -785,7 +785,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
     let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
     let (model, prompt_tokens) = (first.model.clone(), first.prompt_tokens);
     let (tx, events) = mpsc::channel(256);
-    tokio::spawn(async move {
+    tokio::spawn(crate::queue::carry(async move {
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
         let mut media_jobs = 0usize; // queued by this answer's media tools
         loop {
@@ -968,7 +968,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 }
             };
         }
-    });
+    }));
     Ok(Started { events, prompt_tokens, model })
 }
 
