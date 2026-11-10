@@ -106,6 +106,11 @@ impl Server {
             s.extend(e.clone());
         }
         std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
+        // API calls get memory by default; the tests that check exact prompts run without it unless they ask
+        if extra.get("memory_api").is_none() {
+            std::fs::create_dir_all(dir.join("memory")).unwrap();
+            std::fs::write(dir.join("memory/settings.json"), r#"{"api": false}"#).unwrap();
+        }
         let record = dir.join("record.txt");
         let port = free_port();
         let child = Command::new(env!("CARGO_BIN_EXE_am2strata"))

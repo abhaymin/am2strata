@@ -51,6 +51,10 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
         opts.memory = p.has("memory").then(|| p.memory_space());
     } else if opts.memory.is_none() && has("memory") {
         opts.memory = Some(profile.as_ref().map(|p| p.memory_space()).filter(|m| m != "default").unwrap_or_else(|| "api".into()));
+    } else if opts.memory.is_none() && !headers.contains_key("origin") && req.get("strata_memory") != Some(&Value::Bool(false))
+        && s.mgr.memory.settings.read().unwrap().api {
+        // an API client with the main key (no web page): memory in the "api" space unless it opts out
+        opts.memory = Some("api".into());
     }
     // MCP tools run with the user's rights on this PC: every server for this server's own page (strata_mcp), or the
     // servers a profile names (address servers with mcp:*; a program server only by its name); never another web page

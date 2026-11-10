@@ -507,6 +507,10 @@
           <div class="st-card toggle-row"><span>Use memory in this browser's chats<br><span class="muted small">This page's chats send
             the opt-in; the switches below decide what it does.</span></span>
             <button class="st-toggle" id="mem-web" role="switch" aria-checked="true" aria-label="Use memory in this browser's chats"></button></div>
+          <div class="st-card toggle-row"><span>Memory for API calls<br><span class="muted small">Apps and agents that call this
+            server's API with its key (OpenAI, Anthropic, Responses, Gemini) get the same memory, in a space of their own ("api"),
+            without asking for it; a call that sends <code>"strata_memory": false</code> goes without.</span></span>
+            <button class="st-toggle" id="mem-api" role="switch" aria-checked="true" aria-label="Memory for API calls"></button></div>
           <div class="st-card toggle-row"><span>The model can remember, recall and forget<br><span class="muted small">Three tools
             the server runs itself: the model saves a fact when you tell it something worth keeping, and looks things up.</span></span>
             <button class="st-toggle" id="mem-tools" role="switch" aria-checked="true" aria-label="Memory tools"></button></div>

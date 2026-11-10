@@ -1771,6 +1771,26 @@ fn a_client_key_gets_its_profiles_tools_without_flags() {
     assert_eq!(get("not-a-key-at-all-00000", "/v1/models"), 401);
 }
 
+/// Memory for API calls (on by default): a client with the main key and no flag gets remember / recall / forget,
+/// what it saved comes back in a later call, and "strata_memory": false goes without.
+#[test]
+fn api_calls_get_memory_by_default() {
+    let remember = "\n\n<tool_call>\n<function=remember>\n<parameter=fact>\nThe API user's dog is called Bruno.\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Noted.\n</think>{remember}")), ids("Saved.\n</think>\n\nNoted."),
+                                                  ids("Ok.\n</think>\n\nBruno."), ids("Ok.\n</think>\n\nNo idea.")],
+                          json!({"memory_api": true}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Remember: my dog is Bruno")]}));
+    assert_eq!(c, 200, "{r}");
+    assert!(prompt_text(&s.gen_lines()[0]).contains("remember"), "the memory tools are offered with no flag");
+    let (c, _) = s.post("/v1/messages", &json!({"model": "mock-a", "max_tokens": 50,
+                                               "messages": [{"role": "user", "content": "What is my dog called? Bruno?"}]}));
+    assert_eq!(c, 200);
+    assert!(prompt_text(s.gen_lines().last().unwrap()).contains("The API user's dog is called Bruno."), "recalled in another API");
+    s.post("/v1/chat/completions", &json!({"messages": [user("What is my dog called? Bruno?")], "strata_memory": false}));
+    let p = prompt_text(s.gen_lines().last().unwrap());
+    assert!(!p.contains("dog is called Bruno") && !p.contains("remember"), "opted out: {p}");
+}
+
 /// Claude Code's WebSearch: a request with Anthropic's web_search server tool gets server_tool_use and
 /// web_search_tool_result blocks, and the usage counts the search.
 #[test]

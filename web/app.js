@@ -2982,7 +2982,7 @@ async function loadMemory() {
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     j = await r.json();
   } catch (e) { $("mem-list").innerHTML = `<p class="muted">Not loaded: ${esc(String(e.message || e))}</p>`; return; }
-  for (const [id, k] of [["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) $(id).setAttribute("aria-checked", String(!!j.settings[k]));
+  for (const [id, k] of [["mem-api", "api"], ["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) $(id).setAttribute("aria-checked", String(!!j.settings[k]));
   const facts = (j.facts || []).slice().sort((a, b) => b.created - a.created);
   $("mem-sum").textContent = `${facts.length} fact(s) · ${j.conversations_archived} chat(s) with an archive`;
   const who = {all: "everyone", web: "this web app", api: "API clients"};
@@ -3002,7 +3002,7 @@ $("mem-web").onclick = () => {
   store.set("memory-web", on);
   $("mem-web").setAttribute("aria-checked", String(on));
 };
-for (const [id, k] of [["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) {
+for (const [id, k] of [["mem-api", "api"], ["mem-tools", "tools"], ["mem-inject", "inject"], ["mem-extend", "extend_context"]]) {
   $(id).onclick = async () => {
     const on = $(id).getAttribute("aria-checked") !== "true";
     try {

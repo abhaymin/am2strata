@@ -54,23 +54,27 @@ pub struct Settings {
     /// the most tokens the <memory> block may take (estimated at 4 characters a token)
     pub budget_tokens: usize,
     pub top_k: usize,
+    /// API calls with the main key (OpenAI, Anthropic, Responses, Gemini clients) get memory without opting in, in the
+    /// "api" space; one that sends "strata_memory": false does not
+    pub api: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { tools: true, inject: true, extend_context: true, budget_tokens: 1500, top_k: 6 }
+        Settings { tools: true, inject: true, extend_context: true, budget_tokens: 1500, top_k: 6, api: true }
     }
 }
 
 impl Settings {
     fn to_json(&self) -> Value {
         json!({"tools": self.tools, "inject": self.inject, "extend_context": self.extend_context,
-               "budget_tokens": self.budget_tokens, "top_k": self.top_k})
+               "budget_tokens": self.budget_tokens, "top_k": self.top_k, "api": self.api})
     }
     fn apply(&mut self, v: &Value) {
         if let Some(b) = v["tools"].as_bool() { self.tools = b; }
         if let Some(b) = v["inject"].as_bool() { self.inject = b; }
         if let Some(b) = v["extend_context"].as_bool() { self.extend_context = b; }
+        if let Some(b) = v["api"].as_bool() { self.api = b; }
         if let Some(n) = v["budget_tokens"].as_u64() { self.budget_tokens = (n as usize).clamp(100, 32000); }
         if let Some(n) = v["top_k"].as_u64() { self.top_k = (n as usize).clamp(1, 50); }
     }
