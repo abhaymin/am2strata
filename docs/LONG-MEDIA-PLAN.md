@@ -71,15 +71,50 @@ clients wait on one HTTP request. So, for every kind:
 
 ## Video: segments chained
 
-**State (2026-11-11): built, not yet measured on the GPU.**
+**State (2026-11-11): built and measured on the GPU. It runs, but the picture drifts from clip to clip, so it is
+not yet good enough to promise.**
 - **How it works:** `/v1/videos/generations` with `"seconds"` or `"total_frames"` past one clip's `frames` sends the
   media engine a `chain` command. It uses mold's own chain:
-  - `ChainOrchestrator` renders the clips, each continuing from the one before through a 17-frame motion tail;
+  - `ChainOrchestrator` renders the clips, each continuing from the one before (Wan: from the last frame alone,
+    mold's `WAN_HANDOFF_DUPLICATED_FRAMES`; LTX: a 17-frame motion tail);
   - `StitchPlan` joins them with smooth seams;
   - `encode_chain_frames` writes one MP4.
 - **Where it applies:** on Wan 2.2 TI2V 5B (downloaded 2026-11-11) the clips carry the motion over. A text-to-video
   checkpoint chains as independent clips. The longest is 10 minutes at 24 fps.
-- **Tested:** `a_long_video_is_made_as_a_chain_of_clips` on the mock. The GPU time per clip is to be measured.
+- **Tested:** `a_long_video_is_made_as_a_chain_of_clips` on the mock, and `a_video_is_refused_when_the_pc_lacks_its_memory`.
+
+### Measured (2026-11-11, Wan 2.2 TI2V 5B Q8, one RTX 5060 Ti 16 GB, through the live API)
+
+| Run | Result |
+|---|---|
+| One clip, 9 frames, 4 steps, 640×352 | an MP4 in 11 s |
+| Two-clip chain, 17 frames, 2 steps, 640×352 | an MP4 in 55 s (about 12 s a clip; UMT5 on the GPU) |
+| **30 s chain**, 640×352, 20 steps, 24 fps, seed 7 | **721 frames, 6 clips, 1,654 s (27.6 min)**: 264-268 s a clip of 121 frames, the same for each; UMT5 FP16 on the GPU every clip (15.4-16.0 GB free) |
+
+The seams and the picture of the 30 s chain (frame-to-frame difference on a 160×88 grey copy; a lighthouse with waves,
+so the median is high, 10.3):
+- **Each seam is a visible jump:** 17-30 at the seam against 1-5 in the frames before it. At the first seam the
+  framing jumps closer and the brightness goes from 71 to 91.
+- **The picture drifts:** each clip starts from the last, already degraded, frame, so errors add up. By the fourth
+  clip the sky is smeared, the colours are oversaturated and the rocks and waves break into painterly blocks.
+- 640×352 is below the model's own 1280×704, which adds to the artefacts.
+
+The first real try (10 s, 01:50) failed after 36 min with "device mismatch in add, lhs: Cpu, rhs: Cuda". mold had put
+UMT5 on the CPU (F32, about 22.7 GB), the service reached 34.9 GB, and the kernel's OOM killer ran. Fixed since: a
+video job needs 24 GB free or is refused plainly; mold's own messages (UMT5 on GPU or CPU, stage times) are in the
+service log; the Wan carry is one frame, not LTX's 17.
+
+### Next, before long video is offered
+
+1. **Colour and brightness held to the first clip:** match each clip's histogram to clip 1 before it is used as the
+   next clip's start frame and before the stitch. Cheap, on the CPU, and it attacks the drift where it starts.
+2. **Crossfaded seams:** a fade of a few frames at each seam (mold's `TransitionMode` and `fade_frames`), instead of
+   a cut.
+3. **The model's own size, 1280×704:** measure one clip's time there (expected several times the 640×352 time).
+4. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
+   inpaint takes two anchors (`WanImageAnchors`); otherwise a storyboard of independent clips with crossfades.
+5. Measure again on the same prompt and seed: the seam numbers, and the drift (the difference of each clip's mean
+   colour from clip 1's).
 
 - The model: Wan 2.2 TI2V 5B (text and image to video, 1280×704 or 704×1280 at 24 fps, about 5 s a segment) in mold.
   Wan 2.1 1.3B makes text-to-video only, so it can make the first segment but not continue one.
