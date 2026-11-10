@@ -613,6 +613,24 @@ fn mcp_servers_are_managed_from_the_app() {
     assert_eq!(r.status().as_u16(), 403);
 }
 
+/// Production (PRODUCTION-PLAN.md, step 1): the chat engine dies mid-answer (an out-of-memory kill, a crash). That
+/// request gets an error that says what happened; the next one is answered by a new engine, with no manual reload,
+/// and the alerts say so.
+#[test]
+fn a_dead_engine_is_replaced_for_the_next_request() {
+    let s = Server::start(&[Model::default()], &[ids("Hello.\n</think>\n\nfirst"), ids("Hi.\n</think>\n\nsecond answer")],
+                          json!({"die_once": true}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("hi")]}));
+    assert!(c >= 500, "the request the engine died in fails: {c} {r}");
+    assert!(r.to_string().contains("send this one again"), "it says what happened and what to do: {r}");
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("hi again")]}));
+    assert_eq!(c, 200, "the next request is answered by a new engine: {r}");
+    let (_, h) = s.get("/health", false);
+    assert_eq!(h["alerts"], 1, "{h}");
+    let (_, sys) = s.get("/api/system", true);
+    assert!(sys["alerts"].to_string().contains("stopped unexpectedly"), "the alerts tell the user: {}", sys["alerts"]);
+}
+
 #[test]
 fn the_engine_gets_its_eight_token_margin() {
     let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));

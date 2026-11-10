@@ -112,3 +112,20 @@ or with `unsloth start codex`, reaches the same memory, web, media and MCP tools
   answers with the image after a reload, which the mock counts.
 - A remote request without a profile gets no MCP tools.
 - Memory spaces: what one profile remembers, another does not recall.
+
+## 5. Every web app feature through the API (owner, 2026-11-10)
+
+"Server" means the web app's major features used through the server, by any client with a key. Where each stands:
+
+| Feature (web app) | Through the API | Next |
+| --- | --- | --- |
+| Chat with thinking, documents, pictures, video frames | all four APIs | - |
+| Memory (remember, recall, forget, facts in the prompt, chats past the context) | **on by default for the main key's API calls** ("api" space; `strata_memory: false` opts out); per profile for client keys | `/v1/memory` for a client to list, add and remove its own facts |
+| Web search and page reading | `strata_web`, a profile's `web`, and the APIs' own web search tools | - |
+| MCP tools | own page (`strata_mcp`), or a profile naming servers | - |
+| Images, video, speech, songs as chat tools | `strata_media`, or a profile's sets | in the turn (part 3) |
+| Images, video, speech, transcription, songs as endpoints | `/v1/images`, `/v1/videos`, `/v1/audio/*` | jobs that survive a dropped client (PRODUCTION-PLAN.md) |
+| The browser (computer use) | `strata_browser` only | a profile set `browser` |
+| Running code (the canvas) | the page's Run button only | a profile set `code`: a `run_python` tool in the same sandbox, for profiles that name it |
+| Models (list, switch, load) | `/v1/models`, the request's `model` with `switch_on_request`, `/api/inference/load` | model preferences (PRODUCTION-PLAN.md) |
+| Monitor, API calls | `/metrics`, `/api/requests` (main key) | - |

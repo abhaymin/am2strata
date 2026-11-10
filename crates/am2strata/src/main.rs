@@ -130,6 +130,14 @@ pub fn not_own_page(what: &str) -> Response {
           format!("{what} only from PolyStrata's own page (or an origin in the config's trusted_origins)"))
 }
 
+/// A panic in a handler, as a 500 in the APIs' error shape (the panic itself is logged).
+fn panic_answer(err: Box<dyn std::any::Any + Send + 'static>) -> axum::http::Response<axum::body::Body> {
+    let what = err.downcast_ref::<String>().cloned().or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+    tracing::error!("a request handler panicked: {what}");
+    error(StatusCode::INTERNAL_SERVER_ERROR, "server_error",
+          "the server hit an internal error on this request (its log has the details); it keeps running: send the request again")
+}
+
 pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -446,6 +454,8 @@ async fn main() -> Result<()> {
             axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer")))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
+        // a handler that panics is answered with a JSON error, never a dropped connection
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))
         .layer(axum::middleware::from_fn_with_state(hosts, check_host))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;

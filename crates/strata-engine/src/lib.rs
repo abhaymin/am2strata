@@ -22,7 +22,8 @@ pub enum Error {
     Config { path: String, source: Box<dyn std::error::Error + Send + Sync> },
     #[error("starting the engine {exe}: {source}")]
     Spawn { exe: String, source: std::io::Error },
-    #[error("the engine stopped unexpectedly")]
+    #[error("the model's engine stopped unexpectedly (it may have run out of memory, or crashed); am2Strata starts it \
+             again for the next request: send this one again")]
     Died,
     #[error("the engine did not become ready within {0:?}")]
     StartTimeout(Duration),
@@ -252,6 +253,8 @@ pub enum GenEvent {
 }
 
 struct Inner {
+    /// a request found the engine gone or out of step: it is not used again (the manager starts a new one)
+    broken: std::sync::atomic::AtomicBool,
     stdin: Mutex<ChildStdin>,
     events: Mutex<mpsc::UnboundedReceiver<Option<Event>>>,
     /// one request at a time
@@ -313,7 +316,7 @@ impl Engine {
         tokio::time::timeout(ready_timeout, ready).await.map_err(|_| Error::StartTimeout(ready_timeout))??;
         tracing::info!(?info, "engine ready");
         Ok(Self {
-            inner: Arc::new(Inner { stdin: Mutex::new(stdin), events: Mutex::new(rx), turn: Mutex::new(()) }),
+            inner: Arc::new(Inner { broken: Default::default(), stdin: Mutex::new(stdin), events: Mutex::new(rx), turn: Mutex::new(()) }),
             child: Mutex::new(child),
             info,
         })
@@ -331,6 +334,7 @@ impl Engine {
             {
                 let mut stdin = inner.stdin.lock().await;
                 if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                    inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = out.send(Err(Error::Died)).await;
                     return;
                 }
@@ -341,6 +345,7 @@ impl Engine {
                 let ev = match events.recv().await {
                     Some(Some(ev)) => ev,
                     Some(None) | None => {
+                        inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = out.send(Err(Error::Died)).await;
                         return;
                     }
@@ -383,6 +388,14 @@ impl Engine {
     /// and leaves it in step (Error::Refused); FATAL, or any other line, means it is out of step (Error::Died: the
     /// caller restarts it). Only for an engine that has session files (`strata --serve` with --prompt-cache > 0).
     pub async fn session(&self, save: bool, path: &std::path::Path, silence: Duration) -> Result<(u64, u64, f64)> {
+        let r = self.session_step(save, path, silence).await;
+        if matches!(r, Err(Error::Died)) {
+            self.inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+
+    async fn session_step(&self, save: bool, path: &std::path::Path, silence: Duration) -> Result<(u64, u64, f64)> {
         let p = path.to_string_lossy();
         if p.contains(['\r', '\n', '\0']) || p.is_empty() {
             return Err(Error::Refused("invalid session path".into()));
@@ -422,6 +435,18 @@ impl Engine {
                 }
                 _ => return Err(Error::Died),
             }
+        }
+    }
+
+    /// Can this engine take requests? Not once a request found it gone or out of step, nor once its process has
+    /// exited (killed for memory, a crash). An engine being shut down counts as usable until it is gone.
+    pub fn usable(&self) -> bool {
+        if self.inner.broken.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        match self.child.try_lock() {
+            Ok(mut c) => !matches!(c.try_wait(), Ok(Some(_))),
+            Err(_) => true,
         }
     }
 

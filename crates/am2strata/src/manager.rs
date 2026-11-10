@@ -306,8 +306,21 @@ impl Manager {
         })
     }
 
+    /// The loaded model. One whose engine has died (killed for memory, a crash) or went out of step is dropped here,
+    /// so the request that asks loads it again instead of failing on it, and every later one too.
     pub async fn current(&self) -> Option<Arc<Loaded>> {
-        self.current.read().await.clone()
+        let l = self.current.read().await.clone()?;
+        if l.engine.usable() {
+            return Some(l);
+        }
+        let mut w = self.current.write().await;
+        if w.as_ref().is_some_and(|x| Arc::ptr_eq(x, &l)) {
+            *w = None;
+            self.queue.set_resident(crate::queue::Resident::None);
+            tracing::warn!(model = %l.entry.id, "the model's engine stopped (out of memory, or a crash): it is loaded again for the next request");
+            self.monitor.notice(&format!("{}: its engine stopped unexpectedly (out of memory, or a crash) and is loaded again for the next request", l.entry.id));
+        }
+        None
     }
 
     /// The loaded model, loading the default one when none is (a request after an unload starts it again).

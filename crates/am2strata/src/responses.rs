@@ -933,6 +933,8 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
                 }
             }
         }
+        // the run ended with neither its end nor an error (a task that failed): the client hears it, not a silence
+        let _ = tx.send(asm.failed("the answer stopped unexpectedly on the server (its log has why); send the request again")).await;
     });
     if stream {
         let body = futures::stream::unfold(rx, |mut rx| async move {

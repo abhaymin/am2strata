@@ -29,7 +29,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 base64 = "0.22"
 sha2 = "0.10"
 jsonschema = { version = "0.30", default-features = false }
-tower-http = { version = "0.6", features = ["fs", "set-header"] }
+tower-http = { version = "0.6", features = ["fs", "set-header", "catch-panic"] }
 # web_search / fetch_url: DuckDuckGo's HTML results and the text of a page (pure Rust, html5ever)
 scraper = "0.20"
 ego-tree = "0.6.3"

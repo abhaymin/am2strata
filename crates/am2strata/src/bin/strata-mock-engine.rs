@@ -8,7 +8,7 @@
 //! `OK <tokens>`.
 //!
 //! Environment:
-//!   MOCK_SCRIPT   a JSON file: {"replies": [[id, ...], ...], "finish": "stop", "delay_ms": 0}; replies are used in turn
+//!   MOCK_SCRIPT   a JSON file: {"replies": [[id, ...], ...], "finish": "stop", "delay_ms": 0, "die_once": false}; replies are used in turn
 //!                 (the last one repeats); without it every reply is the token 0 once
 //!   MOCK_RECORD   a file each received command line is appended to
 //!   MOCK_IMAGE_TOKENS  the token count the vision mode reports (default 4)
@@ -54,10 +54,13 @@ struct Script {
     replies: Vec<Vec<u32>>,
     finish: String,
     delay: Duration,
+    /// "die_once": the first answer of the first engine sends one token and the engine exits (a crash, an
+    /// out-of-memory kill); a file beside the script makes the engine started after it answer normally
+    die_once: Option<std::path::PathBuf>,
 }
 
 fn script() -> Script {
-    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO };
+    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO, die_once: None };
     if let Ok(path) = std::env::var("MOCK_SCRIPT") {
         if let Ok(v) = std::fs::read_to_string(path).map(|t| serde_json::from_str::<serde_json::Value>(&t)) {
             let v = v.unwrap_or_default();
@@ -72,6 +75,9 @@ fn script() -> Script {
             }
             if let Some(d) = v.get("delay_ms").and_then(|d| d.as_u64()) {
                 s.delay = Duration::from_millis(d);
+            }
+            if v.get("die_once") == Some(&serde_json::Value::Bool(true)) {
+                s.die_once = Some(std::path::PathBuf::from(format!("{}.died", std::env::var("MOCK_SCRIPT").unwrap_or_default())));
             }
         }
     }
@@ -135,6 +141,13 @@ fn main() {
                 say(&format!("PP {n_prompt} {n_prompt} 1.0 1000.0"));
                 let reply = script.replies.get(turn).or(script.replies.last()).cloned().unwrap_or_default();
                 turn += 1;
+                if let Some(mark) = script.die_once.as_ref().filter(|m| !m.exists()) {
+                    let _ = std::fs::write(mark, "died");
+                    if let Some(t) = reply.first() {
+                        say(&format!("T {t}"));
+                    }
+                    std::process::exit(1);
+                }
                 let mut sent = 0;
                 let mut finish = script.finish.clone();
                 for t in reply {

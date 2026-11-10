@@ -285,6 +285,8 @@ async fn pump(started: run::Started, tx: tokio::sync::mpsc::Sender<Option<Value>
                 return; // heartbeat failed: the client is gone
             }
         }
+        // the run ended with neither its end nor an error (a task that failed): the client hears it, not a silence
+        let _ = tx.send(Some(json!({"error": {"type": "server_error", "message": "the answer stopped unexpectedly on the server (its log has why); send the request again"}}))).await;
     }
 }
 

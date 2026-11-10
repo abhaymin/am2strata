@@ -91,9 +91,15 @@ struct Telemetry {
     stat: serde_json::Map<String, Value>,
 }
 
+/// how long a notice stays among the alerts
+pub const NOTICE_S: f64 = 900.0;
+
 pub struct Monitor {
     /// the health watch: cards the driver cannot reach, driver errors since the start, the last one
     health: Mutex<(Vec<String>, u64, Option<String>)>,
+    /// events the user should hear about (an engine that stopped and was restarted, low memory, a long queue):
+    /// (when, text), shown with the alerts for NOTICE_S
+    notices: Mutex<std::collections::VecDeque<(f64, String)>>,
     inner: Mutex<Inner>,
     tel: Mutex<Telemetry>,
     pub started: f64,
@@ -114,6 +120,7 @@ impl Monitor {
         let next_id = history.iter().filter_map(|r| r["id"].as_u64()).max().unwrap_or(0);
         let m = Arc::new(Monitor {
             health: Mutex::new((Vec::new(), 0, None)),
+            notices: Mutex::new(std::collections::VecDeque::new()),
             inner: Mutex::new(Inner { totals: Totals { since: now(), ..Default::default() }, history, next_id, ..Default::default() }),
             tel: Mutex::new(Telemetry::default()),
             started: now(),
@@ -218,7 +225,20 @@ impl Monitor {
         if h.1 > 0 {
             out.push(format!("{} GPU driver error(s) since this server started; the last: {}", h.1, h.2.as_deref().unwrap_or("")));
         }
+        let t = now();
+        out.extend(self.notices.lock().unwrap().iter().filter(|(at, _)| t - at < NOTICE_S).map(|(_, n)| n.clone()));
         out
+    }
+
+    /// Tell the user about an event (with /health's and the web app's alerts, for NOTICE_S); the same text again
+    /// replaces the older one.
+    pub fn notice(&self, text: &str) {
+        let mut n = self.notices.lock().unwrap();
+        n.retain(|(at, x)| x != text && now() - at < NOTICE_S);
+        n.push_back((now(), text.to_string()));
+        while n.len() > 20 {
+            n.pop_front();
+        }
     }
 
     /// What the output parser repaired in a request (Strata 0.2.8 #4427, #4077).
