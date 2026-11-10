@@ -573,8 +573,10 @@ fn chrono_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// POST /v1/videos/generations {"prompt", "model"?, "size"?: "WxH", "frames"?, "fps"?, "steps"?, "seed"?, "format"?}:
-/// one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an image. The answer is the clip
+/// POST /v1/videos/generations {"prompt", "model"?, "size"?: "WxH", "frames"?, "fps"?, "steps"?, "seed"?, "format"?,
+/// "seconds"? / "total_frames"?}: one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an
+/// image. Longer than one clip ("seconds" or "total_frames" past `frames`): a chain of clips (mold's chain, each
+/// continuing from the one before on a model that takes a source image), stitched into one video. The answer is the clip
 /// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
 pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !crate::api_authorized(&s, &headers) {
@@ -638,11 +640,20 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance, "seed": seed,
                    "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
+    // longer than one clip: a chain (the clip's frames each, a 17-frame motion tail: 4n+1 for Wan, 8n+1 for LTX)
+    let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64))
+        .map(|t| t.min(MAX_CHAIN_FRAMES));
+    let (op, r) = match total.filter(|t| *t > frames) {
+        Some(t) => ("chain", json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
+                                    "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
+                                    "motion_tail_frames": 17})),
+        None => ("generate", r),
+    };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("video", &model);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut clip = None;
-    let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
+    let res = s.media.call(json!({"op": op, "request": r}), |ev| {
         if ev["event"] == "video" && clip.is_none() {
             clip = Some(ev.clone());
         }
@@ -672,10 +683,13 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     }
     mon.media_end(job, "stop", &format!("{}x{}, {} frames at {} fps", v["width"], v["height"], v["frames"], v["fps"]));
     Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
-                "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"],
+                "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"], "clips": v["clips"].as_u64().unwrap_or(1),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
                            "engine": "am2strata-media (Rust, candle)", "frames_note": frames_note}})).into_response()
 }
+
+/// The longest chained video: 10 minutes at 24 fps.
+pub const MAX_CHAIN_FRAMES: u64 = 14_400;
 
 /// A video family's frame rule: n * step + 1 frames (Wan 4, LTX-Video and LTX-2 8; mold checks the same).
 pub fn video_frame_step(family: &str) -> u64 {

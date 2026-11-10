@@ -1473,6 +1473,25 @@ fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
     }
 }
 
+/// Long video (LONG-MEDIA-PLAN.md): a request longer than one clip is a chain in the engine (mold's chain: clips
+/// continued from the one before, stitched into one video); one clip stays one generate.
+#[test]
+fn a_long_video_is_made_as_a_chain_of_clips() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "a lighthouse at dusk, waves", "frames": 81, "fps": 16, "seconds": 30}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["frames"], 480, "30 s at 16 fps");
+    assert!(r["clips"].as_u64().unwrap() >= 6, "several clips: {r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["op"] == "chain").expect("a chain command");
+    assert_eq!((chain["request"]["total_frames"].as_u64(), chain["request"]["clip_frames"].as_u64(), chain["request"]["motion_tail_frames"].as_u64()),
+               (Some(480), Some(81), Some(17)));
+    // one clip's worth: an ordinary generate
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "a lighthouse", "frames": 33}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["clips"], 1);
+}
+
 #[test]
 fn a_chat_waits_behind_a_media_job_in_the_queue_and_says_its_place() {
     let s = Server::start(&[Model::default()], &[ids("Queued answer.")], json!({"media_delay_ms": 1500}));

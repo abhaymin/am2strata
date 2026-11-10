@@ -71,6 +71,16 @@ clients wait on one HTTP request. So, for every kind:
 
 ## Video: segments chained
 
+**State (2026-11-11): built, not yet measured on the GPU.**
+- **How it works:** `/v1/videos/generations` with `"seconds"` or `"total_frames"` past one clip's `frames` sends the
+  media engine a `chain` command. It uses mold's own chain:
+  - `ChainOrchestrator` renders the clips, each continuing from the one before through a 17-frame motion tail;
+  - `StitchPlan` joins them with smooth seams;
+  - `encode_chain_frames` writes one MP4.
+- **Where it applies:** on Wan 2.2 TI2V 5B (downloaded 2026-11-11) the clips carry the motion over. A text-to-video
+  checkpoint chains as independent clips. The longest is 10 minutes at 24 fps.
+- **Tested:** `a_long_video_is_made_as_a_chain_of_clips` on the mock. The GPU time per clip is to be measured.
+
 - The model: Wan 2.2 TI2V 5B (text and image to video, 1280×704 or 704×1280 at 24 fps, about 5 s a segment) in mold.
   Wan 2.1 1.3B makes text-to-video only, so it can make the first segment but not continue one.
 - Segment 1 from the prompt; segment k+1 from segment k's last frame and the prompt (or, with a storyboard, that

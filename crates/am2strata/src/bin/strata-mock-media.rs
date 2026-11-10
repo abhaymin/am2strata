@@ -22,6 +22,16 @@ fn main() {
         }
         let cmd: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
         match cmd["op"].as_str().unwrap_or("") {
+            "chain" => {
+                let r = &cmd["request"];
+                let clips = r["total_frames"].as_u64().unwrap_or(0).div_ceil(r["clip_frames"].as_u64().unwrap_or(1).max(1));
+                for st in 1..=3u64 {
+                    emit(serde_json::json!({"event": "step", "step": st, "total": 3, "stage": 1, "stages": clips}));
+                }
+                emit(serde_json::json!({"event": "video", "format": r["output_format"], "width": r["width"], "height": r["height"],
+                                        "frames": r["total_frames"], "fps": r["fps"], "clips": clips, "data": "AAAAIGZ0eXBpc29t"}));
+                emit(serde_json::json!({"event": "done", "ms": 1}));
+            }
             "generate" => {
                 let r = &cmd["request"];
                 // a slow job, for the queue's tests

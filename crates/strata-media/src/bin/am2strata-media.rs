@@ -513,6 +513,51 @@ fn generate(st: &mut State, req: &Value) -> Result<()> {
     Ok(())
 }
 
+/// A long video as a chain of clips (mold's chain: each clip continues from the one before, with its motion tail as
+/// the next clip's conditioning on a model that takes a source image, then stitched and encoded as one MP4):
+/// {"op": "chain", "request": mold's ChainRequest (model, prompt + total_frames + clip_frames, or stages; width,
+/// height, fps, steps, guidance, seed, motion_tail_frames)} -> {"event": "step", "step", "total", "stage", "stages"}...
+/// then {"event": "video", ...} as a one-clip generate gives, and {"event": "done"}.
+fn chain(st: &mut State, req: &Value) -> Result<()> {
+    let model = req["model"].as_str().map(str::to_string).or_else(|| st.model.clone()).ok_or_else(|| anyhow!("no model named"))?;
+    let mut r = req.clone();
+    r["model"] = json!(model);
+    for (k, v) in [("strength", json!(1.0)), ("output_format", json!("mp4")), ("steps", json!(20)), ("guidance", json!(5.0))] {
+        if r.get(k).is_none_or(Value::is_null) {
+            r[k] = v;
+        }
+    }
+    let family = mold_core::manifest::find_manifest(&model).map(|m| m.family.clone()).unwrap_or_else(|| "wan".into());
+    let request: mold_core::ChainRequest = serde_json::from_value(r).context("the chain request")?;
+    let request = request.normalise_with_family(Some(&family)).map_err(|e| anyhow!("{e}"))?;
+    load_placed(st, &model, None)?;
+    let engine = st.engine.as_mut().unwrap();
+    let t0 = std::time::Instant::now();
+    let renderer = engine.as_chain_renderer().ok_or_else(|| anyhow!("{model} cannot chain clips"))?;
+    let stages = request.stages.len() as u64;
+    let mut progress = |ev: mold_core::ChainProgressEvent| {
+        if let mold_core::ChainProgressEvent::DenoiseStep { stage_idx, step, total } = ev {
+            emit(json!({"event": "step", "step": stage_idx as u64 * total as u64 + step as u64, "total": stages * total as u64,
+                        "stage": stage_idx + 1, "stages": stages}));
+        }
+    };
+    let out = mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))
+        .map_err(|e| anyhow!("the chain: {e:?}"))?;
+    let n = out.stage_frames.len();
+    let boundaries: Vec<mold_core::TransitionMode> = request.stages.iter().skip(1).map(|s| s.transition).collect();
+    let fade_lens: Vec<u32> = request.stages.iter().skip(1).map(|s| s.fade_frames.unwrap_or(8)).collect();
+    let plan = mold_inference::chain::stitch::StitchPlan { clips: out.stage_frames, boundaries, fade_lens,
+                                                           motion_tail_frames: request.motion_tail_frames };
+    let frames = plan.assemble().map_err(|e| anyhow!("stitching the clips: {e:?}"))?;
+    let (w, h) = frames.first().map(|f| (f.width(), f.height())).unwrap_or((request.width, request.height));
+    let enc = mold_inference::chain::encode::encode_chain_frames(&frames, request.fps, request.output_format, None)?;
+    let format = serde_json::to_value(enc.format).ok().and_then(|f| f.as_str().map(str::to_string)).unwrap_or_default();
+    emit(json!({"event": "video", "format": format, "width": w, "height": h, "frames": frames.len(), "fps": request.fps,
+                "clips": n, "data": base64::engine::general_purpose::STANDARD.encode(&enc.bytes)}));
+    emit(json!({"event": "done", "ms": t0.elapsed().as_millis() as u64, "seed": request.seed}));
+    Ok(())
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
     let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, placement: None, whisper: None, parler: None,
@@ -540,6 +585,7 @@ fn main() {
                     emit(json!({"event": "loaded", "model": model, "vram_bytes": vram}));
                 }
                 "generate" => generate(&mut st, cmd.get("request").unwrap_or(&Value::Null))?,
+                "chain" => chain(&mut st, cmd.get("request").unwrap_or(&Value::Null))?,
                 "unload" => {
                     if let Some(mut e) = st.engine.take() {
                         e.unload();
