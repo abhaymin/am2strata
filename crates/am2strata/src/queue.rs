@@ -14,6 +14,9 @@ use tokio::sync::Notify;
 
 /// The most jobs taken out of order for the model already loaded, before the head of the queue gets its turn.
 pub const BATCH: usize = 4;
+/// ...and none at all once the job at the head has waited this long: long jobs (an agent's chat of 60,000 tokens takes
+/// minutes) made "4 in a row" a 20-minute wait; past this, the queue goes strictly in order of arrival.
+pub const BATCH_WAIT: Duration = Duration::from_secs(90);
 
 /// The most jobs that may wait at once; one more is refused at once (a client cannot fill the memory with waiters).
 pub const MAX_WAITING: usize = 64;
@@ -66,6 +69,8 @@ pub struct Queue {
     state: Mutex<State>,
     changed: Notify,
     pub max_wait: Option<Duration>,
+    /// BATCH_WAIT (a test sets it to 0)
+    batch_wait: Duration,
 }
 
 /// The turn: held while the job runs; dropped, the next job's.
@@ -121,20 +126,25 @@ impl std::fmt::Display for TooLong {
 
 impl Queue {
     pub fn new(max_wait: Option<Duration>) -> Arc<Queue> {
+        Self::with_batch_wait(max_wait, BATCH_WAIT)
+    }
+
+    pub fn with_batch_wait(max_wait: Option<Duration>, batch_wait: Duration) -> Arc<Queue> {
         Arc::new(Queue {
             state: Mutex::new(State { queue: VecDeque::new(), running: None, resident: Resident::None, batched: 0, next: 1 }),
             changed: Notify::new(),
             max_wait,
+            batch_wait,
         })
     }
 
     /// The job that goes next, if the turn is free.
-    fn choose(s: &State) -> Option<u64> {
+    fn choose(s: &State, batch_wait: Duration) -> Option<u64> {
         if s.running.is_some() {
             return None;
         }
         let head = s.queue.front()?;
-        if !fits(&head.need, &s.resident) && s.batched < BATCH {
+        if !fits(&head.need, &s.resident) && s.batched < BATCH && head.since.elapsed() < batch_wait {
             if let Some(t) = s.queue.iter().find(|t| fits(&t.need, &s.resident)) {
                 return Some(t.id);
             }
@@ -164,7 +174,7 @@ impl Queue {
             notified.as_mut().enable();
             {
                 let mut s = self.state.lock().unwrap();
-                if Self::choose(&s) == Some(id) {
+                if Self::choose(&s, self.batch_wait) == Some(id) {
                     let pos = s.queue.iter().position(|t| t.id == id).unwrap();
                     let t = s.queue.remove(pos).unwrap();
                     // out of order for the resident model counts toward the bound; the head's turn resets it
@@ -289,6 +299,16 @@ mod tests {
         jobs.extend(names.iter().map(|n| (*n, t("a"))));
         let o = order(q.clone(), jobs, after).await;
         assert_eq!(o, ["c1", "c2", "c3", "c4", "img", "c5", "c6"]);
+    }
+
+    #[tokio::test]
+    async fn a_head_that_waited_long_enough_is_not_jumped() {
+        // with the wait already past (0 s), nothing goes ahead of the image at the head: strictly in order of arrival
+        let q = Queue::with_batch_wait(None, Duration::ZERO);
+        q.set_resident(Resident::Text("a".into()));
+        let t = |m: &str| Need::Text(m.into());
+        let o = order(q.clone(), vec![("img", Need::Gpu), ("c1", t("a")), ("c2", t("a"))], after).await;
+        assert_eq!(o, ["img", "c1", "c2"]);
     }
 
     #[tokio::test]
