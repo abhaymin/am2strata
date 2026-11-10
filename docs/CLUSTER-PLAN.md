@@ -75,6 +75,32 @@ machines before the next starts.
      split is rebuilt without it, or the request is refused plainly when the model no longer fits.
    - The PRODUCTION-PLAN rules hold across the cluster: no crash, and overload told plainly.
 
+## Master and workers (owner, 2026-11-11)
+
+The cluster has one **master** and any number of **workers**:
+- **The master:**
+  - is the am2Strata people and apps talk to; it holds the API keys, client profiles, memory, MCP servers and the
+    queue;
+  - routes each request to a worker (phase 1) or splits a model across workers (phase 2);
+  - streams the answer back.
+- **A worker:**
+  - runs engines and media models only;
+  - takes work from its master and from no one else; its own API is closed by default (`"cluster": {"role":
+    "worker", "master": "<master's key fingerprint>"}`);
+  - reports its models, free memory, queue and health every few seconds.
+- **Joining:** a worker joins by pairing (a code typed on the master, or a QR code for a phone). The master can
+  remove it at any time.
+- **Failover:**
+  - a worker that stops reporting is drained (no new work) and, after a timeout, dropped; its running requests
+    are retried on another worker that holds the model, or refused plainly;
+  - when the master itself goes down, workers wait; they do not take over, so there is never a second master.
+    A standby master is a later step.
+- **Peer to peer:**
+  - on the same network, workers find the master by mDNS;
+  - across the internet, through the user's own VPN (Tailscale, WireGuard) first; direct connections by hole
+    punching later;
+  - traffic is always end-to-end encrypted with the paired keys.
+
 ## Security
 
 - **Joining:** only machines the user accepted or paired, never by being on the network alone.
