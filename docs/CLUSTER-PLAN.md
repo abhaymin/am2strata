@@ -4,8 +4,36 @@ Owner's request (2026-11-10): machines on the same network, or remote ones the u
 work together. A model's layers are shared across them, for quicker requests and longer context, as exo and other
 cluster tools do, old phones included.
 
-**State: planned, nothing built.** This page is the design and the order of the work. Each step is measured on real
-machines before the next starts.
+**State: phase 1 (request routing) built and tested on one machine (2026-11-11); its measurement on a second
+machine, and the paired keys, are next.** This page is the design and the order of the work. Each step is measured
+on real machines before the next starts.
+
+### Phase 1 as built (`crates/am2strata/src/cluster.rs`)
+
+- **Configuration:** the master's run config has
+  `"cluster": {"workers": {"pc2": {"url": "http://host:8000", "key": "env:PC2_KEY"}}}`. A worker is an ordinary
+  am2Strata with its own API key, which only the master is given.
+- **Polling:** the master asks each worker for its models and queue every 5 s. A worker that has not answered for
+  15 s gets no new work.
+- **Routing:** a chat (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/completions`) goes to a worker
+  in two cases:
+  - its `model` is not installed on the master but is on a worker. The worker with the model loaded goes first,
+    then the one with the shortest queue.
+  - the master has work waiting and a worker has the same model loaded and idle.
+- **The answer:** streamed back through the master, with `x-strata-worker: <name>`, and kept in the master's API
+  call records.
+- **Failure:** a worker that does not take a request leaves it to the master when the master has the model;
+  otherwise the request is refused plainly (503, naming the worker).
+- **Authentication:** only a request with the master's own key is sent on, never the client's key. The worker gets
+  the worker's key.
+- **The status:** `GET /api/cluster` shows each worker's models, its loaded model, its queue, when it was last seen,
+  and how many requests it has taken.
+- **Security for now:** plain HTTP with the key, so across a network you don't trust, use your own VPN
+  (Tailscale, WireGuard). Paired ed25519 keys, encryption and mDNS discovery are the next steps (parts 1 and 2
+  below).
+- **Tested:** `a_master_routes_a_chat_to_the_worker_that_has_the_model` (two servers on one machine: a worker's
+  model answered through the master, streamed too; the master's own model answered locally; no key, not sent on),
+  and the routing rules in unit tests.
 
 ## What a cluster can and cannot buy (the physics first)
 

@@ -6,6 +6,7 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod agents;
+mod cluster;
 mod machine;
 mod optimizer;
 mod clients;
@@ -115,6 +116,8 @@ pub struct AppState {
     pub code_run_config_on: bool,
     /// the canvas's pages, served sandboxed at /preview/<id>
     pub previews: Arc<preview::Previews>,
+    /// the workers this server routes requests to (cluster.rs; none: a single machine)
+    pub cluster: Arc<cluster::Cluster>,
     /// image generation (v2): the am2strata-media engine process
     pub media: Arc<image_gen::Media>,
     /// media jobs a chat's tools queued (media_jobs.rs)
@@ -415,6 +418,17 @@ async fn main() -> Result<()> {
             }
         });
     }
+    let cluster = Arc::new(match cluster::Cluster::from_config(&first.cfg.rest) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("am2strata: {e}");
+            std::process::exit(2);
+        }
+    });
+    if !cluster.is_empty() {
+        tracing::info!("cluster: master of {}", cluster.workers.iter().map(|w| format!("{} ({})", w.name, w.url)).collect::<Vec<_>>().join(", "));
+        cluster.start_polling();
+    }
     let state = AppState { mgr: mgr.clone(), api_key, clients: Arc::new(clients), mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
@@ -422,6 +436,7 @@ async fn main() -> Result<()> {
                            code_run: Arc::new(code_run),
                            code_run_config_on: first.cfg.rest.get("code_run") != Some(&serde_json::Value::Bool(false)),
                            previews: Arc::new(preview::Previews::default()),
+                           cluster: cluster.clone(),
                            media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)),
                            media_jobs: Arc::new(media_jobs::Jobs::new()) };
     // media jobs kept across restarts; the ones the server stopped in run again
@@ -456,6 +471,7 @@ async fn main() -> Result<()> {
         .route("/api/queue", get(web::queue))
         .route("/api/gpus", get(web::gpus))
         .route("/api/machine", get(web::machine))
+        .route("/api/cluster", get(cluster::status))
         .route("/api/machine/measure", post(web::machine_measure))
         .route("/api/optimise", get(web::optimise_status))
         .route("/api/models/{id}/optimise", post(web::optimise))
@@ -532,6 +548,8 @@ async fn main() -> Result<()> {
             axum::http::header::X_CONTENT_TYPE_OPTIONS, axum::http::HeaderValue::from_static("nosniff")))
         .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
             axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer")))
+        // a chat whose model a worker should answer goes there (cluster.rs); inside the records, so they show it
+        .layer(axum::middleware::from_fn_with_state(state.clone(), cluster::route))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         // overload told plainly: Retry-After on every refusal for load, a warning header while the PC is short of memory
         // or the queue is long

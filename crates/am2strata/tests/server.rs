@@ -2558,3 +2558,39 @@ fn the_optimizer_tunes_a_model_on_the_mock() {
     let (c, _) = s.post("/api/models/nope/optimise", &json!({}));
     assert_eq!(c, 404);
 }
+
+/// Clusters, phase 1 (CLUSTER-PLAN "Master and workers"): a master sends a chat for a model only a worker has to the
+/// worker, and streams its answer back; a model it has itself stays here; GET /api/cluster shows the worker.
+#[test]
+fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
+    let worker = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("Ok.\n</think>\n\nFrom the worker.")], json!({}));
+    let m = Model { extra: json!({"cluster": {"workers": {"pc2": {"url": worker.base, "key": KEY}}}}), ..Model::default() };
+    let master = Server::start(&[m], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
+    let t0 = Instant::now();
+    let cl = loop {
+        let (_, c) = master.get("/api/cluster", true);
+        if c["workers"][0]["ready"] == true || t0.elapsed() > Duration::from_secs(12) {
+            break c;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!((cl["role"].as_str(), cl["workers"][0]["ready"].as_bool()), (Some("master"), Some(true)), "{cl}");
+    assert_eq!(cl["workers"][0]["models"][0], "mock-b");
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", master.base)).bearer_auth(KEY)
+        .json(&json!({"model": "mock-b", "messages": [user("hi")]})).send().unwrap();
+    assert_eq!(r.headers().get("x-strata-worker").and_then(|v| v.to_str().ok()), Some("pc2"));
+    let v: Value = r.json().unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "From the worker.", "{v}");
+    // streamed through the master
+    let ev = master.stream("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "stream": true}));
+    let text: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
+    assert_eq!(text, "From the worker.");
+    // its own model is answered here
+    let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("hi")]}));
+    assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the master.")), "{v}");
+    // a request without the master's key is never sent on
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", master.base))
+        .json(&json!({"model": "mock-b", "messages": [user("hi")]})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+    assert!(r.headers().get("x-strata-worker").is_none());
+}
