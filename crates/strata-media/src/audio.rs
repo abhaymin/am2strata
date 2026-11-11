@@ -756,6 +756,11 @@ impl Parler {
             let codes = codes.to_dtype(DType::I64)?.unsqueeze(0)?;
             let pcm = self.model.audio_encoder.decode_codes(&codes.to_device(&self.device)?)?;
             let pcm = pcm.i((0, 0))?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+            // Parler sometimes holds its last sound (a vowel or a hum that goes on): trimmed to a short natural end
+            let (pcm, held) = trim_held_tail(&pcm, self.rate);
+            if held > 0.0 {
+                eprintln!("[media] speech part {}: a held last sound of {held:.1} s trimmed", k + 1);
+            }
             if k > 0 {
                 out.extend_from_slice(&pause);
             }
@@ -764,6 +769,46 @@ impl Parler {
         }
         Ok((loudness(&out), self.rate))
     }
+}
+
+/// A sentence's held last sound trimmed (VOICES-PLAN: Parler sometimes holds its last vowel or a hum for a second or
+/// more). In 20 ms frames, a run of steady frames (loudness and zero crossings barely changing, still clearly voiced)
+/// that ends the speech and lasts over 0.5 s is cut to its first 0.15 s, with a 80 ms fade; speech itself never holds
+/// that still for that long. -> the samples, and the seconds cut (0 when nothing was).
+pub fn trim_held_tail(pcm: &[f32], rate: u32) -> (Vec<f32>, f32) {
+    let f = (rate as usize / 50).max(1);
+    let frames: Vec<(f32, f32)> = pcm.chunks(f).filter(|c| c.len() == f).map(|c| {
+        let rms = (c.iter().map(|x| x * x).sum::<f32>() / f as f32).sqrt();
+        let zc = c.windows(2).filter(|w| (w[0] >= 0.0) != (w[1] >= 0.0)).count() as f32 / f as f32;
+        (rms, zc)
+    }).collect();
+    let peak = frames.iter().map(|x| x.0).fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return (pcm.to_vec(), 0.0);
+    }
+    let Some(last) = frames.iter().rposition(|x| x.0 > peak * 0.05) else { return (pcm.to_vec(), 0.0) };
+    let mut start = last;
+    while start > 0 {
+        let (a, b) = (frames[start - 1], frames[start]);
+        let steady = (a.0 - b.0).abs() < peak * 0.06 && (a.1 - b.1).abs() < 0.02 && a.0 > peak * 0.05;
+        if !steady {
+            break;
+        }
+        start -= 1;
+    }
+    let run = last + 1 - start;
+    if run * 20 <= 500 {
+        return (pcm.to_vec(), 0.0);
+    }
+    let keep = (start + 8) * f; // the first 0.15 s of the held sound
+    let fade = 4 * f;
+    let mut out = pcm[..keep.min(pcm.len())].to_vec();
+    let n = out.len();
+    for i in 0..fade.min(n) {
+        out[n - 1 - i] *= i as f32 / fade as f32;
+    }
+    let cut = (pcm.len() - out.len()) as f32 / rate as f32;
+    (out, cut)
 }
 
 /// How well `heard` (a transcript) matches `said`: the words they share in order (longest common subsequence) over
@@ -997,6 +1042,31 @@ mod tests {
         assert_eq!(number_words(0), "zero");
         assert_eq!(number_words(100_000_000_105), "one hundred billion one hundred five");
         assert_eq!(spoken("GPT4 and H100 stay"), "GPT4 and H100 stay");
+    }
+
+    #[test]
+    fn a_held_last_sound_is_trimmed_and_speech_is_left_alone() {
+        let rate = 24_000u32;
+        let t = |i: usize| i as f32 / rate as f32;
+        // speech-like: a voice whose loudness and pitch move with the syllables (4 a second)
+        let speech: Vec<f32> = (0..rate as usize).map(|i| {
+            let x = t(i);
+            let syl = (x * 4.0 * std::f32::consts::TAU).sin().abs();
+            syl * 0.5 * (x * (180.0 + 60.0 * (x * 3.0).sin()) * std::f32::consts::TAU).sin()
+        }).collect();
+        let (same, cut) = trim_held_tail(&speech, rate);
+        assert_eq!((same.len(), cut), (speech.len(), 0.0), "speech is not cut");
+        // the same, then a steady hum held for 1.2 s
+        let mut held = speech.clone();
+        held.extend((0..(rate as f32 * 1.2) as usize).map(|i| 0.3 * (t(i) * 200.0 * std::f32::consts::TAU).sin()));
+        let (out, cut) = trim_held_tail(&held, rate);
+        assert!(cut > 0.9 && cut < 1.2, "cut {cut}");
+        assert!(out.len() > speech.len(), "the speech is kept");
+        assert!(out.last().unwrap().abs() < 0.01, "faded out");
+        // a natural ending that dies away is not a held sound
+        let mut decay = speech.clone();
+        decay.extend((0..(rate as f32 * 0.8) as usize).map(|i| 0.3 * (1.0 - i as f32 / (rate as f32 * 0.8)).powi(3) * (t(i) * 200.0 * std::f32::consts::TAU).sin()));
+        assert_eq!(trim_held_tail(&decay, rate).1, 0.0);
     }
 
     #[test]
