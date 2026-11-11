@@ -142,6 +142,8 @@ async function loadModels() {
   installed = models;
   if (!$("gpus-line").dataset.loaded) { $("gpus-line").dataset.loaded = "1"; loadGpus(); }
   renderModels();
+  // a tune started elsewhere (the API, another tab) is followed too
+  if (optJob.state === undefined) { optJob = {state: "unknown"}; optTick(); }
 }
 let installed = [], updatesOf = {};
 // Updates: models downloaded here remember their Hugging Face files; a newer upload of them is offered as an update
@@ -180,7 +182,15 @@ function renderModels() {
     const upd = !u ? "" : u.update ? `<span class="st-badge st-badge--reading" title="${esc(u.changed.join(", "))}">Update available (${(u.bytes / 1e9).toFixed(1)} GB)</span>` +
         `<button class="st-btn st-btn--secondary" data-update="${esc(m.id)}"${m.current ? " disabled title=\"Unload it first\"" : ""}>Update</button>`
       : u.known ? `<span class="st-badge">Up to date</span>` : "";
-    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span></div>` + upd +
+    // the optimizer (OPTIMIZER-PLAN step 4): its profile, the tune running, a Tune button
+    const t = m.tuned, job = optJob.model === m.id && (optJob.state === "waiting" || optJob.state === "running") ? optJob : null;
+    const tunedLine = job ? `Tuning: trial ${job.trials || 0}${job.last ? ` · last ${job.last.decode_tok_s} tok/s` : ""} (chats wait until it ends)`
+      : t ? (t.enabled ? `Tuned: ${t.tuned.decode_tok_s} tok/s, was ${t.baseline.decode_tok_s} (${t.objective})`
+                       : `Tuned ${new Date(t.at * 1000).toLocaleDateString()}: no setting gained 3% (${t.baseline.decode_tok_s} tok/s), the run config is used`) : "";
+    const tuneBtns = (job ? "" : `<button class="st-btn st-btn--secondary" data-tune="${esc(m.id)}" title="Try the engine's speed settings on this PC (about 10-20 minutes; chats wait meanwhile). The run config is never changed.">${t ? "Tune again" : "Tune"}</button>`) +
+      (t && !job && (t.enabled || t.gain >= 1.03) ? `<button class="st-btn st-btn--secondary" data-tuned="${esc(m.id)}" data-on="${t.enabled ? "0" : "1"}">${t.enabled ? "Use the run config" : "Use the tuned settings"}</button>` : "");
+    return `<div class="model-row"><div class="model-row__name"><b>${esc(m.display_name || m.id)}</b><span>${esc(m.id)} · ${esc(facts)}</span>` +
+      (tunedLine ? `<span class="muted">${esc(tunedLine)}</span>` : "") + `</div>` + upd + tuneBtns +
       `<span class="st-badge ${m.current ? "st-badge--generating" : ""}">${m.current ? "Loaded" : "Available"}</span>` +
       (m.current ? `<button class="st-btn st-btn--secondary" data-unload>Unload</button>`
                  : `<button class="st-btn st-btn--primary" data-load="${esc(m.id)}">Load</button>`) +
@@ -531,7 +541,47 @@ async function removeModel(name, planUrl, delUrl, after) {
   } catch (err) { toast("error", "Not removed", String(err.message || err), 8000); }
   after();
 }
+// the optimizer's job (GET api/optimise), followed every 5 s while it runs
+let optJob = {}, optTimer = null;
+async function optTick() {
+  clearTimeout(optTimer);
+  try {
+    const r = await fetch("api/optimise", {headers: headers()});
+    if (!r.ok) return;
+    const was = optJob.state;
+    optJob = await r.json();
+    if ((was === "running" || was === "waiting") && (optJob.state === "done" || optJob.state === "error")) {
+      if (optJob.state === "done") toast("success", "Tuning finished", optJob.enabled
+        ? `${optJob.model}: ${optJob.tuned.decode_tok_s} tok/s, was ${optJob.baseline.decode_tok_s}. Used from now on.`
+        : `${optJob.model}: no setting gained 3%; the run config stays in use.`, 10000);
+      else toast("error", "Tuning stopped", optJob.error || "", 10000);
+      loadModels();
+    } else renderModels();
+    if (optJob.state === "running" || optJob.state === "waiting") optTimer = setTimeout(optTick, 5000);
+  } catch (e) { optTimer = setTimeout(optTick, 10000); }
+}
 $("models-list").addEventListener("click", async (e) => {
+  const tune = e.target.closest("[data-tune]"), tuned = e.target.closest("[data-tuned]");
+  if (tune) {
+    if (!confirm(`Tune ${tune.dataset.tune} for this PC?\n\nThe model is started with other speed settings about 12 times and each is measured (about 10-20 minutes). Chats wait until it ends. Settings that change the answers or do not fit are left out, and the run config is never changed.`)) return;
+    try {
+      const r = await fetch(`api/models/${encodeURIComponent(tune.dataset.tune)}/optimise`, {method: "POST", headers: headers(true), body: "{}"});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error || {}).message || `HTTP ${r.status}`);
+      optJob = j; renderModels(); optTimer = setTimeout(optTick, 2000);
+    } catch (err) { toast("error", "Not started", String(err.message || err), 8000); }
+    return;
+  }
+  if (tuned) {
+    try {
+      const r = await fetch(`api/models/${encodeURIComponent(tuned.dataset.tuned)}/tuned`, {method: "POST", headers: headers(true), body: JSON.stringify({enabled: tuned.dataset.on === "1"})});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error || {}).message || `HTTP ${r.status}`);
+      toast("info", tuned.dataset.on === "1" ? "Tuned settings on" : "Run config in use", "From the model's next load.");
+      loadModels();
+    } catch (err) { toast("error", "Not changed", String(err.message || err), 8000); }
+    return;
+  }
   const rm = e.target.closest("[data-remove]");
   if (rm) {
     const id = rm.dataset.remove;

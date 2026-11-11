@@ -3,7 +3,10 @@
 Owner's request (2026-11-11): am2Strata should optimise the models it runs on Strata's engines, so each model runs as
 fast as this machine allows, within its memory, with no hand tuning.
 
-**State: steps 1-3 built and measured on this PC (2026-11-11); Settings › Models (step 4) is next.**
+**State: steps 1-4 built, and measured on this PC (2026-11-11); quantization advice (step 5) is next.** Step 4:
+Settings › Models has **Tune** on each model (with a confirmation saying how long it takes and that chats wait), its
+progress (trial N, the last speed), the result ("Tuned: 23.4 tok/s, was 18.9", or "no setting gained 3%"), and
+**Use the run config / Use the tuned settings**; a tune started through the API is followed too.
 - **Step 1, the machine's facts:**
   - `GET /api/machine` gives the CPU (name, cores, threads, and AVX2 / AVX-512 / AMX support), the RAM, each GPU
     (VRAM, PCI address, PCIe generation and width now and at most, and the link's speed in GB/s), and the models'
