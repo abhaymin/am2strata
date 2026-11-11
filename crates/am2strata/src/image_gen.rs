@@ -731,9 +731,19 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64))
         .map(|t| t.min(MAX_CHAIN_FRAMES));
     let (op, r) = match total.filter(|t| *t > frames) {
-        Some(t) => ("chain", json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
-                                    "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
-                                    "motion_tail_frames": tail})),
+        Some(t) => {
+            let mut c = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
+                               "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
+                               "motion_tail_frames": tail});
+            // Wan chains: "overlap_frames" (crossfaded frames at each join, default 8) and "hold_colour" (default on)
+            if let Some(o) = req["overlap_frames"].as_u64() {
+                c["overlap_frames"] = json!(o.min(32));
+            }
+            if let Some(h) = req["hold_colour"].as_bool() {
+                c["hold_colour"] = json!(h);
+            }
+            ("chain", c)
+        }
         None => ("generate", r),
     };
     let mon = s.mgr.monitor.clone();

@@ -41,6 +41,8 @@ mod audio;
 mod parler_hf;
 #[path = "../acestep/mod.rs"]
 mod acestep;
+#[path = "../chain_hold.rs"]
+mod chain_hold;
 #[cfg(feature = "onnx")]
 #[path = "../chatterbox.rs"]
 mod chatterbox;
@@ -570,30 +572,80 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
         }
     }
     let family = mold_core::manifest::find_manifest(&model).map(|m| m.family.clone()).unwrap_or_else(|| "wan".into());
-    let request: mold_core::ChainRequest = serde_json::from_value(r).context("the chain request")?;
-    let request = request.normalise_with_family(Some(&family)).map_err(|e| anyhow!("{e}"))?;
+    let parse = |r: &Value| -> Result<mold_core::ChainRequest> {
+        let request: mold_core::ChainRequest = serde_json::from_value(r.clone()).context("the chain request")?;
+        request.normalise_with_family(Some(&family)).map_err(|e| anyhow!("{e}"))
+    };
+    let mut request = parse(&r)?;
+    // Wan (one carried frame): colour held to clip 1 and overlapped crossfades (chain_hold.rs), unless asked not to.
+    // "overlap_frames" (default 8) and "hold_colour" (default: when every clip has the same prompt).
+    let wan = family.starts_with("wan") && request.stages.iter().all(|s| s.transition == mold_core::TransitionMode::Smooth);
+    let overlap = if wan { req["overlap_frames"].as_u64().unwrap_or(8).min(32) as usize } else { 0 };
+    let one_scene = request.stages.windows(2).all(|w| w[0].prompt == w[1].prompt);
+    let hold = wan && req["hold_colour"].as_bool().unwrap_or(one_scene);
+    // each overlap costs frames: ask mold for enough more that the stitched video still has the frames asked for
+    // (normalise clears total_frames once it has made the stages, so it is read from the request)
+    let wanted = r["total_frames"].as_u64().map(|t| t as u32);
+    if let (Some(total), true) = (wanted, overlap > 0) {
+        for _ in 0..4 {
+            let extra = (request.stages.len().saturating_sub(1) * overlap) as u32;
+            let mut r2 = r.clone();
+            r2["total_frames"] = json!(total + extra);
+            let next = parse(&r2)?;
+            let same = next.stages.len() == request.stages.len();
+            request = next;
+            if same {
+                break;
+            }
+        }
+    }
     load_placed(st, &model, None)?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();
-    engine.set_on_progress(Box::new(|ev| log_progress(&ev)));
-    let renderer = engine.as_chain_renderer().ok_or_else(|| anyhow!("{model} cannot chain clips"))?;
     let stages = request.stages.len() as u64;
+    // Wan's stage renderer does not pass its denoise steps to the chain, so they are taken from the engine's own events
+    let stage = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let st2 = stage.clone();
+    engine.set_on_progress(Box::new(move |ev| match ev {
+        ProgressEvent::DenoiseStep { step, total, .. } => {
+            let i = st2.load(std::sync::atomic::Ordering::Relaxed);
+            emit(json!({"event": "step", "step": i * total as u64 + step as u64, "total": stages * total as u64,
+                        "stage": i + 1, "stages": stages}));
+        }
+        ev => log_progress(&ev),
+    }));
+    let renderer = engine.as_chain_renderer().ok_or_else(|| anyhow!("{model} cannot chain clips"))?;
     let mut progress = |ev: mold_core::ChainProgressEvent| {
-        if let mold_core::ChainProgressEvent::DenoiseStep { stage_idx, step, total } = ev {
-            emit(json!({"event": "step", "step": stage_idx as u64 * total as u64 + step as u64, "total": stages * total as u64,
-                        "stage": stage_idx + 1, "stages": stages}));
+        if let mold_core::ChainProgressEvent::StageStart { stage_idx } = ev {
+            stage.store(stage_idx as u64, std::sync::atomic::Ordering::Relaxed);
         }
     };
-    let out = mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))
-        .map_err(|e| anyhow!("the chain: {e:?}"));
+    if wan {
+        eprintln!("[media] chain: {stages} clips, colour held: {hold}, overlap: {overlap} frames");
+    }
+    let out = if wan {
+        let mut held = chain_hold::Held::new(renderer, hold, overlap);
+        mold_inference::chain::ChainOrchestrator::new(&mut held).run(&request, Some(&mut progress))
+    } else {
+        mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))
+    }
+    .map_err(|e| anyhow!("the chain: {e:?}"));
     engine.clear_on_progress();
     let out = out?;
     let n = out.stage_frames.len();
-    let boundaries: Vec<mold_core::TransitionMode> = request.stages.iter().skip(1).map(|s| s.transition).collect();
-    let fade_lens: Vec<u32> = request.stages.iter().skip(1).map(|s| s.fade_frames.unwrap_or(8)).collect();
-    let plan = mold_inference::chain::stitch::StitchPlan { clips: out.stage_frames, boundaries, fade_lens,
-                                                           motion_tail_frames: request.motion_tail_frames };
-    let frames = plan.assemble().map_err(|e| anyhow!("stitching the clips: {e:?}"))?;
+    let frames = if wan {
+        let mut f = chain_hold::stitch(out.stage_frames, overlap);
+        if let Some(t) = wanted {
+            f.truncate(t as usize);
+        }
+        f
+    } else {
+        let boundaries: Vec<mold_core::TransitionMode> = request.stages.iter().skip(1).map(|s| s.transition).collect();
+        let fade_lens: Vec<u32> = request.stages.iter().skip(1).map(|s| s.fade_frames.unwrap_or(8)).collect();
+        let plan = mold_inference::chain::stitch::StitchPlan { clips: out.stage_frames, boundaries, fade_lens,
+                                                               motion_tail_frames: request.motion_tail_frames };
+        plan.assemble().map_err(|e| anyhow!("stitching the clips: {e:?}"))?
+    };
     let (w, h) = frames.first().map(|f| (f.width(), f.height())).unwrap_or((request.width, request.height));
     let enc = mold_inference::chain::encode::encode_chain_frames(&frames, request.fps, request.output_format, None)?;
     let format = serde_json::to_value(enc.format).ok().and_then(|f| f.as_str().map(str::to_string)).unwrap_or_default();

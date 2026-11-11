@@ -1508,6 +1508,13 @@ fn a_long_video_is_made_as_a_chain_of_clips() {
     let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["op"] == "chain").expect("a chain command");
     assert_eq!((chain["request"]["total_frames"].as_u64(), chain["request"]["clip_frames"].as_u64(), chain["request"]["motion_tail_frames"].as_u64()),
                (Some(480), Some(81), Some(1)), "a Wan chain carries one frame from clip to clip (LTX: 17)");
+    assert!(chain["request"].get("overlap_frames").is_none(), "the engine's default unless asked");
+    let (c, _) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 81, "seconds": 10, "overlap_frames": 99, "hold_colour": false}));
+    assert_eq!(c, 200);
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == "chain").last().unwrap();
+    assert_eq!((chain["request"]["overlap_frames"].as_u64(), chain["request"]["hold_colour"].as_bool()), (Some(32), Some(false)),
+               "the joins' crossfade (at most 32 frames) and the colour hold are passed to the engine");
     // one clip's worth: an ordinary generate
     let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "a lighthouse", "frames": 33}));
     assert_eq!(c, 200, "{r}");

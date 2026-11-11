@@ -3638,6 +3638,7 @@ dependencies = [
  "candle-nn-mold",
  "candle-transformers-mold",
  "hf-hub",
+ "image",
  "mold-ai-core",
  "mold-ai-inference",
  "ort",
