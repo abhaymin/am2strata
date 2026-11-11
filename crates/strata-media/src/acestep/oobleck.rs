@@ -130,6 +130,81 @@ impl Decoder {
     }
 }
 
+struct EncoderBlock {
+    res: [ResidualUnit; 3],
+    snake1: Snake,
+    conv1: Conv1d,
+}
+
+impl EncoderBlock {
+    fn new(input: usize, output: usize, stride: usize, vb: VarBuilder) -> Result<Self> {
+        let cfg = Conv1dConfig { stride, padding: stride.div_ceil(2), ..Default::default() };
+        Ok(Self {
+            res: [ResidualUnit::new(input, 1, vb.pp("res_unit1"))?, ResidualUnit::new(input, 3, vb.pp("res_unit2"))?,
+                  ResidualUnit::new(input, 9, vb.pp("res_unit3"))?],
+            snake1: Snake::new(input, vb.pp("snake1"))?,
+            conv1: conv1d_weight_norm(input, output, 2 * stride, cfg, vb.pp("conv1"))?,
+        })
+    }
+}
+
+impl Module for EncoderBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = x.clone();
+        for r in &self.res {
+            x = x.apply(r)?;
+        }
+        x.apply(&self.snake1)?.apply(&self.conv1)
+    }
+}
+
+/// The encoder of the same VAE (the `encoder.` weights): 48 kHz stereo audio to its latent, for continuing a song
+/// from its last seconds (ACE-Step's "complete" task, LONG-MEDIA-PLAN). Its last convolution gives the latent's mean
+/// and log scale (64 channels each); the mean is the latent.
+pub struct Encoder {
+    conv1: Conv1d,
+    blocks: Vec<EncoderBlock>,
+    snake1: Snake,
+    conv2: Conv1d,
+}
+
+/// downsampling 2·4·4·6·10 (the decoder's upsampling in reverse)
+pub const DOWNSAMPLING: [usize; 5] = [2, 4, 4, 6, 10];
+
+impl Encoder {
+    pub fn new(vb: VarBuilder) -> Result<Self> {
+        let cfg7 = Conv1dConfig { padding: 3, ..Default::default() };
+        let cfg3 = Conv1dConfig { padding: 1, ..Default::default() };
+        let conv1 = conv1d_weight_norm(AUDIO_CHANNELS, CHANNELS, 7, cfg7, vb.pp("conv1"))?;
+        let mut blocks = Vec::new();
+        for (i, stride) in DOWNSAMPLING.iter().enumerate() {
+            let (input, output) = (CHANNELS * MULTIPLES[i], CHANNELS * MULTIPLES[i + 1]);
+            blocks.push(EncoderBlock::new(input, output, *stride, vb.pp(format!("block.{i}")))?);
+        }
+        let d_model = CHANNELS * MULTIPLES[5];
+        Ok(Self {
+            conv1,
+            blocks,
+            snake1: Snake::new(d_model, vb.pp("snake1"))?,
+            conv2: conv1d_weight_norm(d_model, 2 * LATENT_CHANNELS, 3, cfg3, vb.pp("conv2"))?,
+        })
+    }
+
+    /// audio [batch, 2, samples] (48 kHz) -> the encoder's output [batch, 128, samples / 1920]: mean and log scale
+    pub fn forward(&self, audio: &Tensor) -> Result<Tensor> {
+        let mut x = audio.apply(&self.conv1)?;
+        for b in &self.blocks {
+            x = x.apply(b)?;
+        }
+        x.apply(&self.snake1)?.apply(&self.conv2)
+    }
+
+    /// audio [batch, 2, samples] -> latent [batch, 64, samples / 1920] (the mean: no sampling noise)
+    pub fn encode(&self, audio: &Tensor) -> Result<Tensor> {
+        self.forward(audio)?.narrow(1, 0, LATENT_CHANNELS)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +226,25 @@ mod tests {
     fn reference() -> std::path::PathBuf {
         std::env::var("ACESTEP_REF").map(Into::into)
             .unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap()).join("Development/ref"))
+    }
+
+    #[test]
+    #[ignore = "needs ACE-Step's checkpoints and the golden files (ACESTEP_REF)"]
+    fn encoder_matches_the_reference() {
+        let r = reference();
+        let dev = Device::Cpu;
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[r.join("ACE-Step-1.5/checkpoints/vae/diffusion_pytorch_model.safetensors")], DType::F32, &dev)
+        }.unwrap();
+        let enc = Encoder::new(vb.pp("encoder")).unwrap();
+        let golden = candle_core::safetensors::load(r.join("acestep-golden/vae-encode.safetensors"), &dev).unwrap();
+        let t0 = std::time::Instant::now();
+        let h = enc.forward(&golden["audio"]).unwrap();
+        assert_eq!(h.dims(), golden["h"].dims());
+        let snr = snr_db(&golden["h"], &h);
+        let mean = snr_db(&golden["mean"], &enc.encode(&golden["audio"]).unwrap());
+        eprintln!("encoder: {:?} -> {:?} in {:.1} s, SNR {snr:.1} dB (mean {mean:.1} dB)", golden["audio"].dims(), h.dims(), t0.elapsed().as_secs_f64());
+        assert!(snr > 40.0 && mean > 40.0, "SNR {snr:.1} dB, mean {mean:.1} dB");
     }
 
     #[test]
