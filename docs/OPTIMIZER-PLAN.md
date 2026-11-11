@@ -3,7 +3,7 @@
 Owner's request (2026-11-11): am2Strata should optimise the models it runs on Strata's engines, so each model runs as
 fast as this machine allows, within its memory, with no hand tuning.
 
-**State: steps 1-3 built (2026-11-11); the real measurement on this PC is next.**
+**State: steps 1-3 built and measured on this PC (2026-11-11); Settings › Models (step 4) is next.**
 - **Step 1, the machine's facts:**
   - `GET /api/machine` gives the CPU (name, cores, threads, and AVX2 / AVX-512 / AMX support), the RAM, each GPU
     (VRAM, PCI address, PCIe generation and width now and at most, and the link's speed in GB/s), and the models'
@@ -31,6 +31,32 @@ fast as this machine allows, within its memory, with no hand tuning.
 - **Tested on the mock** (`the_optimizer_tunes_a_model_on_the_mock`): the mock engine's speed comes from a table
   (`MOCK_SPEED`). The search finds the table's best, drops the setting that fails to start, keeps the run config
   unchanged, and loads the model again with the profile.
+
+## Measured: Tiel Coder Q8 on this PC (2026-11-11)
+
+Hardware: Ryzen 7 7840HS (8 cores, 16 threads, AVX-512), 59.7 GB RAM, 2 × RTX 5060 Ti 16 GB (each at PCIe gen 4 x4,
+7.9 GB/s), WD Blue SN580 (2,409 MB/s read). Engine `strata-poly`, layers split across both cards. Objective: decode.
+Budget 20 min; the search took 696 s, 12 trials.
+
+| Setting | Decode tok/s | Prefill tok/s | Kept? |
+|---|---|---|---|
+| The run config (engine defaults) | 70.4 | 393 | the starting point |
+| The run config again | 70.3 | 394 | agrees with itself for 64 / 11 / 116 tokens of the three answers |
+| `--threads` 6 / 8 / 12 | 69.9 / 70.7 / 71.2 | 401 / **415** / 414 | under the 3% gain |
+| `--window` 1 / 4 | 70.9 / 70.8 | 397 / 395 | under the 3% gain |
+| `--window 12` | the engine stopped | | dropped |
+| `--prompt-batch` 512 / 2048 | 70.6 / 70.1 | 386 / 398 | under the 3% gain |
+| `--expert-swaps 32` | 70.2 | 394 | dropped: its answers parted too soon (11 tokens against 64) |
+| `--expert-swaps 128` | the engine stopped | | dropped |
+
+- **Decode:** nothing gains 3% (the best, `--threads 12`, gains 1.1%). The profile is written but off: Tiel's
+  defaults are already within about 1% of the best on this machine.
+- **Prefill:** `--threads 8` reads prompts 5.5% faster (415 against 393 tok/s). An `"objective": "prefill"` tune
+  would keep it.
+- **Two settings stop the engine:** `--window 12` and `--expert-swaps 128` (probably out of VRAM). They are dropped,
+  and the model in memory was started again each time.
+- **The first try** (the floor that wanted exactly the same tokens) dropped every candidate. Tiel's greedy answers
+  are not bit-exact from run to run, which is why the run config is now run twice.
 
 ## Why it is needed
 
