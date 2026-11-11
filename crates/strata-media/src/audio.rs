@@ -769,7 +769,8 @@ impl Parler {
         let desc = self.desc_tok.encode(description, true).map_err(|e| anyhow!("{e}"))?.get_ids().to_vec();
         let desc = Tensor::new(desc, &self.device)?.unsqueeze(0)?;
         let mut out = Vec::new();
-        let pause = vec![0f32; (self.rate as f32 * 0.25) as usize];
+        // the pause between sentences: under 0.2 s (owner, 2026-11-11: longer gaps sound like the voice stopped)
+        let pause = vec![0f32; (self.rate as f32 * 0.15) as usize];
         for (k, p) in parts.iter().enumerate() {
             let ids = self.tok.encode(p.as_str(), true).map_err(|e| anyhow!("{e}"))?.get_ids().to_vec();
             let prompt = Tensor::new(ids, &self.device)?.unsqueeze(0)?;
@@ -782,6 +783,8 @@ impl Parler {
             let pcm = pcm.i((0, 0))?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
             // Parler sometimes holds its last sound (a vowel or a hum that goes on): trimmed to a short natural end
             let (pcm, held) = trim_held_tail(&pcm, self.rate);
+            // a long silence inside or around a sentence (Indic Parler sometimes leaves several seconds) is cut short
+            let pcm = short_silences(&pcm, self.rate, 0.15);
             if held > 0.0 {
                 eprintln!("[media] speech part {}: a held last sound of {held:.1} s trimmed", k + 1);
             }
@@ -833,6 +836,42 @@ pub fn trim_held_tail(pcm: &[f32], rate: u32) -> (Vec<f32>, f32) {
     }
     let cut = (pcm.len() - out.len()) as f32 / rate as f32;
     (out, cut)
+}
+
+/// Every silence in `pcm` longer than `keep_s` cut to `keep_s` (and at the start and end, to nothing beyond a few
+/// milliseconds): 20 ms frames under 3% of the loudest are silent. The speech itself is untouched.
+pub fn short_silences(pcm: &[f32], rate: u32, keep_s: f32) -> Vec<f32> {
+    let f = (rate as usize / 50).max(1);
+    let n = pcm.len() / f;
+    if n == 0 {
+        return pcm.to_vec();
+    }
+    let rms: Vec<f32> = (0..n).map(|i| (pcm[i * f..(i + 1) * f].iter().map(|x| x * x).sum::<f32>() / f as f32).sqrt()).collect();
+    let peak = rms.iter().cloned().fold(0.0f32, f32::max);
+    if peak <= 0.0 {
+        return pcm.to_vec();
+    }
+    let quiet: Vec<bool> = rms.iter().map(|r| *r < peak * 0.03).collect();
+    let keep = ((keep_s * 50.0).round() as usize).max(1);
+    let mut out = Vec::with_capacity(pcm.len());
+    let mut i = 0;
+    while i < n {
+        let mut j = i;
+        while j < n && quiet[j] == quiet[i] {
+            j += 1;
+        }
+        let (lead, tail) = (i == 0, j == n);
+        if quiet[i] && (j - i) > keep {
+            let k = if lead || tail { 1 } else { keep };
+            let (a, b) = if lead { ((j - k) * f, j * f) } else if tail { (i * f, (i + k) * f) } else { (i * f, (i + k) * f) };
+            out.extend_from_slice(&pcm[a..b]);
+        } else {
+            out.extend_from_slice(&pcm[i * f..j * f]);
+        }
+        i = j;
+    }
+    out.extend_from_slice(&pcm[n * f..]);
+    out
 }
 
 /// How well `heard` (a transcript) matches `said`: the words they share in order (longest common subsequence) over
@@ -1076,6 +1115,25 @@ mod tests {
         assert!(entry("indic-parler-tts").is_some());
         // in an Indian language Gautham speaks as that language's male speaker
         assert!(indic_description("gautham", "ml").unwrap().starts_with("Harish's"));
+    }
+
+    #[test]
+    fn long_silences_are_cut_short_and_speech_kept() {
+        let rate = 24_000u32;
+        let tone = |secs: f32| -> Vec<f32> { (0..(rate as f32 * secs) as usize).map(|i| 0.4 * (i as f32 / rate as f32 * 220.0 * std::f32::consts::TAU).sin()).collect() };
+        let mut x = vec![0.0f32; rate as usize]; // 1 s of silence first
+        x.extend(tone(1.0));
+        x.extend(vec![0.0f32; (rate as f32 * 5.3) as usize]); // the 5.3 s gap seen in an Indic Parler take
+        x.extend(tone(1.0));
+        x.extend(vec![0.0f32; rate as usize / 2]);
+        let y = short_silences(&x, rate, 0.15);
+        let secs = y.len() as f32 / rate as f32;
+        assert!((2.1..2.3).contains(&secs), "two 1 s sounds and one 0.15 s gap: {secs}");
+        // speech with short gaps is left as it is
+        let mut z = tone(0.5);
+        z.extend(vec![0.0f32; rate as usize / 10]);
+        z.extend(tone(0.5));
+        assert_eq!(short_silences(&z, rate, 0.15).len(), z.len());
     }
 
     #[test]
