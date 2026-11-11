@@ -35,6 +35,12 @@ pub struct Profile {
     /// "media_in_turn": "defer" (default: an image or video is made after the answer) or "swap" (the answer waits
     /// for it: the text model stops, the job runs, the model loads again and the answer goes on with the result)
     pub media_in_turn: Option<String>,
+    /// "limits": {"max_image_size": "1024x1024"}: the most pixels an image this key asks for may have
+    pub max_image_pixels: Option<u64>,
+    /// "limits": {"max_video_seconds": N}: the longest video this key may ask for
+    pub max_video_seconds: Option<f64>,
+    /// "limits": {"web_queries_per_turn": N}: web searches one answer may run for this key
+    pub web_queries_per_turn: Option<u32>,
 }
 
 impl Profile {
@@ -111,7 +117,16 @@ impl Clients {
                 Some(m @ ("defer" | "swap")) => Some(m.to_string()),
                 Some(m) => return Err(format!("config clients.{name}.media_in_turn: {m:?} is not \"defer\" or \"swap\"")),
             };
-            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory, media_jobs_per_hour, media_in_turn };
+            let lim = o.get("limits");
+            let max_image_pixels = match lim.and_then(|l| l.get("max_image_size")) {
+                None => None,
+                Some(v) => Some(v.as_str().and_then(|z| z.split_once('x')).and_then(|(a, b)| Some(a.trim().parse::<u64>().ok()? * b.trim().parse::<u64>().ok()?))
+                    .ok_or(format!("config clients.{name}.limits.max_image_size: expected \"WIDTHxHEIGHT\""))?),
+            };
+            let max_video_seconds = lim.and_then(|l| l.get("max_video_seconds")).and_then(Value::as_f64);
+            let web_queries_per_turn = lim.and_then(|l| l.get("web_queries_per_turn")).and_then(Value::as_u64).map(|n| n as u32);
+            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory, media_jobs_per_hour, media_in_turn,
+                                    max_image_pixels, max_video_seconds, web_queries_per_turn };
             if name == "default" {
                 if key.is_some() {
                     return Err("config clients.default: the default profile is the main key's; it has no key of its own".into());
@@ -148,6 +163,7 @@ impl Clients {
     pub fn view(&self) -> Value {
         let show = |p: &Profile| serde_json::json!({"name": p.name, "tools": p.tools, "memory": p.memory_space(),
             "media_jobs_per_hour": p.media_jobs_per_hour, "media_in_turn": p.media_in_turn,
+            "max_image_pixels": p.max_image_pixels, "max_video_seconds": p.max_video_seconds, "web_queries_per_turn": p.web_queries_per_turn,
             "key": p.key.as_deref().map(|k| format!("••••{}", &k[k.len().saturating_sub(4)..]))});
         serde_json::json!({"profiles": self.profiles.iter().map(show).collect::<Vec<_>>(),
                            "default": self.default.as_ref().map(show)})
@@ -161,6 +177,27 @@ impl Clients {
 fn same(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// The client profile this task serves (its key picked it), for its limits; None for the main key.
+pub fn current(c: &Clients) -> Option<Profile> {
+    c.by_name(&crate::queue::current_client()).cloned()
+}
+
+/// Err: the size `w`x`h` is past this task's profile's limit.
+pub fn image_allowed(c: &Clients, w: u64, h: u64) -> Result<(), String> {
+    match current(c).and_then(|p| p.max_image_pixels.map(|m| (p.name, m))) {
+        Some((name, m)) if w * h > m => Err(format!("this key ({name}) may make images of at most {m} pixels; {w}x{h} is {}", w * h)),
+        _ => Ok(()),
+    }
+}
+
+/// Err: a video of `secs` seconds is past this task's profile's limit.
+pub fn video_allowed(c: &Clients, secs: f64) -> Result<(), String> {
+    match current(c).and_then(|p| p.max_video_seconds.map(|m| (p.name, m))) {
+        Some((name, m)) if secs > m + 0.05 => Err(format!("this key ({name}) may make videos of at most {m} s; this one is {secs:.1} s")),
+        _ => Ok(()),
+    }
 }
 
 /// The key a request gives (Bearer or x-api-key).
@@ -203,7 +240,7 @@ mod tests {
 
     #[test]
     fn the_header_narrows_and_never_widens() {
-        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None, media_jobs_per_hour: None, media_in_turn: None };
+        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None, media_jobs_per_hour: None, media_in_turn: None, max_image_pixels: None, max_video_seconds: None, web_queries_per_turn: None };
         let n = p.narrowed("web, MCP:search").unwrap();
         assert_eq!(n.tools, ["mcp:search", "web"].iter().map(|s| s.to_string()).collect());
         assert!(p.narrowed("video").is_err());

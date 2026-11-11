@@ -28,7 +28,13 @@
     - `defer` stays the default.
     - Tested: `swap_makes_the_image_inside_the_answer`.
     - Still to do: an image or video on a second card while the text model stays on the first;
-  - the per-profile limits beyond media jobs an hour (`"limits": {"media_jobs_per_hour": N}`, built 2026-11-11);
+  - per-profile limits: **built** (2026-11-11). `"limits"` in a client profile can set:
+    - `"media_jobs_per_hour": N`;
+    - `"max_image_size": "WxH"`, the most pixels an image may have;
+    - `"max_video_seconds": N`;
+    - `"web_queries_per_turn": N`.
+    Size and length are enforced on the API (403) and on the chat's media tools; past the search limit, the model is
+    told so in the tool result. The main key is not limited. Tested: `a_client_profiles_size_length_and_search_limits_hold`.
   - Settings › Clients is built (2026-11-11, read only: profiles with masked keys, from GET /api/clients); Settings › Connect saying which built-in tools am2Strata answers is still to do.
 
 The USP (owner, 2026-11-09): a client points at am2Strata, over the OpenAI, Anthropic or Responses API, locally or

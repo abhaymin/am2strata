@@ -788,6 +788,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
     tokio::spawn(crate::queue::carry(async move {
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
         let mut media_jobs = 0usize; // queued by this answer's media tools
+        let mut web_queries = 0u32; // this answer's web searches (a client profile may limit them)
+        let web_limit = mgr.clients.get().and_then(|c| crate::clients::current(c)).and_then(|p| p.web_queries_per_turn);
         loop {
             let (mut text, mut reasoning, mut calls, mut own) = (String::new(), String::new(), Vec::new(), 0usize);
             let mut mcp_ids = std::collections::HashSet::new();
@@ -960,9 +962,16 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                         _ = tx.closed() => return,
                     }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
-                    tokio::select! {
-                        r = w.call(&c.name, &args) => r,
-                        _ = tx.closed() => return,
+                    if c.name == "web_search" {
+                        web_queries += 1;
+                    }
+                    match web_limit.filter(|l| c.name == "web_search" && web_queries > *l) {
+                        Some(l) => json!({"ok": false, "chars": 0, "truncated": false, "ms": 0,
+                            "text": format!("error: this key may run {l} web searches an answer, and has; answer from what was found")}),
+                        None => tokio::select! {
+                            r = w.call(&c.name, &args) => r,
+                            _ = tx.closed() => return,
+                        },
                     }
                 } else if let Some(h) = &hub {
                     tokio::select! {

@@ -153,6 +153,8 @@ pub struct Manager {
     pub media_jobs: std::sync::OnceLock<Arc<crate::media_jobs::Jobs>>,
     /// web_search / fetch_url (web_tools.rs; set from the run config at start)
     pub web: std::sync::OnceLock<Arc<crate::web_tools::WebTools>>,
+    /// the client profiles, for their limits inside a turn (set at start)
+    pub clients: std::sync::OnceLock<Arc<crate::clients::Clients>>,
     /// browser computer use (browser.rs; set from the run config at start)
     pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
     /// the sandbox for run_python (code_run.rs; set at start)
@@ -300,6 +302,7 @@ impl Manager {
             snapshots: Arc::new(crate::snapshots::Snapshots::open(&memory_dir)),
             media_jobs: std::sync::OnceLock::new(),
             web: std::sync::OnceLock::new(),
+            clients: std::sync::OnceLock::new(),
             browser: std::sync::OnceLock::new(),
             code: std::sync::OnceLock::new(),
             needs: crate::mem::Needs::open(&memory_dir),

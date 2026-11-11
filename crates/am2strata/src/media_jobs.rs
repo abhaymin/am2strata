@@ -383,6 +383,12 @@ impl Jobs {
                 if !ok {
                     return fail(format!("error: size {size:?} does not work; use one of {}", k["sizes"]));
                 }
+                if let Some(Err(e)) = self.app.get().map(|a| {
+                    let (w, h) = size.split_once('x').map(|(a, b)| (a.parse::<u64>().unwrap_or(0), b.parse::<u64>().unwrap_or(0))).unwrap_or((0, 0));
+                    crate::clients::image_allowed(&a.clients, w, h)
+                }) {
+                    return fail(format!("error: {e}; ask for a smaller size"));
+                }
                 json!({"prompt": prompt, "size": size})
             }
             "video" => {

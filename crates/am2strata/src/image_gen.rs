@@ -360,6 +360,9 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     if !(256..=2048).contains(&w) || !(256..=2048).contains(&h) || w % 16 != 0 || h % 16 != 0 {
         return bad("each side of size must be a multiple of 16 from 256 to 2048");
     }
+    if let Err(e) = crate::clients::image_allowed(&s.clients, w as u64, h as u64) {
+        return error(StatusCode::FORBIDDEN, "permission_error", e);
+    }
     let n = req["n"].as_u64().unwrap_or(1);
     if !(1..=4).contains(&n) {
         return bad("n must be 1 to 4");
@@ -735,6 +738,13 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let format = format.as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
+    {
+        let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64)).unwrap_or(0).max(frames);
+        if let Err(e) = crate::clients::video_allowed(&s.clients, total as f64 / fps as f64)
+            .and_then(|_| crate::clients::image_allowed(&s.clients, w, h)) {
+            return error(StatusCode::FORBIDDEN, "permission_error", e);
+        }
+    }
     let t0 = Instant::now();
     let label = s.media_jobs.label(&req["strata_label"]);
     let _gpu = match s.mgr.gpu_exclusive_needing(!s.media.keep_text_model, "media", &label, crate::manager::VIDEO_JOB_GB).await {

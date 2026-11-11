@@ -429,7 +429,9 @@ async fn main() -> Result<()> {
         tracing::info!("cluster: master of {}", cluster.workers.iter().map(|w| format!("{} ({})", w.name, w.url)).collect::<Vec<_>>().join(", "));
         cluster.start_polling();
     }
-    let state = AppState { mgr: mgr.clone(), api_key, clients: Arc::new(clients), mcp: Some(hub.clone()), trusted_origins,
+    let clients = Arc::new(clients);
+    let _ = mgr.clients.set(clients.clone());
+    let state = AppState { mgr: mgr.clone(), api_key, clients: clients.clone(), mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),

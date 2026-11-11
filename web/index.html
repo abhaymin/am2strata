@@ -635,7 +635,8 @@
           <div class="st-card"><span class="card-title">Add one in the run config</span>
             <pre class="snippet"><code>"clients": {
   "laptop": {"key": "a-long-random-key", "tools": ["memory", "web", "image", "speech", "mcp:*"], "memory": "laptop",
-             "limits": {"media_jobs_per_hour": 20}},
+             "limits": {"media_jobs_per_hour": 20, "max_image_size": "1024x1024",
+                        "max_video_seconds": 10, "web_queries_per_turn": 5}},
   "default": {"tools": ["web"]}
 }</code></pre>
             <p class="muted small">Tools: memory, web, image, video, speech, music, browser, code (run_python in the sandbox), and MCP

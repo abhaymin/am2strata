@@ -2600,3 +2600,34 @@ fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
     assert_eq!(r.status().as_u16(), 401);
     assert!(r.headers().get("x-strata-worker").is_none());
 }
+
+/// A client profile's limits beyond media jobs an hour (SERVER-TOOLS-PLAN): the largest image, the longest video, and
+/// web searches an answer. The main key is not limited.
+#[test]
+fn a_client_profiles_size_length_and_search_limits_hold() {
+    let port = fake_web();
+    let search = "\n\n<tool_call>\n<function=web_search>\n<parameter=query>\nlighthouses\n</parameter>\n</function>\n</tool_call>";
+    let ck = "laptop-key-0123456789";
+    let m = Model { extra: json!({"web_search": {"searxng_url": format!("http://127.0.0.1:{port}")},
+        "clients": {"laptop": {"key": ck, "tools": ["web", "image", "video"],
+                               "limits": {"max_image_size": "512x512", "max_video_seconds": 4, "web_queries_per_turn": 1}}}}),
+                    ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("One.\n</think>{search}")), ids(&format!("Two.\n</think>{search}")),
+                                  ids("Done.\n</think>\n\nFound it.")], json!({}));
+    let post = |key: &str, path: &str, body: Value| {
+        let r = reqwest::blocking::Client::new().post(format!("{}{path}", s.base)).bearer_auth(key).json(&body).send().unwrap();
+        (r.status().as_u16(), r.json::<Value>().unwrap_or(Value::Null))
+    };
+    let (c, e) = post(ck, "/v1/images/generations", json!({"prompt": "a lighthouse", "size": "1024x1024"}));
+    assert_eq!(c, 403, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("262144 pixels"), "{e}");
+    assert_eq!(post(ck, "/v1/images/generations", json!({"prompt": "a lighthouse", "size": "512x512"})).0, 200);
+    assert_eq!(post(KEY, "/v1/images/generations", json!({"prompt": "a lighthouse", "size": "1024x1024"})).0, 200, "the main key has no limit");
+    let (c, e) = post(ck, "/v1/videos/generations", json!({"prompt": "waves", "seconds": 10, "size": "512x512"}));
+    assert_eq!(c, 403, "{e}");
+    // the second web search of one answer is refused, and the model is told so
+    let (c, r) = post(ck, "/v1/chat/completions", json!({"messages": [user("Find lighthouses.")]}));
+    assert_eq!(c, 200, "{r}");
+    let last = prompt_text(s.gen_lines().last().unwrap());
+    assert!(last.contains("may run 1 web searches an answer"), "{last}");
+}
