@@ -356,9 +356,18 @@ impl Manager {
                 return Err(anyhow!(msg));
             }
         }
+        // the optimizer's tuned profile, when it is on and was tuned on this hardware (OPTIMIZER-PLAN step 3)
+        let mut tuned = entry.clone();
+        let dir = entry.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let fp = crate::machine::fingerprint(&crate::machine::facts(&dir));
+        let use_tuned = crate::optimizer::tuned_args(&entry.path, &fp).inspect(|a| tuned.cfg.args = a.clone()).is_some();
+        let entry = &tuned;
         let before = crate::mem::available_gb();
         let t0 = std::time::Instant::now();
-        let l = start(entry, &self.hw, self.ready_timeout).await?;
+        let mut l = start(entry, &self.hw, self.ready_timeout).await?;
+        if use_tuned {
+            l.adapted.push(format!("the tuned settings are used ({})", crate::optimizer::profile_path(&entry.path).display()));
+        }
         let secs = t0.elapsed().as_secs_f64();
         self.load_s.record_mean(&entry.id, secs);
         self.queue.set_switch_cost(&entry.id, secs);
@@ -615,6 +624,45 @@ impl Manager {
         }
     }
 
+    /// The optimizer's trial (OPTIMIZER-PLAN step 2): `id` started with `args` in place of its run config's, each
+    /// prompt (text, tokens to make) answered greedily, then stopped. The caller holds the turn; the model in memory
+    /// is stopped first and is not started again here. -> each answer's tokens and the engine's DONE.
+    pub async fn trial(&self, id: &str, args: Vec<String>, prompts: &[(String, u32)])
+                       -> Result<Vec<(Vec<u32>, strata_protocol::Done)>> {
+        let mut entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        entry.cfg.args = args;
+        if let Some(l) = self.current.write().await.take() {
+            self.snapshots.save(&l, "before the optimizer").await;
+            stop(&l).await;
+        }
+        self.queue.set_resident(crate::queue::Resident::None);
+        let l = start(&entry, &self.hw, self.ready_timeout).await?;
+        let mut out = Vec::new();
+        let mut run = async || -> Result<()> {
+            for (text, max_new) in prompts {
+                let ids = l.tok.encode(text, false).map_err(|e| anyhow!("{e}"))?;
+                let mut rx = l.engine.generate(*max_new, strata_protocol::Sampling { temperature: Some(0.0), ..Default::default() },
+                                               None, ids, None).await;
+                let (mut toks, mut done) = (Vec::new(), None);
+                while let Some(ev) = rx.recv().await {
+                    match ev.map_err(|e| anyhow!("{e}"))? {
+                        strata_engine::GenEvent::Token(t) => toks.push(t),
+                        strata_engine::GenEvent::Done(d) => {
+                            done = Some(d);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((toks, done.ok_or_else(|| anyhow!("the engine stopped before it finished"))?));
+            }
+            Ok(())
+        };
+        let r = run().await;
+        stop(&l).await;
+        r.map(|_| out)
+    }
+
     /// The models as GET /api/models lists them.
     pub async fn list(&self) -> Value {
         let cur = self.current().await.map(|l| l.entry.id.clone());
@@ -629,6 +677,7 @@ impl Manager {
                     // the model a request loads when none is (after a media job, or before the first chat)
                     "default": m.id == self.default_id,
                     "status": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "available" },
+                    "tuned": crate::optimizer::view(&m.path),
                     "problem": Value::Null,
                 })
             })

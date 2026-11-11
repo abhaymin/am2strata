@@ -5,7 +5,7 @@
 //! - **overlapped crossfades:** the next clip starts from the frame `overlap` frames before this clip's end, so the
 //!   two clips cover the same `overlap` frames of time; the stitch crossfades them instead of cutting.
 //! - **a smoothed start frame:** the carried frame is taken to half size and back, so its blocky artefacts are not
-//!   passed on ("smooth_start", default on).
+//!   passed on ("smooth_start", off by default: measured, it did not stop the drift).
 //!
 //! Only for chains whose clips continue one scene (one prompt): a storyboard's clips may change light on purpose.
 

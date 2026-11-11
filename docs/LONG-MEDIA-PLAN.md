@@ -131,15 +131,26 @@ broken. A crossfade between two clips that moved apart also shows both at once (
 frames. The carried frame passes the artefacts on, and a histogram cannot remove them. **Long video is still not
 offered as good.**
 
+A third run (09:13, the same request) added two things:
+- **A whole last clip:** the last clip is now made at full length and the video is cut to length afterwards. The last
+  clip still drifts (9.0 from clip 1, the others 0.5-1.9), so the break was not only its short length.
+- **A smoothed start frame** (half size and back): the joins came out at 17-21, the drift was the same, and the sky
+  still broke up from clip 4. **It did not help**, so it is off by default (`"smooth_start": true` to try it).
+- Time: 1,926 s for 7 whole clips (275 s a clip).
+
+**A text-only model is no longer used for a chain:** Wan 2.1 1.3B can't continue from a frame, so it made the same
+clip each time. A long video moves to a downloaded model that can continue when the request named none, and is
+refused plainly when it named the text-only model.
+
 ### Next, before long video is offered
 
-1. **A cleaner start frame:** re-draw the carried frame lightly (image to image at low strength, or upscale and
-   downscale) before it starts the next clip, so the artefacts are not passed on.
+1. **A cleaner start frame by the model itself:** redraw the carried frame at low strength (image to image) before
+   it starts the next clip. Shrinking it and blowing it back up was tried and did not help.
 2. **The model's own size, 1280×704:** measure one clip's time there (expected several times the 640×352 time). At
    640×352 the model is outside what it was trained on, which makes the artefacts.
 3. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
    inpaint takes two anchors (`WanImageAnchors`); otherwise a storyboard of independent clips with crossfades.
-4. **A short last clip:** fold the remainder into the clip before it, so no clip is only a few frames long.
+4. **The last clip:** find out why it drifts most even at full length.
 5. Measure again on the same prompt and seed (`docs/` keeps these numbers).
 
 - The model: Wan 2.2 TI2V 5B (text and image to video, 1280×704 or 704×1280 at 24 fps, about 5 s a segment) in mold.

@@ -6,6 +6,8 @@
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod agents;
+mod machine;
+mod optimizer;
 mod clients;
 mod gemini;
 mod anthropic;
@@ -453,6 +455,11 @@ async fn main() -> Result<()> {
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
         .route("/api/gpus", get(web::gpus))
+        .route("/api/machine", get(web::machine))
+        .route("/api/machine/measure", post(web::machine_measure))
+        .route("/api/optimise", get(web::optimise_status))
+        .route("/api/models/{id}/optimise", post(web::optimise))
+        .route("/api/models/{id}/tuned", post(web::set_tuned))
         .route("/api/tools/approve", post(browser::approve))
         .route("/api/cache/snapshots/clear", post(web::clear_snapshots))
         .route("/api/models/{id}", axum::routing::delete(model_remove::remove))

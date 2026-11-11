@@ -324,6 +324,80 @@ pub async fn system(State(s): State<AppState>, headers: HeaderMap) -> Response {
     }
 }
 
+/// The machine's facts for the optimizer (OPTIMIZER-PLAN step 1): CPU, RAM, GPUs and their links, the models' disk,
+/// and what was measured on this hardware (GET); POST /api/machine/measure measures the disk's read speed.
+pub async fn machine(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let (d, m) = (s.data_dir.clone(), s.models_dir.clone());
+    match tokio::task::spawn_blocking(move || crate::machine::view(&d, &m)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    }
+}
+
+pub async fn machine_measure(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let (d, m) = (s.data_dir.clone(), s.models_dir.clone());
+    match tokio::task::spawn_blocking(move || crate::machine::measure(&d, &m)).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    }
+}
+
+/// The optimizer (OPTIMIZER-PLAN step 2): POST {"objective": "decode"|"prefill", "budget_s": 1200} tunes a model in
+/// the background (it holds the turn, so chats wait for it, told in the queue); GET /api/optimise follows it.
+pub async fn optimise(State(s): State<AppState>, headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<String>,
+                      body: Option<Json<Value>>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if s.mgr.entry(&id).is_none() {
+        return error(StatusCode::NOT_FOUND, "not_found", format!("no installed model is named {id:?}"));
+    }
+    if matches!(crate::optimizer::JOB.lock().unwrap()["state"].as_str(), Some("waiting" | "running")) {
+        return error(StatusCode::CONFLICT, "busy", "a model is being tuned already: see GET /api/optimise");
+    }
+    let b = body.map(|b| b.0).unwrap_or(Value::Null);
+    let objective = match b["objective"].as_str().unwrap_or("decode") {
+        o @ ("decode" | "prefill") => o.to_string(),
+        o => return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("objective {o:?}: decode or prefill")),
+    };
+    let budget = std::time::Duration::from_secs(b["budget_s"].as_u64().unwrap_or(1200).clamp(60, 4 * 3600));
+    *crate::optimizer::JOB.lock().unwrap() = json!({"state": "waiting", "model": id});
+    tokio::spawn(crate::optimizer::run(s.mgr.clone(), id.clone(), objective, budget));
+    (StatusCode::ACCEPTED, Json(json!({"state": "waiting", "model": id, "status": "/api/optimise"}))).into_response()
+}
+
+pub async fn optimise_status(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let j = crate::optimizer::JOB.lock().unwrap().clone();
+    Json(if j.is_null() { json!({"state": "idle"}) } else { j }).into_response()
+}
+
+/// {"enabled": bool}: use a model's tuned settings from its next load, or not (the profile is kept).
+pub async fn set_tuned(State(s): State<AppState>, headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<String>,
+                       Json(b): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let Some(e) = s.mgr.entry(&id) else {
+        return error(StatusCode::NOT_FOUND, "not_found", format!("no installed model is named {id:?}"));
+    };
+    let Some(on) = b["enabled"].as_bool() else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "send {\"enabled\": true|false}");
+    };
+    match crate::optimizer::set_enabled(&e.path, on) {
+        Ok(()) => Json(json!({"model": id, "tuned": crate::optimizer::view(&e.path), "note": "used from the model's next load"})).into_response(),
+        Err(err) => error(StatusCode::NOT_FOUND, "not_found", format!("{err:#}")),
+    }
+}
+
 /// The GPUs am2strata-hybrid can put weights on here (its --list-devices, run once): their names are what
 /// "--devices" takes in a run config (e.g. "cuda:0=12,hip:0=6").
 pub async fn gpus(State(s): State<AppState>, headers: HeaderMap) -> Response {

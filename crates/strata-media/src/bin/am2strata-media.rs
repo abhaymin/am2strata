@@ -614,7 +614,7 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
             }
         }
     }
-    let smooth = wan && req["smooth_start"].as_bool().unwrap_or(true);
+    let smooth = wan && req["smooth_start"].as_bool().unwrap_or(false);
     load_placed(st, &model, None)?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();

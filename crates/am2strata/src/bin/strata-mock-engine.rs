@@ -12,6 +12,8 @@
 //!                 (the last one repeats); without it every reply is the token 0 once
 //!   MOCK_RECORD   a file each received command line is appended to
 //!   MOCK_IMAGE_TOKENS  the token count the vision mode reports (default 4)
+//!   MOCK_SPEED    the optimizer's table: {"-ub=512": 0.5, "-ub=1024": "fail"}: each engine argument set so multiplies
+//!                 the decode time a token (1 ms), and "fail" exits before READY (a setting that does not fit)
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,6 +99,17 @@ fn main() {
         let _ = writeln!(o, "{s}");
         let _ = o.flush();
     };
+    // the optimizer's table: the time a token by the engine's arguments, or a start that fails
+    let mut ms_per_token = 1.0f64;
+    if let Some(t) = std::env::var("MOCK_SPEED").ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) {
+        for w in args.windows(2) {
+            match t.get(format!("{}={}", w[0], w[1])) {
+                Some(serde_json::Value::String(f)) if f == "fail" => std::process::exit(1),
+                Some(v) => ms_per_token *= v.as_f64().unwrap_or(1.0),
+                None => {}
+            }
+        }
+    }
     say(&format!("INFO context={max_context} mock=1"));
     say("READY mock");
     // stdin is read on its own thread so a STOP arrives while a reply is being written
@@ -168,7 +181,7 @@ fn main() {
                 if stop.load(Ordering::SeqCst) {
                     finish = "cancel".into();
                 }
-                say(&format!("DONE {sent} {n_prompt} 1.0 {}.0 {finish} 0 0 0", sent.max(1)));
+                say(&format!("DONE {sent} {n_prompt} 1.0 {:.1} {finish} 0 0 0", sent.max(1) as f64 * ms_per_token));
             }
             _ => say("ERR unknown command"),
         }

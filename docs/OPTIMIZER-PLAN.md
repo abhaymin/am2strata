@@ -3,7 +3,34 @@
 Owner's request (2026-11-11): am2Strata should optimise the models it runs on Strata's engines, so each model runs as
 fast as this machine allows, within its memory, with no hand tuning.
 
-**State: planned, nothing built.**
+**State: steps 1-3 built (2026-11-11); the real measurement on this PC is next.**
+- **Step 1, the machine's facts:**
+  - `GET /api/machine` gives the CPU (name, cores, threads, and AVX2 / AVX-512 / AMX support), the RAM, each GPU
+    (VRAM, PCI address, PCIe generation and width now and at most, and the link's speed in GB/s), and the models'
+    disk (device, model, whether it spins), with a fingerprint of the hardware.
+  - `POST /api/machine/measure` measures the disk's sequential read speed: up to 1 GiB of the largest model file,
+    with the page cache dropped first.
+  - Both are kept in `<data>/machine.json`. A new fingerprint (a card added, RAM changed) drops the old
+    measurements.
+- **Step 2, the search** (`crates/am2strata/src/optimizer.rs`):
+  - `POST /api/models/{id}/optimise` with `{"objective": "decode"|"prefill", "budget_s": 1200}` runs in the
+    background and holds the turn (chats wait, shown in the queue). `GET /api/optimise` follows it.
+  - It tunes only the flags the run config already passes: `-t`, `-ub`, `-b`, `--resident-experts`. The KV types
+    are never changed.
+  - Each trial starts the engine with those settings and runs the prompt set greedily: a short chat, an
+    8,000-token prompt, a 256-token story. Each trial is capped at 10 minutes.
+  - A candidate is dropped when it fails to start, fails a prompt, or answers with other tokens than the run config.
+  - Coordinate descent: the best value is kept when it gains 3% or more, in up to 3 rounds, within the budget.
+- **Step 3, profiles used at load:**
+  - The result is saved as `<config>.tuned.json`, with every trial, the machine and the date. The run config is
+    never changed.
+  - A load uses the profile when it is on and was tuned on this hardware, and `/health` "adapted" says so.
+  - `POST /api/models/{id}/tuned {"enabled": false}` turns it off.
+  - `GET /api/models` shows each model's `tuned` block.
+  - A profile is turned on only when it gained 3% or more.
+- **Tested on the mock** (`the_optimizer_tunes_a_model_on_the_mock`): the mock engine's speed comes from a table
+  (`MOCK_SPEED`). The search finds the table's best, drops the setting that fails to start, keeps the run config
+  unchanged, and loads the model again with the profile.
 
 ## Why it is needed
 

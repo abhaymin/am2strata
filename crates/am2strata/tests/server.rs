@@ -5,6 +5,7 @@ mod common;
 
 use common::*;
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
 fn user(text: &str) -> Value {
     json!({"role": "user", "content": text})
@@ -2418,4 +2419,70 @@ fn the_gemini_api_answers_as_gemini_with_its_own_key_header() {
     let r = client.post(format!("{}/v1beta/models/x:generateContent", s.base)).json(&body).send().unwrap();
     assert_eq!(r.status().as_u16(), 401);
     assert_eq!(r.json::<Value>().unwrap()["error"]["status"], "PERMISSION_DENIED");
+}
+
+/// The optimizer's machine facts (OPTIMIZER-PLAN step 1): read at once, kept with a fingerprint, and the disk's read
+/// speed measured only when asked.
+#[test]
+fn the_machine_facts_are_read_and_measured() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, r) = s.get("/api/machine", true);
+    assert_eq!(c, 200, "{r}");
+    assert!(r["facts"]["cpu"]["threads"].as_u64().unwrap() >= 1, "{r}");
+    assert!(r["facts"]["ram_gb"].as_f64().unwrap() > 0.0);
+    assert!(r["facts"]["gpus"].is_array());
+    assert_eq!(r["fingerprint"].as_str().unwrap().len(), 16);
+    assert!(r["measured"].is_null(), "nothing measured until asked");
+    let (c, m) = s.post("/api/machine/measure", &json!({}));
+    assert_eq!(c, 200, "{m}");
+    assert!(m["measured"]["at"].as_u64().is_some(), "{m}");
+    let (_, again) = s.get("/api/machine", true);
+    assert_eq!(again["measured"], m["measured"], "kept for the same hardware");
+}
+
+/// The optimizer on the mock (OPTIMIZER-PLAN "Tests"): the mock's speed per setting comes from a table; the search
+/// finds the table's best, drops the setting that fails to start, writes the profile beside the run config (never
+/// over it), and the model is loaded again with it; turned off, the next load uses the run config.
+#[test]
+fn the_optimizer_tunes_a_model_on_the_mock() {
+    let dir_probe = Model { extra: json!({}), ..Model::default() };
+    let s = Server::start(&[dir_probe], &[vec![5, 6, 7]], json!({}));
+    let cfg_path = s.dir.join("strata-mock-a.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    let mut args = cfg["args"].as_array().unwrap().clone();
+    args.extend([json!("-ub"), json!("256")]);
+    cfg["args"] = json!(args);
+    cfg["env"] = json!({"MOCK_SPEED": r#"{"-ub=512": 0.5, "-ub=1024": "fail", "-ub=128": 2.0}"#});
+    std::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+    let (c, r) = s.post("/api/models/mock-a/optimise", &json!({"budget_s": 120}));
+    assert_eq!(c, 202, "{r}");
+    let t0 = Instant::now();
+    let job = loop {
+        let (_, j) = s.get("/api/optimise", true);
+        if j["state"] == "done" || j["state"] == "error" {
+            break j;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(60), "the search is bounded: {j}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(job["state"], "done", "{job}");
+    let a: Vec<String> = serde_json::from_value(job["args"].clone()).unwrap();
+    assert_eq!(a.iter().position(|x| x == "-ub").map(|i| a[i + 1].as_str()), Some("512"), "the table's best: {job}");
+    assert_eq!(job["enabled"], true);
+    assert!(job["tuned"]["decode_tok_s"].as_f64().unwrap() > job["baseline"]["decode_tok_s"].as_f64().unwrap() * 1.5, "{job}");
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before, "the run config is never changed");
+    let profile: Value = serde_json::from_str(&std::fs::read_to_string(s.dir.join("strata-mock-a.tuned.json")).unwrap()).unwrap();
+    assert!(profile["trials"].as_array().unwrap().iter().any(|t| t["value"] == "1024" && t.get("dropped").is_some()), "{profile}");
+    // loaded again with the tuned settings, and the model list says so
+    let (_, h) = s.get("/health", true);
+    assert!(h.to_string().contains("the tuned settings are used"), "{h}");
+    let (_, l) = s.get("/api/models", true);
+    assert_eq!(l["models"][0]["tuned"]["enabled"], true, "{l}");
+    // turned off: kept, not used
+    let (c, r) = s.post("/api/models/mock-a/tuned", &json!({"enabled": false}));
+    assert_eq!((c, r["tuned"]["enabled"].as_bool()), (200, Some(false)), "{r}");
+    // one at a time
+    let (c, _) = s.post("/api/models/nope/optimise", &json!({}));
+    assert_eq!(c, 404);
 }
