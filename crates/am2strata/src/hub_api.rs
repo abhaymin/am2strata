@@ -27,8 +27,14 @@ pub async fn quants(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     match strata_hub::pull::list(repo, token_of(&req)).await {
         Ok(qs) if qs.is_empty() => error(StatusCode::BAD_REQUEST, "invalid_request_error",
                                          format!("{} has no GGUF files (am2Strata runs GGUF models)", strata_hub::pull::repo_name(repo))),
-        Ok(qs) => Json(json!({"repo": strata_hub::pull::repo_name(repo), "quants": qs.into_iter()
-            .map(|(q, size, files)| json!({"quant": q, "size": size, "files": files})).collect::<Vec<_>>()})).into_response(),
+        Ok(qs) => {
+            let mut list: Vec<Value> = qs.into_iter().map(|(q, size, files)| json!({"quant": q, "size": size, "files": files})).collect();
+            // how each fits this machine, and the one to take (OPTIMIZER-PLAN step 5)
+            let dir = s.models_dir.clone();
+            let facts = tokio::task::spawn_blocking(move || crate::machine::facts(&dir)).await.unwrap_or(Value::Null);
+            crate::optimizer::quant_advice(&mut list, &facts);
+            Json(json!({"repo": strata_hub::pull::repo_name(repo), "quants": list})).into_response()
+        }
         Err(e) => error(StatusCode::BAD_GATEWAY, "hub_error", e),
     }
 }

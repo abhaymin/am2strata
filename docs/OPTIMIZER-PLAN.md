@@ -3,10 +3,20 @@
 Owner's request (2026-11-11): am2Strata should optimise the models it runs on Strata's engines, so each model runs as
 fast as this machine allows, within its memory, with no hand tuning.
 
-**State: steps 1-4 built, and measured on this PC (2026-11-11); quantization advice (step 5) is next.** Step 4:
+**State: steps 1-5 built, and measured on this PC (2026-11-11); the cluster split (step 6) waits for CLUSTER-PLAN phase 2.** Step 4:
 Settings › Models has **Tune** on each model (with a confirmation saying how long it takes and that chats wait), its
 progress (trial N, the last speed), the result ("Tuned: 23.4 tok/s, was 18.9", or "no setting gained 3%"), and
 **Use the run config / Use the tuned settings**; a tune started through the API is followed too.
+
+Step 5, quantization advice:
+- `POST /api/hub/quants` marks each quant `fit`: "gpu", "gpu+ram" or "too big". The fit counts the VRAM of every
+  card, the RAM less 8 GB for the system, and about 2 GB for the context.
+- **Recommended:** the largest quant that fits, leaving out 16- and 32-bit files.
+- **Fastest:** the largest quant that fits in VRAM alone.
+- Settings › Models › Add a model chooses the recommended quant and labels each one.
+- On this PC, for unsloth/Qwen3-30B-A3B-GGUF: recommended UD-Q8_K_XL (36.0 GB, VRAM + RAM), fastest UD-Q6_K_XL
+  (26.3 GB).
+- A download is still the user's choice.
 - **Step 1, the machine's facts:**
   - `GET /api/machine` gives the CPU (name, cores, threads, and AVX2 / AVX-512 / AMX support), the RAM, each GPU
     (VRAM, PCI address, PCIe generation and width now and at most, and the link's speed in GB/s), and the models'

@@ -353,6 +353,43 @@ pub fn set_enabled(config: &Path, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Quantization advice (OPTIMIZER-PLAN step 5): each quant of a repository marked by how it fits this machine, from
+/// its size, the VRAM of all cards and the RAM (with 8 GB kept for the system and about 2 GB for the context):
+/// "gpu" (all in VRAM), "gpu+ram" (the rest in RAM: Strata's engines keep a MoE model's experts there), "too big"
+/// (only a MoE model streaming its experts from the SSD, slowly). Two are marked, leaving out 16- and 32-bit files
+/// (references: 8-bit keeps nearly all of them at half the size): "recommended", the largest that fits in VRAM and
+/// RAM (within one repository the larger quant keeps more of the model), and "fastest", the largest that fits in VRAM
+/// alone. A download stays the user's choice.
+pub fn quant_advice(quants: &mut [Value], facts: &Value) {
+    let vram: f64 = facts["gpus"].as_array().into_iter().flatten().filter_map(|g| g["vram_gb"].as_f64()).sum();
+    let ram = facts["ram_gb"].as_f64().unwrap_or(0.0);
+    let (gpu_room, all_room) = (vram * 0.9, vram * 0.9 + (ram - 8.0).max(0.0));
+    let (mut best, mut fastest): (Option<(usize, f64)>, Option<(usize, f64)>) = (None, None);
+    for (i, q) in quants.iter_mut().enumerate() {
+        let need = q["size"].as_f64().unwrap_or(0.0) / 1e9 + 2.0;
+        let fit = if need <= gpu_room { "gpu" } else if need <= all_room { "gpu+ram" } else { "too big" };
+        q["fit"] = json!(fit);
+        q["need_gb"] = json!((need * 10.0).round() / 10.0);
+        let name = q["quant"].as_str().unwrap_or("").to_ascii_uppercase();
+        let reference = ["BF16", "F16", "FP16", "F32", "FP32"].iter().any(|r| name == *r || name.ends_with(&format!("-{r}")) || name.ends_with(&format!("_{r}")));
+        if reference || fit == "too big" {
+            continue;
+        }
+        if best.is_none_or(|(_, n)| need > n) {
+            best = Some((i, need));
+        }
+        if fit == "gpu" && fastest.is_none_or(|(_, n)| need > n) {
+            fastest = Some((i, need));
+        }
+    }
+    if let Some((i, _)) = best {
+        quants[i]["recommended"] = json!(true);
+    }
+    if let Some((i, _)) = fastest.filter(|f| Some(f.0) != best.map(|b| b.0)) {
+        quants[i]["fastest"] = json!(true);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,6 +469,20 @@ mod tests {
                          "decode", Duration::ZERO, |args| async move { table(args) }).await.unwrap();
         assert!(out.stopped_by_budget);
         assert_eq!(out.args, a("-t 16 -ub 256"));
+    }
+
+    #[test]
+    fn the_largest_quant_that_fits_is_recommended() {
+        // 2 x 16 GB cards, 60 GB RAM: VRAM room 28.8 GB, all 80.8 GB
+        let facts = json!({"ram_gb": 60.0, "gpus": [{"vram_gb": 16.0}, {"vram_gb": 16.0}]});
+        let mut q = vec![json!({"quant": "Q4_K_M", "size": 20e9}), json!({"quant": "Q8_0", "size": 37e9}),
+                         json!({"quant": "BF16", "size": 70e9}), json!({"quant": "F32", "size": 140e9})];
+        quant_advice(&mut q, &facts);
+        let fits: Vec<&str> = q.iter().map(|x| x["fit"].as_str().unwrap()).collect();
+        assert_eq!(fits, vec!["gpu", "gpu+ram", "gpu+ram", "too big"]);
+        assert_eq!(q[1]["recommended"], true, "Q8_0: the most that fits, the 16-bit reference left out");
+        assert_eq!(q[0]["fastest"], true, "Q4_K_M: all in VRAM");
+        assert!(q[2].get("recommended").is_none());
     }
 
     #[test]

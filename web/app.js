@@ -2377,8 +2377,11 @@ $("hf-form").onsubmit = async (e) => {
   $("hf-list").disabled = true; $("hf-msg").textContent = "Asking Hugging Face…";
   try {
     const j = await hubCall("api/hub/quants", {repo, token: $("hf-token").value.trim() || undefined});
-    const pick = j.quants.find((q) => /Q4_K_M/i.test(q.quant)) || j.quants[0];
-    $("hf-quant").innerHTML = j.quants.map((q) => `<option value="${esc(q.quant)}"${q === pick ? " selected" : ""}>${esc(q.quant)} · ${bytes(q.size)}${q.files > 1 ? ` · ${q.files} files` : ""}</option>`).join("");
+    // the server's advice for this PC: the largest quant that fits in VRAM and RAM is chosen
+    const pick = j.quants.find((q) => q.recommended) || j.quants.find((q) => /Q4_K_M/i.test(q.quant)) || j.quants[0];
+    const fitText = {"gpu": "fits in VRAM", "gpu+ram": "VRAM + RAM", "too big": "too big for this PC"};
+    $("hf-quant").innerHTML = j.quants.map((q) => `<option value="${esc(q.quant)}"${q === pick ? " selected" : ""}>${esc(q.quant)} · ${bytes(q.size)}${q.files > 1 ? ` · ${q.files} files` : ""}` +
+      `${q.fit ? ` · ${fitText[q.fit] || q.fit}` : ""}${q.recommended ? " · recommended (most quality that fits)" : ""}${q.fastest ? " · fastest (all in VRAM)" : ""}</option>`).join("");
     $("hf-quant").disabled = false; $("hf-pull").disabled = false;
     $("hf-msg").textContent = `${j.repo}: ${j.quants.length} quantization${j.quants.length === 1 ? "" : "s"}`;
   } catch (err) { $("hf-msg").textContent = ""; toast("error", "Not listed", String(err.message || err), 8000); }
