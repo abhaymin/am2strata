@@ -719,6 +719,15 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
         }
     }
     let smooth = wan && req["smooth_start"].as_bool().unwrap_or(false);
+    // "redraw_start": strength (0.1-0.6): an image model redraws the carried frame (image to image) before it starts
+    // the next clip, so the artefacts a clip passes on are drawn over; loaded for each redraw and unloaded after, so
+    // the GPU is the video model's again ("redraw_model", default z-image-turbo:q8)
+    let redraw_strength = req["redraw_start"].as_f64().filter(|s| wan && *s > 0.0).map(|s| s.clamp(0.1, 0.6));
+    let redraw_model = req["redraw_model"].as_str().unwrap_or("z-image-turbo:q8").to_string();
+    let redraw_cfg = st.config.clone();
+    let prompt = request.stages.first().map(|s| s.prompt.clone()).unwrap_or_default();
+    let base_seed = request.seed;
+    let mut redraw_n = 0u64;
     load_placed(st, &model, None)?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();
@@ -745,7 +754,35 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
                   request.stages.iter().map(|s| s.frames).collect::<Vec<_>>());
     }
     let out = if wan {
-        let mut held = chain_hold::Held::new(renderer, hold, overlap, smooth);
+        let rm = redraw_model.clone();
+        let redraw: Option<chain_hold::Redraw> = redraw_strength.map(|strength| -> chain_hold::Redraw {
+            let redraw_model = rm;
+            Box::new(move |frame: &image::RgbImage| -> Result<image::RgbImage> {
+                redraw_n += 1;
+                let paths = mold_core::ModelPaths::resolve(&redraw_model, &redraw_cfg)
+                    .ok_or_else(|| anyhow!("{redraw_model} is not downloaded"))?;
+                let mut e = mold_inference::create_engine(redraw_model.clone(), paths, &redraw_cfg, LoadStrategy::Eager, 0, false)?;
+                e.load()?;
+                let mut png = std::io::Cursor::new(Vec::new());
+                frame.write_to(&mut png, image::ImageFormat::Png)?;
+                let man = mold_core::manifest::find_manifest(&redraw_model);
+                let (w, h) = (frame.width() / 16 * 16, frame.height() / 16 * 16);
+                let r: mold_core::GenerateRequest = serde_json::from_value(json!({
+                    "model": redraw_model, "prompt": prompt, "width": w, "height": h, "batch_size": 1,
+                    "steps": man.map(|m| m.defaults.steps).unwrap_or(9), "guidance": man.map(|m| m.defaults.guidance).unwrap_or(0.0),
+                    "seed": base_seed.unwrap_or(7) + redraw_n, "strength": strength,
+                    "source_image": base64::engine::general_purpose::STANDARD.encode(png.into_inner())}))?;
+                let resp = e.generate(&r);
+                e.unload();
+                let resp = resp?;
+                let img = resp.images.first().ok_or_else(|| anyhow!("the image model returned no image"))?;
+                Ok(image::load_from_memory(&img.data)?.to_rgb8())
+            })
+        });
+        if let Some(s) = redraw_strength {
+            eprintln!("[media] the carried frame is redrawn by {redraw_model} at strength {s}");
+        }
+        let mut held = chain_hold::Held::new(renderer, hold, overlap, smooth, redraw);
         mold_inference::chain::ChainOrchestrator::new(&mut held).run(&request, Some(&mut progress))
     } else {
         mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))

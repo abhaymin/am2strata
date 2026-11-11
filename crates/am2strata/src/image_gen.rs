@@ -772,6 +772,13 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
                     c[k] = json!(b);
                 }
             }
+            // the carried frame redrawn by an image model at this strength (0.1-0.6), and which model
+            if let Some(x) = req["redraw_start"].as_f64() {
+                c["redraw_start"] = json!(x.clamp(0.0, 0.6));
+            }
+            if let Some(m) = req["redraw_model"].as_str().filter(|m| m.contains(':')) {
+                c["redraw_model"] = json!(m);
+            }
             ("chain", c)
         }
         None => ("generate", r),

@@ -68,17 +68,48 @@ fn mean(frames: &[RgbImage]) -> f64 {
     (0..3).map(|c| h[c].iter().enumerate().map(|(v, k)| v as u64 * k).sum::<u64>()).sum::<u64>() as f64 / n as f64
 }
 
+/// Redraws the carried frame (an image model's image-to-image at low strength) before it starts the next clip.
+pub type Redraw<'a> = Box<dyn FnMut(&RgbImage) -> Result<RgbImage> + 'a>;
+
 pub struct Held<'a, R: ChainStageRenderer + ?Sized> {
     inner: &'a mut R,
     reference: Option<Hist>,
     hold_colour: bool,
     overlap: usize,
     smooth: bool,
+    redraw: Option<Redraw<'a>>,
 }
 
 impl<'a, R: ChainStageRenderer + ?Sized> Held<'a, R> {
-    pub fn new(inner: &'a mut R, hold_colour: bool, overlap: usize, smooth: bool) -> Self {
-        Held { inner, reference: None, hold_colour, overlap, smooth }
+    pub fn new(inner: &'a mut R, hold_colour: bool, overlap: usize, smooth: bool, redraw: Option<Redraw<'a>>) -> Self {
+        Held { inner, reference: None, hold_colour, overlap, smooth, redraw }
+    }
+}
+
+/// The opening frames of a clip that continues another come out with colours of their own (measured: blue up by
+/// about 20 for its first ~20 frames, then settling), so one table for the whole clip leaves them off. The first
+/// HEAD frames get a table of their own, eased into the whole clip's over RAMP frames.
+const HEAD: usize = 24;
+const RAMP: usize = 48;
+
+/// Each frame of `frames` held to `reference`: the opening frames by their own table, eased into the whole clip's.
+pub fn hold_to(frames: &mut [RgbImage], reference: &Hist) {
+    let all = match_lut(&hist(frames), reference);
+    let n = frames.len();
+    if n <= HEAD + 2 {
+        apply(frames, &all);
+        return;
+    }
+    let head = match_lut(&hist(&frames[1..1 + HEAD]), reference);
+    for (i, f) in frames.iter_mut().enumerate() {
+        let a = (i as f32 / RAMP as f32).min(1.0);
+        let mut lut = [[0u8; 256]; 3];
+        for c in 0..3 {
+            for v in 0..256 {
+                lut[c][v] = ((1.0 - a) * head[c][v] as f32 + a * all[c][v] as f32).round() as u8;
+            }
+        }
+        apply(std::slice::from_mut(f), &lut);
     }
 }
 
@@ -92,8 +123,7 @@ impl<R: ChainStageRenderer + ?Sized> ChainStageRenderer for Held<'_, R> {
                 None => self.reference = Some(hist(&out.frames)),
                 Some(r) => {
                     let before = mean(&out.frames);
-                    let lut = match_lut(&hist(&out.frames), r);
-                    apply(&mut out.frames, &lut);
+                    hold_to(&mut out.frames, r);
                     eprintln!("[media] colour held to clip 1: mean {before:.1} -> {:.1}", mean(&out.frames));
                 }
             }
@@ -104,6 +134,20 @@ impl<R: ChainStageRenderer + ?Sized> ChainStageRenderer for Held<'_, R> {
         let mut seed = out.frames[n - 1 - k].clone();
         if self.smooth {
             seed = smoothed(&seed);
+        }
+        if let Some(redraw) = self.redraw.as_mut() {
+            let t0 = std::time::Instant::now();
+            match redraw(&seed) {
+                Ok(img) if img.dimensions() == seed.dimensions() => {
+                    eprintln!("[media] start frame redrawn in {:.1} s", t0.elapsed().as_secs_f64());
+                    seed = img;
+                }
+                Ok(img) => {
+                    eprintln!("[media] start frame redrawn at {:?}, resized to {:?}", img.dimensions(), seed.dimensions());
+                    seed = image::imageops::resize(&img, seed.width(), seed.height(), image::imageops::FilterType::CatmullRom);
+                }
+                Err(e) => eprintln!("[media] start frame not redrawn ({e:#}); the frame as it was is used"),
+            }
         }
         out.tail = ChainTail { frames: 1, tail_rgb_frames: vec![seed] };
         Ok(out)
@@ -180,6 +224,18 @@ mod tests {
         assert!((mean(&[g.clone()]) - mean(&[f])).abs() < 3.0);
         let spread = g.pixels().map(|p| (p.0[0] as i32 - 125).abs()).max().unwrap();
         assert!(spread < 25, "the checkerboard is smoothed: {spread}");
+    }
+
+    #[test]
+    fn a_clips_opening_frames_are_held_too() {
+        // the reference: grey 100; the clip: its first 24 frames bluer (b 160), the rest b 120
+        let mk = |r: u8, b: u8| RgbImage::from_pixel(8, 8, image::Rgb([r, 100, b]));
+        let reference = hist(&[mk(100, 100)]);
+        let mut clip: Vec<RgbImage> = (0..121).map(|i| if (1..25).contains(&i) { mk(100, 160) } else { mk(100, 120) }).collect();
+        hold_to(&mut clip, &reference);
+        let b = |f: &RgbImage| f.get_pixel(0, 0).0[2] as i32;
+        assert!((b(&clip[10]) - 100).abs() <= 2, "the opening held: {}", b(&clip[10]));
+        assert!((b(&clip[100]) - 100).abs() <= 2, "the rest held: {}", b(&clip[100]));
     }
 
     #[test]
