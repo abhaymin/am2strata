@@ -36,6 +36,9 @@ impl Metas {
 /// The DiT's instruction when the song planner's codes give the song's structure (ACE-Step's "cover" task: the
 /// codes stand in for a source song).
 pub const PLANNED_INSTRUCTION: &str = "Generate audio semantic tokens based on the given conditions:";
+/// ACE-Step's instruction for its "repaint" task (constants.py TASK_INSTRUCTIONS["repaint"]): a song continued past
+/// the end of its source is a repaint of the frames after it.
+pub const REPAINT_INSTRUCTION: &str = "Repaint the mask area based on the given conditions:";
 
 /// The caption encoder's prompt.
 pub fn caption_prompt(caption: &str, metas: &Metas) -> String {

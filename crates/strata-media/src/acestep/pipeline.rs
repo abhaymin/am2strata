@@ -72,11 +72,17 @@ pub fn noise(seed: u64, frames: usize, device: &Device) -> Result<Tensor> {
     Ok(Tensor::from_vec(v, (1, frames, 64), device)?)
 }
 
+/// The frames over which a continuation's start is crossfaded with its source (ACE-Step's handler passes 12).
+pub const CROSSFADE: usize = 12;
+
 pub struct AceStep {
     text: text::TextEncoder,
     cond: dit::ConditionEncoder,
     dit: dit::Dit,
     vae: oobleck::Decoder,
+    /// the audio encoder, loaded at the first continuation
+    encoder: Option<oobleck::Encoder>,
+    vae_path: std::path::PathBuf,
     silence: Tensor,
     detok: dit::Detokenizer,
     /// the planner, loaded at its first song (3.4 GB in bf16); its folder, if downloaded
@@ -107,7 +113,8 @@ impl AceStep {
         let vbv = unsafe { VarBuilder::from_mmaped_safetensors(&[dir.join("vae/diffusion_pytorch_model.safetensors")], DType::F32, device)? };
         let vae = oobleck::Decoder::new(vbv.pp("decoder"))?;
         let silence = silence_latent(&ck.join("silence_latent.pt"), device)?.to_dtype(dtype)?;
-        Ok(Self { text, cond, dit, vae, silence, detok, planner: None, planner_dir, thought: None, dtype, device: device.clone() })
+        Ok(Self { text, cond, dit, vae, encoder: None, vae_path: dir.join("vae/diffusion_pytorch_model.safetensors"), silence, detok,
+                  planner: None, planner_dir, thought: None, dtype, device: device.clone() })
     }
 
     pub fn has_planner(&self) -> bool {
@@ -201,6 +208,83 @@ impl AceStep {
         Ok(Tensor::cat(&parts, 2)?.squeeze(0)?)
     }
 
+    /// The latent [1, frames, 64] of `audio` [2, samples] at 48 kHz (the encoder's mean; samples past a whole frame
+    /// are left out).
+    pub fn encode(&mut self, audio: &Tensor) -> Result<Tensor> {
+        if self.encoder.is_none() {
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&self.vae_path], DType::F32, &self.device)? };
+            self.encoder = Some(oobleck::Encoder::new(vb.pp("encoder"))?);
+        }
+        let n = audio.dim(1)? / oobleck::HOP * oobleck::HOP;
+        let a = audio.narrow(1, 0, n)?.to_dtype(DType::F32)?.to_device(&self.device)?.unsqueeze(0)?;
+        // in pieces of about 20 s with 2 s either side, so a long source does not need the whole encoder at once
+        const CHUNK: usize = 500;
+        const PAD: usize = 50;
+        let frames = n / oobleck::HOP;
+        let enc = self.encoder.as_ref().unwrap();
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < frames {
+            let end = (start + CHUNK).min(frames);
+            let (lo, hi) = (start.saturating_sub(PAD), (end + PAD).min(frames));
+            let z = enc.encode(&a.narrow(2, lo * oobleck::HOP, (hi - lo) * oobleck::HOP)?)?;
+            parts.push(z.narrow(2, start - lo, end - start)?);
+            start = end;
+        }
+        Ok(Tensor::cat(&parts, 2)?.transpose(1, 2)?.contiguous()?.to_dtype(self.dtype)?)
+    }
+
+    /// A song continued from `source`, the last seconds of the one before ([2, samples] at 48 kHz): ACE-Step's repaint
+    /// run past the end of its source (outpainting). The source is encoded and kept; the frames after it, `s`'s
+    /// duration, are made from noise with the source as context (explicit chunk mask: 0 kept, 1 made), the kept frames
+    /// pulled back to the noised source for the first half of the steps, and the boundary crossfaded over 12 frames.
+    /// The source also gives the timbre when `timbre_from_source` (else silence, as ACE-Step without a reference).
+    /// -> the whole latent (source and new part) and the source's length in frames.
+    pub fn continue_latent(&mut self, s: &Song, source: &Tensor, timbre_from_source: bool,
+                           on_step: &mut dyn FnMut(usize, usize)) -> Result<(Tensor, usize)> {
+        let kept = self.encode(source)?;
+        let k = kept.dim(1)?;
+        let new = s.metas.duration_s.clamp(MIN_SECONDS, MAX_SECONDS) as usize * FRAMES_PER_SECOND;
+        let total = k + new;
+        if total > self.silence.dim(1)? {
+            bail!("the source and the continuation together are past 10 minutes");
+        }
+        let mut metas = s.metas.clone();
+        metas.duration_s = (total / FRAMES_PER_SECOND) as u32;
+        let caption = self.text.caption(&text::caption_prompt_for(text::REPAINT_INSTRUCTION, &s.caption, &metas))?.to_dtype(self.dtype)?;
+        let lyrics = self.text.lyrics(&text::lyric_prompt(&s.lyrics, &s.language))?.to_dtype(self.dtype)?;
+        let timbre = if timbre_from_source { kept.clone() } else { self.silence.narrow(1, 0, 750)? };
+        let cond = self.cond.forward(&caption, &lyrics, &timbre)?;
+        let (latent, _) = self.repaint(&kept, new, &cond, s.seed, s.steps, s.shift, on_step)?;
+        Ok((latent, k))
+    }
+
+    /// The repaint itself, from conditions already made: `kept` [1, k, 64] then `new` frames made.
+    pub fn repaint(&self, kept: &Tensor, new: usize, cond: &Tensor, seed: u64, steps: usize, shift: f32,
+                   on_step: &mut dyn FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
+        let k = kept.dim(1)?;
+        let total = k + new;
+        // the source, then silence where frames are made (ACE-Step's src_latents and clean_src_latents agree here)
+        let clean = Tensor::cat(&[kept, &self.silence.narrow(1, k, new)?], 1)?;
+        let m: Vec<f32> = (0..total).map(|i| if i >= k { 1.0 } else { 0.0 }).collect();
+        let mask = Tensor::from_vec(m, (1, total, 1), &self.device)?.to_dtype(self.dtype)?;
+        let context = Tensor::cat(&[&clean, &mask.broadcast_as((1, total, 64))?.contiguous()?], 2)?;
+        let x = noise(seed, total, &self.device)?.to_dtype(self.dtype)?;
+        let rp = dit::Repaint { mask: &mask, clean: &clean, injection_ratio: 0.5, crossfade: CROSSFADE };
+        let latent = dit::sample_repaint(&self.dit, &x, &context, cond, &dit::schedule(steps, shift), Some(&rp), on_step)?;
+        Ok((latent, context))
+    }
+
+    /// The continuation's audio: the latent decoded whole (so the decoder sees the source), then only the frames from
+    /// CROSSFADE before the source's end, which replace the previous song's last CROSSFADE frames (0.48 s).
+    pub fn continuation(&mut self, s: &Song, source: &Tensor, timbre_from_source: bool,
+                        on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
+        let (latent, k) = self.continue_latent(s, source, timbre_from_source, on_step)?;
+        let from = k.saturating_sub(CROSSFADE);
+        let audio = self.decode(&latent)?;
+        Ok(audio.narrow(1, from * oobleck::HOP, audio.dim(1)? - from * oobleck::HOP)?)
+    }
+
     pub fn song(&mut self, s: &Song, on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
         let latent = self.latent(s, on_step)?;
         self.decode(&latent)
@@ -281,6 +365,48 @@ mod tests {
         eprintln!("final latent against Python's: cosine {c:.5}");
         std::fs::write(r.join("acestep-golden/rust-golden-song.wav"), wav(&a.decode(&x0).unwrap()).unwrap()).unwrap();
         assert!(c > 0.97, "final latent: cosine {c}");
+    }
+
+    /// The golden repaint (acestep-golden-repaint.py): the golden song's first 4 s kept, frames 100..250 made after
+    /// it. The conditions are made here; the noise is the recorded one, so the final latent must match Python's.
+    #[test]
+    #[ignore = "needs ACE-Step's checkpoints and the golden files (ACESTEP_REF)"]
+    fn the_golden_repaint_is_made_again_from_its_noise() {
+        let r = reference();
+        let dev = Device::Cpu;
+        let mut a = AceStep::load(&r.join("ACE-Step-1.5/checkpoints"), &dev).unwrap();
+        let g = |f: &str| candle_core::safetensors::load(r.join(format!("acestep-golden/{f}.safetensors")), &dev).unwrap();
+        let (genr, rp) = (g("generate"), g("repaint"));
+        let m = text::Metas { bpm: Some(100), time_signature: Some("4".into()), key_scale: Some("C major".into()), duration_s: 10 };
+        let caption = a.text.caption(&text::caption_prompt("warm indie pop, female vocal, acoustic guitar, soft drums, hopeful", &m)).unwrap();
+        let lyrics = a.text.lyrics(&text::lyric_prompt("[verse]\nLate at night the city hums\nA little light, a server runs", "en")).unwrap();
+        let cond = a.cond.forward(&caption, &lyrics, &a.silence.narrow(1, 0, 750).unwrap()).unwrap();
+        let cos = |x: &Tensor, y: &Tensor| {
+            let (x, y) = (x.flatten_all().unwrap(), y.flatten_all().unwrap());
+            let d = (&x * &y).unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
+            d / (x.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar::<f32>().unwrap()
+                 * y.sqr().unwrap().sum_all().unwrap().sqrt().unwrap().to_scalar::<f32>().unwrap())
+        };
+        let kept = genr["out.target_latents"].narrow(1, 0, 100).unwrap();
+        // the inputs built here against Python's
+        let clean = Tensor::cat(&[&kept, &a.silence.narrow(1, 100, 150).unwrap()], 1).unwrap();
+        eprintln!("source against Python's: cosine {:.6}", cos(&clean, &rp["clean_src_latents"]));
+        let total = 250;
+        let mvec: Vec<f32> = (0..total).map(|i| if i >= 100 { 1.0 } else { 0.0 }).collect();
+        let mask = Tensor::from_vec(mvec, (1, total, 1), &dev).unwrap();
+        let context = Tensor::cat(&[&clean, &mask.broadcast_as((1, total, 64)).unwrap().contiguous().unwrap()], 2).unwrap();
+        let want_ctx = Tensor::cat(&[&rp["src_latents"], &rp["chunk_masks"]], 2).unwrap();
+        let cctx = cos(&context, &want_ctx);
+        eprintln!("context against Python's: cosine {cctx:.6}");
+        let r2 = dit::Repaint { mask: &mask, clean: &clean, injection_ratio: 0.5, crossfade: CROSSFADE };
+        let x0 = dit::sample_repaint(&a.dit, &rp["noise"], &context, &cond, &dit::schedule(8, 1.0), Some(&r2), &mut |_, _| {}).unwrap();
+        let want = &rp["out"];
+        let (c, cnew) = (cos(&x0, want), cos(&x0.narrow(1, 100, 150).unwrap(), &want.narrow(1, 100, 150).unwrap()));
+        let kept_err = (x0.narrow(1, 0, 88).unwrap() - kept.narrow(1, 0, 88).unwrap()).unwrap().abs().unwrap()
+            .flatten_all().unwrap().max(0).unwrap().to_scalar::<f32>().unwrap();
+        eprintln!("final latent against Python's: cosine {c:.5} (the new part {cnew:.5}); the kept frames off the source by at most {kept_err:.2e}");
+        std::fs::write(r.join("acestep-golden/rust-repaint.wav"), wav(&a.decode(&x0).unwrap()).unwrap()).unwrap();
+        assert!(cctx > 0.9999 && c > 0.97 && cnew > 0.97 && kept_err < 1e-4, "cosine {c}, new part {cnew}, kept {kept_err}");
     }
 
     /// A whole song in Rust (set ACESTEP_DEVICE=cuda for the GPU); writes it for listening and Whisper.

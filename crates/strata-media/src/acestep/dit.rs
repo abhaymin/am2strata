@@ -445,13 +445,69 @@ pub fn dcw_double(x: &Tensor, denoised: &Tensor, low: f32, high: f32) -> Result<
 /// The turbo sampler from `noise` [1, frames, 64]: Euler steps of the flow, the last one to x_0, DCW after each
 /// (scaler 0.05 for the low band, 0.02 for the high, as ACE-Step's defaults). `on_step` sees each step.
 pub fn sample(dit: &Dit, noise: &Tensor, context: &Tensor, cond: &Tensor, ts: &[f32], on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
+    sample_repaint(dit, noise, context, cond, ts, None, on_step)
+}
+
+/// A repaint (ACE-Step's "repaint" task, here run past the end of a source to continue it): the frames to make and the
+/// source they continue.
+pub struct Repaint<'a> {
+    /// [1, frames, 1]: 1 where frames are made, 0 where the source is kept
+    pub mask: &'a Tensor,
+    /// the source's latent [1, frames, 64] (silence where nothing was)
+    pub clean: &'a Tensor,
+    /// the kept frames forced back to the noised source for this share of the steps (ACE-Step: 0.5)
+    pub injection_ratio: f32,
+    /// the frames over which the boundary is crossfaded at the end (ACE-Step's handler: 12)
+    pub crossfade: usize,
+}
+
+/// The repaint's soft mask: 1 where frames are made, ramps of `cf` frames into the kept frames on each side of the
+/// region (as ACE-Step's _repaint_boundary_blend: linspace without its end points).
+pub fn soft_mask(region: (usize, usize), frames: usize, cf: usize) -> Vec<f32> {
+    let (left, right) = region;
+    let mut m = vec![0f32; frames];
+    m[left..right].iter_mut().for_each(|x| *x = 1.0);
+    let fs = left.saturating_sub(cf);
+    let n = left - fs;
+    for j in 0..n {
+        m[fs + j] = (j + 1) as f32 / (n + 1) as f32;
+    }
+    let fe = (right + cf).min(frames);
+    let n = fe - right;
+    for j in 0..n {
+        m[right + j] = 1.0 - (j + 1) as f32 / (n + 1) as f32;
+    }
+    m
+}
+
+/// `sample` with an optional repaint: after each of the first injection_ratio of the steps the kept frames are set
+/// back to the source noised to the next step's level (t·noise + (1-t)·source, the same noise), and at the end the
+/// result is blended with the source through the soft mask (ACE-Step's _repaint_step_injection and
+/// _repaint_boundary_blend).
+pub fn sample_repaint(dit: &Dit, noise: &Tensor, context: &Tensor, cond: &Tensor, ts: &[f32], repaint: Option<&Repaint>,
+                      on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
     let mut x = noise.clone();
+    let cutoff = repaint.map(|r| (r.injection_ratio * ts.len() as f32).round_ties_even() as usize).unwrap_or(0);
     for (i, &t) in ts.iter().enumerate() {
         let v = dit.forward(&x, t, context, cond)?;
         let denoised = (&x - (&v * t as f64)?)?;
         x = if i + 1 == ts.len() { denoised.clone() } else { (&x - (&v * (t - ts[i + 1]) as f64)?)? };
         x = dcw_double(&x, &denoised, t * 0.05, (1.0 - t) * 0.02)?;
+        if let (Some(r), true) = (repaint, i + 1 < ts.len() && i < cutoff) {
+            let tn = ts[i + 1] as f64;
+            let zt = ((noise * tn)? + (r.clean * (1.0 - tn))?)?;
+            let keep = r.mask.ones_like()?.sub(r.mask)?;
+            x = (x.broadcast_mul(r.mask)? + zt.broadcast_mul(&keep)?)?;
+        }
         on_step(i + 1, ts.len());
+    }
+    if let Some(r) = repaint.filter(|r| r.crossfade > 0) {
+        let m = r.mask.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let (Some(left), Some(last)) = (m.iter().position(|v| *v > 0.5), m.iter().rposition(|v| *v > 0.5)) else { return Ok(x) };
+        let soft = soft_mask((left, last + 1), m.len(), r.crossfade);
+        let soft = Tensor::from_vec(soft, (1, m.len(), 1), x.device())?.to_dtype(x.dtype())?;
+        let keep = soft.ones_like()?.sub(&soft)?;
+        x = (x.broadcast_mul(&soft)? + r.clean.broadcast_mul(&keep)?)?;
     }
     Ok(x)
 }
