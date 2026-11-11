@@ -1,0 +1,2933 @@
+use anyhow::{bail, Result};
+use candle_core::{DType, Device, Module, Tensor, D};
+use candle_transformers::models::stable_diffusion::schedulers::PredictionType;
+use mold_candle::stable_diffusion;
+use mold_core::{GenerateRequest, GenerateResponse, ImageData, ModelPaths, Scheduler};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::cache::{
+    cfg_prompt_cache_key, clear_cache, get_or_insert_cached_tensor, image_size_cache_key,
+    latent_size_cache_key, restore_cached_tensor, CachedTensor, CfgPromptCacheKey,
+    ImageSizeCacheKey, LatentSizeCacheKey, LruCache, DEFAULT_IMAGE_CACHE_CAPACITY,
+    DEFAULT_PROMPT_CACHE_CAPACITY,
+};
+use crate::cfg_plus_ddim::DdimAlphaSchedule;
+use crate::device::{check_memory_budget, memory_status_string, preflight_memory_check};
+use crate::engine::{cfg_active, rand_seed, resolve_cfg_plus, InferenceEngine, LoadStrategy};
+use crate::engine_base::EngineBase;
+use crate::image::{build_output_metadata, encode_image};
+use crate::progress::{ProgressCallback, ProgressEvent};
+
+/// Loaded SDXL model components, ready for inference.
+struct LoadedSDXL {
+    /// None after being dropped for VAE decode VRAM; reloaded on next generate.
+    unet: Option<stable_diffusion::unet_2d::UNet2DConditionModel>,
+    vae: stable_diffusion::vae::AutoEncoderKL,
+    clip_l: stable_diffusion::clip::ClipTextTransformer,
+    clip_g: stable_diffusion::clip::ClipTextTransformer,
+    tokenizer_l: Arc<tokenizers::Tokenizer>,
+    tokenizer_g: Arc<tokenizers::Tokenizer>,
+    sd_config: stable_diffusion::StableDiffusionConfig,
+    device: Device,
+    /// Device the CLIP-L / CLIP-G weights live on (shared — Tier 1 groups them).
+    clip_device: Device,
+    dtype: DType,
+    /// Effective VAE dtype after `MOLD_VAE_DTYPE` resolution. Captured at
+    /// load time so img2img encode + decode use the matching precision when
+    /// fp32 is forced. May equal `dtype` (default behaviour preserved).
+    vae_dtype: DType,
+}
+
+/// SDXL inference engine backed by candle's stable_diffusion module.
+pub struct SDXLEngine {
+    base: EngineBase<LoadedSDXL>,
+    scheduler: Scheduler,
+    is_turbo: bool,
+    shared_pool: Option<Arc<Mutex<crate::shared_pool::SharedPool>>>,
+    prompt_cache: Mutex<LruCache<CfgPromptCacheKey, CachedTensor>>,
+    source_latent_cache: Mutex<LruCache<ImageSizeCacheKey, CachedTensor>>,
+    mask_cache: Mutex<LruCache<LatentSizeCacheKey, CachedTensor>>,
+    pending_placement: Option<mold_core::types::DevicePlacement>,
+    /// `Some(path)` when the engine was built from a Civitai single-file
+    /// checkpoint via `from_single_file()`. `load()` branches on this to
+    /// wire a custom `SingleFileBackend` (translating diffusers `vb.get`
+    /// calls through `SdxlRemap`, including row-wise slicing for the
+    /// CLIP-G fused QKV slabs) instead of calling candle's per-component
+    /// `build_*` helpers. `None` for diffusers-layout (HF) checkpoints.
+    pub(crate) single_file_path: Option<PathBuf>,
+    /// Per-request LoRA list, set from `req.lora` / `req.loras` in
+    /// `generate()` and cleared after. Read by `build_unet_for_strategy` to
+    /// decide whether to wrap the UNet's `VarBuilder` with `super::lora`'s
+    /// `wrap_backend_with_lora`. Empty in the no-LoRA hot path.
+    pending_loras: Vec<mold_core::LoraWeight>,
+    /// Fingerprint of the LoRA stack currently merged into the loaded UNet
+    /// (eager mode). When `effective_sdxl_loras(req)` produces a different
+    /// fingerprint, `generate_inner` drops the UNet so the next
+    /// `reload_unet_if_needed` call rebuilds it with the new LoRA wrapper.
+    /// Empty when no LoRA is active. This is the SDXL equivalent of
+    /// `FluxEngine::active_lora`.
+    active_lora_fingerprint: Vec<(String, u64)>,
+    /// Face-identity conditioning: the frozen PuLID bundle, the embedding
+    /// admission extracted for the next request, and the resident adapter.
+    /// Inert — and costs nothing — for every request that does not condition
+    /// on a face.
+    identity: super::identity::SdxlIdentityState,
+    /// Image-prompt conditioning: the frozen IP-Adapter bundle and the
+    /// resident per-layer projections. Independent of [`Self::identity`] —
+    /// see `sd_reference::LayeredCrossAttentionHook` for why the two compose
+    /// rather than exclude each other — and inert for every request that
+    /// attaches no reference picture.
+    reference: crate::sd_reference::SdReferenceState,
+}
+
+/// Compute a stable fingerprint for a LoRA stack: ordered list of
+/// `(path, scale_bits)`. Two stacks are equal iff they merge to the same
+/// transformer, so a comparison drives UNet reload on any change (swap,
+/// scale, add, remove, reorder).
+fn lora_stack_fingerprint(loras: &[mold_core::LoraWeight]) -> Vec<(String, u64)> {
+    loras
+        .iter()
+        .map(|w| (w.path.clone(), w.scale.to_bits()))
+        .collect()
+}
+
+/// VAE scaling factor for standard SDXL models.
+const VAE_SCALE_STANDARD: f64 = 0.18215;
+/// VAE scaling factor for SDXL Turbo models.
+const VAE_SCALE_TURBO: f64 = 0.13025;
+/// Playground v2.5 trains against per-channel normalized SDXL VAE latents.
+const PLAYGROUND_VAE_SCALE: f64 = 0.5;
+const PLAYGROUND_LATENTS_MEAN: [f32; 4] = [-1.6574, 1.886, -1.383, 2.5155];
+const PLAYGROUND_LATENTS_STD: [f32; 4] = [8.4927, 5.9022, 6.5498, 5.2299];
+
+fn playground_latent_stats(device: &Device, dtype: DType) -> Result<(Tensor, Tensor)> {
+    let mean = Tensor::new(&PLAYGROUND_LATENTS_MEAN, device)?
+        .reshape((1, 4, 1, 1))?
+        .to_dtype(dtype)?;
+    let std = Tensor::new(&PLAYGROUND_LATENTS_STD, device)?
+        .reshape((1, 4, 1, 1))?
+        .to_dtype(dtype)?;
+    Ok((mean, std))
+}
+
+fn normalize_playground_latents(latents: &Tensor) -> Result<Tensor> {
+    let (mean, std) = playground_latent_stats(latents.device(), latents.dtype())?;
+    ((latents - mean.broadcast_as(latents.shape())?)? * PLAYGROUND_VAE_SCALE)?
+        .broadcast_div(&std)
+        .map_err(Into::into)
+}
+
+fn denormalize_playground_latents(latents: &Tensor) -> Result<Tensor> {
+    let (mean, std) = playground_latent_stats(latents.device(), latents.dtype())?;
+    (((latents.broadcast_mul(&std)? / PLAYGROUND_VAE_SCALE)?
+        + mean.broadcast_as(latents.shape())?)?)
+    .to_dtype(latents.dtype())
+    .map_err(Into::into)
+}
+
+fn resolve_sdxl_vae_dtype(default_dtype: DType, single_file: bool) -> DType {
+    let default = if single_file {
+        // Several SDXL Civitai single-file finetunes decode to all-black
+        // images when their baked VAE runs in fp16. Use fp32 by default for
+        // this path while still honoring an explicit MOLD_VAE_DTYPE override.
+        DType::F32
+    } else {
+        default_dtype
+    };
+    crate::device::resolve_vae_dtype(default)
+}
+
+impl SDXLEngine {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_name: String,
+        paths: ModelPaths,
+        scheduler: Scheduler,
+        is_turbo: bool,
+        load_strategy: LoadStrategy,
+        gpu_ordinal: usize,
+        shared_pool: Option<Arc<Mutex<crate::shared_pool::SharedPool>>>,
+        identity_assets: Option<mold_core::pulid_assets::PulidPaths>,
+        ip_adapter_assets: Option<mold_core::ip_adapter_assets::IpAdapterPaths>,
+    ) -> Self {
+        Self {
+            base: EngineBase::new(model_name, paths, load_strategy, gpu_ordinal),
+            scheduler,
+            is_turbo,
+            shared_pool,
+            prompt_cache: Mutex::new(LruCache::new(DEFAULT_PROMPT_CACHE_CAPACITY)),
+            source_latent_cache: Mutex::new(LruCache::new(DEFAULT_IMAGE_CACHE_CAPACITY)),
+            mask_cache: Mutex::new(LruCache::new(DEFAULT_IMAGE_CACHE_CAPACITY)),
+            pending_placement: None,
+            single_file_path: None,
+            pending_loras: Vec::new(),
+            active_lora_fingerprint: Vec::new(),
+            identity: super::identity::SdxlIdentityState::new(identity_assets),
+            reference: crate::sd_reference::SdReferenceState::new(
+                mold_core::ip_adapter_assets::ImagePromptFamily::Sdxl,
+                ip_adapter_assets,
+            ),
+        }
+    }
+
+    /// Construct an SDXL engine from a Civitai single-file `.safetensors`
+    /// checkpoint.
+    ///
+    /// Header-parses the file via `loader::single_file::load(_, Family::Sdxl)`,
+    /// validates that the SDXL A1111 → diffusers rename rules cover its
+    /// UNet / VAE / CLIP-L / CLIP-G tensor keys via
+    /// `loader::sdxl_keys::build_sdxl_remap(_)`, and stashes the path in
+    /// `single_file_path`. The actual UNet / VAE / CLIP-L / CLIP-G
+    /// materialisation (with a custom `SimpleBackend` that translates each
+    /// diffusers `vb.get(name)` into the corresponding A1111 key — including
+    /// row-wise slicing for the CLIP-G fused QKV slabs — inside the mmap'd
+    /// single file) lands in a downstream phase. This constructor does
+    /// **not** build the model.
+    ///
+    /// `clip_l_tokenizer` and `clip_g_tokenizer` are paths to companion-pulled
+    /// tokenizer assets; tokenizers never live inside the
+    /// single-file checkpoint.
+    ///
+    /// `is_turbo` is threaded through from the manifest / model config —
+    /// Civitai SDXL Turbo checkpoints are not structurally distinguishable
+    /// from standard SDXL at the safetensors-header level, so the caller
+    /// (the 2.6 factory) makes the call based on `model_cfg.is_turbo` (or
+    /// the `model_name.contains("turbo")` fallback). Drives the
+    /// `VAE_SCALE_TURBO` / `EulerAncestral` defaults at load time via
+    /// `sdxl_config()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_single_file(
+        model_name: String,
+        single_file_path: PathBuf,
+        clip_l_tokenizer: PathBuf,
+        clip_g_tokenizer: PathBuf,
+        scheduler: Scheduler,
+        is_turbo: bool,
+        load_strategy: LoadStrategy,
+        gpu_ordinal: usize,
+        shared_pool: Option<Arc<Mutex<crate::shared_pool::SharedPool>>>,
+        identity_assets: Option<mold_core::pulid_assets::PulidPaths>,
+        ip_adapter_assets: Option<mold_core::ip_adapter_assets::IpAdapterPaths>,
+    ) -> Result<Self> {
+        if !single_file_path.exists() {
+            bail!(
+                "single-file checkpoint not found: {}",
+                single_file_path.display()
+            );
+        }
+
+        // Header-parse and validate the SDXL layout. `single_file::load`
+        // is header-only — no tensor data is mmap'd here.
+        let bundle = crate::loader::single_file::load(
+            &single_file_path,
+            mold_catalog::families::Family::Sdxl,
+        )?;
+
+        // Validate that every diffusers key the future SimpleBackend will
+        // request resolves to a real A1111 source — including the CLIP-G
+        // fused QKV slabs (each `attn.in_proj_*` key expands into three
+        // diffusers entries via `RenameOutput::FusedSlice`). Catches
+        // malformed checkpoints at construction time rather than deep in
+        // the eventual `load()` call.
+        let _remap = crate::loader::sdxl_keys::build_sdxl_remap(&bundle)?;
+
+        // `ModelPaths` is a diffusers-layout view; for single-file the
+        // transformer / vae / clip_encoder / clip_encoder_2 all materialise
+        // from the same checkpoint at load time. The real branch lives on
+        // the new `single_file_path` field — future `load()` consults it
+        // before falling through to the diffusers `build_*` helpers.
+        let paths = ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer: single_file_path.clone(),
+            transformer_shards: Vec::new(),
+            vae: single_file_path.clone(),
+            spatial_upscaler: None,
+            temporal_upscaler: None,
+            distilled_lora: None,
+            t5_encoder: None,
+            clip_encoder: Some(single_file_path.clone()),
+            t5_tokenizer: None,
+            clip_tokenizer: Some(clip_l_tokenizer),
+            clip_encoder_2: Some(single_file_path.clone()),
+            clip_tokenizer_2: Some(clip_g_tokenizer),
+            text_encoder_files: Vec::new(),
+            text_tokenizer: None,
+            decoder: None,
+        };
+
+        // `is_turbo` is threaded through from the 2.6 factory based on the
+        // manifest's `is_turbo` flag (or the `model_name.contains("turbo")`
+        // fallback). Civitai SDXL Turbo checkpoints aren't structurally
+        // distinguishable from standard SDXL at the safetensors-header
+        // level — turbo-vs-standard is purely a load-time concern (VAE
+        // scale, scheduler defaults), so the constructor accepts it
+        // verbatim and stashes it for `sdxl_config()` to read.
+        Ok(Self {
+            base: EngineBase::new(model_name, paths, load_strategy, gpu_ordinal),
+            scheduler,
+            is_turbo,
+            shared_pool,
+            prompt_cache: Mutex::new(LruCache::new(DEFAULT_PROMPT_CACHE_CAPACITY)),
+            source_latent_cache: Mutex::new(LruCache::new(DEFAULT_IMAGE_CACHE_CAPACITY)),
+            mask_cache: Mutex::new(LruCache::new(DEFAULT_IMAGE_CACHE_CAPACITY)),
+            pending_placement: None,
+            single_file_path: Some(single_file_path),
+            pending_loras: Vec::new(),
+            active_lora_fingerprint: Vec::new(),
+            identity: super::identity::SdxlIdentityState::new(identity_assets),
+            reference: crate::sd_reference::SdReferenceState::new(
+                mold_core::ip_adapter_assets::ImagePromptFamily::Sdxl,
+                ip_adapter_assets,
+            ),
+        })
+    }
+
+    /// Validate and return required SDXL paths.
+    fn validate_paths(
+        &self,
+    ) -> Result<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let clip_encoder = self
+            .base
+            .paths
+            .clip_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP-L encoder path required for SDXL models"))?
+            .clone();
+        let clip_tokenizer = self
+            .base
+            .paths
+            .clip_tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP-L tokenizer path required for SDXL models"))?
+            .clone();
+        let clip_encoder_2 = self
+            .base
+            .paths
+            .clip_encoder_2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP-G encoder path required for SDXL models"))?
+            .clone();
+        let clip_tokenizer_2 = self
+            .base
+            .paths
+            .clip_tokenizer_2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP-G tokenizer path required for SDXL models"))?
+            .clone();
+
+        for (label, path) in [
+            ("transformer (UNet)", &self.base.paths.transformer),
+            ("vae", &self.base.paths.vae),
+            ("clip_encoder (CLIP-L)", &clip_encoder),
+            ("clip_tokenizer (CLIP-L)", &clip_tokenizer),
+            ("clip_encoder_2 (CLIP-G)", &clip_encoder_2),
+            ("clip_tokenizer_2 (CLIP-G)", &clip_tokenizer_2),
+        ] {
+            if !path.exists() {
+                bail!("{label} file not found: {}", path.display());
+            }
+        }
+
+        Ok((
+            clip_encoder,
+            clip_tokenizer,
+            clip_encoder_2,
+            clip_tokenizer_2,
+        ))
+    }
+
+    fn load_clip_tokenizer(
+        &self,
+        clip_tokenizer: &std::path::Path,
+        label: &str,
+    ) -> Result<Arc<tokenizers::Tokenizer>> {
+        if let Some(ref pool) = self.shared_pool {
+            return pool.lock().unwrap().load_tokenizer(clip_tokenizer);
+        }
+        Ok(Arc::new(
+            tokenizers::Tokenizer::from_file(clip_tokenizer)
+                .map_err(|e| anyhow::anyhow!("failed to load {label} tokenizer: {e}"))?,
+        ))
+    }
+
+    /// The PuLID adapter path admission froze, or `None`.
+    pub fn identity_adapter_path(&self) -> Option<&PathBuf> {
+        self.identity.adapter_path()
+    }
+
+    /// The adapter's residency follows the UNet's.
+    ///
+    /// Called once at the end of every `generate`, so the two drop sites
+    /// inside the render — the sequential path's `drop(unet)` and the eager
+    /// path's VAE-decode drop — do not each need their own copy of this rule,
+    /// and neither can forget it. It is also the backstop for a render that
+    /// never reaches a drop site at all: a cancellation checkpoint or an error
+    /// inside `denoise_loop` returns straight out of `generate_inner`, and
+    /// without this the ~682 MB adapter would stay resident until a later
+    /// unload or unconditioned request. Whenever the UNet did not survive the
+    /// render the adapter must not either — nothing is going to use it before
+    /// the next conditioned request, which reloads it anyway.
+    fn release_identity_adapter_unless_unet_resident(&mut self) {
+        let unet_resident = self
+            .base
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.unet.is_some());
+        if !unet_resident {
+            self.identity.drop_adapter();
+        }
+    }
+
+    /// Device bytes the PuLID adapter is currently holding, or 0.
+    ///
+    /// The `InferenceEngine` trait has no resident-bytes method to fold this
+    /// into, so it is exposed here exactly as `FluxEngine` exposes its own: it
+    /// is the only way a caller can confirm that a park or an unload actually
+    /// released the adapter rather than leaving device memory nothing accounts
+    /// for.
+    pub fn identity_resident_bytes(&self) -> u64 {
+        self.identity.resident_bytes()
+    }
+
+    /// The IP-Adapter path admission froze, or `None`.
+    pub fn reference_adapter_path(&self) -> Option<&std::path::Path> {
+        self.reference.adapter_path()
+    }
+
+    /// The image-prompt projections follow the same residency rule the
+    /// identity adapter does, and for the same three reasons recorded on
+    /// [`Self::release_identity_adapter_unless_unet_resident`]. They are a
+    /// second slot rather than a shared one because the two adapters are
+    /// loaded independently: a render may condition on a face, a picture,
+    /// both, or neither.
+    fn release_reference_adapter_unless_unet_resident(&mut self) {
+        let unet_resident = self
+            .base
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.unet.is_some());
+        if !unet_resident {
+            self.reference.drop_adapter();
+        }
+    }
+
+    /// Device bytes the IP-Adapter projections are currently holding, or 0.
+    pub fn reference_resident_bytes(&self) -> u64 {
+        self.reference.resident_bytes()
+    }
+
+    /// Create the SDXL config.
+    fn sd_config(&self) -> stable_diffusion::StableDiffusionConfig {
+        if self.is_turbo {
+            stable_diffusion::StableDiffusionConfig::sdxl_turbo(None, None, None)
+        } else {
+            stable_diffusion::StableDiffusionConfig::sdxl(None, None, None)
+        }
+    }
+
+    /// Reload UNet if it was dropped after VAE decode.
+    fn reload_unet_if_needed(&mut self) -> Result<()> {
+        let needs_reload = self
+            .base
+            .loaded
+            .as_ref()
+            .map(|l| l.unet.is_none())
+            .unwrap_or(false);
+
+        if needs_reload {
+            let sd_config = self.sd_config();
+            let loaded = self.base.loaded.as_ref().unwrap();
+            let device = loaded.device.clone();
+            let dtype = loaded.dtype;
+            let _ = loaded;
+
+            self.base.progress.stage_start("Reloading UNet (GPU)");
+            let reload_start = Instant::now();
+            let unet = self.build_unet_for_strategy(&sd_config, &device, dtype)?;
+            self.base.loaded.as_mut().unwrap().unet = Some(unet);
+            self.base
+                .progress
+                .stage_done("Reloading UNet (GPU)", reload_start.elapsed());
+        }
+        Ok(())
+    }
+
+    /// UNet load that branches on `single_file_path` — Civitai single-file
+    /// checkpoints (A1111 naming) get the `SingleFileBackend` dispatch,
+    /// diffusers-layout falls through to candle's `build_unet`. Used by
+    /// every UNet load site (eager `load`, sequential `generate_sequential`,
+    /// and `reload_unet_if_needed`) so the branch logic lives in exactly
+    /// one place.
+    ///
+    /// When `self.pending_loras` is non-empty, the underlying tensor source
+    /// (mmap'd diffusers safetensors or `SingleFileBackend`) is wrapped in
+    /// `super::lora::wrap_backend_with_lora` so the UNet construction loads
+    /// `W' = W + scale·(B @ A)` for every LoRA-targeted layer. The wrapper
+    /// is transparent to `UNet2DConditionModel::new`.
+    fn build_unet_for_strategy(
+        &self,
+        sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::unet_2d::UNet2DConditionModel> {
+        let has_lora = !self.pending_loras.is_empty();
+        if let Some(single_file) = self.single_file_path.as_ref() {
+            let remap = Self::load_sdxl_remap(single_file)?;
+            if has_lora {
+                self.build_unet_single_file_with_lora(single_file, &remap, sd_config, device, dtype)
+            } else {
+                Self::build_unet_single_file(single_file, &remap, sd_config, device, dtype)
+            }
+        } else if has_lora {
+            self.build_unet_diffusers_with_lora(sd_config, device, dtype)
+        } else {
+            Ok(sd_config.build_unet(&self.base.paths.transformer, device, 4, false, dtype)?)
+        }
+    }
+
+    /// Build the UNet from a diffusers-layout single safetensors file with
+    /// LoRA wrappers active. Mirrors candle's `build_unet`: open the mmap,
+    /// wrap it in a `SimpleBackend`, layer `SdxlLoraBackend` on top, and feed
+    /// the resulting `VarBuilder` to `UNet2DConditionModel::new`.
+    fn build_unet_diffusers_with_lora(
+        &self,
+        _sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::unet_2d::UNet2DConditionModel> {
+        use candle_core::safetensors::MmapedSafetensors;
+        use candle_nn::VarBuilder;
+
+        let st = unsafe { MmapedSafetensors::multi(&[&self.base.paths.transformer])? };
+
+        struct MmapBackend {
+            st: MmapedSafetensors,
+        }
+        impl candle_nn::var_builder::SimpleBackend for MmapBackend {
+            fn get(
+                &self,
+                _s: candle_core::Shape,
+                name: &str,
+                _h: candle_nn::Init,
+                dtype: DType,
+                dev: &Device,
+            ) -> candle_core::Result<Tensor> {
+                let t = self.st.load(name, dev)?;
+                if t.dtype() != dtype {
+                    t.to_dtype(dtype)
+                } else {
+                    Ok(t)
+                }
+            }
+            fn get_unchecked(
+                &self,
+                name: &str,
+                dtype: DType,
+                dev: &Device,
+            ) -> candle_core::Result<Tensor> {
+                let t = self.st.load(name, dev)?;
+                if t.dtype() != dtype {
+                    t.to_dtype(dtype)
+                } else {
+                    Ok(t)
+                }
+            }
+            fn contains_tensor(&self, name: &str) -> bool {
+                self.st.get(name).is_ok()
+            }
+        }
+        let inner: Box<dyn candle_nn::var_builder::SimpleBackend> = Box::new(MmapBackend { st });
+        let wrapped = self.wrap_with_loras(inner)?;
+        let vb = VarBuilder::from_backend(wrapped, dtype, device.clone());
+        Ok(stable_diffusion::unet_2d::UNet2DConditionModel::new(
+            vb,
+            4,
+            4,
+            false,
+            mold_candle::stable_diffusion::sdxl_unet(),
+        )?)
+    }
+
+    /// Same as `build_unet_single_file` but with the LoRA wrapper layered on
+    /// top of `SingleFileBackend`. The SDXL `SingleFileBackend` translates
+    /// diffusers candle keys onto the mmap'd A1111 checkpoint; the LoRA
+    /// wrapper then intercepts the merged tensor and adds the per-layer
+    /// delta before it lands on the UNet constructor.
+    fn build_unet_single_file_with_lora(
+        &self,
+        single_file: &std::path::Path,
+        remap: &crate::loader::SdxlRemap,
+        _sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::unet_2d::UNet2DConditionModel> {
+        use crate::loader::SingleFileBackend;
+        use candle_nn::VarBuilder;
+
+        let backend = SingleFileBackend::from_sdxl_unet(single_file, remap)?;
+        let inner: Box<dyn candle_nn::var_builder::SimpleBackend> = Box::new(backend);
+        let wrapped = self.wrap_with_loras(inner)?;
+        let vb = VarBuilder::from_backend(wrapped, dtype, device.clone());
+        Ok(stable_diffusion::unet_2d::UNet2DConditionModel::new(
+            vb,
+            4,
+            4,
+            false,
+            mold_candle::stable_diffusion::sdxl_unet(),
+        )?)
+    }
+
+    /// Wrap an `inner` SimpleBackend with the SDXL LoRA backend. Resolves the
+    /// `pending_loras` list into `LoraSpec`s (parsed-LoRA cache hits keep
+    /// adapter parsing cheap across requests).
+    fn wrap_with_loras(
+        &self,
+        inner: Box<dyn candle_nn::var_builder::SimpleBackend>,
+    ) -> Result<Box<dyn candle_nn::var_builder::SimpleBackend>> {
+        let adapters = super::lora::load_lora_adapters(&self.pending_loras, &self.base.progress)?;
+        let specs: Vec<super::lora::SdxlLoraSpec<'_>> = adapters
+            .iter()
+            .zip(self.pending_loras.iter())
+            .map(|(adapter, w)| super::lora::SdxlLoraSpec {
+                adapter: adapter.as_ref(),
+                scale: w.scale,
+            })
+            .collect();
+        super::lora::wrap_backend_with_lora(inner, &specs, &self.base.progress)
+    }
+
+    /// VAE load with the same single-file vs diffusers branch as
+    /// `build_unet_for_strategy`. Sequential SDXL loads the VAE twice
+    /// (once for img2img encode, once for post-denoise decode), so this
+    /// helper keeps the branch logic in a single place.
+    fn build_vae_for_strategy(
+        &self,
+        sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::vae::AutoEncoderKL> {
+        if let Some(single_file) = self.single_file_path.as_ref() {
+            let remap = Self::load_sdxl_remap(single_file)?;
+            Self::build_vae_single_file(single_file, &remap, sd_config, device, dtype)
+        } else {
+            self.build_vae_diffusers(sd_config, device, dtype)
+        }
+    }
+
+    #[cfg(test)]
+    fn load_vae_cpu_tensors(&self) -> Result<Option<Arc<HashMap<String, Tensor>>>> {
+        self.load_vae_cpu_tensors_for_path(&self.base.paths.vae)
+    }
+
+    fn load_vae_cpu_tensors_for_path(
+        &self,
+        vae_path: &Path,
+    ) -> Result<Option<Arc<HashMap<String, Tensor>>>> {
+        let Some(shared_pool) = &self.shared_pool else {
+            return Ok(None);
+        };
+        shared_pool
+            .lock()
+            .unwrap()
+            .load_safetensors_cpu_tensors(std::slice::from_ref(&vae_path))
+    }
+
+    fn load_vae_var_builder<'a>(
+        &self,
+        vae_path: &Path,
+        dtype: DType,
+        device: &Device,
+        component: &str,
+    ) -> Result<candle_nn::VarBuilder<'a>> {
+        if let Some(tensors) = self.load_vae_cpu_tensors_for_path(vae_path)? {
+            return Ok(crate::encoders::park::varbuilder_from_parked(
+                tensors.as_ref(),
+                dtype,
+                device,
+            ));
+        }
+
+        crate::weight_loader::load_safetensors_with_progress(
+            std::slice::from_ref(&vae_path),
+            dtype,
+            device,
+            component,
+            &self.base.progress,
+        )
+    }
+
+    fn build_vae_diffusers(
+        &self,
+        _sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::vae::AutoEncoderKL> {
+        let vb = self.load_vae_var_builder(&self.base.paths.vae, dtype, device, "VAE")?;
+        Ok(stable_diffusion::vae::AutoEncoderKL::new(
+            vb,
+            3,
+            3,
+            mold_candle::stable_diffusion::vae(),
+        )?)
+    }
+
+    /// Load all SDXL model components (Eager mode).
+    ///
+    /// Two materialisation paths share this entry point — diffusers-layout
+    /// (separate component files via candle's `build_*` helpers) and
+    /// single-file (Civitai checkpoint via a custom `SingleFileBackend`
+    /// that translates each diffusers `vb.get(name)` into mmap'd reads,
+    /// including row-wise slicing for the CLIP-G fused QKV slabs). The
+    /// branch is on `self.single_file_path`.
+    ///
+    /// On error, `self.base.loaded` remains `None` — all components are
+    /// assembled into local variables and only stored on success, so
+    /// partial loads cannot leave the engine in an inconsistent state.
+    pub fn load(&mut self) -> Result<()> {
+        if self.base.loaded.is_some() {
+            return Ok(());
+        }
+
+        // Sequential mode defers loading to generate_sequential()
+        if self.base.load_strategy == LoadStrategy::Sequential {
+            return Ok(());
+        }
+
+        let (clip_encoder, clip_tokenizer, clip_encoder_2, clip_tokenizer_2) =
+            self.validate_paths()?;
+
+        tracing::info!(model = %self.base.model_name, "loading SDXL model components...");
+
+        let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+        let dtype = if crate::device::is_gpu(&device) {
+            DType::F16
+        } else {
+            DType::F32
+        };
+
+        let sd_config = self.sd_config();
+
+        // Tier 1: honor `placement.text_encoders` for both CLIPs as a group.
+        let tier1 = self
+            .pending_placement
+            .as_ref()
+            .map(|p| p.text_encoders.clone())
+            .unwrap_or_default();
+        let clip_device = crate::device::resolve_device(Some(tier1), || Ok(device.clone()))?;
+
+        // Resolve VAE precision once at load — see LoadedSDXL::vae_dtype.
+        let vae_dtype = resolve_sdxl_vae_dtype(dtype, self.single_file_path.is_some());
+        let (unet, vae, clip_l, clip_g) = if let Some(single_file) = self.single_file_path.clone() {
+            self.load_components_single_file(
+                &single_file,
+                &sd_config,
+                &device,
+                &clip_device,
+                dtype,
+                vae_dtype,
+            )?
+        } else {
+            self.load_components_diffusers(
+                &clip_encoder,
+                &clip_encoder_2,
+                &sd_config,
+                &device,
+                &clip_device,
+                dtype,
+                vae_dtype,
+            )?
+        };
+
+        let tokenizer_l = self.load_clip_tokenizer(&clip_tokenizer, "CLIP-L")?;
+        let tokenizer_g = self.load_clip_tokenizer(&clip_tokenizer_2, "CLIP-G")?;
+
+        self.base.loaded = Some(LoadedSDXL {
+            unet: Some(unet),
+            vae,
+            clip_l,
+            clip_g,
+            tokenizer_l,
+            tokenizer_g,
+            sd_config,
+            device,
+            clip_device,
+            dtype,
+            vae_dtype,
+        });
+
+        tracing::info!(model = %self.base.model_name, "all SDXL components loaded successfully");
+        Ok(())
+    }
+
+    /// Diffusers-layout component loader (existing pre-2.6 path).
+    #[allow(clippy::too_many_arguments)]
+    fn load_components_diffusers(
+        &mut self,
+        clip_encoder: &std::path::Path,
+        clip_encoder_2: &std::path::Path,
+        sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        clip_device: &Device,
+        dtype: DType,
+        vae_dtype: DType,
+    ) -> Result<(
+        stable_diffusion::unet_2d::UNet2DConditionModel,
+        stable_diffusion::vae::AutoEncoderKL,
+        stable_diffusion::clip::ClipTextTransformer,
+        stable_diffusion::clip::ClipTextTransformer,
+    )> {
+        self.base.progress.stage_start("Loading UNet (GPU)");
+        let unet_start = Instant::now();
+        let unet = sd_config.build_unet(&self.base.paths.transformer, device, 4, false, dtype)?;
+        self.base
+            .progress
+            .stage_done("Loading UNet (GPU)", unet_start.elapsed());
+
+        self.base.progress.stage_start("Loading VAE (GPU)");
+        let vae_start = Instant::now();
+        let vae = self.build_vae_diffusers(sd_config, device, vae_dtype)?;
+        self.base
+            .progress
+            .stage_done("Loading VAE (GPU)", vae_start.elapsed());
+
+        self.base.progress.stage_start("Loading CLIP-L encoder");
+        let clip_l_start = Instant::now();
+        let clip_l = stable_diffusion::build_clip_transformer(
+            &sd_config.clip,
+            clip_encoder,
+            clip_device,
+            DType::F32,
+        )?;
+        self.base
+            .progress
+            .stage_done("Loading CLIP-L encoder", clip_l_start.elapsed());
+
+        self.base.progress.stage_start("Loading CLIP-G encoder");
+        let clip_g_start = Instant::now();
+        let clip2_config = sd_config
+            .clip2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2 configuration"))?;
+        let clip_g = stable_diffusion::build_clip_transformer(
+            clip2_config,
+            clip_encoder_2,
+            clip_device,
+            DType::F32,
+        )?;
+        self.base
+            .progress
+            .stage_done("Loading CLIP-G encoder", clip_g_start.elapsed());
+
+        Ok((unet, vae, clip_l, clip_g))
+    }
+
+    /// Single-file (Civitai) component loader.
+    ///
+    /// Header-parses the checkpoint, builds the diffusers→A1111 remap
+    /// (incl. CLIP-G `RenameOutput::FusedSlice` entries for the OpenCLIP
+    /// `attn.in_proj_*` slabs), wraps it in `SingleFileBackend`, and feeds
+    /// four `VarBuilder::from_backend(SingleFileBackend)` instances to
+    /// candle's per-component constructors: UNet, VAE, CLIP-L, CLIP-G.
+    /// All four read from the same single-file mmap.
+    ///
+    /// Mold-owned component factories reproduce the upstream aggregate
+    /// configuration without reaching through Candle's private fields.
+    fn load_components_single_file(
+        &mut self,
+        single_file: &std::path::Path,
+        sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        clip_device: &Device,
+        dtype: DType,
+        vae_dtype: DType,
+    ) -> Result<(
+        stable_diffusion::unet_2d::UNet2DConditionModel,
+        stable_diffusion::vae::AutoEncoderKL,
+        stable_diffusion::clip::ClipTextTransformer,
+        stable_diffusion::clip::ClipTextTransformer,
+    )> {
+        let remap = Self::load_sdxl_remap(single_file)?;
+
+        self.base.progress.stage_start("Loading UNet (single-file)");
+        let unet_start = Instant::now();
+        let unet = Self::build_unet_single_file(single_file, &remap, sd_config, device, dtype)?;
+        self.base
+            .progress
+            .stage_done("Loading UNet (single-file)", unet_start.elapsed());
+
+        self.base.progress.stage_start("Loading VAE (single-file)");
+        let vae_start = Instant::now();
+        let vae = Self::build_vae_single_file(single_file, &remap, sd_config, device, vae_dtype)?;
+        self.base
+            .progress
+            .stage_done("Loading VAE (single-file)", vae_start.elapsed());
+
+        self.base
+            .progress
+            .stage_start("Loading CLIP-L (single-file)");
+        let clip_l_start = Instant::now();
+        let clip_l =
+            Self::build_clip_l_single_file(single_file, &remap, &sd_config.clip, clip_device)?;
+        self.base
+            .progress
+            .stage_done("Loading CLIP-L (single-file)", clip_l_start.elapsed());
+
+        self.base
+            .progress
+            .stage_start("Loading CLIP-G (single-file)");
+        let clip_g_start = Instant::now();
+        let clip2_config = sd_config
+            .clip2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SDXL config missing clip2 configuration"))?;
+        let clip_g =
+            Self::build_clip_g_single_file(single_file, &remap, clip2_config, clip_device)?;
+        self.base
+            .progress
+            .stage_done("Loading CLIP-G (single-file)", clip_g_start.elapsed());
+
+        Ok((unet, vae, clip_l, clip_g))
+    }
+
+    /// Header-parse the single-file checkpoint and build the SDXL
+    /// diffusers→A1111 remap. Cheap (no tensor data is mmap'd) — sequential
+    /// reload calls this each time a component is reloaded after dropping.
+    fn load_sdxl_remap(single_file: &std::path::Path) -> Result<crate::loader::SdxlRemap> {
+        use crate::loader::{build_sdxl_remap, single_file as single_file_loader};
+        use mold_catalog::families::Family;
+        let bundle = single_file_loader::load(single_file, Family::Sdxl)
+            .map_err(|e| anyhow::anyhow!("partition single-file SDXL checkpoint: {e}"))?;
+        build_sdxl_remap(&bundle)
+            .map_err(|e| anyhow::anyhow!("build SDXL diffusers→A1111 remap: {e}"))
+    }
+
+    /// Build a UNet from a Civitai single-file checkpoint via
+    /// `SingleFileBackend`. Used by both eager `load_components_single_file`
+    /// and sequential `generate_sequential` so the dispatch is identical
+    /// across modes.
+    fn build_unet_single_file(
+        single_file: &std::path::Path,
+        remap: &crate::loader::SdxlRemap,
+        _sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::unet_2d::UNet2DConditionModel> {
+        use crate::loader::SingleFileBackend;
+        use candle_nn::VarBuilder;
+        let backend = SingleFileBackend::from_sdxl_unet(single_file, remap)?;
+        let vb = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
+        Ok(stable_diffusion::unet_2d::UNet2DConditionModel::new(
+            vb,
+            4,
+            4,
+            false,
+            mold_candle::stable_diffusion::sdxl_unet(),
+        )?)
+    }
+
+    /// Build a VAE from a Civitai single-file checkpoint via a VAE-scoped
+    /// `SingleFileBackend`.
+    fn build_vae_single_file(
+        single_file: &std::path::Path,
+        remap: &crate::loader::SdxlRemap,
+        _sd_config: &stable_diffusion::StableDiffusionConfig,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<stable_diffusion::vae::AutoEncoderKL> {
+        use crate::loader::SingleFileBackend;
+        use candle_nn::VarBuilder;
+        let backend = SingleFileBackend::from_sdxl_vae(single_file, remap)?;
+        let vb = VarBuilder::from_backend(Box::new(backend), dtype, device.clone());
+        Ok(stable_diffusion::vae::AutoEncoderKL::new(
+            vb,
+            3,
+            3,
+            mold_candle::stable_diffusion::vae(),
+        )?)
+    }
+
+    /// Build CLIP-L from a Civitai single-file checkpoint via a CLIP-L-scoped
+    /// `SingleFileBackend`. Scoping is critical: CLIP-L and CLIP-G produce
+    /// the same diffusers keys (e.g. `text_model.embeddings.token_embedding.weight`
+    /// and every encoder layer's `self_attn.{q,k,v,out}_proj.weight`), so
+    /// an all-in-one entries map collapses them and CLIP-L's
+    /// `ClipTextTransformer` would materialise with CLIP-G's `[vocab, 1280]`
+    /// weights instead of its own `[vocab, 768]`. The next
+    /// `Embedding::forward` reshape then blows up with `lhs: [77, 1280],
+    /// rhs: [1, 77, 768]`. See
+    /// `loader::single_file_backend::tests::sdxl_clip_l_scoped_backend_returns_clip_l_tensor_when_keys_collide_with_clip_g`.
+    fn build_clip_l_single_file(
+        single_file: &std::path::Path,
+        remap: &crate::loader::SdxlRemap,
+        clip_config: &stable_diffusion::clip::Config,
+        clip_device: &Device,
+    ) -> Result<stable_diffusion::clip::ClipTextTransformer> {
+        use crate::loader::SingleFileBackend;
+        use candle_nn::VarBuilder;
+        let backend = SingleFileBackend::from_sdxl_clip_l(single_file, remap)?;
+        let vb = VarBuilder::from_backend(Box::new(backend), DType::F32, clip_device.clone());
+        Ok(stable_diffusion::clip::ClipTextTransformer::new(
+            vb,
+            clip_config,
+        )?)
+    }
+
+    /// Build CLIP-G from a Civitai single-file checkpoint via a CLIP-G-scoped
+    /// `SingleFileBackend`. Scoped factory keeps CLIP-G's FusedSlice entries
+    /// for the OpenCLIP `attn.in_proj_*` slabs and excludes CLIP-L's overlap.
+    fn build_clip_g_single_file(
+        single_file: &std::path::Path,
+        remap: &crate::loader::SdxlRemap,
+        clip_config: &stable_diffusion::clip::Config,
+        clip_device: &Device,
+    ) -> Result<stable_diffusion::clip::ClipTextTransformer> {
+        use crate::loader::SingleFileBackend;
+        use candle_nn::VarBuilder;
+        let backend = SingleFileBackend::from_sdxl_clip_g(single_file, remap)?;
+        let vb = VarBuilder::from_backend(Box::new(backend), DType::F32, clip_device.clone());
+        Ok(stable_diffusion::clip::ClipTextTransformer::new(
+            vb,
+            clip_config,
+        )?)
+    }
+
+    /// Tokenize a prompt for a CLIP encoder, padding/truncating to max_len tokens.
+    fn tokenize(
+        tokenizer: &tokenizers::Tokenizer,
+        prompt: &str,
+        max_len: usize,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let encoding = tokenizer
+            .encode(prompt, true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let mut ids = encoding.get_ids().to_vec();
+        ids.truncate(max_len);
+        // Pad with 0s (EOS/PAD token for CLIP)
+        while ids.len() < max_len {
+            ids.push(0);
+        }
+        let ids = ids.into_iter().map(|i| i as i64).collect::<Vec<_>>();
+        Ok(Tensor::new(ids, device)?.unsqueeze(0)?)
+    }
+
+    /// Run the denoising loop (shared between eager and sequential).
+    ///
+    /// `start_step` allows starting from a later timestep for img2img (0 = full txt2img).
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_loop(
+        &self,
+        unet: &stable_diffusion::unet_2d::UNet2DConditionModel,
+        text_embeddings: &Tensor,
+        sched: Scheduler,
+        latents: &mut Tensor,
+        guidance: f64,
+        cfg_plus: bool,
+        steps: u32,
+        start_step: usize,
+        inpaint_ctx: Option<&crate::img_utils::InpaintContext>,
+        identity: Option<&super::identity::ResolvedSdxlIdentity>,
+        reference: Option<&crate::sd_reference::ResolvedReference>,
+    ) -> Result<()> {
+        if matches!(sched, Scheduler::EdmDpmPp2m) {
+            return self.denoise_loop_playground_edm(
+                unet,
+                text_embeddings,
+                latents,
+                guidance,
+                cfg_plus,
+                steps,
+                start_step,
+                inpaint_ctx,
+                identity,
+                reference,
+            );
+        }
+        let use_cfg = cfg_active(guidance);
+        let mut scheduler = crate::scheduler::build_scheduler(
+            sched,
+            steps as usize,
+            PredictionType::Epsilon,
+            self.is_turbo,
+        )?;
+        let timesteps = scheduler.timesteps().to_vec();
+        let active_timesteps = &timesteps[start_step..];
+
+        // CFG++ requires the doubled `[uncond, cond]` forward (so we can read
+        // the uncond row at integration time) AND a DDIM scheduler (the only
+        // one whose alpha schedule we mirror). Other combinations fall back
+        // to standard CFG with a one-shot warn so misconfigurations surface.
+        let cfg_plus_schedule = if cfg_plus && use_cfg && matches!(sched, Scheduler::Ddim) {
+            Some(DdimAlphaSchedule::from_default(steps as usize))
+        } else {
+            if cfg_plus && !use_cfg {
+                tracing::warn!(
+                    guidance,
+                    "cfg_plus requested but cfg_scale does not activate CFG — falling back to standard step (no uncond available)"
+                );
+            } else if cfg_plus {
+                tracing::warn!(
+                    scheduler = ?sched,
+                    "cfg_plus requested but only DDIM is supported on SDXL/SD1.5 — falling back to standard step. Re-run with `--scheduler ddim` to enable CFG++."
+                );
+            }
+            None
+        };
+
+        // Face identity, when this render conditions on one. The runtime is the
+        // gate: `hook_for_step` yields `None` before `id_start_step` and at an
+        // effective weight of 0, and a `None` step calls the UNet's ordinary
+        // `forward` — so an inactive step executes the exact code an
+        // unconditioned build executes.
+        let identity_runtime = identity.map(super::identity::ResolvedSdxlIdentity::runtime);
+        if let Some(resolved) = identity {
+            self.base.progress.info(&format!(
+                "Face identity: {} cross-attention modules",
+                resolved.module_count()
+            ));
+        }
+        // Image prompting rides WITH identity rather than instead of it; see
+        // `sd_reference::LayeredCrossAttentionHook` for the arithmetic that
+        // makes the two additive branches order-independent.
+        let reference_runtime = reference.map(crate::sd_reference::ResolvedReference::runtime);
+        if let Some(resolved) = reference {
+            self.base.progress.info(&format!(
+                "Reference image: {} tokens across {} cross-attention modules",
+                resolved.tokens(),
+                resolved.module_count()
+            ));
+        }
+
+        let denoise_label = format!("Denoising ({} steps)", active_timesteps.len());
+        self.base.progress.stage_start(&denoise_label);
+        let denoise_start = Instant::now();
+
+        for (step_idx, &t) in active_timesteps.iter().enumerate() {
+            self.base.progress.checkpoint()?;
+            let step_start = std::time::Instant::now();
+            let latent_input = if use_cfg {
+                Tensor::cat(&[&*latents, &*latents], 0)?
+            } else {
+                latents.clone()
+            };
+
+            let latent_input = scheduler.scale_model_input(latent_input, t)?;
+            // `start_step` is img2img's offset into the schedule, and
+            // `id_start_step` is measured against the FULL schedule the
+            // request named — so the gate is asked the absolute position,
+            // never the loop's own index into the truncated tail. Identity
+            // and img2img ride together, so this is a live path, not a
+            // hypothetical one.
+            let id_hook = identity_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.hook_for_step(start_step + step_idx));
+            let ip_hook = reference_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.hook_for_step(start_step + step_idx));
+            let noise_pred = match (id_hook.as_ref(), ip_hook.as_ref()) {
+                (None, None) => unet.forward(&latent_input, t as f64, text_embeddings)?,
+                (Some(hook), None) => {
+                    unet.forward_with_hook(&latent_input, t as f64, text_embeddings, hook)?
+                }
+                (None, Some(hook)) => {
+                    unet.forward_with_hook(&latent_input, t as f64, text_embeddings, hook)?
+                }
+                (Some(id), Some(ip)) => unet.forward_with_hook(
+                    &latent_input,
+                    t as f64,
+                    text_embeddings,
+                    &crate::sd_reference::LayeredCrossAttentionHook::new(id, ip),
+                )?,
+            };
+
+            // Hold onto the raw uncond row when CFG++ is active so we can use
+            // it as the renoise direction below; standard path discards it
+            // after CFG blending.
+            let (noise_pred_blended, noise_pred_uncond_opt) = if use_cfg {
+                let chunks = noise_pred.chunk(2, 0)?;
+                let noise_pred_uncond = chunks[0].clone();
+                let noise_pred_cond = &chunks[1];
+                let blended =
+                    (&noise_pred_uncond + ((noise_pred_cond - &noise_pred_uncond)? * guidance)?)?;
+                (blended, Some(noise_pred_uncond))
+            } else {
+                (noise_pred, None)
+            };
+
+            *latents = match (cfg_plus_schedule.as_ref(), noise_pred_uncond_opt.as_ref()) {
+                (Some(ddim_sched), Some(eps_uncond)) => {
+                    ddim_sched.cfg_plus_step(&*latents, &noise_pred_blended, eps_uncond, t)?
+                }
+                _ => scheduler.step(&noise_pred_blended, t, &*latents)?,
+            };
+
+            if let Some(ctx) = inpaint_ctx {
+                let noised_original =
+                    scheduler.add_noise(&ctx.original_latents, ctx.noise.clone(), t)?;
+                *latents = crate::img2img::blend_inpaint_latents(&*latents, ctx, &noised_original)?;
+            }
+
+            self.base.progress.emit(ProgressEvent::DenoiseStep {
+                step: step_idx + 1,
+                total: active_timesteps.len(),
+                elapsed: step_start.elapsed(),
+            });
+        }
+
+        self.base.progress.checkpoint()?;
+        self.base
+            .progress
+            .stage_done(&denoise_label, denoise_start.elapsed());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_loop_playground_edm(
+        &self,
+        unet: &stable_diffusion::unet_2d::UNet2DConditionModel,
+        text_embeddings: &Tensor,
+        latents: &mut Tensor,
+        guidance: f64,
+        cfg_plus: bool,
+        steps: u32,
+        start_step: usize,
+        inpaint_ctx: Option<&crate::img_utils::InpaintContext>,
+        identity: Option<&super::identity::ResolvedSdxlIdentity>,
+        reference: Option<&crate::sd_reference::ResolvedReference>,
+    ) -> Result<()> {
+        if start_step >= steps as usize {
+            return Ok(());
+        }
+        if cfg_plus {
+            tracing::warn!(
+                "cfg_plus requested for Playground EDM — using the model's required DPM++ 2M integrator without CFG++"
+            );
+        }
+        let use_cfg = cfg_active(guidance);
+        let mut scheduler =
+            crate::playground_edm::PlaygroundEdmScheduler::new(steps as usize, start_step)?;
+        let timesteps = scheduler.timesteps().to_vec();
+        let active_timesteps = &timesteps[start_step..];
+        let identity_runtime = identity.map(super::identity::ResolvedSdxlIdentity::runtime);
+        if let Some(resolved) = identity {
+            self.base.progress.info(&format!(
+                "Face identity: {} cross-attention modules",
+                resolved.module_count()
+            ));
+        }
+        // Image prompting rides WITH identity rather than instead of it; see
+        // `sd_reference::LayeredCrossAttentionHook` for the arithmetic that
+        // makes the two additive branches order-independent.
+        let reference_runtime = reference.map(crate::sd_reference::ResolvedReference::runtime);
+        if let Some(resolved) = reference {
+            self.base.progress.info(&format!(
+                "Reference image: {} tokens across {} cross-attention modules",
+                resolved.tokens(),
+                resolved.module_count()
+            ));
+        }
+
+        let denoise_label = format!("Denoising ({} EDM steps)", active_timesteps.len());
+        self.base.progress.stage_start(&denoise_label);
+        let denoise_start = Instant::now();
+
+        for (step_idx, &t) in active_timesteps.iter().enumerate() {
+            self.base.progress.checkpoint()?;
+            let step_start = Instant::now();
+            let latent_input = if use_cfg {
+                Tensor::cat(&[&*latents, &*latents], 0)?
+            } else {
+                latents.clone()
+            };
+            let latent_input = scheduler.scale_model_input(&latent_input)?;
+            let id_hook = identity_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.hook_for_step(start_step + step_idx));
+            let ip_hook = reference_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.hook_for_step(start_step + step_idx));
+            let noise_pred = match (id_hook.as_ref(), ip_hook.as_ref()) {
+                (None, None) => unet.forward(&latent_input, t, text_embeddings)?,
+                (Some(hook), None) => {
+                    unet.forward_with_hook(&latent_input, t, text_embeddings, hook)?
+                }
+                (None, Some(hook)) => {
+                    unet.forward_with_hook(&latent_input, t, text_embeddings, hook)?
+                }
+                (Some(id), Some(ip)) => unet.forward_with_hook(
+                    &latent_input,
+                    t,
+                    text_embeddings,
+                    &crate::sd_reference::LayeredCrossAttentionHook::new(id, ip),
+                )?,
+            };
+            let noise_pred = if use_cfg {
+                let chunks = noise_pred.chunk(2, 0)?;
+                (&chunks[0] + ((&chunks[1] - &chunks[0])? * guidance)?)?
+            } else {
+                noise_pred
+            };
+            *latents = scheduler.step(&noise_pred, &*latents)?;
+
+            if let Some(ctx) = inpaint_ctx {
+                let noised_original =
+                    scheduler.add_noise_at_current_sigma(&ctx.original_latents, &ctx.noise)?;
+                *latents = crate::img2img::blend_inpaint_latents(&*latents, ctx, &noised_original)?;
+            }
+
+            self.base.progress.emit(ProgressEvent::DenoiseStep {
+                step: step_idx + 1,
+                total: active_timesteps.len(),
+                elapsed: step_start.elapsed(),
+            });
+        }
+
+        self.base.progress.checkpoint()?;
+        self.base
+            .progress
+            .stage_done(&denoise_label, denoise_start.elapsed());
+        Ok(())
+    }
+
+    /// Prepare img2img latents: VAE encode source image, add noise at the appropriate timestep.
+    /// Returns (noised_latents, start_step, encoded, noise).
+    ///
+    /// `dtype` is the engine-wide compute dtype (used for noise + denoise loop).
+    /// `vae_dtype` may differ when `MOLD_VAE_DTYPE` forces fp32 — it controls
+    /// the source-tensor decode and the VAE encode input precision; the
+    /// returned encoded latents are cast back to `dtype` for the denoise.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_img2img_latents(
+        &self,
+        vae: &stable_diffusion::vae::AutoEncoderKL,
+        source_bytes: &[u8],
+        width: u32,
+        height: u32,
+        strength: f64,
+        steps: u32,
+        sched: Scheduler,
+        seed: u64,
+        device: &Device,
+        dtype: DType,
+        vae_dtype: DType,
+    ) -> Result<(Tensor, usize, Tensor, Tensor)> {
+        use crate::img_utils::{decode_source_image, NormalizeRange};
+        let vae_scale = if self.is_turbo {
+            VAE_SCALE_TURBO
+        } else {
+            VAE_SCALE_STANDARD
+        };
+        let cache_key = image_size_cache_key(source_bytes, width, height);
+        let (encoded, cache_hit) = get_or_insert_cached_tensor(
+            &self.source_latent_cache,
+            cache_key,
+            device,
+            dtype,
+            || {
+                self.base
+                    .progress
+                    .stage_start("Encoding source image (VAE)");
+                let encode_start = Instant::now();
+
+                let source_tensor = decode_source_image(
+                    source_bytes,
+                    width,
+                    height,
+                    NormalizeRange::MinusOneToOne,
+                    device,
+                    vae_dtype,
+                )?;
+                let encoded = vae.encode(&source_tensor)?.mode()?;
+                let encoded = if matches!(sched, Scheduler::EdmDpmPp2m) {
+                    normalize_playground_latents(&encoded)?
+                } else {
+                    (encoded * vae_scale)?
+                };
+                // VAE may have been loaded at fp32 (banding fix); cast the
+                // encoded latents back to engine dtype so the rest of the
+                // denoise loop stays at its natural precision.
+                let encoded = encoded.to_dtype(dtype)?;
+
+                self.base.progress.phase_done(
+                    crate::ProgressPhase::Vae,
+                    "Encoding source image (VAE)",
+                    encode_start.elapsed(),
+                );
+                Ok(encoded)
+            },
+        )?;
+        if cache_hit {
+            self.base.progress.cache_hit("source image latents");
+        }
+
+        let start_step = crate::img2img::img2img_start_index(steps as usize, strength);
+
+        let latent_h = height as usize / 8;
+        let latent_w = width as usize / 8;
+        let noise =
+            crate::engine::seeded_randn(seed, &[1, 4, latent_h, latent_w], device, DType::F32)?;
+        let noise = noise.to_dtype(dtype)?;
+
+        let noised = if start_step < steps as usize && matches!(sched, Scheduler::EdmDpmPp2m) {
+            let scheduler =
+                crate::playground_edm::PlaygroundEdmScheduler::new(steps as usize, start_step)?;
+            scheduler.add_noise_at(&encoded, &noise, start_step)?
+        } else if start_step < steps as usize {
+            let scheduler = crate::scheduler::build_scheduler(
+                sched,
+                steps as usize,
+                PredictionType::Epsilon,
+                self.is_turbo,
+            )?;
+            let timesteps = scheduler.timesteps();
+            scheduler.add_noise(&encoded, noise.clone(), timesteps[start_step])?
+        } else {
+            encoded.clone()
+        };
+
+        tracing::info!(
+            start_step,
+            total_steps = steps,
+            strength,
+            "img2img: starting from step {start_step}"
+        );
+
+        Ok((noised, start_step, encoded, noise))
+    }
+
+    /// Encode prompt with both CLIP encoders.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_prompt(
+        &self,
+        clip_l: &stable_diffusion::clip::ClipTextTransformer,
+        clip_g: &stable_diffusion::clip::ClipTextTransformer,
+        tokenizer_l: &tokenizers::Tokenizer,
+        tokenizer_g: &tokenizers::Tokenizer,
+        prompt: &str,
+        negative_prompt: &str,
+        max_len: usize,
+        device: &Device,
+        clip_device: &Device,
+        dtype: DType,
+        guidance: f64,
+    ) -> Result<Tensor> {
+        // SDXL caches the **concatenated** `(uncond, cond)` tensor when CFG is
+        // active, so the cache key must include the negative prompt and the
+        // guidance scale. Keying on the positive prompt + guidance alone
+        // returned a stale uncond branch when the user changed only the
+        // negative prompt — silent wrong output.
+        let cache_key = cfg_prompt_cache_key(prompt, negative_prompt, guidance);
+        let (text_embeddings, cache_hit) =
+            get_or_insert_cached_tensor(&self.prompt_cache, cache_key, device, dtype, || {
+                let use_cfg = cfg_active(guidance);
+
+                self.base.progress.stage_start("Encoding prompt (CLIP-L)");
+                let encode_l_start = Instant::now();
+                let tokens_l = Self::tokenize(tokenizer_l, prompt, max_len, clip_device)?;
+                let text_emb_l = clip_l.forward(&tokens_l)?;
+                self.base.progress.phase_done(
+                    crate::ProgressPhase::PromptEncode,
+                    "Encoding prompt (CLIP-L)",
+                    encode_l_start.elapsed(),
+                );
+
+                self.base.progress.stage_start("Encoding prompt (CLIP-G)");
+                let encode_g_start = Instant::now();
+                let tokens_g = Self::tokenize(tokenizer_g, prompt, max_len, clip_device)?;
+                let text_emb_g = clip_g.forward(&tokens_g)?;
+                self.base.progress.phase_done(
+                    crate::ProgressPhase::PromptEncode,
+                    "Encoding prompt (CLIP-G)",
+                    encode_g_start.elapsed(),
+                );
+
+                let text_embeddings = Tensor::cat(&[&text_emb_l, &text_emb_g], D::Minus1)?;
+
+                let text_embeddings = if use_cfg {
+                    let uncond_tokens_l =
+                        Self::tokenize(tokenizer_l, negative_prompt, max_len, clip_device)?;
+                    let uncond_emb_l = clip_l.forward(&uncond_tokens_l)?;
+                    let uncond_tokens_g =
+                        Self::tokenize(tokenizer_g, negative_prompt, max_len, clip_device)?;
+                    let uncond_emb_g = clip_g.forward(&uncond_tokens_g)?;
+                    let uncond_embeddings =
+                        Tensor::cat(&[&uncond_emb_l, &uncond_emb_g], D::Minus1)?;
+                    Tensor::cat(&[&uncond_embeddings, &text_embeddings], 0)?
+                } else {
+                    text_embeddings
+                };
+
+                let text_embeddings = text_embeddings.to_device(device)?;
+                Ok(text_embeddings.to_dtype(dtype)?)
+            })?;
+        if cache_hit {
+            self.base.progress.cache_hit("prompt conditioning");
+            return Ok(text_embeddings);
+        }
+        Ok(text_embeddings)
+    }
+
+    fn cached_mask(
+        &self,
+        mask_bytes: &[u8],
+        latent_h: usize,
+        latent_w: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let key = latent_size_cache_key(mask_bytes, latent_h, latent_w);
+        let (mask, cache_hit) =
+            get_or_insert_cached_tensor(&self.mask_cache, key, device, dtype, || {
+                crate::img_utils::decode_mask_image(mask_bytes, latent_h, latent_w, device, dtype)
+            })?;
+        if cache_hit {
+            self.base.progress.cache_hit("inpaint mask");
+            return Ok(mask);
+        }
+        Ok(mask)
+    }
+
+    /// Generate an image using sequential loading strategy.
+    ///
+    /// Loads components one at a time and drops them when done:
+    /// 1. Load CLIP-L → encode → drop CLIP-L
+    /// 2. Load CLIP-G → encode → drop CLIP-G
+    /// 3. Load UNet → denoise → drop UNet
+    /// 4. Load VAE → decode → drop VAE
+    fn generate_sequential(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        let (clip_encoder, clip_tokenizer, clip_encoder_2, clip_tokenizer_2) =
+            self.validate_paths()?;
+
+        // Check memory budget
+        if let Some(warning) = check_memory_budget(&self.base.paths, LoadStrategy::Sequential) {
+            self.base.progress.info(&warning);
+        }
+
+        let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+        let dtype = if crate::device::is_gpu(&device) {
+            DType::F16
+        } else {
+            DType::F32
+        };
+
+        let sd_config = self.sd_config();
+        let max_len = sd_config.clip.max_position_embeddings;
+
+        let start = Instant::now();
+        let seed = req.seed.unwrap_or_else(rand_seed);
+
+        let width = req.width as usize;
+        let height = req.height as usize;
+        let guidance = req.guidance;
+
+        tracing::info!(
+            prompt = %req.prompt,
+            seed, width, height,
+            steps = req.steps,
+            guidance,
+            "starting sequential SDXL generation"
+        );
+
+        self.base
+            .progress
+            .info("Using sequential loading (load-use-drop) to minimize peak memory");
+
+        // --- Phase 1: Encode prompt (check cache first to skip encoder load) ---
+        let neg = req.negative_prompt.as_deref().unwrap_or("");
+        let cache_key = cfg_prompt_cache_key(&req.prompt, neg, guidance);
+        let text_embeddings = if let Some(tensor) =
+            restore_cached_tensor(&self.prompt_cache, &cache_key, &device, dtype)?
+        {
+            self.base.progress.cache_hit("prompt conditioning");
+            tensor
+        } else {
+            if let Some(status) = memory_status_string() {
+                self.base.progress.info(&status);
+            }
+
+            let tokenizer_l = self.load_clip_tokenizer(&clip_tokenizer, "CLIP-L")?;
+            let tokenizer_g = self.load_clip_tokenizer(&clip_tokenizer_2, "CLIP-G")?;
+
+            let tier1 = self
+                .pending_placement
+                .as_ref()
+                .map(|p| p.text_encoders.clone())
+                .unwrap_or_default();
+            let clip_device = crate::device::resolve_device(Some(tier1), || Ok(device.clone()))?;
+
+            // Branch on single_file_path so cv:<id>-style Civitai checkpoints
+            // (A1111 naming) go through `SingleFileBackend` just like eager
+            // mode does. Without this, candle's diffusers-keyed
+            // `build_clip_transformer` errors with
+            // "cannot find tensor text_model.embeddings.token_embedding.weight".
+            let (clip_l, clip_g) =
+                if let Some(single_file) = self.single_file_path.clone() {
+                    let remap = Self::load_sdxl_remap(&single_file)?;
+
+                    self.base
+                        .progress
+                        .stage_start("Loading CLIP-L (single-file)");
+                    let clip_l_start = Instant::now();
+                    let clip_l = Self::build_clip_l_single_file(
+                        &single_file,
+                        &remap,
+                        &sd_config.clip,
+                        &clip_device,
+                    )?;
+                    self.base
+                        .progress
+                        .stage_done("Loading CLIP-L (single-file)", clip_l_start.elapsed());
+
+                    self.base
+                        .progress
+                        .stage_start("Loading CLIP-G (single-file)");
+                    let clip_g_start = Instant::now();
+                    let clip2_config = sd_config.clip2.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("SDXL config missing clip2 configuration")
+                    })?;
+                    let clip_g = Self::build_clip_g_single_file(
+                        &single_file,
+                        &remap,
+                        clip2_config,
+                        &clip_device,
+                    )?;
+                    self.base
+                        .progress
+                        .stage_done("Loading CLIP-G (single-file)", clip_g_start.elapsed());
+
+                    (clip_l, clip_g)
+                } else {
+                    self.base.progress.stage_start("Loading CLIP-L encoder");
+                    let clip_l_start = Instant::now();
+                    let clip_l = stable_diffusion::build_clip_transformer(
+                        &sd_config.clip,
+                        &clip_encoder,
+                        &clip_device,
+                        DType::F32,
+                    )?;
+                    self.base
+                        .progress
+                        .stage_done("Loading CLIP-L encoder", clip_l_start.elapsed());
+
+                    self.base.progress.stage_start("Loading CLIP-G encoder");
+                    let clip_g_start = Instant::now();
+                    let clip2_config = sd_config.clip2.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("SDXL config missing clip2 configuration")
+                    })?;
+                    let clip_g = stable_diffusion::build_clip_transformer(
+                        clip2_config,
+                        &clip_encoder_2,
+                        &clip_device,
+                        DType::F32,
+                    )?;
+                    self.base
+                        .progress
+                        .stage_done("Loading CLIP-G encoder", clip_g_start.elapsed());
+
+                    (clip_l, clip_g)
+                };
+
+            let text_embeddings = self.encode_prompt(
+                &clip_l,
+                &clip_g,
+                &tokenizer_l,
+                &tokenizer_g,
+                &req.prompt,
+                neg,
+                max_len,
+                &device,
+                &clip_device,
+                dtype,
+                guidance,
+            )?;
+
+            drop(clip_l);
+            drop(clip_g);
+            self.base.progress.info("Freed CLIP-L and CLIP-G encoders");
+            tracing::info!("CLIP encoders dropped (sequential mode)");
+
+            text_embeddings
+        };
+
+        // --- Phase 2: Load UNet and denoise ---
+        let unet_size = std::fs::metadata(&self.base.paths.transformer)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        // SDXL doubles the UNet batch only while CFG is active.
+        let unet_batch = if cfg_active(req.guidance) { 2 } else { 1 };
+        let unet_activation_budget = crate::device::activation_bytes(
+            req.width,
+            req.height,
+            unet_batch,
+            crate::device::dtype_bytes(dtype),
+            crate::device::ActivationFamily::SdxlUnet,
+        );
+        preflight_memory_check("UNet", unet_size, unet_activation_budget)?;
+        if let Some(status) = memory_status_string() {
+            self.base.progress.info(&status);
+        }
+
+        self.base.progress.stage_start("Loading UNet (GPU)");
+        let unet_start = Instant::now();
+        let unet = self.build_unet_for_strategy(&sd_config, &device, dtype)?;
+        self.base
+            .progress
+            .stage_done("Loading UNet (GPU)", unet_start.elapsed());
+
+        let sched = req.scheduler.unwrap_or(self.scheduler);
+        let is_img2img = req.source_image.is_some();
+
+        let (mut latents, start_step, inpaint_ctx) = if let Some(ref source_bytes) =
+            req.source_image
+        {
+            self.base
+                .progress
+                .info("img2img mode: encoding source image before denoising");
+
+            self.base.progress.stage_start("Loading VAE (GPU)");
+            let vae_start_t = Instant::now();
+            let vae_dtype = resolve_sdxl_vae_dtype(dtype, self.single_file_path.is_some());
+            let vae = self.build_vae_for_strategy(&sd_config, &device, vae_dtype)?;
+            self.base
+                .progress
+                .stage_done("Loading VAE (GPU)", vae_start_t.elapsed());
+
+            let (latents, start_step, encoded, noise) = self.prepare_img2img_latents(
+                &vae,
+                source_bytes,
+                req.width,
+                req.height,
+                req.strength,
+                req.steps,
+                sched,
+                seed,
+                &device,
+                dtype,
+                vae_dtype,
+            )?;
+
+            let inpaint_ctx = if let Some(ref mask_bytes) = req.mask_image {
+                let mask = self.cached_mask(mask_bytes, height / 8, width / 8, &device, dtype)?;
+                Some(crate::img_utils::InpaintContext {
+                    original_latents: encoded,
+                    mask,
+                    noise,
+                })
+            } else {
+                None
+            };
+
+            drop(vae);
+            self.base
+                .progress
+                .info("Freed VAE (will reload for decode)");
+            device.synchronize()?;
+
+            (latents, start_step, inpaint_ctx)
+        } else {
+            let latent_h = height / 8;
+            let latent_w = width / 8;
+            let init_noise_sigma = if matches!(sched, Scheduler::EdmDpmPp2m) {
+                crate::playground_edm::PlaygroundEdmScheduler::init_noise_sigma()
+            } else {
+                crate::scheduler::build_scheduler(
+                    sched,
+                    req.steps as usize,
+                    PredictionType::Epsilon,
+                    self.is_turbo,
+                )?
+                .init_noise_sigma()
+            };
+            let latents = (crate::engine::seeded_randn(
+                seed,
+                &[1, 4, latent_h, latent_w],
+                &device,
+                DType::F32,
+            )? * init_noise_sigma)?;
+            (latents.to_dtype(dtype)?, 0, None)
+        };
+
+        // Resolved before the denoise and released with the UNet: the adapter
+        // is ~682 MB the VAE decode's conv2d intermediates would otherwise
+        // have to compete with, on exactly the machine that chose sequential
+        // loading.
+        let identity = self.identity.resolve(
+            req,
+            cfg_active(guidance),
+            &device,
+            dtype,
+            &super::pulid::sdxl_unet_layout(),
+        )?;
+        // Same layout authority as the identity adapter, and for the same
+        // reason: both key their per-layer weights off `plan_attn_layers` of
+        // THIS UNet's config. The 2.5 GB vision tower runs and is dropped
+        // inside this call, so what survives it is only the projections the
+        // loop reads.
+        let reference = self.reference.resolve(
+            req,
+            self.base.model_name(),
+            // The denoise loop concatenates `[uncond, cond]` into ONE forward
+            // when guidance is active, so the projection has to carry both
+            // rows — see `IpAdapterContext::new`.
+            cfg_active(req.guidance),
+            &device,
+            dtype,
+            &super::pulid::sdxl_unet_layout(),
+            &self.base.progress,
+        )?;
+        self.denoise_loop(
+            &unet,
+            &text_embeddings,
+            sched,
+            &mut latents,
+            guidance,
+            resolve_cfg_plus(req),
+            req.steps,
+            start_step,
+            inpaint_ctx.as_ref(),
+            identity.as_ref(),
+            reference.as_ref(),
+        )?;
+
+        drop(inpaint_ctx);
+        drop(identity);
+        self.identity.drop_adapter();
+        drop(reference);
+        self.reference.drop_adapter();
+        drop(unet);
+        drop(text_embeddings);
+        device.synchronize()?;
+        self.base.progress.info("Freed UNet");
+        tracing::info!("UNet dropped (sequential mode)");
+
+        // --- Phase 3: Load VAE and decode ---
+        let vae_load_label = if is_img2img {
+            "Reloading VAE (GPU)"
+        } else {
+            "Loading VAE (GPU)"
+        };
+        self.base.progress.stage_start(vae_load_label);
+        let vae_start = Instant::now();
+        let vae_dtype = resolve_sdxl_vae_dtype(dtype, self.single_file_path.is_some());
+        let vae = self.build_vae_for_strategy(&sd_config, &device, vae_dtype)?;
+        self.base
+            .progress
+            .stage_done(vae_load_label, vae_start.elapsed());
+
+        self.base.progress.stage_start("VAE decode");
+        let vae_decode_start = Instant::now();
+
+        let latents = if matches!(sched, Scheduler::EdmDpmPp2m) {
+            denormalize_playground_latents(&latents)?
+        } else {
+            let vae_scale = if self.is_turbo {
+                VAE_SCALE_TURBO
+            } else {
+                VAE_SCALE_STANDARD
+            };
+            (latents / vae_scale)?
+        };
+        let latents_for_vae = latents.to_dtype(vae_dtype)?;
+        let device_for_sync = device.clone();
+        let img = crate::vae_tiling::decode_with_oom_fallback(
+            &latents_for_vae,
+            |t| vae.decode(t).map_err(Into::into),
+            || {
+                if let Err(e) = device_for_sync.synchronize() {
+                    tracing::warn!(
+                        "SDXL (sequential) device.synchronize() after VAE OOM failed: {e}"
+                    );
+                }
+            },
+        )?;
+
+        let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
+        let img = (img * 255.)?.to_dtype(DType::U8)?;
+        let img = img.squeeze(0)?;
+
+        self.base.progress.phase_done(
+            crate::ProgressPhase::Vae,
+            "VAE decode",
+            vae_decode_start.elapsed(),
+        );
+
+        // VAE dropped here
+        let output_metadata = build_output_metadata(req, seed, Some(sched));
+        let image_bytes = encode_image(
+            &img,
+            req.resolved_output_format(),
+            req.width,
+            req.height,
+            output_metadata.as_ref(),
+        )?;
+
+        let generation_time_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(
+            generation_time_ms,
+            seed,
+            "sequential SDXL generation complete"
+        );
+
+        Ok(GenerateResponse {
+            mesh: None,
+            request_warnings: Vec::new(),
+            audio: None,
+            images: vec![ImageData {
+                data: image_bytes,
+                format: req.resolved_output_format(),
+                width: req.width,
+                height: req.height,
+                index: 0,
+            }],
+            generation_time_ms,
+            model: req.model.clone(),
+            seed_used: seed,
+            video: None,
+            gpu: None,
+            prefix_cache: None,
+        })
+    }
+}
+
+impl SDXLEngine {
+    fn generate_inner(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        // Sequential mode: load-use-drop each component
+        if self.base.load_strategy == LoadStrategy::Sequential {
+            return self.generate_sequential(req);
+        }
+
+        // Eager mode: if the requested LoRA stack differs from what's merged
+        // into the loaded UNet, drop it now so `reload_unet_if_needed` rebuilds
+        // it with the new wrapper.
+        let requested_stack = lora_stack_fingerprint(&self.pending_loras);
+        if requested_stack != self.active_lora_fingerprint {
+            if let Some(loaded) = self.base.loaded.as_mut() {
+                if loaded.unet.is_some() {
+                    loaded.unet = None;
+                    loaded.device.synchronize()?;
+                    tracing::info!("SDXL UNet dropped (LoRA stack changed)");
+                }
+            }
+            self.active_lora_fingerprint = requested_stack;
+        }
+
+        // Eager mode: reload UNet if dropped after previous VAE decode
+        self.reload_unet_if_needed()?;
+
+        let loaded = self
+            .base
+            .loaded
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("model not loaded — call load() first"))?;
+
+        let start = Instant::now();
+        let seed = req.seed.unwrap_or_else(rand_seed);
+
+        let width = req.width as usize;
+        let height = req.height as usize;
+        let guidance = req.guidance;
+
+        tracing::info!(
+            prompt = %req.prompt,
+            seed, width, height,
+            steps = req.steps,
+            guidance,
+            scheduler = %self.scheduler,
+            "starting SDXL generation"
+        );
+
+        // 1. Encode prompt with both CLIP encoders
+        let max_len = loaded.sd_config.clip.max_position_embeddings;
+        let neg = req.negative_prompt.as_deref().unwrap_or("");
+        let text_embeddings = self.encode_prompt(
+            &loaded.clip_l,
+            &loaded.clip_g,
+            &loaded.tokenizer_l,
+            &loaded.tokenizer_g,
+            &req.prompt,
+            neg,
+            max_len,
+            &loaded.device,
+            &loaded.clip_device,
+            loaded.dtype,
+            guidance,
+        )?;
+
+        // 3. Build scheduler and create initial latents
+        let sched = req.scheduler.unwrap_or(self.scheduler);
+
+        let (mut latents, start_step, inpaint_ctx) =
+            if let Some(ref source_bytes) = req.source_image {
+                let (latents, start_step, encoded, noise) = self.prepare_img2img_latents(
+                    &loaded.vae,
+                    source_bytes,
+                    req.width,
+                    req.height,
+                    req.strength,
+                    req.steps,
+                    sched,
+                    seed,
+                    &loaded.device,
+                    loaded.dtype,
+                    loaded.vae_dtype,
+                )?;
+                let inpaint_ctx = if let Some(ref mask_bytes) = req.mask_image {
+                    let mask = self.cached_mask(
+                        mask_bytes,
+                        height / 8,
+                        width / 8,
+                        &loaded.device,
+                        loaded.dtype,
+                    )?;
+                    Some(crate::img_utils::InpaintContext {
+                        original_latents: encoded,
+                        mask,
+                        noise,
+                    })
+                } else {
+                    None
+                };
+                (latents, start_step, inpaint_ctx)
+            } else {
+                let latent_h = height / 8;
+                let latent_w = width / 8;
+                let init_noise_sigma = if matches!(sched, Scheduler::EdmDpmPp2m) {
+                    crate::playground_edm::PlaygroundEdmScheduler::init_noise_sigma()
+                } else {
+                    crate::scheduler::build_scheduler(
+                        sched,
+                        req.steps as usize,
+                        PredictionType::Epsilon,
+                        self.is_turbo,
+                    )?
+                    .init_noise_sigma()
+                };
+                let latents = (crate::engine::seeded_randn(
+                    seed,
+                    &[1, 4, latent_h, latent_w],
+                    &loaded.device,
+                    DType::F32,
+                )? * init_noise_sigma)?;
+                (latents.to_dtype(loaded.dtype)?, 0, None)
+            };
+
+        // 5. Denoising loop
+        let unet = loaded
+            .unet
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("UNet not loaded"))?;
+        let identity = self.identity.resolve(
+            req,
+            cfg_active(guidance),
+            &loaded.device,
+            loaded.dtype,
+            &super::pulid::sdxl_unet_layout(),
+        )?;
+        let reference = self.reference.resolve(
+            req,
+            self.base.model_name(),
+            // One doubled `[uncond, cond]` forward under guidance, so the
+            // projection carries both rows — see `IpAdapterContext::new`.
+            cfg_active(req.guidance),
+            &loaded.device,
+            loaded.dtype,
+            &super::pulid::sdxl_unet_layout(),
+            &self.base.progress,
+        )?;
+        self.denoise_loop(
+            unet,
+            &text_embeddings,
+            sched,
+            &mut latents,
+            guidance,
+            resolve_cfg_plus(req),
+            req.steps,
+            start_step,
+            inpaint_ctx.as_ref(),
+            identity.as_ref(),
+            reference.as_ref(),
+        )?;
+
+        // Drop UNet before VAE decode to free VRAM for conv2d intermediates.
+        // The identity adapter goes with it, through BOTH of its owners — the
+        // render's handle and the engine's resident slot — because releasing
+        // one of them frees nothing.
+        drop(inpaint_ctx);
+        drop(identity);
+        self.identity.drop_adapter();
+        drop(reference);
+        self.reference.drop_adapter();
+        let _ = loaded;
+        let loaded = self.base.loaded.as_mut().unwrap();
+        loaded.unet = None;
+        loaded.device.synchronize()?;
+        tracing::info!("UNet dropped to free VRAM for VAE decode");
+        let _ = loaded;
+        let loaded = self.base.loaded.as_ref().unwrap();
+
+        // 6. VAE decode
+        self.base.progress.stage_start("VAE decode");
+        let vae_start = Instant::now();
+
+        let latents = if matches!(sched, Scheduler::EdmDpmPp2m) {
+            denormalize_playground_latents(&latents)?
+        } else {
+            let vae_scale = if self.is_turbo {
+                VAE_SCALE_TURBO
+            } else {
+                VAE_SCALE_STANDARD
+            };
+            (latents / vae_scale)?
+        };
+        let latents_for_vae = latents.to_dtype(loaded.vae_dtype)?;
+        let vae = &loaded.vae;
+        let device_for_sync = loaded.device.clone();
+        let img = crate::vae_tiling::decode_with_oom_fallback(
+            &latents_for_vae,
+            |t| vae.decode(t).map_err(Into::into),
+            || {
+                if let Err(e) = device_for_sync.synchronize() {
+                    tracing::warn!(
+                        "SDXL (parallel) device.synchronize() after VAE OOM failed: {e}"
+                    );
+                }
+            },
+        )?;
+
+        // 7. Post-process: [1, 3, H, W] → clamp → u8
+        let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
+        let img = (img * 255.)?.to_dtype(DType::U8)?;
+        let img = img.squeeze(0)?; // [3, H, W]
+
+        self.base
+            .progress
+            .phase_done(crate::ProgressPhase::Vae, "VAE decode", vae_start.elapsed());
+
+        // 8. Encode to image format
+        let output_metadata = build_output_metadata(req, seed, Some(sched));
+        let image_bytes = encode_image(
+            &img,
+            req.resolved_output_format(),
+            req.width,
+            req.height,
+            output_metadata.as_ref(),
+        )?;
+
+        let generation_time_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(generation_time_ms, seed, "SDXL generation complete");
+
+        Ok(GenerateResponse {
+            mesh: None,
+            request_warnings: Vec::new(),
+            audio: None,
+            images: vec![ImageData {
+                data: image_bytes,
+                format: req.resolved_output_format(),
+                width: req.width,
+                height: req.height,
+                index: 0,
+            }],
+            generation_time_ms,
+            model: req.model.clone(),
+            seed_used: seed,
+            video: None,
+            gpu: None,
+            prefix_cache: None,
+        })
+    }
+}
+
+impl InferenceEngine for SDXLEngine {
+    /// SDXL is the second family that can honour this, so it overrides the
+    /// trait's refusal exactly as FLUX does.
+    ///
+    /// Both halves come from the same frozen value, so a render cannot end up
+    /// with this request's identity and a previous request's unconditional
+    /// one. SDXL needs the unconditional half for every classifier-free
+    /// render, not just an opt-in branch, so an absent one is caught at
+    /// resolve time rather than silently rendering the negative pass
+    /// unconditioned.
+    fn install_identity_embedding(
+        &mut self,
+        embedding: Option<&mold_core::identity::FrozenIdentityEmbedding>,
+    ) -> Result<()> {
+        let uncond = embedding
+            .map(super::pulid::SdxlIdentityEmbedding::uncond_from_frozen)
+            .transpose()?
+            .flatten();
+        let embedding = embedding
+            .map(super::pulid::SdxlIdentityEmbedding::from_frozen)
+            .transpose()?;
+        self.identity.set_embedding(embedding, uncond);
+        Ok(())
+    }
+
+    fn generate(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        self.base.progress.checkpoint()?;
+        self.pending_placement = req.placement.clone();
+        self.pending_loras = super::lora::effective_sdxl_loras(req);
+        let result = self.generate_inner(req);
+        self.pending_placement = None;
+        self.pending_loras.clear();
+        self.release_identity_adapter_unless_unet_resident();
+        self.release_reference_adapter_unless_unet_resident();
+        result
+    }
+
+    fn model_name(&self) -> &str {
+        self.base.model_name()
+    }
+
+    fn is_loaded(&self) -> bool {
+        // Sequential mode is always "ready" — it loads on demand
+        self.base.is_loaded()
+    }
+
+    fn load(&mut self) -> Result<()> {
+        SDXLEngine::load(self)
+    }
+
+    fn load_for_request(&mut self, req: &GenerateRequest) -> Result<()> {
+        self.pending_placement = req.placement.clone();
+        let result = SDXLEngine::load(self);
+        self.pending_placement = None;
+        result
+    }
+
+    fn unload(&mut self) {
+        self.base.unload();
+        clear_cache(&self.prompt_cache);
+        clear_cache(&self.source_latent_cache);
+        clear_cache(&self.mask_cache);
+        self.active_lora_fingerprint.clear();
+        // Not optional: `ModelCache` parks by calling this and zeroing the
+        // entry's `vram_bytes` while keeping the engine cached, so an adapter
+        // that survived would be device memory nothing accounts for.
+        self.identity.drop_adapter();
+        self.reference.drop_adapter();
+    }
+
+    fn set_on_progress(&mut self, callback: ProgressCallback) {
+        self.base.set_on_progress(callback);
+    }
+
+    fn clear_on_progress(&mut self) {
+        self.base.clear_on_progress();
+    }
+
+    fn set_cancellation_token(&mut self, token: crate::progress::InferenceCancellationToken) {
+        self.base.set_cancellation_token(token);
+    }
+
+    fn clear_cancellation_token(&mut self) {
+        self.base.clear_cancellation_token();
+    }
+
+    fn batch_execution_capability(&self) -> crate::BatchExecutionCapability {
+        crate::batch_execution_capability_for_family("sdxl")
+            .expect("production SDXL batch capability must be registered")
+    }
+
+    fn model_paths(&self) -> Option<&mold_core::ModelPaths> {
+        Some(&self.base.paths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::InferenceEngine;
+    use crate::shared_pool::SharedPool;
+    use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokenizers::models::bpe::BPE;
+
+    #[test]
+    fn playground_latent_normalization_round_trips_all_channels() {
+        let device = Device::Cpu;
+        let latents = Tensor::new(&[[[[1.0f32]], [[-2.0]], [[3.5]], [[0.25]]]], &device).unwrap();
+        let normalized = normalize_playground_latents(&latents).unwrap();
+        let restored = denormalize_playground_latents(&normalized).unwrap();
+        let delta = (&restored - &latents)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            delta < 1e-5,
+            "Playground latent transform drifted by {delta}"
+        );
+    }
+
+    /// Synthesise a minimal SDXL-shaped single-file safetensors with one
+    /// representative key per component bucket. Tensor data is one zero
+    /// F32 — `loader::single_file::load` is header-only and the
+    /// constructor doesn't materialise weights.
+    fn synth_sdxl_single_file(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mold-sdxl-from-sf-{}-{}-{}.safetensors",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+
+        let keys: &[&str] = &[
+            // UNet
+            "model.diffusion_model.input_blocks.0.0.weight",
+            "model.diffusion_model.middle_block.1.transformer_blocks.0.attn1.to_q.weight",
+            // VAE
+            "first_stage_model.encoder.down.0.block.0.norm1.weight",
+            "first_stage_model.quant_conv.weight",
+            // CLIP-L
+            "conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.q_proj.weight",
+            "conditioner.embedders.0.transformer.text_model.final_layer_norm.weight",
+            // CLIP-G — including the fused QKV slab so the constructor
+            // exercises the FusedSlice branch in build_sdxl_remap.
+            "conditioner.embedders.1.model.transformer.resblocks.0.attn.in_proj_weight",
+            "conditioner.embedders.1.model.text_projection",
+        ];
+
+        let f32_zero = 0.0f32.to_le_bytes().to_vec();
+        let buffers: Vec<Vec<u8>> = keys.iter().map(|_| f32_zero.clone()).collect();
+        let mut tensors: HashMap<String, TensorView<'_>> = HashMap::new();
+        for (key, buf) in keys.iter().zip(buffers.iter()) {
+            tensors.insert(
+                (*key).to_string(),
+                TensorView::new(SafeDtype::F32, vec![1], buf).unwrap(),
+            );
+        }
+        serialize_to_file(&tensors, &None, &path).unwrap();
+        path
+    }
+
+    #[test]
+    fn from_single_file_constructs_for_synthetic_sdxl_checkpoint() {
+        let single_file = synth_sdxl_single_file("ok");
+        // Companion CLIP-L / CLIP-G tokenizers are pulled separately
+        // and are not validated by the constructor — their
+        // paths are just stored.
+        let clip_l_tok = std::env::temp_dir().join("mold-sdxl-clip-l-stub.json");
+        let clip_g_tok = std::env::temp_dir().join("mold-sdxl-clip-g-stub.json");
+
+        let engine = SDXLEngine::from_single_file(
+            "juggernaut-xl-v9".to_string(),
+            single_file.clone(),
+            clip_l_tok,
+            clip_g_tok,
+            Scheduler::default(),
+            false,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        )
+        .expect("constructor must accept a valid SDXL single-file layout");
+
+        assert_eq!(engine.model_name(), "juggernaut-xl-v9");
+        assert_eq!(
+            engine.single_file_path.as_deref(),
+            Some(single_file.as_path()),
+            "single-file path must be stashed for the future load() branch",
+        );
+        assert!(
+            !engine.is_loaded(),
+            "constructor must not eagerly materialise model weights",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    #[test]
+    fn sdxl_loads_clip_tokenizers_through_shared_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_l_tokenizer = dir.path().join("clip-l-tokenizer.json");
+        let clip_g_tokenizer = dir.path().join("clip-g-tokenizer.json");
+        tokenizers::Tokenizer::new(BPE::default())
+            .save(&clip_l_tokenizer, false)
+            .unwrap();
+        tokenizers::Tokenizer::new(BPE::default())
+            .save(&clip_g_tokenizer, false)
+            .unwrap();
+        let weights_path = dir.path().join("weights.safetensors");
+        std::fs::write(&weights_path, b"stub").unwrap();
+
+        let shared_pool = Arc::new(Mutex::new(SharedPool::new()));
+        let pooled_l = shared_pool
+            .lock()
+            .unwrap()
+            .load_tokenizer(&clip_l_tokenizer)
+            .unwrap();
+        let pooled_g = shared_pool
+            .lock()
+            .unwrap()
+            .load_tokenizer(&clip_g_tokenizer)
+            .unwrap();
+
+        let paths = ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer: weights_path.clone(),
+            transformer_shards: Vec::new(),
+            vae: weights_path.clone(),
+            spatial_upscaler: None,
+            temporal_upscaler: None,
+            distilled_lora: None,
+            t5_encoder: None,
+            clip_encoder: Some(weights_path.clone()),
+            t5_tokenizer: None,
+            clip_tokenizer: Some(clip_l_tokenizer.clone()),
+            clip_encoder_2: Some(weights_path),
+            clip_tokenizer_2: Some(clip_g_tokenizer.clone()),
+            text_encoder_files: Vec::new(),
+            text_tokenizer: None,
+            decoder: None,
+        };
+        let engine = SDXLEngine::new(
+            "sdxl-test".to_string(),
+            paths,
+            Scheduler::default(),
+            false,
+            LoadStrategy::Eager,
+            0,
+            Some(shared_pool),
+            None,
+            None,
+        );
+
+        let loaded_l = engine
+            .load_clip_tokenizer(&clip_l_tokenizer, "CLIP-L")
+            .unwrap();
+        let loaded_g = engine
+            .load_clip_tokenizer(&clip_g_tokenizer, "CLIP-G")
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&pooled_l, &loaded_l));
+        assert!(Arc::ptr_eq(&pooled_g, &loaded_g));
+    }
+
+    #[test]
+    fn sdxl_loads_vae_tensors_through_shared_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let vae_path = dir.path().join("vae.safetensors");
+        let weight = 1.0f32.to_le_bytes();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "encoder.conv_in.weight".to_string(),
+            TensorView::new(SafeDtype::F32, vec![1], &weight).unwrap(),
+        );
+        serialize_to_file(&tensors, &None, &vae_path).unwrap();
+
+        let shared_pool = Arc::new(Mutex::new(SharedPool::new()));
+        let pooled = shared_pool
+            .lock()
+            .unwrap()
+            .load_safetensors_cpu_tensors(std::slice::from_ref(&vae_path))
+            .unwrap()
+            .unwrap();
+
+        let paths = ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer: dir.path().join("unet.safetensors"),
+            transformer_shards: Vec::new(),
+            vae: vae_path.clone(),
+            spatial_upscaler: None,
+            temporal_upscaler: None,
+            distilled_lora: None,
+            t5_encoder: None,
+            clip_encoder: Some(dir.path().join("clip-l.safetensors")),
+            t5_tokenizer: None,
+            clip_tokenizer: Some(dir.path().join("clip-l-tokenizer.json")),
+            clip_encoder_2: Some(dir.path().join("clip-g.safetensors")),
+            clip_tokenizer_2: Some(dir.path().join("clip-g-tokenizer.json")),
+            text_encoder_files: Vec::new(),
+            text_tokenizer: None,
+            decoder: None,
+        };
+        let engine = SDXLEngine::new(
+            "sdxl-test".to_string(),
+            paths,
+            Scheduler::default(),
+            false,
+            LoadStrategy::Eager,
+            0,
+            Some(shared_pool),
+            None,
+            None,
+        );
+
+        let loaded = engine.load_vae_cpu_tensors().unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&pooled, &loaded));
+    }
+
+    #[test]
+    fn from_single_file_rejects_missing_file() {
+        let bogus = std::env::temp_dir().join(format!(
+            "mold-sdxl-from-sf-missing-{}-{}.safetensors",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+
+        let result = SDXLEngine::from_single_file(
+            "missing".to_string(),
+            bogus,
+            std::env::temp_dir().join("mold-sdxl-clip-l-stub.json"),
+            std::env::temp_dir().join("mold-sdxl-clip-g-stub.json"),
+            Scheduler::default(),
+            false,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            result.is_err(),
+            "constructor must surface a missing-file error before deeper parsing",
+        );
+    }
+
+    #[test]
+    fn load_branches_to_single_file_path_and_invokes_candle_constructors() {
+        // Smoke test (TDD parity with SD15): single-file SDXL
+        // `load()` must dispatch to the single-file branch and hand four
+        // `VarBuilder::from_backend(SingleFileBackend)` instances to
+        // candle's per-component constructors. The synthetic checkpoint
+        // doesn't carry the full SDXL tensor set (UNet, VAE, CLIP-L,
+        // CLIP-G with fused QKV), so the load surfaces an error sourced
+        // from the single-file layer rather than from the diffusers
+        // fallback. Real-shape construction is exercised by 2.10's
+        // <gpu-host> UAT against a real Pony / Juggernaut XL checkpoint.
+        let single_file = synth_sdxl_single_file("load-branch");
+        let make_stub = |label: &str| -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "mold-sdxl-{}-stub-{}-{}.json",
+                label,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::write(&path, b"").unwrap();
+            path
+        };
+        let clip_l_tok = make_stub("clip-l");
+        let clip_g_tok = make_stub("clip-g");
+
+        let mut engine = SDXLEngine::from_single_file(
+            "juggernaut-xl-v9".to_string(),
+            single_file.clone(),
+            clip_l_tok.clone(),
+            clip_g_tok.clone(),
+            Scheduler::Ddim,
+            false,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        )
+        .expect("constructor");
+
+        // `MOLD_DEVICE` is process-global and also mutated by
+        // `sd15::pipeline`'s and `expand`'s own tests; take the crate-shared
+        // lock so cargo's parallel runner can't interleave with them.
+        let _lock = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = crate::test_support::EnvVarGuard::set("MOLD_DEVICE", "cpu");
+        let err = SDXLEngine::load(&mut engine)
+            .expect_err("synthetic checkpoint can't satisfy SDXL's full tensor set");
+        drop(_restore);
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("single-file") || msg.contains("rename rule"),
+            "expected error from the single-file load layer, got: {msg}",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+        let _ = std::fs::remove_file(clip_l_tok);
+        let _ = std::fs::remove_file(clip_g_tok);
+    }
+
+    /// Real-shape SDXL `load()` smoke — see SD15 sibling for the rationale
+    /// for `#[ignore]`. 2.10 UAT replaces this with a real Pony / Juggernaut
+    /// XL pull + load + 4-step generation.
+    #[test]
+    #[ignore]
+    fn from_single_file_real_shape_load_smoke() {
+        // Implementation deferred to the candle-fork-accessor follow-up.
+    }
+
+    /// Sequential single-file dispatch must hand CLIP-L construction to
+    /// `SingleFileBackend` (which translates diffusers `text_model.X` keys
+    /// through `SdxlRemap` into A1111 reads), NOT to candle's diffusers-keyed
+    /// `build_clip_transformer` (which calls `from_mmaped_safetensors` and
+    /// errors with "cannot find tensor text_model.embeddings.token_embedding.weight"
+    /// against an A1111-named Civitai checkpoint). The synthetic checkpoint
+    /// has only one CLIP-L key, so construction *will* fail — but the
+    /// failure must surface from our backend (no rename rule for the
+    /// missing diffusers keys), not from the diffusers loader.
+    ///
+    /// Locks bug 1 from `tasks/catalog-run-bridge-option-c-handoff.md`:
+    /// `mold run --local cv:1759168 "<prompt>"` (default sequential
+    /// strategy) was bailing with the diffusers-loader error before this
+    /// fix because `generate_sequential` ignored `single_file_path` and
+    /// passed the A1111-named single-file path straight to
+    /// `stable_diffusion::build_clip_transformer`.
+    #[test]
+    fn build_clip_l_single_file_dispatches_through_backend_not_diffusers_loader() {
+        let single_file = synth_sdxl_single_file("seq-clip-l-dispatch");
+        let remap = SDXLEngine::load_sdxl_remap(&single_file).expect("remap");
+
+        let result = SDXLEngine::build_clip_l_single_file(
+            &single_file,
+            &remap,
+            &stable_diffusion::clip::Config::sdxl(),
+            &Device::Cpu,
+        );
+
+        let err = result.expect_err(
+            "synthetic CLIP-L is missing token_embedding / position_embedding / \
+             every encoder layer beyond layer 0 — construction must fail",
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("cannot find tensor text_model"),
+            "expected failure from the SingleFileBackend layer (e.g. 'no rename rule \
+             for diffusers key text_model.embeddings.token_embedding.weight'); got the \
+             diffusers `from_mmaped_safetensors` error instead — sequential dispatch \
+             is still routing through `build_clip_transformer`. Got: {msg}",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    /// Same dispatch contract as the CLIP-L test, but for CLIP-G — covers
+    /// the `clip2_config` (1280-dim sdxl2) path.
+    #[test]
+    fn build_clip_g_single_file_dispatches_through_backend_not_diffusers_loader() {
+        let single_file = synth_sdxl_single_file("seq-clip-g-dispatch");
+        let remap = SDXLEngine::load_sdxl_remap(&single_file).expect("remap");
+
+        let result = SDXLEngine::build_clip_g_single_file(
+            &single_file,
+            &remap,
+            &stable_diffusion::clip::Config::sdxl2(),
+            &Device::Cpu,
+        );
+
+        let err = result.expect_err("synthetic CLIP-G is incomplete");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("cannot find tensor text_model"),
+            "expected failure from SingleFileBackend, not diffusers loader. Got: {msg}",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    /// UNet sequential dispatch parity — same shape as the CLIP tests but
+    /// for `build_unet_single_file`. Sequential mode loads UNet between
+    /// the CLIP encoders (drop) and VAE (load); without single-file dispatch
+    /// it would bail with "cannot find tensor conv_in.weight" or similar.
+    #[test]
+    fn build_unet_single_file_dispatches_through_backend_not_diffusers_loader() {
+        let single_file = synth_sdxl_single_file("seq-unet-dispatch");
+        let remap = SDXLEngine::load_sdxl_remap(&single_file).expect("remap");
+
+        let result = SDXLEngine::build_unet_single_file(
+            &single_file,
+            &remap,
+            &stable_diffusion::StableDiffusionConfig::sdxl(None, None, None),
+            &Device::Cpu,
+            DType::F32,
+        );
+
+        let err = result.expect_err("synthetic UNet is incomplete");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("cannot find tensor conv_in"),
+            "expected failure from SingleFileBackend, not diffusers loader. Got: {msg}",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    // ----- Single-file: is_turbo threaded into the single-file constructor -----
+
+    #[test]
+    fn from_single_file_threads_is_turbo_true() {
+        let single_file = synth_sdxl_single_file("turbo");
+        let clip_l_tok = std::env::temp_dir().join("mold-sdxl-turbo-clip-l-stub.json");
+        let clip_g_tok = std::env::temp_dir().join("mold-sdxl-turbo-clip-g-stub.json");
+
+        let engine = SDXLEngine::from_single_file(
+            "sdxl-turbo:fp16".to_string(),
+            single_file.clone(),
+            clip_l_tok,
+            clip_g_tok,
+            Scheduler::EulerAncestral,
+            true,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        )
+        .expect("constructor must accept is_turbo = true");
+
+        assert!(
+            engine.is_turbo,
+            "is_turbo arg must thread into the engine field — sdxl_config() reads this for VAE_SCALE_TURBO",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    #[test]
+    fn from_single_file_threads_is_turbo_false() {
+        let single_file = synth_sdxl_single_file("standard");
+        let clip_l_tok = std::env::temp_dir().join("mold-sdxl-std-clip-l-stub.json");
+        let clip_g_tok = std::env::temp_dir().join("mold-sdxl-std-clip-g-stub.json");
+
+        let engine = SDXLEngine::from_single_file(
+            "sdxl-base:fp16".to_string(),
+            single_file.clone(),
+            clip_l_tok,
+            clip_g_tok,
+            Scheduler::Ddim,
+            false,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        )
+        .expect("constructor must accept is_turbo = false");
+
+        assert!(
+            !engine.is_turbo,
+            "is_turbo = false must produce a standard-config engine",
+        );
+
+        let _ = std::fs::remove_file(single_file);
+    }
+
+    #[test]
+    fn single_file_sdxl_vae_defaults_to_f32_to_avoid_black_finetune_decodes() {
+        unsafe { std::env::remove_var("MOLD_VAE_DTYPE") };
+        assert_eq!(resolve_sdxl_vae_dtype(DType::F16, true), DType::F32);
+        assert_eq!(resolve_sdxl_vae_dtype(DType::F16, false), DType::F16);
+    }
+
+    // SDXL cfg_active predicate tests pin both distilled conventions: Turbo
+    // uses cfg=0.0 while LCM/Lightning commonly use cfg=1.0.
+
+    #[test]
+    fn test_cfg_disabled_at_turbo_guidance_0_0() {
+        assert!(!cfg_active(0.0));
+    }
+
+    #[test]
+    fn test_cfg_disabled_at_guidance_1_0() {
+        assert!(!cfg_active(1.0));
+    }
+
+    #[test]
+    fn test_cfg_disabled_just_below_1_0() {
+        assert!(!cfg_active(1.0 - 1e-5));
+    }
+
+    #[test]
+    fn test_cfg_enabled_at_guidance_1_5() {
+        assert!(cfg_active(1.5));
+    }
+
+    #[test]
+    fn test_cfg_enabled_at_guidance_7_5() {
+        assert!(cfg_active(7.5));
+    }
+
+    /// The adapter's residency follows the UNet's, and the end-of-`generate`
+    /// backstop is what makes that true on the paths that never reach a drop
+    /// site — a cancellation checkpoint or an error inside `denoise_loop`
+    /// returns straight out of `generate_inner`, and ~682 MB would otherwise
+    /// stay on the device until a later unload.
+    #[test]
+    fn a_render_that_never_reaches_a_drop_site_still_releases_the_adapter() {
+        use std::sync::Arc;
+
+        let device = candle_core::Device::Cpu;
+        let config = super::super::pulid::tests::sdxl_tiny_config();
+        let adapter = Arc::new(super::super::pulid::tests::synthetic_adapter(
+            &config, &device,
+        ));
+        let modules = super::super::pulid::plan_attn_layers(&config).len();
+
+        let mut engine = SDXLEngine::new(
+            "sdxl-test".to_string(),
+            ModelPaths {
+                low_noise_transformer: None,
+                low_noise_distilled_lora: None,
+                transformer: PathBuf::from("/nonexistent/unet.safetensors"),
+                transformer_shards: Vec::new(),
+                vae: PathBuf::from("/nonexistent/vae.safetensors"),
+                spatial_upscaler: None,
+                temporal_upscaler: None,
+                distilled_lora: None,
+                t5_encoder: None,
+                clip_encoder: None,
+                t5_tokenizer: None,
+                clip_tokenizer: None,
+                clip_encoder_2: None,
+                clip_tokenizer_2: None,
+                text_encoder_files: Vec::new(),
+                text_tokenizer: None,
+                decoder: None,
+            },
+            Scheduler::default(),
+            false,
+            LoadStrategy::Eager,
+            0,
+            None,
+            None,
+            None,
+        );
+        engine.identity.install_resident_for_test(
+            Arc::clone(&adapter),
+            device.clone(),
+            candle_core::DType::F32,
+            modules,
+        );
+        assert!(engine.identity_resident_bytes() > 0);
+
+        // No `loaded` at all is the strongest form of "the UNet did not
+        // survive this render".
+        engine.release_identity_adapter_unless_unet_resident();
+        assert_eq!(
+            engine.identity_resident_bytes(),
+            0,
+            "the backstop must release the adapter when no UNet is resident"
+        );
+
+        // And `unload()` — which `ModelCache` calls to PARK an engine while
+        // keeping it cached, zeroing the entry's accounted `vram_bytes` —
+        // must release it too, or those bytes are unaccounted for.
+        engine.identity.install_resident_for_test(
+            adapter,
+            device,
+            candle_core::DType::F32,
+            modules,
+        );
+        assert!(engine.identity_resident_bytes() > 0);
+        InferenceEngine::unload(&mut engine);
+        assert_eq!(engine.identity_resident_bytes(), 0);
+    }
+
+    /// `lora_stack_fingerprint` must produce equal fingerprints for the same
+    /// (path, scale) pairs and different ones for any change — driving the
+    /// eager-mode UNet drop in `generate_inner`. This is a pure-function
+    /// pin so a refactor can't silently drop the comparison check.
+    #[test]
+    fn lora_stack_fingerprint_equality_drives_unet_drop() {
+        let a = mold_core::LoraWeight {
+            path: "/x.safetensors".into(),
+            scale: 0.8,
+
+            expert: None,
+        };
+        let b = mold_core::LoraWeight {
+            path: "/y.safetensors".into(),
+            scale: 0.4,
+
+            expert: None,
+        };
+        let same_a = mold_core::LoraWeight {
+            path: "/x.safetensors".into(),
+            scale: 0.8,
+
+            expert: None,
+        };
+        // Equal stacks → equal fingerprints.
+        assert_eq!(
+            lora_stack_fingerprint(&[a.clone(), b.clone()]),
+            lora_stack_fingerprint(&[same_a.clone(), b.clone()])
+        );
+        // Same paths, different scale → different fingerprints.
+        let scaled = mold_core::LoraWeight {
+            path: "/x.safetensors".into(),
+            scale: 0.9,
+
+            expert: None,
+        };
+        assert_ne!(
+            lora_stack_fingerprint(std::slice::from_ref(&a)),
+            lora_stack_fingerprint(std::slice::from_ref(&scaled))
+        );
+        // Reordered stack → different fingerprints (FLUX behaviour: the
+        // merge order is observable through delta accumulation order even
+        // when the sum is commutative, because alpha/scale normalisation
+        // is applied per-layer per-spec).
+        assert_ne!(
+            lora_stack_fingerprint(&[a.clone(), b.clone()]),
+            lora_stack_fingerprint(&[b, a])
+        );
+    }
+
+    /// Regression test for the SDXL prompt-cache key bug: keying only on
+    /// the positive prompt + guidance (as the original code did) returns
+    /// stale (uncond_old, cond) when the user changes just the negative.
+    #[test]
+    fn sdxl_prompt_cache_distinguishes_negative_prompt_changes() {
+        use crate::cache::{cfg_prompt_cache_key, store_cached_tensor};
+
+        let cache: Mutex<LruCache<CfgPromptCacheKey, CachedTensor>> =
+            Mutex::new(LruCache::new(DEFAULT_PROMPT_CACHE_CAPACITY));
+        let device = Device::Cpu;
+        let dtype = DType::F32;
+        let embeddings = candle_core::Tensor::zeros((1, 4), dtype, &device).unwrap();
+
+        let key_a = cfg_prompt_cache_key("a cat", "blurry", 7.0);
+        store_cached_tensor(&cache, key_a.clone(), &embeddings).unwrap();
+
+        // Same positive + same guidance, different negative → MUST miss.
+        let key_b = cfg_prompt_cache_key("a cat", "low quality", 7.0);
+        let restored = restore_cached_tensor(&cache, &key_b, &device, dtype).unwrap();
+        assert!(
+            restored.is_none(),
+            "different negative prompt must miss the cache (silent-wrong-output bug)"
+        );
+
+        // Same key as the insert → MUST hit.
+        let restored = restore_cached_tensor(&cache, &key_a, &device, dtype).unwrap();
+        assert!(
+            restored.is_some(),
+            "identical (pos, neg, guidance) must hit"
+        );
+    }
+}

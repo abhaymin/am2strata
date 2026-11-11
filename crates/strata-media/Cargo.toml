@@ -53,3 +53,12 @@ incremental = true
 cudarc = { git = "https://github.com/utensils/cudarc", rev = "9b3b1bc276bc27c3e99343ee82db7f99705b9ed5" }
 # zip 9.2.2 for CVE-2026-115905: the forks above pin ^8.6 (vendor/zip/AM2STRATA.md)
 zip = { path = "vendor/zip" }
+
+# mold with the Wan VAE tiled-decode fix (vendor/mold/AM2STRATA.md): the pinned git crates replaced by the vendored copy
+[patch."https://github.com/utensils/mold.git"]
+mold-ai-inference = { path = "../../vendor/mold/crates/mold-inference" }
+mold-ai-core = { path = "../../vendor/mold/crates/mold-core" }
+mold-ai-candle = { path = "../../vendor/mold/crates/mold-candle" }
+mold-ai-catalog = { path = "../../vendor/mold/crates/mold-catalog" }
+mold-ai-secure = { path = "../../vendor/mold/crates/mold-secure" }
+mold-ai-secure-client = { path = "../../vendor/mold/crates/mold-secure-client" }

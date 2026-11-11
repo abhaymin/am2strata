@@ -1,0 +1,13257 @@
+use crate::config::ModelConfig;
+use crate::types::Scheduler;
+use crate::ModelPaths;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::LazyLock;
+
+/// Model families that are utility models (not image generators).
+/// These are excluded from default-model selection and don't produce ModelPaths.
+/// The image-to-3D mesh family. Its checkpoints bundle DiT + shape VAE +
+/// image encoder in one file, so it takes the same standalone-VAE exemption
+/// `ltx2` does.
+pub const HUNYUAN3D_FAMILY: &str = "hunyuan3d";
+pub const HUNYUAN3D_21_MODEL: &str = "hunyuan3d-2.1:fp16";
+pub const HUNYUAN3D_2MV_MODEL: &str = "hunyuan3d-2mv:fp16";
+pub const HUNYUAN3D_2MV_TURBO_MODEL: &str = "hunyuan3d-2mv-turbo:fp16";
+
+pub fn hunyuan3d_multiview_model(model: &str) -> bool {
+    let canonical = resolve_model_name(model);
+    matches!(
+        canonical.split(':').next().unwrap_or(&canonical),
+        "hunyuan3d-2mv" | "hunyuan3d-2mv-turbo"
+    )
+}
+
+pub fn hunyuan3d_shape21_model(model: &str) -> bool {
+    let canonical = resolve_model_name(model);
+    canonical.split(':').next() == Some("hunyuan3d-2.1")
+}
+
+/// Recipe geometry needed before loading the checkpoint. This is shared by
+/// admission callers so a canvasless request still prices its actual encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hunyuan3dShapeGeometry {
+    pub conditioning_size: u32,
+    pub num_latents: u64,
+    pub vision_heads: u64,
+}
+
+pub fn hunyuan3d_shape_geometry(model: &str) -> Hunyuan3dShapeGeometry {
+    let canonical = resolve_model_name(model);
+    let base = canonical.split(':').next().unwrap_or(&canonical);
+    Hunyuan3dShapeGeometry {
+        conditioning_size: if base == "hunyuan3d-mini-turbo" {
+            1022
+        } else {
+            512
+        },
+        num_latents: if base == "hunyuan3d-2.1" { 4096 } else { 3072 },
+        vision_heads: if base == "hunyuan3d-2.1" { 16 } else { 24 },
+    }
+}
+
+pub fn hunyuan3d_uses_21_license(model: &str) -> bool {
+    model.starts_with("hunyuan3d-paint")
+        || model.split(':').next() == Some("hunyuan3d-2.1")
+        || model.starts_with("hunyuan3d-2.1-")
+}
+/// The tiers `mold quantize` can derive from a Hunyuan3D shape checkpoint,
+/// by tag. Mirrors `ShapeQuantization::tag` in mold-inference (pinned by a
+/// test there); it lives here because the download door has to recognise a
+/// derived NAME on a host that has never run the quantizer.
+pub const HUNYUAN3D_DERIVED_TIERS: &[&str] = &["fp8", "q8", "q6", "q5", "q4", "q3"];
+
+/// A derived Hunyuan3D shape tier, as advertised by the host that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunyuan3dDerivedTier {
+    /// The registered manifest it is quantized from, e.g. `hunyuan3d-2.1:fp16`.
+    pub source: &'static str,
+    /// The quantization tag, e.g. `q4`.
+    pub tier: &'static str,
+}
+
+/// Recognise `<hunyuan3d base>:<tier>` for a tier the quantizer derives
+/// locally and no registry serves.
+///
+/// A derived tier is registered in ONE host's `config.models` by
+/// `mold quantize`; `/api/models` on that host lists it beside the built-in
+/// tiers, so a client on another machine reads the name and asks to pull it.
+/// There is nothing to pull. `None` for every registered manifest name and for
+/// anything that is not a Hunyuan3D shape base.
+pub fn hunyuan3d_derived_tier(model: &str) -> Option<Hunyuan3dDerivedTier> {
+    let canonical = resolve_model_name(model);
+    if find_manifest(&canonical).is_some() {
+        return None;
+    }
+    let (base, tier) = canonical.split_once(':')?;
+    let tier = HUNYUAN3D_DERIVED_TIERS
+        .iter()
+        .copied()
+        .find(|known| *known == tier)?;
+    let source = find_manifest(&format!("{base}:fp16"))
+        .filter(|manifest| manifest.family == HUNYUAN3D_FAMILY)?;
+    Some(Hunyuan3dDerivedTier {
+        source: source.name.as_str(),
+        tier,
+    })
+}
+
+/// The Hunyuan3D 2.1 PBR paint bundle: auxiliary, hidden, files-only.
+///
+/// Separate from [`HUNYUAN3D_FAMILY`] because it is a different upstream
+/// release under a DIFFERENT licence document (2.1, not 2.0), and because it
+/// textures a mesh rather than generating one.
+pub const HUNYUAN3D_PAINT_FAMILY: &str = "hunyuan3d-paint";
+pub const HUNYUAN3D_PAINT_MANIFEST: &str = "hunyuan3d-paint";
+/// Apache-2.0 U²-Net weights used by the Hunyuan3D background-matting pre-stage.
+pub const HUNYUAN3D_MATTING_FAMILY: &str = "hunyuan3d-matting";
+pub const HUNYUAN3D_MATTING_MANIFEST: &str = "hunyuan3d-matting";
+pub const HUNYUAN3D_MATTING_FORCE_MANIFEST: &str = "hunyuan3d-matting:on";
+/// Tencent's SD2.1 InstructPix2Pix lighting-removal pre-stage. Hidden from
+/// ordinary model pickers; durable mesh workflows invoke it as its own leased
+/// image job so restart and resource ownership remain explicit.
+pub const HUNYUAN3D_DELIGHT_FAMILY: &str = "hunyuan3d-delight";
+pub const HUNYUAN3D_DELIGHT_MANIFEST: &str = "hunyuan3d-delight:fp16";
+/// Untiled 4x upscaler required between paint diffusion and material baking.
+pub const HUNYUAN3D_PAINT_UPSCALER_MANIFEST: &str = "real-esrgan-x4plus:fp16";
+
+/// The tier a surface picks when the caller names no 3-D model.
+///
+/// The 0.6B step-distilled one: it is the smallest download, the lowest VRAM
+/// and the fastest, and its geometry is close enough to the 1.1B tier that
+/// "try image-to-3D" should not cost six minutes on a first attempt.
+pub const HUNYUAN3D_DEFAULT_MODEL: &str = "hunyuan3d-mini-turbo:fp16";
+
+pub const UTILITY_FAMILIES: &[&str] = &["qwen3-expand", "companion"];
+
+/// Model families that are upscaler models (image-to-image enhancement, not generation).
+/// These are excluded from default-model selection and use a simplified config path.
+pub const UPSCALER_FAMILIES: &[&str] = &["upscaler"];
+
+/// Model families that are auxiliary (not standalone generators).
+/// ControlNet models are used via `--control-model`, not as the primary model.
+pub const AUXILIARY_FAMILIES: &[&str] = &[
+    "controlnet",
+    "ltx2-control",
+    "ltx2-camera-control",
+    "pulid",
+    "ip-adapter",
+    HUNYUAN3D_PAINT_FAMILY,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelComponent {
+    Transformer,
+    TransformerShard, // One shard of a multi-file transformer (Z-Image BF16)
+    /// The low-noise half of a two-expert checkpoint (Wan 2.2 A14B).
+    ///
+    /// Deliberately **not** a [`ModelComponent::TransformerShard`]: shards are
+    /// pieces of one network that a loader concatenates into a single
+    /// `VarBuilder`, while the two A14B experts are complete, independently
+    /// loadable transformers that the sampler switches between at a timestep
+    /// boundary. Filing them as shards would mmap 28 GB of weights as one model.
+    /// The high-noise expert occupies the ordinary `Transformer` slot because it
+    /// runs first.
+    LowNoiseTransformer,
+    Vae,
+    SpatialUpscaler, // LTX latent upsampler / spatial upscaler weights
+    TemporalUpscaler,
+    DistilledLora,
+    /// The distilled adapter belonging to [`ModelComponent::LowNoiseTransformer`].
+    /// Each A14B expert is distilled separately, so the pair is not
+    /// interchangeable.
+    LowNoiseDistilledLora,
+    T5Encoder,
+    ClipEncoder,
+    /// A non-CLIP vision tower used for image conditioning.
+    VisionEncoder,
+    T5Tokenizer,
+    ClipTokenizer,
+    ClipEncoder2,   // CLIP-G / OpenCLIP (SDXL)
+    ClipTokenizer2, // CLIP-G tokenizer (SDXL)
+    TextEncoder,    // Generic text encoder shard (Qwen3 for Z-Image)
+    TextTokenizer,  // Generic text encoder tokenizer
+    /// MiniMax H3 synchronized-audio VAE. Kept distinct from the video VAE.
+    AudioVae,
+    /// LTX-2.5's text-conditioned shot-duration predictor.
+    DurationHead,
+    /// Tokenizer / multimodal processor data owned by a model family.
+    Processor,
+    /// Video-side scheduler configuration for a dual-modality model.
+    VideoScheduler,
+    /// Audio-side scheduler configuration for a dual-modality model.
+    AudioScheduler,
+    /// Shared architecture/configuration metadata.
+    ModelConfig,
+    /// Task-transformer configuration. Never shared across tasks; compatible
+    /// layouts of the same task may reuse one pinned config identity.
+    TaskConfig,
+    Decoder,  // Stage B decoder weights (Wuerstchen)
+    Upscaler, // Upscaler model weights (Real-ESRGAN, etc.)
+    /// PuLID's face-identity adapter: the IDFormer encoder plus the extra
+    /// cross-attention blocks grafted onto the FLUX transformer. It is a
+    /// conditioning adapter, never a standalone checkpoint, so it is
+    /// deliberately not a [`ModelComponent::Transformer`] — filing it as one
+    /// would make `paths_from_downloads` demand a VAE for a bundle that has
+    /// no generator of its own.
+    IdentityAdapter,
+    /// The EVA02-CLIP-L-14-336 vision tower PuLID conditions on. The manifest
+    /// carries upstream's `.pt` release as an installer INPUT only; the
+    /// derived candle-loadable artifact is produced separately (#1229) and is
+    /// deliberately not a manifest file.
+    IdentityVisionEncoder,
+    /// SCRFD face detector (InsightFace antelopev2). Locates and aligns the
+    /// face crop the recognizer and vision tower are fed.
+    FaceDetector,
+    /// ArcFace `glintr100` face recognizer (InsightFace antelopev2). Produces
+    /// the identity embedding the adapter conditions on.
+    FaceRecognizer,
+    /// facexlib's BiSeNet face parser. Segments the aligned 512 crop so
+    /// PuLID's background-to-white / face-to-grey mask can be applied before
+    /// the vision tower sees it (`PuLID/pulid/pipeline_flux.py:161-170`). The
+    /// manifest carries upstream's `.pth` release as an installer INPUT only,
+    /// exactly like [`ModelComponent::IdentityVisionEncoder`]; the derived
+    /// candle-loadable artifact is produced on first use and is deliberately
+    /// not a manifest file.
+    FaceParser,
+    /// IP-Adapter's image-prompt weights: the small CLIP-embedding projection
+    /// plus the per-layer `to_k_ip`/`to_v_ip` pair grafted onto every `attn2`
+    /// module. A conditioning adapter, never a standalone checkpoint, so it is
+    /// deliberately not a [`ModelComponent::Transformer`] — the same reasoning
+    /// [`ModelComponent::IdentityAdapter`] records.
+    ///
+    /// Kept distinct from `IdentityAdapter` because the two bundles share a
+    /// storage prefix: resolution is strictly by component, so one name for
+    /// both would let a PuLID install answer for an IP-Adapter one.
+    ImagePromptAdapter,
+    /// The OpenCLIP ViT-H/14 vision tower IP-Adapter conditions on.
+    ///
+    /// Unlike [`ModelComponent::IdentityVisionEncoder`], upstream publishes
+    /// this in HF safetensors layout, so it is loaded directly and there is no
+    /// derived artifact.
+    ImagePromptVisionEncoder,
+    /// The vision tower's `config.json`, carried so the loader reads the
+    /// published architecture rather than trusting a transcription of it.
+    ImagePromptVisionConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelFile {
+    pub hf_repo: String,
+    pub hf_filename: String,
+    pub component: ModelComponent,
+    pub size_bytes: u64,
+    pub gated: bool,
+    /// Expected SHA-256 hex digest. None means not yet collected.
+    pub sha256: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ManifestDefaults {
+    pub steps: u32,
+    pub guidance: f64,
+    pub width: u32,
+    pub height: u32,
+    pub is_schnell: bool,
+    /// Scheduler algorithm: None for flow-matching models, Some for UNet-based models.
+    pub scheduler: Option<Scheduler>,
+    /// Default negative prompt for CFG-based models.
+    pub negative_prompt: Option<String>,
+    /// Default number of video frames. None for image-only models.
+    pub frames: Option<u32>,
+    /// Default video FPS. None for image-only models.
+    pub fps: Option<u32>,
+    /// Per-model source-image conditioning contract (#772). Recorded where
+    /// the manifest is BUILT — the one place that structurally knows the
+    /// task (e.g. which A14B expert repo pair it assembled) — so cold,
+    /// not-yet-downloaded tiers advertise correctly without any name
+    /// parsing. `None` omits the wire field (image families).
+    pub source_image: Option<crate::types::SourceImageCapability>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelManifest {
+    pub name: String,
+    pub family: String,
+    pub description: String,
+    pub files: Vec<ModelFile>,
+    pub defaults: ManifestDefaults,
+    /// Hidden models are excluded from `mold list`, every model picker,
+    /// and `mold pull` tab completion in release builds. They can still be
+    /// used via explicit `mold run <name>` or config.toml entries.
+    pub hidden: bool,
+}
+
+impl ModelManifest {
+    /// Short presentation alias for every curated checkpoint — title, then
+    /// variant — from `model_presentation`, the one authority on how a model
+    /// is named. Never use this label as a request or file id.
+    pub fn display_name(&self) -> String {
+        crate::model_presentation::presentation(self).display_name()
+    }
+
+    /// Size of the model-specific files in bytes.
+    pub fn model_size_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|f| is_model_specific_component(f.component))
+            .map(|f| f.size_bytes)
+            .sum()
+    }
+
+    /// Size of the model-specific files in GB (for display).
+    pub fn model_size_gb(&self) -> f32 {
+        self.model_size_bytes() as f32 / 1_073_741_824.0
+    }
+
+    /// True if this is a utility model (e.g., prompt expansion LLM) not an image generator.
+    ///
+    /// Utility models are downloaded and stored like regular models, but they don't
+    /// produce a `ModelPaths` or get written into the config `[models]` section.
+    ///
+    /// Uses family-based identification (not VAE absence) because auxiliary diffusion
+    /// components like ControlNet also lack a VAE but are NOT utility models.
+    pub fn is_utility(&self) -> bool {
+        UTILITY_FAMILIES.contains(&self.family.as_str())
+    }
+
+    /// True if this is an upscaler model (Real-ESRGAN, etc.) not a diffusion generator.
+    ///
+    /// Upscaler models are downloaded like regular models and get config entries,
+    /// but they use a simplified config path (only `transformer` field for weights)
+    /// and are not eligible as default generation models.
+    pub fn is_upscaler(&self) -> bool {
+        UPSCALER_FAMILIES.contains(&self.family.as_str())
+    }
+
+    /// True if this is an auxiliary model (e.g., ControlNet) not a standalone generator.
+    ///
+    /// Auxiliary models are used as modifiers (via `--control-model`) rather than
+    /// as the primary generation model.
+    pub fn is_auxiliary(&self) -> bool {
+        AUXILIARY_FAMILIES.contains(&self.family.as_str())
+    }
+
+    /// True when this manifest is a bundle of complete, runnable files that
+    /// never resolves to a [`ModelPaths`].
+    ///
+    /// These installs are "the files are on disk" and nothing more: there is
+    /// no transformer/VAE pair to discover, no `[models]` config entry, and
+    /// no default-model eligibility. Both the pull path and the
+    /// installed-state check read this one predicate so a bundle cannot be
+    /// downloaded by one rule and reported missing by another.
+    pub fn is_files_only_bundle(&self) -> bool {
+        self.is_utility()
+            || (crate::ltx25_manifest::is_contract_manifest(&self.name)
+                && !crate::ltx25_manifest::is_runtime_manifest(&self.name))
+            || matches!(
+                self.family.as_str(),
+                "ltx2-control"
+                    | "ltx2-camera-control"
+                    | PULID_FAMILY
+                    | IP_ADAPTER_FAMILY
+                    | HUNYUAN3D_PAINT_FAMILY
+            )
+    }
+
+    /// True if this model can be used as a primary generation model.
+    pub fn is_generation_model(&self) -> bool {
+        !self.is_upscaler() && !self.is_files_only_bundle() && !self.is_auxiliary()
+    }
+
+    /// True if any file in this model requires HuggingFace authentication.
+    pub fn is_gated(&self) -> bool {
+        self.files.iter().any(|f| f.gated)
+    }
+
+    /// Total size of all files in this model in bytes.
+    pub fn total_size_bytes(&self) -> u64 {
+        self.files.iter().map(|f| f.size_bytes).sum()
+    }
+
+    /// Total size of all files in GB (for display).
+    pub fn total_size_gb(&self) -> f32 {
+        self.total_size_bytes() as f32 / 1_073_741_824.0
+    }
+
+    /// Convert downloaded paths into a `ModelConfig` suitable for saving to config.toml.
+    pub fn to_model_config(&self, paths: &ModelPaths) -> ModelConfig {
+        ModelConfig {
+            transformer: Some(paths.transformer.to_string_lossy().to_string()),
+            transformer_shards: if paths.transformer_shards.is_empty() {
+                None
+            } else {
+                Some(
+                    paths
+                        .transformer_shards
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect(),
+                )
+            },
+            low_noise_transformer: paths
+                .low_noise_transformer
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            vae: Some(paths.vae.to_string_lossy().to_string()),
+            spatial_upscaler: paths
+                .spatial_upscaler
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            temporal_upscaler: paths
+                .temporal_upscaler
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            distilled_lora: paths
+                .distilled_lora
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            low_noise_distilled_lora: paths
+                .low_noise_distilled_lora
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            t5_encoder: paths
+                .t5_encoder
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            clip_encoder: paths
+                .clip_encoder
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            t5_tokenizer: paths
+                .t5_tokenizer
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            clip_tokenizer: paths
+                .clip_tokenizer
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            clip_encoder_2: paths
+                .clip_encoder_2
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            clip_tokenizer_2: paths
+                .clip_tokenizer_2
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            text_encoder_files: if paths.text_encoder_files.is_empty() {
+                None
+            } else {
+                Some(
+                    paths
+                        .text_encoder_files
+                        .iter()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .collect(),
+                )
+            },
+            text_tokenizer: paths
+                .text_tokenizer
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            decoder: paths
+                .decoder
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            // Manifest defaults are NOT written to config — resolved at runtime
+            // via resolved_model_config() so manifest updates take effect
+            // immediately without stale config values. See #129.
+            default_steps: None,
+            default_guidance: None,
+            default_width: None,
+            default_height: None,
+            is_schnell: None,
+            is_turbo: None,
+            scheduler: None,
+            negative_prompt: None,
+            lora: None,
+            lora_scale: None,
+            default_frames: None,
+            default_fps: None,
+            description: None,
+            family: None,
+            placement: None,
+        }
+    }
+}
+
+/// Return a numeric quality rank for a model variant tag.
+///
+/// Lower numbers mean higher quality. Used to sort model variants within
+/// a family so that full-precision appears first and smaller quantizations
+/// appear last.
+///
+/// Ordering: bf16 (0) > fp16 (1) > fp8 (2) > q8 (3) > q6 (4) > q5 (5) >
+/// q4/q4-k-s (6) > q3/q3-k-s (7) > q2 (8).
+///
+/// Unknown tags get rank 100 (sorted last).
+pub fn variant_quality_rank(model_name: &str) -> u32 {
+    let tag = model_name.rsplit(':').next().unwrap_or("");
+    match tag {
+        "bf16" => 0,
+        "fp16" => 1,
+        // INT8 ConvRot (W8A8, per-row scales) measures closer to BF16 than
+        // FP8 does on Qwen Image 2.1 (unsloth's card: LPIPS 0.064 vs 0.112).
+        "fp8" | "int8-conv" => 2,
+        "q8" => 3,
+        "q6" => 4,
+        "q5" => 5,
+        "q4" | "q4-k-s" => 6,
+        "q3" | "q3-k-s" => 7,
+        "q2" => 8,
+        _ => 100,
+    }
+}
+
+/// Return the base name of a model (everything before the colon tag).
+///
+/// `"flux-dev:q4"` → `"flux-dev"`, `"sd15:fp16"` → `"sd15"`.
+pub fn model_base_name(model_name: &str) -> &str {
+    model_name.split(':').next().unwrap_or(model_name)
+}
+
+fn is_model_specific_component(component: ModelComponent) -> bool {
+    matches!(
+        component,
+        ModelComponent::Transformer
+            | ModelComponent::TransformerShard
+            | ModelComponent::LowNoiseTransformer
+            | ModelComponent::DistilledLora
+            | ModelComponent::LowNoiseDistilledLora
+            | ModelComponent::TaskConfig
+            | ModelComponent::Upscaler
+    )
+}
+
+/// Determine the clean storage path for a model file relative to the models directory.
+///
+/// - **Transformer / TransformerShard**: `<model-name>/<hf_filename>` (model-specific)
+/// - **All other components** (VAE, encoders, tokenizers): `shared/<family>/<hf_filename>` (shared)
+///
+/// Model names are sanitized: colons become dashes (e.g., `flux-schnell:q8` → `flux-schnell-q8`).
+/// HF filename paths (e.g., `text_encoder/model-00001-of-00003.safetensors`) are preserved as-is,
+/// creating subdirectories under the target directory.
+/// The directory (under the models dir) a manifest's model-specific files are
+/// stored in — its own sanitized name, except where another identity owns the
+/// bytes.
+///
+/// H3 Turbo tags are the base compact stack plus one shared adapter, so their
+/// model-specific files live in the base checkpoint's directory — a machine
+/// holding the base pulls only the adapter, and removal ref-counting protects
+/// the shared bytes in both directions. A Qwen Image 2.1 turbo tag is its base
+/// tier plus one adapter, so its transformer lives in the base tier's
+/// directory by the same rule. LTX-2.5 contract manifests have their own
+/// storage identity. The download seam's `.pulling` marker follows this too,
+/// so pulling a turbo tag never creates a directory nothing is stored in.
+pub fn storage_directory_name(manifest: &ModelManifest) -> String {
+    let storage_name = if crate::ltx25_manifest::is_contract_manifest(&manifest.name) {
+        crate::ltx25_manifest::storage_identity(&manifest.name)
+    } else if manifest.family == crate::minimax_h3::FAMILY {
+        crate::minimax_h3::storage_identity(&manifest.name)
+    } else {
+        manifest.name.as_str()
+    };
+    let qwen21_turbo_base = qwen_image21_turbo_base(storage_name);
+    let storage_name = qwen21_turbo_base.as_deref().unwrap_or(storage_name);
+    storage_name.replace(':', "-")
+}
+
+pub fn storage_path(manifest: &ModelManifest, file: &ModelFile) -> PathBuf {
+    let sanitized_name = storage_directory_name(manifest);
+
+    // Paint uses facebook/dinov2-giant in addition to the CLIP tower shipped
+    // inside Tencent's bundle. Give the external tower an unambiguous path:
+    // both repositories publish a file named `model.safetensors`, and the
+    // runtime must never silently substitute CLIP's 1280-wide tensors for
+    // DINO's 1536-wide tensors.
+    if manifest.name == HUNYUAN3D_PAINT_MANIFEST && file.hf_repo == "facebook/dinov2-giant" {
+        return PathBuf::from("shared")
+            .join(HUNYUAN3D_PAINT_FAMILY)
+            .join("dinov2-giant")
+            .join(&file.hf_filename);
+    }
+
+    // H3's official and Comfy transformers use the same task architecture
+    // config. Keep one copy per task across layouts while the task-specific
+    // source path (`transformer` vs `transformer_ref`) prevents cross-task
+    // substitution. The Comfy manifests intentionally omit official sharded
+    // weight indexes because those do not describe their single-file weights.
+    if manifest.family == crate::minimax_h3::FAMILY
+        && file.component == ModelComponent::TaskConfig
+        && file.hf_repo == crate::minimax_h3::OFFICIAL_REPO
+    {
+        return PathBuf::from("shared")
+            .join(crate::minimax_h3::FAMILY)
+            .join(&file.hf_filename);
+    }
+
+    // H3's reviewed Turbo adapters are keyed by their own task-specific
+    // basenames (`minimax_h3_fl2v_turbo_...`), so every Turbo tag — and any
+    // future tier — shares one on-disk copy under the family `loras/` bucket
+    // instead of duplicating ~1.96 GB per manifest name. The upstream
+    // directory is deliberately dropped: Comfy-Org publishes under `loras/`
+    // while lightx2v and drbaph publish at their repository roots, and every
+    // one of them belongs in the single bucket the docs promise. For the
+    // Comfy-Org adapters the derivation is byte-identical to joining
+    // `hf_filename`, so installed files stay valid.
+    // A tier-basename distinctness test in `minimax_h3` is what keeps two
+    // adapters from colliding on one on-disk name.
+    if manifest.family == crate::minimax_h3::FAMILY
+        && file.component == ModelComponent::DistilledLora
+    {
+        return PathBuf::from("shared")
+            .join(crate::minimax_h3::FAMILY)
+            .join("loras")
+            .join(
+                std::path::Path::new(&file.hf_filename)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new(&file.hf_filename)),
+            );
+    }
+
+    // Every 2.1 turbo tag carries the same Viggle adapter; one copy under the
+    // family's `loras/` bucket serves them all, and removal ref-counting keeps
+    // it while any turbo tag remains.
+    if manifest.family == "qwen-image21" && file.component == ModelComponent::DistilledLora {
+        return PathBuf::from("shared")
+            .join("qwen-image21")
+            .join("loras")
+            .join(&file.hf_filename);
+    }
+
+    if is_model_specific_component(file.component) {
+        PathBuf::from(&sanitized_name).join(&file.hf_filename)
+    } else {
+        // Phase 1 registers LTX-2.5 as a download-only contract family so no
+        // existing LTX-2 runtime can claim it. Its shared assets still land in
+        // the durable LTX-2 bucket that the native split runtime will consume.
+        if crate::ltx25_manifest::is_contract_manifest(&manifest.name) {
+            return PathBuf::from("shared").join("ltx2").join(&file.hf_filename);
+        }
+        // FLUX.2 [dev] publishes a different Mistral encoder, tokenizer, and
+        // VAE under the same relative filenames used by the Klein repos. Do
+        // not let installing one variant overwrite the other's shared assets.
+        if file.hf_repo == "black-forest-labs/FLUX.2-dev" {
+            return PathBuf::from("shared")
+                .join("flux2-dev")
+                .join(&file.hf_filename);
+        }
+        // The ungated dev mirrors (`shared_flux2_dev_open_files`) carry the
+        // same runtime roles, so they belong in the same bucket — one copy
+        // shared by every quantized dev tier. Their filenames never collide
+        // with BFL's (`split_files/...` and a bare `tokenizer.json` against
+        // BFL's `text_encoder/`, `vae/`, `tokenizer/` prefixes), so a host
+        // that installs both tiers keeps both sets intact.
+        if file.hf_repo == "Comfy-Org/flux2-dev"
+            || file.hf_repo == "unsloth/Mistral-Small-3.2-24B-Instruct-2506"
+        {
+            return PathBuf::from("shared")
+                .join("flux2-dev")
+                .join(&file.hf_filename);
+        }
+        // Companion manifests (`t5-v1_1-xxl`, `clip-l`, etc.) route their
+        // shared components to the canonical owning family's bucket so an
+        // already-installed FLUX/SDXL/SD1.5 model's encoders/tokenizers are
+        // found by `ModelPaths::resolve(<companion>, config)` without a
+        // duplicate download. Without this routing, t5-v1_1-xxl's tokenizer
+        // would land at `shared/companion/...` and the catalog bridge's
+        // synthesized `cfg.t5_tokenizer` would stay None even when the file
+        // exists at `shared/flux/...` from a prior FLUX install.
+        if manifest.family == "companion" {
+            let canonical_family = match manifest.name.as_str() {
+                "t5-v1_1-xxl" | "clip-l" | "flux-vae" => "flux",
+                "clip-g" | "sdxl-vae" => "sdxl",
+                "sd-vae-ft-mse" => "sd15",
+                "ltx-video-vae" => "ltx-video",
+                "ltx2-vae" | "ltx2.3-vae" | "ltx2.3-text-projection" => "ltx2",
+                "z-image-te" => "z-image",
+                "flux2-vae" | "flux2-te" | "flux2-te-9b" => "flux2",
+                "ltx2-te" => "ltx2",
+                "wan-umt5" | "wan21-vae" | "wan22-vae" => "wan",
+                _ => "companion",
+            };
+            return PathBuf::from("shared")
+                .join(canonical_family)
+                .join(&file.hf_filename);
+        }
+        if manifest.family == "ltx-video" {
+            return match file.component {
+                // LTX reuses the shared FLUX T5 assets. Keep them under the
+                // flux shared bucket so path layout matches the actual source.
+                ModelComponent::T5Encoder | ModelComponent::T5Tokenizer => {
+                    PathBuf::from("shared").join("flux").join(&file.hf_filename)
+                }
+                // The currently compatible VAE still comes from the legacy
+                // LTX-Video-0.9.5 repo, and the 0.9.8 latent upsampler comes
+                // from the current LTX-Video repo. Keep the clean path aligned
+                // with the source repo to avoid shared/ltx-video ambiguity.
+                ModelComponent::Vae | ModelComponent::SpatialUpscaler => {
+                    let repo_leaf = file.hf_repo.rsplit('/').next().unwrap_or("ltx-video");
+                    PathBuf::from("shared")
+                        .join(repo_leaf)
+                        .join(&file.hf_filename)
+                }
+                _ => PathBuf::from("shared")
+                    .join(&manifest.family)
+                    .join(&file.hf_filename),
+            };
+        }
+        if manifest.family == "qwen-image" || manifest.family == "qwen-image-edit" {
+            match file.hf_repo.as_str() {
+                "Qwen/Qwen-Image" => {
+                    return PathBuf::from("shared")
+                        .join("qwen-image-base")
+                        .join(&file.hf_filename);
+                }
+                "Qwen/Qwen-Image-2512" => {
+                    return PathBuf::from("shared")
+                        .join("qwen-image")
+                        .join(&file.hf_filename);
+                }
+                "Qwen/Qwen-Image-Edit-2511" => {
+                    return PathBuf::from("shared")
+                        .join("qwen-image-edit")
+                        .join(&file.hf_filename);
+                }
+                _ => {}
+            }
+        }
+        // Check if this filename collides with another file in the same
+        // manifest from a different HF repo. If so, use the repo name
+        // as a subfolder to disambiguate (e.g. Wuerstchen has two
+        // text_encoder/model.safetensors from different repos).
+        let has_collision = manifest
+            .files
+            .iter()
+            .any(|other| other.hf_filename == file.hf_filename && other.hf_repo != file.hf_repo);
+        if has_collision {
+            let repo_leaf = file.hf_repo.rsplit('/').next().unwrap_or(&manifest.family);
+            PathBuf::from("shared")
+                .join(repo_leaf)
+                .join(&file.hf_filename)
+        } else {
+            PathBuf::from("shared")
+                .join(&manifest.family)
+                .join(&file.hf_filename)
+        }
+    }
+}
+
+/// Candidate on-disk storage paths for a manifest file.
+///
+/// The first path is the canonical current clean path. Additional entries are
+/// backwards-compatible legacy locations that should still be discovered and
+/// repaired in place by `mold pull`.
+pub fn storage_path_candidates(manifest: &ModelManifest, file: &ModelFile) -> Vec<PathBuf> {
+    let canonical = storage_path(manifest, file);
+    let mut paths = vec![canonical.clone()];
+
+    if manifest.family == "ltx-video" && !is_model_specific_component(file.component) {
+        let legacy = PathBuf::from("shared")
+            .join(&manifest.family)
+            .join(&file.hf_filename);
+        if legacy != canonical {
+            paths.push(legacy);
+        }
+    }
+
+    paths
+}
+
+/// Shared FLUX component files (VAE, T5, CLIP, tokenizers) — identical across all FLUX models.
+fn shared_flux_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.1-schnell".to_string(),
+            hf_filename: "ae.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 335_304_388,
+            gated: true, // BFL repos now require authentication
+            sha256: Some("afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"),
+        },
+        ModelFile {
+            hf_repo: "comfyanonymous/flux_text_encoders".to_string(),
+            hf_filename: "t5xxl_fp16.safetensors".to_string(),
+            component: ModelComponent::T5Encoder,
+            size_bytes: 9_787_841_024,
+            gated: false,
+            sha256: Some("6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635"),
+        },
+        ModelFile {
+            hf_repo: "comfyanonymous/flux_text_encoders".to_string(),
+            hf_filename: "clip_l.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder,
+            size_bytes: 246_144_152,
+            gated: false,
+            sha256: Some("660c6f5b1abae9dc498ac2d21e1347d2abdb0cf6c0c0c8576cd796491d9a6cdd"),
+        },
+        ModelFile {
+            hf_repo: "lmz/mt5-tokenizers".to_string(),
+            hf_filename: "t5-v1_1-xxl.tokenizer.json".to_string(),
+            component: ModelComponent::T5Tokenizer,
+            size_bytes: 2_424_257,
+            gated: false,
+            sha256: None, // non-LFS file, no SHA-256 from HF API
+        },
+        ModelFile {
+            hf_repo: "openai/clip-vit-large-patch14".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None, // non-LFS file, no SHA-256 from HF API
+        },
+    ]
+}
+
+/// All known downloadable model manifests, computed once and cached.
+static KNOWN_MANIFESTS: LazyLock<Vec<ModelManifest>> = LazyLock::new(build_known_manifests);
+
+/// Index mapping canonical model names to their index in `KNOWN_MANIFESTS`.
+static MANIFEST_INDEX: LazyLock<HashMap<String, usize>> = LazyLock::new(|| {
+    KNOWN_MANIFESTS
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.name.clone(), i))
+        .collect()
+});
+
+/// All known downloadable model manifests (FLUX, SDXL, SD3, SD1.5, Z-Image, Flux.2, Qwen-Image, LTX Video).
+pub fn known_manifests() -> &'static [ModelManifest] {
+    &KNOWN_MANIFESTS
+}
+
+/// Visible (non-hidden) manifests for user-facing lists (CLI, model pickers,
+/// tab completion).
+/// Hidden models can still be used via explicit `mold run <name>` or config.toml.
+pub fn visible_manifests() -> impl Iterator<Item = &'static ModelManifest> {
+    known_manifests().iter().filter(|m| !m.hidden)
+}
+
+fn build_known_manifests() -> Vec<ModelManifest> {
+    let mut manifests = vec![
+        ModelManifest {
+            name: "flux-schnell:q8".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Schnell Q8 — fast 4-step, general purpose".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-schnell-gguf".to_string(),
+                    hf_filename: "flux1-schnell-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 12_687_821_728,
+                    gated: false,
+                    sha256: Some(
+                        "f6694941193b10148dbf1f0f498d4ccd3e9875c127fc53946213b68580c66f10",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-dev:q8".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Dev Q8 — full quality, 20+ steps".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-dev-gguf".to_string(),
+                    hf_filename: "flux1-dev-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 12_708_281_504,
+                    gated: false,
+                    sha256: Some(
+                        "129032f32224bf7138f16e18673d8008ba5f84c1ec74063bf4511a8bb4cf553d",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-dev:q4".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Dev Q4 — smaller/faster, good quality".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-dev-gguf".to_string(),
+                    hf_filename: "flux1-dev-Q4_1.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_530_806_432,
+                    gated: false,
+                    sha256: Some(
+                        "da04c47a9b717bf9a4dd545e46d89e4a62fb44b9497bf9a5d13d622d592fbcda",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-dev:q6".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Dev Q6 — best quality/size trade-off".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-dev-gguf".to_string(),
+                    hf_filename: "flux1-dev-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_857_000_736,
+                    gated: false,
+                    sha256: Some(
+                        "9566d56031d7f8de184bb5a0393073956ec4e28b32db3f860bd2b87edca04d13",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-dev:bf16".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Dev BF16 — full quality, full precision (23.8GB transformer)"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.1-dev".to_string(),
+                    hf_filename: "flux1-dev.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 23_802_932_552,
+                    gated: true,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-schnell:bf16".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Schnell BF16 — fast 4-step, full precision (23.8GB transformer)"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.1-schnell".to_string(),
+                    hf_filename: "flux1-schnell.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 23_782_506_688,
+                    gated: true,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-schnell:q4".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Schnell Q4 — fast 4-step, smaller footprint".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-schnell-gguf".to_string(),
+                    hf_filename: "flux1-schnell-Q4_1.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_510_346_656,
+                    gated: false,
+                    sha256: Some(
+                        "a798b7196d2fe614cf9bae9a617dbd9f2c14673e454c7f2f6a500347274630b5",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-schnell:q6".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Schnell Q6 — fast 4-step, best quality/size trade-off".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/FLUX.1-schnell-gguf".to_string(),
+                    hf_filename: "flux1-schnell-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_834_955_808,
+                    gated: false,
+                    sha256: Some(
+                        "a42fd143cec4d7194da281dc8d23a8fe54b16875a13423c042cb545d1da6fa50",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-krea:q8".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Krea Dev Q8 — aesthetic photography fine-tune".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/FLUX.1-Krea-dev-GGUF".to_string(),
+                    hf_filename: "flux1-krea-dev-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 12_714_452_256,
+                    gated: false,
+                    sha256: Some(
+                        "0d085b1e3ae0b90e5dbf74da049a80a565617de622a147d28ee37a07761fbd90",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 4.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-krea:q4".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Krea Dev Q4 — aesthetic photography, smaller footprint"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/FLUX.1-Krea-dev-GGUF".to_string(),
+                    hf_filename: "flux1-krea-dev-Q4_1.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_536_977_184,
+                    gated: false,
+                    sha256: Some(
+                        "be4c46e5492761f00c0d9ca15e78936fbe54c4ee65b16da8e0dbf5f2115ae6b2",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 4.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-krea:q6".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Krea Dev Q6 — aesthetic photography, best quality/size trade-off"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/FLUX.1-Krea-dev-GGUF".to_string(),
+                    hf_filename: "flux1-krea-dev-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_848_349_984,
+                    gated: false,
+                    sha256: Some(
+                        "c50c13ebe1207b2c87b251ccf3a55b9eb54c84f73cee62503d17acd8a460953e",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 4.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux-krea:fp8".to_string(),
+            family: "flux".to_string(),
+            description: "FLUX.1 Krea Dev FP8 — aesthetic photography, scaled FP8 quantization"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "Clybius/FLUX.1-Krea-dev-scaled-fp8".to_string(),
+                    hf_filename: "flux1-krea-dev_float8_e4m3fn_learned_svd.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 11_904_609_210,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 4.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // ── jibMixFlux v7 PixelHeaven (FLUX-dev fine-tune by J1B) ──────────
+        ModelManifest {
+            name: "jibmix-flux:fp8".to_string(),
+            family: "flux".to_string(),
+            description: "jibMixFlux v7.2 PixelHeaven FP8 — photorealistic fine-tune".to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "ak199621/jibMixFlux_v72PixelHeaven.safetensors".to_string(),
+                    hf_filename: "jibMixFlux_v72PixelHeaven.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 11_901_516_784,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "jibmix-flux:q5".to_string(),
+            family: "flux".to_string(),
+            description: "jibMixFlux v7 PixelHeaven Q5 — photorealistic, best GGUF quality"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "TheLounger/Jib_Mix_Flux_v7_Beta-GGUF".to_string(),
+                    hf_filename: "Jib_Mix_Flux_v7_Beta-Q5_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 8_421_981_344,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "jibmix-flux:q4".to_string(),
+            family: "flux".to_string(),
+            description: "jibMixFlux v7 PixelHeaven Q4 — photorealistic, good quality/size"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "TheLounger/Jib_Mix_Flux_v7_Beta-GGUF".to_string(),
+                    hf_filename: "Jib_Mix_Flux_v7_Beta-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 6_934_297_760,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "jibmix-flux:q3".to_string(),
+            family: "flux".to_string(),
+            description: "jibMixFlux v7 PixelHeaven Q3 — photorealistic, smaller footprint"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "TheLounger/Jib_Mix_Flux_v7_Beta-GGUF".to_string(),
+                    hf_filename: "Jib_Mix_Flux_v7_Beta-Q3_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_370_969_248,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // ── UltraReal Fine-Tune (photorealistic FLUX-dev fine-tune by Danrisi) ──
+        ModelManifest {
+            name: "ultrareal-v2:bf16".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v2.0 BF16 — photorealistic, full precision"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "youknownothing/UltrarealFineTune-Flux".to_string(),
+                    hf_filename: "ultrarealFineTune_v20.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 23_802_910_336,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v3:q8".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v3 Q8 — photorealistic, best GGUF quality"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "belisarius/FLUX.1-dev-ultrarealFineTune_v3Experimental-GGUF"
+                        .to_string(),
+                    hf_filename: "ultrarealFineTune_v3Experimental-q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 12_723_103_008,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v3:q6".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v3 Q6 — photorealistic, best quality/size trade-off"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "belisarius/FLUX.1-dev-ultrarealFineTune_v3Experimental-GGUF"
+                        .to_string(),
+                    hf_filename: "ultrarealFineTune_v3Experimental-q6_k.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_857_000_736,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v3:q4".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v3 Q4 — photorealistic, smaller footprint"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "belisarius/FLUX.1-dev-ultrarealFineTune_v3Experimental-GGUF"
+                        .to_string(),
+                    hf_filename: "ultrarealFineTune_v3Experimental-q4_k_s.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 6_805_988_640,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v4:q8".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v4 Q8 — photorealistic (latest), best GGUF quality"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "void-gryph/ultrareal-fine-tune-GGUF".to_string(),
+                    hf_filename: "ultrareal-fine-tune.Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 12_619_809_408,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v4:q5".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v4 Q5 — photorealistic (latest), good quality/size"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "void-gryph/ultrareal-fine-tune-GGUF".to_string(),
+                    hf_filename: "ultrareal-fine-tune.Q5_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 8_170_103_424,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ultrareal-v4:q4".to_string(),
+            family: "flux".to_string(),
+            description: "UltraReal Fine-Tune v4 Q4 — photorealistic (latest), smaller footprint"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "void-gryph/ultrareal-fine-tune-GGUF".to_string(),
+                    hf_filename: "ultrareal-fine-tune.Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 6_686_868_096,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // ── iNiverse Mix SFW/NSFW (FLUX-dev fine-tune by JinnGames) ──────────
+        ModelManifest {
+            name: "iniverse-mix:fp8".to_string(),
+            family: "flux".to_string(),
+            description: "iNiverse Mix F1D RealNSFW GuoFeng v2 FP8 — realistic SFW/NSFW mix"
+                .to_string(),
+            files: {
+                let mut files = shared_flux_files();
+                files.push(ModelFile {
+                    hf_repo: "modelzpalace/iniverseMixSFWNSFW_f1dRealnsfwGuofengV2".to_string(),
+                    hf_filename: "iniverseMixSFWNSFW_f1dRealnsfwGuofengV2.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 11_901_513_960,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 3.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ];
+    manifests.extend(sd15_manifests());
+    manifests.extend(sd3_manifests());
+    manifests.extend(sdxl_manifests());
+    manifests.extend(zimage_manifests());
+    manifests.extend(flux2_manifests());
+    manifests.extend(qwen_image_manifests());
+    manifests.extend(qwen_image21_manifests());
+    manifests.extend(wuerstchen_manifests());
+    manifests.extend(hunyuan3d_manifests());
+    manifests.extend(ltx_video_manifests());
+    manifests.extend(ltx2_manifests());
+    manifests.extend(crate::ltx25_manifest::manifests());
+    manifests.extend(wan_manifests());
+    manifests.extend(crate::minimax_h3::manifests());
+    manifests.extend(ltx2_control_manifests());
+    manifests.extend(ltx2_camera_control_manifests());
+    manifests.extend(pulid_manifests());
+    manifests.extend(ip_adapter_manifests());
+    manifests.extend(controlnet_manifests());
+    manifests.extend(qwen3_expand_manifests());
+    manifests.extend(upscaler_manifests());
+    manifests.extend(companion_manifests());
+    manifests
+}
+
+/// Shared SD3 component files (VAE, CLIP-L, CLIP-G, T5-XXL, tokenizers) — identical across all SD3.5 models.
+///
+/// SD3 uses three text encoders: CLIP-L (768-dim), CLIP-G (1280-dim), and T5-XXL (4096-dim).
+/// The VAE is embedded in the transformer safetensors for BF16, but GGUF models need a separate VAE.
+/// For separate text encoders, we use files from stabilityai/stable-diffusion-3.5-large.
+fn shared_sd3_files() -> Vec<ModelFile> {
+    vec![
+        // VAE: SD3 VAE is embedded in the monolithic safetensors from stabilityai.
+        // The mmap approach means only VAE weights (~300MB) get paged in, not the full file.
+        // The pipeline uses vb.rename_f(sd3_vae_vb_rename).pp("first_stage_model") prefix.
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-3.5-large".to_string(),
+            hf_filename: "sd3.5_large.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 16_460_379_262, // monolithic (VAE portion ~300MB via mmap)
+            gated: true,
+            sha256: None,
+        },
+        // CLIP-L encoder
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-3.5-large".to_string(),
+            hf_filename: "text_encoders/clip_l.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder,
+            size_bytes: 246_144_152,
+            gated: true,
+            sha256: None,
+        },
+        // CLIP-G encoder
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-3.5-large".to_string(),
+            hf_filename: "text_encoders/clip_g.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder2,
+            size_bytes: 1_389_382_176,
+            gated: true,
+            sha256: None,
+        },
+        // T5-XXL encoder
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-3.5-large".to_string(),
+            hf_filename: "text_encoders/t5xxl_fp16.safetensors".to_string(),
+            component: ModelComponent::T5Encoder,
+            size_bytes: 9_787_841_024,
+            gated: true,
+            sha256: None,
+        },
+        // CLIP-L tokenizer (same as FLUX/SDXL)
+        ModelFile {
+            hf_repo: "openai/clip-vit-large-patch14".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None,
+        },
+        // CLIP-G tokenizer (same as SDXL)
+        ModelFile {
+            hf_repo: "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer2,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None,
+        },
+        // T5 tokenizer (same as FLUX)
+        ModelFile {
+            hf_repo: "lmz/mt5-tokenizers".to_string(),
+            hf_filename: "t5-v1_1-xxl.tokenizer.json".to_string(),
+            component: ModelComponent::T5Tokenizer,
+            size_bytes: 2_424_257,
+            gated: false,
+            sha256: None,
+        },
+    ]
+}
+
+/// All known SD3.5 model manifests.
+fn sd3_manifests() -> Vec<ModelManifest> {
+    vec![
+        // --- SD3.5 Large (depth=38, 8.1B) ---
+        ModelManifest {
+            name: "sd3.5-large:q8".to_string(),
+            family: "sd3".to_string(),
+            description: "SD3.5 Large Q8 — 8.1B MMDiT, high quality, 28 steps".to_string(),
+            files: {
+                let mut files = shared_sd3_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/stable-diffusion-3.5-large-gguf".to_string(),
+                    hf_filename: "sd3.5_large-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 8_779_212_512,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 28,
+                guidance: 4.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "sd3.5-large:q4".to_string(),
+            family: "sd3".to_string(),
+            description: "SD3.5 Large Q4 — 8.1B MMDiT, smaller footprint, 28 steps".to_string(),
+            files: {
+                let mut files = shared_sd3_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/stable-diffusion-3.5-large-gguf".to_string(),
+                    hf_filename: "sd3.5_large-Q4_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 4_772_054_752,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 28,
+                guidance: 4.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // --- SD3.5 Large Turbo (depth=38, 8.1B, 4 steps, CFG=1.0) ---
+        ModelManifest {
+            name: "sd3.5-large-turbo:q8".to_string(),
+            family: "sd3".to_string(),
+            description: "SD3.5 Large Turbo Q8 — 8.1B MMDiT, fast 4-step generation".to_string(),
+            files: {
+                let mut files = shared_sd3_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/stable-diffusion-3.5-large-turbo-gguf".to_string(),
+                    hf_filename: "sd3.5_large_turbo-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 8_779_212_512,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // --- SD3.5 Medium (depth=24, 2.5B) ---
+        ModelManifest {
+            name: "sd3.5-medium:q8".to_string(),
+            family: "sd3".to_string(),
+            description: "SD3.5 Medium Q8 — 2.5B MMDiT, SLG support, 28 steps".to_string(),
+            files: {
+                let mut files = shared_sd3_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/stable-diffusion-3.5-medium-gguf".to_string(),
+                    hf_filename: "sd3.5_medium-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 2_855_825_856,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 28,
+                guidance: 4.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ]
+}
+
+/// Shared SD1.5 component files (VAE, CLIP-L encoder, tokenizer) — identical across all SD1.5 models.
+fn shared_sd15_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "stabilityai/sd-vae-ft-mse".to_string(),
+            hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 334_643_276,
+            gated: false,
+            sha256: Some("a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815"),
+        },
+        ModelFile {
+            hf_repo: "stable-diffusion-v1-5/stable-diffusion-v1-5".to_string(),
+            hf_filename: "text_encoder/model.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder,
+            size_bytes: 492_265_874,
+            gated: false,
+            sha256: Some("d008943c017f0092921106440254dbbe00b6a285f7883ec8ba160c3faad88334"),
+        },
+        ModelFile {
+            hf_repo: "openai/clip-vit-large-patch14".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None, // non-LFS file, no SHA-256 from HF API
+        },
+    ]
+}
+
+/// All known SD1.5 model manifests.
+fn sd15_manifests() -> Vec<ModelManifest> {
+    vec![
+        ModelManifest {
+            name: "sd15:fp16".to_string(),
+            family: "sd15".to_string(),
+            description: "Stable Diffusion 1.5 — canonical base model, huge LoRA ecosystem"
+                .to_string(),
+            files: {
+                let mut files = shared_sd15_files();
+                files.push(ModelFile {
+                    hf_repo: "stable-diffusion-v1-5/stable-diffusion-v1-5".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_438_167_540,
+                    gated: false,
+                    sha256: Some(
+                        "19da7aaa4b880e59d56843f1fcb4dd9b599c28a1d9d9af7c1143057c8ffae9f1",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.5,
+                width: 512,
+                height: 512,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "dreamshaper-v8:fp16".to_string(),
+            family: "sd15".to_string(),
+            description: "DreamShaper v8 — best versatile SD1.5, photorealistic + fantasy"
+                .to_string(),
+            files: {
+                let mut files = shared_sd15_files();
+                files.push(ModelFile {
+                    hf_repo: "Lykon/dreamshaper-8".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_438_167_536,
+                    gated: false,
+                    sha256: Some(
+                        "89b54dc332757e6fff8caef7399e8061833d7d668d42fdbcc02b3e366921c5a6",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.5,
+                width: 512,
+                height: 512,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "realistic-vision-v5:fp16".to_string(),
+            family: "sd15".to_string(),
+            description: "Realistic Vision v5.1 — gold standard photorealistic SD1.5".to_string(),
+            files: {
+                let mut files = shared_sd15_files();
+                files.push(ModelFile {
+                    hf_repo: "SG161222/Realistic_Vision_V5.1_noVAE".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_438_167_536,
+                    gated: false,
+                    sha256: Some(
+                        "4e0868e8fcae7d4ea8f8cdd3051704b3b47d741dc8e8629552d1a07f6efb8e32",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.5,
+                width: 512,
+                height: 512,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ]
+}
+
+/// Shared SDXL component files (VAE, dual-CLIP encoders, tokenizers) — identical across all SDXL models.
+fn shared_sdxl_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "madebyollin/sdxl-vae-fp16-fix".to_string(),
+            hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 334_643_268,
+            gated: false,
+            sha256: Some("1b909373b28f2137098b0fd9dbc6f97f8410854f31f84ddc9fa04b077b0ace2c"),
+        },
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
+            hf_filename: "text_encoder/model.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder,
+            size_bytes: 492_265_168,
+            gated: false,
+            sha256: Some("5c3d6454dd2d23414b56aa1b5858a72487a656937847b6fea8d0606d7a42cdbc"),
+        },
+        ModelFile {
+            hf_repo: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
+            hf_filename: "text_encoder_2/model.safetensors".to_string(),
+            component: ModelComponent::ClipEncoder2,
+            size_bytes: 2_778_702_264,
+            gated: false,
+            sha256: Some("3a6032f63d37ae02bbc74ccd6a27440578cd71701f96532229d0154f55a8d3ff"),
+        },
+        ModelFile {
+            hf_repo: "openai/clip-vit-large-patch14".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None, // non-LFS file, no SHA-256 from HF API
+        },
+        ModelFile {
+            hf_repo: "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::ClipTokenizer2,
+            size_bytes: 2_224_003,
+            gated: false,
+            sha256: None, // non-LFS file, no SHA-256 from HF API
+        },
+    ]
+}
+
+/// All known SDXL model manifests.
+fn sdxl_manifests() -> Vec<ModelManifest> {
+    vec![
+        // --- Standard SDXL (DDIM scheduler, 20-30 steps, guidance 7.5) ---
+        ModelManifest {
+            name: "sdxl-base:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "SDXL Base 1.0 — official Stability AI base model".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "stabilityai/stable-diffusion-xl-base-1.0".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "83e012a805b84c7ca28e5646747c90a243c65c8ba4f070e2d7ddc9d74661e139",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "dreamshaper-xl:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "DreamShaper XL — fantasy, concept art, stylized".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "Lykon/dreamshaper-xl-v2-turbo".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "c1217e273e6fd7570c2ae9d38172323ff0b6f8ac7f2000b3ba99d4851906ee1e",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 8,
+                guidance: 2.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EulerAncestral),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "juggernaut-xl:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "Juggernaut XL — photorealism, cinematic lighting".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "RunDiffusion/Juggernaut-XL-v9".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "cf1ee18eb36712683f50c1e674634875e2adf7413d7492d5f9aa7e69e1a8c17a",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 30,
+                guidance: 7.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "realvis-xl:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "RealVisXL V5.0 — photorealism, versatile subjects".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "SG161222/RealVisXL_V5.0".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "ea10386073d39ffdde9fda426745b3f5e9dcd2af204c128ece0f4ea84570ffee",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.5,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::Ddim),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "playground-v2.5:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "Playground v2.5 — aesthetic quality, artistic".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "playgroundai/playground-v2.5-1024px-aesthetic".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "933778ce76c1fc0ca918b37e1488411b8a99bbd3279c12f527a3ac995a340864",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 50,
+                guidance: 3.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EdmDpmPp2m),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // --- Pony / CyberRealistic (standard SDXL architecture, anime/art/photorealistic) ---
+        ModelManifest {
+            name: "pony-v6:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "Pony Diffusion V6 XL — anime, art, stylized generation".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "kitty7779/ponyDiffusionV6XL".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EulerAncestral),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "cyberrealistic-pony:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "CyberRealistic Pony v16 — photorealistic Pony fine-tune".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "LillyCherry/cyberrealisticPony_v160".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 25,
+                guidance: 7.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EulerAncestral),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // --- Turbo SDXL (Euler Ancestral, 1-4 steps, guidance 0.0) ---
+        ModelManifest {
+            name: "sdxl-turbo:fp16".to_string(),
+            family: "sdxl".to_string(),
+            description: "SDXL Turbo — ultra-fast 1-4 step generation".to_string(),
+            files: {
+                let mut files = shared_sdxl_files();
+                files.push(ModelFile {
+                    hf_repo: "stabilityai/sdxl-turbo".to_string(),
+                    hf_filename: "unet/diffusion_pytorch_model.fp16.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_135_149_760,
+                    gated: false,
+                    sha256: Some(
+                        "48fa46161a745f48d4054df3fe13804ee255486bca893403b60373c188fd1bdb",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 0.0,
+                width: 512,
+                height: 512,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EulerAncestral),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ]
+}
+
+/// Shared Z-Image component files (Qwen3 text encoder, VAE, tokenizer) — identical across all Z-Image models.
+fn shared_zimage_files() -> Vec<ModelFile> {
+    vec![
+        // Qwen3 text encoder (3 shards)
+        ModelFile {
+            hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00003.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 3_957_900_840,
+            gated: false,
+            sha256: Some("328a91d3122359d5547f9d79521205bc0a46e1f79a792dfe650e99fc2d651223"),
+        },
+        ModelFile {
+            hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00003.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 3_987_450_520,
+            gated: false,
+            sha256: Some("6cd087b316306a68c562436b5492edbcf6e16c6dba3a1308279caa5a58e21ca5"),
+        },
+        ModelFile {
+            hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+            hf_filename: "text_encoder/model-00003-of-00003.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 99_630_640,
+            gated: false,
+            sha256: Some("7ca841ee75b9c61267c0c6148fd8d096d3d21b6d3e161256a9b878154f91fc52"),
+        },
+        // VAE
+        ModelFile {
+            hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 167_666_902,
+            gated: false,
+            sha256: Some("f5b59a26851551b67ae1fe58d32e76486e1e812def4696a4bea97f16604d40a3"),
+        },
+        // Qwen3 tokenizer
+        ModelFile {
+            hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+            hf_filename: "tokenizer/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 11_422_654,
+            gated: false,
+            sha256: Some("aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
+        },
+    ]
+}
+
+/// All known Z-Image model manifests.
+fn zimage_manifests() -> Vec<ModelManifest> {
+    vec![
+        // BF16 full precision
+        ModelManifest {
+            name: "z-image-turbo:bf16".to_string(),
+            family: "z-image".to_string(),
+            description: "Z-Image Turbo BF16 — 9-step, Alibaba flow-matching".to_string(),
+            files: {
+                let mut files = shared_zimage_files();
+                // Transformer shards (3 files)
+                files.push(ModelFile {
+                    hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00001-of-00003.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_973_693_184,
+                    gated: false,
+                    sha256: Some(
+                        "95facd593e2549e8252acb571c653d57f7ddb7f1060d4e81712f152555a88804",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00002-of-00003.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_973_693_184,
+                    gated: false,
+                    sha256: Some(
+                        "a4bbe43ee184a1fb5af4b412d27555f532893bdc3165b1149e304ed82b5d7015",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Tongyi-MAI/Z-Image-Turbo".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00003-of-00003.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 4_670_000_000, // ~4.67GB
+                    gated: false,
+                    sha256: Some(
+                        "aba4e37a590e63210878160a718d916d80398f4e1f78ab6c9b2b2a00d92769fa",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 9,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // GGUF quantized variants (transformer only; shared components are always BF16)
+        ModelManifest {
+            name: "z-image-turbo:q8".to_string(),
+            family: "z-image".to_string(),
+            description: "Z-Image Turbo Q8 — GGUF source, dense runtime fallback".to_string(),
+            files: {
+                let mut files = shared_zimage_files();
+                files.push(ModelFile {
+                    hf_repo: "leejet/Z-Image-Turbo-GGUF".to_string(),
+                    hf_filename: "z_image_turbo-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 6_577_440_704,
+                    gated: false,
+                    sha256: Some(
+                        "df1c5baa86d1398c979495a6072dbcee79444fdb884a2445582ba0769c44e9a1",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 9,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "z-image-turbo:q6".to_string(),
+            family: "z-image".to_string(),
+            description: "Z-Image Turbo Q6 — GGUF source, dense runtime fallback".to_string(),
+            files: {
+                let mut files = shared_zimage_files();
+                files.push(ModelFile {
+                    hf_repo: "leejet/Z-Image-Turbo-GGUF".to_string(),
+                    hf_filename: "z_image_turbo-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_263_239_104,
+                    gated: false,
+                    sha256: Some(
+                        "319f627beac8059b7546f36a7b4d5097b7f4ee6a1fc37585d0f75ca1d12d01af",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 9,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "z-image-turbo:q4".to_string(),
+            family: "z-image".to_string(),
+            description: "Z-Image Turbo Q4 — GGUF source, dense runtime fallback".to_string(),
+            files: {
+                let mut files = shared_zimage_files();
+                files.push(ModelFile {
+                    hf_repo: "leejet/Z-Image-Turbo-GGUF".to_string(),
+                    hf_filename: "z_image_turbo-Q4_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_683_370_944,
+                    gated: false,
+                    sha256: Some(
+                        "14b375ab4f226bc5378f68f37e899ef3c2242b8541e61e2bc1aff40976086fbd",
+                    ),
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 9,
+                guidance: 0.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ]
+}
+
+/// Shared Flux.2 Klein-4B component files (Qwen3 text encoder, VAE, tokenizer).
+///
+/// Klein uses Qwen3 (hidden_size=2560, 36 layers) — same model architecture as Z-Image's
+/// text encoder. The encoder stacks 3 hidden state outputs to produce joint_attention_dim=7680.
+fn shared_flux2_files() -> Vec<ModelFile> {
+    vec![
+        // Qwen3 text encoder shard 1 (from the Klein repo, 2 shards)
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00002.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_967_215_360,
+            gated: false,
+            sha256: None,
+        },
+        // Qwen3 text encoder shard 2
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00002.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 3_077_766_632,
+            gated: false,
+            sha256: None,
+        },
+        // VAE
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 168_120_878,
+            gated: false,
+            sha256: None,
+        },
+        // Qwen3 tokenizer
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+            hf_filename: "tokenizer/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 11_422_654,
+            gated: false,
+            sha256: None,
+        },
+    ]
+}
+
+/// Runtime assets for the gated FLUX.2 [dev] checkpoint.
+///
+/// The official Mistral3 conditioner concatenates hidden states after decoder
+/// layers 10, 20, and 30 (zero-based hidden-state indices 10/20/30). Shards
+/// 9-10 contain only later decoder layers and the unused language-model head,
+/// so downloading them would add bytes that can never affect Mold output.
+fn shared_flux2_dev_files() -> Vec<ModelFile> {
+    const REPO: &str = "black-forest-labs/FLUX.2-dev";
+    const TEXT_SHARDS: [(&str, u64, &str); 8] = [
+        (
+            "text_encoder/model-00001-of-00010.safetensors",
+            4_883_550_696,
+            "91831c2ce219df0ce63bc33c6249e5cb01db8d93816bcebf975f1c406286520e",
+        ),
+        (
+            "text_encoder/model-00002-of-00010.safetensors",
+            4_781_593_336,
+            "8ffe80706a66b2f5ef1fb058806ccf09f124ec4ad38af7a377e44ab1ee2fd664",
+        ),
+        (
+            "text_encoder/model-00003-of-00010.safetensors",
+            4_886_472_224,
+            "99ec66e891f9563f568734eadfc5b7701e04620e8e163d4d5755277a3b50cf2f",
+        ),
+        (
+            "text_encoder/model-00004-of-00010.safetensors",
+            4_781_593_376,
+            "e1df1527b12b1eb5cbd9a50914f9e6eb24e885ec830a3c16b5eed6ad0b53a396",
+        ),
+        (
+            "text_encoder/model-00005-of-00010.safetensors",
+            4_781_593_368,
+            "3556ac03f47c24eb8ad27c237e25baad639c651d9596fd72cb1523137bf56163",
+        ),
+        (
+            "text_encoder/model-00006-of-00010.safetensors",
+            4_886_472_248,
+            "2c41e6f80f2b5ca384ce703eac048a13daf2aff689c3acca66a8943f45338aae",
+        ),
+        (
+            "text_encoder/model-00007-of-00010.safetensors",
+            4_781_593_376,
+            "62a725f154f6ba942a36b5cc450db2b2df32f434e3224558c789bc04fa05fd36",
+        ),
+        (
+            "text_encoder/model-00008-of-00010.safetensors",
+            4_781_593_368,
+            "3a1a6ac77e6434418bb7273b68a7b3534fed5217c990061c92a8f990dd6ab20e",
+        ),
+    ];
+
+    let mut files = TEXT_SHARDS
+        .into_iter()
+        .map(|(hf_filename, size_bytes, sha256)| ModelFile {
+            hf_repo: REPO.to_string(),
+            hf_filename: hf_filename.to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes,
+            gated: true,
+            sha256: Some(sha256),
+        })
+        .collect::<Vec<_>>();
+    files.extend([
+        ModelFile {
+            hf_repo: REPO.to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 336_213_556,
+            gated: true,
+            sha256: Some("d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5"),
+        },
+        ModelFile {
+            hf_repo: REPO.to_string(),
+            hf_filename: "tokenizer/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 17_078_037,
+            gated: true,
+            sha256: Some("b76085f9923309d873994d444989f7eb6ec074b06f25b58f1e8d7b7741070949"),
+        },
+    ]);
+    files
+}
+
+/// All known Flux.2 model manifests.
+fn flux2_manifests() -> Vec<ModelManifest> {
+    let mut manifests = vec![
+        // Flux.2 Klein-4B BF16 (Apache 2.0, NOT gated)
+        ModelManifest {
+            name: "flux2-klein:bf16".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-4B BF16 — Apache 2.0, 4B param distilled flow-matching"
+                .to_string(),
+            files: {
+                let mut files = shared_flux2_files();
+                files.push(ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_751_109_744,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None, // Uses flow-matching Euler
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // Flux.2 Klein-4B GGUF quantizations (from unsloth, Apache 2.0)
+        ModelManifest {
+            name: "flux2-klein:q8".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-4B Q8 GGUF — smaller download, reduced quality".to_string(),
+            files: {
+                let mut files = shared_flux2_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-4B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-4b-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 4_300_644_928,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux2-klein:q6".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-4B Q6 GGUF — smaller download, reduced quality".to_string(),
+            files: {
+                let mut files = shared_flux2_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-4B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-4b-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_409_273_408,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux2-klein:q4".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-4B Q4 GGUF — smallest download, reduced quality".to_string(),
+            files: {
+                let mut files = shared_flux2_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-4B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-4b-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 2_604_311_104,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // ── Flux.2 Klein-9B (distilled, Non-Commercial) ─────────────────────
+        // Klein-9B uses Qwen3-8B (hidden_size=4096) vs Klein-4B's Qwen3-4B (2560).
+        ModelManifest {
+            name: "flux2-klein-9b:bf16".to_string(),
+            family: "flux2".to_string(),
+            description:
+                "Flux.2 Klein-9B BF16 — 9B param distilled, sub-second generation on RTX 4090"
+                    .to_string(),
+            files: {
+                let mut files = shared_flux2_9b_files();
+                files.push(ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_801_069_272,
+                    gated: true,
+                    sha256: None,
+                });
+                files.push(ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 8_356_121_608,
+                    gated: true,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux2-klein-9b:q8".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-9B Q8 GGUF — best quantized quality".to_string(),
+            files: {
+                let mut files = shared_flux2_9b_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-9B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-9b-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_978_304_800,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux2-klein-9b:q6".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-9B Q6 GGUF — good quality/size trade-off".to_string(),
+            files: {
+                let mut files = shared_flux2_9b_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-9B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-9b-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_865_424_160,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "flux2-klein-9b:q4".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-9B Q4 GGUF — smallest footprint".to_string(),
+            files: {
+                let mut files = shared_flux2_9b_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/FLUX.2-klein-9B-GGUF".to_string(),
+                    hf_filename: "flux-2-klein-9b-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_909_829_920,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1024,
+                height: 1024,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+    ];
+
+    const REPO: &str = "black-forest-labs/FLUX.2-dev";
+    const TRANSFORMER_SHARDS: [(&str, u64, &str); 7] = [
+        (
+            "transformer/diffusion_pytorch_model-00001-of-00007.safetensors",
+            9_935_797_200,
+            "9d9b85f75f72fb17c7d29dacf7c430e924da93122d578a559a36a7635e153714",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00002-of-00007.safetensors",
+            9_890_181_048,
+            "86adf6f41474b00bd57afbb29a09f008be7d6af8ae914956585ba5bc6bf97c28",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00003-of-00007.safetensors",
+            9_814_681_480,
+            "a14e26e8f305dd26d7881f333e6e6ce5b562cbb55282538f46d38e1ff2715179",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00004-of-00007.safetensors",
+            9_814_681_536,
+            "5c4f38976fd8d7e5fb2d4cd20562d74eebba3264566987e3ef938d807c75be90",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00005-of-00007.safetensors",
+            9_814_681_536,
+            "4d7a74d916fc22117cde8bad76aa4b561e6dc92368cddc23bdae06dbc586ad95",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00006-of-00007.safetensors",
+            9_814_681_536,
+            "08f3ad03610651f9d630177ac3a4770d532fa72d788d3b36c39a0301b1595447",
+        ),
+        (
+            "transformer/diffusion_pytorch_model-00007-of-00007.safetensors",
+            5_361_898_792,
+            "789b9bacb607e9b97597f77c86056fa6cbb747c2a6016588e6e196814b5f9733",
+        ),
+    ];
+    let mut files = shared_flux2_dev_files();
+    files.extend(
+        TRANSFORMER_SHARDS
+            .into_iter()
+            .map(|(hf_filename, size_bytes, sha256)| ModelFile {
+                hf_repo: REPO.to_string(),
+                hf_filename: hf_filename.to_string(),
+                component: ModelComponent::TransformerShard,
+                size_bytes,
+                gated: true,
+                sha256: Some(sha256),
+            }),
+    );
+    manifests.push(ModelManifest {
+        name: "flux2-dev:bf16".to_string(),
+        family: "flux2".to_string(),
+        description: "FLUX.2 [dev] BF16 — 32B guidance-distilled image generation and editing"
+            .to_string(),
+        files,
+        defaults: ManifestDefaults {
+            steps: 50,
+            guidance: 4.0,
+            width: 1024,
+            height: 1024,
+            is_schnell: false,
+            scheduler: None,
+            negative_prompt: None,
+            frames: None,
+            fps: None,
+            source_image: None,
+        },
+        hidden: false,
+    });
+
+    // ── FLUX.2 [dev] quantized tiers ────────────────────────────────────
+    // The BF16 tier above is gated end to end: BFL's `FLUX.2-dev` repo holds
+    // the transformer AND the Mistral3 encoder. These tiers pair an ungated
+    // transformer with `shared_flux2_dev_open_files()`, so the whole model is
+    // installable without a BFL license acceptance.
+    for (tag, filename, size, sha, description) in [
+        (
+            "q8",
+            "flux2-dev-Q8_0.gguf",
+            35_002_602_464u64,
+            "09d005300dd8dcbbd489bb75ada6254145c84c2c9c3d7cc1829e3c5dedcb42ce",
+            "FLUX.2 [dev] Q8 GGUF — near-BF16 quality, ~40 GB resident; needs a 46/48 GB-class GPU",
+        ),
+        (
+            "q6",
+            "flux2-dev-Q6_K.gguf",
+            27_396_232_160,
+            "0a662e0303d65b7da4741c7bc54bbccd4d7fc17b23e71ced36d177467f4a0ef1",
+            "FLUX.2 [dev] Q6 GGUF — ~33 GB resident; needs a 40 GB-class GPU",
+        ),
+        (
+            "q4",
+            "flux2-dev-Q4_K_M.gguf",
+            19_959_731_168,
+            "5f7ac6649e2f5e21a49a6f83931a67530bd887e2d34379c3da1d0f0406501de1",
+            "FLUX.2 [dev] Q4 GGUF — smallest dev tier, ~25 GB resident; needs a 32 GB-class GPU",
+        ),
+    ] {
+        let mut files = shared_flux2_dev_open_files();
+        files.push(ModelFile {
+            hf_repo: "unsloth/FLUX.2-dev-GGUF".to_string(),
+            hf_filename: filename.to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: size,
+            gated: false,
+            sha256: Some(sha),
+        });
+        manifests.push(ModelManifest {
+            name: format!("flux2-dev:{tag}"),
+            family: "flux2".to_string(),
+            description: description.to_string(),
+            files,
+            defaults: flux2_dev_defaults(),
+            hidden: false,
+        });
+    }
+
+    // Comfy-Org's mixed FP8: attention stays BF16, the MLP slabs are
+    // `float8_e4m3fn` with per-tensor `weight_scale` sidecars.
+    {
+        let mut files = shared_flux2_dev_open_files();
+        files.push(ModelFile {
+            hf_repo: "Comfy-Org/flux2-dev".to_string(),
+            hf_filename: "split_files/diffusion_models/flux2_dev_fp8mixed.safetensors".to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: 35_455_599_592,
+            gated: false,
+            sha256: Some("863a82e4ff950a42a6b0e80bea824828f129eb1a8fbbdbd9e8cb29859127b486"),
+        });
+        manifests.push(ModelManifest {
+            name: "flux2-dev:fp8".to_string(),
+            family: "flux2".to_string(),
+            description: "FLUX.2 [dev] FP8 (mixed) — BF16 attention, FP8 MLP; one file, \
+                 loads whole, ~41 GB resident; needs a 46/48 GB-class GPU"
+                .to_string(),
+            files,
+            defaults: flux2_dev_defaults(),
+            hidden: false,
+        });
+    }
+
+    // ── FLUX.2 [klein] FP8 tiers (BFL's own conversions) ────────────────
+    {
+        let mut files = shared_flux2_files();
+        files.push(ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-4b-fp8".to_string(),
+            hf_filename: "flux-2-klein-4b-fp8.safetensors".to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: 4_070_624_520,
+            gated: false,
+            sha256: Some("97ed34fe0567e436200f2faee3939b88f2b5d99f8af2a4dc16532c4245c0ccb6"),
+        });
+        manifests.push(ModelManifest {
+            name: "flux2-klein:fp8".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-4B FP8 — Apache 2.0, BFL's own FP8 conversion".to_string(),
+            files,
+            defaults: flux2_klein_defaults(),
+            hidden: false,
+        });
+    }
+    {
+        let mut files = shared_flux2_9b_files();
+        files.push(ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9b-fp8".to_string(),
+            hf_filename: "flux-2-klein-9b-fp8.safetensors".to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: 9_433_061_528,
+            gated: true,
+            sha256: Some("865ba09f5b4c3cbd3468a4bd3acb9fcb2f8740c54317482f0bcd4ed1d3655cee"),
+        });
+        manifests.push(ModelManifest {
+            name: "flux2-klein-9b:fp8".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-9B FP8 — BFL's own FP8 conversion".to_string(),
+            files,
+            defaults: flux2_klein_defaults(),
+            hidden: false,
+        });
+    }
+
+    manifests.extend(flux2_klein_base_manifests());
+    manifests
+}
+
+/// Shared defaults for the guidance-distilled FLUX.2 [dev] tiers.
+fn flux2_dev_defaults() -> ManifestDefaults {
+    ManifestDefaults {
+        steps: 50,
+        guidance: 4.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    }
+}
+
+/// Shared defaults for the step-distilled FLUX.2 [klein] tiers.
+fn flux2_klein_defaults() -> ManifestDefaults {
+    ManifestDefaults {
+        steps: 4,
+        guidance: 1.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    }
+}
+
+/// Shared defaults for the undistilled FLUX.2 [klein] base tiers.
+///
+/// `guidance_scale=4.0, num_inference_steps=50` is the model card's own
+/// recipe, and 4.0 is a TRUE-CFG scale here: these checkpoints carry
+/// `guidance_embeds: false`, so `diffusers`'
+/// `pipeline_flux2_klein.py:593` runs an unconditional branch whenever
+/// `guidance_scale > 1` instead of feeding a guidance embedding.
+fn flux2_klein_base_defaults() -> ManifestDefaults {
+    ManifestDefaults {
+        steps: 50,
+        guidance: 4.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    }
+}
+
+/// Ungated runtime assets for FLUX.2 [dev].
+///
+/// BFL's `FLUX.2-dev` repo is license-gated, which would put every dev tier —
+/// including the ungated community quantizations — behind an access request.
+/// Comfy-Org republishes the same VAE (its sha256 is byte-identical to the
+/// gated file pinned in `shared_flux2_dev_files`) and a Mistral3 encoder
+/// whose language model is already pruned to layers 0-29 plus `model.norm` —
+/// exactly the prefix `encoders::mistral3` streams, since it captures hidden
+/// states after layers 10/20/30. It also carries the vision tower and
+/// projector, which the streamed loader never requests and an mmap therefore
+/// never pages in. Keys are HF-native (`model.layers.N.*`) rather than BFL's
+/// `language_model.model.*`, which the loader resolves from the header.
+/// The tekken tokenizer comes from unsloth's ungated Mistral-Small mirror.
+fn shared_flux2_dev_open_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "Comfy-Org/flux2-dev".to_string(),
+            hf_filename: "split_files/text_encoders/mistral_3_small_flux2_bf16.safetensors"
+                .to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 35_584_897_447,
+            gated: false,
+            sha256: Some("7d79902f60b1aeb3a6de2cfad02f4367b5e300a1387de3d03ac717cfa3df117c"),
+        },
+        ModelFile {
+            hf_repo: "Comfy-Org/flux2-dev".to_string(),
+            hf_filename: "split_files/vae/flux2-vae.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 336_213_556,
+            gated: false,
+            sha256: Some("d64f3a68e1cc4f9f4e29b6e0da38a0204fe9a49f2d4053f0ec1fa1ca02f9c4b5"),
+        },
+        ModelFile {
+            hf_repo: "unsloth/Mistral-Small-3.2-24B-Instruct-2506".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 17_078_019,
+            gated: false,
+            sha256: Some("23ad081f384b2bdb3c97f6e5461dfce52c1174c7328854a55006988f0fef9da7"),
+        },
+    ]
+}
+
+/// FLUX.2 [klein] base — the undistilled checkpoints.
+///
+/// Architecturally identical to the distilled Klein tiers (`transformer/
+/// config.json` is byte-for-byte the same, `guidance_embeds: false`), so they
+/// reuse `Flux2Config::klein()` / `klein_9b()` and the same Qwen3 encoders.
+/// What differs is sampling: no step or guidance distillation, so they take
+/// ~50 steps and real classifier-free guidance with a negative prompt.
+fn flux2_klein_base_manifests() -> Vec<ModelManifest> {
+    let mut manifests = Vec::new();
+
+    // 4B base — Apache 2.0, ungated, Qwen3-4B encoder shared with Klein-4B.
+    {
+        let mut files = shared_flux2_files();
+        files.push(ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-base-4B".to_string(),
+            hf_filename: "transformer/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: 7_751_109_744,
+            gated: false,
+            sha256: Some("e109674697ffa1a3983126e32512f5428a9442bd8df59f9c95566ee90a473bb6"),
+        });
+        manifests.push(ModelManifest {
+            name: "flux2-klein-base:bf16".to_string(),
+            family: "flux2".to_string(),
+            description:
+                "Flux.2 Klein-4B Base BF16 — Apache 2.0, undistilled, true CFG for fine-tuning"
+                    .to_string(),
+            files,
+            defaults: flux2_klein_base_defaults(),
+            hidden: false,
+        });
+    }
+    for (tag, filename, size, sha, quality) in [
+        (
+            "q8",
+            "flux-2-klein-base-4b-Q8_0.gguf",
+            4_300_644_928u64,
+            "77e37664ca374e6d30271c9ce2fed0ebf348e3c276333de7187957961a5b17db",
+            "near-BF16 quality",
+        ),
+        (
+            "q6",
+            "flux-2-klein-base-4b-Q6_K.gguf",
+            3_409_273_408,
+            "d3766256c3ecd90b85f5a84d2ebe4825e3d7889d334b84423c344424d197b4ce",
+            "smaller download",
+        ),
+        (
+            "q4",
+            "flux-2-klein-base-4b-Q4_K_M.gguf",
+            2_604_311_104,
+            "8348ff1f2b3ac3cf9eb62f38322fcbb6d92811d39aa036d0671cf7bef9411266",
+            "smallest download",
+        ),
+    ] {
+        let mut files = shared_flux2_files();
+        files.push(ModelFile {
+            hf_repo: "unsloth/FLUX.2-klein-base-4B-GGUF".to_string(),
+            hf_filename: filename.to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: size,
+            gated: false,
+            sha256: Some(sha),
+        });
+        manifests.push(ModelManifest {
+            name: format!("flux2-klein-base:{tag}"),
+            family: "flux2".to_string(),
+            description: format!(
+                "Flux.2 Klein-4B Base {} GGUF — undistilled, {quality}",
+                tag.to_uppercase()
+            ),
+            files,
+            defaults: flux2_klein_base_defaults(),
+            hidden: false,
+        });
+    }
+
+    // 9B base — gated like Klein-9B, Qwen3-8B encoder shared with it.
+    {
+        let mut files = shared_flux2_9b_files();
+        for (filename, size, sha) in [
+            (
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+                9_801_069_272u64,
+                "1f63382abfccc0a8cbd034555010ebe9f94c5a33ffcc55ac08900ef2893e57b8",
+            ),
+            (
+                "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+                8_356_121_608,
+                "d891d8c65a14816e84148cb81d9455acd666f66ef703df497659ff0b1c1516ca",
+            ),
+        ] {
+            files.push(ModelFile {
+                hf_repo: "black-forest-labs/FLUX.2-klein-base-9B".to_string(),
+                hf_filename: filename.to_string(),
+                component: ModelComponent::TransformerShard,
+                size_bytes: size,
+                gated: true,
+                sha256: Some(sha),
+            });
+        }
+        manifests.push(ModelManifest {
+            name: "flux2-klein-base-9b:bf16".to_string(),
+            family: "flux2".to_string(),
+            description: "Flux.2 Klein-9B Base BF16 — undistilled, true CFG".to_string(),
+            files,
+            defaults: flux2_klein_base_defaults(),
+            hidden: false,
+        });
+    }
+    for (tag, filename, size, sha, quality) in [
+        (
+            "q8",
+            "flux-2-klein-base-9b-Q8_0.gguf",
+            9_978_304_800u64,
+            "0f625ee27883d25379e897ea7b4328ec13376455bf6c2159f3aef7a801c88f10",
+            "near-BF16 quality",
+        ),
+        (
+            "q6",
+            "flux-2-klein-base-9b-Q6_K.gguf",
+            7_865_424_160,
+            "3b8dd7d0f63d2f8ac6bfffc6b8239dcc614dd7c0344930b10779624591bdfda3",
+            "smaller download",
+        ),
+        (
+            "q4",
+            "flux-2-klein-base-9b-Q4_K_M.gguf",
+            5_909_829_920,
+            "70395338f2cb3647b6a259d3cc60e42d9adf0bbbc56a5ae95338389c1c8bb497",
+            "smallest download",
+        ),
+    ] {
+        let mut files = shared_flux2_9b_files();
+        files.push(ModelFile {
+            hf_repo: "unsloth/FLUX.2-klein-base-9B-GGUF".to_string(),
+            hf_filename: filename.to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: size,
+            gated: false,
+            sha256: Some(sha),
+        });
+        manifests.push(ModelManifest {
+            name: format!("flux2-klein-base-9b:{tag}"),
+            family: "flux2".to_string(),
+            description: format!(
+                "Flux.2 Klein-9B Base {} GGUF — undistilled, {quality}",
+                tag.to_uppercase()
+            ),
+            files,
+            defaults: flux2_klein_base_defaults(),
+            hidden: false,
+        });
+    }
+
+    manifests
+}
+
+/// Shared Flux.2 Klein-9B component files (Qwen3 text encoder 4 shards, VAE, tokenizer).
+///
+/// Klein-9B uses a larger Qwen3 encoder (hidden_size=4096, 4 shards) than Klein-4B
+/// (hidden_size=2560, 2 shards). The VAE and tokenizer format are the same.
+/// The text encoder and tokenizer come from the gated klein-9B repo.
+fn shared_flux2_9b_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_902_257_696,
+            gated: true,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_915_960_368,
+            gated: true,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_983_068_496,
+            gated: true,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 1_580_230_264,
+            gated: true,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 168_120_878,
+            gated: true,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+            hf_filename: "tokenizer/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 11_422_654,
+            gated: true,
+            sha256: None,
+        },
+    ]
+}
+
+/// Shared base Qwen-Image component files (VAE, text encoder shards, tokenizer).
+fn shared_qwen_image_base_files() -> Vec<ModelFile> {
+    vec![
+        // VAE
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 253_806_966,
+            gated: false,
+            sha256: None,
+        },
+        // Qwen2.5-VL text encoder shards
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_968_243_304,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_991_495_816,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image".to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_932_751_040,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image".to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 1_691_924_384,
+            gated: false,
+            sha256: None,
+        },
+        // Tokenizer shared across both Qwen-Image releases.
+        ModelFile {
+            hf_repo: "Qwen/Qwen2.5-7B".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 7_031_645,
+            gated: false,
+            sha256: None,
+        },
+    ]
+}
+
+/// Shared Qwen-Image-2512 component files (VAE, text encoder shards, tokenizer).
+fn shared_qwen_image_2512_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 253_806_966,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_968_243_304,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_991_495_816,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_932_751_040,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 1_691_924_384,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen2.5-7B".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 7_031_645,
+            gated: false,
+            sha256: None,
+        },
+    ]
+}
+
+/// Shared Qwen-Image-Edit-2511 component files (VAE, text encoder shards, tokenizer).
+fn shared_qwen_image_edit_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 253_806_966,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_968_243_304,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_991_495_816,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_932_751_040,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 1_691_924_384,
+            gated: false,
+            sha256: None,
+        },
+        ModelFile {
+            hf_repo: "Qwen/Qwen2.5-7B".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 7_031_645,
+            gated: false,
+            sha256: None,
+        },
+    ]
+}
+
+/// The official Qwen Image 2.1 repository. Every file below is pinned by its
+/// LFS digest from revision `b3179ad355be050328e483a9dfdd9e60cd62adfa` (the
+/// weights are byte-identical at the later README-only revisions).
+pub const QWEN_IMAGE21_REPO: &str = "Qwen/Qwen-Image-2.1";
+
+/// The Viggle 6-step turbo LoRA repository, pinned at revision
+/// `bb26a0f38e5fe6c124aaccc9187a87eed5d9ed13`. Published under the Qwen
+/// Research License (its `LICENSE` is byte-identical to the base model's).
+pub const QWEN_IMAGE21_VIGGLE_TURBO_REPO: &str = "Viggle/Qwen-Image-2.1-viggle-turbo";
+
+/// The r256 v0.2.1 6-step adapter the turbo tiers carry.
+pub const QWEN_IMAGE21_VIGGLE_TURBO_LORA: &str =
+    "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256.safetensors";
+
+/// Every tier's shared runtime: the Qwen3-VL conditioner (language model and
+/// vision tower in one set of BF16 shards — the vision tower is always read
+/// from these, whatever the transformer tier), the RGBA VAE, and the
+/// processor tokenizer. Non-transformer components route to
+/// `shared/qwen-image21/`, so a host downloads them once for every tier.
+pub fn shared_qwen_image21_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+            component: ModelComponent::Vae,
+            size_bytes: 1_350_989_512,
+            gated: false,
+            sha256: Some("a07a1b7c4ee2966a1b3bdc37de9b4f983d56937e46619f709a80b6e490675417"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_998_056_552,
+            gated: false,
+            sha256: Some("dde00291b5f7fb92013895310a3da0ddba78674df9f10d505d375243dc01fc6f"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_915_962_464,
+            gated: false,
+            sha256: Some("9047faccc0a6d98496a52d55f27be1c94a9c259d1e283fbea0128d054a948d42"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 4_915_962_496,
+            gated: false,
+            sha256: Some("8c54187654c0176b73ae73785bf791dc9a14c9df7fb4310083a09d42048cb57e"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 2_704_357_976,
+            gated: false,
+            sha256: Some("5311532aaaeae3259eb6a7b2c600636be1159adf7ded35f53579f7d0e7d43cdd"),
+        },
+        ModelFile {
+            hf_repo: QWEN_IMAGE21_REPO.to_string(),
+            hf_filename: "processor/tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 11_422_654,
+            gated: false,
+            sha256: Some("aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"),
+        },
+    ]
+}
+
+/// One Qwen Image 2.1 transformer tier: its tag, a one-line description, and
+/// its transformer file(s).
+struct QwenImage21Tier {
+    tag: &'static str,
+    description: &'static str,
+    transformer: Vec<ModelFile>,
+}
+
+fn qwen_image21_tiers() -> Vec<QwenImage21Tier> {
+    let gguf = |file: &str, size_bytes: u64, sha256: &'static str| ModelFile {
+        // stable-diffusion.cpp's author publishes these, so the same GGUF runs
+        // under a reference implementation on the same GPU (the Z-Image
+        // precedent). Revision `cc11433936a06e9765f7c0c0b1f0436cfd2b9856`.
+        hf_repo: "leejet/Qwen-Image-2.1-GGUF".to_string(),
+        hf_filename: file.to_string(),
+        component: ModelComponent::Transformer,
+        size_bytes,
+        gated: false,
+        sha256: Some(sha256),
+    };
+    vec![
+        QwenImage21Tier {
+            tag: "bf16",
+            description:
+                "Qwen Image 2.1 BF16 — Qwen3-VL conditioner and 32-block causal-condition transformer",
+            transformer: vec![
+                ModelFile {
+                    hf_repo: QWEN_IMAGE21_REPO.to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_968_332_504,
+                    gated: false,
+                    sha256: Some(
+                        "9e6bc2d641e67bf277895ea8777141044a38f3edb7101bc469b2961dd7c36b4b",
+                    ),
+                },
+                ModelFile {
+                    hf_repo: QWEN_IMAGE21_REPO.to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 4_261_951_904,
+                    gated: false,
+                    sha256: Some(
+                        "3aaf234dcbe128530479735854a346b5e3e66283b7c11db56f836bbd1c13ebaa",
+                    ),
+                },
+            ],
+        },
+        QwenImage21Tier {
+            tag: "int8-conv",
+            description: "Qwen Image 2.1 INT8 ConvRot — Comfy-Org's W8A8 transformer (7.3 GB)",
+            // Comfy-Org revision `9a44dbdb47cefd046be9c0a13476192f34c8db8e`.
+            // Blocks are I8 with per-row F32 scales; non-block layers stay BF16.
+            transformer: vec![ModelFile {
+                hf_repo: "Comfy-Org/Qwen-Image-2.1".to_string(),
+                hf_filename: "diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+                    .to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 7_256_783_064,
+                gated: false,
+                sha256: Some("cb74113cb03faecd79611b01fd7fd642f0aa60d6f0b95086abee214d75eaa57d"),
+            }],
+        },
+        QwenImage21Tier {
+            tag: "fp8",
+            description: "Qwen Image 2.1 FP8 — unsloth's row-scaled F8E4M3 transformer (7.1 GB)",
+            // unsloth revision `d67caebb412f98c968f9be41b3a8cea80b3e039a`:
+            // torchao `_weight_qdata` (F8E4M3) plus per-row `_weight_scale`.
+            transformer: vec![ModelFile {
+                hf_repo: "unsloth/Qwen-Image-2.1-FP8".to_string(),
+                hf_filename: "Qwen-Image-2.1-FP8.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 7_122_877_560,
+                gated: false,
+                sha256: Some("70e151cfbedd37de7f4a11bda8f58180965c85f4960584c3d10acff599fcd205"),
+            }],
+        },
+        QwenImage21Tier {
+            tag: "q8",
+            description: "Qwen Image 2.1 Q8_0 GGUF transformer (7.7 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q8_0.gguf",
+                7_687_155_744,
+                "f8b244b00937f0e444a40dbf7866460871b89b30142594973b6012d1b471dc0a",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q6",
+            description: "Qwen Image 2.1 Q6_K GGUF transformer (6.0 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q6_K.gguf",
+                5_996_851_232,
+                "1c51d1a8e6cf2b215719dea0c4f0f4cbfff9214a1c7571e57913f57d6a9c3c12",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q5",
+            description: "Qwen Image 2.1 Q5_0 GGUF transformer (5.1 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q5_0.gguf",
+                5_069_910_048,
+                "8dfeb1ee091a5d7c7d8191f69723254f031de8fe67ec219a21bf7df57590ab43",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q4",
+            description: "Qwen Image 2.1 Q4_K GGUF transformer (4.2 GB)",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q4_K.gguf",
+                4_197_494_816,
+                "29f9c83c249ff0292fb2943fceddfa2319b446601866c82a4f8be062abea72c2",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q3",
+            description: "Qwen Image 2.1 Q3_K GGUF transformer (3.3 GB) — coherent, softer fine text",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q3_K.gguf",
+                3_270_553_632,
+                "5a6352cb450d334ba17a9d18c7fd8c3e774799245b9da0f963ce0c6624deb758",
+            )],
+        },
+        QwenImage21Tier {
+            tag: "q2",
+            description: "Qwen Image 2.1 Q2_K GGUF transformer (2.6 GB) — last resort for small cards; visibly degraded, lettering illegible",
+            transformer: vec![gguf(
+                "qwen_image_2.1-Q2_K.gguf",
+                2_561_716_256,
+                "5f79e41d3424abb230ee1486e1f4adab1b07c8c0fd10601fc402fe9890443fe6",
+            )],
+        },
+    ]
+}
+
+/// Why a Metal host cannot run `qwen-image-2.1:fp8`. Shared with the engine's
+/// load-time refusal (which answers by the checkpoint's format, for a renamed
+/// or config-registered file) so both doors say the same thing.
+pub const QWEN_IMAGE21_FP8_METAL_REFUSAL: &str = "qwen-image-2.1:fp8 needs CUDA: candle's Metal \
+     backend has no F8E4M3 cast kernel to widen its weights. Use qwen-image-2.1:int8-conv or a \
+     GGUF tier on Metal.";
+
+/// Manifest tiers a GPU backend cannot execute at all, by exact canonical
+/// name. Both are FP8 checkpoints whose engines widen F8E4M3 weights through a
+/// cast kernel candle's Metal backend does not have (Qwen Image 2.1's
+/// `Q21WeightSource::open`, Wan's `ScaledFp8Checkpoint::ensure_supported`);
+/// the engines still refuse by checkpoint format at load, and this table is
+/// what lets pull and admission refuse BEFORE the download.
+const BACKEND_REFUSED_TIERS: &[(&str, crate::GpuBackend)] = &[
+    ("qwen-image-2.1:fp8", crate::GpuBackend::Metal),
+    ("wan22-t2v-a14b:fp8", crate::GpuBackend::Metal),
+    ("wan22-i2v-a14b:fp8", crate::GpuBackend::Metal),
+];
+
+/// Why `backend` cannot execute the manifest tier `model`, or `None`.
+///
+/// The one authority `mold pull` (a local pull on a Metal build), the
+/// server's download routes and generation admission ask, so a Metal host
+/// refuses an FP8 tier before fetching gigabytes it can never load.
+pub fn backend_refusal(model: &str, backend: crate::GpuBackend) -> Option<String> {
+    let resolved = resolve_model_name(model);
+    let (name, _) = BACKEND_REFUSED_TIERS
+        .iter()
+        .find(|(name, refused)| *name == resolved && *refused == backend)?;
+    Some(if *name == "qwen-image-2.1:fp8" {
+        QWEN_IMAGE21_FP8_METAL_REFUSAL.to_string()
+    } else {
+        format!(
+            "{name} is fp8-scaled, which mold does not run on Metal — candle has no Metal fp8 \
+             widening kernel. Use a GGUF tier of this model instead."
+        )
+    })
+}
+
+/// The base tiers a turbo tag is offered on. Each turbo tag is the base
+/// tier's files plus the Viggle adapter, and shares the base tier's
+/// transformer bytes on disk (`storage_path`).
+pub const QWEN_IMAGE21_TURBO_TAGS: &[&str] = &["bf16", "int8-conv", "q8"];
+
+/// The six raw sigmas of Viggle's published 6-step recipe (the model card's
+/// diffusers example; `crates/mold-inference/testdata/qwen_image21/viggle_lora_layout.json`).
+/// The flow scheduler still applies its target-token `mu` shift to them;
+/// only `shift_terminal` is dropped.
+pub const QWEN_IMAGE21_TURBO_SIGMAS: [f64; 6] = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25];
+
+/// A turbo tier's fixed sampling recipe. Like [`WanDmdLadder`], every value
+/// is a property of the distillation, not a preference: the profile pins
+/// steps and guidance to it and the engine builds its schedule from it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QwenTurboSchedule {
+    /// Raw sigmas before the scheduler's `mu` shift; `sigmas.len()` is the
+    /// step count.
+    pub sigmas: &'static [f64],
+    /// `None`: the turbo recipe runs with `shift_terminal=None`, where the
+    /// base model's scheduler stretches to 0.02.
+    pub shift_terminal: Option<f64>,
+    /// `true_cfg_scale` — 1.0, one forward per step, no negative branch.
+    pub guidance: f64,
+    /// Scale the distilled adapter is installed at (alpha/rank from its
+    /// metadata still applies on top: 256/256 = 1).
+    pub lora_scale: f64,
+}
+
+impl QwenTurboSchedule {
+    pub fn steps(&self) -> u32 {
+        self.sigmas.len() as u32
+    }
+}
+
+/// Viggle's v0.2.1 6-step recipe (model card at `bb26a0f`).
+pub const QWEN_IMAGE21_VIGGLE_TURBO: QwenTurboSchedule = QwenTurboSchedule {
+    sigmas: &QWEN_IMAGE21_TURBO_SIGMAS,
+    shift_terminal: None,
+    guidance: 1.0,
+    lora_scale: 1.0,
+};
+
+/// The fixed recipe of a Qwen Image 2.1 turbo tier, or `None` for a tier that
+/// walks the ordinary schedule. The ONE authority, modelled on
+/// [`wan_dmd_ladder`]: the generation profile pins steps and guidance from
+/// it, admission refuses anything else, and the engine reads the sigmas,
+/// terminal shift and adapter scale from it.
+pub fn qwen_image21_turbo_schedule(model_name: &str) -> Option<QwenTurboSchedule> {
+    let resolved = resolve_model_name(model_name);
+    let (base, tag) = resolved.split_once(':')?;
+    (base == "qwen-image-2.1-turbo" && QWEN_IMAGE21_TURBO_TAGS.contains(&tag))
+        .then_some(QWEN_IMAGE21_VIGGLE_TURBO)
+}
+
+/// The base tier a turbo tag stacks its adapter on (`qwen-image-2.1-turbo:q8`
+/// → `qwen-image-2.1:q8`). Turbo storage lives under this identity, so a host
+/// holding the base tier pulls only the adapter.
+pub fn qwen_image21_turbo_base(model_name: &str) -> Option<String> {
+    let (base, tag) = model_name.split_once(':')?;
+    (base == "qwen-image-2.1-turbo" && QWEN_IMAGE21_TURBO_TAGS.contains(&tag))
+        .then(|| format!("qwen-image-2.1:{tag}"))
+}
+
+/// Qwen Image 2.1 has a distinct Qwen3-VL conditioner, transformer, and VAE
+/// layout from the older Qwen Image family. Keep its artifact graph separate:
+/// sharing a similarly named tokenizer or VAE would make a complete-looking
+/// install that cannot be loaded by either runtime.
+fn qwen_image21_manifests() -> Vec<ModelManifest> {
+    let base_defaults = ManifestDefaults {
+        steps: 40,
+        guidance: 1.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        // The `None` passthrough every edit family uses: references ride
+        // `edit_images` (`capabilities.reference_images`), which refuses
+        // `source_image` by name.
+        source_image: None,
+    };
+    let turbo_defaults = ManifestDefaults {
+        steps: QWEN_IMAGE21_VIGGLE_TURBO.steps(),
+        guidance: QWEN_IMAGE21_VIGGLE_TURBO.guidance,
+        ..base_defaults.clone()
+    };
+    let turbo_lora = ModelFile {
+        hf_repo: QWEN_IMAGE21_VIGGLE_TURBO_REPO.to_string(),
+        hf_filename: QWEN_IMAGE21_VIGGLE_TURBO_LORA.to_string(),
+        component: ModelComponent::DistilledLora,
+        size_bytes: 1_359_147_904,
+        gated: false,
+        sha256: Some("2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803"),
+    };
+    let mut manifests = Vec::new();
+    let mut turbo = Vec::new();
+    for tier in qwen_image21_tiers() {
+        let mut files = tier.transformer.clone();
+        files.extend(shared_qwen_image21_files());
+        if QWEN_IMAGE21_TURBO_TAGS.contains(&tier.tag) {
+            let mut turbo_files = files.clone();
+            turbo_files.push(turbo_lora.clone());
+            turbo.push(ModelManifest {
+                name: format!("qwen-image-2.1-turbo:{}", tier.tag),
+                family: "qwen-image21".to_string(),
+                description: format!(
+                    "{} + Viggle 6-step turbo LoRA (r256, Qwen Research License, non-commercial)",
+                    tier.description
+                        .split(" — ")
+                        .next()
+                        .unwrap_or(tier.description)
+                ),
+                files: turbo_files,
+                defaults: turbo_defaults.clone(),
+                hidden: false,
+            });
+        }
+        manifests.push(ModelManifest {
+            name: format!("qwen-image-2.1:{}", tier.tag),
+            family: "qwen-image21".to_string(),
+            description: tier.description.to_string(),
+            files,
+            defaults: base_defaults.clone(),
+            hidden: false,
+        });
+    }
+    manifests.extend(turbo);
+    manifests
+}
+
+/// All known Qwen-Image model manifests.
+fn qwen_image_manifests() -> Vec<ModelManifest> {
+    let base_defaults = ManifestDefaults {
+        steps: 50,
+        guidance: 4.0,
+        width: 1328,
+        height: 1328,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+    let qwen_2512_defaults = base_defaults.clone();
+    let qwen_edit_defaults = ManifestDefaults {
+        steps: 50,
+        guidance: 4.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+    // NVIDIA's DMD2 distill collapses the schedule to four CFG-free steps.
+    let qwen_flash_defaults = ManifestDefaults {
+        steps: 4,
+        guidance: 1.0,
+        ..base_defaults.clone()
+    };
+    // DiffSynth's Distill-Full merge trades a longer schedule for fidelity.
+    let qwen_distill_defaults = ManifestDefaults {
+        steps: 15,
+        guidance: 1.0,
+        ..base_defaults.clone()
+    };
+    let qwen_edit_lightning_defaults = ManifestDefaults {
+        steps: 4,
+        guidance: 1.0,
+        ..qwen_edit_defaults.clone()
+    };
+
+    vec![
+        // Base Qwen-Image.
+        ModelManifest {
+            name: "qwen-image:bf16".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image BF16 — base model, 60-block flow-matching transformer"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                let shards: &[(&str, u64)] = &[
+                    (
+                        "transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+                        4_989_364_312,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+                        4_984_214_160,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+                        4_946_470_000,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+                        4_984_213_736,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+                        4_946_471_896,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+                        4_946_451_560,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+                        4_908_690_520,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+                        4_984_232_856,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+                        1_170_918_840,
+                    ),
+                ];
+                for (filename, size) in shards {
+                    files.push(ModelFile {
+                        hf_repo: "Qwen/Qwen-Image".to_string(),
+                        hf_filename: filename.to_string(),
+                        component: ModelComponent::TransformerShard,
+                        size_bytes: *size,
+                        gated: false,
+                        sha256: None,
+                    });
+                }
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        // Base Qwen-Image FP8 E4M3 (ComfyUI-compatible transformer, BF16 text encoder)
+        // NOTE: The FP8 text encoder (qwen_2.5_vl_7b_fp8_scaled.safetensors)
+        // requires scale_input/scale_weight dequantization that candle doesn't
+        // support. We use the BF16 text encoder shared with GGUF variants instead.
+        ModelManifest {
+            name: "qwen-image:fp8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image FP8 — base model, ComfyUI-compatible transformer".to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Qwen-Image_ComfyUI".to_string(),
+                    hf_filename: "split_files/diffusion_models/qwen_image_fp8_e4m3fn.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 20_442_787_688,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q8 — base model quantized transformer, best quality"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 21_761_817_120,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q6".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q6 — base model quantized, quality/size trade-off".to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 16_824_990_240,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q5".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q5 — base model quantized, dynamic K_M variant".to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q5_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 14_934_899_232,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q4".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q4 — base model quantized, dynamic K_M variant".to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 13_065_746_976,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q3".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q3 — base model quantized, dynamic K_M variant".to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q3_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_679_567_392,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image:q2".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Q2 — base model quantized, smallest published K variant"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "city96/Qwen-Image-gguf".to_string(),
+                    hf_filename: "qwen-image-Q2_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_062_518_304,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: base_defaults.clone(),
+            hidden: false,
+        },
+        // Qwen-Image-2512.
+        ModelManifest {
+            name: "qwen-image-2512:bf16".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 BF16 — December update, strongest quality".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                let shards: &[(&str, u64)] = &[
+                    (
+                        "transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+                        4_989_364_312,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+                        4_984_214_160,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+                        4_946_470_000,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+                        4_984_213_736,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+                        4_946_471_896,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+                        4_946_451_560,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+                        4_908_690_520,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+                        4_984_232_856,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+                        1_170_918_840,
+                    ),
+                ];
+                for (filename, size) in shards {
+                    files.push(ModelFile {
+                        hf_repo: "Qwen/Qwen-Image-2512".to_string(),
+                        hf_filename: filename.to_string(),
+                        component: ModelComponent::TransformerShard,
+                        size_bytes: *size,
+                        gated: false,
+                        sha256: None,
+                    });
+                }
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q8 — Unsloth GGUF, best quality".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 21_761_817_120,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q6".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q6 — Unsloth GGUF, quality/size trade-off".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 16_824_990_240,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q5".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q5 — Unsloth dynamic K_M GGUF".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q5_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 15_000_074_784,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q4".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q4 — Unsloth dynamic K_M GGUF".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 13_244_758_560,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q3".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q3 — Unsloth dynamic K_M GGUF".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q3_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_932_896_800,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-2512:q2".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Q2 — Unsloth smallest published K variant".to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-2512-GGUF".to_string(),
+                    hf_filename: "qwen-image-2512-Q2_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_333_837_344,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_2512_defaults.clone(),
+            hidden: false,
+        },
+        // Lightning distilled variants (step-distilled, no CFG needed)
+        ModelManifest {
+            name: "qwen-image-lightning:fp8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Lightning FP8 — 4-step distilled, 12-25x faster"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "lightx2v/Qwen-Image-2512-Lightning".to_string(),
+                    hf_filename:
+                        "qwen_image_2512_fp8_e4m3fn_scaled_comfyui_4steps_v1.0.safetensors"
+                            .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 20_436_302_974,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 4,
+                guidance: 1.0,
+                width: 1328,
+                height: 1328,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-lightning:fp8-8step".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image-2512 Lightning FP8 — 8-step distilled, higher quality"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_2512_files();
+                files.push(ModelFile {
+                    hf_repo: "lightx2v/Qwen-Image-2512-Lightning".to_string(),
+                    hf_filename: "qwen_image_2512_fp8_e4m3fn_scaled_8steps_v1.0.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 20_487_870_224,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: ManifestDefaults {
+                steps: 8,
+                guidance: 1.0,
+                width: 1328,
+                height: 1328,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: false,
+        },
+        // NVIDIA's DMD2 4-step distill of BASE Qwen-Image. Same 60-block
+        // transformer, so it reuses the base shared components.
+        ModelManifest {
+            name: "qwen-image-flash:q8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Flash Q8 (NVIDIA): 4-step DMD2 distill — dense small text, hair-fine detail, and very complex scenes may degrade vs base"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "realrebelai/Qwen_Image_Flash_GGUF".to_string(),
+                    hf_filename: "Qwen-Image-Flash-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 21_761_817_152,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_flash_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-flash:q4".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Flash Q4 (NVIDIA): 4-step DMD2 distill — dense small text, hair-fine detail, and very complex scenes may degrade vs base"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "realrebelai/Qwen_Image_Flash_GGUF".to_string(),
+                    hf_filename: "Qwen-Image-Flash-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 11_715_639_872,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_flash_defaults.clone(),
+            hidden: false,
+        },
+        // DiffSynth's Distill-Full merge of BASE Qwen-Image: a gentler 15-step
+        // distillation that keeps more of the base model's fidelity.
+        ModelManifest {
+            name: "qwen-image-distill:q8".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Distill Q8 — 15-step DiffSynth Distill-Full merge, CFG-free"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/Qwen-Image-Distill-GGUF".to_string(),
+                    hf_filename: "Qwen_Image_Distill-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 21_761_817_120,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_distill_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-distill:q4".to_string(),
+            family: "qwen-image".to_string(),
+            description: "Qwen-Image Distill Q4 — 15-step DiffSynth Distill-Full merge, CFG-free"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_base_files();
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/Qwen-Image-Distill-GGUF".to_string(),
+                    hf_filename: "Qwen_Image_Distill-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 13_065_746_976,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_distill_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:bf16".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description: "Qwen-Image-Edit-2511 BF16 — multimodal image editing".to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                let shards: &[(&str, u64)] = &[
+                    (
+                        "transformer/diffusion_pytorch_model-00001-of-00005.safetensors",
+                        9_973_578_592,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00002-of-00005.safetensors",
+                        9_987_326_072,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00003-of-00005.safetensors",
+                        9_987_307_440,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00004-of-00005.safetensors",
+                        9_930_685_712,
+                    ),
+                    (
+                        "transformer/diffusion_pytorch_model-00005-of-00005.safetensors",
+                        982_130_472,
+                    ),
+                ];
+                for (filename, size) in shards {
+                    files.push(ModelFile {
+                        hf_repo: "Qwen/Qwen-Image-Edit-2511".to_string(),
+                        hf_filename: filename.to_string(),
+                        component: ModelComponent::TransformerShard,
+                        size_bytes: *size,
+                        gated: false,
+                        sha256: None,
+                    });
+                }
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q8".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description: "Qwen-Image-Edit-2511 Q8 — multimodal image editing, best GGUF quality"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 21_761_817_184,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q6".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description:
+                "Qwen-Image-Edit-2511 Q6 — multimodal image editing, quality/size trade-off"
+                    .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q6_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 16_852_417_120,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q5".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description: "Qwen-Image-Edit-2511 Q5 — multimodal image editing, dynamic K_M GGUF"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q5_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 15_027_501_664,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q4".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description: "Qwen-Image-Edit-2511 Q4 — multimodal image editing, dynamic K_M GGUF"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q4_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 13_244_758_624,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q3".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description: "Qwen-Image-Edit-2511 Q3 — multimodal image editing, dynamic K_M GGUF"
+                .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q3_K_M.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_920_805_472,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen-image-edit-2511:q2".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description:
+                "Qwen-Image-Edit-2511 Q2 — multimodal image editing, smallest published K variant"
+                    .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "unsloth/Qwen-Image-Edit-2511-GGUF".to_string(),
+                    hf_filename: "qwen-image-edit-2511-Q2_K.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 7_468_022_368,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_defaults.clone(),
+            hidden: false,
+        },
+        // Official pre-merged Lightning edit distill: lightx2v fuses the
+        // Edit-2511 transformer with ModelTC's 4-step Lightning LoRA and
+        // exports ComfyUI-named fp8_e4m3fn_scaled weights, which is exactly
+        // the FP8 transformer path mold already runs. Transformer-only
+        // export: it publishes no scheduler, so it keeps the base contract.
+        ModelManifest {
+            name: "qwen-image-edit-lightning:fp8".to_string(),
+            family: "qwen-image-edit".to_string(),
+            description:
+                "Qwen-Image-Edit-2511 Lightning FP8 — official 4-step fused distill (lightx2v)"
+                    .to_string(),
+            files: {
+                let mut files = shared_qwen_image_edit_files();
+                files.push(ModelFile {
+                    hf_repo: "lightx2v/Qwen-Image-Edit-2511-Lightning".to_string(),
+                    hf_filename:
+                        "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui_4steps_v1.0.safetensors"
+                            .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 20_447_469_486,
+                    gated: false,
+                    sha256: None,
+                });
+                files
+            },
+            defaults: qwen_edit_lightning_defaults.clone(),
+            hidden: false,
+        },
+    ]
+}
+
+fn wuerstchen_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 30,
+        guidance: 4.0,
+        width: 1024,
+        height: 1024,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: Some(
+            "low quality, blurry, distorted, deformed, disfigured, bad anatomy, watermark"
+                .to_string(),
+        ),
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+    vec![ModelManifest {
+        name: "wuerstchen-v2:fp16".to_string(),
+        family: "wuerstchen".to_string(),
+        description: "Wuerstchen v2 FP16 — research model, 3-stage cascade with 42x latent compression, painterly style".to_string(),
+        files: vec![
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen".to_string(),
+                hf_filename: "decoder/diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Decoder,
+                size_bytes: 4_221_568_336,
+                gated: false,
+                sha256: None,
+            },
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen".to_string(),
+                hf_filename: "vqgan/diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Vae,
+                size_bytes: 73_639_568,
+                gated: false,
+                sha256: None,
+            },
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen-prior".to_string(),
+                hf_filename: "prior/diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 3_974_614_642,
+                gated: false,
+                sha256: None,
+            },
+            // Prior CLIP-G encoder (1280-dim, for Stage C)
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen-prior".to_string(),
+                hf_filename: "text_encoder/model.safetensors".to_string(),
+                component: ModelComponent::ClipEncoder2,
+                size_bytes: 2_772_149_276,
+                gated: false,
+                sha256: None,
+            },
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen-prior".to_string(),
+                hf_filename: "tokenizer/tokenizer.json".to_string(),
+                component: ModelComponent::ClipTokenizer2,
+                size_bytes: 2_224_091,
+                gated: false,
+                sha256: None,
+            },
+            // Decoder CLIP encoder (1024-dim, for Stage B)
+            // Uses separate TextEncoder component to get model-specific path
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen".to_string(),
+                hf_filename: "text_encoder/model.safetensors".to_string(),
+                component: ModelComponent::ClipEncoder,
+                size_bytes: 1_411_983_168,
+                gated: false,
+                sha256: None,
+            },
+            ModelFile {
+                hf_repo: "warp-ai/wuerstchen".to_string(),
+                hf_filename: "tokenizer/tokenizer.json".to_string(),
+                component: ModelComponent::ClipTokenizer,
+                size_bytes: 2_224_119,
+                gated: false,
+                sha256: None,
+            },
+        ],
+        defaults,
+        hidden: false,
+    }]
+}
+
+/// Presentation alias for a curated model id (including accepted input aliases).
+/// Third-party ids have no curated label and keep their provider title.
+pub fn model_display_name(name: &str) -> Option<String> {
+    find_manifest(name).map(ModelManifest::display_name)
+}
+
+/// Resolve a user-provided model name to its canonical `name:tag` form.
+///
+/// - `flux-schnell` → `flux-schnell:q8` (FLUX default tag)
+/// - `dreamshaper-xl` → `dreamshaper-xl:fp16` (SDXL default tag)
+/// - `flux-dev:q4` → `flux-dev:q4` (unchanged)
+/// - `flux-dev-q4` → `flux-dev:q4` (legacy format)
+pub fn resolve_model_name(input: &str) -> String {
+    if let Some(name) = crate::minimax_h3::resolve_model_name(input) {
+        return name.to_string();
+    }
+    // Already has a tag
+    if input.contains(':') {
+        return input.to_string();
+    }
+    // Bare-name match — companion manifests ("clip-l", "sdxl-vae", ...)
+    // register without a `:tag` because there's only one variant. Catch
+    // them here so the tag-resolution loop below doesn't synthesize a
+    // bogus `clip-l:q8` and miss the real entry.
+    if find_manifest_exact(input).is_some() {
+        return input.to_string();
+    }
+    if input == "qwen-image-edit" {
+        return "qwen-image-edit-2511:q8".to_string();
+    }
+    // The Lightning edit distill ships one tier. Without this pin the
+    // `:q8` → `:fp16` → `:bf16` → `:fp8` loop below synthesizes a name that
+    // does not exist, and the bare model is unreachable.
+    if input == "qwen-image-edit-lightning" {
+        return "qwen-image-edit-lightning:fp8".to_string();
+    }
+    // These high-memory BF16 variants are opt-in. Bare LTX-2.3 22B names
+    // continue to resolve to the smaller FP8 checkpoints.
+    if matches!(input, "ltx-2.3-22b-dev" | "ltx-2.3-22b-distilled") {
+        return format!("{input}:fp8");
+    }
+    // LTX-2.5 offers the full BF16 Conv-VAE pack explicitly, while bare
+    // names select the official compact ConvRot INT8 pack.
+    if matches!(input, "ltx-2.5-22b-dev" | "ltx-2.5-22b-distilled") {
+        return format!("{input}:int8-conv");
+    }
+    // The bare 5B name stays on the fp16 safetensors default. The tag loop
+    // below tries `:q8` before `:fp16`, so without this pin the small-card
+    // GGUF tag added by #794 would silently become the family default.
+    if input == "wan22-ti2v-5b" {
+        return format!("{input}:fp16");
+    }
+    // `flux2-dev` stays on the full BF16 checkpoint it has always meant. The
+    // tag loop tries `:q8` first, so adding the quantized tiers would have
+    // silently re-pointed the bare name at a different 35 GB download —
+    // starting a fresh pull on a host that already has the 103 GB install,
+    // and switching to a tier the engine cannot block-offload. The
+    // quantized tiers are chosen by naming their tag.
+    if input == "flux2-dev" {
+        return format!("{input}:bf16");
+    }
+    // Qwen Image 2.1's bare names stay on the full BF16 tier they have always
+    // meant. The tag loop tries `:q8` first, so without this pin adding the
+    // GGUF tiers would silently re-point `qwen-image-2.1` at a different
+    // download on a host that already holds the BF16 install.
+    if matches!(input, "qwen-image-2.1" | "qwen-image-2.1-turbo") {
+        return format!("{input}:bf16");
+    }
+    // Legacy format: flux-dev-q4 -> flux-dev:q4 and
+    // ltx-2.3-22b-dev-fp8 -> ltx-2.3-22b-dev:fp8.
+    if let Some((base, suffix)) = input.rsplit_once('-') {
+        let legacy_quant = (suffix.starts_with('q')
+            && suffix.len() <= 3
+            && suffix[1..].chars().all(|c| c.is_ascii_digit()))
+            || matches!(suffix, "fp8" | "fp16" | "bf16");
+        // A dashed spelling of a shipped non-quant tag resolves too
+        // (`wan22-ti2v-5b-turbo` -> `wan22-ti2v-5b:turbo`), but only when the
+        // colon form is a real manifest. Without that guard every bare name
+        // ending in a dash segment — `flux-dev`, `wan21-t2v-1.3b` — would be
+        // rewritten into a tag that does not exist. The exact bare-name match
+        // above already wins for models whose own name ends that way.
+        if legacy_quant || find_manifest_exact(&format!("{base}:{suffix}")).is_some() {
+            return format!("{base}:{suffix}");
+        }
+    }
+    // Try default tags in preference order: :q8 (GGUF, smaller), :fp16 (SDXL), :bf16, :fp8 (community)
+    for tag in ["q8", "fp16", "bf16", "fp8"] {
+        let candidate = format!("{input}:{tag}");
+        if find_manifest_exact(&candidate).is_some() {
+            return candidate;
+        }
+    }
+    // Fallback to :q8 for backward compatibility
+    format!("{input}:q8")
+}
+
+/// Find a manifest by exact name (no resolution). Used internally to avoid
+/// circular dependency in `resolve_model_name`.
+fn find_manifest_exact(name: &str) -> Option<&'static ModelManifest> {
+    MANIFEST_INDEX.get(name).map(|&i| &KNOWN_MANIFESTS[i])
+}
+
+/// Find a manifest by name, handling tag resolution and legacy names.
+pub fn find_manifest(name: &str) -> Option<&'static ModelManifest> {
+    let canonical = resolve_model_name(name);
+    MANIFEST_INDEX.get(&canonical).map(|&i| &KNOWN_MANIFESTS[i])
+}
+
+/// One manifest file resolved to its authoritative local storage path.
+///
+/// Unlike [`crate::ModelPaths`], this representation is role-agnostic and
+/// lossless: repeated roles and components with no legacy engine slot remain
+/// present. Ownership, qualification, and split-pack inference should use it
+/// whenever they need the complete artifact graph.
+#[derive(Debug, Clone)]
+pub struct ResolvedManifestFile {
+    pub component: ModelComponent,
+    pub path: PathBuf,
+    pub file: &'static ModelFile,
+}
+
+/// Resolve every file owned by a known manifest without projecting it through
+/// [`crate::ModelPaths`].
+pub fn resolved_manifest_files(
+    config: &crate::Config,
+    model_name: &str,
+) -> Option<Vec<ResolvedManifestFile>> {
+    let manifest = find_manifest(model_name)?;
+    let models_dir = config.resolved_models_dir();
+    Some(
+        manifest
+            .files
+            .iter()
+            .map(|file| ResolvedManifestFile {
+                component: file.component,
+                path: models_dir.join(storage_path(manifest, file)),
+                file,
+            })
+            .collect(),
+    )
+}
+
+/// Find a manifest whose Transformer (or TransformerShard) file points
+/// at the given Hugging Face repo (e.g. `"black-forest-labs/FLUX.1-dev"`).
+/// Used by the catalog API to map HF catalog rows back to a known model
+/// name when computing the `installed` wire field — `find_manifest`
+/// itself is keyed on canonical names like `"flux-dev:q8"`, so HF repo
+/// paths never resolve through it directly.
+///
+/// Returns the FIRST matching manifest in `KNOWN_MANIFESTS` order. When
+/// multiple quantizations of the same model share an HF repo
+/// (e.g. several `flux-dev:qN` variants from `city96/FLUX.1-dev-gguf`),
+/// the caller may not get the variant the user actually has on disk —
+/// that's fine, because `manifest_model_is_downloaded` then queries
+/// the resolved canonical name and returns `false` if the user has
+/// no copy of that specific variant.
+pub fn find_manifest_by_hf_repo(hf_repo: &str) -> Option<&'static ModelManifest> {
+    KNOWN_MANIFESTS.iter().find(|m| {
+        m.files.iter().any(|f| {
+            matches!(
+                f.component,
+                ModelComponent::Transformer | ModelComponent::TransformerShard
+            ) && f.hf_repo == hf_repo
+        })
+    })
+}
+
+/// Find smaller quantized alternatives for a model.
+/// Given `"ultrareal-v2:bf16"`, returns `["ultrareal-v3:q4", "ultrareal-v3:q8", ...]`
+/// sorted by model size ascending. Returns empty if no alternatives found.
+pub fn find_smaller_alternatives(name: &str) -> Vec<String> {
+    let canonical = resolve_model_name(name);
+    let current = find_manifest(&canonical);
+    let current_size = current.map(|m| m.model_size_bytes()).unwrap_or(u64::MAX);
+
+    // Extract base name (everything before first colon, minus version suffix like -v2)
+    let base = canonical.split(':').next().unwrap_or(&canonical);
+    // Also try the family prefix (e.g. "ultrareal" from "ultrareal-v2")
+    let family_prefix = base
+        .rfind("-v")
+        .or_else(|| base.rfind("-V"))
+        .map(|i| &base[..i])
+        .unwrap_or(base);
+
+    let mut alternatives: Vec<(u64, String)> = known_manifests()
+        .iter()
+        .filter(|m| {
+            m.name != canonical
+                && (m.name.starts_with(&format!("{base}:"))
+                    || m.name.starts_with(&format!("{family_prefix}-")))
+                && m.model_size_bytes() < current_size
+        })
+        .map(|m| (m.model_size_bytes(), m.name.clone()))
+        .collect();
+
+    alternatives.sort();
+    alternatives.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Check if a name resolves to a known model (manifest or config).
+pub fn is_known_model(name: &str, config: &crate::Config) -> bool {
+    let canonical = resolve_model_name(name);
+    config.models.contains_key(name)
+        || config.models.contains_key(&canonical)
+        || find_manifest(&canonical).is_some()
+}
+
+/// All known model names (manifests + config), deduplicated and sorted.
+pub fn all_model_names(config: &crate::Config) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    for m in known_manifests() {
+        seen.insert(m.name.clone());
+    }
+    for key in config.models.keys() {
+        seen.insert(key.clone());
+    }
+    let mut names: Vec<String> = seen.into_iter().collect();
+    names.sort();
+    names
+}
+
+/// True if a family string identifies a generation model (not upscaler, utility, or auxiliary).
+///
+/// Used by `all_generation_model_names` to classify config-only models whose family
+/// is a plain string rather than a `ModelManifest` with methods.
+pub fn is_generation_family(family: &str) -> bool {
+    !UPSCALER_FAMILIES.contains(&family)
+        && !UTILITY_FAMILIES.contains(&family)
+        && !AUXILIARY_FAMILIES.contains(&family)
+}
+
+/// All known generation model names (excludes upscalers, utility, and auxiliary models),
+/// deduplicated and sorted.
+pub fn all_generation_model_names(config: &crate::Config) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    for m in known_manifests() {
+        if m.is_generation_model() {
+            seen.insert(m.name.clone());
+        }
+    }
+    for key in config.models.keys() {
+        // Use resolved config to get the correct family (inherits from manifest if present).
+        let resolved = config.resolved_model_config(key);
+        let family = resolved.family.as_deref().unwrap_or("flux");
+        if is_generation_family(family) {
+            seen.insert(key.clone());
+        }
+    }
+    let mut names: Vec<String> = seen.into_iter().collect();
+    names.sort();
+    names
+}
+
+/// Check if a string structurally resembles a model name without being a known one.
+///
+/// Returns true if the input contains explicit tag syntax (colon), shares a family
+/// prefix with a known model, or has high string similarity to any known model base name.
+pub fn looks_like_model_name(input: &str, config: &crate::Config) -> bool {
+    // Explicit tag syntax is always model-like
+    if input.contains(':') {
+        return true;
+    }
+
+    // After the colon early-return above, input is guaranteed colon-free
+    let input_base = input;
+
+    // Extract family from input by stripping version suffix (e.g. "ultrareal-v8" → "ultrareal")
+    let input_family = input_base
+        .rfind("-v")
+        .or_else(|| input_base.rfind("-V"))
+        .and_then(|i| {
+            let suffix = &input_base[i + 2..];
+            if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                Some(&input_base[..i])
+            } else {
+                None
+            }
+        });
+
+    // Check if input's family prefix matches any known model family
+    if let Some(family) = input_family {
+        for m in known_manifests() {
+            if m.family == family {
+                return true;
+            }
+        }
+        // Also check config model base names for the same family prefix
+        for key in config.models.keys() {
+            let key_base = key.split(':').next().unwrap_or(key);
+            let key_family = key_base
+                .rfind("-v")
+                .or_else(|| key_base.rfind("-V"))
+                .and_then(|i| {
+                    let s = &key_base[i + 2..];
+                    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                        Some(&key_base[..i])
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(key_base);
+            if key_family == family {
+                return true;
+            }
+        }
+    }
+
+    // Fuzzy match: check if any known model base name is very similar.
+    // Note: all_model_names() rebuilds the list each call; this is fine since
+    // looks_like_model_name runs at most once per CLI invocation on the error path.
+    for name in all_model_names(config) {
+        let base = name.split(':').next().unwrap_or(&name);
+        if strsim::jaro_winkler(input_base, base) >= 0.75 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Suggest similar model names for a given input, ranked by similarity.
+/// Returns up to `max` suggestions.
+pub fn suggest_similar_models(input: &str, config: &crate::Config, max: usize) -> Vec<String> {
+    let input_base = input.split(':').next().unwrap_or(input);
+
+    // all_generation_model_names already deduplicates via HashSet, so no explicit dedup needed
+    let mut scored: Vec<(f64, String)> = all_generation_model_names(config)
+        .into_iter()
+        .map(|name| {
+            let base = name.split(':').next().unwrap_or(&name);
+            let sim = strsim::jaro_winkler(input_base, base);
+            (sim, name)
+        })
+        .filter(|(sim, _)| *sim > 0.6)
+        .collect();
+
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(max).map(|(_, name)| name).collect()
+}
+
+/// FP16 T5-XXL model size in bytes.
+pub const T5_FP16_SIZE: u64 = 9_787_841_024;
+
+/// BF16 Qwen3-4B text encoder size in bytes (3 safetensors shards).
+pub const QWEN3_FP16_SIZE: u64 = 8_044_982_000;
+
+/// BF16 Qwen3-8B text encoder size in bytes (4 safetensors shards, Klein-9B).
+pub const QWEN3_8B_FP16_SIZE: u64 = 16_388_044_384;
+
+// ── Quantized T5 variant registry ────────────────────────────────────────────
+
+/// A quantized T5 encoder variant available from HuggingFace.
+#[derive(Debug, Clone)]
+pub struct T5Variant {
+    pub tag: &'static str,
+    pub hf_repo: &'static str,
+    pub hf_filename: &'static str,
+    pub size_bytes: u64,
+}
+
+/// Known T5 quantized variants, sorted largest → smallest.
+pub fn known_t5_variants() -> &'static [T5Variant] {
+    static VARIANTS: &[T5Variant] = &[
+        T5Variant {
+            tag: "q8",
+            hf_repo: "city96/t5-v1_1-xxl-encoder-gguf",
+            hf_filename: "t5-v1_1-xxl-encoder-Q8_0.gguf",
+            size_bytes: 5_061_584_064,
+        },
+        T5Variant {
+            tag: "q6",
+            hf_repo: "city96/t5-v1_1-xxl-encoder-gguf",
+            hf_filename: "t5-v1_1-xxl-encoder-Q6_K.gguf",
+            size_bytes: 3_908_261_056,
+        },
+        T5Variant {
+            tag: "q5",
+            hf_repo: "city96/t5-v1_1-xxl-encoder-gguf",
+            hf_filename: "t5-v1_1-xxl-encoder-Q5_K_M.gguf",
+            size_bytes: 3_386_856_640,
+        },
+        T5Variant {
+            tag: "q4",
+            hf_repo: "city96/t5-v1_1-xxl-encoder-gguf",
+            hf_filename: "t5-v1_1-xxl-encoder-Q4_K_M.gguf",
+            size_bytes: 2_896_123_072,
+        },
+        T5Variant {
+            tag: "q3",
+            hf_repo: "city96/t5-v1_1-xxl-encoder-gguf",
+            hf_filename: "t5-v1_1-xxl-encoder-Q3_K_S.gguf",
+            size_bytes: 2_099_467_456,
+        },
+    ];
+    VARIANTS
+}
+
+/// Find a T5 variant by tag (e.g. "q8", "q5").
+pub fn find_t5_variant(tag: &str) -> Option<&'static T5Variant> {
+    known_t5_variants().iter().find(|v| v.tag == tag)
+}
+
+// ── Quantized UMT5 variant registry ─────────────────────────────────────────
+
+/// FP16 UMT5-XXL encoder size in bytes — the encoder every Wan checkpoint
+/// shares.
+///
+/// It is also the floor of a wan render's memory: the sequential weight peak is
+/// `max(encoder, transformer + vae)`, and 11.4 GB is larger than every shipped
+/// wan transformer except the A14B experts. Shrinking it is the one lever that
+/// moves every tier at once.
+pub const UMT5_FP16_SIZE: u64 = 11_366_399_385;
+
+/// A quantized UMT5 encoder variant available from HuggingFace.
+#[derive(Debug, Clone)]
+pub struct Umt5Variant {
+    pub tag: &'static str,
+    pub hf_repo: &'static str,
+    pub hf_filename: &'static str,
+    pub size_bytes: u64,
+}
+
+/// Known UMT5 quantized variants, sorted largest → smallest.
+///
+/// city96's `umt5-xxl-encoder-gguf` is the same publisher and conversion
+/// lineage as the T5 registry above, and the loader that reads them already
+/// exists (`wan::text::umt5::UMt5Encoder::from_gguf`). The publisher's own
+/// floor is Q5_K_M — "use Q5_K_M or larger" — so nothing smaller ships here;
+/// a text encoder that drifts takes the whole render with it, and the download
+/// saving below that point is marginal.
+///
+/// Sizes are the repository's own, read from the HF blob listing rather than
+/// from the survey that prompted this work: that report has Q5_K_M at 3.66 GB,
+/// which is in fact Q4_K_M's size. The real Q5_K_M is 4.15 GB.
+pub fn known_umt5_variants() -> &'static [Umt5Variant] {
+    static VARIANTS: &[Umt5Variant] = &[
+        Umt5Variant {
+            tag: "q8",
+            hf_repo: "city96/umt5-xxl-encoder-gguf",
+            hf_filename: "umt5-xxl-encoder-Q8_0.gguf",
+            size_bytes: 6_043_068_256,
+        },
+        Umt5Variant {
+            tag: "q6",
+            hf_repo: "city96/umt5-xxl-encoder-gguf",
+            hf_filename: "umt5-xxl-encoder-Q6_K.gguf",
+            size_bytes: 4_667_283_296,
+        },
+        Umt5Variant {
+            tag: "q5",
+            hf_repo: "city96/umt5-xxl-encoder-gguf",
+            hf_filename: "umt5-xxl-encoder-Q5_K_M.gguf",
+            size_bytes: 4_145_878_880,
+        },
+    ];
+    VARIANTS
+}
+
+/// Look up a UMT5 variant by tag.
+pub fn find_umt5_variant(tag: &str) -> Option<&'static Umt5Variant> {
+    known_umt5_variants().iter().find(|v| v.tag == tag)
+}
+
+// ── Quantized Qwen3 variant registry ──────────────────────────────────────────
+
+/// A quantized Qwen3 text encoder variant available from HuggingFace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen3Variant {
+    pub tag: &'static str,
+    pub hf_repo: &'static str,
+    pub hf_filename: &'static str,
+    pub size_bytes: u64,
+    /// Pinned LFS digest, verified after download when present. The
+    /// historical Qwen3 lists predate pinning and resolve unpinned.
+    pub sha256: Option<&'static str>,
+}
+
+/// A quantized Qwen2.5-VL text encoder variant available from HuggingFace.
+#[derive(Debug, Clone)]
+pub struct Qwen2VlVariant {
+    pub tag: &'static str,
+    pub hf_repo: &'static str,
+    pub hf_filename: &'static str,
+    pub size_bytes: u64,
+}
+
+/// Known Qwen3 quantized variants, sorted largest → smallest.
+pub fn known_qwen3_variants() -> &'static [Qwen3Variant] {
+    static VARIANTS: &[Qwen3Variant] = &[
+        Qwen3Variant {
+            tag: "q8",
+            hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
+            hf_filename: "Qwen_3_4b-Q8_0.gguf",
+            size_bytes: 4_280_404_704,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "q6",
+            hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
+            hf_filename: "Qwen_3_4b-Q6_K.gguf",
+            size_bytes: 3_306_260_704,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "iq4",
+            hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
+            hf_filename: "Qwen_3_4b-imatrix-IQ4_XS.gguf",
+            size_bytes: 2_270_751_136,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "q3",
+            hf_repo: "worstplayer/Z-Image_Qwen_3_4b_text_encoder_GGUF",
+            hf_filename: "Qwen_3_4b-imatrix-Q3_K_M.gguf",
+            size_bytes: 2_075_617_696,
+            sha256: None,
+        },
+    ];
+    VARIANTS
+}
+
+/// Known Qwen2.5-VL-7B quantized variants, sorted largest → smallest.
+pub fn known_qwen2_vl_variants() -> &'static [Qwen2VlVariant] {
+    static VARIANTS: &[Qwen2VlVariant] = &[
+        Qwen2VlVariant {
+            tag: "q8",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q8_0.gguf",
+            size_bytes: 8_100_000_000,
+        },
+        Qwen2VlVariant {
+            tag: "q6",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q6_K.gguf",
+            size_bytes: 6_250_000_000,
+        },
+        Qwen2VlVariant {
+            tag: "q5",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q5_K_M.gguf",
+            size_bytes: 5_440_000_000,
+        },
+        Qwen2VlVariant {
+            tag: "q4",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf",
+            size_bytes: 4_680_000_000,
+        },
+        Qwen2VlVariant {
+            tag: "q3",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q3_K_M.gguf",
+            size_bytes: 3_810_000_000,
+        },
+        Qwen2VlVariant {
+            tag: "q2",
+            hf_repo: "unsloth/Qwen2.5-VL-7B-Instruct-GGUF",
+            hf_filename: "Qwen2.5-VL-7B-Instruct-Q2_K.gguf",
+            size_bytes: 3_020_000_000,
+        },
+    ];
+    VARIANTS
+}
+
+/// Find a Qwen2.5-VL variant by tag (e.g. "q6", "q4", "q3").
+pub fn find_qwen2_vl_variant(tag: &str) -> Option<&'static Qwen2VlVariant> {
+    known_qwen2_vl_variants().iter().find(|v| v.tag == tag)
+}
+
+/// Find a Qwen3-4B variant by tag (e.g. "q8", "q6", "iq4", "q3").
+pub fn find_qwen3_variant(tag: &str) -> Option<&'static Qwen3Variant> {
+    known_qwen3_variants().iter().find(|v| v.tag == tag)
+}
+
+// ── Quantized Qwen3-8B variant registry ─────────────────────────────────────
+
+/// Known Qwen3-8B quantized variants (for Klein-9B), sorted largest → smallest.
+pub fn known_qwen3_8b_variants() -> &'static [Qwen3Variant] {
+    static VARIANTS: &[Qwen3Variant] = &[
+        Qwen3Variant {
+            tag: "q8",
+            hf_repo: "unsloth/Qwen3-8B-GGUF",
+            hf_filename: "Qwen3-8B-Q8_0.gguf",
+            size_bytes: 8_709_519_168,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "q6",
+            hf_repo: "unsloth/Qwen3-8B-GGUF",
+            hf_filename: "Qwen3-8B-Q6_K.gguf",
+            size_bytes: 6_725_900_096,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "iq4",
+            hf_repo: "unsloth/Qwen3-8B-GGUF",
+            hf_filename: "Qwen3-8B-IQ4_XS.gguf",
+            size_bytes: 4_581_287_744,
+            sha256: None,
+        },
+        Qwen3Variant {
+            tag: "q3",
+            hf_repo: "unsloth/Qwen3-8B-GGUF",
+            hf_filename: "Qwen3-8B-Q3_K_M.gguf",
+            size_bytes: 4_124_161_856,
+            sha256: None,
+        },
+    ];
+    VARIANTS
+}
+
+/// Find a Qwen3-8B variant by tag (e.g. "q8", "q6", "iq4", "q3").
+pub fn find_qwen3_8b_variant(tag: &str) -> Option<&'static Qwen3Variant> {
+    known_qwen3_8b_variants().iter().find(|v| v.tag == tag)
+}
+
+// ── Quantized Qwen3-VL-8B variant registry ──────────────────────────────────
+
+/// Pinned revision of `Qwen/Qwen3-VL-8B-Instruct-GGUF` the digests below
+/// were read from (Hub API LFS oids).
+pub const QWEN3_VL_8B_GGUF_REVISION: &str = "f982a07559d4a2f6c8744d840bf6fccab30eea96";
+
+/// Quantized language models for Qwen Image 2.1's Qwen3-VL-8B-Instruct text
+/// encoder, sorted largest → smallest.
+///
+/// The Image 2.1 text-encoder shards are stock Qwen3-VL-8B-Instruct (identical
+/// 750-tensor key set; sampled tensors hash identically), so the official
+/// GGUF conversions serve as its language half. The vision tower always comes
+/// from the BF16 shards. Deliberately NOT [`known_qwen3_8b_variants`]:
+/// `unsloth/Qwen3-8B` is a different model with a 1e6 RoPE base.
+pub fn known_qwen3_vl_8b_variants() -> &'static [Qwen3Variant] {
+    static VARIANTS: &[Qwen3Variant] = &[
+        Qwen3Variant {
+            tag: "q8",
+            hf_repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            hf_filename: "Qwen3VL-8B-Instruct-Q8_0.gguf",
+            size_bytes: 8_709_519_456,
+            sha256: Some("0d264b3941185d00a74f75c4245521dae088ff1efc90ab8d1754e83f5844adb0"),
+        },
+        Qwen3Variant {
+            tag: "q4",
+            hf_repo: "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+            hf_filename: "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+            size_bytes: 5_027_784_800,
+            sha256: Some("67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"),
+        },
+    ];
+    VARIANTS
+}
+
+/// Whether auto-fallback may choose `variant` without an explicit
+/// `MOLD_QWEN3_VARIANT`.
+///
+/// Measured on the Qwen Image 2.1 t2i template against the BF16 checkpoint run
+/// in F32 (per-token cosine of the conditioning rows): Q8_0 mean 0.9992, worst
+/// 0.9929 — closer than the shipped BF16 tier's own worst token (0.9642).
+/// Q4_K_M mean 0.9607, worst 0.3948 — the attention-sink token collapses, and
+/// forcing an exact dequantized matmul does not recover it (0.9629), so it is
+/// the weights, not a kernel. Q4 stays selectable by name for a card that
+/// cannot hold Q8 at all, and is never chosen silently.
+pub fn qwen3_vl_8b_variant_auto_eligible(variant: &Qwen3Variant) -> bool {
+    variant.tag == "q8"
+}
+
+/// Find a Qwen3-VL-8B variant by tag (`q8`, `q4`).
+pub fn find_qwen3_vl_8b_variant(tag: &str) -> Option<&'static Qwen3Variant> {
+    known_qwen3_vl_8b_variants().iter().find(|v| v.tag == tag)
+}
+
+/// Total size of all files in the manifest in bytes.
+pub fn total_download_size(manifest: &ModelManifest) -> u64 {
+    manifest.total_size_bytes()
+}
+
+/// Compute how many bytes still need to be downloaded for a model.
+///
+/// Checks each manifest file against the hf-hub cache and local storage paths.
+/// Returns `(total_bytes, remaining_bytes)` where `remaining_bytes` is the
+/// amount that actually needs to be fetched.
+pub fn compute_download_size(manifest: &ModelManifest) -> (u64, u64) {
+    let mut total = 0u64;
+    let mut remaining = 0u64;
+    for file in &manifest.files {
+        total += file.size_bytes;
+        let subdir = storage_path(manifest, file);
+        let subdir_str = subdir.parent().map(|p| p.to_string_lossy().to_string());
+        if crate::download::cached_file_path(
+            &file.hf_repo,
+            &file.hf_filename,
+            subdir_str.as_deref(),
+        )
+        .is_none()
+        {
+            remaining += file.size_bytes;
+        }
+    }
+    (total, remaining)
+}
+
+/// Check whether a single manifest file is already cached locally.
+pub fn is_file_cached(manifest: &ModelManifest, file: &ModelFile) -> bool {
+    let subdir = storage_path(manifest, file);
+    let subdir_str = subdir.parent().map(|p| p.to_string_lossy().to_string());
+    crate::download::cached_file_path(&file.hf_repo, &file.hf_filename, subdir_str.as_deref())
+        .is_some()
+}
+
+/// Convert a `ModelManifest` to a `ModelPaths` from resolved download paths.
+///
+/// For diffusion models, Transformer (or TransformerShards) and VAE are usually required.
+/// For upscaler models, only the Upscaler component is required (mapped to `transformer`).
+/// For utility models (e.g., qwen3-expand), only the Transformer is required (no VAE).
+/// LTX-2 family manifests use a single-file upstream checkpoint and do not require a separate
+/// VAE asset. Other components are optional — each engine validates what it needs at load time.
+pub fn paths_from_downloads(
+    downloads: &[(ModelComponent, PathBuf)],
+    family: &str,
+) -> Option<ModelPaths> {
+    let find = |c: ModelComponent| -> Option<PathBuf> {
+        downloads
+            .iter()
+            .find(|(comp, _)| *comp == c)
+            .map(|(_, p)| p.clone())
+    };
+
+    let collect = |c: ModelComponent| -> Vec<PathBuf> {
+        downloads
+            .iter()
+            .filter(|(comp, _)| *comp == c)
+            .map(|(_, p)| p.clone())
+            .collect()
+    };
+
+    // Upscaler models: single weights file via Upscaler component, no VAE or encoders
+    if UPSCALER_FAMILIES.contains(&family) {
+        let transformer = find(ModelComponent::Upscaler)?;
+        return Some(ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer,
+            transformer_shards: Vec::new(),
+            vae: PathBuf::new(),
+            spatial_upscaler: None,
+            temporal_upscaler: None,
+            distilled_lora: None,
+            t5_encoder: None,
+            clip_encoder: None,
+            t5_tokenizer: None,
+            clip_tokenizer: None,
+            clip_encoder_2: None,
+            clip_tokenizer_2: None,
+            text_encoder_files: Vec::new(),
+            text_tokenizer: None,
+            decoder: None,
+        });
+    }
+
+    let transformer_shards = collect(ModelComponent::TransformerShard);
+
+    // Transformer: prefer Transformer / TransformerShard. Pure text-encoder
+    // companions (e.g. flux2-te) declare only TextEncoder files — fall back
+    // to the first TextEncoder shard so the companion still produces a
+    // usable ModelPaths for `manifest_files_exist` and the bridge's
+    // `text_encoder_files` collection logic.
+    let transformer = find(ModelComponent::Transformer)
+        .or_else(|| transformer_shards.first().cloned())
+        .or_else(|| {
+            if UTILITY_FAMILIES.contains(&family) {
+                downloads
+                    .iter()
+                    .find(|(c, _)| *c == ModelComponent::TextEncoder)
+                    .or_else(|| {
+                        downloads
+                            .iter()
+                            .find(|(c, _)| *c == ModelComponent::Decoder)
+                    })
+                    .map(|(_, p)| p.clone())
+            } else {
+                None
+            }
+        })?;
+
+    // Utility models and LTX-2: transformer + optional tokenizer, no standalone VAE asset
+    let vae = if UTILITY_FAMILIES.contains(&family)
+        || family == "ltx2"
+        || family == HUNYUAN3D_FAMILY
+        || family == HUNYUAN3D_MATTING_FAMILY
+    {
+        find(ModelComponent::Vae).unwrap_or_default()
+    } else {
+        find(ModelComponent::Vae)?
+    };
+
+    Some(ModelPaths {
+        transformer,
+        transformer_shards,
+        vae,
+        low_noise_transformer: find(ModelComponent::LowNoiseTransformer),
+        spatial_upscaler: find(ModelComponent::SpatialUpscaler),
+        temporal_upscaler: find(ModelComponent::TemporalUpscaler),
+        distilled_lora: find(ModelComponent::DistilledLora),
+        low_noise_distilled_lora: find(ModelComponent::LowNoiseDistilledLora),
+        t5_encoder: find(ModelComponent::T5Encoder),
+        clip_encoder: find(ModelComponent::ClipEncoder),
+        t5_tokenizer: find(ModelComponent::T5Tokenizer),
+        clip_tokenizer: find(ModelComponent::ClipTokenizer),
+        clip_encoder_2: find(ModelComponent::ClipEncoder2),
+        clip_tokenizer_2: find(ModelComponent::ClipTokenizer2),
+        text_encoder_files: collect(ModelComponent::TextEncoder),
+        text_tokenizer: find(ModelComponent::TextTokenizer),
+        decoder: find(ModelComponent::Decoder),
+    })
+}
+
+/// Hunyuan3D 2.0 image-to-3D shape checkpoints.
+///
+/// Each checkpoint is ONE self-contained safetensors file carrying three
+/// prefixes — `model.` (the flow-matching DiT), `vae.` (the vecset shape VAE)
+/// and `conditioner.main_image_encoder.model.` (a DINOv2-giant vision tower).
+/// The manifest therefore declares a single [`ModelComponent::Transformer`]
+/// file and the family is exempted from the standalone-VAE requirement in
+/// [`paths_from_downloads`], exactly as `ltx2` is: there is no separate VAE
+/// asset to name, and inventing one would make `manifest_files_exist` look
+/// for a file that upstream never publishes.
+///
+/// Geometry only — texturing pulls the separate `hunyuan3d-paint` bundle.
+///
+/// Sizes and digests are the HF LFS `size`/`oid` for each blob, read from
+/// `https://huggingface.co/api/models/<repo>/tree/main/<dir>`.
+fn hunyuan3d_manifests() -> Vec<ModelManifest> {
+    // The shape path takes no text prompt and no output canvas: the source
+    // image is letterboxed to the conditioning resolution the checkpoint's
+    // `image_processor.size` names, and the artifact is a mesh. `width`/
+    // `height` record that conditioning size so catalog rows and profiles
+    // have an honest number; `validation` refuses a client-supplied canvas
+    // for the family rather than silently ignoring it.
+    //
+    // `guidance` is 5.0 everywhere, but it means two different things and the
+    // checkpoint decides which: the undistilled tier has no guidance
+    // embedding and spends it on a real classifier-free guided branch (two
+    // forward passes per step), while the distilled tiers feed it to
+    // `guidance_in` and run one pass. Upstream defaults to 5.0 for both
+    // (`comfy/model_base.py:2116`), which is why the number does not change.
+    let defaults = |steps: u32, guidance: f64, cond: u32| ManifestDefaults {
+        steps,
+        guidance,
+        width: cond,
+        height: cond,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: Some(crate::types::SourceImageCapability::Required),
+    };
+    let multiview_defaults = |steps: u32| {
+        let mut value = defaults(steps, 5.0, 512);
+        // Every image is a semantically named reference. Keeping a second,
+        // unlabeled source_image would make the front slot ambiguous.
+        value.source_image = Some(crate::types::SourceImageCapability::Unsupported);
+        value
+    };
+
+    vec![
+        // Default: 0.6B DiT, step-distilled, ~5 GB VRAM. Conditions DINOv2 at
+        // 1022 rather than 518 (`hunyuan3d-dit-v2-mini-turbo/config.yaml`
+        // `image_processor.size: 1022`), which is why a "0.6B" model is still
+        // 3.8 GB on disk — the vision tower is 1.1B of it.
+        ModelManifest {
+            name: "hunyuan3d-mini-turbo:fp16".to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2.0 mini Turbo — image-to-3D mesh, step-distilled".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "tencent/Hunyuan3D-2mini".to_string(),
+                hf_filename: "hunyuan3d-dit-v2-mini-turbo/model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 3_822_584_202,
+                gated: false,
+                sha256: Some("bdbcef30dd0149a281e17d5b5b1fdad1122c904e098a42f3100e04e03c247bc4"),
+            }],
+            defaults: defaults(5, 5.0, 1022),
+            hidden: false,
+        },
+        // 1.1B DiT, step-distilled.
+        ModelManifest {
+            name: "hunyuan3d-turbo:fp16".to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2.0 Turbo — image-to-3D mesh, step-distilled".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "tencent/Hunyuan3D-2".to_string(),
+                hf_filename: "hunyuan3d-dit-v2-0-turbo/model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 4_930_777_530,
+                gated: false,
+                sha256: Some("5ee5a81e4df08a1c65b79910bf5b145a90376e526794f4607a4d5d068d62f269"),
+            }],
+            defaults: defaults(5, 5.0, 512),
+            hidden: false,
+        },
+        // 1.1B DiT, undistilled: real CFG at guidance 5.0, 30 steps.
+        ModelManifest {
+            name: "hunyuan3d:fp16".to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2.0 — image-to-3D mesh, highest shape fidelity".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "tencent/Hunyuan3D-2".to_string(),
+                hf_filename: "hunyuan3d-dit-v2-0/model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 4_928_151_562,
+                gated: false,
+                sha256: Some("360bc281fc956d4acac0c3d36d5ec0ebf8cdddbf4b8892e894d12419388d479b"),
+            }],
+            defaults: defaults(30, 5.0, 512),
+            hidden: false,
+        },
+        // Tencent revision 3a761b539b29fe4ff64714813aa9560fd66f5de0.
+        // The ordinary 2mv tier is undistilled and runs a real CFG branch.
+        ModelManifest {
+            name: HUNYUAN3D_2MV_MODEL.to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2mv — shape generation from one to four named views"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "tencent/Hunyuan3D-2mv".to_string(),
+                hf_filename: "hunyuan3d-dit-v2-mv/model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 4_928_151_562,
+                gated: false,
+                sha256: Some("d36f5881bcdc56726b73e517cd444c13c60732431622da7268145355c8d38e9c"),
+            }],
+            defaults: multiview_defaults(30),
+            hidden: false,
+        },
+        // Step-distilled 2mv with a guidance embedding and Tencent's
+        // consistency-flow schedule. The five-step recipe is upstream's
+        // `examples/fast_shape_gen_multiview.py`.
+        ModelManifest {
+            name: HUNYUAN3D_2MV_TURBO_MODEL.to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2mv Turbo — five-step shape generation from named views"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "tencent/Hunyuan3D-2mv".to_string(),
+                hf_filename: "hunyuan3d-dit-v2-mv-turbo/model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 4_930_777_530,
+                gated: false,
+                sha256: Some("172d7a989b99f66af760da0080d8c6f6350c72609536cf0c55b87a4afa574e45"),
+            }],
+            defaults: multiview_defaults(5),
+            hidden: false,
+        },
+        // 2.1 is a separate MoE architecture with a DINOv2-large conditioner.
+        // HF revision f9ca54c4da6c1f521f944ae345a74ad6feb12a4d, LFS verified.
+        ModelManifest {
+            name: HUNYUAN3D_21_MODEL.to_string(),
+            family: HUNYUAN3D_FAMILY.to_string(),
+            description: "Hunyuan3D 2.1 — image-to-3D mesh with the 3.3B MoE shape model"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Comfy-Org/hunyuan3D_2.1_repackaged".to_string(),
+                hf_filename: "hunyuan_3d_v2.1.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 7_365_943_290,
+                gated: false,
+                sha256: Some("5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72"),
+            }],
+            defaults: defaults(30, 5.0, 512),
+            hidden: false,
+        },
+        // The 2.1 PBR paint bundle. Auxiliary, hidden and files-only: it
+        // textures a mesh rather than generating one, so it is never a
+        // checkpoint, never a default model, and never resolves to a
+        // `ModelPaths`. Same shape as the PuLID bundles.
+        //
+        // Upstream ships a diffusers layout. The three `unet/*.py` modules and
+        // `README.md` are deliberately NOT declared: mold never executes
+        // upstream Python, so shipping it would be dead weight at best.
+        ModelManifest {
+            name: HUNYUAN3D_PAINT_MANIFEST.to_string(),
+            family: HUNYUAN3D_PAINT_FAMILY.to_string(),
+            description: "Hunyuan3D 2.1 PBR paint — albedo + metallic-roughness texturing weights"
+                .to_string(),
+            files: hunyuan3d_paint_files(),
+            defaults: hunyuan3d_paint_defaults(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: HUNYUAN3D_MATTING_FORCE_MANIFEST.to_string(),
+            family: HUNYUAN3D_MATTING_FAMILY.to_string(),
+            description: "U²-Net forced background matting for Hunyuan3D inputs".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "f5aiteam/rembg".to_string(),
+                hf_filename: "u2net.onnx".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 175_997_641,
+                gated: false,
+                sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491"),
+            }],
+            defaults: ManifestDefaults {
+                width: 512,
+                height: 512,
+                steps: 1,
+                guidance: 1.0,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: Some(crate::types::SourceImageCapability::Required),
+            },
+            hidden: true,
+        },
+        // rembg's full U²-Net model, used as a bounded pre-stage and never as
+        // a standalone generator. This HF mirror carries the exact bytes from
+        // danielgatis/rembg's v0.0.0 release asset (the SHA-256 and rembg's
+        // published MD5 both match).
+        ModelManifest {
+            name: HUNYUAN3D_MATTING_MANIFEST.to_string(),
+            family: HUNYUAN3D_MATTING_FAMILY.to_string(),
+            description: "U²-Net background matting for Hunyuan3D inputs".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "f5aiteam/rembg".to_string(),
+                hf_filename: "u2net.onnx".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 175_997_641,
+                gated: false,
+                sha256: Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491"),
+            }],
+            defaults: ManifestDefaults {
+                width: 512,
+                height: 512,
+                steps: 1,
+                guidance: 1.0,
+                is_schnell: false,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: Some(crate::types::SourceImageCapability::Required),
+            },
+            hidden: true,
+        },
+        // Hunyuan3D 2.0 revision 9cd649ba6913f7a852e3286bad86bfa9a2d83dcf.
+        // The tokenizer is the standard CLIP BPE tokenizer and comes from its
+        // canonical ungated repository because Tencent's diffusers directory
+        // publishes vocab/merges rather than tokenizer.json.
+        ModelManifest {
+            name: HUNYUAN3D_DELIGHT_MANIFEST.to_string(),
+            family: HUNYUAN3D_DELIGHT_FAMILY.to_string(),
+            description: "Hunyuan3D lighting and highlight removal".to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "tencent/Hunyuan3D-2".to_string(),
+                    hf_filename: "hunyuan3d-delight-v2-0/unet/diffusion_pytorch_model.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 3_463_772_592,
+                    gated: false,
+                    sha256: Some(
+                        "0ce61d15a43d11ba19079ab8f24dfce78b876d3f5291470079ef64b17e08ca58",
+                    ),
+                },
+                ModelFile {
+                    hf_repo: "tencent/Hunyuan3D-2".to_string(),
+                    hf_filename: "hunyuan3d-delight-v2-0/vae/diffusion_pytorch_model.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 167_335_342,
+                    gated: false,
+                    sha256: Some(
+                        "3e4c08995484ee61270175e9e7a072b66a6e4eeb5f0c266667fe1f45b90daf9a",
+                    ),
+                },
+                ModelFile {
+                    hf_repo: "tencent/Hunyuan3D-2".to_string(),
+                    hf_filename: "hunyuan3d-delight-v2-0/text_encoder/model.safetensors"
+                        .to_string(),
+                    component: ModelComponent::ClipEncoder,
+                    size_bytes: 680_820_392,
+                    gated: false,
+                    sha256: Some(
+                        "bc1827c465450322616f06dea41596eac7d493f4e95904dcb51f0fc745c4e13f",
+                    ),
+                },
+                ModelFile {
+                    hf_repo: "openai/clip-vit-large-patch14".to_string(),
+                    hf_filename: "tokenizer.json".to_string(),
+                    component: ModelComponent::ClipTokenizer,
+                    size_bytes: 2_224_003,
+                    gated: false,
+                    sha256: Some(
+                        "a83e0809aa4c3af7208b2df632a7a69668c6d48775b3c3fe4e1b1199d1f8b8f4",
+                    ),
+                },
+            ],
+            defaults: ManifestDefaults {
+                steps: 50,
+                guidance: 1.0,
+                width: 512,
+                height: 512,
+                is_schnell: false,
+                scheduler: Some(Scheduler::EulerAncestral),
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: Some(crate::types::SourceImageCapability::Required),
+            },
+            hidden: true,
+        },
+    ]
+}
+
+/// A files-only bundle runs nothing on its own, so every generation knob is a
+/// placeholder. Mirrors `pulid_bundle_defaults`.
+fn hunyuan3d_paint_defaults() -> ManifestDefaults {
+    ManifestDefaults {
+        steps: 1,
+        guidance: 0.0,
+        width: 512,
+        height: 512,
+        is_schnell: true,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    }
+}
+
+/// Sizes and digests are the HF LFS `size`/`oid` for each blob, read from
+/// `https://huggingface.co/api/models/tencent/Hunyuan3D-2.1/tree/main/hunyuan3d-paintpbr-v2-1`
+/// on 2026-09-01. Small config and tokenizer blobs are plain git objects with
+/// no LFS digest, so they pin size only.
+fn hunyuan3d_paint_files() -> Vec<ModelFile> {
+    const REPO: &str = "tencent/Hunyuan3D-2.1";
+    let file =
+        |name: &str, component: ModelComponent, size_bytes: u64, sha256: Option<&'static str>| {
+            ModelFile {
+                hf_repo: REPO.to_string(),
+                hf_filename: format!("hunyuan3d-paintpbr-v2-1/{name}"),
+                component,
+                size_bytes,
+                gated: false,
+                sha256,
+            }
+        };
+    let mut files = vec![
+        file("model_index.json", ModelComponent::ModelConfig, 617, None),
+        // Multiview diffusion UNet — 12 input channels, 6 views at 512.
+        file(
+            "unet/diffusion_pytorch_model.bin",
+            ModelComponent::Transformer,
+            3_925_293_863,
+            Some("675a1b5cd0098b2002637c443946529c03c5cd54427f40245263350feb3dd5b8"),
+        ),
+        file("unet/config.json", ModelComponent::ModelConfig, 911, None),
+        file(
+            "vae/diffusion_pytorch_model.bin",
+            ModelComponent::Vae,
+            334_707_217,
+            Some("1b4889b6b1d4ce7ae320a02dedaeff1780ad77d415ea0d744b476155c6377ddc"),
+        ),
+        file("vae/config.json", ModelComponent::ModelConfig, 553, None),
+        file(
+            "text_encoder/pytorch_model.bin",
+            ModelComponent::TextEncoder,
+            1_361_671_895,
+            Some("c3e254d7b61353497ea0be2c4013df4ea8f739ee88cffa0ba58cd085459ed565"),
+        ),
+        file(
+            "text_encoder/config.json",
+            ModelComponent::ModelConfig,
+            613,
+            None,
+        ),
+        // The reference vision tower the paint UNet cross-attends to.
+        file(
+            "image_encoder/model.safetensors",
+            ModelComponent::ClipEncoder,
+            1_264_217_240,
+            Some("ae616c24393dd1854372b0639e5541666f7521cbe219669255e865cb7f89466a"),
+        ),
+        file(
+            "image_encoder/config.json",
+            ModelComponent::ModelConfig,
+            554,
+            None,
+        ),
+        file(
+            "tokenizer/vocab.json",
+            ModelComponent::TextTokenizer,
+            1_059_962,
+            None,
+        ),
+        file(
+            "tokenizer/merges.txt",
+            ModelComponent::TextTokenizer,
+            524_619,
+            None,
+        ),
+        file(
+            "tokenizer/tokenizer_config.json",
+            ModelComponent::TextTokenizer,
+            807,
+            None,
+        ),
+        file(
+            "tokenizer/special_tokens_map.json",
+            ModelComponent::TextTokenizer,
+            460,
+            None,
+        ),
+        file(
+            "scheduler/scheduler_config.json",
+            ModelComponent::ModelConfig,
+            387,
+            None,
+        ),
+        file(
+            "feature_extractor/preprocessor_config.json",
+            ModelComponent::Processor,
+            342,
+            None,
+        ),
+    ];
+    // Hunyuan Paint's active reference conditioning comes from this external
+    // DINOv2 Giant tower (`multiview_utils.py`), not from the 1280-wide CLIP
+    // image encoder bundled in the diffusers directory above. Keep both: the
+    // Tencent directory remains complete, while the runtime dependency is
+    // explicit and independently integrity-pinned.
+    files.push(ModelFile {
+        hf_repo: "facebook/dinov2-giant".to_string(),
+        hf_filename: "model.safetensors".to_string(),
+        component: ModelComponent::VisionEncoder,
+        size_bytes: 4_546_005_432,
+        gated: false,
+        sha256: Some("917d3c470db999d32a312f8542149be91c7cbac61ee8fb4b67ae3d82b79ce21f"),
+    });
+    files
+}
+
+fn ltx_video_manifests() -> Vec<ModelManifest> {
+    // Plain LTX-Video has no image-to-video path — its engine never reads
+    // `source_image` (chain stages render independently and stitch). Only
+    // LTX-2 conditions on a still, so these advertise Unsupported and
+    // admission rejects an attached image instead of silently ignoring it.
+    let dev_defaults = ManifestDefaults {
+        steps: 40,
+        guidance: 3.0,
+        width: 1216,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: Some(25),
+        fps: Some(30),
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+    };
+    let distilled_defaults = ManifestDefaults {
+        steps: 8,
+        guidance: 1.0,
+        width: 1216,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: Some(25),
+        fps: Some(30),
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+    };
+    let multiscale_distilled_defaults = ManifestDefaults {
+        steps: 7,
+        guidance: 1.0,
+        width: 1216,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: Some(25),
+        fps: Some(30),
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+    };
+    let multiscale_dev_defaults = ManifestDefaults {
+        steps: 30,
+        guidance: 8.0,
+        width: 1216,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: Some(25),
+        fps: Some(30),
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+    };
+    let shared_t5_files = vec![
+        // T5-XXL FP16 text encoder (shared with FLUX)
+        ModelFile {
+            hf_repo: "comfyanonymous/flux_text_encoders".to_string(),
+            hf_filename: "t5xxl_fp16.safetensors".to_string(),
+            component: ModelComponent::T5Encoder,
+            size_bytes: 9_787_841_024,
+            gated: false,
+            sha256: Some("6e480b09fae049a72d2a8c5fbccb8d3e92febeb233bbe9dfe7256958a9167635"),
+        },
+        // T5 tokenizer (shared with FLUX)
+        ModelFile {
+            hf_repo: "lmz/mt5-tokenizers".to_string(),
+            hf_filename: "t5-v1_1-xxl.tokenizer.json".to_string(),
+            component: ModelComponent::T5Tokenizer,
+            size_bytes: 17_163_758,
+            gated: false,
+            sha256: Some("812ebb1f7bcb9ec5b9b0efcd45e72fbd2ef5f46ec8c4b29d3b07dc1505ca5af7"),
+        },
+    ];
+    // Current Candle LTX VAE support still targets the published legacy VAE
+    // layout from LTX-Video-0.9.5. The newer LTX-Video repo ships a different
+    // VAE checkpoint that fails local decode with the current port
+    // (`decoder.conv_in.conv.weight` shape mismatch) and needs a follow-up
+    // architecture update before we can switch repos.
+    let shared_vae_file = ModelFile {
+        hf_repo: "Lightricks/LTX-Video-0.9.5".to_string(),
+        hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+        component: ModelComponent::Vae,
+        size_bytes: 2_493_855_612,
+        gated: false,
+        sha256: Some("7eb65b16cf8ddfd70ccb1c541384ae49ffd6639d754c6b713a11cb72d097233f"),
+    };
+    let spatial_upscaler_file = ModelFile {
+        hf_repo: "Lightricks/LTX-Video".to_string(),
+        hf_filename: "ltxv-spatial-upscaler-0.9.8.safetensors".to_string(),
+        component: ModelComponent::SpatialUpscaler,
+        size_bytes: 505_024_432,
+        gated: false,
+        sha256: None,
+    };
+    vec![
+        ModelManifest {
+            name: "ltx-video-0.9.6:bf16".to_string(),
+            family: "ltx-video".to_string(),
+            description: "LTX Video 0.9.6 2B BF16 — improved quality, 30fps, text-to-video"
+                .to_string(),
+            files: {
+                let mut f = vec![
+                    ModelFile {
+                        hf_repo: "Lightricks/LTX-Video".to_string(),
+                        hf_filename: "ltxv-2b-0.9.6-dev-04-25.safetensors".to_string(),
+                        component: ModelComponent::Transformer,
+                        size_bytes: 6_340_743_924,
+                        gated: false,
+                        sha256: None,
+                    },
+                    shared_vae_file.clone(),
+                ];
+                f.extend(shared_t5_files.clone());
+                f
+            },
+            defaults: dev_defaults,
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ltx-video-0.9.6-distilled:bf16".to_string(),
+            family: "ltx-video".to_string(),
+            description: "LTX Video 0.9.6 distilled 2B BF16 — fast 8-step text-to-video"
+                .to_string(),
+            files: {
+                let mut f = vec![
+                    ModelFile {
+                        hf_repo: "Lightricks/LTX-Video".to_string(),
+                        hf_filename: "ltxv-2b-0.9.6-distilled-04-25.safetensors".to_string(),
+                        component: ModelComponent::Transformer,
+                        size_bytes: 6_340_744_028,
+                        gated: false,
+                        sha256: None,
+                    },
+                    shared_vae_file.clone(),
+                ];
+                f.extend(shared_t5_files.clone());
+                f
+            },
+            defaults: distilled_defaults,
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ltx-video-0.9.8-2b-distilled:bf16".to_string(),
+            family: "ltx-video".to_string(),
+            description: "LTX Video 0.9.8 distilled 2B BF16 — multiscale-ready low-VRAM path"
+                .to_string(),
+            files: {
+                let mut f = vec![
+                    ModelFile {
+                        hf_repo: "Lightricks/LTX-Video".to_string(),
+                        hf_filename: "ltxv-2b-0.9.8-distilled.safetensors".to_string(),
+                        component: ModelComponent::Transformer,
+                        size_bytes: 6_340_744_492,
+                        gated: false,
+                        sha256: None,
+                    },
+                    shared_vae_file.clone(),
+                    spatial_upscaler_file.clone(),
+                ];
+                f.extend(shared_t5_files.clone());
+                f
+            },
+            defaults: multiscale_distilled_defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ltx-video-0.9.8-13b-dev:bf16".to_string(),
+            family: "ltx-video".to_string(),
+            description: "LTX Video 0.9.8 13B dev BF16 — highest-quality legacy LTX checkpoint; needs a 40 GB-class GPU (no offload path; LTX-2 supersedes it on 24 GB cards)"
+                .to_string(),
+            files: {
+                let mut f = vec![
+                    ModelFile {
+                        hf_repo: "Lightricks/LTX-Video".to_string(),
+                        hf_filename: "ltxv-13b-0.9.8-dev.safetensors".to_string(),
+                        component: ModelComponent::Transformer,
+                        size_bytes: 28_579_183_340,
+                        gated: false,
+                        sha256: None,
+                    },
+                    shared_vae_file.clone(),
+                    spatial_upscaler_file.clone(),
+                ];
+                f.extend(shared_t5_files.clone());
+                f
+            },
+            defaults: multiscale_dev_defaults,
+            hidden: false,
+        },
+        ModelManifest {
+            name: "ltx-video-0.9.8-13b-distilled:bf16".to_string(),
+            family: "ltx-video".to_string(),
+            description: "LTX Video 0.9.8 13B distilled BF16 — faster legacy 13B LTX video; needs a 40 GB-class GPU (no offload path; LTX-2 supersedes it on 24 GB cards)"
+                .to_string(),
+            files: {
+                let mut f = vec![
+                    ModelFile {
+                        hf_repo: "Lightricks/LTX-Video".to_string(),
+                        hf_filename: "ltxv-13b-0.9.8-distilled.safetensors".to_string(),
+                        component: ModelComponent::Transformer,
+                        size_bytes: 28_579_183_564,
+                        gated: false,
+                        sha256: None,
+                    },
+                    shared_vae_file,
+                    spatial_upscaler_file,
+                ];
+                f.extend(shared_t5_files);
+                f
+            },
+            defaults: multiscale_distilled_defaults,
+            hidden: false,
+        },
+    ]
+}
+
+fn shared_ltx2_files() -> Vec<ModelFile> {
+    let gemma_repo = "google/gemma-3-12b-it-qat-q4_0-unquantized".to_string();
+    [
+        "config.json",
+        "generation_config.json",
+        "model-00001-of-00005.safetensors",
+        "model-00002-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+        "model-00005-of-00005.safetensors",
+        "model.safetensors.index.json",
+        "added_tokens.json",
+        "chat_template.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "tokenizer_config.json",
+    ]
+    .into_iter()
+    .map(|hf_filename| {
+        let (size_bytes, sha256) = match hf_filename {
+            "model-00001-of-00005.safetensors" => (
+                4_979_902_192,
+                Some("e6fb899db428481aafb45a20130457df6e247e7cb03b7d9f01ee4bc2a9a08138"),
+            ),
+            "model-00002-of-00005.safetensors" => (
+                4_931_296_592,
+                Some("d251e7fe9799d529405ddb61705a44cd700bd30a8b66a8d44ae26ddf8365dbc6"),
+            ),
+            "model-00003-of-00005.safetensors" => (
+                4_931_296_656,
+                Some("0684ef801385f0669a0b3e4ab160c50877efdbfa40eb97788595985de2743e78"),
+            ),
+            "model-00004-of-00005.safetensors" => (
+                4_931_296_656,
+                Some("b4b964e6526f81ccfa625c900b72ce92d5e0fd2debb75998763038ad06b9c541"),
+            ),
+            "model-00005-of-00005.safetensors" => (
+                4_601_000_928,
+                Some("4ef2de8f93e165b4e02425769fc566000b0674256ef0c3a27b23a0d45eb12088"),
+            ),
+            "tokenizer.json" => (
+                33_384_570,
+                Some("7d4046bf0505a327dd5a0abbb427ecd4fc82f99c2ceaa170bc61ecde12809b0c"),
+            ),
+            "tokenizer.model" => (
+                4_689_074,
+                Some("1299c11d7cf632ef3b4e11937501358ada021bbdf7c47638d13c0ee982f2e79c"),
+            ),
+            _ => (0, None),
+        };
+        ModelFile {
+            hf_repo: gemma_repo.clone(),
+            hf_filename: hf_filename.to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes,
+            gated: true,
+            sha256,
+        }
+    })
+    .collect()
+}
+
+fn ltx2_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 8,
+        guidance: 3.0,
+        width: 1216,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: Some(97),
+        fps: Some(24),
+        source_image: Some(crate::types::SourceImageCapability::Optional),
+    };
+
+    let make_manifest = |name: &str,
+                         description: &str,
+                         transformer_repo: &str,
+                         transformer_file: &str,
+                         shared_repo: &str,
+                         spatial_file: &str,
+                         spatial_file_x1_5: Option<&str>,
+                         temporal_file: &str,
+                         distilled_lora: Option<&str>| {
+        let mut files = shared_ltx2_files();
+        let (transformer_size_bytes, transformer_sha256) = match transformer_file {
+            "ltx-2-19b-dev-fp8.safetensors" => (
+                27_078_716_018,
+                "8a67e709b6d1adc061cb19921887a5c15754178199e45801a04310e9b522760d",
+            ),
+            "ltx-2-19b-distilled-fp8.safetensors" => (
+                27_078_716_346,
+                "8ae14327130c6ffdc87705b02c8e7654aa5c6d9a7f28a52d0acc1c30cb0d2932",
+            ),
+            "ltx-2.3-22b-dev-fp8.safetensors" => (
+                29_145_431_166,
+                "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450",
+            ),
+            "ltx-2.3-22b-distilled-fp8.safetensors" => (
+                29_531_884_062,
+                "d9646b6f2d5c42d337b23671634c43bfeece6989644f51b4a3aa088465ccd3b2",
+            ),
+            "ltx-2.3-22b-dev.safetensors" => (
+                46_149_344_974,
+                "7ab7225325bc403448ea84b6db2269811a880e5118cd2ee2b6282a93d585016f",
+            ),
+            "ltx-2.3-22b-distilled-1.1.safetensors" => (
+                46_149_345_334,
+                "b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc",
+            ),
+            other => panic!("unexpected LTX-2 transformer file '{other}'"),
+        };
+        files.push(ModelFile {
+            hf_repo: transformer_repo.to_string(),
+            hf_filename: transformer_file.to_string(),
+            component: ModelComponent::Transformer,
+            size_bytes: transformer_size_bytes,
+            gated: false,
+            sha256: Some(transformer_sha256),
+        });
+        let (spatial_size_bytes, spatial_sha256) = match spatial_file {
+            "ltx-2-spatial-upscaler-x2-1.0.safetensors" => (
+                995_765_578,
+                "3160fabf8edf0bc4dd8de40353a180813b111ce586b655ad54af9a7b8c6736de",
+            ),
+            "ltx-2.3-spatial-upscaler-x2-1.0.safetensors" => (
+                995_743_504,
+                "93800de87dbc448b5b31f3c5c3a1579ba6335151de061a564f6f026b0fc770ad",
+            ),
+            "ltx-2.3-spatial-upscaler-x2-1.1.safetensors" => (
+                995_743_560,
+                "5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed",
+            ),
+            other => panic!("unexpected LTX-2 spatial upscaler file '{other}'"),
+        };
+        files.push(ModelFile {
+            hf_repo: shared_repo.to_string(),
+            hf_filename: spatial_file.to_string(),
+            component: ModelComponent::SpatialUpscaler,
+            size_bytes: spatial_size_bytes,
+            gated: false,
+            sha256: Some(spatial_sha256),
+        });
+        if let Some(spatial_file_x1_5) = spatial_file_x1_5 {
+            let (spatial_size_bytes, spatial_sha256) = match spatial_file_x1_5 {
+                "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors" => (
+                    1_090_125_794,
+                    "b2b3193e68cb04b4701e1d59bec4ed5d5e3e84506d9a42d5a129d37d39823df7",
+                ),
+                other => panic!("unexpected LTX-2 x1.5 spatial upscaler file '{other}'"),
+            };
+            files.push(ModelFile {
+                hf_repo: shared_repo.to_string(),
+                hf_filename: spatial_file_x1_5.to_string(),
+                component: ModelComponent::SpatialUpscaler,
+                size_bytes: spatial_size_bytes,
+                gated: false,
+                sha256: Some(spatial_sha256),
+            });
+        }
+        let (temporal_size_bytes, temporal_sha256) = match temporal_file {
+            "ltx-2-temporal-upscaler-x2-1.0.safetensors" => (
+                261_965_800,
+                "9a35c2eb92f6ed39369fcb83045daa070bc7c2a97fc7267abd6291203fd05b88",
+            ),
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors" => (
+                261_944_000,
+                "2bc3300f2b3c3c1834d72164fbf13a3b9fd73e5a741e8a2c3f4035f89a75c3fe",
+            ),
+            other => panic!("unexpected LTX-2 temporal upscaler file '{other}'"),
+        };
+        files.push(ModelFile {
+            hf_repo: shared_repo.to_string(),
+            hf_filename: temporal_file.to_string(),
+            component: ModelComponent::TemporalUpscaler,
+            size_bytes: temporal_size_bytes,
+            gated: false,
+            sha256: Some(temporal_sha256),
+        });
+        if let Some(distilled_lora) = distilled_lora {
+            let (distilled_lora_size_bytes, distilled_lora_sha256) = match distilled_lora {
+                "ltx-2-19b-distilled-lora-384.safetensors" => (
+                    7_674_558_424,
+                    "2718f89582003cbb5b616635f18c091641917a3f3e5a2f2ad0fb3d5fdd153534",
+                ),
+                "ltx-2.3-22b-distilled-lora-384.safetensors" => (
+                    7_605_507_256,
+                    "2943ab994f3c9d88052e5a2a34cca14e4a2dfc36b1d8c407931d52d5c25dd72b",
+                ),
+                "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" => (
+                    7_605_507_256,
+                    "f5d4953f3386197a4b4f5abdb17616ff256171e8075c111d6e7d2dfa6e823b3a",
+                ),
+                other => panic!("unexpected LTX-2 distilled LoRA file '{other}'"),
+            };
+            files.push(ModelFile {
+                hf_repo: shared_repo.to_string(),
+                hf_filename: distilled_lora.to_string(),
+                component: ModelComponent::DistilledLora,
+                size_bytes: distilled_lora_size_bytes,
+                gated: false,
+                sha256: Some(distilled_lora_sha256),
+            });
+        }
+        ModelManifest {
+            name: name.to_string(),
+            family: "ltx2".to_string(),
+            description: description.to_string(),
+            files,
+            defaults: defaults.clone(),
+            hidden: false,
+        }
+    };
+
+    vec![
+        make_manifest(
+            "ltx-2-19b-dev:fp8",
+            "LTX-2 19B dev FP8 — joint audio-video generation",
+            "Lightricks/LTX-2",
+            "ltx-2-19b-dev-fp8.safetensors",
+            "Lightricks/LTX-2",
+            "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+            None,
+            "ltx-2-temporal-upscaler-x2-1.0.safetensors",
+            Some("ltx-2-19b-distilled-lora-384.safetensors"),
+        ),
+        make_manifest(
+            "ltx-2-19b-distilled:fp8",
+            "LTX-2 19B distilled FP8 — faster joint audio-video generation",
+            "Lightricks/LTX-2",
+            "ltx-2-19b-distilled-fp8.safetensors",
+            "Lightricks/LTX-2",
+            "ltx-2-spatial-upscaler-x2-1.0.safetensors",
+            None,
+            "ltx-2-temporal-upscaler-x2-1.0.safetensors",
+            None,
+        ),
+        make_manifest(
+            "ltx-2.3-22b-dev:fp8",
+            "LTX-2.3 22B dev FP8 — highest quality joint audio-video model",
+            "Lightricks/LTX-2.3-fp8",
+            "ltx-2.3-22b-dev-fp8.safetensors",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+            Some("ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"),
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            Some("ltx-2.3-22b-distilled-lora-384.safetensors"),
+        ),
+        make_manifest(
+            "ltx-2.3-22b-distilled:fp8",
+            "LTX-2.3 22B distilled FP8 — fastest joint audio-video pipeline",
+            "Lightricks/LTX-2.3-fp8",
+            "ltx-2.3-22b-distilled-fp8.safetensors",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+            Some("ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"),
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            None,
+        ),
+        make_manifest(
+            "ltx-2.3-22b-dev:bf16",
+            "LTX-2.3 22B dev BF16 — full-quality trainable joint audio-video model",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-22b-dev.safetensors",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            Some("ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"),
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            Some("ltx-2.3-22b-distilled-lora-384-1.1.safetensors"),
+        ),
+        make_manifest(
+            "ltx-2.3-22b-distilled:bf16",
+            "LTX-2.3 22B distilled BF16 — full-precision eight-step pipeline",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-22b-distilled-1.1.safetensors",
+            "Lightricks/LTX-2.3",
+            "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            Some("ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"),
+            "ltx-2.3-temporal-upscaler-x2-1.0.safetensors",
+            None,
+        ),
+    ]
+}
+
+fn ltx2_control_manifests() -> Vec<ModelManifest> {
+    crate::ltx2_control::LTX2_CONTROL_ADAPTERS
+        .iter()
+        .map(|adapter| ModelManifest {
+            name: adapter.download_model.to_string(),
+            family: "ltx2-control".to_string(),
+            description: format!("{} — {}", adapter.label, adapter.profile.label()),
+            files: adapter
+                .files()
+                .map(|file| ModelFile {
+                    hf_repo: adapter.hf_repo.to_string(),
+                    hf_filename: file.hf_filename.to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: file.size_bytes,
+                    gated: adapter.gated,
+                    sha256: Some(file.sha256),
+                })
+                .collect(),
+            defaults: ManifestDefaults {
+                steps: 1,
+                guidance: 0.0,
+                width: 16,
+                height: 16,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: true,
+        })
+        .collect()
+}
+
+fn ltx2_camera_control_manifests() -> Vec<ModelManifest> {
+    crate::ltx2_camera::LTX2_CAMERA_CONTROLS
+        .iter()
+        .map(|preset| ModelManifest {
+            name: preset.download_model.to_string(),
+            family: "ltx2-camera-control".to_string(),
+            description: format!("{} camera control — LTX-2 19B", preset.label),
+            files: vec![ModelFile {
+                hf_repo: preset.hf_repo.to_string(),
+                hf_filename: preset.hf_filename.to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: preset.size_bytes,
+                gated: false,
+                sha256: Some(preset.sha256),
+            }],
+            defaults: ManifestDefaults {
+                steps: 1,
+                guidance: 0.0,
+                width: 16,
+                height: 16,
+                is_schnell: true,
+                scheduler: None,
+                negative_prompt: None,
+                frames: None,
+                fps: None,
+                source_image: None,
+            },
+            hidden: true,
+        })
+        .collect()
+}
+
+/// Family name for the PuLID-FLUX identity-conditioning asset bundle.
+pub const PULID_FAMILY: &str = "pulid";
+
+/// Manifest name for the PuLID-FLUX v0.9.1 asset bundle.
+pub const PULID_FLUX_MANIFEST: &str = "pulid-flux";
+
+/// Installable auxiliary bundles required by one concrete generation request.
+///
+/// Clients use this registry-driven answer to run the same generic
+/// consent/download loop for local execution that servers derive during
+/// placement. Adding a future request-bound auxiliary bundle belongs here,
+/// never as a model id embedded in an individual UI.
+pub fn auxiliary_manifests_for_request(
+    request: &crate::types::GenerateRequest,
+) -> Vec<&'static str> {
+    auxiliary_manifests_for_request_with_family(request, None)
+}
+
+/// Family-aware auxiliary bundle lookup for opaque live-catalog model ids.
+pub fn auxiliary_manifests_for_request_with_family(
+    request: &crate::types::GenerateRequest,
+    family_hint: Option<&str>,
+) -> Vec<&'static str> {
+    let mut manifests = Vec::new();
+    let family = family_hint
+        .or_else(|| find_manifest(&request.model).map(|manifest| manifest.family.as_str()));
+    if request
+        .mesh
+        .as_ref()
+        .is_some_and(|mesh| mesh.texture == Some(true))
+        && family == Some(HUNYUAN3D_FAMILY)
+    {
+        manifests.push(HUNYUAN3D_PAINT_MANIFEST);
+        manifests.push(HUNYUAN3D_PAINT_UPSCALER_MANIFEST);
+    }
+    if crate::identity::request_mentions_identity(request)
+        && crate::identity::effective_id_weight(request) > 0.0
+    {
+        // The bundle follows the checkpoint's family — `pulid-flux` or
+        // `pulid-sdxl` — through the one identity authority; a model no family
+        // qualifies needs no bundle because admission refuses it first.
+        if let Some(family) =
+            crate::identity::identity_family_with_hint(&request.model, family_hint)
+        {
+            manifests.push(family.manifest());
+        }
+    }
+    // The image-prompt bundle follows the same rule, through its own one
+    // authority. Without this the local path advertises `Combines` on SD1.5
+    // and SDXL and then cannot provision it: the render loads the checkpoint
+    // and both text encoders before discovering the adapter is absent.
+    if crate::validation::request_conditions_on_reference(request) {
+        if let Some(family) =
+            family.and_then(crate::ip_adapter_assets::ImagePromptFamily::from_generation_family)
+        {
+            manifests.push(family.manifest());
+        }
+    }
+    manifests
+}
+
+#[cfg(test)]
+mod ip_adapter_auxiliary_tests {
+    use super::*;
+
+    fn request(model: &str, weight: Option<f64>, with_reference: bool) -> crate::GenerateRequest {
+        let mut req = crate::test_support::minimal_generate_request(model);
+        if with_reference {
+            req.edit_images = Some(vec![vec![0x89, 0x50, 0x4E, 0x47]]);
+        }
+        req.reference_weight = weight;
+        req
+    }
+
+    /// A local SD render with a reference plans its bundle, so `mold run`
+    /// pulls it BEFORE the checkpoint loads rather than failing an encode
+    /// late. The advertised capability and the acquirable asset have to be the
+    /// same answer.
+    #[test]
+    fn an_sd_reference_request_plans_its_own_bundle() {
+        for (model, family, expected) in [
+            ("sd15:fp16", "sd15", IP_ADAPTER_SD15_MANIFEST),
+            ("sdxl-base:fp16", "sdxl", IP_ADAPTER_SDXL_MANIFEST),
+        ] {
+            let planned = auxiliary_manifests_for_request_with_family(
+                &request(model, None, true),
+                Some(family),
+            );
+            assert!(planned.contains(&expected), "{model}: {planned:?}");
+        }
+    }
+
+    /// Weight zero conditions on nothing, so it plans nothing — the same
+    /// falsification rule `id_weight` has, and the reason the predicate is the
+    /// effective weight rather than the presence of `edit_images`.
+    #[test]
+    fn a_zero_weighted_reference_plans_no_bundle() {
+        let planned = auxiliary_manifests_for_request_with_family(
+            &request("sdxl-base:fp16", Some(0.0), true),
+            Some("sdxl"),
+        );
+        assert!(planned.is_empty(), "{planned:?}");
+    }
+
+    /// A family whose references are native to the checkpoint has no adapter
+    /// to pull, and a request with no reference at all plans nothing.
+    #[test]
+    fn other_families_and_bare_requests_plan_no_bundle() {
+        for (model, family) in [
+            ("flux2-klein:bf16", "flux2"),
+            ("qwen-image-edit-2511:q4", "qwen-image-edit"),
+        ] {
+            let planned = auxiliary_manifests_for_request_with_family(
+                &request(model, None, true),
+                Some(family),
+            );
+            assert!(
+                !planned.iter().any(|name| name.starts_with("ip-adapter")),
+                "{model}: {planned:?}"
+            );
+        }
+        let planned = auxiliary_manifests_for_request_with_family(
+            &request("sdxl-base:fp16", None, false),
+            Some("sdxl"),
+        );
+        assert!(planned.is_empty(), "{planned:?}");
+    }
+}
+
+/// Manifest name for the PuLID v1.1 (SDXL) asset bundle.
+pub const PULID_SDXL_MANIFEST: &str = "pulid-sdxl";
+
+/// Manifest family every IP-Adapter bundle carries.
+///
+/// One family for both bundles so `storage_path` lands their shared vision
+/// tower at a single `shared/ip-adapter/` path.
+pub const IP_ADAPTER_FAMILY: &str = "ip-adapter";
+
+/// The SD1.5 image-prompt bundle.
+pub const IP_ADAPTER_SD15_MANIFEST: &str = "ip-adapter-sd15";
+
+/// The SDXL image-prompt bundle.
+pub const IP_ADAPTER_SDXL_MANIFEST: &str = "ip-adapter-sdxl";
+
+/// The four extraction artifacts every PuLID bundle shares.
+///
+/// The vision tower, the two InsightFace graphs, and the BiSeNet parser belong
+/// to the FACE EXTRACTOR, which is identical for FLUX and SDXL — upstream's
+/// `pipeline_v1_1.py:get_id_embedding` is the same algorithm as
+/// `pipeline_flux.py`'s, over the same networks. Only the identity adapter
+/// differs, so the bundles share one file list and, because every one of these
+/// is a shared (non-model-specific) component of the same `pulid` family, one
+/// on-disk copy under `shared/pulid/`. A machine that already has `pulid-flux`
+/// pulls exactly the 984 MB SDXL adapter and nothing else.
+fn shared_pulid_extraction_files() -> Vec<ModelFile> {
+    vec![
+        // `pipeline_flux.py:58` builds `EVA02-CLIP-L-14-336`; BAAI publishes
+        // that checkpoint as a PyTorch pickle in `QuanSun/EVA-CLIP`. Mold
+        // carries it as a conversion INPUT and never loads the `.pt`
+        // directly; the derived artifact is issue #1229's.
+        ModelFile {
+            hf_repo: "QuanSun/EVA-CLIP".to_string(),
+            hf_filename: "EVA02_CLIP_L_336_psz14_s6B.pt".to_string(),
+            component: ModelComponent::IdentityVisionEncoder,
+            size_bytes: 856_461_210,
+            gated: false,
+            sha256: Some("84c3a17a228c567a155259b2245b0b59072bf7da510260a0a02ec54de6d50b05"),
+        },
+        // Provenance: InsightFace publishes antelopev2 as a zip on GitHub
+        // releases / Google Drive, which mold's HF-only `ModelFile` cannot
+        // express. PuLID itself resolves the pack from the Hugging Face
+        // mirror — `pipeline_flux.py:70`,
+        // `snapshot_download('DIAMONIK7777/antelopev2', ...)` — and both
+        // mirrored files hash to the pins below (verified 2026-08-21
+        // against the official antelopev2 digests), so mold pulls the
+        // same bytes upstream does.
+        //
+        // LICENSE: these two files are InsightFace *pretrained models*,
+        // which are "available for non-commercial research purposes only"
+        // (InsightFace README, "License"). The code is MIT; the weights are
+        // not. Mold does not bundle them and refuses to download them until
+        // the user has explicitly recorded acceptance — see
+        // [`crate::license_acceptance`].
+        ModelFile {
+            hf_repo: "DIAMONIK7777/antelopev2".to_string(),
+            hf_filename: "scrfd_10g_bnkps.onnx".to_string(),
+            component: ModelComponent::FaceDetector,
+            size_bytes: 16_923_827,
+            gated: false,
+            sha256: Some("5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91"),
+        },
+        ModelFile {
+            hf_repo: "DIAMONIK7777/antelopev2".to_string(),
+            hf_filename: "glintr100.onnx".to_string(),
+            component: ModelComponent::FaceRecognizer,
+            size_bytes: 260_665_334,
+            gated: false,
+            sha256: Some("4ab1d6435d639628a6f3e5008dd4f929edf4c4124b1a7169e1048f9fef534cdf"),
+        },
+        // `pipeline_flux.py:53` builds facexlib's BiSeNet face parser
+        // (`init_parsing_model(model_name='bisenet')`), which facexlib
+        // itself downloads from its own GitHub release
+        // (`facexlib/parsing/__init__.py:9-11`,
+        // `.../releases/download/v0.2.0/parsing_bisenet.pth`). A GitHub
+        // release is not something `ModelFile` can express, so mold pulls
+        // the Hugging Face mirror whose LFS object hashes to the same
+        // bytes — the antelopev2 precedent above, verified 2026-08-21
+        // against the digest of the GitHub download itself.
+        //
+        // LICENSE: facexlib is MIT (Xintao Wang, 2020) and its released
+        // weights ship under that licence, so this file carries none of
+        // the antelopev2 non-commercial restriction and needs no recorded
+        // acceptance. Mold carries it as a conversion INPUT and never
+        // loads the `.pth` directly.
+        ModelFile {
+            hf_repo: "leonelhs/facexlib".to_string(),
+            hf_filename: "parsing_bisenet.pth".to_string(),
+            component: ModelComponent::FaceParser,
+            size_bytes: 53_289_463,
+            gated: false,
+            sha256: Some("468e13ca13a9b43cc0881a9f99083a430e9c0a38abd935431d1c28ee94b26567"),
+        },
+    ]
+}
+
+/// Dummy defaults: a files-only auxiliary bundle never generates, so nothing
+/// reads these. Mirrors `ltx2_control_manifests`.
+fn pulid_bundle_defaults() -> ManifestDefaults {
+    ManifestDefaults {
+        steps: 1,
+        guidance: 0.0,
+        width: 16,
+        height: 16,
+        is_schnell: true,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    }
+}
+
+/// The PuLID auxiliary asset bundles, one per qualified base architecture.
+///
+/// These are emphatically **not** generation models: each is an identity
+/// adapter plus the four auxiliary artifacts a render needs before it can
+/// condition on a face. They are hidden (never offered as a checkpoint),
+/// auxiliary (never a default model), and files-only (never resolve to a
+/// [`ModelPaths`]).
+fn pulid_manifests() -> Vec<ModelManifest> {
+    vec![
+        ModelManifest {
+            name: PULID_FLUX_MANIFEST.to_string(),
+            family: PULID_FAMILY.to_string(),
+            description: "PuLID-FLUX v0.9.1 identity conditioning — adapter, EVA02-CLIP vision tower, and InsightFace antelopev2 face models".to_string(),
+            files: {
+                let mut files = vec![
+            // Upstream's own download: `pipeline_flux.py:95` calls
+                    // `hf_hub_download('guozinan/PuLID', f'pulid_flux_{version}.safetensors')`.
+                    ModelFile {
+                        hf_repo: "guozinan/PuLID".to_string(),
+                        hf_filename: "pulid_flux_v0.9.1.safetensors".to_string(),
+                        component: ModelComponent::IdentityAdapter,
+                        size_bytes: 1_142_099_520,
+                        gated: false,
+                        sha256: Some(
+                            "92c41c3af322b02e58e1b32842e4601e08c8f16ec1fe80089dbe957df510f51d",
+                        ),
+                    },
+                ];
+                files.extend(shared_pulid_extraction_files());
+                files
+            },
+            defaults: pulid_bundle_defaults(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: PULID_SDXL_MANIFEST.to_string(),
+            family: PULID_FAMILY.to_string(),
+            description: "PuLID v1.1 identity conditioning for SDXL — adapter, EVA02-CLIP vision tower, and InsightFace antelopev2 face models".to_string(),
+            files: {
+                let mut files = vec![
+                    // Upstream's own download: `pipeline_v1_1.py:152` calls
+                    // `hf_hub_download('guozinan/PuLID', 'pulid_v1.1.safetensors')`.
+                    // The file carries BOTH halves of the SDXL adapter:
+                    // `id_adapter.*` is the IDFormer (the same class FLUX's
+                    // `pulid_encoder.*` holds) and
+                    // `id_adapter_attn_layers.<i>.{id_to_k,id_to_v}` are the 70
+                    // UNet cross-attention injections.
+                    //
+                    // LICENSE: PuLID itself is Apache-2.0, so this file needs no
+                    // recorded acceptance. The two antelopev2 graphs beside it
+                    // still do — the extractor is shared, so the gate is too.
+                    ModelFile {
+                        hf_repo: "guozinan/PuLID".to_string(),
+                        hf_filename: "pulid_v1.1.safetensors".to_string(),
+                        component: ModelComponent::IdentityAdapter,
+                        size_bytes: 984_405_232,
+                        gated: false,
+                        sha256: Some(
+                            "4cb8ceec1078e0165399b88332ab3c5971619111b8e1730e6bae64144aabae41",
+                        ),
+                    },
+                ];
+                files.extend(shared_pulid_extraction_files());
+                files
+            },
+            defaults: pulid_bundle_defaults(),
+            hidden: true,
+        },
+    ]
+}
+
+/// The vision tower both IP-Adapter bundles condition on.
+///
+/// `ip-adapter_sdxl_vit-h` is named for THIS tower — it deliberately reuses
+/// `models/image_encoder` rather than the ViT-bigG one beside it, which
+/// belongs to the out-of-scope `ip-adapter_sdxl`. So the two bundles differ in
+/// exactly one file, and because they carry the same family they land these
+/// two at one `shared/ip-adapter/` path: a machine holding one bundle pulls
+/// only the other's adapter. The same arrangement `shared_pulid_extraction_files`
+/// makes for the four artifacts PuLID's two bundles share.
+///
+/// LICENSE: laion's CLIP-ViT-H-14 is MIT and `h94/IP-Adapter` is Apache-2.0,
+/// so neither bundle needs recorded acceptance — unlike PuLID, whose
+/// antelopev2 graphs are research-only.
+fn shared_ip_adapter_vision_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "h94/IP-Adapter".to_string(),
+            hf_filename: "models/image_encoder/model.safetensors".to_string(),
+            component: ModelComponent::ImagePromptVisionEncoder,
+            size_bytes: 2_528_373_448,
+            gated: false,
+            sha256: Some("6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030"),
+        },
+        // Carried so the loader reads the published architecture rather than
+        // trusting a transcription of it. 1280 wide, 32 layers, 16 heads,
+        // patch 14, projection 1024, `hidden_act: "gelu"` — that last one is
+        // the exact erf form, which is neither candle's tanh `Tensor::gelu()`
+        // nor the fork's QuickGelu, and is why the tower is ported locally.
+        ModelFile {
+            hf_repo: "h94/IP-Adapter".to_string(),
+            hf_filename: "models/image_encoder/config.json".to_string(),
+            component: ModelComponent::ImagePromptVisionConfig,
+            size_bytes: 560,
+            gated: false,
+            sha256: Some("625d37b31afbf2f0792a87846b3654ee23f20568409e35b78a1f795b04e1a7a1"),
+        },
+    ]
+}
+
+/// The IP-Adapter auxiliary asset bundles, one per base architecture.
+///
+/// Like the PuLID bundles these are emphatically **not** generation models:
+/// each is an image-prompt adapter plus the shared vision tower a render needs
+/// before it can condition on a reference picture. Hidden, auxiliary, and
+/// files-only.
+///
+/// Scope is the CLASSIC adapters. The Plus files (`ip-adapter-plus_*`) replace
+/// the linear projection with a Resampler emitting 16 tokens instead of 4;
+/// `ip_adapter::IpAdapterShape` already reads the token count off the file, so
+/// adding them later is a manifest entry and a Resampler, not a new contract.
+fn ip_adapter_manifests() -> Vec<ModelManifest> {
+    vec![
+        ModelManifest {
+            name: IP_ADAPTER_SD15_MANIFEST.to_string(),
+            family: IP_ADAPTER_FAMILY.to_string(),
+            description:
+                "IP-Adapter image prompting for SD1.5 — adapter and OpenCLIP ViT-H/14 vision tower"
+                    .to_string(),
+            files: {
+                let mut files = vec![ModelFile {
+                    hf_repo: "h94/IP-Adapter".to_string(),
+                    hf_filename: "models/ip-adapter_sd15.safetensors".to_string(),
+                    component: ModelComponent::ImagePromptAdapter,
+                    size_bytes: 44_642_768,
+                    gated: false,
+                    sha256: Some(
+                        "289b45f16d043d0bf542e45831f971dcdaabe18b656f11e86d9dfba7e9ee3369",
+                    ),
+                }];
+                files.extend(shared_ip_adapter_vision_files());
+                files
+            },
+            defaults: pulid_bundle_defaults(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: IP_ADAPTER_SDXL_MANIFEST.to_string(),
+            family: IP_ADAPTER_FAMILY.to_string(),
+            description:
+                "IP-Adapter image prompting for SDXL — adapter and OpenCLIP ViT-H/14 vision tower"
+                    .to_string(),
+            files: {
+                let mut files = vec![ModelFile {
+                    hf_repo: "h94/IP-Adapter".to_string(),
+                    hf_filename: "sdxl_models/ip-adapter_sdxl_vit-h.safetensors".to_string(),
+                    component: ModelComponent::ImagePromptAdapter,
+                    size_bytes: 698_391_064,
+                    gated: false,
+                    sha256: Some(
+                        "ebf05d918348aec7abb02a5e9ecef77e0aaea6914a5c4ea13f50d45eb1681831",
+                    ),
+                }];
+                files.extend(shared_ip_adapter_vision_files());
+                files
+            },
+            defaults: pulid_bundle_defaults(),
+            hidden: true,
+        },
+    ]
+}
+
+fn controlnet_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 25,
+        guidance: 7.5,
+        width: 512,
+        height: 512,
+        is_schnell: false,
+        scheduler: Some(Scheduler::Ddim),
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+    vec![
+        ModelManifest {
+            name: "controlnet-canny-sd15:fp16".to_string(),
+            family: "controlnet".to_string(),
+            description: "ControlNet Canny edge detection for SD1.5".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "lllyasviel/control_v11p_sd15_canny".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 722_598_642,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "controlnet-depth-sd15:fp16".to_string(),
+            family: "controlnet".to_string(),
+            description: "ControlNet depth estimation for SD1.5".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "lllyasviel/control_v11f1p_sd15_depth".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 722_598_642,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "controlnet-openpose-sd15:fp16".to_string(),
+            family: "controlnet".to_string(),
+            description: "ControlNet OpenPose body detection for SD1.5".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "lllyasviel/control_v11p_sd15_openpose".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 722_598_642,
+                gated: false,
+                sha256: None,
+            }],
+            defaults,
+            hidden: false,
+        },
+    ]
+}
+
+fn qwen3_expand_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 0,
+        guidance: 0.0,
+        width: 0,
+        height: 0,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+
+    vec![
+        ModelManifest {
+            name: "qwen3-expand:q8".to_string(),
+            family: "qwen3-expand".to_string(),
+            description: "Qwen3-1.7B Q8 — prompt expansion LLM (1.8GB)".to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "Qwen/Qwen3-1.7B-GGUF".to_string(),
+                    hf_filename: "Qwen3-1.7B-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 1_834_426_016,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "Qwen/Qwen3-1.7B".to_string(),
+                    hf_filename: "tokenizer.json".to_string(),
+                    component: ModelComponent::TextTokenizer,
+                    size_bytes: 11_422_654,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "qwen3-expand-small:q8".to_string(),
+            family: "qwen3-expand".to_string(),
+            description: "Qwen3-0.6B Q8 — lightweight prompt expansion LLM (0.6GB)".to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "Qwen/Qwen3-0.6B-GGUF".to_string(),
+                    hf_filename: "Qwen3-0.6B-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 639_446_688,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "Qwen/Qwen3-1.7B".to_string(),
+                    hf_filename: "tokenizer.json".to_string(),
+                    component: ModelComponent::TextTokenizer,
+                    size_bytes: 11_422_654,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults,
+            hidden: false,
+        },
+    ]
+}
+
+/// Synthetic manifest entries for the canonical companions in
+/// `mold_catalog::companions::COMPANIONS`. Single-file Civitai checkpoints
+/// (SDXL Pony, FLUX-dev finetunes, etc.) routinely strip their text encoders
+/// and VAE; the catalog scanner records `companions: ["clip-l", ...]` on
+/// those entries, and `POST /api/catalog/:id/download` enqueues each missing
+/// companion before the primary entry. The download queue is keyed on
+/// manifest names, so each canonical companion needs an entry here.
+///
+/// These manifests live in `family: "companion"` (see `UTILITY_FAMILIES`) so
+/// they're hidden from `mold list`, never selected as defaults, and routed
+/// through `pull_model_files_only_with_callback` instead of the
+/// config-writing path.
+///
+/// File lists are deliberately minimal — just the safetensors + (where
+/// applicable) the unified `tokenizer.json`. Single-file engines
+/// only need the encoder weights and a tokenizer; richer A1111-style
+/// loaders that want config/vocab/merges files are a future extension.
+/// Upstream's default negative prompt, shared by every Wan variant
+/// (`Wan2.2/wan/configs/shared_config.py`). Applied when a request leaves
+/// `negative_prompt` unset: these checkpoints were tuned against it, and an
+/// empty uncond quietly degrades CFG quality.
+/// Upstream's tuned Chinese negative prompt, shared by every Wan preset
+/// (`Wan2.2/wan/configs/shared_config.py`). The manifests plant it in their
+/// defaults; the engine falls back to it when a request arrives without one.
+pub const WAN_DEFAULT_NEGATIVE_PROMPT: &str = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
+
+/// The tuned default negative prompt a family's *engine* substitutes when a
+/// request carries no `negative_prompt` at all. This is the single source for
+/// every surface that advertises, materializes, or prefills that default —
+/// `/api/models[].default_negative_prompt`, the server's request
+/// materialization, the CLI's local fallback, and every client's prefill all
+/// resolve through here so they cannot drift from the engine
+/// (`wan/pipeline.rs::resolve_negative_prompt`). An explicit value — the
+/// empty string included — is always authoritative and never replaced.
+pub fn default_negative_prompt_for_family(family: &str) -> Option<&'static str> {
+    match family {
+        "wan" => Some(WAN_DEFAULT_NEGATIVE_PROMPT),
+        _ => None,
+    }
+}
+
+/// The A14B quality tier's advertised guidance scale. Upstream runs the tier
+/// with *per-expert* scales — T2V `(3.0, 4.0)` low/high, I2V `(3.5, 3.5)`
+/// (`Wan2.2/wan/configs/wan_{t2v,i2v}_A14B.py:37`) — which a single wire
+/// scalar cannot express, so the manifests advertise this compromise value.
+/// The engine treats a request carrying exactly this value as "the default"
+/// and substitutes upstream's per-expert pair; any other explicit scale is
+/// honored uniformly. Keeping the sentinel and the manifest default the same
+/// constant is what makes that contract hold.
+pub const WAN_A14B_QUALITY_GUIDANCE: f64 = 3.5;
+
+/// Denoising rungs for `wan21-t2v-1.3b:turbo`: FastVideo's FastWan2.1 DMD
+/// distill walks exactly these three, no more and no fewer
+/// (`fastvideo/configs/pipelines/wan.py:117-123`,
+/// `FastWan2_1_T2V_480P_Config.dmd_denoising_steps`, at commit `40b93784`).
+pub const FASTWAN_1_3B_RUNGS: [u32; 3] = [1000, 757, 522];
+
+/// Denoising rungs for `wan22-ti2v-5b:dmd`: FastVideo's FastWan2.2 DMD
+/// distill of the TI2V-5B (`fastvideo/configs/pipelines/wan.py:275-279`,
+/// `FastWan2_2_TI2V_5B_Config.dmd_denoising_steps`, commit `40b93784`).
+///
+/// Deliberately a second array rather than a reference to
+/// [`FASTWAN_1_3B_RUNGS`]. The integers being equal is a property of the
+/// recipe FastVideo happened to reuse, not a shared constant: they are two
+/// independent upstream declarations, on two different sigma tables, and a
+/// revision to one must not move the other.
+pub const FASTWAN_2_2_TI2V_5B_RUNGS: [u32; 3] = [1000, 757, 522];
+
+/// The published schedule of a DMD-distilled Wan tier: the rungs it walks and
+/// the sigma table those rungs are timesteps ON.
+///
+/// The shift belongs here rather than in the sampler because it is a property
+/// of the TIER, not of the distillation technique. FastWan2.1's 1.3B was
+/// distilled at `flow_shift = 8.0` and FastWan2.2's TI2V-5B at `5.0`
+/// (`fastvideo/configs/pipelines/wan.py:117-123` and `:275-279`, commit
+/// `40b93784`; the training pipeline reads that config value —
+/// `fastvideo/training/distillation_pipeline.py:142-144`, and
+/// `examples/distill/Wan2.2-TI2V-5B-Diffusers/Data-free/distill_dmd_t2v_5B.sh`
+/// passes `--flow_shift 5`). mold follows the shift each student was TRAINED
+/// on; upstream's own `DmdDenoisingStage.__init__` hardcodes
+/// `FlowMatchEulerDiscreteScheduler(shift=8.0)` for every tier
+/// (`fastvideo/pipelines/stages/denoising.py:1255-1257`), which is an
+/// inference bug the 5B would otherwise inherit. Rungs without their table
+/// would render the 5B on the 1.3B's sigmas with no error anywhere — a
+/// silently wrong clip, which is the failure this struct exists to make
+/// impossible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WanDmdLadder {
+    /// The timesteps the student predicts x0 at, strictly descending.
+    pub rungs: &'static [u32],
+    /// The flow shift of the sigma table those timesteps index.
+    pub table_shift: f64,
+}
+
+/// The 1.3B distill's published schedule.
+pub const FASTWAN_1_3B_LADDER: WanDmdLadder = WanDmdLadder {
+    rungs: &FASTWAN_1_3B_RUNGS,
+    table_shift: 8.0,
+};
+
+/// The TI2V-5B distill's published schedule.
+pub const FASTWAN_2_2_TI2V_5B_LADDER: WanDmdLadder = WanDmdLadder {
+    rungs: &FASTWAN_2_2_TI2V_5B_RUNGS,
+    table_shift: 5.0,
+};
+
+/// The fixed denoising ladder of a DMD-distilled Wan tier, or `None` for a
+/// tier that walks an ordinary `(steps, shift)` schedule.
+///
+/// This is the ONE authority for "this checkpoint is a rung-ladder distill":
+/// the generation profile pins `steps` to the ladder's length and guidance to
+/// 1.0 and empties the scheduler list, admission refuses anything else, and
+/// the Wan engine builds its DMD solver from the same rungs and the same
+/// table shift. A DMD student predicts x0 at each rung and is re-noised to
+/// the next (`fastvideo/pipelines/stages/denoising.py`, `DmdDenoisingStage`);
+/// walking it with UniPC or Euler, at any other step count, or on any other
+/// sigma table, is not a slower render but a different, worse one, which is
+/// why nothing here is a user preference.
+pub fn wan_dmd_ladder(model_name: &str) -> Option<WanDmdLadder> {
+    match model_name {
+        "wan21-t2v-1.3b:turbo" => Some(FASTWAN_1_3B_LADDER),
+        "wan22-ti2v-5b:dmd" => Some(FASTWAN_2_2_TI2V_5B_LADDER),
+        _ => None,
+    }
+}
+
+/// Shared Wan component files: the UMT5-XXL text encoder (identical across
+/// every Wan 2.1/2.2 variant — Comfy-Org's safetensors repack of upstream's
+/// `models_t5_umt5-xxl-enc-bf16.pth`) and its SentencePiece tokenizer in
+/// tokenizers-crate JSON form.
+fn shared_wan_files() -> Vec<ModelFile> {
+    vec![
+        ModelFile {
+            hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+            hf_filename: "split_files/text_encoders/umt5_xxl_fp16.safetensors".to_string(),
+            component: ModelComponent::TextEncoder,
+            size_bytes: 11_366_399_385,
+            gated: false,
+            sha256: Some("7b8850f1961e1cf8a77cca4c964a358d303f490833c6c087d0cff4b2f99db2af"),
+        },
+        ModelFile {
+            hf_repo: "google/umt5-xxl".to_string(),
+            hf_filename: "tokenizer.json".to_string(),
+            component: ModelComponent::TextTokenizer,
+            size_bytes: 16_853_013,
+            gated: false,
+            sha256: Some("af904105ce1071b1202bba0059a841f4a7b85b48b6ec179c4948e3483476e0dd"),
+        },
+    ]
+}
+
+/// Wan 2.1/2.2 video manifests (ComfyUI-repack weight layout — the format the
+/// GGUF/LoRA ecosystem shares). Text-to-video is live; image conditioning on
+/// TI2V-5B follows in a later layer.
+fn wan_manifests() -> Vec<ModelManifest> {
+    let defaults_480p = ManifestDefaults {
+        // ComfyUI's proven Wan 2.1 recipe (30 steps, cfg 6, uni_pc); upstream
+        // defaults to 50 steps at cfg 5-6, which buys little at 1.3B scale.
+        steps: 30,
+        guidance: 6.0,
+        width: 832,
+        height: 480,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: Some(WAN_DEFAULT_NEGATIVE_PROMPT.to_string()),
+        frames: Some(81),
+        fps: Some(16),
+        // The 1.3B is a pure T2V DiT (16-channel patch embedding, no
+        // conditioning concat or inpaint path) — a supplied source image is
+        // rejected, so admission should refuse it before the queue (#772).
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+    };
+    let defaults_ti2v = ManifestDefaults {
+        // ComfyUI's TI2V-5B template: 20 steps, cfg 5, uni_pc, 121f @ 24 fps.
+        steps: 20,
+        guidance: 5.0,
+        width: 1280,
+        height: 704,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: Some(WAN_DEFAULT_NEGATIVE_PROMPT.to_string()),
+        frames: Some(121),
+        fps: Some(24),
+        // TI2V renders text-to-video and, when a source is supplied,
+        // pins it as frame 0 through the latent-inpaint path (#772).
+        source_image: Some(crate::types::SourceImageCapability::Optional),
+    };
+    // The Turbo distill differs from the quality tier only in the denoise
+    // budget: 4 steps, and guidance 1.0 so `needs_cfg_pass` drops the
+    // unconditional forward. That is (20 x 2) / 4 = 10x fewer transformer
+    // forwards for the same clip. Everything else — the 2.2 VAE grid, the
+    // 121-frame 24 fps default, the shift — is the base checkpoint's.
+    let defaults_ti2v_turbo = ManifestDefaults {
+        steps: 4,
+        guidance: 1.0,
+        ..defaults_ti2v.clone()
+    };
+    // FastVideo's DMD distill of the same 5B differs from the base tier only
+    // in the denoise budget: 3 rungs, and guidance 1.0 so `needs_cfg_pass`
+    // drops the unconditional forward. That is 3 transformer forwards against
+    // the base's 20 x 2 = 40 for the same clip. Everything else — the 2.2 VAE
+    // grid, 1280x704, 121 frames at 24 fps, the tuned negative prompt — is
+    // the base checkpoint's.
+    //
+    // `source_image` is `Unsupported` here where the base tiers are
+    // `Optional`, and it is the one field that does not follow from the
+    // denoise budget. Upstream distilled this student data-free on T2V
+    // trajectories with a SCALAR timestep; its DMD stage has no image branch
+    // at all and its model card says text-to-video. mold's TI2V
+    // latent-inpaint path still runs on it — the engine pins latent frame 0
+    // and re-imposes it after every rung, and it does hold, bit-exact — but
+    // the student never saw a per-token `t=0` and does not treat that pinned
+    // frame as where the clip starts: measured on an L40S against
+    // `:turbo` from the same stills and seeds, it lurches to a tighter,
+    // more saturated framing within ~4 frames and, on a person, changes
+    // clothing and build while it does so, leaving the pinned frame an
+    // orphan. `:turbo` holds the same sources across the whole clip. So the
+    // conditioning is refused at admission rather than shipped half-working;
+    // this one field also turns off first/last frame and extend, and the
+    // server's own capability sync hides keyframes with them.
+    let defaults_ti2v_dmd = ManifestDefaults {
+        steps: 3,
+        guidance: 1.0,
+        source_image: Some(crate::types::SourceImageCapability::Unsupported),
+        ..defaults_ti2v.clone()
+    };
+    // FastVideo's DMD distill of the 1.3B differs from the base tier only in
+    // the denoise budget: 3 rungs, and guidance 1.0 so `needs_cfg_pass` drops
+    // the unconditional forward. That is (30 x 2) / 3 = 20x fewer transformer
+    // forwards for the same clip. Everything else — 832x480, 81 frames at
+    // 16 fps, the tuned negative prompt, and `SourceImageCapability::
+    // Unsupported` (it is the same pure-T2V DiT) — is the base's.
+    let defaults_480p_turbo = ManifestDefaults {
+        steps: 3,
+        guidance: 1.0,
+        ..defaults_480p.clone()
+    };
+
+    vec![
+        ModelManifest {
+            name: "wan21-t2v-1.3b:bf16".to_string(),
+            family: "wan".to_string(),
+            description: "Wan 2.1 T2V 1.3B BF16 — 480p text-to-video".to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                    hf_filename: "split_files/diffusion_models/wan2.1_t2v_1.3B_bf16.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 2_838_104_528,
+                    gated: false,
+                    sha256: Some(
+                        "6f999b0d6cb9a72b3d98ac386ed96f57f8cecae13994a69232514ea4974ad5fd",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan_2.1_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 253_815_318,
+                    gated: false,
+                    sha256: Some(
+                        "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_480p.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "wan21-t2v-1.3b:turbo".to_string(),
+            family: "wan".to_string(),
+            description:
+                "Wan 2.1 T2V 1.3B Turbo — 3-step 480p text-to-video (FastVideo DMD distill)"
+                    .to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                // FastVideo's DMD distill of the same 1.3B transformer,
+                // published as a single-file diffusers checkpoint
+                // (`FastVideo/FastWan2.1-T2V-1.3B-Diffusers`, apache-2.0,
+                // ungated). It is stored F32 — 5.96 GB on disk against the
+                // base bf16's 2.84 GB — and mold casts to bf16 lazily at
+                // load, so it costs ~3 GB in VRAM. VRAM admission prices a
+                // transformer by file length, which over-reserves here;
+                // harmless at 1.3B scale, and the alternative would be a
+                // second authority on dtype.
+                //
+                // Its `transformer/config.json` is the base checkpoint's
+                // geometry exactly — dim 1536, 30 layers, in/out 16, ffn
+                // 8960, patch [1,2,2] — so mold's shape-driven detection
+                // needs no new arm. The extra 60
+                // `blocks.N.to_gate_compress.{weight,bias}` sparse-attention
+                // gate tensors are tolerated by the loader.
+                //
+                // The distill is the whole delta, and none of it is a user
+                // preference: the ladder is pinned by `wan_dmd_ladder`, and
+                // the solver is DMD (predict x0, re-noise to the next rung),
+                // not UniPC — which is why the generation profile fixes
+                // steps, guidance, scheduler and shift rather than defaulting
+                // them.
+                files.push(ModelFile {
+                    hf_repo: "FastVideo/FastWan2.1-T2V-1.3B-Diffusers".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_959_377_056,
+                    gated: false,
+                    sha256: Some(
+                        "b01c847916349edb53f93338142b78077277140a8247332e354bcf6a00840b49",
+                    ),
+                });
+                // VAE and UMT5 are unchanged copies of the base 2.1 stack, so
+                // the turbo tier shares them byte for byte.
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan_2.1_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 253_815_318,
+                    gated: false,
+                    sha256: Some(
+                        "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_480p_turbo,
+            hidden: false,
+        },
+        wan21_t2v_14b_manifest(Wan21T2v14bTier::Compact, defaults_480p.clone()),
+        wan21_t2v_14b_manifest(Wan21T2v14bTier::Quality, defaults_480p),
+        ModelManifest {
+            name: "wan22-ti2v-5b:fp16".to_string(),
+            family: "wan".to_string(),
+            description: "Wan 2.2 TI2V 5B FP16 — 720p24 text- and image-to-video".to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                    hf_filename: "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"
+                        .to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_999_658_848,
+                    gated: false,
+                    sha256: Some(
+                        "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan2.2_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 1_409_400_960,
+                    gated: false,
+                    sha256: Some(
+                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_ti2v.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "wan22-ti2v-5b:q8".to_string(),
+            family: "wan".to_string(),
+            description: "Wan 2.2 TI2V 5B Q8_0 — 720p24 text- and image-to-video (small-card GGUF)"
+                .to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                // QuantStack's Q8_0 repack of the same 5B transformer:
+                // 5.4 GB against fp16's 10 GB, which is what reaches
+                // 8-12 GB-class cards (#794).
+                // VRAM peak: 18,460 MiB at the default 1280x704 x 121f
+                // (24 fps, 20 steps) on an RTX 4090 — small cards use
+                // reduced frames/resolution (#794).
+                files.push(ModelFile {
+                    hf_repo: "QuantStack/Wan2.2-TI2V-5B-GGUF".to_string(),
+                    hf_filename: "Wan2.2-TI2V-5B-Q8_0.gguf".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 5_400_179_040,
+                    gated: false,
+                    sha256: Some(
+                        "57bece983817ab2f957546683bb670f13be7d99022d45674840cd999a050ea8f",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan2.2_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 1_409_400_960,
+                    gated: false,
+                    sha256: Some(
+                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_ti2v,
+            hidden: false,
+        },
+        ModelManifest {
+            name: "wan22-ti2v-5b:turbo".to_string(),
+            family: "wan".to_string(),
+            description: "Wan 2.2 TI2V 5B Turbo — 4-step 720p24 text- and image-to-video"
+                .to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                // Self-Forcing step+CFG distillation of the same 5B
+                // transformer (`quanhaol/Wan2.2-TI2V-5B-Turbo`). We ship the
+                // diffusers repack rather than the original, which publishes
+                // only a 20 GB `model.pt` pickle mold cannot load.
+                //
+                // Its `transformer/config.json` is the base checkpoint's
+                // geometry exactly — in_channels 48, 30 layers, 24 heads x
+                // 128, ffn 14336, patch [1,2,2] — so mold's shape-driven
+                // detection needs no new arm, and its `scheduler_config.json`
+                // is UniPC at `flow_shift 5.0`, which is already the family
+                // default. The distill is the whole delta: 4 steps at
+                // guidance 1.0, where `needs_cfg_pass` skips the
+                // unconditional forward entirely.
+                files.push(ModelFile {
+                    hf_repo: "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 9_932_338_872,
+                    gated: false,
+                    sha256: Some(
+                        "941f10781e7abbc53644557165cbe086e9672170475c27f8e34cb11a98617232",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "yetter-ai/Wan2.2-TI2V-5B-Turbo-Diffusers".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model-00002-of-00002.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TransformerShard,
+                    size_bytes: 89_266_952,
+                    gated: false,
+                    sha256: Some(
+                        "4e375f2441c3abb07cf3fb190eb88b23a5c44e01bc4a47569c6e778d49e7b5e6",
+                    ),
+                });
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan2.2_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 1_409_400_960,
+                    gated: false,
+                    sha256: Some(
+                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_ti2v_turbo,
+            hidden: false,
+        },
+        ModelManifest {
+            name: "wan22-ti2v-5b:dmd".to_string(),
+            family: "wan".to_string(),
+            description: "Wan 2.2 TI2V 5B DMD — 3-step 720p24 text-to-video (FastVideo DMD \
+                 distill)"
+                .to_string(),
+            files: {
+                let mut files = shared_wan_files();
+                // FastVideo's DMD distill of the same 5B transformer
+                // (`FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers`,
+                // apache-2.0, ungated), published as one unsharded diffusers
+                // file — all 825 tensors bf16, 9.3 GiB, the same on-disk size
+                // as the base fp16 tier.
+                //
+                // Its tensor key set is EXACTLY the base
+                // `Wan-AI/Wan2.2-TI2V-5B-Diffusers` one (no sparse-attention
+                // gates, no image embedder) and its `transformer/config.json`
+                // is the base geometry — in_channels 48, 30 layers, 24 heads
+                // x 128, ffn 14336, patch [1,2,2] — so mold's shape-driven
+                // detection needs no new arm.
+                //
+                // The tag is `:dmd`, not `:turbo`: `:turbo` on this
+                // checkpoint is already yetter-ai's Self-Forcing 4-step
+                // distill, which takes an adjustable guidance scale and walks
+                // an ordinary solver schedule. This one does neither.
+                //
+                // The distill is the whole delta, and none of it is a user
+                // preference: the rungs AND the shift-5 table they sit on are
+                // pinned by `wan_dmd_ladder`, and the solver is DMD (predict
+                // x0, re-noise to the next rung), not UniPC — which is why
+                // the generation profile fixes steps, guidance, scheduler and
+                // shift rather than defaulting them.
+                files.push(ModelFile {
+                    hf_repo: "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers".to_string(),
+                    hf_filename: "transformer/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_999_660_080,
+                    gated: false,
+                    sha256: Some(
+                        "a1cf4acd5d0242ca0cad68e115064f4ac7e748686c9cf0da050ce87decc6b9bf",
+                    ),
+                });
+                // The VAE and UMT5 in FastVideo's repo are byte-identical to
+                // the base 2.2 stack, so the tier pulls the same Comfy-Org
+                // 2.2 VAE the other 5B tiers already have on disk.
+                files.push(ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                    hf_filename: "split_files/vae/wan2.2_vae.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 1_409_400_960,
+                    gated: false,
+                    sha256: Some(
+                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156",
+                    ),
+                });
+                files
+            },
+            defaults: defaults_ti2v_dmd,
+            hidden: false,
+        },
+        a14b_manifest(A14bTier::Fast, A14bTask::T2v),
+        a14b_manifest(A14bTier::Quality, A14bTask::T2v),
+        a14b_manifest(A14bTier::Compact, A14bTask::T2v),
+        a14b_manifest(A14bTier::Fp8, A14bTask::T2v),
+        a14b_manifest(A14bTier::Fast, A14bTask::I2v),
+        a14b_manifest(A14bTier::Quality, A14bTask::I2v),
+        a14b_manifest(A14bTier::Compact, A14bTask::I2v),
+        a14b_manifest(A14bTier::Fp8, A14bTask::I2v),
+    ]
+}
+
+/// Which Wan 2.1 T2V-14B tier a manifest is built for.
+///
+/// The 14B is the dense single-expert 2.1 checkpoint — `dim` 5120, 40 layers,
+/// `in_dim` 16 — which the engine already shape-detects, so these tiers add no
+/// architecture. What they add is the checkpoint itself: 2.1 shipped in mold
+/// only at 1.3B, while the 14B carries the CausVid/lightx2v-era LoRA ecosystem
+/// and city96 publishes the canonical GGUFs (#797).
+///
+/// Only two of city96's fifteen tiers ship. Q8_0 is the quality tier and
+/// Q5_K_M the one that leaves room for the encoder on a 16 GB card; the
+/// intermediate tiers buy nothing a user cannot get by picking one of these
+/// two, and every additional tier is another SHA to keep honest.
+#[derive(Clone, Copy)]
+enum Wan21T2v14bTier {
+    /// Q5_K_M — 11.3 GB.
+    Compact,
+    /// Q8_0 — 15.9 GB.
+    Quality,
+}
+
+impl Wan21T2v14bTier {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Compact => "q5",
+            Self::Quality => "q8",
+        }
+    }
+
+    /// `(filename, size_bytes, sha256)` — read from the repository's own blob
+    /// listing, not from the survey that prompted the work.
+    fn file(self) -> (&'static str, u64, &'static str) {
+        match self {
+            Self::Compact => (
+                "wan2.1-t2v-14b-Q5_K_M.gguf",
+                11_264_907_904,
+                "5a4a0973e661603920633729c4a929a85e20e4107c5e7b4d9f103888f5a38178",
+            ),
+            Self::Quality => (
+                "wan2.1-t2v-14b-Q8_0.gguf",
+                15_879_461_504,
+                "cd4f1cc5cd4b63f25898340e997d6299984114e8755be5407bc585a1e0ec9f38",
+            ),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Compact => "Wan 2.1 T2V 14B Q5_K_M — 480p text-to-video (smaller-card GGUF)",
+            Self::Quality => "Wan 2.1 T2V 14B Q8_0 — 480p text-to-video",
+        }
+    }
+}
+
+/// One Wan 2.1 T2V-14B tier.
+///
+/// The VAE is the same 2.1 VAE the 1.3B pins, and the encoder and tokenizer
+/// come from `shared_wan_files()`, so a user who already has the 1.3B pulls
+/// only the transformer. The recipe is the 1.3B's — ComfyUI's Wan 2.1 template
+/// — because it is the same family at the same resolution; the flow shift the
+/// template pairs with it is already the engine's single-expert default of 8.0
+/// (`wan/pipeline.rs`), so no per-tier shift is needed.
+fn wan21_t2v_14b_manifest(tier: Wan21T2v14bTier, defaults: ManifestDefaults) -> ModelManifest {
+    let (filename, size_bytes, sha256) = tier.file();
+    ModelManifest {
+        name: format!("wan21-t2v-14b:{}", tier.tag()),
+        family: "wan".to_string(),
+        description: tier.description().to_string(),
+        files: {
+            let mut files = shared_wan_files();
+            files.push(ModelFile {
+                hf_repo: "city96/Wan2.1-T2V-14B-gguf".to_string(),
+                hf_filename: filename.to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes,
+                gated: false,
+                sha256: Some(sha256),
+            });
+            files.push(ModelFile {
+                hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                hf_filename: "split_files/vae/wan_2.1_vae.safetensors".to_string(),
+                component: ModelComponent::Vae,
+                size_bytes: 253_815_318,
+                gated: false,
+                sha256: Some("2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"),
+            });
+            files
+        },
+        defaults,
+        hidden: false,
+    }
+}
+
+/// Which A14B task a manifest is built for. The two differ only in the GGUF
+/// repository and the distill pair — the DiT is the same 40-block, 5120-wide
+/// network, with I2V declaring 36 input channels for the mask-plus-image
+/// concat.
+#[derive(Clone, Copy)]
+enum A14bTask {
+    T2v,
+    I2v,
+}
+
+impl A14bTask {
+    fn slug(self) -> &'static str {
+        match self {
+            Self::T2v => "t2v",
+            Self::I2v => "i2v",
+        }
+    }
+
+    fn gguf_repo(self) -> &'static str {
+        match self {
+            Self::T2v => "QuantStack/Wan2.2-T2V-A14B-GGUF",
+            Self::I2v => "QuantStack/Wan2.2-I2V-A14B-GGUF",
+        }
+    }
+}
+
+/// The four shipped A14B tiers. The GGUF tiers are the same weights at
+/// different quantizations; what actually separates them is the four-step
+/// distill, which only the Lightning tiers carry. The fp8 tier is a different
+/// container entirely (#777).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum A14bTier {
+    /// Q5_K_M plus the lightx2v four-step distill pair.
+    Fast,
+    /// Q8_0, no adapter, the family's ordinary step count.
+    Quality,
+    /// Q4_K_M plus the same four-step distill pair as `Fast` — the same
+    /// recipe with a ~1.1 GB smaller resident expert, aimed at 12-16 GB
+    /// cards. Q4_K_M is the community floor before the quality cliff; the
+    /// Q4/Q5 boundary is where GGUF Wan degrades visibly (#794).
+    Compact,
+    /// Comfy-Org's `*_fp8_scaled` e4m3 safetensors experts (~14.3 GB each,
+    /// max-of-pair residency on 24 GB cards), running the 20-step quality
+    /// recipe. Measured against `:q8` at 33f/832x480 on an RTX 4090: step
+    /// time is a wash (~28 s/step both — the denoise is compute-bound, not
+    /// weight-decode-bound), but peak VRAM drops 20,278 → 17,646 MiB. That
+    /// headroom, plus the LoRA story, is the tier: unlike GGUF, user LoRAs
+    /// (including the lightx2v pair passed via `--lora`) merge into fp8
+    /// weights at load instead of running as a per-step branch. Bare-name
+    /// resolution deliberately stays on `:q8` (#777 tier-semantics
+    /// decision).
+    Fp8,
+}
+
+impl A14bTier {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Fast => "q5",
+            Self::Quality => "q8",
+            Self::Compact => "q4",
+            Self::Fp8 => "fp8",
+        }
+    }
+
+    fn gguf_quant(self) -> &'static str {
+        match self {
+            Self::Fast => "Q5_K_M",
+            Self::Quality => "Q8_0",
+            Self::Compact => "Q4_K_M",
+            Self::Fp8 => unreachable!("the fp8 tier ships safetensors, not GGUF"),
+        }
+    }
+
+    /// Whether the tier ships the lightx2v four-step Lightning distill pair.
+    /// The adapters were trained against the bf16 weights, so the Q5 and Q4
+    /// tiers pull byte-identical files. The fp8 tier merges user adapters at
+    /// load instead of shipping one.
+    fn has_distill(self) -> bool {
+        matches!(self, Self::Fast | Self::Compact)
+    }
+}
+
+/// `(size, sha256)` for one shipped A14B artifact, read from the Hugging Face
+/// API rather than from any local copy.
+type FileFacts = (u64, &'static str);
+
+fn a14b_expert_facts(task: A14bTask, tier: A14bTier, low_noise: bool) -> FileFacts {
+    match (task, tier, low_noise) {
+        (A14bTask::T2v, A14bTier::Fast, false) => (
+            10_790_416_896,
+            "fe704eb3541b09edb9cb675d58443bebccbabba0c9f5353305a6e01d9d9a2478",
+        ),
+        (A14bTask::T2v, A14bTier::Fast, true) => (
+            10_790_416_896,
+            "67242c61f055eb40c70fb421eb7dc1bdfde9c535f47c165fdfbf0b81b8b535dd",
+        ),
+        (A14bTask::T2v, A14bTier::Quality, false) => (
+            15_404_970_496,
+            "e15fecd4ce8f7effe1c4d9ab2c51d37b071bf3dd8b7f1b73e9fc27ac28f6820a",
+        ),
+        (A14bTask::T2v, A14bTier::Quality, true) => (
+            15_404_970_496,
+            "71574f62260f3ba305c31085c922a2b1b6672dbfdbe07717c066688ea56966fc",
+        ),
+        (A14bTask::I2v, A14bTier::Fast, false) => (
+            10_792_055_296,
+            "163e9e5ae7ff83a4598d55242c767384be8909749dc07240d388a24838e8bac6",
+        ),
+        (A14bTask::I2v, A14bTier::Fast, true) => (
+            10_792_055_296,
+            "c5affcba15576959fa6d63c18261275b6407c3edd5ad3d8ab1c420e96f9d05d0",
+        ),
+        (A14bTask::I2v, A14bTier::Quality, false) => (
+            15_406_608_896,
+            "619a66032c28e1b27882dfccc0bf93e51edb1491e8d4e4c6f291726abe4de8aa",
+        ),
+        (A14bTask::I2v, A14bTier::Quality, true) => (
+            15_406_608_896,
+            "029c7adc74de4f7804905c5e4fb9335d0862cd2fc37191df526aeac13b64425e",
+        ),
+        // The Q4_K_M pairs (#794). Sizes and hashes read from the Hugging
+        // Face API (`lfs.oid`), like every row above.
+        // VRAM peaks on an RTX 4090 at the 4-step Lightning defaults
+        // (53f @ 16 fps): T2V 21,372 MiB at 832x480; I2V 19,580 MiB at
+        // 720x480 (#794).
+        (A14bTask::T2v, A14bTier::Compact, false) => (
+            9_650_090_496,
+            "e0c490c6e316fd91ff52034e4ca66b825717e33ff11624585c0ccfcb5d410c59",
+        ),
+        (A14bTask::T2v, A14bTier::Compact, true) => (
+            9_650_090_496,
+            "091a5bae02e14aa016bc9b10a7892efda4c629346b81c5dcebbe30ea2ac8923a",
+        ),
+        (A14bTask::I2v, A14bTier::Compact, false) => (
+            9_651_728_896,
+            "836250abfaa3411694e2c9cf3a0cc18265329d5156d81aa116d5366b0f8f02e7",
+        ),
+        (A14bTask::I2v, A14bTier::Compact, true) => (
+            9_651_728_896,
+            "e2f98d834af009d035c6b0918268f2eba0aa8a63025ce942277e2384d40b0866",
+        ),
+        // The Comfy-Org fp8-scaled safetensors pairs (#777), read from the
+        // Hugging Face API like every row above. Comfy-Org over Kijai's `_KJ`
+        // exports: same e4m3 ComfyUI marker contract the loader shipped
+        // against in #747, ~1 GB smaller per expert, and the repository this
+        // family's VAE/encoder rows already pull from.
+        (A14bTask::T2v, A14bTier::Fp8, false) => (
+            14_293_923_632,
+            "cad711ae211c8b23455ec68cd6a190a33a3d874234a77eb57266d73f8f0e6c9f",
+        ),
+        (A14bTask::T2v, A14bTier::Fp8, true) => (
+            14_293_923_632,
+            "e71b96d7c82e638694c5e7fb98fac4bfb0e4ddc5fbbb4b1df40da8f0f1278a97",
+        ),
+        (A14bTask::I2v, A14bTier::Fp8, false) => (
+            14_294_742_832,
+            "6122e79d55e0f235698d11d657f3b196c5273c830da00b2b013c5a048d5e6a42",
+        ),
+        (A14bTask::I2v, A14bTier::Fp8, true) => (
+            14_294_742_832,
+            "5471a457b6ac404202a5fbe6c11595a3d5641fc766b00f38763f72303fffc21e",
+        ),
+    }
+}
+
+/// The four-step distill for one expert.
+///
+/// **Source matters here.** `lightx2v/Wan2.2-Distill-Loras` publishes files with
+/// the same names and the same advertised purpose, but its I2V pair is not the
+/// pure low-rank format: both halves carry hundreds of `.diff`/`.diff_b`
+/// full-weight deltas and the low-noise half additionally targets
+/// `cross_attn.{k,v,norm_k}_img` and `img_emb.proj.*` — the Wan 2.1 CLIP-vision
+/// branch that Wan 2.2's own I2V checkpoint does not contain (its GGUF has zero
+/// `_img` tensors). Kijai's `Wan22_Lightx2v` rank-64 I2V pair has the same
+/// problem. The Comfy-Org repack below is the one that is 400 clean low-rank
+/// pairs with an I64 alpha of 8 at rank 64 — headers parsed, not assumed.
+fn a14b_distill_facts(task: A14bTask, low_noise: bool) -> (&'static str, FileFacts) {
+    match (task, low_noise) {
+        (A14bTask::T2v, false) => (
+            "wan2.2_t2v_lightx2v_4steps_lora_v1.1_high_noise.safetensors",
+            (
+                1_226_977_424,
+                "698321cb86bd30c4af06c9b84e656a1048c8cb54e06d50694536fb5de37fde41",
+            ),
+        ),
+        (A14bTask::T2v, true) => (
+            "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors",
+            (
+                1_226_977_424,
+                "ec95216e614b3c132c11bfb387b11feedf62163150ccc9068bca8a189771e75a",
+            ),
+        ),
+        (A14bTask::I2v, false) => (
+            "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+            (
+                1_226_977_424,
+                "d176c808d6fc461999b68e321efcb7501b20b8c3797523ed0df14f7d1deff11e",
+            ),
+        ),
+        (A14bTask::I2v, true) => (
+            "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+            (
+                1_226_977_424,
+                "024f21de095bc8fad9809ded3e9e49a2e170dcf27075da8145ba7d60d8aab7f9",
+            ),
+        ),
+    }
+}
+
+/// A Wan 2.2 A14B mixture-of-experts manifest.
+///
+/// Both experts ship as separate files and exactly one is GPU-resident at a
+/// time, so the VRAM demand is the max over the pair rather than their sum —
+/// 10.8 GB at `:q5`, 15.4 GB at `:q8`, 9.65 GB at `:q4` (measured `:q4` total
+/// peaks on an RTX 4090 at the 53f Lightning defaults: T2V 21,372 MiB at
+/// 832x480, I2V 19,580 MiB at 720x480; #794). Disk is the sum.
+///
+/// Resolution defaults to 480p because that is the acceptance target for this
+/// tier (#747: "81f 480p in ~1.5-3 min on a 4090"); 720p renders, but not in
+/// that budget.
+fn a14b_manifest(tier: A14bTier, task: A14bTask) -> ModelManifest {
+    let expert_file = |low_noise: bool| {
+        let (size_bytes, sha256) = a14b_expert_facts(task, tier, low_noise);
+        let (hf_repo, hf_filename) = if tier == A14bTier::Fp8 {
+            (
+                "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                format!(
+                    "split_files/diffusion_models/wan2.2_{}_{}_noise_14B_fp8_scaled.safetensors",
+                    task.slug(),
+                    if low_noise { "low" } else { "high" },
+                ),
+            )
+        } else {
+            let folder = if low_noise { "LowNoise" } else { "HighNoise" };
+            (
+                task.gguf_repo().to_string(),
+                format!(
+                    "{folder}/Wan2.2-{}-A14B-{folder}-{}.gguf",
+                    task.slug().to_uppercase(),
+                    tier.gguf_quant()
+                ),
+            )
+        };
+        ModelFile {
+            hf_repo,
+            hf_filename,
+            component: if low_noise {
+                ModelComponent::LowNoiseTransformer
+            } else {
+                ModelComponent::Transformer
+            },
+            size_bytes,
+            gated: false,
+            sha256: Some(sha256),
+        }
+    };
+    let distill_file = |low_noise: bool| {
+        let (filename, (size_bytes, sha256)) = a14b_distill_facts(task, low_noise);
+        ModelFile {
+            hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+            hf_filename: format!("split_files/loras/{filename}"),
+            component: if low_noise {
+                ModelComponent::LowNoiseDistilledLora
+            } else {
+                ModelComponent::DistilledLora
+            },
+            size_bytes,
+            gated: false,
+            sha256: Some(sha256),
+        }
+    };
+
+    let mut files = shared_wan_files();
+    files.push(expert_file(false));
+    files.push(expert_file(true));
+    // A14B pairs with the 2.1 VAE, same file the 1.3B uses — it dedupes into
+    // `shared/wan/`.
+    files.push(ModelFile {
+        hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+        hf_filename: "split_files/vae/wan_2.1_vae.safetensors".to_string(),
+        component: ModelComponent::Vae,
+        size_bytes: 253_815_318,
+        gated: false,
+        sha256: Some("2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"),
+    });
+    if tier.has_distill() {
+        files.push(distill_file(false));
+        files.push(distill_file(true));
+    }
+
+    let (steps, guidance, tier_note) = match tier {
+        // The lightx2v recipe. Guidance 1.0 is not a weak setting, it is the
+        // switch that drops the unconditional pass entirely — one forward per
+        // step, which is half of where the speed comes from.
+        A14bTier::Fast | A14bTier::Compact => (4, 1.0, "4-step Lightning distill"),
+        A14bTier::Quality => (20, WAN_A14B_QUALITY_GUIDANCE, "20-step, no distill"),
+        A14bTier::Fp8 => (20, WAN_A14B_QUALITY_GUIDANCE, "20-step, fp8-scaled"),
+    };
+    let task_label = match task {
+        A14bTask::T2v => "text-to-video",
+        A14bTask::I2v => "image-to-video",
+    };
+    let container_label = match tier {
+        A14bTier::Fp8 => "FP8-scaled".to_string(),
+        _ => tier.gguf_quant().to_string(),
+    };
+
+    ModelManifest {
+        name: format!("wan22-{}-a14b:{}", task.slug(), tier.tag()),
+        family: "wan".to_string(),
+        description: format!(
+            "Wan 2.2 A14B {} {container_label} — 480p16 {task_label}, two-expert MoE ({tier_note})",
+            task.slug().to_uppercase(),
+        ),
+        files,
+        defaults: ManifestDefaults {
+            steps,
+            guidance,
+            width: 832,
+            height: 480,
+            is_schnell: false,
+            scheduler: None,
+            negative_prompt: Some(WAN_DEFAULT_NEGATIVE_PROMPT.to_string()),
+            // The Q5-backed tiers now default to the checkpoint's trained 81
+            // frames, which #776 item 3's block offload made reachable on a
+            // 24 GB card: measured on an RTX 4090, 81f at 832x480 renders in
+            // 316.3 s at a 17,322 MiB peak with the offload policy engaging by
+            // itself. Before it, the same shape OOM'd — the old 53 was the
+            // no-offload envelope, recorded here when 23,975 MiB at 53 frames
+            // was the most the pair could hold.
+            //
+            // The Q8 and fp8 tiers carry a larger resident expert, so parking
+            // does not reach 81 for them — but 33 was never their envelope
+            // either; it was the number recorded before anyone measured. Both
+            // are measured now, on the same card and by the same protocol
+            // (largest 4n+1 count admission accepts on an idle 4090, then a
+            // real render):
+            //
+            // * Q8 (~15.3 GB expert, parks): **73 frames**, 2,235.0 s at a
+            //   16,650 MiB peak. 77 and 81 are refused at ~25.3 and ~25.9 GB
+            //   against ~24.8 GB usable.
+            // * fp8 (~14.3 GB expert, cannot park — the byte round trip is
+            //   GGUF-only): **45 frames**, 996.4 s at a 19,082 MiB peak. 49 is
+            //   refused at ~25.2 GB.
+            //
+            // Both defaults sit at the edge of what admission accepts with the
+            // card otherwise idle, which is the same posture the pre-offload
+            // 53 held (23,975 MiB of 24,564). A card sharing VRAM with a
+            // desktop session should pass a smaller `--frames` rather than
+            // meet a refusal at the tier's own default.
+            //
+            // Q4 is measured too, not inferred from Q5: 81f at 832x480 renders
+            // in 317.5 s at a 15,722 MiB peak on the same card. Inferring it
+            // from Q5's smaller resident would have been the same
+            // arithmetic-not-measurement move this comment refuses everywhere
+            // else.
+            frames: Some(match tier {
+                A14bTier::Fast | A14bTier::Compact => 81,
+                A14bTier::Quality => 73,
+                A14bTier::Fp8 => 45,
+            }),
+            fps: Some(16),
+            // Recorded from the task this manifest was assembled for, not
+            // its name: the I2V pair denoises a 36-channel mask-plus-image
+            // concat and cannot generate without the image; the T2V pair has
+            // no conditioning input at all (#772).
+            source_image: Some(match task {
+                A14bTask::T2v => crate::types::SourceImageCapability::Unsupported,
+                A14bTask::I2v => crate::types::SourceImageCapability::Required,
+            }),
+        },
+        hidden: false,
+    }
+}
+
+fn companion_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 0,
+        guidance: 0.0,
+        width: 0,
+        height: 0,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+
+    vec![
+        // CLIP-L — text encoder for SD1.5, SDXL, FLUX, Flux.2.
+        ModelManifest {
+            name: "clip-l".to_string(),
+            family: "companion".to_string(),
+            description: "OpenAI CLIP-L companion (single-file SD1.5/SDXL/FLUX checkpoints)"
+                .to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "openai/clip-vit-large-patch14".to_string(),
+                    hf_filename: "model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 1_710_540_580,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "openai/clip-vit-large-patch14".to_string(),
+                    hf_filename: "tokenizer.json".to_string(),
+                    component: ModelComponent::ClipTokenizer,
+                    size_bytes: 2_224_003,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // CLIP-G — second text encoder for SDXL.
+        ModelManifest {
+            name: "clip-g".to_string(),
+            family: "companion".to_string(),
+            description: "OpenCLIP ViT-bigG companion (single-file SDXL checkpoints)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k".to_string(),
+                // `open_clip_pytorch_model.safetensors` 404s; the actual
+                // OpenCLIP-format file is `open_clip_model.safetensors`
+                // (10.16 GB).
+                hf_filename: "open_clip_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 10_158_382_892,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // SDXL VAE — fp16-fix VAE used by every SDXL single-file checkpoint.
+        ModelManifest {
+            name: "sdxl-vae".to_string(),
+            family: "companion".to_string(),
+            description: "SDXL fp16-fix VAE companion".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "madebyollin/sdxl-vae-fp16-fix".to_string(),
+                hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 334_643_268,
+                gated: false,
+                sha256: Some("1b909373b28f2137098b0fd9dbc6f97f8410854f31f84ddc9fa04b077b0ace2c"),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // SD1.5 VAE — ft-mse stability VAE used by SD1.5 single-file checkpoints.
+        ModelManifest {
+            name: "sd-vae-ft-mse".to_string(),
+            family: "companion".to_string(),
+            description: "Stability SD1.5 ft-mse VAE companion".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "stabilityai/sd-vae-ft-mse".to_string(),
+                hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 334_643_276,
+                gated: false,
+                sha256: Some("a1d993488569e928462932c8c38a0760b874d166399b14414135bd9c42df5815"),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // T5-XXL — shared text encoder for FLUX, Flux.2, LTX-Video, LTX-2.
+        // The bf16 variant is the canonical full-precision companion;
+        // FLUX single-file flows can pull this instead of bundling T5 in the
+        // checkpoint.
+        ModelManifest {
+            name: "t5-v1_1-xxl".to_string(),
+            family: "companion".to_string(),
+            description: "T5-XXL bf16 companion (single-file FLUX / Flux.2 / LTX-Video)"
+                .to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "city96/t5-v1_1-xxl-encoder-bf16".to_string(),
+                    hf_filename: "model.safetensors".to_string(),
+                    component: ModelComponent::Transformer,
+                    size_bytes: 9_787_841_024,
+                    gated: false,
+                    sha256: None,
+                },
+                // Tokenizer must ride along: the catalog bridge resolves a
+                // companion's ModelPaths and copies `paths.t5_tokenizer` into
+                // the synthesized `cfg.t5_tokenizer`. Without this entry,
+                // `cfg.t5_tokenizer` would stay None and FLUX/SD3/Flux.2
+                // single-file loads bomb with "T5 tokenizer path required".
+                ModelFile {
+                    hf_repo: "lmz/mt5-tokenizers".to_string(),
+                    hf_filename: "t5-v1_1-xxl.tokenizer.json".to_string(),
+                    component: ModelComponent::T5Tokenizer,
+                    size_bytes: 2_424_257,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // LTX-Video VAE — used by LTX-Video single-file Civitai checkpoints.
+        // Civitai fine-tunes are transformer-only; the VAE is pulled separately
+        // from the same HF repo mold uses for manifest-based LTX-Video models.
+        ModelManifest {
+            name: "ltx-video-vae".to_string(),
+            family: "companion".to_string(),
+            description: "LTX-Video VAE companion (single-file Civitai LTX-Video checkpoints)"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Lightricks/LTX-Video-0.9.5".to_string(),
+                hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+                // Companion manifests are download-only; the engine resolves
+                // the VAE from paths.transformer. Same pattern as sdxl-vae /
+                // flux-vae / sd-vae-ft-mse companions.
+                component: ModelComponent::Transformer,
+                size_bytes: 2_493_855_612,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: "ltx2-vae".to_string(),
+            family: "companion".to_string(),
+            description: "LTX-2 video VAE companion for transformer-only checkpoints"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Lightricks/LTX-2".to_string(),
+                hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 2_444_982_370,
+                gated: false,
+                sha256: Some(
+                    "107cc359e3c4bce18c53d98686f4b3fe10c4207b6665d89b38b0741270514bfb",
+                ),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: "ltx2.3-vae".to_string(),
+            family: "companion".to_string(),
+            description: "LTX-2.3 video VAE companion for transformer-only checkpoints"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Kijai/LTX2.3_comfy".to_string(),
+                hf_filename: "vae/LTX23_video_vae_bf16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 1_452_258_578,
+                gated: false,
+                sha256: Some(
+                    "01ea62d09bc139f95c5dee7b5c062ad6a3e6cd8be910a1983ac02e7eb5b8ee3b",
+                ),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: "ltx2.3-text-projection".to_string(),
+            family: "companion".to_string(),
+            description: "LTX-2.3 Gemma hidden-state projection companion for diffusion-only checkpoints".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Kijai/LTX2.3_comfy".to_string(),
+                hf_filename: "text_encoders/ltx-2.3_text_projection_bf16.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 2_312_149_072,
+                gated: false,
+                sha256: Some(
+                    "911d59bb4cb7708179c9a0045ea0fe41212ecfb77aed3a02702b7c0a8274911f",
+                ),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Wan UMT5-XXL — shared text encoder for every Wan 2.1/2.2 variant.
+        // Single-file catalog checkpoints (Civitai/HF transformer-only) pull
+        // this instead of bundling the 11 GB encoder in the checkpoint.
+        ModelManifest {
+            name: "wan-umt5".to_string(),
+            family: "companion".to_string(),
+            description: "Wan UMT5-XXL text encoder companion (single-file Wan checkpoints)"
+                .to_string(),
+            files: vec![
+                // TextEncoder (not Transformer) on purpose: like flux2-te,
+                // a pure text-encoder companion declares TextEncoder shards
+                // so `paths_from_downloads` falls back to them, and the
+                // shared-component storage path dedupes with the primary
+                // Wan manifests' own copy under `shared/wan/`.
+                ModelFile {
+                    hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                    hf_filename: "split_files/text_encoders/umt5_xxl_fp16.safetensors"
+                        .to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 11_366_399_385,
+                    gated: false,
+                    sha256: Some(
+                        "7b8850f1961e1cf8a77cca4c964a358d303f490833c6c087d0cff4b2f99db2af",
+                    ),
+                },
+                // Tokenizer rides along so the catalog bridge's synthesized
+                // config gets a tokenizer path (same reason as t5-v1_1-xxl).
+                ModelFile {
+                    hf_repo: "google/umt5-xxl".to_string(),
+                    hf_filename: "tokenizer.json".to_string(),
+                    component: ModelComponent::TextTokenizer,
+                    size_bytes: 16_853_013,
+                    gated: false,
+                    sha256: Some(
+                        "af904105ce1071b1202bba0059a841f4a7b85b48b6ec179c4948e3483476e0dd",
+                    ),
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Wan 2.1 VAE — used by every 1.3B/14B/A14B Wan model.
+        ModelManifest {
+            name: "wan21-vae".to_string(),
+            family: "companion".to_string(),
+            description: "Wan 2.1 video VAE companion (1.3B/14B/A14B checkpoints)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Comfy-Org/Wan_2.1_ComfyUI_repackaged".to_string(),
+                hf_filename: "split_files/vae/wan_2.1_vae.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 253_815_318,
+                gated: false,
+                sha256: Some("2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Wan 2.2 VAE — TI2V-5B's higher-compression (16x16x4, 48ch) VAE.
+        ModelManifest {
+            name: "wan22-vae".to_string(),
+            family: "companion".to_string(),
+            description: "Wan 2.2 video VAE companion (TI2V-5B checkpoints)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "Comfy-Org/Wan_2.2_ComfyUI_Repackaged".to_string(),
+                hf_filename: "split_files/vae/wan2.2_vae.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 1_409_400_960,
+                gated: false,
+                sha256: Some("e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // FLUX VAE — used by FLUX single-file checkpoints. BFL gating
+        // applies; the catalog UI shows the "needs token" badge.
+        ModelManifest {
+            name: "flux-vae".to_string(),
+            family: "companion".to_string(),
+            description: "Black Forest Labs FLUX VAE companion (single-file FLUX)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "black-forest-labs/FLUX.1-schnell".to_string(),
+                hf_filename: "ae.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 335_304_388,
+                gated: true,
+                sha256: Some("afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"),
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Flux.2 text encoder — Qwen3 4B (two safetensors shards) +
+        // tokenizer. Pulled from the Apache-2.0 Klein-4B repo so single-file
+        // Civitai Flux.2 checkpoints have a runnable text encoder.
+        ModelManifest {
+            name: "flux2-te".to_string(),
+            family: "companion".to_string(),
+            description: "Flux.2 Qwen3 text encoder + tokenizer companion (single-file Flux.2)"
+                .to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+                    hf_filename: "text_encoder/model-00001-of-00002.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 4_967_215_360,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+                    hf_filename: "text_encoder/model-00002-of-00002.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 3_077_766_632,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+                    hf_filename: "tokenizer/tokenizer.json".to_string(),
+                    component: ModelComponent::TextTokenizer,
+                    size_bytes: 11_422_654,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Flux.2 text encoder for Klein-9B / FLUX.2-Dev — Qwen3 8B (four
+        // safetensors shards) + tokenizer. Sourced from the gated
+        // FLUX.2-klein-9B repo; users need a BFL token to pull it.
+        ModelManifest {
+            name: "flux2-te-9b".to_string(),
+            family: "companion".to_string(),
+            description:
+                "Flux.2 Qwen3-8B text encoder + tokenizer companion (single-file Klein-9B / Dev)"
+                    .to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "text_encoder/model-00001-of-00004.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 4_902_257_696,
+                    gated: true,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "text_encoder/model-00002-of-00004.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 4_915_960_368,
+                    gated: true,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "text_encoder/model-00003-of-00004.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 4_983_068_496,
+                    gated: true,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "text_encoder/model-00004-of-00004.safetensors".to_string(),
+                    component: ModelComponent::TextEncoder,
+                    size_bytes: 1_580_230_264,
+                    gated: true,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "black-forest-labs/FLUX.2-klein-9B".to_string(),
+                    hf_filename: "tokenizer/tokenizer.json".to_string(),
+                    component: ModelComponent::TextTokenizer,
+                    size_bytes: 11_422_654,
+                    gated: true,
+                    sha256: None,
+                },
+            ],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Flux.2 VAE — Klein-specific, ~168 MB. Distinct from `flux-vae`
+        // (FLUX.1's 335 MB ae.safetensors) which is incompatible.
+        ModelManifest {
+            name: "flux2-vae".to_string(),
+            family: "companion".to_string(),
+            description: "Flux.2 Klein VAE companion (single-file Flux.2)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "black-forest-labs/FLUX.2-klein-4B".to_string(),
+                hf_filename: "vae/diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Transformer,
+                size_bytes: 168_120_878,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Z-Image shared runtime assets — Qwen3 BF16 shards, tokenizer, and
+        // VAE used by single-file Civitai Z-Image checkpoints. The primary
+        // checkpoint is the transformer only; catalog resolution fills
+        // cfg.text_encoder_files / cfg.text_tokenizer / cfg.vae from this
+        // companion.
+        ModelManifest {
+            name: "z-image-te".to_string(),
+            family: "companion".to_string(),
+            description: "Z-Image Qwen3 text encoder + tokenizer companion (single-file Z-Image)"
+                .to_string(),
+            files: shared_zimage_files()
+                .into_iter()
+                .filter(|file| {
+                    matches!(
+                        file.component,
+                        ModelComponent::TextEncoder
+                            | ModelComponent::TextTokenizer
+                            | ModelComponent::Vae
+                    )
+                })
+                .collect(),
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        // Gemma 3 12B text encoder + tokenizer companion for LTX-2 / LTX-2.3
+        // single-file Civitai checkpoints. The combined LTX-2 .safetensors
+        // bundles transformer + VAE only; the runtime (`ltx2/assets.rs`)
+        // requires the Gemma TE separately and reads its directory off the
+        // first entry in `paths.text_encoder_files`. Same gated repo + file
+        // set the manifest LTX-2 models pull, so a user with the Gemma TE
+        // already installed for `ltx-2-19b-distilled:fp8` (etc.) gets cv:*
+        // installs essentially for free via the HF cache.
+        ModelManifest {
+            name: "ltx2-te".to_string(),
+            family: "companion".to_string(),
+            description: "LTX-2 Gemma-3-12B text encoder + tokenizer companion (single-file LTX-2)"
+                .to_string(),
+            files: shared_ltx2_files(),
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: "qwen-image-runtime".to_string(),
+            family: "companion".to_string(),
+            description: "Qwen-Image VAE, text encoder, and tokenizer companion (single-file Qwen-Image)"
+                .to_string(),
+            files: shared_qwen_image_base_files(),
+            defaults: defaults.clone(),
+            hidden: true,
+        },
+        ModelManifest {
+            name: "wuerstchen-runtime".to_string(),
+            family: "companion".to_string(),
+            description:
+                "Wuerstchen decoder, VQGAN, CLIP encoders, and tokenizers companion (single-file Wuerstchen)"
+                    .to_string(),
+            files: vec![
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen".to_string(),
+                    hf_filename: "decoder/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Decoder,
+                    size_bytes: 4_221_568_336,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen".to_string(),
+                    hf_filename: "vqgan/diffusion_pytorch_model.safetensors".to_string(),
+                    component: ModelComponent::Vae,
+                    size_bytes: 73_639_568,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen-prior".to_string(),
+                    hf_filename: "text_encoder/model.safetensors".to_string(),
+                    component: ModelComponent::ClipEncoder2,
+                    size_bytes: 2_772_149_276,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen-prior".to_string(),
+                    hf_filename: "tokenizer/tokenizer.json".to_string(),
+                    component: ModelComponent::ClipTokenizer2,
+                    size_bytes: 2_224_091,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen".to_string(),
+                    hf_filename: "text_encoder/model.safetensors".to_string(),
+                    component: ModelComponent::ClipEncoder,
+                    size_bytes: 1_411_983_168,
+                    gated: false,
+                    sha256: None,
+                },
+                ModelFile {
+                    hf_repo: "warp-ai/wuerstchen".to_string(),
+                    hf_filename: "tokenizer/tokenizer.json".to_string(),
+                    component: ModelComponent::ClipTokenizer,
+                    size_bytes: 2_224_119,
+                    gated: false,
+                    sha256: None,
+                },
+            ],
+            defaults,
+            hidden: true,
+        },
+    ]
+}
+
+fn upscaler_manifests() -> Vec<ModelManifest> {
+    let defaults = ManifestDefaults {
+        steps: 0,
+        guidance: 0.0,
+        width: 0,
+        height: 0,
+        is_schnell: false,
+        scheduler: None,
+        negative_prompt: None,
+        frames: None,
+        fps: None,
+        source_image: None,
+    };
+
+    vec![
+        ModelManifest {
+            name: "real-esrgan-x4plus:fp16".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x4+ FP16 — high quality 4x upscaler (32MB)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x4plus".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 33_461_662,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-x4plus:fp32".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x4+ FP32 — high quality 4x upscaler (64MB)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x4plus".to_string(),
+                hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 66_857_868,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-x4plus-anime:fp16".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x4+ Anime FP16 — anime-optimized 4x upscaler (8.5MB)"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x4plus_anime_6B".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 8_953_054,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-x4plus-anime:fp32".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x4+ Anime FP32 — anime-optimized 4x upscaler (17MB)"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x4plus_anime_6B".to_string(),
+                hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 17_888_804,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-anime-v3:fp32".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN Anime Video v3 FP32 — fast anime 4x upscaler (2.4MB)"
+                .to_string(),
+            files: vec![ModelFile {
+                hf_repo: "wkrettek/real-esrgan-models".to_string(),
+                hf_filename: "realesr_animevideov3.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 2_489_904,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-x2plus:fp16".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x2+ FP16 — high quality 2x upscaler (32MB)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x2plus".to_string(),
+                hf_filename: "diffusion_pytorch_model.fp16.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 33_472_030,
+                gated: false,
+                sha256: None,
+            }],
+            defaults: defaults.clone(),
+            hidden: false,
+        },
+        ModelManifest {
+            name: "real-esrgan-x2plus:fp32".to_string(),
+            family: "upscaler".to_string(),
+            description: "Real-ESRGAN x2+ FP32 — high quality 2x upscaler (64MB)".to_string(),
+            files: vec![ModelFile {
+                hf_repo: "hlky/RealESRGAN_x2plus".to_string(),
+                hf_filename: "diffusion_pytorch_model.safetensors".to_string(),
+                component: ModelComponent::Upscaler,
+                size_bytes: 66_878_604,
+                gated: false,
+                sha256: None,
+            }],
+            defaults,
+            hidden: false,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    /// An FP8 tier needs an F8E4M3 widening kernel Metal does not have, so a
+    /// Metal host refuses it BEFORE downloading — by every spelling of the
+    /// name — while CUDA and every other tier are untouched.
+    #[test]
+    fn fp8_tiers_are_refused_on_metal_before_download() {
+        use crate::GpuBackend;
+        let refusal = super::backend_refusal("qwen-image-2.1:fp8", GpuBackend::Metal).unwrap();
+        assert_eq!(refusal, super::QWEN_IMAGE21_FP8_METAL_REFUSAL);
+        assert!(refusal.contains("int8-conv"), "{refusal}");
+        // The legacy dash spelling resolves to the same tier.
+        assert!(super::backend_refusal("qwen-image-2.1-fp8", GpuBackend::Metal).is_some());
+        for wan in ["wan22-t2v-a14b:fp8", "wan22-i2v-a14b:fp8"] {
+            let refusal = super::backend_refusal(wan, GpuBackend::Metal).unwrap();
+            assert!(
+                refusal.contains(wan) && refusal.contains("GGUF"),
+                "{refusal}"
+            );
+            assert!(super::backend_refusal(wan, GpuBackend::Cuda).is_none());
+        }
+        assert!(super::backend_refusal("qwen-image-2.1:fp8", GpuBackend::Cuda).is_none());
+        for runnable in [
+            "qwen-image-2.1:bf16",
+            "qwen-image-2.1:int8-conv",
+            "qwen-image-2.1:q8",
+            "wan22-t2v-a14b:q8",
+        ] {
+            assert!(
+                super::backend_refusal(runnable, GpuBackend::Metal).is_none(),
+                "{runnable}"
+            );
+        }
+        // Every refused name is a real manifest entry, so a rename cannot
+        // silently drop a refusal.
+        for name in super::BACKEND_REFUSED_TIERS.iter().map(|(name, _)| *name) {
+            assert!(super::find_manifest(name).is_some(), "{name}");
+        }
+    }
+
+    /// `hunyuan3d-2.1:q4` is what plato advertises after `mold quantize`;
+    /// no registry serves it, and a pull of it on another host must say so
+    /// rather than "unknown model" (#1672).
+    #[test]
+    fn a_derived_hunyuan3d_tier_names_its_source_and_a_registered_name_does_not() {
+        let derived = super::hunyuan3d_derived_tier("hunyuan3d-2.1:q4").unwrap();
+        assert_eq!(derived.source, "hunyuan3d-2.1:fp16");
+        assert_eq!(derived.tier, "q4");
+        let mini = super::hunyuan3d_derived_tier("hunyuan3d-mini-turbo:fp8").unwrap();
+        assert_eq!(mini.source, "hunyuan3d-mini-turbo:fp16");
+        assert!(super::hunyuan3d_derived_tier("hunyuan3d-2.1:fp16").is_none());
+        assert!(super::hunyuan3d_derived_tier("hunyuan3d-2.1").is_none());
+        assert!(super::hunyuan3d_derived_tier("hunyuan3d-2.1:q2").is_none());
+        assert!(super::hunyuan3d_derived_tier("flux-dev:q4").is_none());
+        assert!(super::hunyuan3d_derived_tier("not-a-model:q4").is_none());
+    }
+
+    #[test]
+    fn hunyuan3d_multiview_tiers_pin_their_distinct_weights_and_recipes() {
+        let normal = super::find_manifest("hunyuan3d-2mv:fp16").expect("2mv shape recipe");
+        assert_eq!(normal.family, super::HUNYUAN3D_FAMILY);
+        assert_eq!(normal.defaults.steps, 30);
+        assert_eq!(normal.defaults.guidance, 5.0);
+        assert_eq!(
+            normal.defaults.source_image,
+            Some(crate::SourceImageCapability::Unsupported)
+        );
+        assert_eq!(normal.files[0].size_bytes, 4_928_151_562);
+        assert_eq!(
+            normal.files[0].sha256,
+            Some("d36f5881bcdc56726b73e517cd444c13c60732431622da7268145355c8d38e9c")
+        );
+
+        let turbo = super::find_manifest("hunyuan3d-2mv-turbo:fp16").expect("2mv Turbo recipe");
+        assert_eq!(turbo.family, super::HUNYUAN3D_FAMILY);
+        assert_eq!(turbo.defaults.steps, 5);
+        assert_eq!(turbo.defaults.guidance, 5.0);
+        assert_eq!(
+            turbo.defaults.source_image,
+            Some(crate::SourceImageCapability::Unsupported)
+        );
+        assert_eq!(turbo.files[0].size_bytes, 4_930_777_530);
+        assert_eq!(
+            turbo.files[0].sha256,
+            Some("172d7a989b99f66af760da0080d8c6f6350c72609536cf0c55b87a4afa574e45")
+        );
+    }
+
+    #[test]
+    fn hunyuan3d21_is_a_pinned_undistilled_shape_recipe() {
+        let model = super::find_manifest("hunyuan3d-2.1:fp16").expect("2.1 shape recipe");
+        assert_eq!(model.family, super::HUNYUAN3D_FAMILY);
+        assert_eq!(model.defaults.steps, 30);
+        assert_eq!(model.defaults.guidance, 5.0);
+        assert_eq!(model.files.len(), 1);
+        assert_eq!(model.files[0].size_bytes, 7_365_943_290);
+        assert_eq!(
+            model.files[0].sha256,
+            Some("5f21e98a6cb99b13b5e224abaee33929570fff7af2b6a0060001559a04ba9d72")
+        );
+        let shape = super::hunyuan3d_shape_geometry(&model.name);
+        assert_eq!(shape.num_latents, 4096);
+        assert_eq!(shape.vision_heads, 16);
+        assert_eq!(shape.conditioning_size, 512);
+    }
+
+    #[test]
+    fn hunyuan3d_matting_is_a_hidden_runnable_pinned_pipeline() {
+        let matting =
+            super::find_manifest(HUNYUAN3D_MATTING_MANIFEST).expect("matting dependency manifest");
+        assert!(matting.hidden);
+        assert!(!matting.is_auxiliary());
+        assert!(!matting.is_files_only_bundle());
+        assert!(matting.is_generation_model());
+        assert_eq!(matting.defaults.scheduler, None);
+        assert_eq!(matting.files.len(), 1);
+        let file = &matting.files[0];
+        assert_eq!(file.size_bytes, 175_997_641);
+        assert_eq!(
+            file.sha256,
+            Some("8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a7a728a912b491")
+        );
+    }
+
+    #[test]
+    fn hunyuan3d_delight_is_a_hidden_runnable_pinned_pipeline() {
+        let delight =
+            super::find_manifest(HUNYUAN3D_DELIGHT_MANIFEST).expect("delight pipeline manifest");
+        assert!(delight.hidden);
+        assert!(!delight.is_auxiliary());
+        assert!(!delight.is_files_only_bundle());
+        assert_eq!(delight.family, HUNYUAN3D_DELIGHT_FAMILY);
+        assert_eq!(delight.defaults.steps, 50);
+        assert_eq!(delight.defaults.guidance, 1.0);
+        assert_eq!(
+            delight.defaults.scheduler,
+            Some(crate::Scheduler::EulerAncestral)
+        );
+        assert_eq!(delight.files.len(), 4);
+        assert_eq!(delight.total_size_bytes(), 4_314_152_329);
+    }
+
+    use super::*;
+
+    #[test]
+    fn request_auxiliary_bundle_registry_tracks_active_identity_only() {
+        let mut request: crate::types::GenerateRequest =
+            serde_json::from_value(serde_json::json!({
+                "prompt": "portrait",
+                "model": "flux-dev:q8",
+                "width": 1024,
+                "height": 1024,
+                "steps": 20,
+                "seed": 1,
+                "id_image": "AQ=="
+            }))
+            .unwrap();
+        assert_eq!(
+            auxiliary_manifests_for_request(&request),
+            vec![PULID_FLUX_MANIFEST]
+        );
+
+        request.id_weight = Some(0.0);
+        assert!(auxiliary_manifests_for_request(&request).is_empty());
+        request.id_image = None;
+        request.id_weight = None;
+        assert!(auxiliary_manifests_for_request(&request).is_empty());
+    }
+
+    #[test]
+    fn textured_mesh_request_names_both_paint_dependencies() {
+        let mut request = crate::test_support::minimal_generate_request("hunyuan3d-2.1:fp16");
+        request.mesh = Some(crate::types::MeshRequestOptions {
+            texture: Some(true),
+            texture_resolution: Some(2048),
+            ..Default::default()
+        });
+        assert_eq!(
+            auxiliary_manifests_for_request(&request),
+            vec![HUNYUAN3D_PAINT_MANIFEST, HUNYUAN3D_PAINT_UPSCALER_MANIFEST]
+        );
+        request.mesh.as_mut().unwrap().texture = Some(false);
+        assert!(auxiliary_manifests_for_request(&request).is_empty());
+
+        request.mesh.as_mut().unwrap().texture = Some(true);
+        request.model = "hf:owner/custom-shape".into();
+        assert_eq!(
+            auxiliary_manifests_for_request_with_family(&request, Some(HUNYUAN3D_FAMILY)),
+            vec![HUNYUAN3D_PAINT_MANIFEST, HUNYUAN3D_PAINT_UPSCALER_MANIFEST]
+        );
+    }
+
+    /// The bundle follows the checkpoint's family: an SDXL identity request
+    /// needs `pulid-sdxl`, a FLUX one `pulid-flux`, and a checkpoint no family
+    /// qualifies needs nothing — admission refuses it before any download.
+    #[test]
+    fn request_auxiliary_bundle_follows_the_identity_family() {
+        let request_for = |model: &str| -> crate::types::GenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "prompt": "portrait",
+                "model": model,
+                "width": 1024,
+                "height": 1024,
+                "steps": 20,
+                "seed": 1,
+                "id_image": "AQ=="
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            auxiliary_manifests_for_request(&request_for("sdxl-base:fp16")),
+            vec![PULID_SDXL_MANIFEST]
+        );
+        assert_eq!(
+            auxiliary_manifests_for_request(&request_for("juggernaut-xl")),
+            vec![PULID_SDXL_MANIFEST],
+            "a bare name resolves before the family is chosen"
+        );
+        assert_eq!(
+            auxiliary_manifests_for_request(&request_for("flux-dev")),
+            vec![PULID_FLUX_MANIFEST]
+        );
+        assert_eq!(
+            auxiliary_manifests_for_request_with_family(&request_for("cv:123"), Some("flux")),
+            vec![PULID_FLUX_MANIFEST]
+        );
+        assert_eq!(
+            auxiliary_manifests_for_request_with_family(
+                &request_for("hf:owner/sdxl-finetune"),
+                Some("sdxl")
+            ),
+            vec![PULID_SDXL_MANIFEST]
+        );
+        assert!(
+            auxiliary_manifests_for_request(&request_for("sdxl-turbo:fp16")).is_empty(),
+            "an unqualified checkpoint is refused at admission, so it needs no bundle"
+        );
+    }
+
+    #[test]
+    fn pulid_bundle_is_a_hidden_sha_pinned_auxiliary_bundle() {
+        let manifest = find_manifest(PULID_FLUX_MANIFEST).expect("pulid-flux resolves");
+        assert_eq!(manifest.family, PULID_FAMILY);
+        assert!(
+            manifest.hidden,
+            "the bundle is never offered as a checkpoint"
+        );
+        assert!(manifest.is_auxiliary());
+        assert!(!manifest.is_generation_model());
+        assert!(!manifest.is_utility());
+        assert!(!manifest.is_upscaler());
+        assert!(!manifest.is_gated());
+        assert!(
+            manifest.is_files_only_bundle(),
+            "the bundle has no transformer/VAE pair to resolve"
+        );
+
+        let components: Vec<ModelComponent> =
+            manifest.files.iter().map(|file| file.component).collect();
+        assert_eq!(components.len(), 5);
+        for expected in [
+            ModelComponent::IdentityAdapter,
+            ModelComponent::IdentityVisionEncoder,
+            ModelComponent::FaceDetector,
+            ModelComponent::FaceRecognizer,
+            ModelComponent::FaceParser,
+        ] {
+            assert!(
+                components.contains(&expected),
+                "missing component {expected:?}"
+            );
+        }
+
+        for file in &manifest.files {
+            assert!(
+                file.sha256.is_some_and(|hash| hash.len() == 64),
+                "{} must be sha256-pinned",
+                file.hf_filename
+            );
+            assert!(
+                file.size_bytes > 0,
+                "{} must declare a real byte size",
+                file.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn pulid_bundle_never_resolves_to_model_paths() {
+        // `paths_from_downloads` exists to build a generator's paths. The
+        // bundle has no Transformer component at all, so it must decline
+        // rather than synthesize one — this is why `pulid_assets` exists.
+        let manifest = find_manifest(PULID_FLUX_MANIFEST).unwrap();
+        let downloads: Vec<(ModelComponent, PathBuf)> = manifest
+            .files
+            .iter()
+            .map(|file| (file.component, PathBuf::from(&file.hf_filename)))
+            .collect();
+        assert!(paths_from_downloads(&downloads, &manifest.family).is_none());
+    }
+
+    #[test]
+    fn pulid_assets_share_one_storage_root() {
+        let manifest = find_manifest(PULID_FLUX_MANIFEST).unwrap();
+        for file in &manifest.files {
+            assert_eq!(
+                storage_path(manifest, file),
+                PathBuf::from("shared")
+                    .join(PULID_FAMILY)
+                    .join(&file.hf_filename),
+                "{} must live in the shared pulid root",
+                file.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn pulid_family_is_registered_as_auxiliary() {
+        assert!(AUXILIARY_FAMILIES.contains(&PULID_FAMILY));
+        assert!(!UTILITY_FAMILIES.contains(&PULID_FAMILY));
+        assert!(!UPSCALER_FAMILIES.contains(&PULID_FAMILY));
+    }
+
+    /// The engine's absence fallback (`wan/pipeline.rs::resolve_negative_prompt`)
+    /// and the advertised default must be one value: every wan manifest
+    /// plants exactly the family constant. Only wan gets an engine-side
+    /// substitution — wuerstchen's manifest negative is a CLI-layer default
+    /// (`resolved_model_config`) the server never applies, so the helper must
+    /// keep returning None for it rather than promising HTTP behavior that
+    /// does not exist.
+    #[test]
+    fn family_default_negative_prompt_matches_the_wan_manifests() {
+        assert_eq!(
+            default_negative_prompt_for_family("wan"),
+            Some(WAN_DEFAULT_NEGATIVE_PROMPT)
+        );
+        for family in [
+            "flux",
+            "ltx2",
+            "ltx-video",
+            "sdxl",
+            "sd15",
+            "qwen-image",
+            "wuerstchen",
+        ] {
+            assert_eq!(default_negative_prompt_for_family(family), None);
+        }
+        let mut wan_manifests = 0;
+        for manifest in known_manifests().iter().filter(|m| m.family == "wan") {
+            wan_manifests += 1;
+            assert_eq!(
+                manifest.defaults.negative_prompt.as_deref(),
+                Some(WAN_DEFAULT_NEGATIVE_PROMPT),
+                "wan manifest {} disagrees with the engine fallback",
+                manifest.name
+            );
+        }
+        assert!(wan_manifests > 0, "wan manifests exist");
+    }
+
+    #[test]
+    fn camera_control_presets_have_hidden_auxiliary_download_manifests() {
+        let visible_names = visible_manifests()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+
+        for preset in crate::ltx2_camera::LTX2_CAMERA_CONTROLS {
+            let manifest = find_manifest(preset.download_model)
+                .unwrap_or_else(|| panic!("missing manifest for {}", preset.download_model));
+            assert!(manifest.hidden);
+            assert!(manifest.is_auxiliary());
+            assert!(!manifest.is_generation_model());
+            assert!(!visible_names.contains(preset.download_model));
+            assert_eq!(manifest.family, "ltx2-camera-control");
+            assert_eq!(manifest.files.len(), 1);
+
+            let file = &manifest.files[0];
+            assert_eq!(file.hf_repo, preset.hf_repo);
+            assert_eq!(file.hf_filename, preset.hf_filename);
+            assert_eq!(file.component, ModelComponent::Transformer);
+            assert_eq!(file.size_bytes, preset.size_bytes);
+            assert_eq!(file.sha256, Some(preset.sha256));
+            assert!(!file.gated);
+        }
+    }
+
+    #[test]
+    fn storage_path_transformer_is_model_specific() {
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        let transformer_file = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .unwrap();
+        let path = storage_path(manifest, transformer_file);
+        assert!(
+            path.starts_with("flux-schnell-q8"),
+            "transformer should be under model-specific dir, got: {}",
+            path.display()
+        );
+        assert!(path.to_string_lossy().contains("flux1-schnell-Q8_0.gguf"));
+    }
+
+    #[test]
+    fn storage_path_shared_components_under_family() {
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        for file in &manifest.files {
+            let path = storage_path(manifest, file);
+            match file.component {
+                ModelComponent::Transformer | ModelComponent::TransformerShard => {
+                    assert!(path.starts_with("flux-schnell-q8"));
+                }
+                _ => {
+                    assert!(
+                        path.starts_with("shared/flux"),
+                        "shared component {:?} should be under shared/flux, got: {}",
+                        file.component,
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn companion_shared_components_route_to_canonical_owning_family() {
+        // Catalog single-file flows resolve a companion's ModelPaths and
+        // copy `paths.t5_tokenizer` / `paths.clip_tokenizer` into the
+        // synthesized config. Companions must route their *shared* (non
+        // model-specific) components to the same on-disk bucket the owning
+        // family uses, so an already-installed flux-schnell's tokenizer is
+        // found by ModelPaths::resolve("t5-v1_1-xxl", config) without a
+        // re-download. The companion's primary weight (Transformer) still
+        // lives under <companion>/<file> per is_model_specific_component
+        // (intentional and preserved).
+        // t5-v1_1-xxl ships the tokenizer; clip-l ships its tokenizer.
+        // clip-g/sdxl-vae/etc are Transformer-only companions — the
+        // routing branch they take is is_model_specific_component, so they
+        // don't exercise this path. Cover only companions with at least
+        // one shared file.
+        let cases = [
+            ("t5-v1_1-xxl", "shared/flux"),
+            ("clip-l", "shared/flux"),
+            ("z-image-te", "shared/z-image"),
+        ];
+        for (companion, expected_prefix) in cases {
+            let manifest = find_manifest(companion)
+                .unwrap_or_else(|| panic!("companion manifest '{companion}' not registered"));
+            let mut shared_files = 0;
+            for file in &manifest.files {
+                if is_model_specific_component(file.component) {
+                    continue;
+                }
+                shared_files += 1;
+                let path = storage_path(manifest, file);
+                assert!(
+                    path.starts_with(expected_prefix),
+                    "companion '{}' shared file '{}' routed to '{}', expected '{}'",
+                    companion,
+                    file.hf_filename,
+                    path.display(),
+                    expected_prefix
+                );
+            }
+            assert!(
+                shared_files > 0,
+                "companion '{companion}' has no shared (non-Transformer) files — \
+                 the canonical-routing test is meaningless for it"
+            );
+        }
+    }
+
+    #[test]
+    fn t5_companion_includes_tokenizer_so_catalog_bridge_finds_it() {
+        // Regression: cv:* FLUX single-file loads bombed with "T5 tokenizer
+        // path required for FLUX models" because the t5-v1_1-xxl companion
+        // declared only the encoder weights — copy_catalog_companion saw
+        // paths.t5_tokenizer == None and never set cfg.t5_tokenizer.
+        let manifest = find_manifest("t5-v1_1-xxl").unwrap();
+        let has_tokenizer = manifest
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::T5Tokenizer);
+        assert!(
+            has_tokenizer,
+            "t5-v1_1-xxl companion must declare a T5Tokenizer file"
+        );
+    }
+
+    #[test]
+    fn zimage_text_encoder_companion_includes_shards_and_tokenizer() {
+        // Regression: cv:* Z-Image loads declared a required `z-image-te`
+        // companion, but there was no synthetic manifest for the auto-pull
+        // and catalog resolution failed with "missing required component".
+        let manifest = find_manifest("z-image-te").unwrap();
+        let text_encoder_shards = manifest
+            .files
+            .iter()
+            .filter(|f| f.component == ModelComponent::TextEncoder)
+            .count();
+        let has_tokenizer = manifest
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::TextTokenizer);
+        let has_vae = manifest
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::Vae);
+
+        assert_eq!(
+            text_encoder_shards, 3,
+            "z-image-te must declare all three Qwen3 text encoder shards"
+        );
+        assert!(
+            has_tokenizer,
+            "z-image-te companion must declare the Qwen3 tokenizer"
+        );
+        assert!(has_vae, "z-image-te companion must declare the Z-Image VAE");
+    }
+
+    #[test]
+    fn qwen_shared_components_do_not_collapse_base_and_2512() {
+        let base_manifest = find_manifest("qwen-image:q4").unwrap();
+        let base_encoder = base_manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextEncoder)
+            .unwrap();
+        let base_path = storage_path(base_manifest, base_encoder);
+        assert!(base_path.starts_with("shared/qwen-image-base"));
+
+        let q2512_manifest = find_manifest("qwen-image-2512:q4").unwrap();
+        let q2512_encoder = q2512_manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextEncoder)
+            .unwrap();
+        let q2512_path = storage_path(q2512_manifest, q2512_encoder);
+        assert!(q2512_path.starts_with("shared/qwen-image"));
+        assert_ne!(base_path, q2512_path);
+
+        let qedit_manifest = find_manifest("qwen-image-edit-2511:q4").unwrap();
+        let qedit_encoder = qedit_manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextEncoder)
+            .unwrap();
+        let qedit_path = storage_path(qedit_manifest, qedit_encoder);
+        assert!(qedit_path.starts_with("shared/qwen-image-edit"));
+        assert_ne!(base_path, qedit_path);
+        assert_ne!(q2512_path, qedit_path);
+    }
+
+    #[test]
+    fn qwen_image21_manifest_pins_the_native_artifact_graph() {
+        let manifest = find_manifest("qwen-image-2.1:bf16").expect("Qwen Image 2.1 manifest");
+        assert_eq!(manifest.family, "qwen-image21");
+        assert_eq!(manifest.defaults.steps, 40);
+        assert_eq!(manifest.defaults.guidance, 1.0);
+        assert_eq!(
+            (manifest.defaults.width, manifest.defaults.height),
+            (1024, 1024)
+        );
+
+        let expected = [
+            (
+                ModelComponent::TransformerShard,
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+                9_968_332_504,
+            ),
+            (
+                ModelComponent::TransformerShard,
+                "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+                4_261_951_904,
+            ),
+            (
+                ModelComponent::Vae,
+                "vae/diffusion_pytorch_model.safetensors",
+                1_350_989_512,
+            ),
+            (
+                ModelComponent::TextEncoder,
+                "text_encoder/model-00001-of-00004.safetensors",
+                4_998_056_552,
+            ),
+            (
+                ModelComponent::TextEncoder,
+                "text_encoder/model-00002-of-00004.safetensors",
+                4_915_962_464,
+            ),
+            (
+                ModelComponent::TextEncoder,
+                "text_encoder/model-00003-of-00004.safetensors",
+                4_915_962_496,
+            ),
+            (
+                ModelComponent::TextEncoder,
+                "text_encoder/model-00004-of-00004.safetensors",
+                2_704_357_976,
+            ),
+            (
+                ModelComponent::TextTokenizer,
+                "processor/tokenizer.json",
+                11_422_654,
+            ),
+        ];
+        assert_eq!(manifest.files.len(), expected.len());
+        for (component, filename, size_bytes) in expected {
+            let file = manifest
+                .files
+                .iter()
+                .find(|file| file.component == component && file.hf_filename == filename)
+                .unwrap_or_else(|| panic!("missing {filename}"));
+            assert_eq!(file.hf_repo, "Qwen/Qwen-Image-2.1", "{filename}");
+            assert_eq!(file.size_bytes, size_bytes, "{filename}");
+            assert!(file.sha256.is_some(), "{filename} must be checksum-pinned");
+        }
+
+        let downloads = manifest
+            .files
+            .iter()
+            .map(|file| {
+                (
+                    file.component,
+                    PathBuf::from(format!("/models/{}", file.hf_filename)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let paths = paths_from_downloads(&downloads, &manifest.family)
+            .expect("native Qwen Image 2.1 artifacts must resolve to ModelPaths");
+        assert_eq!(paths.transformer_shards.len(), 2);
+        assert_eq!(paths.text_encoder_files.len(), 4);
+        assert_eq!(
+            paths.text_tokenizer,
+            Some(PathBuf::from("/models/processor/tokenizer.json"))
+        );
+        assert_eq!(
+            paths.vae,
+            PathBuf::from("/models/vae/diffusion_pytorch_model.safetensors")
+        );
+    }
+
+    #[test]
+    fn every_qwen_image21_tier_shares_one_pinned_runtime() {
+        let tags = [
+            "bf16",
+            "int8-conv",
+            "fp8",
+            "q8",
+            "q6",
+            "q5",
+            "q4",
+            "q3",
+            "q2",
+        ];
+        let bf16 = find_manifest("qwen-image-2.1:bf16").unwrap();
+        let shared: Vec<PathBuf> = shared_qwen_image21_files()
+            .iter()
+            .map(|file| storage_path(bf16, file))
+            .collect();
+        for tag in tags {
+            let name = format!("qwen-image-2.1:{tag}");
+            let manifest = find_manifest(&name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(manifest.family, "qwen-image21");
+            assert!(!manifest.hidden, "{name}");
+            assert_eq!(manifest.defaults.steps, 40, "{name}");
+            assert_eq!(manifest.defaults.source_image, None, "{name}");
+            for file in &manifest.files {
+                let sha = file
+                    .sha256
+                    .unwrap_or_else(|| panic!("{name} {}", file.hf_filename));
+                assert_eq!(sha.len(), 64, "{name} {}", file.hf_filename);
+                assert!(file.size_bytes > 0);
+                assert_ne!(file.component, ModelComponent::DistilledLora, "{name}");
+            }
+            // The conditioner, VAE and tokenizer are ONE copy for every tier.
+            for path in &shared {
+                assert!(
+                    manifest
+                        .files
+                        .iter()
+                        .any(|file| &storage_path(manifest, file) == path),
+                    "{name} must share {}",
+                    path.display()
+                );
+                assert!(
+                    path.starts_with("shared/qwen-image21"),
+                    "{}",
+                    path.display()
+                );
+            }
+            // Every tier carries exactly one transformer — sharded or single.
+            let transformers = manifest
+                .files
+                .iter()
+                .filter(|file| {
+                    matches!(
+                        file.component,
+                        ModelComponent::Transformer | ModelComponent::TransformerShard
+                    )
+                })
+                .count();
+            assert_eq!(transformers, if tag == "bf16" { 2 } else { 1 }, "{name}");
+        }
+        let gguf = find_manifest("qwen-image-2.1:q4").unwrap();
+        assert_eq!(gguf.files[0].hf_repo, "leejet/Qwen-Image-2.1-GGUF");
+        assert_eq!(gguf.files[0].hf_filename, "qwen_image_2.1-Q4_K.gguf");
+    }
+
+    #[test]
+    fn qwen_image21_turbo_tags_stack_the_viggle_adapter_on_their_base_tier() {
+        for tag in QWEN_IMAGE21_TURBO_TAGS {
+            let name = format!("qwen-image-2.1-turbo:{tag}");
+            let turbo = find_manifest(&name).unwrap_or_else(|| panic!("{name}"));
+            let base = find_manifest(&format!("qwen-image-2.1:{tag}")).unwrap();
+            assert_eq!(turbo.family, "qwen-image21");
+            assert_eq!(turbo.defaults.steps, 6);
+            assert_eq!(turbo.defaults.guidance, 1.0);
+            assert_eq!(turbo.files.len(), base.files.len() + 1);
+            // Every base file lands at the SAME path, so a host that holds the
+            // base tier pulls only the adapter.
+            for file in &base.files {
+                assert_eq!(
+                    storage_path(turbo, file),
+                    storage_path(base, file),
+                    "{name} {}",
+                    file.hf_filename
+                );
+            }
+            let adapter = turbo
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::DistilledLora)
+                .unwrap();
+            assert_eq!(adapter.hf_repo, QWEN_IMAGE21_VIGGLE_TURBO_REPO);
+            assert_eq!(adapter.hf_filename, QWEN_IMAGE21_VIGGLE_TURBO_LORA);
+            assert_eq!(adapter.size_bytes, 1_359_147_904);
+            assert_eq!(
+                adapter.sha256,
+                Some("2a0148f5c73abbed5f97da5ea356e439318aadb281d01fce4af39cdf43728803")
+            );
+            assert_eq!(
+                storage_path(turbo, adapter),
+                PathBuf::from("shared/qwen-image21/loras").join(QWEN_IMAGE21_VIGGLE_TURBO_LORA)
+            );
+            let schedule = qwen_image21_turbo_schedule(&name).unwrap();
+            assert_eq!(schedule, QWEN_IMAGE21_VIGGLE_TURBO);
+            assert_eq!(schedule.sigmas, &[1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]);
+            assert_eq!(schedule.steps(), 6);
+            assert_eq!(schedule.shift_terminal, None);
+            assert_eq!(schedule.guidance, 1.0);
+            assert_eq!(schedule.lora_scale, 1.0);
+            assert_eq!(qwen_image21_turbo_base(&name).unwrap(), base.name);
+        }
+        assert!(qwen_image21_turbo_schedule("qwen-image-2.1:bf16").is_none());
+        assert!(qwen_image21_turbo_schedule("qwen-image-2.1-turbo:q4").is_none());
+        assert_eq!(
+            qwen_image21_turbo_schedule("qwen-image-2.1-turbo"),
+            Some(QWEN_IMAGE21_VIGGLE_TURBO)
+        );
+    }
+
+    #[test]
+    fn bare_qwen_image21_names_stay_on_bf16() {
+        assert_eq!(resolve_model_name("qwen-image-2.1"), "qwen-image-2.1:bf16");
+        assert_eq!(
+            resolve_model_name("qwen-image-2.1-turbo"),
+            "qwen-image-2.1-turbo:bf16"
+        );
+        assert_eq!(
+            variant_quality_rank("qwen-image-2.1:int8-conv"),
+            variant_quality_rank("qwen-image-2.1:fp8")
+        );
+        assert!(
+            variant_quality_rank("qwen-image-2.1:int8-conv")
+                < variant_quality_rank("qwen-image-2.1:q8")
+        );
+    }
+
+    #[test]
+    fn qwen_flash_manifests_are_four_step_dmd2_distills() {
+        for (name, filename, size) in [
+            (
+                "qwen-image-flash:q8",
+                "Qwen-Image-Flash-Q8_0.gguf",
+                21_761_817_152_u64,
+            ),
+            (
+                "qwen-image-flash:q4",
+                "Qwen-Image-Flash-Q4_K_M.gguf",
+                11_715_639_872_u64,
+            ),
+        ] {
+            let manifest = find_manifest(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(manifest.family, "qwen-image", "{name} family");
+            assert_eq!(manifest.defaults.steps, 4, "{name} steps");
+            assert_eq!(manifest.defaults.guidance, 1.0, "{name} guidance");
+            assert_eq!(manifest.defaults.width, 1328, "{name} width");
+            assert_eq!(manifest.defaults.height, 1328, "{name} height");
+            assert!(
+                manifest.description.contains(
+                    "4-step DMD2 distill — dense small text, hair-fine detail, and very complex scenes may degrade vs base"
+                ),
+                "{name} description must disclose the distillation trade-off, got: {}",
+                manifest.description
+            );
+            let transformer = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::Transformer)
+                .unwrap_or_else(|| panic!("{name} has no transformer file"));
+            assert_eq!(transformer.hf_repo, "realrebelai/Qwen_Image_Flash_GGUF");
+            assert_eq!(transformer.hf_filename, filename);
+            assert_eq!(transformer.size_bytes, size, "{name} exact size");
+        }
+    }
+
+    #[test]
+    fn qwen_distill_manifests_are_fifteen_step_merges() {
+        for (name, filename, size) in [
+            (
+                "qwen-image-distill:q8",
+                "Qwen_Image_Distill-Q8_0.gguf",
+                21_761_817_120_u64,
+            ),
+            (
+                "qwen-image-distill:q4",
+                "Qwen_Image_Distill-Q4_K_M.gguf",
+                13_065_746_976_u64,
+            ),
+        ] {
+            let manifest = find_manifest(name).unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(manifest.family, "qwen-image", "{name} family");
+            assert_eq!(manifest.defaults.steps, 15, "{name} steps");
+            assert_eq!(manifest.defaults.guidance, 1.0, "{name} guidance");
+            assert_eq!(manifest.defaults.width, 1328, "{name} width");
+            assert_eq!(manifest.defaults.height, 1328, "{name} height");
+            let transformer = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::Transformer)
+                .unwrap_or_else(|| panic!("{name} has no transformer file"));
+            assert_eq!(transformer.hf_repo, "QuantStack/Qwen-Image-Distill-GGUF");
+            assert_eq!(transformer.hf_filename, filename);
+            assert_eq!(transformer.size_bytes, size, "{name} exact size");
+        }
+    }
+
+    /// The official lightx2v fused Lightning edit distill: a transformer-only
+    /// fp8_scaled export on the existing FP8 path, four steps at CFG 1.0.
+    #[test]
+    fn qwen_edit_lightning_manifest_is_a_four_step_official_distill() {
+        let manifest = find_manifest("qwen-image-edit-lightning:fp8").unwrap();
+        assert_eq!(manifest.family, "qwen-image-edit");
+        assert_eq!(manifest.defaults.steps, 4);
+        assert_eq!(manifest.defaults.guidance, 1.0);
+        assert_eq!(manifest.defaults.width, 1024);
+        assert_eq!(manifest.defaults.height, 1024);
+        let transformer = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .expect("edit-lightning has no transformer file");
+        assert_eq!(
+            transformer.hf_repo,
+            "lightx2v/Qwen-Image-Edit-2511-Lightning"
+        );
+        assert_eq!(
+            transformer.hf_filename,
+            "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui_4steps_v1.0.safetensors"
+        );
+        assert_eq!(transformer.size_bytes, 20_447_469_486);
+        // The FP8 loader keys off "fp8" in the filename; a rename would
+        // silently reroute this checkpoint through the BF16 path.
+        assert!(transformer.hf_filename.contains("fp8"));
+        // Single-tier bare name resolves to its only build.
+        assert_eq!(
+            resolve_model_name("qwen-image-edit-lightning"),
+            "qwen-image-edit-lightning:fp8"
+        );
+    }
+
+    #[test]
+    fn qwen_distilled_variants_reuse_the_existing_shared_buckets() {
+        let base_path = {
+            let manifest = find_manifest("qwen-image:q4").unwrap();
+            let encoder = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::TextEncoder)
+                .unwrap();
+            storage_path(manifest, encoder)
+        };
+        let edit_path = {
+            let manifest = find_manifest("qwen-image-edit-2511:q4").unwrap();
+            let encoder = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::TextEncoder)
+                .unwrap();
+            storage_path(manifest, encoder)
+        };
+
+        // Flash and Distill are distills of BASE Qwen-Image: they must land in
+        // the `shared/qwen-image-base` bucket, not the 2512 one.
+        for name in [
+            "qwen-image-flash:q8",
+            "qwen-image-flash:q4",
+            "qwen-image-distill:q8",
+            "qwen-image-distill:q4",
+        ] {
+            let manifest = find_manifest(name).unwrap();
+            let encoder = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::TextEncoder)
+                .unwrap();
+            let path = storage_path(manifest, encoder);
+            assert!(
+                path.starts_with("shared/qwen-image-base"),
+                "{name} encoder must share the base bucket, got: {}",
+                path.display()
+            );
+            assert_eq!(path, base_path, "{name} must not fork the base bucket");
+        }
+
+        let lightning = find_manifest("qwen-image-edit-lightning:fp8").unwrap();
+        let lightning_encoder = lightning
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextEncoder)
+            .unwrap();
+        let lightning_path = storage_path(lightning, lightning_encoder);
+        assert_eq!(
+            lightning_path, edit_path,
+            "edit-lightning must share the edit bucket"
+        );
+    }
+
+    #[test]
+    fn qwen_distilled_bare_names_resolve_through_the_quality_ladder() {
+        // No pins: the `:q8` → `:fp16` → `:bf16` → `:fp8` loop picks q8.
+        assert_eq!(
+            resolve_model_name("qwen-image-flash"),
+            "qwen-image-flash:q8"
+        );
+        assert_eq!(
+            resolve_model_name("qwen-image-distill"),
+            "qwen-image-distill:q8"
+        );
+        // The single-tier edit-lightning pin must not steal the existing
+        // bare `qwen-image-edit` default.
+        assert_eq!(
+            resolve_model_name("qwen-image-edit"),
+            "qwen-image-edit-2511:q8"
+        );
+    }
+
+    #[test]
+    fn qwen_lightning_transformer_sizes_are_exact() {
+        // Rounded sizes break `file_is_complete`, which re-downloads on every
+        // run. These are the exact byte sizes published by the HF repo.
+        for (name, filename, size) in [
+            (
+                "qwen-image-lightning:fp8",
+                "qwen_image_2512_fp8_e4m3fn_scaled_comfyui_4steps_v1.0.safetensors",
+                20_436_302_974_u64,
+            ),
+            (
+                "qwen-image-lightning:fp8-8step",
+                "qwen_image_2512_fp8_e4m3fn_scaled_8steps_v1.0.safetensors",
+                20_487_870_224_u64,
+            ),
+        ] {
+            let manifest = find_manifest(name).unwrap();
+            let transformer = manifest
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::Transformer)
+                .unwrap();
+            assert_eq!(transformer.hf_filename, filename, "{name} filename");
+            assert_eq!(transformer.size_bytes, size, "{name} exact size");
+        }
+    }
+
+    #[test]
+    fn storage_path_zimage_preserves_nested_filenames() {
+        let manifest = find_manifest("z-image-turbo:q8").unwrap();
+        let encoder_file = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextEncoder)
+            .unwrap();
+        let path = storage_path(manifest, encoder_file);
+        // Nested HF filename like "text_encoder/model-00001-of-00003.safetensors"
+        // should be preserved under shared/z-image/
+        assert!(
+            path.starts_with("shared/z-image"),
+            "got: {}",
+            path.display()
+        );
+        assert!(path.to_string_lossy().contains("text_encoder/"));
+    }
+
+    #[test]
+    fn storage_path_sdxl_transformer_is_model_specific() {
+        let manifest = find_manifest("sdxl-base:fp16").unwrap();
+        let transformer_file = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .unwrap();
+        let path = storage_path(manifest, transformer_file);
+        assert!(
+            path.starts_with("sdxl-base-fp16"),
+            "got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn storage_path_colon_sanitized() {
+        let manifest = find_manifest("flux-dev:q4").unwrap();
+        let transformer_file = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .unwrap();
+        let path = storage_path(manifest, transformer_file);
+        assert!(
+            !path.to_string_lossy().contains(':'),
+            "colons should be replaced with dashes"
+        );
+        assert!(path.starts_with("flux-dev-q4"));
+    }
+
+    #[test]
+    fn resolve_name_with_tag() {
+        assert_eq!(resolve_model_name("flux-dev:q4"), "flux-dev:q4");
+        assert_eq!(resolve_model_name("flux-schnell:q8"), "flux-schnell:q8");
+    }
+
+    #[test]
+    fn resolve_name_default_tag() {
+        assert_eq!(resolve_model_name("flux-schnell"), "flux-schnell:q8");
+        assert_eq!(resolve_model_name("flux-dev"), "flux-dev:q8");
+        assert_eq!(
+            resolve_model_name("qwen-image-edit"),
+            "qwen-image-edit-2511:q8"
+        );
+        // SDXL models default to :fp16
+        assert_eq!(resolve_model_name("sdxl-base"), "sdxl-base:fp16");
+        assert_eq!(resolve_model_name("sdxl-turbo"), "sdxl-turbo:fp16");
+        assert_eq!(resolve_model_name("dreamshaper-xl"), "dreamshaper-xl:fp16");
+        assert_eq!(resolve_model_name("ltx-2.3-22b-dev"), "ltx-2.3-22b-dev:fp8");
+        assert_eq!(
+            resolve_model_name("ltx-2.3-22b-distilled"),
+            "ltx-2.3-22b-distilled:fp8"
+        );
+        assert_eq!(
+            resolve_model_name("ltx-2.5-22b-dev"),
+            "ltx-2.5-22b-dev:int8-conv"
+        );
+        assert_eq!(
+            resolve_model_name("ltx-2.5-22b-distilled"),
+            "ltx-2.5-22b-distilled:int8-conv"
+        );
+    }
+
+    #[test]
+    fn resolve_name_legacy_format() {
+        assert_eq!(resolve_model_name("flux-dev-q4"), "flux-dev:q4");
+        assert_eq!(resolve_model_name("flux-dev-q8"), "flux-dev:q8");
+        assert_eq!(
+            resolve_model_name("ltx-2.3-22b-dev-fp8"),
+            "ltx-2.3-22b-dev:fp8"
+        );
+    }
+
+    #[test]
+    fn find_known_manifests() {
+        assert!(find_manifest("flux-schnell").is_some());
+        assert!(find_manifest("flux-dev:q4").is_some());
+        assert!(find_manifest("flux-dev-q4").is_some());
+        assert!(find_manifest("flux-krea").is_some());
+        assert!(find_manifest("flux-schnell:q6").is_some());
+        assert!(find_manifest("flux-dev:q6").is_some());
+        assert!(find_manifest("flux-krea:q4").is_some());
+        assert!(find_manifest("flux-krea:q6").is_some());
+        // SD1.5 models
+        assert!(find_manifest("sd15").is_some());
+        assert!(find_manifest("sd15:fp16").is_some());
+        assert!(find_manifest("dreamshaper-v8").is_some());
+        assert!(find_manifest("dreamshaper-v8:fp16").is_some());
+        assert!(find_manifest("realistic-vision-v5").is_some());
+        assert!(find_manifest("realistic-vision-v5:fp16").is_some());
+        // SD3 models
+        assert!(find_manifest("sd3.5-large:q8").is_some());
+        assert!(find_manifest("sd3.5-large:q4").is_some());
+        assert!(find_manifest("sd3.5-large-turbo:q8").is_some());
+        assert!(find_manifest("sd3.5-medium:q8").is_some());
+        // Flux.2 models
+        assert!(find_manifest("flux2-klein:bf16").is_some());
+        assert!(find_manifest("nonexistent").is_none());
+    }
+
+    #[test]
+    fn h3_queue_titles_share_short_curated_names() {
+        assert_eq!(
+            model_display_name(crate::minimax_h3::FL2VA_COMFY).as_deref(),
+            Some("MiniMax H3 Frames")
+        );
+        assert_eq!(
+            model_display_name(crate::minimax_h3::REF2VA_COMFY).as_deref(),
+            Some("MiniMax H3 References")
+        );
+        for tier in crate::minimax_h3::REVIEWED_TURBO_MANIFEST_TIERS {
+            let title = model_display_name(tier.model).unwrap();
+            assert!(title.contains(tier.display_label), "{title}");
+            assert!(!title.contains("downloadable"), "{title}");
+        }
+        assert_eq!(
+            model_display_name(crate::minimax_h3::FL2VA_FASTH3_V2_INT8).as_deref(),
+            Some("MiniMax H3 Frames FastH3 V2 8-step (FastVideo)")
+        );
+        assert_eq!(model_display_name("hf:someone/custom-title"), None);
+    }
+
+    #[test]
+    fn find_manifest_returns_correct_result() {
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        assert_eq!(manifest.name, "flux-schnell:q8");
+        assert_eq!(manifest.family, "flux");
+    }
+
+    #[test]
+    fn find_manifest_exact_unknown_returns_none() {
+        assert!(find_manifest_exact("totally-unknown-model:q99").is_none());
+    }
+
+    #[test]
+    fn flux2_klein_defaults() {
+        let manifest = find_manifest("flux2-klein:bf16").unwrap();
+        assert_eq!(manifest.name, "flux2-klein:bf16");
+        assert_eq!(manifest.family, "flux2");
+        assert_eq!(manifest.defaults.steps, 4);
+        assert!((manifest.defaults.guidance - 1.0).abs() < 0.01);
+        assert_eq!(manifest.defaults.width, 1024);
+        assert_eq!(manifest.defaults.height, 1024);
+    }
+
+    #[test]
+    fn flux2_dev_manifest_is_exact_and_collision_free() {
+        let manifest = find_manifest_exact("flux2-dev:bf16").unwrap();
+        assert_eq!(manifest.family, "flux2");
+        assert_eq!(manifest.defaults.steps, 50);
+        assert_eq!(manifest.defaults.guidance, 4.0);
+        assert!(manifest.is_gated());
+        assert!(!manifest.hidden);
+        assert_eq!(manifest.total_size_bytes(), 103_364_356_713);
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .filter(|file| file.component == ModelComponent::TransformerShard)
+                .count(),
+            7
+        );
+        assert_eq!(
+            manifest
+                .files
+                .iter()
+                .filter(|file| file.component == ModelComponent::TextEncoder)
+                .count(),
+            8
+        );
+        assert!(manifest
+            .files
+            .iter()
+            .all(|file| file.hf_repo == "black-forest-labs/FLUX.2-dev"));
+        assert!(manifest.files.iter().all(|file| file.sha256.is_some()));
+        assert!(!manifest
+            .files
+            .iter()
+            .any(|file| file.hf_filename == "flux2-dev.safetensors"));
+
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| !is_model_specific_component(file.component))
+        {
+            assert!(storage_path(manifest, file).starts_with("shared/flux2-dev"));
+        }
+        let klein = find_manifest_exact("flux2-klein:bf16").unwrap();
+        let dev_vae = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::Vae)
+            .unwrap();
+        let klein_vae = klein
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::Vae)
+            .unwrap();
+        assert_ne!(
+            storage_path(manifest, dev_vae),
+            storage_path(klein, klein_vae)
+        );
+    }
+
+    /// The quantized dev tiers exist so a host without a BFL license
+    /// acceptance can still run FLUX.2 [dev]. If any file in them were gated,
+    /// the tier would be exactly as unreachable as `flux2-dev:bf16` and there
+    /// would be no reason for it to exist.
+    #[test]
+    fn flux2_dev_quantized_tiers_are_installable_without_a_bfl_license() {
+        for name in [
+            "flux2-dev:q8",
+            "flux2-dev:q6",
+            "flux2-dev:q4",
+            "flux2-dev:fp8",
+        ] {
+            let manifest = find_manifest_exact(name).unwrap();
+            assert_eq!(manifest.family, "flux2");
+            assert!(!manifest.is_gated(), "{name} must not be gated");
+            assert!(
+                manifest.files.iter().all(|file| file.sha256.is_some()),
+                "{name} must pin every file's sha256"
+            );
+            assert!(
+                manifest
+                    .files
+                    .iter()
+                    .all(|file| file.hf_repo != "black-forest-labs/FLUX.2-dev"),
+                "{name} must not reach into the gated BFL dev repo"
+            );
+            // Dev keeps its own defaults: 50 steps at guidance 4.0, which the
+            // guidance embedder consumes (unlike the distilled Klein tiers).
+            assert_eq!(manifest.defaults.steps, 50, "{name} steps");
+            assert_eq!(manifest.defaults.guidance, 4.0, "{name} guidance");
+            for file in manifest
+                .files
+                .iter()
+                .filter(|file| !is_model_specific_component(file.component))
+            {
+                assert!(
+                    storage_path(manifest, file).starts_with("shared/flux2-dev"),
+                    "{name} shared asset {} escaped the dev bucket",
+                    file.hf_filename
+                );
+            }
+        }
+    }
+
+    /// One copy of the 35 GB Mistral encoder is shared by every quantized dev
+    /// tier, and it must never land on top of a BFL file of the same role.
+    #[test]
+    fn flux2_dev_open_assets_share_one_path_and_never_shadow_the_gated_set() {
+        let q4 = find_manifest_exact("flux2-dev:q4").unwrap();
+        let fp8 = find_manifest_exact("flux2-dev:fp8").unwrap();
+        let encoder = |manifest: &ModelManifest| {
+            let file = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::TextEncoder)
+                .unwrap();
+            storage_path(manifest, file)
+        };
+        assert_eq!(encoder(q4), encoder(fp8));
+
+        let gated = find_manifest_exact("flux2-dev:bf16").unwrap();
+        let gated_paths: Vec<_> = gated
+            .files
+            .iter()
+            .map(|file| storage_path(gated, file))
+            .collect();
+        for file in &q4.files {
+            let path = storage_path(q4, file);
+            assert!(
+                !gated_paths.contains(&path),
+                "open dev asset collides with the gated set at {}",
+                path.display()
+            );
+        }
+    }
+
+    /// The undistilled base checkpoints are architecturally identical to the
+    /// distilled Klein tiers — same encoder files, same VAE — and differ only
+    /// in sampling: ~50 steps and a real CFG scale.
+    #[test]
+    fn flux2_klein_base_tiers_reuse_klein_assets_with_cfg_defaults() {
+        for (name, sibling) in [
+            ("flux2-klein-base:bf16", "flux2-klein:bf16"),
+            ("flux2-klein-base:q8", "flux2-klein:q8"),
+            ("flux2-klein-base:q6", "flux2-klein:q6"),
+            ("flux2-klein-base:q4", "flux2-klein:q4"),
+            ("flux2-klein-base-9b:bf16", "flux2-klein-9b:bf16"),
+            ("flux2-klein-base-9b:q8", "flux2-klein-9b:q8"),
+            ("flux2-klein-base-9b:q6", "flux2-klein-9b:q6"),
+            ("flux2-klein-base-9b:q4", "flux2-klein-9b:q4"),
+        ] {
+            let base = find_manifest_exact(name).unwrap();
+            let distilled = find_manifest_exact(sibling).unwrap();
+            assert_eq!(base.family, "flux2");
+            assert_eq!(base.defaults.steps, 50, "{name} steps");
+            assert_eq!(base.defaults.guidance, 4.0, "{name} guidance");
+
+            let shared = |manifest: &ModelManifest| {
+                let mut paths: Vec<_> = manifest
+                    .files
+                    .iter()
+                    .filter(|file| !is_model_specific_component(file.component))
+                    .map(|file| storage_path(manifest, file))
+                    .collect();
+                paths.sort();
+                paths
+            };
+            assert_eq!(
+                shared(base),
+                shared(distilled),
+                "{name} must reuse {sibling}'s encoder/VAE bytes"
+            );
+        }
+    }
+
+    /// The 4B base tier is Apache 2.0 all the way down; only the 9B halves
+    /// inherit Klein-9B's gate.
+    #[test]
+    fn flux2_klein_base_4b_is_ungated() {
+        assert!(!find_manifest_exact("flux2-klein-base:bf16")
+            .unwrap()
+            .is_gated());
+        assert!(!find_manifest_exact("flux2-klein-base:q4")
+            .unwrap()
+            .is_gated());
+    }
+
+    /// `resolve_model_name` walks `:q8 → :fp16 → :bf16 → :fp8`, so a bare base
+    /// name must not silently resolve to a distilled Klein tier — and adding
+    /// `flux2-dev:q8` must not re-point the bare `flux2-dev`, which has always
+    /// meant the full BF16 checkpoint.
+    #[test]
+    fn flux2_bare_names_resolve_within_their_own_family_and_dev_stays_bf16() {
+        assert_eq!(
+            resolve_model_name("flux2-klein-base"),
+            "flux2-klein-base:q8"
+        );
+        assert_eq!(
+            resolve_model_name("flux2-klein-base-9b"),
+            "flux2-klein-base-9b:q8"
+        );
+        assert_eq!(resolve_model_name("flux2-klein"), "flux2-klein:q8");
+        assert_eq!(resolve_model_name("flux2-dev"), "flux2-dev:bf16");
+        // The quantized dev tiers stay reachable by tag, in both spellings.
+        assert_eq!(resolve_model_name("flux2-dev:q4"), "flux2-dev:q4");
+        assert_eq!(resolve_model_name("flux2-dev-q4"), "flux2-dev:q4");
+    }
+
+    /// FP8 tiers are single-file transformers; the engine header-peeks them,
+    /// so the file must be the only model-specific component.
+    #[test]
+    fn flux2_fp8_tiers_are_single_file_transformers() {
+        for (name, filename) in [
+            ("flux2-klein:fp8", "flux-2-klein-4b-fp8.safetensors"),
+            ("flux2-klein-9b:fp8", "flux-2-klein-9b-fp8.safetensors"),
+            (
+                "flux2-dev:fp8",
+                "split_files/diffusion_models/flux2_dev_fp8mixed.safetensors",
+            ),
+        ] {
+            let manifest = find_manifest_exact(name).unwrap();
+            let transformers: Vec<_> = manifest
+                .files
+                .iter()
+                .filter(|file| is_model_specific_component(file.component))
+                .collect();
+            assert_eq!(transformers.len(), 1, "{name} transformer count");
+            assert_eq!(transformers[0].hf_filename, filename);
+            assert_eq!(transformers[0].component, ModelComponent::Transformer);
+        }
+    }
+
+    #[test]
+    fn sd3_resolves_to_q8() {
+        let manifest = find_manifest("sd3.5-large").unwrap();
+        assert_eq!(manifest.name, "sd3.5-large:q8");
+        assert_eq!(manifest.family, "sd3");
+        assert_eq!(manifest.defaults.steps, 28);
+        assert!((manifest.defaults.guidance - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sd3_turbo_defaults() {
+        let manifest = find_manifest("sd3.5-large-turbo:q8").unwrap();
+        assert_eq!(manifest.defaults.steps, 4);
+        assert!((manifest.defaults.guidance - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn flux_krea_resolves_to_q8() {
+        let manifest = find_manifest("flux-krea").unwrap();
+        assert_eq!(manifest.name, "flux-krea:q8");
+        assert!(!manifest.defaults.is_schnell);
+        assert_eq!(manifest.defaults.steps, 25);
+    }
+
+    #[test]
+    fn flux_krea_legacy_format() {
+        assert_eq!(resolve_model_name("flux-krea-q4"), "flux-krea:q4");
+        assert_eq!(resolve_model_name("flux-krea-q6"), "flux-krea:q6");
+    }
+
+    #[test]
+    fn flux_krea_fp8_exists() {
+        let manifest = find_manifest("flux-krea:fp8").unwrap();
+        assert_eq!(manifest.family, "flux");
+        assert!(!manifest.defaults.is_schnell);
+        assert_eq!(manifest.defaults.guidance, 4.5);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.hf_filename.contains("float8_e4m3fn")));
+    }
+
+    #[test]
+    fn jibmix_flux_manifests_exist() {
+        assert!(find_manifest("jibmix-flux:fp8").is_some());
+        assert!(find_manifest("jibmix-flux:q5").is_some());
+        assert!(find_manifest("jibmix-flux:q4").is_some());
+        assert!(find_manifest("jibmix-flux:q3").is_some());
+    }
+
+    #[test]
+    fn jibmix_flux_bare_resolves_to_fp8() {
+        // No :q8/:fp16/:bf16 tag exists, so bare name resolves to :fp8
+        assert_eq!(resolve_model_name("jibmix-flux"), "jibmix-flux:fp8");
+    }
+
+    #[test]
+    fn jibmix_flux_defaults() {
+        let manifest = find_manifest("jibmix-flux:q4").unwrap();
+        assert_eq!(manifest.family, "flux");
+        assert!(!manifest.defaults.is_schnell);
+        assert_eq!(manifest.defaults.steps, 25);
+        assert_eq!(manifest.defaults.guidance, 3.0);
+    }
+
+    #[test]
+    fn ultrareal_v2_exists() {
+        let manifest = find_manifest("ultrareal-v2:bf16").unwrap();
+        assert_eq!(manifest.family, "flux");
+        assert!(!manifest.defaults.is_schnell);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.hf_filename.ends_with(".safetensors")
+                && f.component == ModelComponent::Transformer));
+    }
+
+    #[test]
+    fn ultrareal_v3_manifests_exist() {
+        assert!(find_manifest("ultrareal-v3:q8").is_some());
+        assert!(find_manifest("ultrareal-v3:q6").is_some());
+        assert!(find_manifest("ultrareal-v3:q4").is_some());
+    }
+
+    #[test]
+    fn ultrareal_v4_manifests_exist() {
+        assert!(find_manifest("ultrareal-v4:q8").is_some());
+        assert!(find_manifest("ultrareal-v4:q5").is_some());
+        assert!(find_manifest("ultrareal-v4:q4").is_some());
+    }
+
+    #[test]
+    fn ultrareal_v4_defaults() {
+        let manifest = find_manifest("ultrareal-v4:q8").unwrap();
+        assert_eq!(manifest.family, "flux");
+        assert!(!manifest.defaults.is_schnell);
+        assert_eq!(manifest.defaults.steps, 25);
+        assert_eq!(manifest.defaults.guidance, 3.5);
+    }
+
+    #[test]
+    fn iniverse_mix_exists() {
+        let manifest = find_manifest("iniverse-mix:fp8").unwrap();
+        assert_eq!(manifest.family, "flux");
+        assert!(!manifest.defaults.is_schnell);
+        assert_eq!(manifest.defaults.steps, 25);
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.hf_filename.contains("iniverseMixSFWNSFW")));
+    }
+
+    #[test]
+    fn iniverse_mix_bare_resolves_to_fp8() {
+        assert_eq!(resolve_model_name("iniverse-mix"), "iniverse-mix:fp8");
+    }
+
+    #[test]
+    fn pony_v6_exists() {
+        let manifest = find_manifest("pony-v6:fp16").unwrap();
+        assert_eq!(manifest.family, "sdxl");
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::EulerAncestral));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.hf_repo.contains("ponyDiffusionV6XL")));
+    }
+
+    #[test]
+    fn cyberrealistic_pony_exists() {
+        let manifest = find_manifest("cyberrealistic-pony:fp16").unwrap();
+        assert_eq!(manifest.family, "sdxl");
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::EulerAncestral));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.hf_repo.contains("cyberrealisticPony")));
+    }
+
+    #[test]
+    fn flux2_klein_gguf_exists() {
+        assert!(find_manifest("flux2-klein:q8").is_some());
+        assert!(find_manifest("flux2-klein:q6").is_some());
+        assert!(find_manifest("flux2-klein:q4").is_some());
+    }
+
+    #[test]
+    fn flux2_klein_resolves_to_q8() {
+        // bare "flux2-klein" resolves to :q8 (tried first, matches existing installs)
+        let name = resolve_model_name("flux2-klein");
+        assert_eq!(name, "flux2-klein:q8");
+    }
+
+    #[test]
+    fn flux2_klein_9b_defaults() {
+        let manifest = find_manifest("flux2-klein-9b:bf16").unwrap();
+        assert_eq!(manifest.family, "flux2");
+        assert_eq!(manifest.defaults.steps, 4);
+        assert!((manifest.defaults.guidance - 1.0).abs() < 0.01);
+        assert_eq!(manifest.defaults.width, 1024);
+    }
+
+    #[test]
+    fn flux2_klein_9b_bf16_is_sharded() {
+        let manifest = find_manifest("flux2-klein-9b:bf16").unwrap();
+        let shards: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| f.component == ModelComponent::TransformerShard)
+            .collect();
+        assert_eq!(
+            shards.len(),
+            2,
+            "Klein-9B BF16 should have 2 transformer shards"
+        );
+    }
+
+    #[test]
+    fn flux2_klein_9b_gguf_exists() {
+        assert!(find_manifest("flux2-klein-9b:q8").is_some());
+        assert!(find_manifest("flux2-klein-9b:q6").is_some());
+        assert!(find_manifest("flux2-klein-9b:q4").is_some());
+    }
+
+    #[test]
+    fn flux2_klein_9b_resolves_to_q8() {
+        let name = resolve_model_name("flux2-klein-9b");
+        assert_eq!(name, "flux2-klein-9b:q8");
+    }
+
+    #[test]
+    fn flux2_klein_9b_shared_files_are_gated() {
+        let manifest = find_manifest("flux2-klein-9b:q8").unwrap();
+        let text_encoders: Vec<_> = manifest
+            .files
+            .iter()
+            .filter(|f| f.component == ModelComponent::TextEncoder)
+            .collect();
+        assert!(
+            text_encoders.iter().all(|f| f.gated),
+            "Klein-9B text encoder shards should be gated"
+        );
+    }
+
+    #[test]
+    fn variant_quality_rank_ordering() {
+        use super::variant_quality_rank;
+        assert!(variant_quality_rank("flux-dev:bf16") < variant_quality_rank("flux-dev:fp16"));
+        assert!(variant_quality_rank("flux-dev:fp16") < variant_quality_rank("flux-dev:fp8"));
+        assert!(variant_quality_rank("flux-dev:fp8") < variant_quality_rank("flux-dev:q8"));
+        assert!(variant_quality_rank("flux-dev:q8") < variant_quality_rank("flux-dev:q6"));
+        assert!(variant_quality_rank("flux-dev:q6") < variant_quality_rank("flux-dev:q5"));
+        assert!(variant_quality_rank("flux-dev:q5") < variant_quality_rank("flux-dev:q4"));
+        assert!(variant_quality_rank("flux-dev:q4") < variant_quality_rank("flux-dev:q3"));
+    }
+
+    #[test]
+    fn variant_quality_rank_unknown_tag_sorts_last() {
+        use super::variant_quality_rank;
+        assert!(variant_quality_rank("custom-model") > variant_quality_rank("flux-dev:q3"));
+    }
+
+    #[test]
+    fn variant_quality_rank_includes_explicit_k_s_tags() {
+        use super::variant_quality_rank;
+        assert_eq!(
+            variant_quality_rank("ltx-2.5-22b-distilled:q4-k-s"),
+            variant_quality_rank("ltx-2.5-22b-distilled:q4")
+        );
+        assert_eq!(
+            variant_quality_rank("ltx-2.5-22b-distilled:q3-k-s"),
+            variant_quality_rank("ltx-2.5-22b-distilled:q3")
+        );
+    }
+
+    #[test]
+    fn model_base_name_extracts_prefix() {
+        use super::model_base_name;
+        assert_eq!(model_base_name("flux-dev:q4"), "flux-dev");
+        assert_eq!(model_base_name("sd15:fp16"), "sd15");
+        assert_eq!(model_base_name("custom-model"), "custom-model");
+    }
+
+    #[test]
+    fn known_manifests_count() {
+        // 24 FLUX + 3 SD1.5 + 4 SD3 + 8 SDXL + 4 Z-Image + 9 Flux.2 + 29 Qwen-Image/Qwen-Image-Edit + 1 Wuerstchen + 5 LTX Video + 6 LTX-2 + 14 Wan + 6 visible MiniMax H3 contracts + 7 LTX-2 controls + 7 LTX-2 camera controls + 3 ControlNet + 2 Qwen3-Expand + 7 Upscaler + 20 Companion = 159
+        // Wan fp8 bump (#777): +wan22-{t2v,i2v}-a14b:fp8 — the Comfy-Org
+        // fp8-scaled expert pairs.
+        // Wan bump: +wan22-{t2v,i2v}-a14b:{q5,q8} — the two-expert A14B tiers.
+        // Wan low-VRAM bump (#794): +wan22-{t2v,i2v}-a14b:q4 and
+        // +wan22-ti2v-5b:q8.
+        // Wan fast-tier bump (#793): +wan22-ti2v-5b:turbo — the Self-Forcing
+        // 4-step distill of the same 5B transformer.
+        // Companion bump: +flux2-te, +flux2-te-9b, +flux2-vae for the
+        // catalog bridge (single-file Civitai Flux.2 fine-tunes); +z-image-te
+        // for single-file Civitai Z-Image checkpoints; +ltx2-te for the
+        // catalog bridge (single-file Civitai LTX-2 / LTX-2.3 fine-tunes —
+        // Gemma 3 12B text encoder); +wan-umt5, +wan21-vae, +wan22-vae for
+        // single-file Wan checkpoints.
+        // Wan 2.1 14B bump (#797): +wan21-t2v-14b:{q5,q8} — city96's canonical
+        // GGUFs for the dense 2.1 14B, which the engine already shape-detects.
+        // Qwen distilled bump (#1042): +qwen-image-flash:{q4,q8} (NVIDIA DMD2
+        // 4-step), +qwen-image-distill:{q4,q8} (DiffSynth Distill-Full 15-step),
+        // PuLID bump (#1220): +pulid-flux — one hidden auxiliary files-only
+        // bundle (identity adapter + EVA02-CLIP source + antelopev2 face
+        // models). Not a checkpoint; never a default-model candidate.
+        // PuLID SDXL bump (#1228): +pulid-sdxl — the second hidden auxiliary
+        // files-only bundle. It carries the SAME four extraction artifacts as
+        // `pulid-flux` at the SAME `shared/pulid/` paths and differs by one
+        // file, the PuLID v1.1 adapter.
+        // H3 NVFP4 bump (#1319): +minimax-h3-{fl2va,ref2va}:comfy-pruned-nvfp4
+        // — the pruned NVFP4 transformers on the same shared compact graph.
+        // Acquirable and storable; execution is refused because mold has no
+        // engine arm for the layout.
+        // Ref2VA Turbo (#825): +minimax-h3-ref2va:comfy-pruned-int8-turbo-4step
+        // — the reviewed 4-step adapter beside the Ref2VA base stack, added
+        // once Ref2VA execution landed.
+        // LTX 2.5 contract/runtime bump (#1372/#1373): six split-pack
+        // manifests. Dev/Distilled each expose compact INT8 and full BF16
+        // Conv-VAE runtimes; the two diffusion-VAE contracts stay hidden.
+        // LTX 2.5 GGUF bump (#1414): +7 Abiray Distilled transformer tiers
+        // (:q3-k-s :q3 :q4-k-s :q4 :q5 :q6 :q8) on the shared int8-conv
+        // companion graph — visible downloads, runtime still gated.
+        // Flux.2 completion bump: +14. FLUX.2 [dev] :q8 :q6 :q4 :fp8 (ungated
+        // transformers on the ungated Comfy-Org/unsloth runtime assets, so the
+        // whole tier installs without a BFL license acceptance), klein
+        // :fp8 and klein-9b:fp8 (BFL's own FP8 conversions), and the eight
+        // undistilled klein base tiers (4B and 9B × bf16/q8/q6/q4) which take
+        // real CFG instead of a guidance embedding.
+        // Hunyuan3D bump (#1495): +3 image-to-3D shape checkpoints —
+        // `hunyuan3d-mini-turbo:fp16`, `hunyuan3d-turbo:fp16`,
+        // `hunyuan3d:fp16`. One self-contained file each (DiT + shape VAE +
+        // DINOv2-giant), so each contributes exactly one manifest.
+        // Licence-parity bump: +1 for the `hunyuan3d-paint` bundle, an
+        // auxiliary hidden files-only install (like the PuLID bundles) whose
+        // many files are ONE manifest. It exists so the Tencent 2.1 terms —
+        // a separate document from the 2.0 shape terms — are required by
+        // something and can therefore be accepted on every surface.
+        // lightx2v Turbo bump: +2. `minimax-h3-fl2va:comfy-pruned-int8-turbo-4step-768p-v1.1`
+        // and `minimax-h3-fl2va:comfy-pruned-int8-turbo-8step-768p` — two FL2VA
+        // Turbo adapters from `lightx2v/Minimax-h3-Turbo` beside the same FL2VA
+        // compact base stack, so each contributes exactly one manifest.
+        // Rank-21 Turbo bump: +3. `…-turbo-4step-768p-r21`, `…-turbo-8step-r21`
+        // and `minimax-h3-ref2va:comfy-pruned-int8-turbo-4step-r21` — SVD-resized
+        // derivatives of three already-shipped adapters, published by
+        // `drbaph/MiniMax-H3-Turbo-Lora-ComfyUI`. Two ride the FL2VA compact
+        // base stack and one the Ref2VA one; each is one manifest.
+        // Wan DMD bump: +1. `wan21-t2v-1.3b:turbo` — FastVideo's 3-rung DMD
+        // distill of the same 1.3B transformer, on the same shared UMT5 and
+        // 2.1 VAE, so it contributes exactly one manifest.
+        // Wan DMD 5B bump: +1. `wan22-ti2v-5b:dmd` — the same DMD recipe
+        // applied to the 2.2 TI2V-5B, one unsharded FastVideo transformer on
+        // the shared UMT5 and the 2.2 VAE the other 5B tiers already pull, so
+        // it too is exactly one manifest.
+        // Hunyuan3D 2.1 shape: one additional self-contained checkpoint.
+        // Hunyuan3D multiview: +2 self-contained normal and five-step Turbo
+        // checkpoints, each carrying its DiT, shape VAE and DINO tower.
+        // Mesh preprocessing: +3 hidden runnable workers — auto/forced U²-Net
+        // matting aliases and the Delight diffusion pipeline.
+        // IP-Adapter bump (#1573): +2 hidden auxiliary files-only bundles,
+        // `ip-adapter-sd15` and `ip-adapter-sdxl`. Like the PuLID pair they
+        // share their vision tower — the OpenCLIP ViT-H/14 at the SAME
+        // `shared/ip-adapter/` paths — and differ by one file, the adapter.
+        // Neither is a checkpoint or a default-model candidate.
+        // Qwen Image 2.1: one self-contained BF16 checkpoint with its own
+        // Qwen3-VL conditioner, two transformer shards, and decoder.
+        // Qwen Image 2.1 tiers: +8 transformer tiers (int8-conv, fp8, q8, q6,
+        // q5, q4, q3, q2) on the shared conditioner/VAE, and +3 turbo tags
+        // (bf16, int8-conv, q8) that stack the Viggle 6-step adapter on those
+        // base files.
+        // DMAD / PDMD distill bump: +3. `minimax-h3-fl2va:comfy-pruned-int8-dmad-4step`,
+        // `…-pdmd-2step` and `…-pdmd-4step` — Kijai's rank-reduced builds of the
+        // DMAD and PDMD distill LoRAs from `Kijai/MiniMax-H3-experimental`, each
+        // one adapter beside the FL2VA compact base stack, so one manifest each.
+        // MiniMax H3 FastH3 V2 (#1812): +1 distilled base tier, the FL2VA
+        // compact stack with FastVideo's distilled transformer substituted.
+        assert_eq!(known_manifests().len(), 226);
+    }
+
+    /// Every reviewed H3 Turbo adapter lands in the one family `loras/`
+    /// bucket, keyed by its own basename, whatever directory its upstream
+    /// repository publishes it in. Comfy-Org publishes under `loras/` and
+    /// lightx2v at the repository root; both flatten to the same rule, so the
+    /// three adapters already installed keep their exact paths.
+    #[test]
+    fn h3_turbo_adapters_store_under_the_family_loras_directory_whatever_the_upstream_path() {
+        use crate::minimax_h3::REVIEWED_TURBO_MANIFEST_TIERS;
+        for tier in REVIEWED_TURBO_MANIFEST_TIERS {
+            let manifest = find_manifest(tier.model).unwrap();
+            let adapter = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::DistilledLora)
+                .unwrap();
+            let basename = std::path::Path::new(tier.adapter_hf_filename)
+                .file_name()
+                .unwrap();
+            assert_eq!(
+                storage_path(manifest, adapter),
+                PathBuf::from("shared")
+                    .join(crate::minimax_h3::FAMILY)
+                    .join("loras")
+                    .join(basename),
+                "{}",
+                tier.model
+            );
+        }
+
+        // The three adapters installed before the derivation changed keep
+        // their exact on-disk paths; a moved file is a silent re-download of
+        // ~1.96 GB and an orphan beside it.
+        for (model, expected) in [
+            (
+                crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP,
+                "shared/minimax-h3/loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+            ),
+            (
+                crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P,
+                "shared/minimax-h3/loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors",
+            ),
+            (
+                crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP,
+                "shared/minimax-h3/loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            ),
+        ] {
+            let manifest = find_manifest(model).unwrap();
+            let adapter = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::DistilledLora)
+                .unwrap();
+            assert_eq!(
+                storage_path(manifest, adapter),
+                PathBuf::from(expected),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_ltx_manifests_removed() {
+        assert!(find_manifest("ltx-video-0.9:bf16").is_none());
+        assert!(find_manifest("ltx-video-0.9.5:bf16").is_none());
+    }
+
+    #[test]
+    fn current_ltx_manifests_present() {
+        assert!(find_manifest("ltx-video-0.9.6:bf16").is_some());
+        assert!(find_manifest("ltx-video-0.9.6-distilled:bf16").is_some());
+        assert!(find_manifest("ltx-video-0.9.8-2b-distilled:bf16").is_some());
+        assert!(find_manifest("ltx-video-0.9.8-13b-dev:bf16").is_some());
+        assert!(find_manifest("ltx-video-0.9.8-13b-distilled:bf16").is_some());
+    }
+
+    /// The Wan manifests are the contract every later stack layer builds on:
+    /// bare names resolve to the shipped tags, the component set is complete
+    /// (transformer + VAE + UMT5 + tokenizer), every payload carries a
+    /// SHA-256, and the entries stay hidden until the engine's factory arm
+    /// The Turbo tier's whole reason to exist is the denoise budget: 4 steps
+    /// at guidance 1.0, where `needs_cfg_pass` skips the unconditional
+    /// forward, against the quality tier's 20 steps with CFG. That is a 10x
+    /// reduction in transformer forwards, and it is the only thing that may
+    /// differ — the clip shape, timing, and conditioning capability are the
+    /// base checkpoint's, because it *is* the base checkpoint distilled.
+    #[test]
+    fn the_ti2v_turbo_tier_changes_only_the_denoise_budget() {
+        let quality = find_manifest("wan22-ti2v-5b:fp16").expect("quality tier ships");
+        let turbo = find_manifest("wan22-ti2v-5b:turbo").expect("turbo tier ships");
+
+        assert_eq!(turbo.defaults.steps, 4);
+        assert_eq!(turbo.defaults.guidance, 1.0);
+        assert!(
+            turbo.defaults.guidance <= 1.0,
+            "guidance above 1.0 would reinstate the unconditional forward the distill removes",
+        );
+        let forwards = |d: &ManifestDefaults| d.steps * if d.guidance > 1.0 { 2 } else { 1 };
+        assert_eq!(
+            forwards(&quality.defaults) / forwards(&turbo.defaults),
+            10,
+            "the tier exists for a 10x forward-count reduction",
+        );
+
+        // Everything else is the base checkpoint's.
+        assert_eq!(turbo.family, quality.family);
+        assert_eq!(turbo.defaults.width, quality.defaults.width);
+        assert_eq!(turbo.defaults.height, quality.defaults.height);
+        assert_eq!(turbo.defaults.frames, quality.defaults.frames);
+        assert_eq!(turbo.defaults.fps, quality.defaults.fps);
+        assert_eq!(turbo.defaults.source_image, quality.defaults.source_image);
+        assert_eq!(
+            turbo.defaults.negative_prompt,
+            quality.defaults.negative_prompt
+        );
+
+        // The distill ships as diffusers shards, so it carries
+        // `TransformerShard` rather than a single `Transformer`; the rest of
+        // the component set and the SHA-256 pinning are unchanged.
+        assert!(turbo
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::TransformerShard));
+        for component in [
+            ModelComponent::Vae,
+            ModelComponent::TextEncoder,
+            ModelComponent::TextTokenizer,
+        ] {
+            assert!(
+                turbo.files.iter().any(|f| f.component == component),
+                "turbo missing {component:?}"
+            );
+        }
+        for file in &turbo.files {
+            assert!(
+                file.sha256.is_some(),
+                "turbo: {} must carry a SHA-256",
+                file.hf_filename
+            );
+        }
+        assert!(!turbo.hidden);
+    }
+
+    /// The 1.3B DMD tier's whole reason to exist is the denoise budget: 3
+    /// rungs at guidance 1.0, where `needs_cfg_pass` skips the unconditional
+    /// forward, against the base tier's 30 steps with CFG. That is a 20x
+    /// reduction in transformer forwards, and it is the only thing that may
+    /// differ — the clip shape, timing, and conditioning capability are the
+    /// base checkpoint's, because it *is* the base checkpoint distilled.
+    #[test]
+    fn the_1_3b_turbo_tier_changes_only_the_denoise_budget() {
+        let base = find_manifest("wan21-t2v-1.3b:bf16").expect("base tier ships");
+        let turbo = find_manifest("wan21-t2v-1.3b:turbo").expect("turbo tier ships");
+
+        assert_eq!(turbo.defaults.steps, 3);
+        assert_eq!(turbo.defaults.guidance, 1.0);
+        assert!(
+            turbo.defaults.guidance <= 1.0,
+            "guidance above 1.0 would reinstate the unconditional forward the distill removes",
+        );
+        let forwards = |d: &ManifestDefaults| d.steps * if d.guidance > 1.0 { 2 } else { 1 };
+        assert_eq!(
+            forwards(&base.defaults) / forwards(&turbo.defaults),
+            20,
+            "the tier exists for a 20x forward-count reduction",
+        );
+        assert_eq!(
+            wan_dmd_ladder("wan21-t2v-1.3b:turbo").map(|ladder| ladder.rungs.len()),
+            Some(turbo.defaults.steps as usize),
+            "the pinned ladder is what the advertised step count means",
+        );
+
+        // Everything else is the base checkpoint's.
+        assert_eq!(turbo.family, base.family);
+        assert_eq!(turbo.defaults.width, base.defaults.width);
+        assert_eq!(turbo.defaults.height, base.defaults.height);
+        assert_eq!(turbo.defaults.frames, base.defaults.frames);
+        assert_eq!(turbo.defaults.fps, base.defaults.fps);
+        assert_eq!(turbo.defaults.source_image, base.defaults.source_image);
+        assert_eq!(
+            turbo.defaults.negative_prompt,
+            base.defaults.negative_prompt
+        );
+        assert_eq!(turbo.defaults.scheduler, base.defaults.scheduler);
+        assert_eq!(turbo.defaults.is_schnell, base.defaults.is_schnell);
+
+        // FastVideo publishes one unsharded diffusers file, so the tier
+        // carries a single `Transformer` rather than a shard pair.
+        assert_eq!(
+            turbo
+                .files
+                .iter()
+                .filter(|f| f.component == ModelComponent::Transformer)
+                .count(),
+            1,
+        );
+        assert!(!turbo
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::TransformerShard));
+        for component in [
+            ModelComponent::Vae,
+            ModelComponent::TextEncoder,
+            ModelComponent::TextTokenizer,
+        ] {
+            assert!(
+                turbo.files.iter().any(|f| f.component == component),
+                "turbo missing {component:?}"
+            );
+        }
+        for file in &turbo.files {
+            assert!(
+                file.sha256.is_some(),
+                "turbo: {} must carry a SHA-256",
+                file.hf_filename
+            );
+        }
+        assert!(!turbo.hidden);
+    }
+
+    /// The 5B DMD tier's whole reason to exist is the denoise budget: 3 rungs
+    /// at guidance 1.0, where `needs_cfg_pass` skips the unconditional
+    /// forward, against the base tier's 20 steps with CFG. Everything else —
+    /// the 2.2 VAE grid, 1280x704, 121 frames at 24 fps, the tuned negative
+    /// prompt — is the base checkpoint's, because it *is* the base checkpoint
+    /// distilled (FastVideo distilled data-free from its own trajectories).
+    #[test]
+    fn the_5b_dmd_tier_changes_only_the_denoise_budget() {
+        let base = find_manifest("wan22-ti2v-5b:fp16").expect("base tier ships");
+        let dmd = find_manifest("wan22-ti2v-5b:dmd").expect("dmd tier ships");
+
+        assert_eq!(dmd.defaults.steps, 3);
+        assert_eq!(dmd.defaults.guidance, 1.0);
+        assert!(
+            dmd.defaults.guidance <= 1.0,
+            "guidance above 1.0 would reinstate the unconditional forward the distill removes",
+        );
+        // 40 against 3, stated as two numbers rather than a ratio: 40/3 is not
+        // integral, and rounding it would hide which side moved.
+        let forwards = |d: &ManifestDefaults| d.steps * if d.guidance > 1.0 { 2 } else { 1 };
+        assert_eq!(forwards(&base.defaults), 40);
+        assert_eq!(forwards(&dmd.defaults), 3);
+        assert_eq!(
+            wan_dmd_ladder("wan22-ti2v-5b:dmd").map(|ladder| ladder.rungs.len()),
+            Some(dmd.defaults.steps as usize),
+            "the pinned ladder is what the advertised step count means",
+        );
+
+        // Everything else is the base checkpoint's.
+        assert_eq!(dmd.family, base.family);
+        assert_eq!(dmd.defaults.width, base.defaults.width);
+        assert_eq!(dmd.defaults.height, base.defaults.height);
+        assert_eq!(dmd.defaults.frames, base.defaults.frames);
+        assert_eq!(dmd.defaults.fps, base.defaults.fps);
+        assert_eq!(dmd.defaults.negative_prompt, base.defaults.negative_prompt);
+        assert_eq!(dmd.defaults.scheduler, base.defaults.scheduler);
+        assert_eq!(dmd.defaults.is_schnell, base.defaults.is_schnell);
+
+        // Image conditioning is asserted EXPLICITLY, never as "equals the base
+        // tier", because this is the one default that deliberately DIFFERS
+        // from `:fp16`. FastVideo distilled and documents this checkpoint as
+        // text-to-video only, and the GPU A/B agreed: mold's TI2V
+        // latent-inpaint path pins frame 0 bit-exact on this student, but the
+        // clip lurches away from it within ~4 frames where `:turbo` holds the
+        // same source, so the tier refuses conditioning rather than
+        // advertising it half-working.
+        assert_eq!(
+            dmd.defaults.source_image,
+            Some(crate::types::SourceImageCapability::Unsupported)
+        );
+        assert!(!crate::catalog::extend_capable_model(
+            "wan",
+            dmd.defaults.source_image
+        ));
+
+        // FastVideo publishes one unsharded diffusers file, so the tier
+        // carries a single `Transformer` rather than a shard pair.
+        assert_eq!(
+            dmd.files
+                .iter()
+                .filter(|f| f.component == ModelComponent::Transformer)
+                .count(),
+            1,
+        );
+        assert!(!dmd
+            .files
+            .iter()
+            .any(|f| f.component == ModelComponent::TransformerShard));
+        for component in [
+            ModelComponent::Vae,
+            ModelComponent::TextEncoder,
+            ModelComponent::TextTokenizer,
+        ] {
+            assert!(
+                dmd.files.iter().any(|f| f.component == component),
+                "dmd missing {component:?}"
+            );
+        }
+        for file in &dmd.files {
+            assert!(
+                file.sha256.is_some(),
+                "dmd: {} must carry a SHA-256",
+                file.hf_filename
+            );
+        }
+        assert!(!dmd.hidden);
+    }
+
+    /// `wan_dmd_ladder` is the ONE authority for "this tier walks a fixed rung
+    /// ladder", so the manifest it names must agree with it: as many steps as
+    /// rungs, no CFG, and a strictly descending ladder inside the flow-match
+    /// timestep range. Every other Wan tier must answer `None` — a laddered
+    /// tier the profile does not know about would advertise adjustable
+    /// controls the engine ignores.
+    #[test]
+    fn wan_dmd_ladders_agree_with_their_manifests() {
+        let mut laddered = 0;
+        for manifest in known_manifests().iter().filter(|m| m.family == "wan") {
+            let Some(ladder) = wan_dmd_ladder(&manifest.name) else {
+                continue;
+            };
+            laddered += 1;
+            assert_eq!(
+                manifest.defaults.steps as usize,
+                ladder.rungs.len(),
+                "{}: the advertised step count is the ladder length",
+                manifest.name
+            );
+            assert!(
+                manifest.defaults.guidance <= 1.0,
+                "{}: a DMD student runs one forward per rung",
+                manifest.name
+            );
+            for window in ladder.rungs.windows(2) {
+                assert!(
+                    window[0] > window[1],
+                    "{}: rungs must strictly descend, got {:?}",
+                    manifest.name,
+                    ladder.rungs
+                );
+            }
+            for &rung in ladder.rungs {
+                assert!(
+                    (1..=1000).contains(&rung),
+                    "{}: rung {rung} is outside the flow-match timestep range",
+                    manifest.name
+                );
+            }
+            assert!(
+                ladder.table_shift.is_finite() && ladder.table_shift > 0.0,
+                "{}: the rungs are timesteps on a real sigma table",
+                manifest.name
+            );
+        }
+        assert_eq!(laddered, 2, "the two FastWan DMD distills are laddered");
+
+        for manifest in known_manifests().iter().filter(|m| {
+            m.family == "wan" && m.name != "wan21-t2v-1.3b:turbo" && m.name != "wan22-ti2v-5b:dmd"
+        }) {
+            assert!(
+                wan_dmd_ladder(&manifest.name).is_none(),
+                "{} walks an ordinary (steps, shift) schedule",
+                manifest.name
+            );
+        }
+    }
+
+    /// The rungs alone do not describe a DMD schedule: they are timesteps on
+    /// a sigma table, and the two shipped distills sit on DIFFERENT tables —
+    /// FastWan2.1's 1.3B on shift 8, FastWan2.2's TI2V-5B on shift 5
+    /// (`fastvideo/configs/pipelines/wan.py:117-123` and `:275-279`, commit
+    /// `40b93784`). The rung integers being equal today is a coincidence of
+    /// the distillation recipe, not a shared constant, which is exactly why a
+    /// ladder carries its own table shift and each tier its own rung array.
+    /// Reading one tier's rungs against the other's table is a silently wrong
+    /// render, never an error.
+    #[test]
+    fn wan_dmd_ladders_carry_the_shift_they_were_distilled_on() {
+        let small = wan_dmd_ladder("wan21-t2v-1.3b:turbo").expect("the 1.3B distill ships");
+        let large = wan_dmd_ladder("wan22-ti2v-5b:dmd").expect("the 5B distill ships");
+
+        assert_eq!(small.rungs, &[1000u32, 757, 522]);
+        assert_eq!(small.table_shift, 8.0);
+        assert_eq!(large.rungs, &[1000u32, 757, 522]);
+        assert_eq!(large.table_shift, 5.0);
+        assert_ne!(
+            small.table_shift, large.table_shift,
+            "a ladder that did not carry its shift would render one of these on the other's table"
+        );
+
+        // Each ladder names its OWN rung const, so a later upstream revision
+        // to one tier's ladder cannot silently move the other's. That the two
+        // are separate declarations is a source fact and not an observable
+        // one — rustc is free to unify constants holding equal bytes — so
+        // this asserts the wiring rather than the addresses.
+        assert_eq!(small.rungs, &FASTWAN_1_3B_RUNGS);
+        assert_eq!(large.rungs, &FASTWAN_2_2_TI2V_5B_RUNGS);
+        assert_eq!(FASTWAN_1_3B_LADDER, small);
+        assert_eq!(FASTWAN_2_2_TI2V_5B_LADDER, large);
+    }
+
+    /// exists — a listed model that cannot load is worse than none.
+    #[test]
+    fn wan_manifests_resolve_and_carry_full_component_sets() {
+        assert_eq!(resolve_model_name("wan21-t2v-1.3b"), "wan21-t2v-1.3b:bf16");
+        // The FastVideo DMD distill is reachable only by its own tag: the
+        // bare-name ladder is `:q8 -> :fp16 -> :bf16 -> :fp8`, so adding
+        // `:turbo` cannot re-point anyone's existing `wan21-t2v-1.3b` at a
+        // 3-step checkpoint. The dashed spelling resolves like every other
+        // family's.
+        assert_eq!(
+            resolve_model_name("wan21-t2v-1.3b:turbo"),
+            "wan21-t2v-1.3b:turbo"
+        );
+        assert_eq!(
+            resolve_model_name("wan21-t2v-1.3b-turbo"),
+            "wan21-t2v-1.3b:turbo"
+        );
+        // The bare 5B name must stay on the fp16 default even though a `:q8`
+        // small-card tag now exists — the generic tag loop tries `:q8` first,
+        // so this is pinned explicitly in `resolve_model_name` (#794).
+        assert_eq!(resolve_model_name("wan22-ti2v-5b"), "wan22-ti2v-5b:fp16");
+        // Legacy-dash form resolves like every other family's.
+        assert_eq!(
+            resolve_model_name("wan22-ti2v-5b-fp16"),
+            "wan22-ti2v-5b:fp16"
+        );
+        assert_eq!(resolve_model_name("wan22-ti2v-5b-q8"), "wan22-ti2v-5b:q8");
+        // The 2.1 14B ships only GGUF tiers, so the bare name takes the
+        // generic loop's first hit — `:q8`, the quality tier — rather than
+        // needing a pin. Both tags stay addressable, dash form included.
+        assert_eq!(resolve_model_name("wan21-t2v-14b"), "wan21-t2v-14b:q8");
+        assert_eq!(resolve_model_name("wan21-t2v-14b-q5"), "wan21-t2v-14b:q5");
+        // The Turbo distill is reachable only by its own tag. The bare-name
+        // ladder is `:q8 -> :fp16 -> :bf16 -> :fp8`, so adding it cannot
+        // silently re-point anyone's existing `wan22-ti2v-5b` at a 4-step
+        // checkpoint (#793).
+        assert_eq!(
+            resolve_model_name("wan22-ti2v-5b:turbo"),
+            "wan22-ti2v-5b:turbo"
+        );
+        assert_eq!(
+            resolve_model_name("wan22-ti2v-5b-turbo"),
+            "wan22-ti2v-5b:turbo"
+        );
+        // The FastVideo DMD distill takes `:dmd` because `:turbo` is already
+        // the Self-Forcing 4-step tier on this checkpoint. Same rule as every
+        // other added tag: reachable only by its own name, and the bare name
+        // is unmoved.
+        assert_eq!(resolve_model_name("wan22-ti2v-5b:dmd"), "wan22-ti2v-5b:dmd");
+        assert_eq!(resolve_model_name("wan22-ti2v-5b-dmd"), "wan22-ti2v-5b:dmd");
+        assert_eq!(resolve_model_name("wan22-ti2v-5b"), "wan22-ti2v-5b:fp16");
+
+        for name in [
+            "wan21-t2v-1.3b:bf16",
+            "wan21-t2v-1.3b:turbo",
+            "wan21-t2v-14b:q5",
+            "wan21-t2v-14b:q8",
+            "wan22-ti2v-5b:fp16",
+            "wan22-ti2v-5b:q8",
+            "wan22-ti2v-5b:dmd",
+        ] {
+            let manifest = find_manifest(name).unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(manifest.family, "wan");
+            assert!(
+                !manifest.hidden,
+                "{name} is listable now that the wan engine exists"
+            );
+            for component in [
+                ModelComponent::Transformer,
+                ModelComponent::Vae,
+                ModelComponent::TextEncoder,
+                ModelComponent::TextTokenizer,
+            ] {
+                assert!(
+                    manifest.files.iter().any(|f| f.component == component),
+                    "{name} missing {component:?}"
+                );
+            }
+            for file in &manifest.files {
+                assert!(
+                    file.sha256.is_some(),
+                    "{name}: {} must carry a SHA-256",
+                    file.hf_filename
+                );
+            }
+            let defaults = &manifest.defaults;
+            assert!(defaults.frames.is_some() && defaults.fps.is_some());
+            assert!(
+                defaults.negative_prompt.is_some(),
+                "{name} must default to upstream's tuned negative prompt"
+            );
+        }
+
+        // The two VAE generations must not be conflated: 2.1 (16ch) for the
+        // 1.3B/14B family, 2.2 (48ch) for TI2V-5B.
+        let vae_file = |name: &str| {
+            find_manifest(name)
+                .unwrap()
+                .files
+                .iter()
+                .find(|f| f.component == ModelComponent::Vae)
+                .unwrap()
+                .hf_filename
+                .clone()
+        };
+        assert!(vae_file("wan21-t2v-1.3b:bf16").contains("wan_2.1_vae"));
+        assert!(vae_file("wan22-ti2v-5b:fp16").contains("wan2.2_vae"));
+        assert!(vae_file("wan22-ti2v-5b:q8").contains("wan2.2_vae"));
+        assert!(vae_file("wan22-ti2v-5b:dmd").contains("wan2.2_vae"));
+
+        // The `:q8` tag is the same 5B transformer as QuantStack's Q8_0 GGUF
+        // — the ~5.4 GB pull that reaches small cards (#794).
+        let q8 = find_manifest("wan22-ti2v-5b:q8").unwrap();
+        let transformer = q8
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .unwrap();
+        assert_eq!(transformer.hf_repo, "QuantStack/Wan2.2-TI2V-5B-GGUF");
+        assert!(transformer.hf_filename.contains("Q8_0"));
+        // Same recipe as fp16: the quantization changes the pull, not the
+        // defaults contract.
+        let fp16 = find_manifest("wan22-ti2v-5b:fp16").unwrap();
+        assert_eq!(q8.defaults.steps, fp16.defaults.steps);
+        assert_eq!(q8.defaults.guidance, fp16.defaults.guidance);
+        assert_eq!(q8.defaults.frames, fp16.defaults.frames);
+        assert_eq!(q8.defaults.fps, fp16.defaults.fps);
+        assert_eq!((q8.defaults.width, q8.defaults.height), (1280, 704));
+    }
+
+    /// Every A14B tier ships a complete expert pair, and the fast tier ships a
+    /// distill for each expert. A manifest with one expert, or with one distill
+    /// applied to both, is not a smaller model — it is a broken one.
+    #[test]
+    fn a14b_manifests_carry_both_experts_and_a_distill_per_expert() {
+        // Bare names take the family's `:q8` default, which is the quality tier.
+        assert_eq!(resolve_model_name("wan22-t2v-a14b"), "wan22-t2v-a14b:q8");
+        assert_eq!(resolve_model_name("wan22-i2v-a14b"), "wan22-i2v-a14b:q8");
+
+        for name in [
+            "wan22-t2v-a14b:q4",
+            "wan22-t2v-a14b:q5",
+            "wan22-t2v-a14b:q8",
+            "wan22-i2v-a14b:q4",
+            "wan22-i2v-a14b:q5",
+            "wan22-i2v-a14b:q8",
+        ] {
+            let manifest = find_manifest(name).unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(manifest.family, "wan");
+            assert!(!manifest.hidden);
+
+            let file = |component: ModelComponent| {
+                manifest
+                    .files
+                    .iter()
+                    .find(|f| f.component == component)
+                    .unwrap_or_else(|| panic!("{name} missing {component:?}"))
+            };
+            let high = file(ModelComponent::Transformer);
+            let low = file(ModelComponent::LowNoiseTransformer);
+            assert!(high.hf_filename.contains("HighNoise"), "{name}");
+            assert!(low.hf_filename.contains("LowNoise"), "{name}");
+            assert_ne!(
+                high.sha256, low.sha256,
+                "{name}: the two experts are different networks"
+            );
+            assert_eq!(high.hf_repo, low.hf_repo);
+
+            // The 2.1 VAE, byte-identical to the 1.3B's so it dedupes.
+            assert!(file(ModelComponent::Vae)
+                .hf_filename
+                .contains("wan_2.1_vae"));
+            for component in [ModelComponent::TextEncoder, ModelComponent::TextTokenizer] {
+                file(component);
+            }
+            for f in &manifest.files {
+                assert!(f.sha256.is_some(), "{name}: {} needs a SHA", f.hf_filename);
+            }
+
+            let defaults = &manifest.defaults;
+            // Every default is a measured RTX 4090 envelope. The Q5/Q4 tiers
+            // reach the checkpoint's trained 81 frames because block offload
+            // parks trailing blocks for them (#776 item 3). The Q8 pair's
+            // ~4.6 GB larger resident expert does not: its measured edge is
+            // 73 frames (2,235.0 s at a 16,650 MiB peak; 77 and 81 are both
+            // refused, at ~25.3 and ~25.9 GB against ~24.8 GB usable). All
+            // stay on the 4n+1 grid; bigger cards pass --frames 81 explicitly.
+            let expected_frames = if name.ends_with(":q8") { 73 } else { 81 };
+            assert_eq!(defaults.frames, Some(expected_frames), "{name}");
+            assert_eq!(
+                (expected_frames - 1) % 4,
+                0,
+                "{name}: envelope default must sit on the 4n+1 grid"
+            );
+            assert_eq!(defaults.fps, Some(16));
+            assert!(defaults.negative_prompt.is_some());
+
+            // Both `:q5` and `:q4` are Lightning tiers; only `:q8` renders
+            // the family's ordinary schedule without the distill.
+            let fast = !name.ends_with(":q8");
+            let distills: Vec<_> = manifest
+                .files
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.component,
+                        ModelComponent::DistilledLora | ModelComponent::LowNoiseDistilledLora
+                    )
+                })
+                .collect();
+            if fast {
+                assert_eq!(distills.len(), 2, "{name}: one distill per expert");
+                assert_ne!(
+                    distills[0].sha256, distills[1].sha256,
+                    "{name}: each expert is distilled separately"
+                );
+                assert!(distills
+                    .iter()
+                    .any(|f| f.hf_filename.contains("high_noise")));
+                assert!(distills.iter().any(|f| f.hf_filename.contains("low_noise")));
+                // The lightx2v recipe: four steps, and guidance 1.0 so the
+                // unconditional pass is skipped rather than merely weakened.
+                assert_eq!(defaults.steps, 4);
+                assert_eq!(defaults.guidance, 1.0);
+            } else {
+                assert!(
+                    distills.is_empty(),
+                    "{name}: the quality tier has no distill"
+                );
+                assert_eq!(defaults.steps, 20);
+                assert_eq!(defaults.guidance, 3.5);
+            }
+        }
+
+        // The distill pairs must come from the Comfy-Org repack. The
+        // similarly-named `lightx2v/Wan2.2-Distill-Loras` I2V files carry
+        // `.diff`/`.diff_b` full-weight deltas and target the Wan 2.1 CLIP
+        // branch, which this family's checkpoints do not have.
+        for name in [
+            "wan22-t2v-a14b:q4",
+            "wan22-t2v-a14b:q5",
+            "wan22-i2v-a14b:q4",
+            "wan22-i2v-a14b:q5",
+        ] {
+            for file in find_manifest(name).unwrap().files.iter().filter(|f| {
+                matches!(
+                    f.component,
+                    ModelComponent::DistilledLora | ModelComponent::LowNoiseDistilledLora
+                )
+            }) {
+                assert_eq!(
+                    file.hf_repo, "Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+                    "{name}"
+                );
+            }
+        }
+
+        // Both experts are model-specific, so neither lands in the shared pool
+        // where the other tier's same-named file would collide with it.
+        let manifest = find_manifest("wan22-t2v-a14b:q5").unwrap();
+        for component in [
+            ModelComponent::Transformer,
+            ModelComponent::LowNoiseTransformer,
+            ModelComponent::DistilledLora,
+            ModelComponent::LowNoiseDistilledLora,
+        ] {
+            let file = manifest
+                .files
+                .iter()
+                .find(|f| f.component == component)
+                .unwrap();
+            let path = storage_path(manifest, file);
+            assert!(
+                path.starts_with("wan22-t2v-a14b-q5"),
+                "{component:?} must be model-specific, got {}",
+                path.display()
+            );
+        }
+    }
+
+    /// The `:q4` tier is the `:q5` recipe with smaller experts (#794): it must
+    /// carry byte-identical Lightning distill files — the adapters were
+    /// trained once, against the bf16 weights, and are quant-independent —
+    /// while its experts are the Q4_K_M GGUFs, distinct from Q5_K_M's.
+    #[test]
+    fn a14b_q4_tier_reuses_the_q5_lightning_distill_pair() {
+        for base in ["wan22-t2v-a14b", "wan22-i2v-a14b"] {
+            let q4 = find_manifest(&format!("{base}:q4")).unwrap();
+            let q5 = find_manifest(&format!("{base}:q5")).unwrap();
+
+            for component in [
+                ModelComponent::DistilledLora,
+                ModelComponent::LowNoiseDistilledLora,
+            ] {
+                let file = |m: &'static ModelManifest| {
+                    m.files
+                        .iter()
+                        .find(|f| f.component == component)
+                        .unwrap_or_else(|| panic!("{}: missing {component:?}", m.name))
+                };
+                let (a, b) = (file(q4), file(q5));
+                assert_eq!(a.hf_repo, b.hf_repo, "{base} {component:?}");
+                assert_eq!(a.hf_filename, b.hf_filename, "{base} {component:?}");
+                assert_eq!(a.sha256, b.sha256, "{base} {component:?}");
+                assert_eq!(a.size_bytes, b.size_bytes, "{base} {component:?}");
+            }
+
+            for component in [
+                ModelComponent::Transformer,
+                ModelComponent::LowNoiseTransformer,
+            ] {
+                let expert = q4.files.iter().find(|f| f.component == component).unwrap();
+                assert!(
+                    expert.hf_filename.contains("Q4_K_M"),
+                    "{base} {component:?}: expected a Q4_K_M expert, got {}",
+                    expert.hf_filename
+                );
+            }
+
+            // Same Lightning recipe as `:q5`, down to the reduced-envelope
+            // frame default.
+            assert_eq!(q4.defaults.steps, q5.defaults.steps);
+            assert_eq!(q4.defaults.guidance, q5.defaults.guidance);
+            assert_eq!(q4.defaults.frames, q5.defaults.frames);
+        }
+    }
+
+    /// The wan-umt5 companion and the primary Wan manifests must agree on
+    /// storage: the companion bridge routes its shared components into
+    /// `shared/wan/`, where the primary manifests already put the encoder and
+    /// tokenizer — so a companion pull and a primary pull dedupe to one
+    /// on-disk copy of the 11 GB encoder. (The VAE companions deliberately do
+    /// NOT dedupe: like ltx-video-vae/ltx2-vae they carry their payload as a
+    /// model-specific Transformer file the catalog bridge points at directly.)
+    #[test]
+    fn wan_umt5_companion_shares_storage_with_primary_manifests() {
+        let primary = find_manifest("wan21-t2v-1.3b:bf16").unwrap();
+        let umt5 = find_manifest("wan-umt5").unwrap();
+        for component in [ModelComponent::TextEncoder, ModelComponent::TextTokenizer] {
+            let companion_file = umt5
+                .files
+                .iter()
+                .find(|f| f.component == component)
+                .unwrap();
+            let primary_file = primary
+                .files
+                .iter()
+                .find(|f| f.component == component)
+                .unwrap();
+            assert_eq!(
+                storage_path(umt5, companion_file),
+                storage_path(primary, primary_file),
+                "companion {component:?} must land where the primary manifests put it"
+            );
+        }
+    }
+
+    #[test]
+    fn ltx_098_manifests_include_spatial_upscaler() {
+        for model in [
+            "ltx-video-0.9.8-2b-distilled:bf16",
+            "ltx-video-0.9.8-13b-dev:bf16",
+            "ltx-video-0.9.8-13b-distilled:bf16",
+        ] {
+            let manifest = find_manifest(model).expect("manifest should exist");
+            assert!(
+                manifest
+                    .files
+                    .iter()
+                    .any(|file| file.component == ModelComponent::SpatialUpscaler),
+                "{model} missing spatial upscaler component"
+            );
+        }
+    }
+
+    #[test]
+    fn ltx2_manifests_include_verified_hashes_for_transformers_and_gemma() {
+        for model in [
+            "ltx-2-19b-dev:fp8",
+            "ltx-2-19b-distilled:fp8",
+            "ltx-2.3-22b-dev:fp8",
+            "ltx-2.3-22b-distilled:fp8",
+            "ltx-2.3-22b-dev:bf16",
+            "ltx-2.3-22b-distilled:bf16",
+        ] {
+            let manifest = find_manifest(model).expect("manifest should exist");
+            let transformer = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::Transformer)
+                .expect("transformer entry should exist");
+            assert!(
+                transformer.sha256.is_some(),
+                "{model} missing transformer sha256"
+            );
+
+            let gemma_shards = manifest
+                .files
+                .iter()
+                .filter(|file| {
+                    file.component == ModelComponent::TextEncoder
+                        && file.hf_filename.ends_with(".safetensors")
+                })
+                .count();
+            assert_eq!(gemma_shards, 5, "{model} missing Gemma shard entries");
+            for file in manifest.files.iter().filter(|file| {
+                file.component == ModelComponent::TextEncoder
+                    && (file.hf_filename.ends_with(".safetensors")
+                        || file.hf_filename == "tokenizer.json"
+                        || file.hf_filename == "tokenizer.model")
+            }) {
+                assert!(
+                    file.sha256.is_some(),
+                    "{model} missing sha256 for {}",
+                    file.hf_filename
+                );
+                assert!(file.gated, "{model} should mark Gemma asset as gated");
+            }
+        }
+    }
+
+    #[test]
+    fn ltx2_22b_bf16_manifests_use_upstream_reference_checkpoints() {
+        for (model, filename, size_bytes, sha256) in [
+            (
+                "ltx-2.3-22b-dev:bf16",
+                "ltx-2.3-22b-dev.safetensors",
+                46_149_344_974,
+                "7ab7225325bc403448ea84b6db2269811a880e5118cd2ee2b6282a93d585016f",
+            ),
+            (
+                "ltx-2.3-22b-distilled:bf16",
+                "ltx-2.3-22b-distilled-1.1.safetensors",
+                46_149_345_334,
+                "b33b7fe4bbfe084f484be4aaf90b0f1d95dca20d403ac4c0e037eb8c4f0af7cc",
+            ),
+        ] {
+            let manifest = find_manifest(model).expect("BF16 manifest should exist");
+            assert_eq!(manifest.family, "ltx2");
+            let transformer = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::Transformer)
+                .expect("transformer entry should exist");
+            assert_eq!(transformer.hf_repo, "Lightricks/LTX-2.3");
+            assert_eq!(transformer.hf_filename, filename);
+            assert_eq!(transformer.size_bytes, size_bytes);
+            assert_eq!(transformer.sha256, Some(sha256));
+        }
+    }
+
+    #[test]
+    fn ltx2_22b_manifests_include_x1_5_spatial_upscaler_after_x2_default() {
+        for model in [
+            "ltx-2.3-22b-dev:fp8",
+            "ltx-2.3-22b-distilled:fp8",
+            "ltx-2.3-22b-dev:bf16",
+            "ltx-2.3-22b-distilled:bf16",
+        ] {
+            let manifest = find_manifest(model).expect("manifest should exist");
+            let spatial_files: Vec<&str> = manifest
+                .files
+                .iter()
+                .filter(|file| file.component == ModelComponent::SpatialUpscaler)
+                .map(|file| file.hf_filename.as_str())
+                .collect();
+            let x2 = if model.ends_with(":bf16") {
+                "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+            } else {
+                "ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
+            };
+            assert_eq!(
+                spatial_files,
+                vec![x2, "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"]
+            );
+        }
+    }
+
+    #[test]
+    fn ltx_shared_t5_assets_live_under_shared_flux() {
+        let manifest = find_manifest("ltx-video-0.9.8-2b-distilled:bf16").unwrap();
+        let t5 = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::T5Encoder)
+            .unwrap();
+        let tokenizer = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::T5Tokenizer)
+            .unwrap();
+        assert!(storage_path(manifest, t5).starts_with("shared/flux"));
+        assert!(storage_path(manifest, tokenizer).starts_with("shared/flux"));
+    }
+
+    #[test]
+    fn ltx_shared_vae_and_spatial_upscaler_use_repo_aligned_paths() {
+        let manifest = find_manifest("ltx-video-0.9.8-13b-distilled:bf16").unwrap();
+        let vae = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::Vae)
+            .unwrap();
+        let upscaler = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::SpatialUpscaler)
+            .unwrap();
+        assert!(storage_path(manifest, vae).starts_with("shared/LTX-Video-0.9.5"));
+        assert!(storage_path(manifest, upscaler).starts_with("shared/LTX-Video"));
+    }
+
+    #[test]
+    fn ltx_storage_candidates_include_legacy_shared_bucket() {
+        let manifest = find_manifest("ltx-video-0.9.8-2b-distilled:bf16").unwrap();
+        let t5 = manifest
+            .files
+            .iter()
+            .find(|file| file.component == ModelComponent::T5Encoder)
+            .unwrap();
+        let candidates = storage_path_candidates(manifest, t5);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].starts_with("shared/flux"));
+        assert!(candidates[1].starts_with("shared/ltx-video"));
+    }
+
+    #[test]
+    fn ltx_manifests_use_the_compatible_legacy_vae_source() {
+        for manifest in known_manifests()
+            .iter()
+            .filter(|manifest| manifest.family == "ltx-video")
+        {
+            let vae = manifest
+                .files
+                .iter()
+                .find(|file| file.component == ModelComponent::Vae)
+                .expect("ltx manifest should include a VAE");
+            assert_eq!(
+                vae.hf_repo, "Lightricks/LTX-Video-0.9.5",
+                "{} should keep using the compatible legacy LTX VAE until the newer VAE layout is ported",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_has_required_components() {
+        for manifest in known_manifests() {
+            let components: Vec<_> = manifest.files.iter().map(|f| f.component).collect();
+            // All diffusion models need VAE except families that intentionally ship a
+            // single-file upstream checkpoint without a standalone VAE asset.
+            if !manifest.is_utility()
+                && !manifest.is_upscaler()
+                && !manifest.is_auxiliary()
+                && manifest.family != "ltx2"
+                && manifest.family != HUNYUAN3D_FAMILY
+                && manifest.family != HUNYUAN3D_MATTING_FAMILY
+            {
+                assert!(
+                    components.contains(&ModelComponent::Vae),
+                    "{} missing Vae",
+                    manifest.name
+                );
+            }
+
+            match manifest.family.as_str() {
+                HUNYUAN3D_FAMILY => {
+                    // One file, one component. The shape VAE and the DINOv2
+                    // conditioner live inside it under the `vae.` and
+                    // `conditioner.` prefixes, which is why the standalone-VAE
+                    // requirement above exempts this family.
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (hunyuan3d) missing Transformer",
+                        manifest.name
+                    );
+                    assert_eq!(
+                        manifest.files.len(),
+                        1,
+                        "{} (hunyuan3d) must be a single self-contained checkpoint",
+                        manifest.name
+                    );
+                }
+                "flux" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (flux) missing Transformer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder),
+                        "{} (flux) missing ClipEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer),
+                        "{} (flux) missing ClipTokenizer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::T5Encoder),
+                        "{} (flux) missing T5Encoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::T5Tokenizer),
+                        "{} (flux) missing T5Tokenizer",
+                        manifest.name
+                    );
+                }
+                "sd15" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (sd15) missing Transformer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder),
+                        "{} (sd15) missing ClipEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer),
+                        "{} (sd15) missing ClipTokenizer",
+                        manifest.name
+                    );
+                    // SD1.5 does NOT use dual CLIP
+                    assert!(
+                        !components.contains(&ModelComponent::ClipEncoder2),
+                        "{} (sd15) should not have ClipEncoder2",
+                        manifest.name
+                    );
+                }
+                "sd3" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (sd3) missing Transformer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder),
+                        "{} (sd3) missing ClipEncoder (CLIP-L)",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer),
+                        "{} (sd3) missing ClipTokenizer (CLIP-L)",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder2),
+                        "{} (sd3) missing ClipEncoder2 (CLIP-G)",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer2),
+                        "{} (sd3) missing ClipTokenizer2 (CLIP-G)",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::T5Encoder),
+                        "{} (sd3) missing T5Encoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::T5Tokenizer),
+                        "{} (sd3) missing T5Tokenizer",
+                        manifest.name
+                    );
+                }
+                "sdxl" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (sdxl) missing Transformer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder),
+                        "{} (sdxl) missing ClipEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer),
+                        "{} (sdxl) missing ClipTokenizer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipEncoder2),
+                        "{} (sdxl) missing ClipEncoder2",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::ClipTokenizer2),
+                        "{} (sdxl) missing ClipTokenizer2",
+                        manifest.name
+                    );
+                }
+                "z-image" => {
+                    // Z-Image uses Transformer (GGUF) or TransformerShard (BF16)
+                    assert!(
+                        components.contains(&ModelComponent::Transformer)
+                            || components.contains(&ModelComponent::TransformerShard),
+                        "{} (z-image) missing Transformer or TransformerShard",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextEncoder),
+                        "{} (z-image) missing TextEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextTokenizer),
+                        "{} (z-image) missing TextTokenizer",
+                        manifest.name
+                    );
+                    // Z-Image does NOT use CLIP
+                    assert!(
+                        !components.contains(&ModelComponent::ClipEncoder),
+                        "{} (z-image) should not have ClipEncoder",
+                        manifest.name
+                    );
+                }
+                "flux2" => {
+                    // Flux.2 uses Transformer (or TransformerShard for sharded BF16) + Qwen3 TextEncoder + TextTokenizer
+                    assert!(
+                        components.contains(&ModelComponent::Transformer)
+                            || components.contains(&ModelComponent::TransformerShard),
+                        "{} (flux2) missing Transformer or TransformerShard",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextEncoder),
+                        "{} (flux2) missing TextEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextTokenizer),
+                        "{} (flux2) missing TextTokenizer",
+                        manifest.name
+                    );
+                    // Flux.2 Klein does NOT use CLIP or T5
+                    assert!(
+                        !components.contains(&ModelComponent::ClipEncoder),
+                        "{} (flux2) should not have ClipEncoder",
+                        manifest.name
+                    );
+                    assert!(
+                        !components.contains(&ModelComponent::T5Encoder),
+                        "{} (flux2) should not have T5Encoder",
+                        manifest.name
+                    );
+                }
+                "ltx2" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (ltx2) missing Transformer",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::SpatialUpscaler),
+                        "{} (ltx2) missing SpatialUpscaler",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TemporalUpscaler),
+                        "{} (ltx2) missing TemporalUpscaler",
+                        manifest.name
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextEncoder),
+                        "{} (ltx2) missing Gemma text encoder files",
+                        manifest.name
+                    );
+                }
+                "qwen-image21" => {
+                    assert!(
+                        components.contains(&ModelComponent::Transformer)
+                            || components.contains(&ModelComponent::TransformerShard),
+                        "{} ({}) missing Transformer or TransformerShard",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextEncoder),
+                        "{} ({}) missing TextEncoder",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextTokenizer),
+                        "{} ({}) missing TextTokenizer",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::Vae),
+                        "{} ({}) missing Vae",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        !components.contains(&ModelComponent::ClipEncoder),
+                        "{} ({}) should not have ClipEncoder",
+                        manifest.name,
+                        manifest.family
+                    );
+                }
+                "qwen-image" | "qwen-image-edit" => {
+                    // Qwen-Image uses TransformerShard (BF16 sharded)
+                    assert!(
+                        components.contains(&ModelComponent::Transformer)
+                            || components.contains(&ModelComponent::TransformerShard),
+                        "{} ({}) missing Transformer or TransformerShard",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextEncoder),
+                        "{} ({}) missing TextEncoder",
+                        manifest.name,
+                        manifest.family
+                    );
+                    assert!(
+                        components.contains(&ModelComponent::TextTokenizer),
+                        "{} ({}) missing TextTokenizer",
+                        manifest.name,
+                        manifest.family
+                    );
+                    // Qwen-Image does NOT use CLIP
+                    assert!(
+                        !components.contains(&ModelComponent::ClipEncoder),
+                        "{} ({}) should not have ClipEncoder",
+                        manifest.name,
+                        manifest.family
+                    );
+                }
+                "controlnet" => {
+                    // ControlNet only needs the transformer weights (no VAE, CLIP, etc.)
+                    assert!(
+                        components.contains(&ModelComponent::Transformer),
+                        "{} (controlnet) missing Transformer",
+                        manifest.name
+                    );
+                }
+                "upscaler" => {
+                    // Upscaler only needs the upscaler weights file
+                    assert!(
+                        components.contains(&ModelComponent::Upscaler),
+                        "{} (upscaler) missing Upscaler",
+                        manifest.name
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn shared_files_gated_flags() {
+        for file in shared_flux_files() {
+            if file.hf_repo.starts_with("black-forest-labs/") {
+                assert!(
+                    file.gated,
+                    "{} should be gated (BFL repo)",
+                    file.hf_filename
+                );
+            } else {
+                assert!(!file.gated, "{} should not be gated", file.hf_filename);
+            }
+        }
+    }
+
+    // --- T5 variant registry tests ---
+
+    #[test]
+    fn t5_variants_sorted_largest_first() {
+        let variants = known_t5_variants();
+        for w in variants.windows(2) {
+            assert!(
+                w[0].size_bytes >= w[1].size_bytes,
+                "{} ({}) should be >= {} ({})",
+                w[0].tag,
+                w[0].size_bytes,
+                w[1].tag,
+                w[1].size_bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn umt5_variants_are_ordered_gguf_and_stay_above_the_publisher_floor() {
+        let variants = known_umt5_variants();
+        assert!(!variants.is_empty());
+
+        // Largest to smallest: the auto policy walks this order and takes the
+        // first that fits, so a mis-ordered registry silently picks a smaller
+        // encoder than the card could hold.
+        for pair in variants.windows(2) {
+            assert!(
+                pair[0].size_bytes > pair[1].size_bytes,
+                "{} must be larger than {}",
+                pair[0].tag,
+                pair[1].tag
+            );
+        }
+
+        for variant in variants {
+            assert!(variant.hf_filename.ends_with(".gguf"), "{}", variant.tag);
+            // Every variant must actually save something against FP16, or it
+            // is not worth a second artifact.
+            assert!(variant.size_bytes < UMT5_FP16_SIZE, "{}", variant.tag);
+        }
+
+        // city96 publishes below Q5_K_M, but the publisher's own guidance is
+        // "use Q5_K_M or larger" — a drifting text encoder takes the whole
+        // render with it, and the download saving below that is marginal.
+        assert!(
+            variants.iter().all(|v| v.size_bytes >= 4_000_000_000),
+            "no variant may sit below the publisher's Q5_K_M floor"
+        );
+
+        assert_eq!(find_umt5_variant("q8").unwrap().tag, "q8");
+        assert_eq!(find_umt5_variant("q5").unwrap().tag, "q5");
+        assert!(find_umt5_variant("q3").is_none());
+        assert!(find_umt5_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn umt5_fp16_size_matches_the_shared_wan_encoder_file() {
+        // The registry's FP16 constant and the file every wan manifest pulls
+        // must agree: the constant is what admission and the auto policy price
+        // against, and a drift would make both reason about a file that is not
+        // the one on disk.
+        let encoder = shared_wan_files()
+            .into_iter()
+            .find(|file| file.component == ModelComponent::TextEncoder)
+            .expect("wan ships a text encoder");
+        assert_eq!(encoder.size_bytes, UMT5_FP16_SIZE);
+    }
+
+    #[test]
+    fn find_t5_variant_by_tag() {
+        assert_eq!(find_t5_variant("q8").unwrap().tag, "q8");
+        assert_eq!(find_t5_variant("q5").unwrap().tag, "q5");
+        assert_eq!(find_t5_variant("q3").unwrap().tag, "q3");
+        assert!(find_t5_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn t5_variants_all_gguf() {
+        for v in known_t5_variants() {
+            assert!(
+                v.hf_filename.ends_with(".gguf"),
+                "{} should be a GGUF file",
+                v.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn sdxl_manifests_have_scheduler() {
+        for manifest in known_manifests() {
+            if manifest.family == "sdxl" {
+                assert!(
+                    manifest.defaults.scheduler.is_some(),
+                    "{} (sdxl) should have a scheduler",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdxl_turbo_uses_euler_ancestral() {
+        let manifest = find_manifest("sdxl-turbo").unwrap();
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::EulerAncestral));
+        assert_eq!(manifest.defaults.steps, 4);
+        assert_eq!(manifest.defaults.guidance, 0.0);
+    }
+
+    #[test]
+    fn sdxl_base_uses_ddim() {
+        let manifest = find_manifest("sdxl-base").unwrap();
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::Ddim));
+        assert_eq!(manifest.defaults.steps, 25);
+    }
+
+    #[test]
+    fn playground_v25_uses_its_upstream_edm_contract() {
+        let manifest = find_manifest("playground-v2.5").unwrap();
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::EdmDpmPp2m));
+        assert_eq!(manifest.defaults.steps, 50);
+        assert_eq!(manifest.defaults.guidance, 3.0);
+    }
+
+    #[test]
+    fn sdxl_resolve_fp16_default() {
+        assert_eq!(resolve_model_name("sdxl-base"), "sdxl-base:fp16");
+        assert_eq!(
+            resolve_model_name("playground-v2.5"),
+            "playground-v2.5:fp16"
+        );
+    }
+
+    #[test]
+    fn t5_fp16_larger_than_all_quantized() {
+        for v in known_t5_variants() {
+            assert!(
+                T5_FP16_SIZE > v.size_bytes,
+                "FP16 should be larger than {}",
+                v.tag
+            );
+        }
+    }
+
+    // --- SD1.5 tests ---
+
+    #[test]
+    fn sd15_manifest_exists() {
+        assert!(find_manifest("sd15").is_some());
+        assert!(find_manifest("sd15:fp16").is_some());
+    }
+
+    #[test]
+    fn sd15_default_tag_resolves() {
+        assert_eq!(resolve_model_name("sd15"), "sd15:fp16");
+    }
+
+    #[test]
+    fn dreamshaper_v8_resolves() {
+        let manifest = find_manifest("dreamshaper-v8").unwrap();
+        assert_eq!(manifest.name, "dreamshaper-v8:fp16");
+        assert_eq!(manifest.family, "sd15");
+        assert_eq!(manifest.defaults.steps, 25);
+        assert_eq!(manifest.defaults.width, 512);
+    }
+
+    #[test]
+    fn sd15_defaults() {
+        for manifest in known_manifests() {
+            if manifest.family == "sd15" {
+                assert_eq!(manifest.defaults.scheduler, Some(Scheduler::Ddim));
+                assert_eq!(manifest.defaults.width, 512);
+                assert_eq!(manifest.defaults.height, 512);
+            }
+        }
+    }
+
+    #[test]
+    fn realistic_vision_v5_resolves() {
+        let manifest = find_manifest("realistic-vision-v5").unwrap();
+        assert_eq!(manifest.name, "realistic-vision-v5:fp16");
+        assert_eq!(manifest.family, "sd15");
+        assert_eq!(manifest.defaults.steps, 25);
+        assert_eq!(manifest.defaults.width, 512);
+        assert_eq!(manifest.defaults.guidance, 7.5);
+        assert_eq!(manifest.defaults.scheduler, Some(Scheduler::Ddim));
+    }
+
+    #[test]
+    fn shared_sd15_files_not_gated() {
+        for file in shared_sd15_files() {
+            assert!(
+                !file.gated,
+                "SD1.5 shared file {} should not be gated",
+                file.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn sd15_manifests_have_scheduler() {
+        for manifest in known_manifests() {
+            if manifest.family == "sd15" {
+                assert!(
+                    manifest.defaults.scheduler.is_some(),
+                    "{} (sd15) should have a scheduler",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    // --- Z-Image tests ---
+
+    #[test]
+    fn zimage_turbo_resolves_to_q8() {
+        assert_eq!(resolve_model_name("z-image-turbo"), "z-image-turbo:q8");
+    }
+
+    #[test]
+    fn zimage_turbo_bf16_found() {
+        let manifest = find_manifest("z-image-turbo:bf16").unwrap();
+        assert_eq!(manifest.family, "z-image");
+        assert_eq!(manifest.defaults.steps, 9);
+        assert_eq!(manifest.defaults.guidance, 0.0);
+        assert_eq!(manifest.defaults.scheduler, None);
+    }
+
+    // --- Qwen3 variant registry tests ---
+
+    #[test]
+    fn qwen3_variants_sorted_largest_first() {
+        let variants = known_qwen3_variants();
+        for w in variants.windows(2) {
+            assert!(
+                w[0].size_bytes >= w[1].size_bytes,
+                "{} ({}) should be >= {} ({})",
+                w[0].tag,
+                w[0].size_bytes,
+                w[1].tag,
+                w[1].size_bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn find_qwen3_variant_by_tag() {
+        assert_eq!(find_qwen3_variant("q8").unwrap().tag, "q8");
+        assert_eq!(find_qwen3_variant("q6").unwrap().tag, "q6");
+        assert_eq!(find_qwen3_variant("iq4").unwrap().tag, "iq4");
+        assert_eq!(find_qwen3_variant("q3").unwrap().tag, "q3");
+        assert!(find_qwen3_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn find_qwen2_vl_variant_by_tag() {
+        assert_eq!(find_qwen2_vl_variant("q8").unwrap().tag, "q8");
+        assert_eq!(find_qwen2_vl_variant("q6").unwrap().tag, "q6");
+        assert_eq!(find_qwen2_vl_variant("q5").unwrap().tag, "q5");
+        assert_eq!(find_qwen2_vl_variant("q4").unwrap().tag, "q4");
+        assert_eq!(find_qwen2_vl_variant("q3").unwrap().tag, "q3");
+        assert_eq!(find_qwen2_vl_variant("q2").unwrap().tag, "q2");
+        assert!(find_qwen2_vl_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn qwen3_variants_all_gguf() {
+        for v in known_qwen3_variants() {
+            assert!(
+                v.hf_filename.ends_with(".gguf"),
+                "{} should be a GGUF file",
+                v.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3_fp16_larger_than_all_quantized() {
+        for v in known_qwen3_variants() {
+            assert!(
+                QWEN3_FP16_SIZE > v.size_bytes,
+                "FP16 should be larger than {}",
+                v.tag
+            );
+        }
+    }
+
+    // --- Qwen3-8B variant registry tests ---
+
+    #[test]
+    fn qwen3_8b_variants_sorted_largest_first() {
+        let variants = known_qwen3_8b_variants();
+        for w in variants.windows(2) {
+            assert!(
+                w[0].size_bytes >= w[1].size_bytes,
+                "{} ({}) should be >= {} ({})",
+                w[0].tag,
+                w[0].size_bytes,
+                w[1].tag,
+                w[1].size_bytes,
+            );
+        }
+    }
+
+    #[test]
+    fn find_qwen3_8b_variant_by_tag() {
+        assert_eq!(find_qwen3_8b_variant("q8").unwrap().tag, "q8");
+        assert_eq!(find_qwen3_8b_variant("q6").unwrap().tag, "q6");
+        assert_eq!(find_qwen3_8b_variant("iq4").unwrap().tag, "iq4");
+        assert_eq!(find_qwen3_8b_variant("q3").unwrap().tag, "q3");
+        assert!(find_qwen3_8b_variant("nonexistent").is_none());
+    }
+
+    #[test]
+    fn qwen3_vl_8b_variants_are_pinned_official_ggufs() {
+        let variants = known_qwen3_vl_8b_variants();
+        assert_eq!(
+            variants.iter().map(|v| v.tag).collect::<Vec<_>>(),
+            ["q8", "q4"]
+        );
+        for pair in variants.windows(2) {
+            assert!(pair[0].size_bytes > pair[1].size_bytes, "largest first");
+        }
+        for v in variants {
+            assert_eq!(v.hf_repo, "Qwen/Qwen3-VL-8B-Instruct-GGUF");
+            assert!(v.hf_filename.ends_with(".gguf"));
+            let sha = v.sha256.expect("the VL list is pinned");
+            assert_eq!(sha.len(), 64);
+            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(v.size_bytes < QWEN3_8B_FP16_SIZE);
+        }
+        assert_eq!(find_qwen3_vl_8b_variant("q4").unwrap().tag, "q4");
+        assert!(find_qwen3_vl_8b_variant("iq4").is_none());
+        // The historical lists stay unpinned; the VL list shares no file with
+        // Klein-9B's (a different model).
+        assert!(known_qwen3_8b_variants().iter().all(|v| v.sha256.is_none()));
+        assert!(known_qwen3_8b_variants()
+            .iter()
+            .all(|k| variants.iter().all(|v| v.hf_repo != k.hf_repo)));
+    }
+
+    #[test]
+    fn qwen3_8b_variants_all_gguf() {
+        for v in known_qwen3_8b_variants() {
+            assert!(
+                v.hf_filename.ends_with(".gguf"),
+                "{} should be a GGUF file",
+                v.hf_filename
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3_8b_fp16_larger_than_all_quantized() {
+        for v in known_qwen3_8b_variants() {
+            assert!(
+                QWEN3_8B_FP16_SIZE > v.size_bytes,
+                "8B FP16 should be larger than {}",
+                v.tag
+            );
+        }
+    }
+
+    #[test]
+    fn qwen3_8b_larger_than_4b() {
+        // Every 8B variant should be larger than the corresponding 4B variant
+        let variants_4b = known_qwen3_variants();
+        let variants_8b = known_qwen3_8b_variants();
+        for v8 in variants_8b {
+            if let Some(v4) = variants_4b.iter().find(|v| v.tag == v8.tag) {
+                assert!(
+                    v8.size_bytes > v4.size_bytes,
+                    "8B {} ({}) should be larger than 4B {} ({})",
+                    v8.tag,
+                    v8.size_bytes,
+                    v4.tag,
+                    v4.size_bytes,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zimage_defaults() {
+        for manifest in known_manifests() {
+            if manifest.family == "z-image" {
+                assert_eq!(manifest.defaults.steps, 9);
+                assert_eq!(manifest.defaults.guidance, 0.0);
+                assert_eq!(manifest.defaults.scheduler, None);
+            }
+        }
+    }
+
+    #[test]
+    fn total_download_size_equals_sum_of_file_sizes() {
+        for manifest in known_manifests() {
+            let total = total_download_size(manifest);
+            let sum: u64 = manifest.files.iter().map(|f| f.size_bytes).sum();
+            assert_eq!(
+                total, sum,
+                "total_download_size mismatch for {}",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn compute_download_remaining_lte_total() {
+        // remaining_bytes must always be <= total_bytes
+        for manifest in known_manifests() {
+            let (total, remaining) = compute_download_size(manifest);
+            assert!(
+                remaining <= total,
+                "remaining ({remaining}) > total ({total}) for {}",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn total_file_bytes_is_positive_for_all_manifests() {
+        // Every manifest must have files that sum to a positive total
+        for manifest in known_manifests() {
+            let total = total_download_size(manifest);
+            assert!(total > 0, "total_download_size is 0 for {}", manifest.name);
+        }
+    }
+
+    #[test]
+    fn total_size_gb_matches_total_size_bytes() {
+        for manifest in known_manifests() {
+            let from_bytes = manifest.total_size_bytes() as f32 / 1_073_741_824.0;
+            let from_method = manifest.total_size_gb();
+            assert!(
+                (from_bytes - from_method).abs() < 0.001,
+                "total_size_gb mismatch for {}: {} vs {}",
+                manifest.name,
+                from_bytes,
+                from_method
+            );
+        }
+    }
+
+    #[test]
+    fn model_size_gb_matches_model_size_bytes() {
+        for manifest in known_manifests() {
+            let from_bytes = manifest.model_size_bytes() as f32 / 1_073_741_824.0;
+            let from_method = manifest.model_size_gb();
+            assert!(
+                (from_bytes - from_method).abs() < 0.001,
+                "model_size_gb mismatch for {}: {} vs {}",
+                manifest.name,
+                from_bytes,
+                from_method
+            );
+        }
+    }
+
+    #[test]
+    fn total_size_includes_shared_components() {
+        // Models with shared files must have total >= model-specific size.
+        for manifest in known_manifests() {
+            if manifest.is_auxiliary() || manifest.is_upscaler() {
+                continue; // ControlNet and upscalers are single-file models
+            }
+            let model_specific_bytes: u64 = manifest
+                .files
+                .iter()
+                .filter(|f| is_model_specific_component(f.component))
+                .map(|f| f.size_bytes)
+                .sum();
+            let total = manifest.total_size_bytes();
+            assert!(
+                total >= model_specific_bytes,
+                "{}: total ({}) should be >= model-specific ({})",
+                manifest.name,
+                total,
+                model_specific_bytes
+            );
+            assert_eq!(
+                manifest.model_size_bytes(),
+                model_specific_bytes,
+                "{}: model size should match model-specific files",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_manifest_has_size_gb_field() {
+        // Ensures we don't accidentally re-add a static size_gb field.
+        // If this test exists and compiles, the field doesn't exist on ModelManifest.
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        let _: f32 = manifest.total_size_gb(); // computed, not stored
+    }
+
+    #[test]
+    fn flux_schnell_total_exceeds_transformer() {
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        // Transformer is ~12GB, shared components add ~9.8GB
+        let total_gb = manifest.total_size_gb();
+        assert!(
+            total_gb > 20.0,
+            "flux-schnell:q8 total should be >20GB (was {})",
+            total_gb
+        );
+    }
+
+    #[test]
+    fn flux_schnell_model_size_is_transformer_only() {
+        let manifest = find_manifest("flux-schnell:q8").unwrap();
+        let model_gb = manifest.model_size_gb();
+        assert!(
+            model_gb > 11.0 && model_gb < 13.0,
+            "flux-schnell:q8 model size should be transformer-only (~11.8GiB), was {}",
+            model_gb
+        );
+        assert!(manifest.total_size_gb() > model_gb);
+    }
+
+    #[test]
+    fn zimage_q8_size_includes_shared() {
+        let manifest = find_manifest("z-image-turbo:q8").unwrap();
+        let total = manifest.total_size_gb();
+        // Transformer (~6.58GB) + shared (~8.2GB) = ~13.8 GiB
+        assert!(total > 13.0);
+    }
+
+    #[test]
+    fn controlnet_model_size_matches_total_size() {
+        let manifest = find_manifest("controlnet-canny-sd15:fp16").unwrap();
+        assert_eq!(manifest.model_size_bytes(), manifest.total_size_bytes());
+    }
+
+    #[test]
+    fn wuerstchen_no_storage_path_collisions() {
+        let manifest = find_manifest("wuerstchen-v2:fp16").unwrap();
+        let paths: Vec<_> = manifest
+            .files
+            .iter()
+            .map(|f| storage_path(manifest, f))
+            .collect();
+        // No two files should resolve to the same local path
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            paths.len(),
+            unique.len(),
+            "storage path collision in wuerstchen manifest: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn find_smaller_alternatives_for_bf16_model() {
+        let alts = super::find_smaller_alternatives("ultrareal-v2:bf16");
+        // Should find ultrareal-v3 and v4 quantized variants (all smaller than 23.8GB)
+        assert!(
+            !alts.is_empty(),
+            "bf16 model should have smaller alternatives"
+        );
+        for alt in &alts {
+            assert!(
+                alt.contains("ultrareal"),
+                "alternative should be in same family: {alt}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_smaller_alternatives_for_smallest_model_is_empty() {
+        // flux-schnell:q4 is already the smallest flux-schnell variant
+        let alts = super::find_smaller_alternatives("flux-schnell:q4");
+        // Should have no smaller alternatives (q4 is the smallest)
+        assert!(
+            alts.is_empty() || alts.iter().all(|a| a != "flux-schnell:q4"),
+            "should not suggest the same model"
+        );
+    }
+
+    #[test]
+    fn looks_like_model_name_family_match() {
+        let config = crate::Config::default();
+        // ultrareal-v8 shares "ultrareal" family with ultrareal-v2/v3/v4
+        assert!(super::looks_like_model_name("ultrareal-v8", &config));
+        // dreamshaper-v9 shares "dreamshaper" family with dreamshaper-v8
+        assert!(super::looks_like_model_name("dreamshaper-v9", &config));
+    }
+
+    #[test]
+    fn looks_like_model_name_colon_syntax() {
+        let config = crate::Config::default();
+        // Explicit colon tag is always model-like, even if totally unknown
+        assert!(super::looks_like_model_name("foo:q8", &config));
+        assert!(super::looks_like_model_name("flux-dev:q99", &config));
+    }
+
+    #[test]
+    fn looks_like_model_name_fuzzy_match() {
+        let config = crate::Config::default();
+        // Close misspelling of "flux-dev"
+        assert!(super::looks_like_model_name("flx-dev", &config));
+    }
+
+    #[test]
+    fn looks_like_model_name_rejects_natural_language() {
+        let config = crate::Config::default();
+        for word in &[
+            "a",
+            "sunset",
+            "photorealistic",
+            "cat",
+            "beautiful",
+            "oil painting",
+        ] {
+            assert!(
+                !super::looks_like_model_name(word, &config),
+                "'{word}' should not look like a model name"
+            );
+        }
+    }
+
+    #[test]
+    fn suggest_similar_models_for_near_miss() {
+        let config = crate::Config::default();
+        let suggestions = super::suggest_similar_models("ultrareal-v8", &config, 5);
+        assert!(!suggestions.is_empty(), "should have suggestions");
+        // Should include at least one ultrareal variant
+        assert!(
+            suggestions.iter().any(|s| s.starts_with("ultrareal-")),
+            "should suggest ultrareal variants, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_similar_models_empty_for_unrelated() {
+        let config = crate::Config::default();
+        let suggestions = super::suggest_similar_models("zzzzzzzzz", &config, 5);
+        assert!(
+            suggestions.is_empty(),
+            "unrelated string should have no suggestions"
+        );
+    }
+
+    #[test]
+    fn all_generation_model_names_excludes_upscalers() {
+        let config = crate::Config::default();
+        let gen_names = super::all_generation_model_names(&config);
+        for name in &gen_names {
+            if let Some(manifest) = find_manifest(name) {
+                assert!(
+                    !manifest.is_upscaler(),
+                    "all_generation_model_names should not contain upscaler '{name}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_generation_model_names_excludes_utility_models() {
+        let config = crate::Config::default();
+        let gen_names = super::all_generation_model_names(&config);
+        for name in &gen_names {
+            if let Some(manifest) = find_manifest(name) {
+                assert!(
+                    !manifest.is_utility(),
+                    "all_generation_model_names should not contain utility model '{name}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_generation_model_names_contains_diffusion_models() {
+        let config = crate::Config::default();
+        let gen_names = super::all_generation_model_names(&config);
+        // Should contain at least some well-known diffusion models.
+        assert!(
+            gen_names.iter().any(|n| n.starts_with("flux-schnell")),
+            "generation names should include flux-schnell variants"
+        );
+        assert!(
+            gen_names.iter().any(|n| n.starts_with("flux-dev")),
+            "generation names should include flux-dev variants"
+        );
+    }
+
+    #[test]
+    fn all_generation_model_names_excludes_controlnet() {
+        let config = crate::Config::default();
+        let gen_names = super::all_generation_model_names(&config);
+        for name in &gen_names {
+            if let Some(manifest) = find_manifest(name) {
+                assert!(
+                    !manifest.is_auxiliary(),
+                    "all_generation_model_names should not contain auxiliary model '{name}'"
+                );
+            }
+        }
+        // Verify controlnet models exist in the full list but not generation list.
+        let all_names = super::all_model_names(&config);
+        assert!(
+            all_names.iter().any(|n| n.starts_with("controlnet-")),
+            "all_model_names should include controlnet models"
+        );
+        assert!(
+            !gen_names.iter().any(|n| n.starts_with("controlnet-")),
+            "all_generation_model_names should not include controlnet models"
+        );
+    }
+
+    #[test]
+    fn all_model_names_includes_upscalers() {
+        let config = crate::Config::default();
+        let all_names = super::all_model_names(&config);
+        assert!(
+            all_names.iter().any(|n| n.starts_with("real-esrgan")),
+            "all_model_names should still include upscaler models"
+        );
+    }
+
+    #[test]
+    fn suggest_similar_models_excludes_upscalers() {
+        let config = crate::Config::default();
+        // Suggestions for any input should never include upscaler models.
+        let suggestions = super::suggest_similar_models("flux-schnell", &config, 50);
+        for s in &suggestions {
+            if let Some(m) = find_manifest(s) {
+                assert!(
+                    !m.is_upscaler(),
+                    "suggest_similar_models should not suggest upscaler '{s}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen3_expand_manifest_has_transformer_and_tokenizer() {
+        let manifest = find_manifest("qwen3-expand:q8").unwrap();
+        let components: Vec<_> = manifest.files.iter().map(|f| f.component).collect();
+        assert!(components.contains(&ModelComponent::Transformer));
+        assert!(components.contains(&ModelComponent::TextTokenizer));
+        assert!(!components.contains(&ModelComponent::Vae));
+    }
+
+    #[test]
+    fn qwen3_expand_manifest_ungated() {
+        let manifest = find_manifest("qwen3-expand:q8").unwrap();
+        assert!(!manifest.is_gated());
+        let small = find_manifest("qwen3-expand-small:q8").unwrap();
+        assert!(!small.is_gated());
+    }
+
+    #[test]
+    fn qwen3_expand_family() {
+        let manifest = find_manifest("qwen3-expand:q8").unwrap();
+        assert_eq!(manifest.family, "qwen3-expand");
+    }
+
+    #[test]
+    fn qwen3_expand_resolve_bare_name() {
+        // "qwen3-expand" should resolve to "qwen3-expand:q8"
+        let resolved = resolve_model_name("qwen3-expand");
+        assert_eq!(resolved, "qwen3-expand:q8");
+    }
+
+    #[test]
+    fn qwen3_expand_storage_paths() {
+        let manifest = find_manifest("qwen3-expand:q8").unwrap();
+        let transformer = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::Transformer)
+            .unwrap();
+        let path = storage_path(manifest, transformer);
+        // Transformer is model-specific: qwen3-expand-q8/<filename>
+        assert!(
+            path.starts_with("qwen3-expand-q8"),
+            "got: {}",
+            path.display()
+        );
+
+        let tokenizer = manifest
+            .files
+            .iter()
+            .find(|f| f.component == ModelComponent::TextTokenizer)
+            .unwrap();
+        let tok_path = storage_path(manifest, tokenizer);
+        // Tokenizer is shared: shared/qwen3-expand/<filename>
+        assert!(
+            tok_path.starts_with("shared/qwen3-expand"),
+            "got: {}",
+            tok_path.display()
+        );
+    }
+
+    // --- is_utility family-based identification ---
+
+    #[test]
+    fn qwen3_expand_is_utility() {
+        let manifest = find_manifest("qwen3-expand:q8").unwrap();
+        assert!(manifest.is_utility(), "qwen3-expand should be utility");
+    }
+
+    #[test]
+    fn qwen3_expand_small_is_utility() {
+        let manifest = find_manifest("qwen3-expand-small:q8").unwrap();
+        assert!(
+            manifest.is_utility(),
+            "qwen3-expand-small should be utility"
+        );
+    }
+
+    #[test]
+    fn controlnet_is_not_utility() {
+        let manifest = find_manifest("controlnet-canny-sd15:fp16").unwrap();
+        assert!(!manifest.is_utility(), "controlnet should NOT be utility");
+    }
+
+    #[test]
+    fn controlnet_depth_is_not_utility() {
+        let manifest = find_manifest("controlnet-depth-sd15:fp16").unwrap();
+        assert!(
+            !manifest.is_utility(),
+            "controlnet-depth should NOT be utility"
+        );
+    }
+
+    #[test]
+    fn controlnet_openpose_is_not_utility() {
+        let manifest = find_manifest("controlnet-openpose-sd15:fp16").unwrap();
+        assert!(
+            !manifest.is_utility(),
+            "controlnet-openpose should NOT be utility"
+        );
+    }
+
+    #[test]
+    fn flux_models_are_not_utility() {
+        for manifest in known_manifests() {
+            if manifest.family == "flux" {
+                assert!(
+                    !manifest.is_utility(),
+                    "{} should NOT be utility",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sd15_models_are_not_utility() {
+        for manifest in known_manifests() {
+            if manifest.family == "sd15" {
+                assert!(
+                    !manifest.is_utility(),
+                    "{} should NOT be utility",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_diffusion_model_is_utility() {
+        let diffusion_families = [
+            "flux",
+            "sd15",
+            "sdxl",
+            "sd3",
+            "z-image",
+            "flux2",
+            "qwen-image",
+            "qwen-image-edit",
+            "wuerstchen",
+            "ltx-video",
+        ];
+        for manifest in known_manifests() {
+            if diffusion_families.contains(&manifest.family.as_str()) {
+                assert!(
+                    !manifest.is_utility(),
+                    "{} (family={}) should NOT be utility",
+                    manifest.name,
+                    manifest.family
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utility_families_constant_matches_expand_manifests() {
+        for manifest in known_manifests() {
+            if manifest.family == "qwen3-expand" {
+                assert!(
+                    UTILITY_FAMILIES.contains(&manifest.family.as_str()),
+                    "{} family not in UTILITY_FAMILIES",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_utility_models_identified_by_is_utility() {
+        let utility_count = known_manifests().iter().filter(|m| m.is_utility()).count();
+        // Currently 22: 2 qwen3-expand variants + 20 catalog companions
+        // (clip-l, clip-g, sdxl-vae, sd-vae-ft-mse, t5-v1_1-xxl, flux-vae,
+        // ltx-video-vae, ltx2-vae, ltx2.3-vae, ltx2.3-text-projection, flux2-te, flux2-te-9b,
+        // flux2-vae, z-image-te, ltx2-te, wan-umt5, wan21-vae, wan22-vae,
+        // qwen-image-runtime, wuerstchen-runtime).
+        assert_eq!(
+            utility_count, 22,
+            "expected exactly 22 utility models, got {utility_count}"
+        );
+    }
+
+    // --- is_upscaler family-based identification ---
+
+    #[test]
+    fn upscaler_models_are_upscaler() {
+        for manifest in known_manifests() {
+            if manifest.family == "upscaler" {
+                assert!(
+                    manifest.is_upscaler(),
+                    "{} should be upscaler",
+                    manifest.name
+                );
+                assert!(
+                    !manifest.is_utility(),
+                    "{} should NOT be utility",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    // --- Companion manifests (single-file Civitai checkpoint dependencies) ---
+
+    /// All canonical companion names from `mold_catalog::companions::COMPANIONS`
+    /// that the `POST /api/catalog/:id/download` companion auto-pull resolves.
+    const COMPANION_NAMES: &[&str] = &[
+        "clip-l",
+        "clip-g",
+        "sdxl-vae",
+        "sd-vae-ft-mse",
+        "t5-v1_1-xxl",
+        "flux-vae",
+        "flux2-te",
+        "flux2-te-9b",
+        "flux2-vae",
+        "z-image-te",
+        "ltx-video-vae",
+        "ltx2-vae",
+        "ltx2.3-vae",
+        "ltx2.3-text-projection",
+        "ltx2-te",
+        "wan-umt5",
+        "wan21-vae",
+        "wan22-vae",
+    ];
+
+    #[test]
+    fn companion_canonical_names_all_resolve() {
+        for name in COMPANION_NAMES {
+            let manifest = find_manifest(name).unwrap_or_else(|| {
+                panic!("companion {name} must resolve via find_manifest");
+            });
+            assert_eq!(manifest.name, *name, "{name} canonical-name mismatch");
+            assert_eq!(
+                manifest.family, "companion",
+                "{name} should land in the companion family"
+            );
+            assert!(
+                manifest.hidden,
+                "{name} must be hidden — companions never appear in `mold list`"
+            );
+            assert!(
+                !manifest.files.is_empty(),
+                "{name} must declare at least one file to pull"
+            );
+        }
+    }
+
+    #[test]
+    fn companion_manifests_are_utility() {
+        for name in COMPANION_NAMES {
+            let manifest = find_manifest(name).expect("companion resolves");
+            assert!(
+                manifest.is_utility(),
+                "{name} must be utility — companions don't get config entries or default-model status",
+            );
+            assert!(
+                !manifest.is_generation_model(),
+                "{name} must not be a generation model",
+            );
+        }
+    }
+
+    #[test]
+    fn companion_clip_l_points_at_openai_repo() {
+        // Mirrors mold_catalog::companions::COMPANIONS["clip-l"].repo —
+        // the synthetic manifest must keep tracking the canonical source.
+        let manifest = find_manifest("clip-l").expect("clip-l resolves");
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|f| f.hf_repo == "openai/clip-vit-large-patch14"),
+            "clip-l must source from openai/clip-vit-large-patch14",
+        );
+    }
+
+    #[test]
+    fn upscaler_manifests_have_upscaler_component() {
+        for manifest in known_manifests() {
+            if manifest.is_upscaler() {
+                assert!(
+                    manifest
+                        .files
+                        .iter()
+                        .any(|f| f.component == ModelComponent::Upscaler),
+                    "{} missing Upscaler component",
+                    manifest.name
+                );
+                // Upscalers should have exactly one file
+                assert_eq!(
+                    manifest.files.len(),
+                    1,
+                    "{} should have exactly 1 file",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn all_upscaler_models_identified_by_is_upscaler() {
+        let count = known_manifests().iter().filter(|m| m.is_upscaler()).count();
+        assert_eq!(count, 7, "expected 7 upscaler models, got {count}");
+    }
+
+    #[test]
+    fn upscaler_storage_path_is_model_specific() {
+        let manifest = find_manifest("real-esrgan-x4plus:fp16").unwrap();
+        let file = &manifest.files[0];
+        let path = storage_path(manifest, file);
+        // Upscaler component is model-specific, stored under model name dir
+        assert!(
+            path.starts_with("real-esrgan-x4plus-fp16"),
+            "upscaler should be under model-specific dir, got: {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn diffusion_models_are_not_upscaler() {
+        for manifest in known_manifests() {
+            if [
+                "flux",
+                "sd15",
+                "sdxl",
+                "sd3",
+                "z-image",
+                "flux2",
+                "qwen-image",
+                "qwen-image-edit",
+                "wuerstchen",
+            ]
+            .contains(&manifest.family.as_str())
+            {
+                assert!(
+                    !manifest.is_upscaler(),
+                    "{} should NOT be upscaler",
+                    manifest.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_models_are_alpha() {
+        for manifest in known_manifests() {
+            let desc = &manifest.description;
+            assert!(
+                !desc.contains("(alpha)") && !desc.contains("[alpha]"),
+                "model '{}' is still marked alpha: {desc}",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn no_diffusion_model_descriptions_have_stale_alpha_prefix() {
+        // Ensure no model uses the old [alpha] prefix format (should use (alpha) suffix)
+        for manifest in known_manifests() {
+            assert!(
+                !manifest.description.starts_with("[alpha]"),
+                "model '{}' uses stale [alpha] prefix format: {}",
+                manifest.name,
+                manifest.description
+            );
+        }
+    }
+
+    // ── Pipeline structural tests ────────────────────────────────────────
+    // These tests read pipeline source files to verify consistent VRAM
+    // management patterns across all model families.
+
+    /// Pipelines that use eager mode must wrap their transformer/UNet in Option
+    /// so it can be dropped before VAE decode to free VRAM.
+    #[test]
+    fn all_pipelines_wrap_transformer_in_option() {
+        let pipeline_fields = [
+            (
+                "flux",
+                "crates/mold-inference/src/flux/pipeline.rs",
+                "Option<FluxTransformer>",
+            ),
+            (
+                "flux2",
+                "crates/mold-inference/src/flux2/pipeline.rs",
+                "Option<Flux2TransformerWrapper>",
+            ),
+            (
+                "sd15",
+                "crates/mold-inference/src/sd15/pipeline.rs",
+                "Option<stable_diffusion::unet_2d::UNet2DConditionModel>",
+            ),
+            (
+                "sdxl",
+                "crates/mold-inference/src/sdxl/pipeline.rs",
+                "Option<stable_diffusion::unet_2d::UNet2DConditionModel>",
+            ),
+            (
+                "sd3",
+                "crates/mold-inference/src/sd3/pipeline.rs",
+                "Option<SD3Transformer>",
+            ),
+            (
+                "zimage",
+                "crates/mold-inference/src/zimage/pipeline.rs",
+                "Option<ZImageTransformer>",
+            ),
+            (
+                "qwen_image",
+                "crates/mold-inference/src/qwen_image/pipeline.rs",
+                "Option<QwenImageTransformer>",
+            ),
+            (
+                "wuerstchen (prior)",
+                "crates/mold-inference/src/wuerstchen/pipeline.rs",
+                "Option<WPrior>",
+            ),
+            (
+                "wuerstchen (decoder)",
+                "crates/mold-inference/src/wuerstchen/pipeline.rs",
+                "Option<WDiffNeXt>",
+            ),
+        ];
+
+        let workspace = env!("CARGO_MANIFEST_DIR")
+            .strip_suffix("/crates/mold-core")
+            .or_else(|| env!("CARGO_MANIFEST_DIR").strip_suffix("crates/mold-core"))
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+
+        for (family, path, expected_type) in pipeline_fields {
+            let full_path = format!("{workspace}/{path}");
+            let source = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+            assert!(
+                source.contains(expected_type),
+                "{family} pipeline ({path}) must wrap transformer/UNet in {expected_type} \
+                 for VRAM management — field should be Option-wrapped so it can be dropped \
+                 before VAE decode"
+            );
+        }
+    }
+
+    /// All pipelines must call device.synchronize() before VAE/VQ-GAN decode
+    /// in their eager generate path to ensure CUDA releases freed memory.
+    #[test]
+    fn all_pipelines_synchronize_before_decode() {
+        let pipelines = [
+            ("flux", "crates/mold-inference/src/flux/pipeline.rs"),
+            ("flux2", "crates/mold-inference/src/flux2/pipeline.rs"),
+            ("sd15", "crates/mold-inference/src/sd15/pipeline.rs"),
+            ("sdxl", "crates/mold-inference/src/sdxl/pipeline.rs"),
+            ("sd3", "crates/mold-inference/src/sd3/pipeline.rs"),
+            ("zimage", "crates/mold-inference/src/zimage/pipeline.rs"),
+            (
+                "qwen_image",
+                "crates/mold-inference/src/qwen_image/pipeline.rs",
+            ),
+            (
+                "wuerstchen",
+                "crates/mold-inference/src/wuerstchen/pipeline.rs",
+            ),
+        ];
+
+        let workspace = env!("CARGO_MANIFEST_DIR")
+            .strip_suffix("/crates/mold-core")
+            .or_else(|| env!("CARGO_MANIFEST_DIR").strip_suffix("crates/mold-core"))
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+
+        for (family, path) in pipelines {
+            let full_path = format!("{workspace}/{path}");
+            let source = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+            assert!(
+                source.contains("synchronize()"),
+                "{family} pipeline ({path}) must call device.synchronize() before decode \
+                 to ensure CUDA releases freed transformer/UNet VRAM"
+            );
+        }
+    }
+
+    /// All pipelines with sequential mode must check the prompt cache BEFORE
+    /// loading the text encoder, to avoid wasting seconds reloading the encoder
+    /// on batch iterations when the prompt is identical.
+    #[test]
+    fn sequential_pipelines_check_cache_before_encoder_load() {
+        // Each entry: (family, path, cache_check_pattern, encoder_load_patterns)
+        // The cache check must appear BEFORE the encoder load in generate_sequential().
+        let pipelines = [
+            (
+                "flux2",
+                "crates/mold-inference/src/flux2/pipeline.rs",
+                // Flux.2 asks for the render's prompts as a SET (a true-CFG
+                // base render encodes two), so its cache check is the helper
+                // that answers only when every one of them is already cached.
+                "restore_cached_prompts(",
+                &["Qwen3Encoder::load_"][..],
+            ),
+            (
+                "flux",
+                "crates/mold-inference/src/flux/pipeline.rs",
+                "restore_prompt_cache(",
+                &["T5Encoder::load"][..],
+            ),
+            (
+                "sd15",
+                "crates/mold-inference/src/sd15/pipeline.rs",
+                "restore_cached_tensor(",
+                &["build_clip_transformer("][..],
+            ),
+            (
+                "sdxl",
+                "crates/mold-inference/src/sdxl/pipeline.rs",
+                "restore_cached_tensor(",
+                &["build_clip_transformer("][..],
+            ),
+            (
+                "sd3",
+                "crates/mold-inference/src/sd3/pipeline.rs",
+                "restore_cached_tensor_pair(",
+                &[
+                    "SD3TripleEncoder::load(",
+                    "SD3TripleEncoder::load_with_tokenizers(",
+                ][..],
+            ),
+            (
+                "zimage",
+                "crates/mold-inference/src/zimage/pipeline.rs",
+                "restore_cached_tensor(",
+                &["Qwen3Encoder::load_"][..],
+            ),
+            (
+                "qwen_image",
+                "crates/mold-inference/src/qwen_image/pipeline.rs",
+                "get_cloned(&prompt_key)",
+                &["load_text_encoder("][..],
+            ),
+            (
+                "wuerstchen",
+                "crates/mold-inference/src/wuerstchen/pipeline.rs",
+                "restore_cached_tensor_pair(",
+                &["build_clip_transformer("][..],
+            ),
+        ];
+
+        let workspace = env!("CARGO_MANIFEST_DIR")
+            .strip_suffix("/crates/mold-core")
+            .or_else(|| env!("CARGO_MANIFEST_DIR").strip_suffix("crates/mold-core"))
+            .unwrap_or(env!("CARGO_MANIFEST_DIR"));
+
+        for (family, path, cache_pattern, load_patterns) in pipelines {
+            let full_path = format!("{workspace}/{path}");
+            let source = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+
+            // Find generate_sequential function body
+            let seq_start = source.find("fn generate_sequential(").unwrap_or_else(|| {
+                panic!("{family} pipeline ({path}) missing generate_sequential()")
+            });
+            let seq_body = &source[seq_start..];
+
+            let cache_pos = seq_body.find(cache_pattern).unwrap_or_else(|| {
+                panic!(
+                    "{family} pipeline ({path}) generate_sequential() missing cache check '{cache_pattern}'"
+                )
+            });
+            let (load_pattern, load_pos) = load_patterns
+                .iter()
+                .filter_map(|pattern| seq_body.find(pattern).map(|pos| (*pattern, pos)))
+                .min_by_key(|(_, pos)| *pos)
+                .unwrap_or_else(|| {
+                    let expected = load_patterns.join("' or '");
+                    panic!(
+                        "{family} pipeline ({path}) generate_sequential() missing encoder load '{expected}'"
+                    )
+                });
+
+            assert!(
+                cache_pos < load_pos,
+                "{family} pipeline ({path}): prompt cache check ('{cache_pattern}' at offset {cache_pos}) \
+                 must appear BEFORE encoder load ('{load_pattern}' at offset {load_pos}) \
+                 in generate_sequential() — encoder should not be loaded when cache hits"
+            );
+        }
+    }
+
+    // --- paths_from_downloads: upscaler and utility family support (issue #184) ---
+
+    #[test]
+    fn paths_from_downloads_upscaler_returns_some() {
+        let downloads = vec![(
+            ModelComponent::Upscaler,
+            PathBuf::from("/models/upscaler/weights.safetensors"),
+        )];
+        let paths = paths_from_downloads(&downloads, "upscaler");
+        assert!(
+            paths.is_some(),
+            "upscaler downloads should produce ModelPaths"
+        );
+        let paths = paths.unwrap();
+        assert_eq!(
+            paths.transformer,
+            PathBuf::from("/models/upscaler/weights.safetensors"),
+            "upscaler weights should map to transformer field"
+        );
+        assert_eq!(paths.vae, PathBuf::new(), "upscaler should have empty vae");
+    }
+
+    #[test]
+    fn paths_from_downloads_upscaler_missing_component_returns_none() {
+        // No Upscaler component → should return None
+        let downloads: Vec<(ModelComponent, PathBuf)> = vec![];
+        assert!(
+            paths_from_downloads(&downloads, "upscaler").is_none(),
+            "empty downloads for upscaler should return None"
+        );
+    }
+
+    #[test]
+    fn paths_from_downloads_utility_returns_some_without_vae() {
+        let downloads = vec![
+            (
+                ModelComponent::Transformer,
+                PathBuf::from("/models/qwen3/model.gguf"),
+            ),
+            (
+                ModelComponent::TextTokenizer,
+                PathBuf::from("/models/qwen3/tokenizer.json"),
+            ),
+        ];
+        let paths = paths_from_downloads(&downloads, "qwen3-expand");
+        assert!(
+            paths.is_some(),
+            "utility downloads without VAE should produce ModelPaths"
+        );
+        let paths = paths.unwrap();
+        assert_eq!(paths.transformer, PathBuf::from("/models/qwen3/model.gguf"));
+        assert_eq!(paths.vae, PathBuf::new(), "utility should have empty vae");
+        assert_eq!(
+            paths.text_tokenizer,
+            Some(PathBuf::from("/models/qwen3/tokenizer.json"))
+        );
+    }
+
+    #[test]
+    fn paths_from_downloads_utility_missing_transformer_returns_none() {
+        // Utility model with only a tokenizer (no transformer) → should return None
+        let downloads = vec![(
+            ModelComponent::TextTokenizer,
+            PathBuf::from("/models/qwen3/tokenizer.json"),
+        )];
+        assert!(
+            paths_from_downloads(&downloads, "qwen3-expand").is_none(),
+            "utility without transformer should return None"
+        );
+    }
+
+    #[test]
+    fn paths_from_downloads_diffusion_still_requires_vae() {
+        // Diffusion model without VAE → should return None (unchanged behavior)
+        let downloads = vec![(
+            ModelComponent::Transformer,
+            PathBuf::from("/models/flux/transformer.safetensors"),
+        )];
+        assert!(
+            paths_from_downloads(&downloads, "flux").is_none(),
+            "diffusion model without VAE should return None"
+        );
+    }
+
+    #[test]
+    fn paths_from_downloads_diffusion_with_all_components() {
+        let downloads = vec![
+            (
+                ModelComponent::Transformer,
+                PathBuf::from("/models/flux/transformer.safetensors"),
+            ),
+            (
+                ModelComponent::Vae,
+                PathBuf::from("/models/flux/vae.safetensors"),
+            ),
+        ];
+        let paths = paths_from_downloads(&downloads, "flux");
+        assert!(
+            paths.is_some(),
+            "diffusion model with transformer+vae should work"
+        );
+        let paths = paths.unwrap();
+        assert_eq!(
+            paths.transformer,
+            PathBuf::from("/models/flux/transformer.safetensors")
+        );
+        assert_eq!(paths.vae, PathBuf::from("/models/flux/vae.safetensors"));
+    }
+
+    #[test]
+    fn all_upscaler_manifests_produce_paths() {
+        // Regression: every upscaler manifest should produce valid ModelPaths
+        for manifest in known_manifests() {
+            if !manifest.is_upscaler() {
+                continue;
+            }
+            let downloads: Vec<(ModelComponent, PathBuf)> = manifest
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        f.component,
+                        PathBuf::from(format!("/fake/{}", f.hf_filename)),
+                    )
+                })
+                .collect();
+            let paths = paths_from_downloads(&downloads, &manifest.family);
+            assert!(
+                paths.is_some(),
+                "upscaler manifest '{}' should produce ModelPaths from its downloads",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn all_utility_manifests_produce_paths() {
+        // Regression: every utility manifest should produce valid ModelPaths
+        for manifest in known_manifests() {
+            if !manifest.is_utility() {
+                continue;
+            }
+            let downloads: Vec<(ModelComponent, PathBuf)> = manifest
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        f.component,
+                        PathBuf::from(format!("/fake/{}", f.hf_filename)),
+                    )
+                })
+                .collect();
+            let paths = paths_from_downloads(&downloads, &manifest.family);
+            assert!(
+                paths.is_some(),
+                "utility manifest '{}' should produce ModelPaths from its downloads",
+                manifest.name
+            );
+        }
+    }
+
+    #[test]
+    fn find_manifest_by_hf_repo_matches_transformer_repo() {
+        // FLUX.1-dev is a well-known canonical entry — its transformer
+        // ships from black-forest-labs/FLUX.1-dev (BF16 path) and from
+        // city96/FLUX.1-dev-gguf (GGUF quantizations). Either repo string
+        // must surface a matching manifest.
+        assert!(find_manifest_by_hf_repo("black-forest-labs/FLUX.1-dev").is_some());
+        assert!(find_manifest_by_hf_repo("city96/FLUX.1-dev-gguf").is_some());
+    }
+
+    #[test]
+    fn find_manifest_by_hf_repo_returns_none_for_unknown_repo() {
+        assert!(find_manifest_by_hf_repo("some-random-org/never-shipped").is_none());
+    }
+
+    #[test]
+    fn find_manifest_by_hf_repo_ignores_non_transformer_repos() {
+        // lmz/mt5-tokenizers ships only T5Tokenizer files across every
+        // manifest that references it — never as a Transformer or
+        // TransformerShard. The lookup must not surface those manifests
+        // when keyed on the tokenizer repo, otherwise an HF catalog row
+        // pointing at a tokenizer would mis-route to whatever model
+        // happens to bundle that tokenizer.
+        //
+        // (Note: openai/clip-vit-large-patch14 is NOT a safe choice for
+        // this assertion — the `clip-l` companion manifest declares its
+        // CLIP weights as `ModelComponent::Transformer`, so the lookup
+        // legitimately resolves CLIP-L there.)
+        assert!(find_manifest_by_hf_repo("lmz/mt5-tokenizers").is_none());
+    }
+}

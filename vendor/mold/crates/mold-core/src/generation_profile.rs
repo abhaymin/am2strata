@@ -1,0 +1,6192 @@
+//! Canonical, versioned generation-control profiles.
+//!
+//! A profile is the one model/recipe authority consumed by admission, Rust
+//! clients, and `/api/models`. Browser clients receive the same fully-resolved
+//! recipes and never reconstruct family policy. The legacy flattened model
+//! defaults remain a derived compatibility view for one release.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+use crate::{
+    validation, GenerationImageReferenceRole, GuidanceCapabilities, Ltx2PipelineMode,
+    MeshMattingMode, MeshReferenceFormat, MeshUpAxis, OutputFormat, Scheduler,
+    SourceImageCapability,
+};
+
+pub const GENERATION_PROFILE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolutionDomain {
+    Dynamic,
+    Buckets,
+    SourceDriven,
+    None,
+}
+
+/// What an off-bucket resolution means for a `Buckets`-domain recipe.
+///
+/// `Reject` keeps the historical fail-closed behaviour (H3's reviewed
+/// runtime genuinely refuses off-bucket shapes). `Warn` admits any size
+/// that clears the alignment/limit/aspect gates — the buckets are the
+/// trained sizes the model is optimized for, not the only runnable ones —
+/// and the advisory dimension-warning channel tells the user results may
+/// vary. Absent on the wire means `Reject`, so older profiles keep today's
+/// semantics and clients fail closed against older servers.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+#[ts(rename_all = "kebab-case")]
+pub enum OffBucketPolicy {
+    #[default]
+    Reject,
+    Warn,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ControlMode {
+    Adjustable,
+    Fixed,
+    Hidden,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProvenanceKind {
+    Upstream,
+    MoldPolicy,
+    Derived,
+    DeliveryLimit,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct ProfileProvenance {
+    pub kind: ProvenanceKind,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    pub qualified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
+/// Server-side qualification record for upstream resolution candidates.
+///
+/// `qualified` means the dimensions may be presented as recommendations; it
+/// is not a per-size runtime-performance claim. A dynamic family can qualify
+/// a pinned upstream oracle when Mold's alignment, pixel admission, and image
+/// delivery paths are resolution-generic. Bucketed or size-sensitive families
+/// additionally need a checked-in exact-size generation-and-delivery campaign.
+/// The generator keeps the evidence visible so those two qualification paths
+/// cannot be conflated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionQualificationRecord {
+    pub family: &'static str,
+    pub source: &'static str,
+    pub revision: &'static str,
+    pub qualified: bool,
+    pub evidence: &'static str,
+    pub candidates: &'static [(u32, u32)],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+#[ts(rename = "ProfileResolutionPreset")]
+pub struct ResolutionPreset {
+    pub id: String,
+    pub width: u32,
+    pub height: u32,
+    pub tier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+#[ts(rename = "ProfileAspectGroup")]
+pub struct AspectGroup {
+    pub id: String,
+    pub label: String,
+    pub presets: Vec<ResolutionPreset>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct ResolutionProfile {
+    pub domain: ResolutionDomain,
+    pub alignment: u32,
+    pub min_width: u32,
+    pub min_height: u32,
+    #[ts(type = "number")]
+    pub max_pixels: u64,
+    /// Optional source-image canvas ceiling. Source-driven models can accept
+    /// a larger output canvas than their conditioning encoder should ingest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub source_max_pixels: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_axis_pixels: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_aspect_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_aspect_ratio: Option<f64>,
+    /// Only meaningful for the `Buckets` domain; see [`OffBucketPolicy`].
+    /// Absent on the wire (older servers and profiles) means `Reject`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub off_bucket: Option<OffBucketPolicy>,
+    pub aspect_groups: Vec<AspectGroup>,
+}
+
+/// The one human sentence explaining why a control is fixed or bounded.
+///
+/// Authored at the single place the fixedness or the bound is decided, so no
+/// client ever composes copy for a value it did not choose. A pinned control
+/// is the obvious case, but an ADJUSTABLE control whose range is narrower
+/// than the family's needs the sentence just as much — H3's undistilled step
+/// floor is a reviewed schedule, and a user who cannot see why 20 is refused
+/// reads it as a bug. Absent for a control with nothing worth saying — a
+/// client that finds no note renders nothing rather than inventing a
+/// sentence, which is exactly what an older server's response deserializes
+/// to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct IntegerControl {
+    pub default: u32,
+    pub min: u32,
+    pub max: u32,
+    pub step: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<u32>,
+    pub mode: ControlMode,
+    /// See [`IntegerControl`]'s note on fixed-or-bounded-control copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct FloatControl {
+    pub default: f64,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    pub mode: ControlMode,
+    /// See [`IntegerControl`]'s note on fixed-or-bounded-control copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+#[ts(rename = "ProfileFpsControl")]
+pub enum FpsControl {
+    Fixed {
+        value: u32,
+    },
+    Adjustable {
+        default: u32,
+        min: u32,
+        max: u32,
+        step: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct TemporalProfile {
+    pub frames: IntegerControl,
+    pub frame_offset: u32,
+    pub fps: FpsControl,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct GenerationDefaultsProfile {
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub guidance: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct RecipeSelector {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<Ltx2PipelineMode>,
+}
+
+/// A non-numeric request field's complete UI/admission contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct FeatureControlProfile {
+    pub mode: ControlMode,
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Background-removal policy exposed by a mesh recipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct MeshMattingControlProfile {
+    pub mode: ControlMode,
+    pub default: MeshMattingMode,
+    pub choices: Vec<MeshMattingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// How a recipe treats `GenerateRequest.prompt`.
+///
+/// The profile is the SINGLE authority for this. Before it existed, each
+/// surface carried its own family allowlist, so a family with no text encoder
+/// at all still had to be typed into four clients before an empty prompt
+/// stopped being an error somewhere.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptRequirement {
+    /// An empty prompt is refused at admission. The default, and what an
+    /// older server's profile deserializes to.
+    #[default]
+    Required,
+    /// An empty prompt is admitted, but the text still conditions the render
+    /// when present.
+    Optional,
+    /// The recipe has no text encoder. The prompt is recorded as provenance
+    /// and changes nothing about the pixels or the geometry.
+    Ignored,
+}
+
+impl PromptRequirement {
+    /// Whether a request on this recipe must carry a non-empty prompt.
+    pub fn is_required(self) -> bool {
+        self == Self::Required
+    }
+
+    /// Whether the recipe reads the prompt at all. When it does not, there
+    /// is nothing for prompt expansion or remix to do either.
+    pub fn is_ignored(self) -> bool {
+        self == Self::Ignored
+    }
+}
+
+/// The prompt's complete admission contract for one recipe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct PromptCapabilitiesProfile {
+    pub mode: PromptRequirement,
+    /// Why the prompt is optional or ignored. Absent when it is required —
+    /// there is nothing to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Default for PromptCapabilitiesProfile {
+    fn default() -> Self {
+        Self {
+            mode: PromptRequirement::Required,
+            reason: None,
+        }
+    }
+}
+
+/// The 3-D controls a mesh recipe accepts, and their reviewed bounds.
+///
+/// Present only on a mesh recipe. Its absence is what tells a client — and
+/// [`validate_request_against_recipe`] — that `GenerateRequest.mesh` has no
+/// meaning here, so an octree resolution sent to a raster model is refused
+/// rather than silently dropped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct MeshCapabilitiesProfile {
+    /// Query-grid resolutions this recipe admits. An ALLOWLIST, because the
+    /// occupancy field is evaluated on `(n + 1)^3` points.
+    pub octree_resolutions: Vec<u32>,
+    pub octree_default: u32,
+    /// Iso-level the surface is extracted at.
+    pub threshold: FloatControl,
+    pub target_faces_min: u32,
+    pub target_faces_max: u32,
+    /// Triangle budget a TEXTURED run decimates to when the request names no
+    /// `target_faces`, mirroring Tencent's own paint pipeline. Geometry-only
+    /// runs have no default and keep the raw surface, which is why this is
+    /// one advertised number rather than a `target_faces_default`.
+    ///
+    /// `None` means an older server, never "no budget" — a client shows the
+    /// control unprefilled there, exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_faces_texture_default: Option<u32>,
+    /// The PBR texture stage. `Hidden` in every build that ships without the
+    /// paint bundle, with the reason a client shows instead of the control.
+    pub texture: FeatureControlProfile,
+    /// Semantic camera slots accepted by a multiview shape checkpoint.
+    /// `None` means an older server; current servers always emit a block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_views: Option<NamedViewsProfile>,
+    /// A user-supplied mesh accepted by a texture-only workflow.
+    /// `None` means an older server; current servers always emit a block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_input: Option<MeshInputProfile>,
+    /// Texture atlas sizes admitted by the same request validator.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub texture_resolutions: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture_default_resolution: Option<u32>,
+    /// Number of raster views used by the paint stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub texture_view_count: Option<IntegerControl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matting: Option<MeshMattingControlProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delight: Option<FeatureControlProfile>,
+    /// Complete workflows executable by this recipe in this build.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workflow_modes: Vec<MeshWorkflowMode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct NamedViewsProfile {
+    pub mode: ControlMode,
+    pub roles: Vec<GenerationImageReferenceRole>,
+    pub min_count: u32,
+    pub max_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct MeshInputProfile {
+    pub mode: ControlMode,
+    pub formats: Vec<MeshReferenceFormat>,
+    pub max_count: u32,
+    #[ts(type = "number")]
+    pub max_bytes: u64,
+    pub up_axes: Vec<MeshUpAxis>,
+    pub meters_per_unit_min: f64,
+    pub meters_per_unit_max: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum MeshWorkflowMode {
+    ImageToMesh,
+    MultiviewToMesh,
+    MeshRoundtrip,
+    MeshTexture,
+    TextToMesh,
+}
+
+/// A repeatable adapter input and its immutable stack limit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct AdapterControlProfile {
+    pub mode: ControlMode,
+    pub max_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Ordered heterogeneous reference conditioning, derived from the admission authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct GenerationReferencesProfile {
+    pub mode: ControlMode,
+    pub required: bool,
+    pub kinds: Vec<String>,
+    pub max_count: u32,
+    pub max_images: u32,
+    pub max_videos: u32,
+    pub max_audios: u32,
+    #[ts(type = "number")]
+    pub min_duration_ms: u64,
+    #[ts(type = "number")]
+    pub max_duration_ms: u64,
+    #[ts(type = "number")]
+    pub max_video_duration_ms: u64,
+    #[ts(type = "number")]
+    pub max_audio_duration_ms: u64,
+    #[ts(type = "number")]
+    pub max_inline_bytes: u64,
+    pub requires_visual: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct BoundaryFramesProfile {
+    pub mode: ControlMode,
+    pub first_required: bool,
+    pub last_required: bool,
+    pub min_frames: u32,
+    pub wire: String,
+}
+
+pub fn generation_references_for_model(model: &str) -> Option<GenerationReferencesProfile> {
+    use crate::minimax_h3 as h3;
+    let contract = h3::capability_contract_for_model(model)?;
+    if contract.task != h3::Task::Ref2va {
+        return None;
+    }
+    Some(GenerationReferencesProfile {
+        mode: ControlMode::Adjustable,
+        required: true,
+        kinds: vec!["image".into(), "video".into(), "audio".into()],
+        max_count: h3::MAX_REFERENCE_FILES as u32,
+        max_images: h3::MAX_REFERENCE_IMAGES as u32,
+        max_videos: h3::MAX_REFERENCE_VIDEOS as u32,
+        max_audios: h3::MAX_REFERENCE_AUDIOS as u32,
+        min_duration_ms: h3::MIN_REFERENCE_DURATION_MS,
+        max_duration_ms: h3::MAX_REFERENCE_DURATION_MS,
+        max_video_duration_ms: h3::MAX_AGGREGATE_REFERENCE_VIDEO_MS,
+        max_audio_duration_ms: h3::MAX_AGGREGATE_REFERENCE_AUDIO_MS,
+        max_inline_bytes: h3::MAX_INLINE_REFERENCE_BYTES as u64,
+        requires_visual: true,
+    })
+}
+
+pub fn boundary_frames_for_model(model: &str) -> Option<BoundaryFramesProfile> {
+    let contract = crate::minimax_h3::capability_contract_for_model(model)?;
+    (contract.task == crate::minimax_h3::Task::Fl2va).then(|| BoundaryFramesProfile {
+        mode: ControlMode::Adjustable,
+        first_required: false,
+        last_required: false,
+        min_frames: crate::minimax_h3::MIN_FRAMES,
+        wire: "h3-endpoints".into(),
+    })
+}
+
+/// How a recipe's ordered reference images relate to `source_image`.
+///
+/// Two questions, two fields: `source_image` keeps saying whether the
+/// checkpoint can start from a latent at all, and this says what happens when
+/// references are also present. Absent that split, a recipe that accepts both
+/// forms could only advertise one of them.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceSourceRelation {
+    /// References REPLACE the source image: the pipeline never reads
+    /// `source_image`, so sending one is a client mistake. Qwen-Image-Edit
+    /// (whose first image IS the edit target) and FLUX.2 [dev].
+    #[default]
+    Replaces,
+    /// The recipe renders from a source image OR from references, never both
+    /// in one pass. FLUX.2 [klein]: upstream's reference edit
+    /// (`pipeline_flux2_klein.py`) and its inpaint pipeline
+    /// (`pipeline_flux2_klein_inpaint.py`) are separate classes, so no single
+    /// pass takes an img2img latent and a reference group together.
+    Exclusive,
+    /// The recipe reads a source image and references in the SAME pass.
+    ///
+    /// SD1.5 and SDXL with IP-Adapter: the image prompt is a second key/value
+    /// stream added onto every cross-attention output, so it composes with
+    /// img2img, inpaint, ControlNet and a LoRA rather than replacing any of
+    /// them (`stable-diffusion.cpp` `src/model/common/block.hpp:385-392`).
+    /// This is the only relation for which none of the img2img fields are
+    /// refused; the two wells are both live and neither parks.
+    Combines,
+}
+
+/// How a client derives the default output canvas from a request's ordered
+/// references, when the user has not chosen a size.
+///
+/// A CLIENT rule, never an admission rewrite: `GenerateRequest.width` and
+/// `height` are required, so the server cannot tell a chosen size from a
+/// default one and admission stays exact.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceCanvasRule {
+    /// Take the LAST reference's aspect ratio at upstream's fixed 1024x1024
+    /// area (`validation::LAST_REFERENCE_CANVAS_AREA`) on the recipe's grid,
+    /// clamped into the recipe's `resolution` bounds:
+    /// `validation::last_reference_canvas`. Qwen Image 2.1's
+    /// `calculate_dimensions` sizes the output from the last condition image
+    /// (diffusers `pipeline_qwenimage21.py:621-623`); the clamp is mold's.
+    LastReference,
+}
+
+/// A still-image container a recipe accepts as an ordered reference.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageInputFormat {
+    Png,
+    Jpeg,
+    Webp,
+}
+
+impl ImageInputFormat {
+    /// The formats a profile with an empty `formats` list (every recipe
+    /// before the field existed, and every older server) accepts.
+    pub const LEGACY: &'static [ImageInputFormat] =
+        &[ImageInputFormat::Png, ImageInputFormat::Jpeg];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageInputFormat::Png => "PNG",
+            ImageInputFormat::Jpeg => "JPEG",
+            ImageInputFormat::Webp => "WebP",
+        }
+    }
+}
+
+/// "PNG or JPEG", "PNG, JPEG, or WebP": the list a refusal names.
+pub fn image_input_format_list(formats: &[ImageInputFormat]) -> String {
+    let labels: Vec<&str> = formats.iter().map(|format| format.label()).collect();
+    match labels.as_slice() {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [first, second] => format!("{first} or {second}"),
+        [init @ .., last] => format!("{}, or {last}", init.join(", ")),
+    }
+}
+
+/// The ordered reference-image (`GenerateRequest.edit_images`) contract.
+///
+/// The SINGLE authority for "does this model do reference editing, how many
+/// images, and what does that mean for `source_image`". Before it existed,
+/// every surface re-derived the answer from the model NAME — which is exactly
+/// how FLUX.2 [klein]'s reference support stayed invisible on the wire while
+/// the engine already had the plumbing.
+// `Eq` is deliberately absent: `weight` carries an `f64` range, so the profile
+// is only ever partially comparable. Nothing keys a map on it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct ReferenceImagesProfile {
+    /// `Hidden` on a recipe that has no reference protocol at all; every
+    /// recipe that does advertises `Adjustable`.
+    pub mode: ControlMode,
+    /// Whether a render is impossible without at least one reference.
+    pub required: bool,
+    /// The family ceiling on the ordered group. `None` means the recipe
+    /// imposes no count bound of its own (Qwen-Image-Edit); a `Hidden` recipe
+    /// carries `Some(0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub max_count: Option<u32>,
+    /// Whether the FIRST reference is the image being edited rather than a
+    /// side reference. True only for Qwen-Image-Edit, whose canvas is
+    /// therefore source-driven.
+    pub primary_is_target: bool,
+    pub source_relation: ReferenceSourceRelation,
+    /// Engine processing budget per image with exactly one reference.
+    /// Originals above this size are resized by the engine, not refused at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub max_pixels_single: Option<u64>,
+    /// Engine processing budget per image with several references.
+    /// This is not an ingestion or transport limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub max_pixels_multi: Option<u64>,
+    /// The one human sentence a client shows instead of the control, and the
+    /// refusal a `Hidden` recipe answers `edit_images` with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Injection strength for a decoupled-cross-attention reference adapter
+    /// (`GenerateRequest.reference_weight`). `None` on a recipe whose
+    /// reference protocol has no weight at all.
+    ///
+    /// It lives INSIDE this block rather than as a sibling bool, deliberately.
+    /// `supports_identity` is a bare bool whose numeric bounds are constants in
+    /// `mold_core::identity`, which forces every client to hard-code `0..3`;
+    /// here the range travels with the capability, so a client that renders a
+    /// slider reads one answer and a host that retunes the bounds does not
+    /// need a client release.
+    ///
+    /// Absent on an older host is the same statement as `None`: no weight
+    /// control. That is safe because a recipe with no adapter has no strength
+    /// to set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<FloatControl>,
+    /// How a client sizes the default canvas from the references. `None`
+    /// means no rule (the canvas is the recipe default) — or an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<ReferenceCanvasRule>,
+    /// Still containers accepted as references. EMPTY means
+    /// [`ImageInputFormat::LEGACY`] (PNG and JPEG): every recipe that
+    /// predates the field, and every older server.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<ImageInputFormat>,
+}
+
+impl ReferenceImagesProfile {
+    /// The accepted reference containers, with an empty list read as the
+    /// legacy PNG/JPEG pair.
+    pub fn accepted_formats(&self) -> &[ImageInputFormat] {
+        if self.formats.is_empty() {
+            ImageInputFormat::LEGACY
+        } else {
+            &self.formats
+        }
+    }
+}
+
+/// The sentence a recipe with no reference protocol shows and refuses with.
+///
+/// Deliberately family-neutral: naming today's edit models here is what made
+/// the previous wording ("only supported for qwen-image-edit and flux2-dev")
+/// go stale the moment Klein gained references.
+pub const REFERENCE_IMAGES_UNSUPPORTED_REASON: &str =
+    "This model does not accept reference images (edit_images).";
+
+/// The transparent-background contract (`GenerateRequest.transparent_background`).
+///
+/// One decision function, [`transparency_for_recipe`], and one validator,
+/// [`validate_transparency_against`], which both admission doors call so a
+/// refusal reads the same from either. Absent on the wire means an OLDER
+/// SERVER: a client hides the toggle (there is no older behaviour to fall
+/// back to).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct TransparencyCapabilitiesProfile {
+    /// `Adjustable` where the recipe renders a transparent background on
+    /// request; `Hidden` everywhere else.
+    pub mode: ControlMode,
+    /// The toggle's default position. Always `false` today.
+    pub default: bool,
+    /// Output containers that carry alpha and may be chosen while the toggle
+    /// is on. Narrowed to what the binary can encode
+    /// ([`qualify_generation_profile_delivery`]).
+    pub formats: Vec<OutputFormat>,
+    /// Whether an alpha-carrying REFERENCE keeps alpha in the output even
+    /// with the toggle off (Qwen Image 2.1's four-channel VAE: editing a
+    /// transparent layer returns a transparent layer). With neither the
+    /// toggle nor such a reference, the render is delivered as RGB.
+    pub native_alpha: bool,
+    /// The sentence a `Hidden` recipe shows and refuses the toggle with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The sentence a recipe without transparent rendering shows and refuses with.
+pub const TRANSPARENCY_UNSUPPORTED_REASON: &str =
+    "This model does not render transparent backgrounds (transparent_background).";
+
+/// The ONE decision for a recipe's transparency contract.
+///
+/// Qwen Image 2.1 (every tier, turbo included) renders RGBA natively through
+/// its four-channel VAE and follows the model card's RGBA prompt recipe
+/// (`crate::transparency`), so it is `Adjustable` with PNG and WebP as the
+/// alpha-carrying containers. Every other recipe is `Hidden`.
+pub fn transparency_for_recipe(family: &str, _model: &str) -> TransparencyCapabilitiesProfile {
+    match canonical_family(family) {
+        "qwen-image21" => TransparencyCapabilitiesProfile {
+            mode: ControlMode::Adjustable,
+            default: false,
+            formats: vec![OutputFormat::Png, OutputFormat::Webp],
+            native_alpha: true,
+            reason: None,
+        },
+        _ => TransparencyCapabilitiesProfile {
+            mode: ControlMode::Hidden,
+            default: false,
+            formats: Vec::new(),
+            native_alpha: false,
+            reason: Some(TRANSPARENCY_UNSUPPORTED_REASON.to_string()),
+        },
+    }
+}
+
+/// Validate a request's `transparent_background` against ONE recipe's
+/// transparency contract.
+///
+/// Called by BOTH admission doors — family validation and
+/// [`validate_request_against_recipe`] — and by durable admission, so the
+/// sentence is identical whichever refuses. Only `Some(true)` asks for
+/// anything; `Some(false)` is accepted everywhere (admission normalizes it to
+/// `None`). The format checked is the one the render will use: the explicit
+/// `output_format`, else the still default (PNG).
+pub fn validate_transparency_against(
+    profile: &TransparencyCapabilitiesProfile,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    validate_transparency_choice(
+        profile,
+        request.transparent_background,
+        request.resolved_output_format(),
+    )
+}
+
+/// [`validate_transparency_against`] on the two facts it reads, for a client
+/// preflight that has not built a whole request yet (`mold run --transparent`
+/// resolves its container long before the request exists). Same sentences,
+/// because it IS the same check.
+pub fn validate_transparency_choice(
+    profile: &TransparencyCapabilitiesProfile,
+    transparent_background: Option<bool>,
+    format: OutputFormat,
+) -> Result<(), String> {
+    if transparent_background != Some(true) {
+        return Ok(());
+    }
+    if matches!(profile.mode, ControlMode::Hidden) {
+        return Err(profile
+            .reason
+            .clone()
+            .unwrap_or_else(|| TRANSPARENCY_UNSUPPORTED_REASON.to_string()));
+    }
+    if !profile.formats.contains(&format) {
+        let alpha = profile
+            .formats
+            .iter()
+            .map(|format| format.extension())
+            .collect::<Vec<_>>()
+            .join(" or ");
+        return Err(format!(
+            "transparent_background needs a format with an alpha channel; use {alpha} instead of {}",
+            format.extension()
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct OutputCapabilitiesProfile {
+    pub default_format: OutputFormat,
+    pub formats: Vec<OutputFormat>,
+    pub audio_requires_mp4: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_reason: Option<String>,
+}
+
+/// Delivery encoders linked into a concrete Mold binary.
+///
+/// The authored registry describes the complete Mold-qualified contract. Each
+/// executable narrows that contract to what it can actually deliver before it
+/// advertises, renders, or validates a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationDeliveryCapabilities {
+    pub mp4: bool,
+    pub webp: bool,
+}
+
+impl GenerationDeliveryCapabilities {
+    pub const fn new(mp4: bool, webp: bool) -> Self {
+        Self { mp4, webp }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct WanRecipeCapabilitiesProfile {
+    pub mode: ControlMode,
+    pub supports_distill_strength: bool,
+    pub supports_first_last_frame: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_last_frame_min_frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct GenerationCapabilitiesProfile {
+    pub guidance: GuidanceCapabilities,
+    pub negative_prompt: FeatureControlProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_image: Option<SourceImageCapability>,
+    pub supports_lora: bool,
+    pub supports_controlnet: bool,
+    /// Face-identity conditioning (`GenerateRequest.id_image`). True only for
+    /// an identity-qualified checkpoint on a binary that links the identity
+    /// adapter, so a client never offers a control this server would refuse.
+    #[serde(default)]
+    pub supports_identity: bool,
+    pub supports_sequence: bool,
+    pub supports_extend: bool,
+    pub supports_audio: bool,
+    pub source_video: FeatureControlProfile,
+    pub mask: FeatureControlProfile,
+    pub keyframes: FeatureControlProfile,
+    pub audio: FeatureControlProfile,
+    pub lora: AdapterControlProfile,
+    pub controlnet: AdapterControlProfile,
+    pub output: OutputCapabilitiesProfile,
+    pub wan_recipe: WanRecipeCapabilitiesProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedulers: Vec<Scheduler>,
+    /// Whether this recipe requires, accepts, or ignores a prompt. The single
+    /// authority: server validation and every client read it rather than
+    /// carrying their own family list. Absent on an older server's profile,
+    /// which deserializes to `Required` — the answer that was true for every
+    /// recipe before this field existed.
+    #[serde(default)]
+    pub prompt: PromptCapabilitiesProfile,
+    /// Whether `GenerateRequest.strength` changes the render.
+    ///
+    /// `#[serde(default)]` is deliberately `false`: an older server that does
+    /// not send the field is not asserting that strength works, and a client
+    /// must fall back to its own legacy predicate rather than read a `true`
+    /// nobody wrote.
+    #[serde(default)]
+    pub supports_strength: bool,
+    /// The ordered reference-image contract, or `None` on an OLDER SERVER.
+    ///
+    /// `Option`, not a bare default, for the reason `supports_strength`'s
+    /// `false` is documented above but inverted: absence here is not a
+    /// refusal. A server that predates this field still renders FLUX.2 [dev]
+    /// and Qwen-Image-Edit references, so a client that read absence as "no
+    /// references" would hide a control that works. Fall back to the legacy
+    /// name predicate, never to a `Hidden` nobody wrote. Every recipe this
+    /// build emits carries `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_images: Option<ReferenceImagesProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_references: Option<GenerationReferencesProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_frames: Option<BoundaryFramesProfile>,
+    /// The transparent-background contract, or `None` on an OLDER SERVER
+    /// (clients hide the toggle). Every recipe this build emits carries
+    /// `Some`; see [`transparency_for_recipe`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency: Option<TransparencyCapabilitiesProfile>,
+    /// 3-D controls. Present only on a mesh recipe; its absence means
+    /// `GenerateRequest.mesh` is refused here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<MeshCapabilitiesProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct GenerationRecipeProfile {
+    pub id: String,
+    pub label: String,
+    pub request_selector: RecipeSelector,
+    pub defaults: GenerationDefaultsProfile,
+    pub resolution: ResolutionProfile,
+    pub steps: IntegerControl,
+    pub guidance: FloatControl,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalProfile>,
+    pub capabilities: GenerationCapabilitiesProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provenance: Vec<ProfileProvenance>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema, ts_rs::TS)]
+pub struct GenerationProfileSet {
+    pub schema_version: u32,
+    pub profile_id: String,
+    pub profile_hash: String,
+    pub default_recipe_id: String,
+    pub recipes: Vec<GenerationRecipeProfile>,
+}
+
+impl GenerationProfileSet {
+    pub fn default_recipe(&self) -> Option<&GenerationRecipeProfile> {
+        self.recipes
+            .iter()
+            .find(|recipe| recipe.id == self.default_recipe_id)
+    }
+
+    /// Whether any selectable recipe of this model advertises face-identity
+    /// conditioning. `/api/models[].supports_identity` reads this rather than
+    /// re-deriving the predicate.
+    pub fn supports_identity(&self) -> bool {
+        self.recipes
+            .iter()
+            .any(|recipe| recipe.capabilities.supports_identity)
+    }
+
+    pub fn recipe_for_pipeline(
+        &self,
+        pipeline: Option<Ltx2PipelineMode>,
+    ) -> Option<&GenerationRecipeProfile> {
+        match pipeline {
+            Some(pipeline) => self
+                .recipes
+                .iter()
+                .find(|recipe| recipe.request_selector.pipeline == Some(pipeline)),
+            None => self.default_recipe(),
+        }
+    }
+
+    /// Recompute the content address after a server-side runtime probe refines
+    /// an advertised capability. The profile hash must describe the exact
+    /// contract on the wire, not the pre-probe manifest approximation.
+    pub fn refresh_hash(&mut self) {
+        self.profile_hash.clear();
+        let encoded = serde_json::to_vec(self).expect("generation profile must serialize");
+        self.profile_hash = format!("{:x}", Sha256::digest(encoded));
+    }
+}
+
+/// Narrow an authored profile to the delivery encoders in a concrete binary.
+///
+/// This is intentionally shared by server and local surfaces so neither can
+/// advertise or accept a format the executing binary cannot encode. Recipes
+/// with no viable delivery format remain unavailable; they are never silently
+/// redirected to an unrelated container.
+pub fn qualify_generation_profile_delivery(
+    profile: &mut GenerationProfileSet,
+    delivery: GenerationDeliveryCapabilities,
+) {
+    for recipe in &mut profile.recipes {
+        recipe
+            .capabilities
+            .output
+            .formats
+            .retain(|format| match format {
+                OutputFormat::Mp4 => delivery.mp4,
+                OutputFormat::Webp => delivery.webp,
+                _ => true,
+            });
+        if !recipe
+            .capabilities
+            .output
+            .formats
+            .contains(&recipe.capabilities.output.default_format)
+        {
+            if let Some(format) = recipe.capabilities.output.formats.first().copied() {
+                recipe.capabilities.output.default_format = format;
+            }
+        }
+        // The toggle's alpha containers are narrowed by the same encoders: a
+        // build without WebP must not offer a transparent WebP.
+        if let Some(transparency) = recipe.capabilities.transparency.as_mut() {
+            transparency.formats.retain(|format| match format {
+                OutputFormat::Webp => delivery.webp,
+                _ => true,
+            });
+        }
+        if recipe.capabilities.output.audio_requires_mp4 && !delivery.mp4 {
+            recipe.capabilities.supports_audio = false;
+        }
+    }
+
+    profile
+        .recipes
+        .retain(|recipe| !recipe.capabilities.output.formats.is_empty());
+    if !profile
+        .recipes
+        .iter()
+        .any(|recipe| recipe.id == profile.default_recipe_id)
+    {
+        profile.default_recipe_id = profile
+            .recipes
+            .first()
+            .map(|recipe| recipe.id.clone())
+            .unwrap_or_default();
+    }
+    profile.refresh_hash();
+}
+
+/// Resolve the profile-owned output default for a concrete request selector.
+pub fn generation_profile_default_output_format(
+    profile: &GenerationProfileSet,
+    pipeline: Option<Ltx2PipelineMode>,
+) -> Result<OutputFormat, String> {
+    let recipe = profile.recipe_for_pipeline(pipeline).ok_or_else(|| {
+        if let Some(pipeline) = pipeline {
+            format!("pipeline '{pipeline}' is not available for this model")
+        } else {
+            format!(
+                "generation profile '{}' has no default recipe",
+                profile.profile_id
+            )
+        }
+    })?;
+    Ok(recipe.capabilities.output.default_format)
+}
+
+/// Fill an omitted request output from its resolved recipe contract.
+pub fn materialize_generation_profile_output_default(
+    profile: &GenerationProfileSet,
+    request: &mut crate::GenerateRequest,
+) -> Result<(), String> {
+    if request.output_format.is_none() {
+        request.output_format = Some(generation_profile_default_output_format(
+            profile,
+            request.pipeline,
+        )?);
+    }
+    Ok(())
+}
+
+/// The prompt contract for a family, with or without visual conditioning.
+///
+/// The ONE authority behind both [`crate::validation::prompt_required_for`]
+/// and the `prompt` block every recipe advertises, so admission and every
+/// client necessarily agree. Three answers:
+///
+///   - `Ignored` for a mesh family: it has no text encoder anywhere in it, so
+///     a prompt is provenance and nothing else.
+///   - `Optional` for a video family whose request carries visual
+///     conditioning — LTX-2, Wan and MiniMax H3. **The justification is not
+///     the text encoder, it is the render:** an attached still, a pair of
+///     boundary frames, a reference set or a clip to continue already
+///     determines what the frames show, so a prompt refines that render
+///     rather than authoring it. An unprompted clip tends toward near-static
+///     micro-motion, which is guidance for the user, not a refusal. Legacy
+///     LTX-Video stays required because mold's engine cannot accept visual
+///     conditioning at all.
+///   - `Required` everywhere else, including every text-to-video tier of the
+///     families above: with nothing attached, the prompt IS the render.
+///
+/// The conditioning half is the caller's answer, never a per-tier list here.
+/// Admission passes [`crate::validation::has_visual_conditioning`] for the
+/// request in hand, and the recipe builder passes the tier's own
+/// `source_image` contract, so a t2v tier advertises `Required` for free.
+pub fn prompt_requirement_for_family(
+    family: Option<&str>,
+    has_visual_conditioning: bool,
+) -> PromptRequirement {
+    match family.map(canonical_family) {
+        Some(family)
+            if family == crate::manifest::HUNYUAN3D_FAMILY
+                || family == crate::manifest::HUNYUAN3D_MATTING_FAMILY
+                || family == crate::manifest::HUNYUAN3D_DELIGHT_FAMILY =>
+        {
+            PromptRequirement::Ignored
+        }
+        Some("ltx2" | "wan") if has_visual_conditioning => PromptRequirement::Optional,
+        Some(family) if has_visual_conditioning && crate::minimax_h3::is_family(family) => {
+            PromptRequirement::Optional
+        }
+        _ => PromptRequirement::Required,
+    }
+}
+
+/// Whether this family's renderer emits an audio track at all.
+///
+/// The family half of the audio contract, and the ONE place it is decided:
+/// the recipe's advertised `capabilities.supports_audio`, the chain
+/// capability table, and every default resolved by [`resolve_enable_audio`]
+/// read this rather than carrying their own family list.
+///
+/// LTX-2 answers to `GenerateRequest.enable_audio`; MiniMax H3 emits
+/// synchronized audio unconditionally and the flag is inert there (its
+/// admission arm returns before the flag is ever read). Every other family
+/// has no audio decode path.
+pub fn family_emits_audio(family: &str) -> bool {
+    let family = canonical_family(family);
+    family == "ltx2" || crate::minimax_h3::is_family(family)
+}
+
+/// Resolve `enable_audio` for one render.
+///
+/// An explicit value always wins — a user who turned sound off gets silence,
+/// and a user who turned it on gets an admission error where the recipe
+/// cannot deliver. **Unset means the recipe's own answer, and that answer is
+/// ON wherever the recipe can deliver audio.** A video model that renders
+/// sound is what the user asked for when they picked it; making them find a
+/// toggle first shipped silent clips by default.
+///
+/// `supports_audio` is the recipe's advertised capability
+/// (`capabilities.supports_audio`, or [`family_emits_audio`] where only the
+/// family is known), never a second family list at the call site.
+///
+/// This is the same rule the LTX-2 engine has always applied to a one-shot
+/// (`enable_audio.unwrap_or(output == Mp4)`); it is now the rule at the chain
+/// doors and in every client too, which is where the two had diverged.
+pub fn resolve_enable_audio(requested: Option<bool>, supports_audio: bool) -> bool {
+    requested.unwrap_or(supports_audio)
+}
+
+/// The advertised sentence for a non-required prompt.
+fn prompt_reason(mode: PromptRequirement) -> Option<String> {
+    match mode {
+        PromptRequirement::Required => None,
+        PromptRequirement::Optional => Some(
+            "The source media conditions this render; a prompt refines it but is not required."
+                .to_string(),
+        ),
+        PromptRequirement::Ignored => {
+            Some("This model has no text encoder; the prompt is saved as a note.".to_string())
+        }
+    }
+}
+
+/// The reference-image contract for one model, and the ONE place it is
+/// decided.
+///
+/// Every surface — admission, the profile door, the CLI, and the browser
+/// clients through the serialized block — reads this rather than matching on
+/// the model name. Upstream references:
+///
+///   - FLUX.2: `diffusers/pipelines/flux2/pipeline_flux2_klein.py:616,765-809`
+///     takes `image: list | PIL | None` and prepares reference ids at
+///     `t = 10 + 10 * i`; the block is "Copied from" the dev pipeline
+///     (`pipeline_flux2.py:406`), so distilled Klein, Klein base, and dev all
+///     speak the identical protocol with the same checkpoint layout.
+///     ComfyUI's `comfy/model_detection.py:242-256` sets
+///     `ref_index_scale = 10.0` for EVERY flux2 checkpoint.
+///   - The per-image pixel budget is BFL's 2024²/1024² split
+///     (`InvokeAI/invokeai/backend/flux2/ref_image_extension.py:27-29`), which
+///     mold applies family-wide; diffusers' flat 1 MP cap is the documented
+///     divergence.
+///   - Qwen-Image-Edit's first image is the edit TARGET
+///     (`qwen_image/pipeline.rs`), which is why its canvas is source-driven
+///     and why it imposes no count ceiling of its own.
+pub fn reference_images_for_recipe(family: &str, model: &str) -> ReferenceImagesProfile {
+    match canonical_family(family) {
+        "qwen-image-edit" => ReferenceImagesProfile {
+            mode: ControlMode::Adjustable,
+            required: true,
+            // No count ceiling of its own. Upstream's "1-3 images" is advice
+            // about quality, not a bound admission can enforce.
+            max_count: None,
+            primary_is_target: true,
+            source_relation: ReferenceSourceRelation::Replaces,
+            max_pixels_single: Some(validation::QWEN_IMAGE_EDIT_SOURCE_MAX_PIXELS),
+            max_pixels_multi: Some(validation::QWEN_IMAGE_EDIT_SOURCE_MAX_PIXELS),
+            reason: None,
+            // The references ARE the conditioning; there is no adapter to
+            // dial down.
+            weight: None,
+            canvas: None,
+            formats: Vec::new(),
+        },
+        // Qwen Image 2.1's one image-conditioned path serves edit and
+        // multi-reference alike (diffusers `pipeline_qwenimage21.py`): every
+        // image is a condition, none is special, and the output canvas is a
+        // picked size — the LAST condition image only sets the default
+        // aspect (`canvas: LastReference`). Up to 10 per the model card
+        // ("Support up to 10 reference images"); each is resized to a ~1024²
+        // area. PNG, JPEG and WebP are all accepted and never flattened: an
+        // RGBA reference is read with its alpha.
+        "qwen-image21" => ReferenceImagesProfile {
+            mode: ControlMode::Adjustable,
+            required: false,
+            max_count: Some(validation::QWEN_IMAGE21_MAX_REFERENCE_IMAGES),
+            primary_is_target: false,
+            source_relation: ReferenceSourceRelation::Replaces,
+            max_pixels_single: Some(validation::QWEN_IMAGE21_REFERENCE_MAX_PIXELS),
+            max_pixels_multi: Some(validation::QWEN_IMAGE21_REFERENCE_MAX_PIXELS),
+            reason: None,
+            weight: None,
+            canvas: Some(ReferenceCanvasRule::LastReference),
+            formats: vec![
+                ImageInputFormat::Png,
+                ImageInputFormat::Jpeg,
+                ImageInputFormat::Webp,
+            ],
+        },
+        "flux2" => ReferenceImagesProfile {
+            mode: ControlMode::Adjustable,
+            required: false,
+            max_count: Some(validation::FLUX2_MAX_REFERENCE_IMAGES as u32),
+            primary_is_target: false,
+            // [dev]'s reference protocol REPLACES img2img — it advertises no
+            // strength and no mask. Klein's does not: it renders from one or
+            // the other, so it keeps both when no references are attached.
+            source_relation: if validation::is_flux2_dev_model(model) {
+                ReferenceSourceRelation::Replaces
+            } else {
+                ReferenceSourceRelation::Exclusive
+            },
+            max_pixels_single: Some(validation::FLUX2_SINGLE_REFERENCE_MAX_PIXELS),
+            max_pixels_multi: Some(validation::FLUX2_MULTI_REFERENCE_MAX_PIXELS),
+            reason: None,
+            // References are packed as extra transformer tokens, not injected
+            // through an adapter, so there is no strength to set.
+            weight: None,
+            canvas: None,
+            formats: Vec::new(),
+        },
+        // IP-Adapter image prompting. The FIRST recipe to advertise
+        // `Combines`: the reference is an image PROMPT injected as a second
+        // key/value stream on every cross-attention output
+        // (`stable-diffusion.cpp` `src/model/common/block.hpp:385-392`), so it
+        // rides WITH img2img, inpaint, ControlNet and a LoRA rather than
+        // replacing any of them. Every other reference family refuses a
+        // source image; this one must not.
+        //
+        // One image, because the classic adapters project exactly one CLIP
+        // embedding. Upstream averages several, which is a later change and a
+        // larger `max_count`, not a different contract.
+        //
+        // No pixel ceilings: the tower resizes to 224 regardless, so a bound
+        // here would refuse pictures it is about to shrink anyway.
+        "sd15" | "sdxl" => ReferenceImagesProfile {
+            mode: ControlMode::Adjustable,
+            required: false,
+            max_count: Some(1),
+            primary_is_target: false,
+            source_relation: ReferenceSourceRelation::Combines,
+            max_pixels_single: None,
+            max_pixels_multi: None,
+            reason: None,
+            weight: Some(FloatControl {
+                default: validation::REFERENCE_WEIGHT_DEFAULT,
+                min: 0.0,
+                max: validation::REFERENCE_WEIGHT_MAX,
+                step: 0.05,
+                mode: ControlMode::Adjustable,
+                note: None,
+            }),
+            canvas: None,
+            formats: Vec::new(),
+        },
+        _ => ReferenceImagesProfile {
+            mode: ControlMode::Hidden,
+            required: false,
+            max_count: Some(0),
+            primary_is_target: false,
+            source_relation: ReferenceSourceRelation::Replaces,
+            max_pixels_single: None,
+            max_pixels_multi: None,
+            reason: Some(REFERENCE_IMAGES_UNSUPPORTED_REASON.to_string()),
+            weight: None,
+            canvas: None,
+            formats: Vec::new(),
+        },
+    }
+}
+
+/// The name a reference refusal calls the model by.
+///
+/// The model the USER typed, with its quantization tag dropped, so the pinned
+/// family wordings ("qwen-image-edit uses edit_images instead of
+/// source_image") survive the move to one generic validator. A catalog id or
+/// any other identity that is not a manifest stable name is quoted back
+/// whole — inventing a friendlier label for it would name a model the caller
+/// never asked for.
+pub fn reference_subject_label(family: &str, model: &str) -> String {
+    let resolved = crate::manifest::resolve_model_name(model);
+    if let Some((name, _tag)) = resolved.split_once(':') {
+        if !name.is_empty()
+            && !name.contains('/')
+            && crate::manifest::known_manifests()
+                .iter()
+                .any(|manifest| manifest.name == resolved)
+        {
+            return name.to_string();
+        }
+    }
+    if resolved.is_empty() {
+        return canonical_family(family).to_string();
+    }
+    resolved
+}
+
+/// Validate a request's `edit_images` against ONE recipe's reference contract.
+///
+/// The generic replacement for the per-family triad `validation.rs` carried:
+/// the refusals below were the qwen-image-edit and flux2-dev branches, and
+/// they read identically because they always were the same contract with the
+/// subject substituted. `subject` comes from [`reference_subject_label`], so
+/// both doors — family validation and the profile door — produce byte-equal
+/// sentences.
+///
+/// The FLUX.2 [dev] LoRA refusal deliberately does NOT live here: Klein has
+/// references AND LoRA, so that refusal belongs to the checkpoint, not to the
+/// reference protocol.
+pub fn validate_edit_images_against(
+    profile: &ReferenceImagesProfile,
+    subject: &str,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    // The weight belongs to the adapter, so a recipe with no adapter refuses it
+    // rather than accepting and ignoring it — the accept-and-ignore failure the
+    // whole capability contract exists to prevent.
+    //
+    // It runs BEFORE the `Hidden` early return below, and that ordering is the
+    // point: `Hidden` is 117 of the 176 shipped recipes, so checking it after
+    // would mean a `reference_weight` of 99 — or NaN — was silently accepted on
+    // every family that has no reference protocol at all, then carried into
+    // provenance for Reuse to replay. It is also checked whether or not
+    // references are attached, because naming a strength for nothing is the
+    // same mistake either way.
+    match (&profile.weight, request.reference_weight) {
+        (Some(_), Some(weight)) => crate::validation::validate_reference_weight(weight)?,
+        (None, Some(_)) => {
+            return Err(format!(
+                "{subject} has no reference adapter, so reference_weight does not apply"
+            ));
+        }
+        _ => {}
+    }
+
+    let images = request.edit_images.as_deref();
+    if matches!(profile.mode, ControlMode::Hidden) {
+        if images.is_some() {
+            return Err(profile
+                .reason
+                .clone()
+                .unwrap_or_else(|| REFERENCE_IMAGES_UNSUPPORTED_REASON.to_string()));
+        }
+        return Ok(());
+    }
+    let attached = images.is_some_and(|images| !images.is_empty());
+    if profile.required && !attached {
+        // A target-first recipe's first image is the thing being edited, so
+        // the sentence names the Target well the user is looking at.
+        return Err(if profile.primary_is_target {
+            "Qwen Image Edit needs at least one image. Add a Target image and try again."
+                .to_string()
+        } else {
+            format!("{subject} needs at least one reference image. Add one and try again.")
+        });
+    }
+    if images.is_some_and(<[Vec<u8>]>::is_empty) {
+        return Err("edit_images must not be empty when provided".to_string());
+    }
+    if attached {
+        let images = images.unwrap_or_default();
+        // A recipe whose references REPLACE or EXCLUDE the source image edits
+        // one picture, and a batch of edits of one picture is not a thing the
+        // engines express. A `Combines` recipe's reference is an image PROMPT:
+        // its tokens are the same for every row and broadcast across the
+        // batch, so batching is ordinary and refusing it would take away a
+        // normal SD workflow for no reason.
+        if request.batch_size != 1
+            && !matches!(profile.source_relation, ReferenceSourceRelation::Combines)
+        {
+            return Err(format!(
+                "{subject} reference editing only supports batch_size = 1"
+            ));
+        }
+        if let Some(max) = profile.max_count {
+            if images.len() > max as usize {
+                return Err(format!(
+                    "{subject} supports at most {max} ordered reference images"
+                ));
+            }
+        }
+        // Sniffed, then checked against the recipe's own list, so WebP is
+        // accepted exactly where it is advertised and every other recipe
+        // keeps the historical PNG/JPEG sentence byte for byte.
+        let accepted = profile.accepted_formats();
+        if images.iter().any(|image| {
+            !crate::validation::sniff_image_input_format(image)
+                .is_some_and(|format| accepted.contains(&format))
+        }) {
+            return Err(format!(
+                "edit_images must contain only {} images",
+                image_input_format_list(accepted)
+            ));
+        }
+        // Bound every reference by its header before anything decodes it.
+        // A header that cannot be read is not a size: the engine's decoder
+        // refuses those bytes itself, with the decoder's own reason.
+        for (index, image) in images.iter().enumerate() {
+            if let Ok((width, height)) = crate::reference_image::oriented_dimensions(image) {
+                crate::reference_image::validate_reference_image_dimensions(
+                    &format!("Reference {}", index + 1),
+                    width,
+                    height,
+                )?;
+            }
+        }
+    }
+    // `Replaces` never reads `source_image`, so the img2img fields are refused
+    // whether or not references are attached. `Exclusive` renders from ONE of
+    // the two, so the same fields are refused only once references are here.
+    let refuse_source = match profile.source_relation {
+        ReferenceSourceRelation::Replaces => true,
+        ReferenceSourceRelation::Exclusive => attached,
+        ReferenceSourceRelation::Combines => false,
+    };
+    if refuse_source {
+        if request.source_image.is_some() {
+            return Err(format!(
+                "{subject} uses edit_images instead of source_image"
+            ));
+        }
+        if request.mask_image.is_some() {
+            return Err(format!("{subject} does not support mask_image"));
+        }
+        if request.control_image.is_some() || request.control_model.is_some() {
+            return Err(format!("{subject} does not support ControlNet inputs"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate an explicit output format against a recipe's advertised delivery.
+///
+/// Extracted from [`validate_request_against_recipe`] so durable admission can
+/// run this ONE check before a row is accepted. A format the recipe does not
+/// advertise is a client mistake that will never become valid, so it belongs
+/// at the door as a 422 rather than as a job that holds and then fails.
+pub fn validate_output_format_against_generation_profile(
+    recipe: &GenerationRecipeProfile,
+    output_format: OutputFormat,
+) -> Result<(), String> {
+    if recipe.capabilities.output.formats.contains(&output_format) {
+        return Ok(());
+    }
+    Err(format!(
+        "output format '{}' is not available for this recipe",
+        output_format.extension()
+    ))
+}
+
+/// Validate a request's `mesh` block against the recipe's advertised 3-D
+/// controls, and refuse the block outright on a recipe that has none.
+///
+/// The messages deliberately match `validation::validate_mesh_request`: the
+/// two doors are the same contract, and a caller must not be able to tell
+/// which one refused.
+pub fn validate_mesh_against_recipe(
+    recipe: &GenerationRecipeProfile,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    let Some(options) = request.mesh.as_ref() else {
+        return Ok(());
+    };
+    let Some(mesh) = recipe.capabilities.mesh.as_ref() else {
+        return Err(
+            "mesh options are only supported by 3-D families; this model renders raster output"
+                .to_string(),
+        );
+    };
+    if let Some(resolution) = options.octree_resolution {
+        if !mesh.octree_resolutions.contains(&resolution) {
+            return Err(format!(
+                "mesh.octree_resolution ({resolution}) must be one of {:?}",
+                mesh.octree_resolutions
+            ));
+        }
+    }
+    if let Some(threshold) = options.threshold {
+        let threshold = f64::from(threshold);
+        if !threshold.is_finite() || !(mesh.threshold.min..=mesh.threshold.max).contains(&threshold)
+        {
+            return Err(format!(
+                "mesh.threshold ({threshold}) must be between {} and {}",
+                mesh.threshold.min, mesh.threshold.max
+            ));
+        }
+    }
+    if let Some(target) = options.target_faces {
+        if !(mesh.target_faces_min..=mesh.target_faces_max).contains(&target) {
+            return Err(format!(
+                "mesh.target_faces ({target}) must be between {} and {}",
+                mesh.target_faces_min, mesh.target_faces_max
+            ));
+        }
+    }
+    if options.texture == Some(true) && !matches!(mesh.texture.mode, ControlMode::Adjustable) {
+        return Err(mesh.texture.reason.clone().unwrap_or_else(|| {
+            "PBR texture generation is not available in this build; \
+             omit mesh.texture to render geometry only"
+                .to_string()
+        }));
+    }
+    if options.matting.is_some() {
+        let available = mesh
+            .matting
+            .as_ref()
+            .is_some_and(|control| matches!(control.mode, ControlMode::Adjustable));
+        if !available {
+            return Err(mesh
+                .matting
+                .as_ref()
+                .and_then(|control| control.reason.clone())
+                .unwrap_or_else(|| "Background matting is not available for this recipe".into()));
+        }
+    }
+    if options.delight == Some(true) {
+        let available = mesh
+            .delight
+            .as_ref()
+            .is_some_and(|control| matches!(control.mode, ControlMode::Adjustable));
+        if !available {
+            return Err(mesh
+                .delight
+                .as_ref()
+                .and_then(|control| control.reason.clone())
+                .unwrap_or_else(|| "Delighting is not available for this recipe".into()));
+        }
+    }
+    Ok(())
+}
+
+/// Validate model-owned request fields against the exact resolved recipe.
+/// Family validation may still perform engine-specific structural checks, but
+/// it must not widen these advertised controls.
+pub fn validate_request_against_generation_profile(
+    profile: &GenerationProfileSet,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    validate_request_against_recipe(recipe_for_request(profile, request)?, request)
+}
+
+/// The recipe a request selects: its `pipeline`'s, else the default.
+pub fn recipe_for_request<'a>(
+    profile: &'a GenerationProfileSet,
+    request: &crate::GenerateRequest,
+) -> Result<&'a GenerationRecipeProfile, String> {
+    if let Some(pipeline) = request.pipeline {
+        profile
+            .recipes
+            .iter()
+            .find(|recipe| recipe.request_selector.pipeline == Some(pipeline))
+            .ok_or_else(|| format!("pipeline '{}' is not available for this model", pipeline))
+    } else {
+        profile.default_recipe().ok_or_else(|| {
+            format!(
+                "generation profile '{}' has no default recipe",
+                profile.profile_id
+            )
+        })
+    }
+}
+
+/// The advisory for a non-empty `negative_prompt` sent to a recipe that
+/// hides the control (`capabilities.negative_prompt.mode == Hidden`): the
+/// guidance-distilled and fixed-schedule tiers — Qwen Image 2.1 turbo, FLUX
+/// schnell, the Wan DMD ladder, MiniMax H3 — never run an unconditional
+/// branch, so the text conditions nothing.
+///
+/// A WARNING, never a refusal: older clients and saved drafts send the field
+/// regardless of the recipe, and refusing them would break prints that render
+/// exactly as intended. An empty string is the explicit opt-out and says
+/// nothing. Ask it on the CALLER's request, before any server-side default is
+/// materialized into it.
+pub fn negative_prompt_ignored_warning(
+    profile: &GenerationProfileSet,
+    request: &crate::GenerateRequest,
+) -> Option<String> {
+    let negative = request.negative_prompt.as_deref()?.trim();
+    if negative.is_empty() {
+        return None;
+    }
+    let recipe = recipe_for_request(profile, request).ok()?;
+    (recipe.capabilities.negative_prompt.mode == ControlMode::Hidden).then(|| {
+        format!(
+            "negative prompt ignored by this recipe: '{}' does not read a negative prompt",
+            request.model
+        )
+    })
+}
+
+pub fn validate_request_against_recipe(
+    recipe: &GenerationRecipeProfile,
+    request: &crate::GenerateRequest,
+) -> Result<(), String> {
+    validate_integer("steps", request.steps, &recipe.steps)?;
+    validate_float("guidance", request.guidance, &recipe.guidance)?;
+    if let Some(scheduler) = request.scheduler {
+        let advertised = &recipe.capabilities.schedulers;
+        if !advertised.contains(&scheduler) {
+            return Err(format!(
+                "scheduler '{scheduler}' is not available for this recipe"
+            ));
+        }
+    }
+    if let Some(output_format) = request.output_format {
+        validate_output_format_against_generation_profile(recipe, output_format)?;
+    }
+    validate_mesh_against_recipe(recipe, request)?;
+    // The reference contract is advertised once and validated against the
+    // same block, exactly like `mesh`. The subject is resolved from the
+    // request's own model so this door and family validation cannot word the
+    // same refusal differently.
+    if let Some(reference_images) = recipe.capabilities.reference_images.as_ref() {
+        let subject = reference_subject_label(
+            crate::validation::resolved_family_for(&request.model).unwrap_or_default(),
+            &request.model,
+        );
+        validate_edit_images_against(reference_images, &subject, request)?;
+    }
+    if let Some(transparency) = recipe.capabilities.transparency.as_ref() {
+        validate_transparency_against(transparency, request)?;
+    }
+
+    let resolution = &recipe.resolution;
+    if resolution.domain != ResolutionDomain::None {
+        validate_resolution(resolution, request.width, request.height)?;
+    }
+
+    if let Some(temporal) = &recipe.temporal {
+        let frames = request.frames.unwrap_or(temporal.frames.default);
+        let effective_fps = request.fps.unwrap_or(match temporal.fps {
+            FpsControl::Fixed { value } => value,
+            FpsControl::Adjustable { default, .. } => default,
+        });
+        let mut effective_frames = temporal.frames.clone();
+        if let Some(seconds) = temporal.max_duration_seconds {
+            let raw_duration_cap = seconds
+                .saturating_mul(effective_fps.max(1))
+                .saturating_add(temporal.frame_offset);
+            let grid_cap = raw_duration_cap.saturating_sub(temporal.frame_offset)
+                / temporal.frames.step
+                * temporal.frames.step
+                + temporal.frame_offset;
+            effective_frames.max = effective_frames.max.min(grid_cap);
+        }
+        validate_integer("frames", frames, &effective_frames)?;
+        match temporal.fps {
+            FpsControl::Fixed { value } => {
+                if request.fps.is_some_and(|fps| fps != value) {
+                    return Err(format!("fps is fixed at {value} for this recipe"));
+                }
+            }
+            FpsControl::Adjustable { min, max, step, .. } => {
+                if let Some(fps) = request.fps {
+                    if !(min..=max).contains(&fps) || !(fps - min).is_multiple_of(step) {
+                        return Err(format!(
+                            "fps must be {min} through {max} in steps of {step}"
+                        ));
+                    }
+                }
+            }
+        }
+    } else if request.frames.is_some() || request.fps.is_some() {
+        return Err("frames and fps are not supported by this recipe".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_dimensions_against_recipe(
+    recipe: &GenerationRecipeProfile,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    if recipe.resolution.domain == ResolutionDomain::None {
+        return Err("resolution is not available for this recipe".to_string());
+    }
+    validate_resolution(&recipe.resolution, width, height)
+}
+
+/// Advisory counterpart to the `Warn` off-bucket policy: the size is admitted
+/// (it cleared every hard gate), but the model is not tuned for it. `None`
+/// for exact buckets, for `Reject`-policy recipes (they refuse instead), and
+/// for sizes the recipe refuses outright.
+pub fn off_bucket_resolution_warning(
+    recipe: &GenerationRecipeProfile,
+    width: u32,
+    height: u32,
+) -> Option<String> {
+    let profile = &recipe.resolution;
+    if profile.domain != ResolutionDomain::Buckets
+        || profile.off_bucket.unwrap_or_default() != OffBucketPolicy::Warn
+        || validate_resolution(profile, width, height).is_err()
+    {
+        return None;
+    }
+    let exact = profile
+        .aspect_groups
+        .iter()
+        .flat_map(|group| &group.presets)
+        .any(|preset| preset.width == width && preset.height == height);
+    (!exact).then(|| format!("This model isn't optimized for {width}x{height} — results may vary."))
+}
+
+/// Client-surface advisory for a custom size: the server (or forced-local
+/// engine) is the admission authority, so a recipe refusal is reported as a
+/// warning rather than blocking entry — the request still submits and the
+/// authoritative refusal comes back as the job's own error. Falls through to
+/// the warn-policy off-bucket advisory for admitted sizes.
+pub fn resolution_advisory(
+    recipe: &GenerationRecipeProfile,
+    width: u32,
+    height: u32,
+) -> Option<String> {
+    match validate_dimensions_against_recipe(recipe, width, height) {
+        Err(error) => Some(format!("{error} — the server may reject this size")),
+        Ok(()) => off_bucket_resolution_warning(recipe, width, height),
+    }
+}
+
+fn validate_resolution(profile: &ResolutionProfile, width: u32, height: u32) -> Result<(), String> {
+    if width < profile.min_width || height < profile.min_height {
+        return Err(format!(
+            "width and height must each be at least {}x{} for this recipe",
+            profile.min_width, profile.min_height
+        ));
+    }
+    if !width.is_multiple_of(profile.alignment) || !height.is_multiple_of(profile.alignment) {
+        return Err(format!(
+            "width and height must be multiples of {} for this recipe",
+            profile.alignment
+        ));
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > profile.max_pixels {
+        return Err(format!(
+            "resolution {width}x{height} exceeds this recipe's {} pixel limit",
+            profile.max_pixels
+        ));
+    }
+    if let Some(max_axis) = profile.max_axis_pixels {
+        if width > max_axis || height > max_axis {
+            return Err(format!(
+                "width and height must not exceed {max_axis} for this recipe"
+            ));
+        }
+    }
+    let aspect = f64::from(width) / f64::from(height);
+    if profile
+        .min_aspect_ratio
+        .is_some_and(|minimum| aspect < minimum)
+        || profile
+            .max_aspect_ratio
+            .is_some_and(|maximum| aspect > maximum)
+    {
+        return Err(format!(
+            "resolution {width}x{height} is outside this recipe's aspect-ratio range"
+        ));
+    }
+    if profile.domain == ResolutionDomain::Buckets
+        && profile.off_bucket.unwrap_or_default() == OffBucketPolicy::Reject
+        && !profile
+            .aspect_groups
+            .iter()
+            .flat_map(|group| &group.presets)
+            .any(|preset| preset.width == width && preset.height == height)
+    {
+        return Err(format!(
+            "resolution {width}x{height} is not an available bucket for this recipe"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_integer(name: &str, value: u32, control: &IntegerControl) -> Result<(), String> {
+    if control.mode == ControlMode::Fixed && value != control.default {
+        return Err(format!(
+            "{name} is fixed at {} for this recipe",
+            control.default
+        ));
+    }
+    if !(control.min..=control.max).contains(&value)
+        || !(value - control.min).is_multiple_of(control.step)
+    {
+        return Err(format!(
+            "{name} must be {} through {} in steps of {}",
+            control.min, control.max, control.step
+        ));
+    }
+    Ok(())
+}
+
+fn validate_float(name: &str, value: f64, control: &FloatControl) -> Result<(), String> {
+    if !value.is_finite() {
+        return Err(format!("{name} must be finite"));
+    }
+    if control.mode == ControlMode::Fixed && (value - control.default).abs() > f64::EPSILON {
+        return Err(format!(
+            "{name} is fixed at {} for this recipe",
+            control.default
+        ));
+    }
+    if value < control.min || value > control.max {
+        return Err(format!(
+            "{name} must be {} through {}",
+            control.min, control.max
+        ));
+    }
+    if control.step <= 0.0 || !control.step.is_finite() {
+        return Err(format!("{name} has an invalid profile step"));
+    }
+    let steps = (value - control.min) / control.step;
+    let tolerance = f64::EPSILON * 16.0 * steps.abs().max(1.0);
+    if (steps - steps.round()).abs() > tolerance {
+        return Err(format!(
+            "{name} must be {} through {} in steps of {}",
+            control.min, control.max, control.step
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationProfileInput<'a> {
+    pub model: &'a str,
+    pub family: &'a str,
+    pub sub_family: Option<&'a str>,
+    pub default_width: u32,
+    pub default_height: u32,
+    pub default_steps: u32,
+    pub default_guidance: f64,
+    pub default_frames: Option<u32>,
+    pub default_fps: Option<u32>,
+    pub default_negative_prompt: Option<String>,
+    pub source_image: Option<SourceImageCapability>,
+    pub supports_sequence: bool,
+    pub supports_extend: bool,
+    pub supports_audio: bool,
+}
+
+/// Resolve the canonical shipped profile for a built-in manifest.
+///
+/// Catalog advertisement, generated documentation, and registry invariants
+/// all call this function so they cannot independently reinterpret manifest
+/// defaults or capabilities.
+pub fn generation_profile_for_manifest(
+    manifest: &crate::manifest::ModelManifest,
+) -> GenerationProfileSet {
+    let family = manifest.family.as_str();
+    generation_profile_for_manifest_with_defaults(
+        manifest,
+        GenerationDefaultsProfile {
+            width: manifest.defaults.width,
+            height: manifest.defaults.height,
+            steps: manifest.defaults.steps,
+            guidance: manifest.defaults.guidance,
+            frames: manifest.defaults.frames,
+            fps: manifest.defaults.fps,
+            negative_prompt: crate::manifest::default_negative_prompt_for_family(family)
+                .map(str::to_string),
+        },
+    )
+}
+
+/// Resolve a built-in manifest while preserving validated local default
+/// overlays. Identity and capabilities still come exclusively from the
+/// manifest; callers may replace only user-owned defaults.
+pub fn generation_profile_for_manifest_with_defaults(
+    manifest: &crate::manifest::ModelManifest,
+    defaults: GenerationDefaultsProfile,
+) -> GenerationProfileSet {
+    let family = manifest.family.as_str();
+    resolve_generation_profile(GenerationProfileInput {
+        model: &manifest.name,
+        family,
+        sub_family: None,
+        default_width: defaults.width,
+        default_height: defaults.height,
+        default_steps: defaults.steps,
+        default_guidance: defaults.guidance,
+        default_frames: defaults.frames,
+        default_fps: defaults.fps,
+        default_negative_prompt: defaults.negative_prompt,
+        source_image: manifest.defaults.source_image,
+        supports_sequence: crate::chain::model_supports_sequence(&manifest.name, family),
+        supports_extend: crate::catalog::extend_capable_model(
+            family,
+            manifest.defaults.source_image,
+        ),
+        // A family that declares its own audio contract answers here (H3
+        // always renders synchronized audio); LTX-2 keeps the optimistic
+        // family answer the server's per-checkpoint probe then narrows.
+        supports_audio: crate::catalog::declared_audio_capability(family, &manifest.name)
+            .unwrap_or(family == "ltx2"),
+    })
+}
+
+const SD15: &[(u32, u32)] = &[(512, 512), (512, 768), (768, 512), (384, 512), (512, 384)];
+const SDXL: &[(u32, u32)] = &[
+    (1024, 1024),
+    (1152, 896),
+    (896, 1152),
+    (1216, 832),
+    (832, 1216),
+    (1344, 768),
+    (768, 1344),
+    (1536, 640),
+    (640, 1536),
+];
+const SD3: &[(u32, u32)] = &[
+    (1024, 1024),
+    (1152, 896),
+    (896, 1152),
+    (1216, 832),
+    (832, 1216),
+    (1344, 768),
+    (768, 1344),
+];
+const FLUX: &[(u32, u32)] = &[
+    (1024, 1024),
+    (1024, 768),
+    (768, 1024),
+    (1024, 576),
+    (576, 1024),
+    (768, 768),
+];
+/// Official, runtime-qualified Z-Image-Turbo 1024-tier presets.
+const Z_IMAGE_UPSTREAM_CANDIDATES: &[(u32, u32)] = &[
+    (1024, 1024),
+    (1152, 896),
+    (896, 1152),
+    (1152, 864),
+    (864, 1152),
+    (1248, 832),
+    (832, 1248),
+    (1280, 720),
+    (720, 1280),
+    (1344, 576),
+    (576, 1344),
+];
+/// Current official Qwen-Image standard aspect-ratio presets.
+const QWEN_UPSTREAM_CANDIDATES: &[(u32, u32)] = &[
+    (1328, 1328),
+    (1664, 928),
+    (928, 1664),
+    (1472, 1104),
+    (1104, 1472),
+    (1584, 1056),
+    (1056, 1584),
+];
+/// Qwen Image 2.1's upstream canvases: Mold's qualified 1024x1024 default
+/// plus the model card's native 2K "Supported Aspect Ratios" table
+/// (`Qwen/Qwen-Image-2.1` README at `b3179ad` lines 111-121, 1:1, 4:3, 3:4, 3:2, 2:3, 16:9,
+/// 9:16 in that order). Every size is on the family's 32 px grid; the largest
+/// area (2400x1792) and longest side (2752) are the family ceilings
+/// `validation::QWEN_IMAGE21_MAX_PIXELS` / `QWEN_IMAGE21_MAX_AXIS`.
+const QWEN_IMAGE21_UPSTREAM_CANDIDATES: &[(u32, u32)] = &[
+    (1024, 1024),
+    (2048, 2048),
+    (2400, 1792),
+    (1792, 2400),
+    (2528, 1696),
+    (1696, 2528),
+    (2752, 1536),
+    (1536, 2752),
+];
+/// Mold's own ~1 MP aspect presets for Qwen Image 2.1 — NOT upstream's (the
+/// card publishes only the 2K table). Each keeps the 2K preset's aspect at
+/// roughly the default 1024² area, on the 32 px grid, so a user can pick a
+/// non-square shape without paying a 4 MP render. Recorded with
+/// `MoldPolicy` provenance beside the upstream record.
+const QWEN_IMAGE21_MOLD_1K_PRESETS: &[(u32, u32)] = &[
+    (1184, 896),
+    (896, 1184),
+    (1248, 832),
+    (832, 1248),
+    (1376, 768),
+    (768, 1376),
+];
+/// Every canvas the 2.1 profile recommends: the upstream candidates plus
+/// Mold's 1K aspect presets.
+const QWEN_IMAGE21_PRESETS: &[(u32, u32)] = &[
+    (1024, 1024),
+    (1184, 896),
+    (896, 1184),
+    (1248, 832),
+    (832, 1248),
+    (1376, 768),
+    (768, 1376),
+    (2048, 2048),
+    (2400, 1792),
+    (1792, 2400),
+    (2528, 1696),
+    (1696, 2528),
+    (2752, 1536),
+    (1536, 2752),
+];
+const WUERSTCHEN: &[(u32, u32)] = &[(1024, 1024)];
+const LTX_VIDEO: &[(u32, u32)] = &[
+    (704, 480),
+    (768, 512),
+    (512, 512),
+    (1024, 576),
+    (1216, 704),
+    (576, 1024),
+    (768, 768),
+    (512, 768),
+];
+const LTX2: &[(u32, u32)] = &[
+    (704, 480),
+    (768, 512),
+    (512, 512),
+    (1024, 576),
+    (1216, 704),
+    (704, 1216),
+    (576, 1024),
+    (768, 768),
+    (512, 768),
+    (1536, 1024),
+    (1024, 1536),
+    (1920, 1088),
+    (1088, 1920),
+];
+const WAN_480: &[(u32, u32)] = &[(832, 480), (480, 832)];
+const WAN_480_720: &[(u32, u32)] = &[(832, 480), (480, 832), (1280, 720), (720, 1280)];
+const WAN_TI2V: &[(u32, u32)] = &[(1280, 704), (704, 1280)];
+const H3: &[(u32, u32)] = &[
+    (1536, 672),
+    (1344, 768),
+    (1024, 768),
+    (768, 768),
+    (768, 1024),
+    (768, 1344),
+];
+/// The compact stack's RECOMMENDED canvases. Its admission rule is
+/// `minimax_h3::is_admitted_compact_canvas` — any 32-aligned canvas inside the
+/// campaign's own area ceiling — so these are a ladder to pick from rather
+/// than the only sizes that run. Restating the list here is what would let it
+/// drift from the runtime that enforces the rule.
+const H3_COMPACT: &[(u32, u32)] = crate::minimax_h3::REVIEWED_COMPACT_CANVASES;
+
+const Z_IMAGE_QUALIFICATION: ResolutionQualificationRecord =
+    ResolutionQualificationRecord {
+        family: "z-image",
+        source: "https://huggingface.co/spaces/Tongyi-MAI/Z-Image-Turbo/blob/768cb50d847cdbba97c89533ae976be69cf5a5b8/app.py",
+        revision: "768cb50d847cdbba97c89533ae976be69cf5a5b8",
+        qualified: true,
+        evidence: "docs/qualification/z-image-1024-tier-metal-q4.json: exact-size Q4 Metal generation and decoded PNG delivery for every 1024-tier candidate",
+        candidates: Z_IMAGE_UPSTREAM_CANDIDATES,
+    };
+
+const QWEN_IMAGE_QUALIFICATION: ResolutionQualificationRecord =
+    ResolutionQualificationRecord {
+        family: "qwen-image",
+        source: "https://github.com/QwenLM/Qwen-Image/blob/6b5e1f5cec987d404be5ac6657db3b9aacb56a89/README.md",
+        revision: "6b5e1f5cec987d404be5ac6657db3b9aacb56a89",
+        qualified: true,
+        evidence: "contract qualification: pinned upstream README.md aspect_ratios oracle; Mold dynamic /16 admission and common decoded-image delivery are resolution-generic; no per-size runtime-performance claim",
+        candidates: QWEN_UPSTREAM_CANDIDATES,
+    };
+
+const QWEN_IMAGE21_QUALIFICATION: ResolutionQualificationRecord =
+    ResolutionQualificationRecord {
+        family: "qwen-image21",
+        source: "https://huggingface.co/Qwen/Qwen-Image-2.1/blob/b3179ad355be050328e483a9dfdd9e60cd62adfa/README.md",
+        revision: "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+        qualified: true,
+        evidence: "docs/qualification/qwen-image-2.1-metal-uat.json: SHA-256-verified official checkpoint, full default 1024x1024/40-step Metal render, and decoded RGB PNG delivery; the seven 2K presets are the pinned README's Supported Aspect Ratios table, admitted by the family's 2400x1792 / 2752 px ceilings, with CUDA renders recorded in docs/qualification/qwen-image-2.1-cuda-performance.json",
+        candidates: QWEN_IMAGE21_UPSTREAM_CANDIDATES,
+    };
+
+/// Return the pinned upstream dimension record and its Mold qualification
+/// status for a family with an authored aspect set.
+pub fn resolution_qualification_record(
+    family: &str,
+) -> Option<&'static ResolutionQualificationRecord> {
+    match canonical_family(family) {
+        "z-image" => Some(&Z_IMAGE_QUALIFICATION),
+        "qwen-image" => Some(&QWEN_IMAGE_QUALIFICATION),
+        "qwen-image21" => Some(&QWEN_IMAGE21_QUALIFICATION),
+        _ => None,
+    }
+}
+
+pub fn family_presets(family: &str) -> &'static [(u32, u32)] {
+    match canonical_family(family) {
+        "sd15" => SD15,
+        "sdxl" => SDXL,
+        "sd3" => SD3,
+        "flux" | "flux2" => FLUX,
+        "z-image" => Z_IMAGE_UPSTREAM_CANDIDATES,
+        "qwen-image" | "qwen-image-edit" => QWEN_UPSTREAM_CANDIDATES,
+        "qwen-image21" => QWEN_IMAGE21_PRESETS,
+        "wuerstchen" => WUERSTCHEN,
+        "ltx-video" => LTX_VIDEO,
+        "ltx2" => LTX2,
+        "wan" => WAN_480_720,
+        "minimax-h3" => H3,
+        _ => &[],
+    }
+}
+
+/// Resolve the authored UI grouping for the conservative legacy family
+/// adapter. The dimensions and their display grouping therefore come from the
+/// same registry path as versioned profiles.
+pub fn family_aspect_groups(family: &str) -> Vec<AspectGroup> {
+    let family = canonical_family(family);
+    aspect_groups(family, family_presets(family))
+}
+
+pub fn presets_for_identity<'a>(
+    model: &str,
+    family: &str,
+    sub_family: Option<&str>,
+) -> &'a [(u32, u32)] {
+    let family = canonical_family(family);
+    if family == "minimax-h3" {
+        // Only the hidden official BF16 references keep the flexible ladder.
+        // Every compact identity — and any identity the layout resolver does
+        // not recognize — takes the fixed reviewed envelope, the same
+        // fail-toward-the-stricter-contract rule as `source_fit_dimensions`.
+        return match crate::minimax_h3::layout_for_model(model) {
+            Some(crate::minimax_h3::Layout::OfficialBf16) => H3,
+            _ => H3_COMPACT,
+        };
+    }
+    if family != "wan" {
+        return family_presets(family);
+    }
+    let identity = format!(
+        "{} {}",
+        crate::manifest::resolve_model_name(model).to_ascii_lowercase(),
+        sub_family.unwrap_or_default().to_ascii_lowercase()
+    );
+    if identity.contains("ti2v-5b") {
+        WAN_TI2V
+    } else if identity.contains("1.3b") {
+        WAN_480
+    } else {
+        WAN_480_720
+    }
+}
+
+pub fn canonical_family(family: &str) -> &str {
+    match family.trim() {
+        "ltx-2" => "ltx2",
+        "flux.2" | "flux-2" => "flux2",
+        "minimax_h3" | "minimaxh3" => "minimax-h3",
+        other => other,
+    }
+}
+
+pub fn resolve_generation_profile(input: GenerationProfileInput<'_>) -> GenerationProfileSet {
+    let family = canonical_family(input.family);
+    let profile_id = input
+        .sub_family
+        .map(|sub| format!("{family}.{sub}"))
+        .unwrap_or_else(|| format!("{family}.{}", crate::manifest::model_base_name(input.model)));
+    let mut recipes = if family == "ltx2" {
+        let mut recipes = vec![recipe(&input, "auto", "Auto", None)];
+        for pipeline in Ltx2PipelineMode::ALL {
+            recipes.push(recipe(
+                &input,
+                pipeline.as_str(),
+                &pipeline_label(pipeline),
+                Some(pipeline),
+            ));
+        }
+        recipes
+    } else {
+        vec![recipe(&input, "default", "Default", None)]
+    };
+    recipes.retain(|recipe| {
+        !(family == "ltx2"
+            && recipe.request_selector.pipeline == Some(Ltx2PipelineMode::T2a)
+            && !input.supports_audio)
+    });
+    let mut set = GenerationProfileSet {
+        schema_version: GENERATION_PROFILE_SCHEMA_VERSION,
+        profile_id,
+        profile_hash: String::new(),
+        default_recipe_id: if family == "ltx2" { "auto" } else { "default" }.to_string(),
+        recipes,
+    };
+    set.refresh_hash();
+    set
+}
+
+/// The sentence explaining a fixed guidance control.
+///
+/// Authored beside the decision that fixes the scale, so the wording can never
+/// describe a value the recipe did not pin. H3 does not run a guided branch at
+/// all, so its copy names that rather than a distilled CFG the user could
+/// escape by picking a Dev checkpoint.
+fn fixed_guidance_note(
+    family: &str,
+    dmd_ladder: Option<crate::manifest::WanDmdLadder>,
+    guidance_caps: GuidanceCapabilities,
+    scale: f64,
+) -> Option<String> {
+    if guidance_caps.adjustable {
+        return None;
+    }
+    if family == "minimax-h3" {
+        return Some(
+            "MiniMax H3 does not use classifier-free guidance; guidance is fixed at 0.".to_string(),
+        );
+    }
+    // Asked of the ladder itself, never of the family: a future Wan tier that
+    // pins a scale for some other reason must not inherit this sentence.
+    if dmd_ladder.is_some() {
+        return Some(
+            "This DMD distill runs one forward per rung; guidance is fixed at 1.0 and a negative \
+             prompt is not encoded."
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "Distilled recipe fixes CFG at {scale:.1}. Choose a Dev checkpoint with Auto or a guided pipeline to adjust it."
+    ))
+}
+
+/// The sentence explaining a distilled tier's fixed step count (Turbo, DMAD, or
+/// PDMD — the wording is family-neutral because the tier families differ).
+///
+/// A reviewed Turbo tier's `steps` is terminal-inclusive — the published
+/// N-step schedule has N denoise intervals and therefore N+1 sampler grid
+/// points ([`crate::minimax_h3::TurboManifestTier::steps`]) — so the field
+/// shows 9 for the 8-step tier. Saying so is the whole point of the note.
+fn fixed_turbo_steps_note(tier: &crate::minimax_h3::TurboManifestTier) -> String {
+    let intervals = tier.steps.saturating_sub(1);
+    let points = tier.steps;
+    format!(
+        "Fixed by the {intervals}-step distilled tier: {points} terminal-inclusive sampler grid points ({intervals} denoise intervals)."
+    )
+}
+
+/// The sentence explaining a distilled BASE tier's fixed step count. Neutral
+/// wording: the schedule belongs to a full-weight distilled transformer, not
+/// to a Turbo adapter, and is counted terminal-inclusive like one.
+fn fixed_distilled_base_steps_note(tier: &crate::minimax_h3::DistilledBaseManifestTier) -> String {
+    let intervals = tier.steps.saturating_sub(1);
+    let points = tier.steps;
+    format!(
+        "Fixed by the {intervals}-step distilled tier: {points} terminal-inclusive sampler grid points ({intervals} denoise intervals)."
+    )
+}
+
+/// The sentence explaining an UNDISTILLED H3 tag's step FLOOR.
+///
+/// The control is adjustable, so nothing here is about a pin: it is about a
+/// bound the user can see and cannot otherwise account for. The floor is the
+/// smallest schedule the checkpoint was ever reviewed at, and below it the
+/// print flashes once per latent frame — a failure that looks like a bug in
+/// mold rather than a step count the user chose, which is exactly why the
+/// number needs a sentence. The 4- and 8-step renders someone came here
+/// looking for exist, on the Turbo tags, so the note says where.
+fn base_compact_steps_note() -> String {
+    format!(
+        "Floor is the undistilled tier's smallest reviewed schedule: {} terminal-inclusive sampler grid points (ComfyUI's default; the released default is {}). Fewer flash once per latent frame — pick a Turbo tag for a 4- or 8-step render.",
+        crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+        crate::minimax_h3::DEFAULT_STEPS,
+    )
+}
+
+/// The sentence explaining a DMD-distilled Wan tier's fixed step count.
+///
+/// The ladder is not a budget the user spends: the student was trained to
+/// predict x0 at exactly these timesteps, so naming them is the note. The
+/// table is named alongside them because a timestep means nothing without
+/// one, and the shipped distills do not share a table — the 1.3B sits on
+/// shift 8 and the TI2V-5B on shift 5.
+/// Why a Qwen Image 2.1 turbo tier's guidance is pinned.
+const QWEN21_TURBO_GUIDANCE_NOTE: &str = "The Viggle turbo distill runs one forward per step; guidance is fixed at 1.0 and a negative prompt is not encoded.";
+
+fn fixed_qwen21_turbo_steps_note(schedule: crate::manifest::QwenTurboSchedule) -> String {
+    let sigmas = schedule
+        .sigmas
+        .iter()
+        .map(|sigma| sigma.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Fixed by the Viggle turbo distill: {} steps on the published sigmas {sigmas}.",
+        schedule.steps()
+    )
+}
+
+fn fixed_dmd_steps_note(ladder: crate::manifest::WanDmdLadder) -> String {
+    let rungs = ladder
+        .rungs
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Fixed by the DMD distill: {} denoise rungs at timesteps {rungs} on FastVideo's shift-{:.0} sigma table.",
+        ladder.rungs.len(),
+        ladder.table_shift
+    )
+}
+
+/// The three step counts a client can offer as a quality ladder: a faster
+/// draft, the recipe's own default, and a slower pass.
+///
+/// The rungs are relative to the DEFAULT rather than to the control's bounds,
+/// because the default is the only number the recipe actually vouches for —
+/// the bounds are a validation envelope (`1..=100` for most families), and
+/// thirds of that envelope would offer 33 steps for a 4-step Klein render.
+/// Half rounds up so a 1-step default cannot produce a zero rung, and both
+/// outer rungs are clamped into `[min, max]` before the list is deduped, so a
+/// narrow band collapses rather than escaping the control.
+///
+/// A FIXED control never comes here: a wan DMD tier and an H3 Turbo tier are
+/// distilled onto one schedule length, and a second rung would advertise a
+/// render they cannot perform.
+pub fn steps_ladder(min: u32, default: u32, max: u32) -> Vec<u32> {
+    let mut rungs = vec![
+        default.div_ceil(2).max(min),
+        default,
+        (default * 3).div_ceil(2).min(max),
+    ];
+    rungs.sort_unstable();
+    rungs.dedup();
+    rungs
+}
+
+fn recipe(
+    input: &GenerationProfileInput<'_>,
+    id: &str,
+    label: &str,
+    pipeline: Option<Ltx2PipelineMode>,
+) -> GenerationRecipeProfile {
+    let family = canonical_family(input.family);
+    let source_image =
+        validation::source_image_capability_for_engine(Some(family), input.source_image);
+    // The reviewed compact H3 stack has one canvas, one step count, and one
+    // frame count. All three are derived from the identity, never from
+    // `input.default_*` — those are laundered through user `model_prefs` in
+    // `build_model_catalog` and can carry a stale off-envelope value.
+    let h3_compact = crate::minimax_h3::uses_reviewed_compact_envelope(family, input.model);
+    // A Turbo tier's step count is a property of the distilled adapter, not
+    // a qualification pin: its schedule has exactly that many grid points, so
+    // it stays a fixed control. The base compact tag takes a range.
+    let h3_compact_turbo = crate::minimax_h3::turbo_tier_for_model(input.model);
+    // A distilled BASE tier (FastH3 V2) is fixed for the same reason: its
+    // full-weight distillation has exactly that schedule length. The one
+    // authority for "is this H3 step control fixed" is `fixed_steps_for_model`.
+    let h3_distilled_base = crate::minimax_h3::distilled_base_tier_for_model(input.model);
+    let h3_compact_turbo_steps = crate::minimax_h3::fixed_steps_for_model(input.model);
+    let h3_compact_steps = h3_compact_turbo_steps.unwrap_or(crate::minimax_h3::COMFY_DEFAULT_STEPS);
+    let audio_only = pipeline == Some(Ltx2PipelineMode::T2a);
+    // A mesh recipe is canvasless for the same reason an audio-only one is:
+    // the artifact has no pixel dimensions. The source image is letterboxed to
+    // the checkpoint's own conditioning size, which is not a canvas the user
+    // picks, so advertising a resolution control here would offer a knob the
+    // engine ignores.
+    let mesh_only = family == crate::manifest::HUNYUAN3D_FAMILY;
+    // The reference contract is resolved ONCE, here, and everything that used
+    // to sniff `qwen-image-edit` or `contains("dev")` reads it instead.
+    let reference_images = reference_images_for_recipe(family, input.model);
+    let references_visible = !matches!(reference_images.mode, ControlMode::Hidden);
+    // Only a recipe whose references REPLACE the source latent loses img2img:
+    // an `Exclusive` recipe (Klein) still renders from a source image when no
+    // references are attached, so it keeps strength and the mask.
+    let references_replace_source = references_visible
+        && matches!(
+            reference_images.source_relation,
+            ReferenceSourceRelation::Replaces
+        );
+    // A target-first recipe edits the image it is given, so the canvas follows
+    // the source rather than a picked size.
+    let source_driven = reference_images.primary_is_target
+        || matches!(
+            pipeline,
+            Some(Ltx2PipelineMode::Retake | Ltx2PipelineMode::LipDub)
+        );
+    let composed = family == "ltx2"
+        && pipeline
+            .map(Ltx2PipelineMode::refines_spatially)
+            .unwrap_or_else(|| {
+                validation::ltx2_spatial_composition(input.model, None)
+                    == validation::Ltx2SpatialComposition::TiledTwoStage
+            });
+    let composition = if composed {
+        validation::Ltx2SpatialComposition::TiledTwoStage
+    } else {
+        validation::Ltx2SpatialComposition::SinglePass
+    };
+    let alignment = if composed {
+        validation::LTX2_TWO_STAGE_ALIGNMENT
+    } else if family == "wan" {
+        identity_alignment(input.model, family, input.sub_family)
+    } else {
+        validation::dimension_alignment_for_family(Some(family))
+    };
+    let mut dimensions = presets_for_identity(input.model, family, input.sub_family).to_vec();
+    if composed {
+        for rung in validation::LTX2_OUTPUT_RUNGS
+            .iter()
+            .filter(|rung| rung.requires_tiled_stage2())
+        {
+            dimensions.push((rung.width, rung.height));
+            dimensions.push((rung.height, rung.width));
+        }
+    }
+    dimensions.retain(|(width, height)| {
+        width.is_multiple_of(alignment)
+            && height.is_multiple_of(alignment)
+            && validation::validate_generation_dimensions_composed(
+                *width,
+                *height,
+                Some(family),
+                composition,
+            )
+            .is_ok()
+    });
+    let resolution = if audio_only || mesh_only {
+        ResolutionProfile {
+            domain: ResolutionDomain::None,
+            alignment: 1,
+            min_width: 0,
+            min_height: 0,
+            max_pixels: 0,
+            source_max_pixels: None,
+            max_axis_pixels: None,
+            min_aspect_ratio: None,
+            max_aspect_ratio: None,
+            off_bucket: None,
+            aspect_groups: Vec::new(),
+        }
+    } else {
+        ResolutionProfile {
+            domain: if source_driven {
+                ResolutionDomain::SourceDriven
+            } else if family == "wan" {
+                ResolutionDomain::Buckets
+            } else {
+                // The compact H3 stack is a RANGE, not a bucket set: any
+                // 32-aligned canvas inside its area ceiling is admitted and
+                // the memory estimate decides what fits. Its presets survive
+                // as `aspect_groups` recommendations.
+                ResolutionDomain::Dynamic
+            },
+            alignment,
+            min_width: if h3_compact {
+                crate::minimax_h3::reviewed_compact_min_axis_pixels()
+            } else {
+                alignment.max(64)
+            },
+            min_height: if h3_compact {
+                crate::minimax_h3::reviewed_compact_min_axis_pixels()
+            } else {
+                alignment.max(64)
+            },
+            // The compact stack's ceilings come from its own canvas rule. The
+            // family constants are the *official* BF16 ladder's headroom and
+            // sit above the compact area ceiling, which lets a client that
+            // reads the ceiling offer a size admission refuses.
+            max_pixels: if h3_compact {
+                crate::minimax_h3::reviewed_compact_max_pixels()
+            } else {
+                validation::max_pixels_for_family_composed(Some(family), composition)
+            },
+            // A target-first recipe's "source" IS its first reference, so the
+            // conditioning ceiling is the reference ceiling — one number, not
+            // two that can drift.
+            source_max_pixels: reference_images
+                .primary_is_target
+                .then_some(reference_images.max_pixels_single)
+                .flatten(),
+            max_axis_pixels: if h3_compact {
+                Some(crate::minimax_h3::reviewed_compact_max_axis_pixels())
+            } else {
+                validation::max_axis_pixels_for_family_composed(Some(family), composition)
+            },
+            min_aspect_ratio: (family == "minimax-h3")
+                .then_some(crate::minimax_h3::MIN_ASPECT_RATIO),
+            max_aspect_ratio: (family == "minimax-h3")
+                .then_some(crate::minimax_h3::MAX_ASPECT_RATIO),
+            // Wan's buckets are the trained sizes, not the only runnable
+            // ones — a deliberate off-bucket request is admitted and the
+            // advisory warning channel says results may vary. H3's compact
+            // presets are recommendations on a continuous range, so there is
+            // no off-bucket question to answer at all.
+            off_bucket: (family == "wan").then_some(OffBucketPolicy::Warn),
+            aspect_groups: aspect_groups(family, &dimensions),
+        }
+    };
+
+    let guidance_caps = if family == "minimax-h3" {
+        GuidanceCapabilities {
+            adjustable: false,
+            supports_negative_prompt: false,
+            fixed_scale: Some(0.0),
+        }
+    } else {
+        GuidanceCapabilities::for_recipe(family, input.model, pipeline)
+    };
+    let effective_guidance = guidance_caps.fixed_scale.unwrap_or(input.default_guidance);
+    let mut temporal = temporal_profile(input, family);
+    if let Some(temporal) = temporal.as_mut().filter(|_| h3_compact) {
+        // The compact stack takes the FAMILY frame grid. It was pinned to one
+        // clip length because the runtime envelope validated `frames` by
+        // equality; the envelope is now minted per request and the memory
+        // estimate refuses what does not fit.
+        temporal.frames = IntegerControl {
+            default: crate::minimax_h3::DEFAULT_COMPACT_FRAMES,
+            min: crate::minimax_h3::MIN_FRAMES,
+            max: crate::minimax_h3::MAX_FRAMES,
+            step: crate::minimax_h3::FRAME_STEP,
+            recommended: vec![
+                crate::minimax_h3::MIN_FRAMES,
+                crate::minimax_h3::DEFAULT_COMPACT_FRAMES,
+                226,
+                crate::minimax_h3::MAX_FRAMES,
+            ],
+            mode: ControlMode::Adjustable,
+            note: None,
+        };
+    }
+    // This predicate now answers exactly ONE question: does the checkpoint's
+    // own loader refuse a LoRA? FLUX.2 [dev] does; Klein does not, and Klein
+    // has references too, so the reference contract above is what mask,
+    // strength, and the canvas read. It matches `validation::is_flux2_dev_model`
+    // so admission and the profile cannot disagree about which tier this is.
+    let flux2_dev = family == "flux2" && validation::is_flux2_dev_model(input.model);
+    let wan = family == "wan";
+    let normalized_model = crate::manifest::resolve_model_name(input.model).to_ascii_lowercase();
+    // A DMD-distilled Wan tier walks exactly the rungs
+    // `manifest::wan_dmd_ladder` pins, predicting x0 at each and re-noising
+    // to the next (FastVideo's `DmdDenoisingStage`). The step count, the
+    // guidance, the solver, and the flow shift are all properties of that
+    // published schedule rather than user preferences, so the profile pins
+    // every one of them instead of offering a control the engine ignores.
+    let wan_dmd_ladder = wan
+        .then(|| crate::manifest::wan_dmd_ladder(&normalized_model))
+        .flatten();
+    let wan_dmd_steps = wan_dmd_ladder.map(|ladder| ladder.rungs.len() as u32);
+    // A Qwen Image 2.1 turbo tier walks Viggle's six published sigmas with
+    // the distilled adapter installed: steps and guidance are the recipe's
+    // (`manifest::qwen_image21_turbo_schedule`), never a preference.
+    let qwen21_turbo = (family == "qwen-image21")
+        .then(|| crate::manifest::qwen_image21_turbo_schedule(&normalized_model))
+        .flatten();
+    let pinned_steps = wan_dmd_steps.or(qwen21_turbo.map(|schedule| schedule.steps()));
+    // BFL's own FP8 Flux.2 conversions store `weight / weight_scale`, and a
+    // LoRA merge widens the weight it patches — dropping the scale on exactly
+    // the layers the adapter touches. `Flux2Engine::load_transformer` refuses
+    // the pair, so the control must not be offered. Same shape of refusal as
+    // wan's fp8-scaled expert tier below.
+    let flux2_fp8 = family == "flux2" && normalized_model.ends_with(":fp8");
+    // Checkpoints whose own loader refuses an adapter stack, whatever the
+    // family supports: FLUX.2 [dev]'s reference protocol, the FP8 Flux.2
+    // conversions, and wan's fp8-scaled expert pair.
+    let checkpoint_refuses_lora =
+        flux2_dev || flux2_fp8 || (wan && normalized_model.ends_with("a14b:fp8"));
+    let lora_supported = validation::family_supports_lora(family) && !checkpoint_refuses_lora;
+    let source_video_required = matches!(
+        pipeline,
+        Some(Ltx2PipelineMode::IcLora | Ltx2PipelineMode::Retake | Ltx2PipelineMode::LipDub)
+    );
+    let source_video_supported = family == "ltx2" && !audio_only;
+    let keyframes_required = pipeline == Some(Ltx2PipelineMode::Keyframe);
+    let keyframes_supported = family == "ltx2" || wan;
+    let audio_input_required = pipeline == Some(Ltx2PipelineMode::A2Vid);
+    let audio_input_supported = family == "ltx2" && !audio_only;
+    let mask_supported = !audio_only
+        && !mesh_only
+        && !matches!(family, "ltx-video" | "ltx2" | "wan" | "minimax-h3")
+        && !references_replace_source
+        && source_image != Some(SourceImageCapability::Unsupported);
+    // Denoise strength describes how much of an existing latent survives. A
+    // family that never starts from one — audio-only, mesh, wan's pinned
+    // conditioning frames, the source-driven edit pipelines, and any recipe
+    // that takes no source image at all — does not read the field, so
+    // advertising it would offer a slider with no effect.
+    let supports_strength = !audio_only
+        && !mesh_only
+        && !wan
+        && family != "minimax-h3"
+        && family != crate::manifest::HUNYUAN3D_MATTING_FAMILY
+        && family != crate::manifest::HUNYUAN3D_DELIGHT_FAMILY
+        && !references_replace_source
+        && source_image != Some(SourceImageCapability::Unsupported);
+    // The advertised mode is the answer for a CONDITIONED request, because
+    // that is the only one that can differ from `Required`. A client resolves
+    // it against the request it is actually building — the same
+    // `prompt_requirement_for_family` call admission makes — so a recipe that
+    // can never carry conditioning advertises `Required` outright.
+    let prompt_mode = prompt_requirement_for_family(
+        Some(family),
+        !audio_only && source_image != Some(SourceImageCapability::Unsupported),
+    );
+    let controlnet_supported = family == "sd15";
+    // Identity conditioning is advertised only when this binary can actually
+    // execute it AND the checkpoint is one of the qualified ones. Both halves
+    // belong to `crate::identity`: `identity_runtime_available` is the feature
+    // AND the landed runtime adapter, never a bare `cfg!(feature = "pulid")`,
+    // which would advertise a control the worker cannot honour.
+    let identity_supported = crate::identity::identity_runtime_available()
+        && crate::identity::identity_qualified_model_with_family(input.model, Some(family));
+    let output = if mesh_only {
+        OutputCapabilitiesProfile {
+            // GLB is the only STORED form. OBJ, OBJ+PBR ZIP, STL and PLY are offered as
+            // export transcodes from the gallery, never as generation
+            // targets: each of them loses something the stored glTF carries
+            // — materials and textures for OBJ, vertex identity and UVs for
+            // STL — so publishing one would publish an incomplete artifact.
+            default_format: OutputFormat::Glb,
+            formats: vec![OutputFormat::Glb],
+            audio_requires_mp4: false,
+            delivery_reason: Some(
+                "3-D delivery uses binary glTF; OBJ, OBJ+PBR ZIP, STL and PLY are available as gallery exports."
+                    .to_string(),
+            ),
+        }
+    } else if audio_only {
+        OutputCapabilitiesProfile {
+            default_format: OutputFormat::Wav,
+            formats: vec![OutputFormat::Wav],
+            audio_requires_mp4: false,
+            delivery_reason: Some("Audio-only delivery uses WAV.".to_string()),
+        }
+    } else if family == "minimax-h3" {
+        OutputCapabilitiesProfile {
+            default_format: OutputFormat::Mp4,
+            formats: vec![OutputFormat::Mp4],
+            audio_requires_mp4: true,
+            delivery_reason: Some("Synchronized H3 audio/video delivery requires MP4.".to_string()),
+        }
+    } else if temporal.is_some() {
+        OutputCapabilitiesProfile {
+            default_format: OutputFormat::Mp4,
+            formats: vec![
+                OutputFormat::Mp4,
+                OutputFormat::Gif,
+                OutputFormat::Apng,
+                OutputFormat::Webp,
+            ],
+            audio_requires_mp4: family == "ltx2",
+            delivery_reason: (family == "ltx2")
+                .then(|| "Audio-enabled video delivery requires MP4.".to_string()),
+        }
+    } else {
+        OutputCapabilitiesProfile {
+            default_format: OutputFormat::Png,
+            formats: vec![OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Webp],
+            audio_requires_mp4: false,
+            delivery_reason: None,
+        }
+    };
+    let default_width = if h3_compact {
+        crate::minimax_h3::DEFAULT_WIDTH
+    } else {
+        input.default_width
+    };
+    let default_height = if h3_compact {
+        crate::minimax_h3::DEFAULT_HEIGHT
+    } else {
+        input.default_height
+    };
+    // Like the H3 compact envelope, a DMD ladder's step count is derived from
+    // the identity and never from `input.default_steps` — that value is
+    // laundered through user `model_prefs` in `build_model_catalog` and can
+    // carry a stale off-ladder number.
+    let default_steps = match (pinned_steps, h3_compact) {
+        (Some(steps), _) => steps,
+        (None, true) => h3_compact_steps,
+        (None, false) => input.default_steps,
+    };
+    let steps_min = match (pinned_steps, h3_compact_turbo_steps, family) {
+        (Some(steps), _, _) | (None, Some(steps), _) => steps,
+        // The undistilled floor is the identity's own smallest REVIEWED
+        // schedule, not the sampler's arithmetic minimum — the same authority
+        // admission reads, so the control advertises exactly what the door
+        // enforces.
+        (None, None, "minimax-h3") => crate::minimax_h3::steps_floor_for_model(input.model),
+        _ => 1,
+    };
+    let steps_max = match (pinned_steps, h3_compact_turbo_steps, h3_compact) {
+        (Some(steps), _, _) | (None, Some(steps), _) => steps,
+        (None, None, true) => crate::minimax_h3::COMPACT_MAX_STEPS,
+        (None, None, false) => 100,
+    };
+    let steps_mode = if pinned_steps.is_some() || h3_compact_turbo_steps.is_some() {
+        ControlMode::Fixed
+    } else {
+        ControlMode::Adjustable
+    };
+    let defaults = GenerationDefaultsProfile {
+        width: if audio_only || mesh_only {
+            0
+        } else {
+            default_width
+        },
+        height: if audio_only || mesh_only {
+            0
+        } else {
+            default_height
+        },
+        steps: default_steps,
+        guidance: effective_guidance,
+        frames: temporal.as_ref().map(|profile| profile.frames.default),
+        fps: temporal.as_ref().map(|profile| match profile.fps {
+            FpsControl::Fixed { value } => value,
+            FpsControl::Adjustable { default, .. } => default,
+        }),
+        negative_prompt: input.default_negative_prompt.clone(),
+    };
+    GenerationRecipeProfile {
+        id: id.to_string(),
+        label: label.to_string(),
+        request_selector: RecipeSelector { pipeline },
+        defaults,
+        resolution,
+        steps: IntegerControl {
+            default: default_steps,
+            min: steps_min,
+            max: steps_max,
+            step: 1,
+            // A pinned count has one rung by definition: a wan DMD tier and
+            // an H3 Turbo tier are distilled onto one schedule length, so
+            // offering a second number would advertise a render they cannot
+            // perform. Everything adjustable gets the ladder.
+            recommended: if steps_mode == ControlMode::Fixed {
+                vec![default_steps]
+            } else {
+                steps_ladder(steps_min, default_steps, steps_max)
+            },
+            mode: steps_mode,
+            // Order is load-bearing: a Turbo tag is an H3 identity too, and
+            // its pinned schedule is the more specific answer. The base arm
+            // explains a FLOOR on an adjustable control, which is the case
+            // the note contract was widened for.
+            note: wan_dmd_ladder
+                .map(fixed_dmd_steps_note)
+                .or_else(|| qwen21_turbo.map(fixed_qwen21_turbo_steps_note))
+                .or_else(|| h3_compact_turbo.map(fixed_turbo_steps_note))
+                .or_else(|| h3_distilled_base.map(fixed_distilled_base_steps_note))
+                .or_else(|| (family == "minimax-h3").then(base_compact_steps_note)),
+        },
+        guidance: FloatControl {
+            default: effective_guidance,
+            min: if guidance_caps.adjustable {
+                0.0
+            } else {
+                effective_guidance
+            },
+            max: if guidance_caps.adjustable {
+                100.0
+            } else {
+                effective_guidance
+            },
+            step: 0.1,
+            mode: if guidance_caps.adjustable {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Fixed
+            },
+            note: if qwen21_turbo.is_some() && !guidance_caps.adjustable {
+                Some(QWEN21_TURBO_GUIDANCE_NOTE.to_string())
+            } else {
+                fixed_guidance_note(family, wan_dmd_ladder, guidance_caps, effective_guidance)
+            },
+        },
+        temporal,
+        capabilities: GenerationCapabilitiesProfile {
+            guidance: guidance_caps,
+            negative_prompt: feature_control(
+                guidance_caps.supports_negative_prompt,
+                false,
+                "This recipe does not encode a negative prompt.",
+            ),
+            source_image,
+            reference_images: Some(reference_images),
+            generation_references: generation_references_for_model(input.model),
+            boundary_frames: boundary_frames_for_model(input.model),
+            transparency: Some(transparency_for_recipe(family, input.model)),
+            supports_lora: lora_supported,
+            supports_controlnet: controlnet_supported,
+            supports_identity: identity_supported,
+            supports_sequence: input.supports_sequence && !audio_only,
+            supports_extend: input.supports_extend && !audio_only,
+            supports_audio: input.supports_audio || audio_only,
+            source_video: feature_control(
+                source_video_supported,
+                source_video_required,
+                "This recipe does not accept a source video.",
+            ),
+            mask: feature_control(
+                mask_supported,
+                false,
+                "This model does not accept an inpainting mask.",
+            ),
+            keyframes: feature_control(
+                keyframes_supported,
+                keyframes_required,
+                "This model does not accept keyframes.",
+            ),
+            audio: feature_control(
+                audio_input_supported,
+                audio_input_required,
+                "This recipe does not accept source audio.",
+            ),
+            lora: AdapterControlProfile {
+                mode: if lora_supported {
+                    ControlMode::Adjustable
+                } else {
+                    ControlMode::Hidden
+                },
+                max_count: if lora_supported {
+                    if pipeline == Some(Ltx2PipelineMode::IcLora) {
+                        3
+                    } else {
+                        4
+                    }
+                } else {
+                    0
+                },
+                reason: (!lora_supported)
+                    .then(|| "This model does not accept LoRA adapters.".to_string()),
+            },
+            controlnet: AdapterControlProfile {
+                mode: if controlnet_supported {
+                    ControlMode::Adjustable
+                } else {
+                    ControlMode::Hidden
+                },
+                max_count: u32::from(controlnet_supported),
+                reason: (!controlnet_supported)
+                    .then(|| "ControlNet generation is available for SD1.5 models.".to_string()),
+            },
+            output,
+            wan_recipe: WanRecipeCapabilitiesProfile {
+                // A DMD ladder has no solver and no shift to choose: the
+                // rungs and the sigma table they sit on are the published
+                // schedule, so the whole sampler group is hidden rather than
+                // shown with controls the engine ignores.
+                mode: if wan && wan_dmd_ladder.is_none() {
+                    ControlMode::Adjustable
+                } else {
+                    ControlMode::Hidden
+                },
+                supports_distill_strength: wan
+                    && wan_dmd_ladder.is_none()
+                    && (normalized_model.ends_with("a14b:q4")
+                        || normalized_model.ends_with("a14b:q5")),
+                // Keyed on the source-image contract, never on the ladder: a
+                // fixed sampler says nothing about whether the checkpoint can
+                // be handed two frames, and the server recomputes this field
+                // (and `keyframes.mode`) from exactly `source_image` once the
+                // runtime probe answers
+                // (`model_manager::synchronize_generation_profile_capabilities`),
+                // so a ladder-keyed cold profile would contradict the hot one.
+                supports_first_last_frame: wan
+                    && source_image != Some(SourceImageCapability::Unsupported),
+                first_last_frame_min_frames: wan.then_some(validation::WAN_TI2V_FLF_MIN_FRAMES),
+                reason: if wan_dmd_ladder.is_some() {
+                    Some(
+                        "This DMD distill walks a fixed rung ladder; its solver and flow shift \
+                         are part of the published schedule."
+                            .to_string(),
+                    )
+                } else {
+                    (!wan).then(|| "Wan sampler controls apply only to Wan models.".to_string())
+                },
+            },
+            // A DMD student predicts x0 at each pinned rung and is re-noised
+            // to the next; running UniPC or Euler over it is not a slower
+            // render but a different, worse one, so no solver is offered.
+            schedulers: match family {
+                _ if wan_dmd_ladder.is_some() => Vec::new(),
+                "sdxl" if normalized_model.starts_with("playground-v2.5") => {
+                    vec![Scheduler::EdmDpmPp2m]
+                }
+                "sd15" | "sdxl" => {
+                    vec![Scheduler::Ddim, Scheduler::EulerAncestral, Scheduler::UniPc]
+                }
+                family if family == crate::manifest::HUNYUAN3D_MATTING_FAMILY => Vec::new(),
+                family if family == crate::manifest::HUNYUAN3D_DELIGHT_FAMILY => {
+                    vec![Scheduler::EulerAncestral]
+                }
+                "wan" => vec![Scheduler::UniPc, Scheduler::Euler, Scheduler::DpmPp],
+                _ => Vec::new(),
+            },
+            prompt: PromptCapabilitiesProfile {
+                mode: prompt_mode,
+                reason: prompt_reason(prompt_mode),
+            },
+            supports_strength,
+            mesh: mesh_only.then(|| mesh_capabilities_profile(&normalized_model)),
+        },
+        provenance: provenance(family),
+    }
+}
+
+/// The Hunyuan3D checkpoint a durable workflow runs on when the user names
+/// none.
+///
+/// MODE-AWARE, because the modes do not share a checkpoint. A roundtrip goes
+/// through the 2.1 shape VAE and no other tier has one — the same
+/// `hunyuan3d_shape21_model` test that decides whether a recipe advertises
+/// `MeshRoundtrip` at all — and a multiview reconstruction needs a 2mv
+/// checkpoint. Everything else runs on the small fast default.
+///
+/// One default for every mode is what made `mold mesh-workflow create --mesh
+/// chair.glb` answer `mesh-roundtrip requires a Hunyuan3D 2.1 shape
+/// checkpoint` to anyone who did not already know to pass `--model`. This
+/// lives beside [`mesh_capabilities_profile`] so the model a mode defaults to
+/// and the modes a model advertises cannot disagree; a test asserts exactly
+/// that.
+pub fn default_model_for_mesh_workflow_mode(mode: MeshWorkflowMode) -> &'static str {
+    match mode {
+        MeshWorkflowMode::MeshRoundtrip => crate::manifest::HUNYUAN3D_21_MODEL,
+        MeshWorkflowMode::MultiviewToMesh => crate::manifest::HUNYUAN3D_2MV_TURBO_MODEL,
+        MeshWorkflowMode::ImageToMesh
+        | MeshWorkflowMode::TextToMesh
+        | MeshWorkflowMode::MeshTexture => crate::manifest::HUNYUAN3D_DEFAULT_MODEL,
+    }
+}
+
+/// The 3-D control block, built from the SAME constants
+/// `validation::validate_mesh_request` enforces, so a client that stays inside
+/// the advertised bounds can never be refused by the door it was reading.
+fn mesh_capabilities_profile(model: &str) -> MeshCapabilitiesProfile {
+    let multiview = crate::manifest::hunyuan3d_multiview_model(model);
+    let roundtrip_available = crate::manifest::hunyuan3d_shape21_model(model);
+    let paint_available = cfg!(feature = "mesh-texture");
+    MeshCapabilitiesProfile {
+        octree_resolutions: validation::MESH_OCTREE_RESOLUTIONS.to_vec(),
+        octree_default: validation::MESH_DEFAULT_OCTREE_RESOLUTION,
+        threshold: FloatControl {
+            default: validation::mesh_default_threshold_for_model(model),
+            min: 0.0,
+            max: 1.0,
+            step: validation::MESH_THRESHOLD_STEP,
+            mode: ControlMode::Adjustable,
+            note: None,
+        },
+        target_faces_min: validation::MESH_MIN_TARGET_FACES,
+        target_faces_max: validation::MESH_MAX_TARGET_FACES,
+        target_faces_texture_default: Some(validation::MESH_TEXTURE_DEFAULT_TARGET_FACES),
+        texture: FeatureControlProfile {
+            mode: if paint_available {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            },
+            required: false,
+            reason: (!paint_available).then(|| {
+                "PBR texture generation requires the mesh-texture build feature".to_string()
+            }),
+        },
+        named_views: Some(NamedViewsProfile {
+            mode: if multiview {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            },
+            roles: vec![
+                GenerationImageReferenceRole::Front,
+                GenerationImageReferenceRole::Left,
+                GenerationImageReferenceRole::Back,
+                GenerationImageReferenceRole::Right,
+            ],
+            min_count: if multiview { 1 } else { 0 },
+            max_count: if multiview { 4 } else { 0 },
+            reason: (!multiview)
+                .then(|| "Named camera views require a Hunyuan3D 2mv checkpoint".to_string()),
+        }),
+        mesh_input: Some(MeshInputProfile {
+            mode: if paint_available || roundtrip_available {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            },
+            formats: vec![MeshReferenceFormat::Glb, MeshReferenceFormat::Obj],
+            max_count: u32::from(paint_available || roundtrip_available),
+            max_bytes: validation::MESH_REFERENCE_MAX_BYTES,
+            up_axes: vec![MeshUpAxis::Y, MeshUpAxis::Z],
+            meters_per_unit_min: 1.0e-6,
+            meters_per_unit_max: 1.0e6,
+            reason: (!(paint_available || roundtrip_available)).then(|| {
+                "Mesh input requires Hunyuan3D 2.1 round-trip weights or the mesh-texture build feature"
+                    .to_string()
+            }),
+        }),
+        texture_resolutions: validation::MESH_TEXTURE_RESOLUTIONS.to_vec(),
+        texture_default_resolution: Some(2048),
+        texture_view_count: Some(IntegerControl {
+            default: 6,
+            min: 6,
+            max: 6,
+            step: 1,
+            recommended: Vec::new(),
+            mode: ControlMode::Fixed,
+            note: Some("Hunyuan3D Paint renders six canonical views".to_string()),
+        }),
+        matting: Some(MeshMattingControlProfile {
+            mode: if cfg!(feature = "mesh-matting") {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            },
+            default: MeshMattingMode::Auto,
+            choices: if cfg!(feature = "mesh-matting") {
+                vec![
+                    MeshMattingMode::Auto,
+                    MeshMattingMode::On,
+                    MeshMattingMode::Off,
+                ]
+            } else {
+                Vec::new()
+            },
+            reason: (!cfg!(feature = "mesh-matting"))
+                .then(|| "Background matting requires the mesh-matting build feature".to_string()),
+        }),
+        delight: Some(feature_control(
+            cfg!(feature = "mesh-delight"),
+            false,
+            "Delighting requires the mesh-delight build feature",
+        )),
+        workflow_modes: if multiview {
+            vec![MeshWorkflowMode::MultiviewToMesh]
+        } else {
+            let mut modes = vec![MeshWorkflowMode::ImageToMesh, MeshWorkflowMode::TextToMesh];
+            if roundtrip_available {
+                modes.push(MeshWorkflowMode::MeshRoundtrip);
+            }
+            if paint_available {
+                modes.push(MeshWorkflowMode::MeshTexture);
+            }
+            modes
+        },
+    }
+}
+
+fn feature_control(
+    supported: bool,
+    required: bool,
+    unsupported_reason: &'static str,
+) -> FeatureControlProfile {
+    FeatureControlProfile {
+        mode: if supported {
+            ControlMode::Adjustable
+        } else {
+            ControlMode::Hidden
+        },
+        required: supported && required,
+        reason: (!supported).then(|| unsupported_reason.to_string()),
+    }
+}
+
+fn temporal_profile(input: &GenerationProfileInput<'_>, family: &str) -> Option<TemporalProfile> {
+    let step = validation::frame_step_for_family(family)?;
+    let offset = validation::frame_offset_for_family(family).unwrap_or(1);
+    let fps = input.default_fps.unwrap_or(validation::LTX2_DEFAULT_FPS);
+    let max = if family == "minimax-h3" {
+        345
+    } else if family == "ltx2" {
+        // The absolute resource guard (604) is not itself on LTX-2's 8n+1
+        // request grid. Advertise the largest requestable value; admission
+        // applies the lower duration-derived cap for the selected FPS.
+        validation::max_frames_for_family_at_fps(family, 120)?
+    } else {
+        validation::max_frames_for_family_at_fps(family, fps)?
+    };
+    let min = validation::min_frames_for_family(family).unwrap_or(offset);
+    let default = input.default_frames.unwrap_or(min).clamp(min, max);
+    Some(TemporalProfile {
+        frames: IntegerControl {
+            default,
+            min,
+            max,
+            step,
+            recommended: vec![default],
+            mode: ControlMode::Adjustable,
+            note: None,
+        },
+        frame_offset: offset,
+        fps: if let Some(fixed) = validation::fixed_fps_for_family(family) {
+            FpsControl::Fixed { value: fixed }
+        } else {
+            FpsControl::Adjustable {
+                default: fps,
+                min: 1,
+                max: 120,
+                step: 1,
+            }
+        },
+        max_duration_seconds: validation::max_runtime_seconds_for_family(family),
+    })
+}
+
+fn aspect_groups(family: &str, dimensions: &[(u32, u32)]) -> Vec<AspectGroup> {
+    let mut groups: Vec<AspectGroup> = Vec::new();
+    for &(width, height) in dimensions {
+        let id = authored_aspect_label(family, width, height);
+        let preset = ResolutionPreset {
+            id: format!("{width}x{height}"),
+            width,
+            height,
+            tier: "recommended".to_string(),
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.id == id) {
+            group.presets.push(preset);
+        } else {
+            groups.push(AspectGroup {
+                label: id.clone(),
+                id,
+                presets: vec![preset],
+            });
+        }
+    }
+    for group in &mut groups {
+        group
+            .presets
+            .sort_by_key(|preset| preset.width * preset.height);
+    }
+    groups
+}
+
+fn authored_aspect_label(family: &str, width: u32, height: u32) -> String {
+    match (canonical_family(family), width, height) {
+        ("qwen-image" | "qwen-image-edit", 1664, 928) => "≈16:9".to_string(),
+        ("qwen-image" | "qwen-image-edit", 928, 1664) => "≈9:16".to_string(),
+        // The 2.1 model card names its 2K table by nominal aspect (2400x1792
+        // is "4:3", 2752x1536 is "16:9"); Mold's 1K presets share those groups.
+        ("qwen-image21", 2400, 1792) | ("qwen-image21", 1184, 896) => "4:3".to_string(),
+        ("qwen-image21", 1792, 2400) | ("qwen-image21", 896, 1184) => "3:4".to_string(),
+        ("qwen-image21", 2528, 1696) | ("qwen-image21", 1248, 832) => "3:2".to_string(),
+        ("qwen-image21", 1696, 2528) | ("qwen-image21", 832, 1248) => "2:3".to_string(),
+        ("qwen-image21", 2752, 1536) | ("qwen-image21", 1376, 768) => "16:9".to_string(),
+        ("qwen-image21", 1536, 2752) | ("qwen-image21", 768, 1376) => "9:16".to_string(),
+        _ => {
+            let divisor = gcd(width, height);
+            format!("{}:{}", width / divisor, height / divisor)
+        }
+    }
+}
+
+fn gcd(mut left: u32, mut right: u32) -> u32 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left.max(1)
+}
+
+fn identity_alignment(model: &str, family: &str, sub_family: Option<&str>) -> u32 {
+    if family == "wan"
+        && format!("{} {}", model, sub_family.unwrap_or_default())
+            .to_ascii_lowercase()
+            .contains("ti2v-5b")
+    {
+        32
+    } else {
+        validation::dimension_alignment_for_model(model, Some(family))
+    }
+}
+
+fn pipeline_label(pipeline: Ltx2PipelineMode) -> String {
+    pipeline
+        .as_str()
+        .split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn provenance(family: &str) -> Vec<ProfileProvenance> {
+    if canonical_family(family) == "qwen-image-edit" {
+        return vec![ProfileProvenance {
+            kind: ProvenanceKind::MoldPolicy,
+            source: "Mold source-driven Qwen Image Edit guidance".to_string(),
+            revision: None,
+            qualified: true,
+            evidence: Some(
+                "source fitting preserves the input aspect on the dynamic /16 canvas and caps edit inputs at upstream's 1024x1024 VAE area; optional shape presets reuse Mold's qualified Qwen Image aspect set"
+                    .to_string(),
+            ),
+        }];
+    }
+    if let Some(record) = resolution_qualification_record(family) {
+        let mut provenance = vec![ProfileProvenance {
+            kind: ProvenanceKind::Upstream,
+            source: record.source.to_string(),
+            revision: Some(record.revision.to_string()),
+            qualified: record.qualified,
+            evidence: Some(record.evidence.to_string()),
+        }];
+        if canonical_family(family) == "qwen-image21" {
+            provenance.push(ProfileProvenance {
+                kind: ProvenanceKind::MoldPolicy,
+                source: "Mold ~1 MP Qwen Image 2.1 aspect presets".to_string(),
+                revision: None,
+                qualified: true,
+                evidence: Some(format!(
+                    "{} Mold-chosen ~1 MP presets ({}) keep the 2K table's aspects at the default area on the 32 px grid; not published upstream",
+                    QWEN_IMAGE21_MOLD_1K_PRESETS.len(),
+                    QWEN_IMAGE21_MOLD_1K_PRESETS
+                        .iter()
+                        .map(|(width, height)| format!("{width}x{height}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+        }
+        return provenance;
+    }
+    let (source, revision, evidence) = match family {
+        "ltx-video" => (
+            "https://github.com/Lightricks/LTX-Video",
+            Some("4b2d053057623ddd4d0a1d3e9cd28890e9ef487f"),
+            "mold.generation-profile.v1",
+        ),
+        "ltx2" => (
+            "https://github.com/Lightricks/LTX-2",
+            Some("4f8905737aac86a554637cac86c178877a39c744"),
+            "mold.generation-profile.v1",
+        ),
+        "wan" => (
+            "https://github.com/Wan-Video/Wan2.2",
+            Some("42bf4cfaa384bc21833865abc2f9e6c0e67233dc"),
+            "mold.generation-profile.v1",
+        ),
+        "minimax-h3" => (
+            "https://github.com/MiniMax-AI/MiniMax-H3",
+            Some("fa6891ff7cdaaa03fa4497e89ac64ff169219acf"),
+            "mold.generation-profile.v1",
+        ),
+        _ => (
+            "mold-qualified compatibility profile",
+            None,
+            "mold.generation-profile.v1",
+        ),
+    };
+    vec![ProfileProvenance {
+        kind: if source.starts_with("http") {
+            ProvenanceKind::Upstream
+        } else {
+            ProvenanceKind::MoldPolicy
+        },
+        source: source.to_string(),
+        revision: revision.map(str::to_string),
+        qualified: true,
+        evidence: Some(evidence.to_string()),
+    }]
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn typed_h3_reference_capability_matches_task_limits() {
+        let refs = super::generation_references_for_model(crate::minimax_h3::REF2VA_COMFY).unwrap();
+        assert_eq!(
+            refs.max_images as usize,
+            crate::minimax_h3::MAX_REFERENCE_IMAGES
+        );
+        assert_eq!(
+            refs.max_inline_bytes as usize,
+            crate::minimax_h3::MAX_INLINE_REFERENCE_BYTES
+        );
+        assert!(super::generation_references_for_model(crate::minimax_h3::FL2VA_COMFY).is_none());
+    }
+
+    use super::*;
+
+    /// Every workflow mode's default model is one that ADVERTISES that mode.
+    ///
+    /// The two facts sit in adjacent functions and could drift the moment a
+    /// tier gains or loses a capability. Asking the capability builder itself
+    /// is the only check that cannot go stale — and it is the check that was
+    /// missing when a roundtrip defaulted to the 2.0 tier and was refused by
+    /// the door it had just been sent to.
+    #[test]
+    fn every_workflow_mode_defaults_to_a_model_that_advertises_it() {
+        for mode in [
+            MeshWorkflowMode::ImageToMesh,
+            MeshWorkflowMode::MultiviewToMesh,
+            MeshWorkflowMode::MeshRoundtrip,
+            MeshWorkflowMode::MeshTexture,
+            MeshWorkflowMode::TextToMesh,
+        ] {
+            // Texturing is a build feature, so on a build with no paint
+            // engine NO model advertises it and there is nothing to check.
+            if mode == MeshWorkflowMode::MeshTexture && !cfg!(feature = "mesh-texture") {
+                continue;
+            }
+            let model = default_model_for_mesh_workflow_mode(mode);
+            let advertised = mesh_capabilities_profile(model).workflow_modes;
+            assert!(
+                advertised.contains(&mode),
+                "{mode:?} defaults to {model}, which advertises {advertised:?}"
+            );
+        }
+    }
+
+    /// A roundtrip's default is a 2.1 shape checkpoint by the same test the
+    /// workflow validator applies, so the CLI default can never be the thing
+    /// admission refuses.
+    #[test]
+    fn the_roundtrip_default_passes_the_validators_own_2_1_test() {
+        assert!(crate::manifest::hunyuan3d_shape21_model(
+            default_model_for_mesh_workflow_mode(MeshWorkflowMode::MeshRoundtrip)
+        ));
+        // And the ordinary default is deliberately NOT a 2.1 tier: it is the
+        // small fast one, which is why the mode has to decide.
+        assert!(!crate::manifest::hunyuan3d_shape21_model(
+            default_model_for_mesh_workflow_mode(MeshWorkflowMode::TextToMesh)
+        ));
+    }
+
+    fn input<'a>(model: &'a str, family: &'a str) -> GenerationProfileInput<'a> {
+        GenerationProfileInput {
+            model,
+            family,
+            sub_family: None,
+            default_width: 1024,
+            default_height: 1024,
+            default_steps: 20,
+            default_guidance: 3.5,
+            default_frames: None,
+            default_fps: None,
+            default_negative_prompt: None,
+            source_image: None,
+            supports_sequence: false,
+            supports_extend: false,
+            supports_audio: false,
+        }
+    }
+
+    fn qwen21_profile(model: &str) -> GenerationProfileSet {
+        let manifest = crate::manifest::find_manifest(model).expect(model);
+        generation_profile_for_manifest(manifest)
+    }
+
+    fn qwen21_request(model: &str) -> crate::GenerateRequest {
+        serde_json::from_value(serde_json::json!({
+            "prompt": "a paper lantern",
+            "model": model,
+            "width": 1024,
+            "height": 1024,
+            "steps": 40,
+            "guidance": 4.0,
+            "batch_size": 1
+        }))
+        .unwrap()
+    }
+
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0];
+    const WEBP: &[u8] = b"RIFF\x0e\x00\x00\x00WEBPVP8 ";
+
+    #[test]
+    fn qwen_image21_advertises_ten_ordered_references_sized_from_the_last() {
+        let profile = qwen21_profile("qwen-image-2.1:bf16");
+        let recipe = profile.default_recipe().unwrap();
+        let references = recipe.capabilities.reference_images.as_ref().unwrap();
+        assert_eq!(references.mode, ControlMode::Adjustable);
+        assert!(!references.required);
+        assert_eq!(references.max_count, Some(10));
+        assert_eq!(
+            references.max_count,
+            Some(validation::QWEN_IMAGE21_MAX_REFERENCE_IMAGES)
+        );
+        assert!(!references.primary_is_target);
+        assert_eq!(
+            references.source_relation,
+            ReferenceSourceRelation::Replaces
+        );
+        assert_eq!(references.max_pixels_single, Some(1024 * 1024));
+        assert_eq!(references.max_pixels_multi, Some(1024 * 1024));
+        assert_eq!(references.canvas, Some(ReferenceCanvasRule::LastReference));
+        assert_eq!(
+            references.formats,
+            vec![
+                ImageInputFormat::Png,
+                ImageInputFormat::Jpeg,
+                ImageInputFormat::Webp
+            ]
+        );
+        assert!(references.weight.is_none());
+        // Not source-driven: the canvas is a picked size; the last reference
+        // only sets the client's default aspect.
+        assert_eq!(recipe.resolution.domain, ResolutionDomain::Dynamic);
+        // References replace the source, so there is no mask or strength.
+        assert_eq!(recipe.capabilities.mask.mode, ControlMode::Hidden);
+        assert!(!recipe.capabilities.supports_strength);
+        assert_eq!(recipe.capabilities.source_image, None);
+        let json = serde_json::to_value(references).unwrap();
+        assert_eq!(json["canvas"], "last-reference");
+        assert_eq!(json["formats"], serde_json::json!(["png", "jpeg", "webp"]));
+        // Every other recipe keeps the wire shape it always had.
+        let flux = resolve_generation_profile(input("flux2-dev:q8", "flux2"));
+        let flux_refs = serde_json::to_value(
+            flux.default_recipe()
+                .unwrap()
+                .capabilities
+                .reference_images
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(flux_refs.get("canvas").is_none());
+        assert!(flux_refs.get("formats").is_none());
+    }
+
+    #[test]
+    fn webp_references_are_accepted_only_where_advertised() {
+        let qwen = reference_images_for_recipe("qwen-image21", "qwen-image-2.1:bf16");
+        let mut req = qwen21_request("qwen-image-2.1:bf16");
+        req.edit_images = Some(vec![PNG.to_vec(), JPEG.to_vec(), WEBP.to_vec()]);
+        validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap();
+        req.edit_images = Some(vec![b"GIF89a".to_vec()]);
+        assert_eq!(
+            validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap_err(),
+            "edit_images must contain only PNG, JPEG, or WebP images"
+        );
+        req.edit_images = Some(vec![PNG.to_vec(); 11]);
+        assert_eq!(
+            validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap_err(),
+            "qwen-image-2.1 supports at most 10 ordered reference images"
+        );
+
+        // Every other family keeps the historical sentence byte for byte.
+        let flux = reference_images_for_recipe("flux2", "flux2-dev:q8");
+        let mut flux_req = qwen21_request("flux2-dev:q8");
+        flux_req.edit_images = Some(vec![WEBP.to_vec()]);
+        assert_eq!(
+            validate_edit_images_against(&flux, "flux2-dev", &flux_req).unwrap_err(),
+            "edit_images must contain only PNG or JPEG images"
+        );
+    }
+
+    /// A PNG whose header DECLARES `width`x`height` and carries one empty
+    /// IDAT: a few dozen bytes that would decode to width*height*4 bytes.
+    fn png_declaring(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let chunk = |kind: &[u8; 4], data: &[u8]| {
+            let mut out = (data.len() as u32).to_be_bytes().to_vec();
+            let mut body = kind.to_vec();
+            body.extend_from_slice(data);
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+            out
+        };
+        let mut ihdr = width.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend(chunk(b"IHDR", &ihdr));
+        png.extend(chunk(
+            b"IDAT",
+            &[0x78, 0x9c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ));
+        png.extend(chunk(b"IEND", &[]));
+        png
+    }
+
+    /// Reference size is bounded at the door, for every family, before a
+    /// queue row exists: a tiny PNG declaring 60000x60000 would otherwise
+    /// reach an engine decode of ~14 GB on the host. The bounds are
+    /// `reference_image`'s; an unreadable header is left to the engine's
+    /// decoder, which refuses it, rather than being guessed at here.
+    #[test]
+    fn oversized_references_are_refused_at_admission() {
+        let qwen = reference_images_for_recipe("qwen-image21", "qwen-image-2.1:bf16");
+        let mut req = qwen21_request("qwen-image-2.1:bf16");
+        req.edit_images = Some(vec![
+            png_declaring(1024, 768),
+            png_declaring(60_000, 60_000),
+        ]);
+        let error = validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap_err();
+        assert!(error.starts_with("Reference 2 is 60000x60000"), "{error}");
+        req.edit_images = Some(vec![png_declaring(9_000, 12_000)]);
+        let error = validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap_err();
+        assert!(error.contains("100000000 pixels"), "{error}");
+        req.edit_images = Some(vec![png_declaring(4, 1_000)]);
+        let error = validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap_err();
+        assert!(error.contains("200:1"), "{error}");
+        req.edit_images = Some(vec![png_declaring(16_384, 4_096), PNG.to_vec()]);
+        validate_edit_images_against(&qwen, "qwen-image-2.1", &req).unwrap();
+
+        let flux = reference_images_for_recipe("flux2", "flux2-dev:q8");
+        let mut flux_req = qwen21_request("flux2-dev:q8");
+        flux_req.edit_images = Some(vec![png_declaring(20_000, 1_000)]);
+        assert!(validate_edit_images_against(&flux, "flux2-dev", &flux_req)
+            .unwrap_err()
+            .contains("16384"));
+    }
+
+    #[test]
+    fn transparency_is_advertised_only_on_qwen_image21() {
+        let qwen = qwen21_profile("qwen-image-2.1:bf16");
+        let transparency = qwen
+            .default_recipe()
+            .unwrap()
+            .capabilities
+            .transparency
+            .clone()
+            .unwrap();
+        assert_eq!(transparency.mode, ControlMode::Adjustable);
+        assert!(!transparency.default);
+        assert!(transparency.native_alpha);
+        assert_eq!(
+            transparency.formats,
+            vec![OutputFormat::Png, OutputFormat::Webp]
+        );
+        assert!(transparency.reason.is_none());
+
+        for (model, family) in [
+            ("flux-dev:q8", "flux"),
+            ("qwen-image:q8", "qwen-image"),
+            ("sdxl-base:fp16", "sdxl"),
+        ] {
+            let profile = resolve_generation_profile(input(model, family));
+            let hidden = profile
+                .default_recipe()
+                .unwrap()
+                .capabilities
+                .transparency
+                .clone()
+                .unwrap();
+            assert_eq!(hidden.mode, ControlMode::Hidden, "{model}");
+            assert!(hidden.formats.is_empty(), "{model}");
+            assert_eq!(
+                hidden.reason.as_deref(),
+                Some(TRANSPARENCY_UNSUPPORTED_REASON),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_admission_doors_refuse_transparency_with_one_sentence() {
+        // A family without the contract.
+        let mut flux = qwen21_request("flux-dev:q8");
+        flux.guidance = 3.5;
+        flux.steps = 20;
+        flux.transparent_background = Some(true);
+        let family_door = crate::validation::validate_generate_request(&flux).unwrap_err();
+        let flux_profile = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let recipe_door =
+            validate_request_against_generation_profile(&flux_profile, &flux).unwrap_err();
+        assert_eq!(family_door, TRANSPARENCY_UNSUPPORTED_REASON);
+        assert_eq!(family_door, recipe_door);
+
+        // JPEG cannot carry alpha.
+        let profile = qwen21_profile("qwen-image-2.1:bf16");
+        let mut req = qwen21_request("qwen-image-2.1:bf16");
+        req.transparent_background = Some(true);
+        req.output_format = Some(OutputFormat::Jpeg);
+        let expected =
+            "transparent_background needs a format with an alpha channel; use png or webp instead of jpeg";
+        assert_eq!(
+            crate::validation::validate_generate_request(&req).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            validate_request_against_generation_profile(&profile, &req).unwrap_err(),
+            expected
+        );
+        for format in [None, Some(OutputFormat::Png), Some(OutputFormat::Webp)] {
+            req.output_format = format;
+            crate::validation::validate_generate_request(&req).unwrap();
+            validate_request_against_generation_profile(&profile, &req).unwrap();
+        }
+        // The request-free preflight a client runs before it has a request
+        // answers with the same sentences, because it is the same check.
+        let qwen_transparency = transparency_for_recipe("qwen-image21", "qwen-image-2.1:bf16");
+        assert_eq!(
+            validate_transparency_choice(&qwen_transparency, Some(true), OutputFormat::Jpeg)
+                .unwrap_err(),
+            expected
+        );
+        validate_transparency_choice(&qwen_transparency, Some(true), OutputFormat::Webp).unwrap();
+        validate_transparency_choice(&qwen_transparency, Some(false), OutputFormat::Jpeg).unwrap();
+        assert_eq!(
+            validate_transparency_choice(
+                &transparency_for_recipe("flux", "flux-dev:q8"),
+                Some(true),
+                OutputFormat::Png
+            )
+            .unwrap_err(),
+            TRANSPARENCY_UNSUPPORTED_REASON
+        );
+
+        // `false` asks for nothing, anywhere, and normalizes away.
+        flux.transparent_background = Some(false);
+        crate::validation::validate_generate_request(&flux).unwrap();
+        validate_request_against_generation_profile(&flux_profile, &flux).unwrap();
+        flux.normalize_transparent_background();
+        assert_eq!(flux.transparent_background, None);
+        req.transparent_background = Some(true);
+        req.normalize_transparent_background();
+        assert_eq!(req.transparent_background, Some(true));
+    }
+
+    #[test]
+    fn delivery_without_webp_narrows_the_transparency_formats_too() {
+        let mut profile = qwen21_profile("qwen-image-2.1:bf16");
+        let recipe = profile.default_recipe().unwrap();
+        assert_eq!(
+            recipe.capabilities.output.formats,
+            vec![OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Webp]
+        );
+        assert!(recipe.capabilities.output.delivery_reason.is_none());
+        qualify_generation_profile_delivery(
+            &mut profile,
+            GenerationDeliveryCapabilities {
+                mp4: true,
+                webp: false,
+            },
+        );
+        let recipe = profile.default_recipe().unwrap();
+        assert_eq!(
+            recipe.capabilities.output.formats,
+            vec![OutputFormat::Png, OutputFormat::Jpeg]
+        );
+        assert_eq!(
+            recipe.capabilities.transparency.as_ref().unwrap().formats,
+            vec![OutputFormat::Png]
+        );
+        let mut req = qwen21_request("qwen-image-2.1:bf16");
+        req.transparent_background = Some(true);
+        req.output_format = Some(OutputFormat::Webp);
+        assert!(validate_request_against_generation_profile(&profile, &req).is_err());
+    }
+
+    #[test]
+    fn every_qwen_image21_2k_preset_is_advertised_and_admitted() {
+        let profile = qwen21_profile("qwen-image-2.1:bf16");
+        let recipe = profile.default_recipe().unwrap();
+        assert_eq!(recipe.resolution.max_pixels, 2400 * 1792);
+        assert_eq!(recipe.resolution.max_axis_pixels, Some(2752));
+        assert_eq!(recipe.resolution.alignment, 32);
+        let presets: std::collections::HashSet<(u32, u32)> = recipe
+            .resolution
+            .aspect_groups
+            .iter()
+            .flat_map(|group| &group.presets)
+            .map(|preset| (preset.width, preset.height))
+            .collect();
+        let record = resolution_qualification_record("qwen-image21").unwrap();
+        assert_eq!(record.candidates.len(), 8);
+        for &(width, height) in record.candidates.iter().chain(QWEN_IMAGE21_MOLD_1K_PRESETS) {
+            assert!(presets.contains(&(width, height)), "{width}x{height}");
+            let mut req = qwen21_request("qwen-image-2.1:bf16");
+            req.width = width;
+            req.height = height;
+            crate::validation::validate_generate_request(&req)
+                .unwrap_or_else(|error| panic!("{width}x{height}: {error}"));
+            validate_request_against_generation_profile(&profile, &req)
+                .unwrap_or_else(|error| panic!("{width}x{height}: {error}"));
+        }
+        assert_eq!(presets.len(), 14);
+        let groups: Vec<&str> = recipe
+            .resolution
+            .aspect_groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect();
+        for label in ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"] {
+            assert!(groups.contains(&label), "{label} in {groups:?}");
+        }
+        // One past each ceiling is refused.
+        let mut req = qwen21_request("qwen-image-2.1:bf16");
+        req.width = 2784;
+        req.height = 1024;
+        assert!(crate::validation::validate_generate_request(&req).is_err());
+        req.width = 2432;
+        req.height = 1792;
+        assert!(crate::validation::validate_generate_request(&req).is_err());
+        assert_eq!(recipe.provenance.len(), 2);
+        assert_eq!(recipe.provenance[1].kind, ProvenanceKind::MoldPolicy);
+    }
+
+    /// A recipe that hides the negative prompt warns, never refuses, when a
+    /// caller sends one anyway; a recipe that reads it and the empty-string
+    /// opt-out say nothing. Every Hidden-negative recipe answers the same.
+    #[test]
+    fn a_hidden_negative_prompt_is_an_advisory_not_a_refusal() {
+        let mut request: crate::GenerateRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "a lantern",
+            "model": "qwen-image-2.1-turbo:q8",
+            "width": 1024,
+            "height": 1024,
+            "steps": 6,
+            "guidance": 1.0,
+        }))
+        .unwrap();
+        request.negative_prompt = Some("blurry".to_string());
+        let profile_for = |name: &str| {
+            generation_profile_for_manifest(crate::manifest::find_manifest(name).unwrap())
+        };
+        let turbo = profile_for("qwen-image-2.1-turbo:q8");
+        let warning = negative_prompt_ignored_warning(&turbo, &request).unwrap();
+        assert!(
+            warning.starts_with("negative prompt ignored by this recipe"),
+            "{warning}"
+        );
+        assert!(validate_request_against_generation_profile(&turbo, &request).is_ok());
+
+        request.model = "qwen-image-2.1:q8".to_string();
+        assert_eq!(
+            negative_prompt_ignored_warning(&profile_for("qwen-image-2.1:q8"), &request),
+            None
+        );
+
+        request.model = "qwen-image-2.1-turbo:q8".to_string();
+        request.negative_prompt = Some("  ".to_string());
+        assert_eq!(negative_prompt_ignored_warning(&turbo, &request), None);
+        request.negative_prompt = None;
+        assert_eq!(negative_prompt_ignored_warning(&turbo, &request), None);
+
+        // The same rule for every recipe that hides the control.
+        request.negative_prompt = Some("blurry".to_string());
+        for manifest in crate::manifest::visible_manifests() {
+            let profile = generation_profile_for_manifest(manifest);
+            let Some(recipe) = profile.default_recipe() else {
+                continue;
+            };
+            request.model = manifest.name.clone();
+            request.pipeline = None;
+            let hidden = recipe.capabilities.negative_prompt.mode == ControlMode::Hidden;
+            assert_eq!(
+                negative_prompt_ignored_warning(&profile, &request).is_some(),
+                hidden,
+                "{}",
+                manifest.name
+            );
+        }
+    }
+
+    /// A turbo tag pins the distill's recipe — steps, guidance, no negative
+    /// prompt — from its IDENTITY, while keeping everything else the base
+    /// tier advertises: references, transparency and a user LoRA on top.
+    #[test]
+    fn qwen_image21_turbo_tiers_pin_the_viggle_recipe() {
+        for tag in crate::manifest::QWEN_IMAGE21_TURBO_TAGS {
+            let name = format!("qwen-image-2.1-turbo:{tag}");
+            let manifest = crate::manifest::find_manifest(&name).unwrap();
+            // A stale model_prefs default must not reach the pinned control.
+            let profile = generation_profile_for_manifest_with_defaults(
+                manifest,
+                GenerationDefaultsProfile {
+                    width: 1024,
+                    height: 1024,
+                    steps: 40,
+                    guidance: 4.0,
+                    frames: None,
+                    fps: None,
+                    negative_prompt: None,
+                },
+            );
+            let recipe = profile.default_recipe().unwrap();
+            assert_eq!(recipe.steps.mode, ControlMode::Fixed, "{name}");
+            assert_eq!((recipe.steps.min, recipe.steps.max), (6, 6), "{name}");
+            assert_eq!(recipe.defaults.steps, 6, "{name}");
+            assert!(recipe.steps.note.as_deref().unwrap().contains("0.9375"));
+            assert_eq!(recipe.guidance.mode, ControlMode::Fixed, "{name}");
+            assert_eq!(recipe.guidance.default, 1.0, "{name}");
+            assert_eq!(recipe.defaults.guidance, 1.0, "{name}");
+            assert!(recipe.guidance.note.as_deref().unwrap().contains("turbo"));
+            assert_eq!(
+                recipe.capabilities.negative_prompt.mode,
+                ControlMode::Hidden,
+                "{name}"
+            );
+            assert!(recipe.capabilities.supports_lora, "{name}");
+            let base = crate::manifest::find_manifest(&format!("qwen-image-2.1:{tag}")).unwrap();
+            let base_profile = generation_profile_for_manifest(base);
+            let base_recipe = base_profile.default_recipe().unwrap();
+            assert_eq!(
+                recipe.capabilities.lora.max_count,
+                base_recipe.capabilities.lora.max_count
+            );
+            assert_eq!(
+                recipe.capabilities.reference_images,
+                base_recipe.capabilities.reference_images
+            );
+            assert_eq!(
+                recipe.capabilities.transparency,
+                base_recipe.capabilities.transparency
+            );
+            assert_eq!(recipe.resolution, base_recipe.resolution);
+            // The base tier keeps ordinary true CFG.
+            assert_eq!(base_recipe.steps.mode, ControlMode::Adjustable);
+            assert_eq!(base_recipe.guidance.mode, ControlMode::Adjustable);
+            assert_eq!(
+                base_recipe.capabilities.negative_prompt.mode,
+                ControlMode::Adjustable
+            );
+
+            // Admission refuses anything but the recipe.
+            let mut req = qwen21_request(&name);
+            req.steps = 6;
+            req.guidance = 1.0;
+            validate_request_against_generation_profile(&profile, &req).unwrap();
+            req.steps = 8;
+            assert!(validate_request_against_generation_profile(&profile, &req).is_err());
+            req.steps = 6;
+            req.guidance = 4.0;
+            assert!(validate_request_against_generation_profile(&profile, &req).is_err());
+        }
+    }
+
+    #[test]
+    fn qwen_image21_takes_lora_on_every_tier() {
+        assert!(validation::family_supports_lora("qwen-image21"));
+        let profile = qwen21_profile("qwen-image-2.1:bf16");
+        let capabilities = &profile.default_recipe().unwrap().capabilities;
+        assert!(capabilities.supports_lora);
+        assert_eq!(capabilities.lora.mode, ControlMode::Adjustable);
+    }
+
+    #[test]
+    fn an_older_servers_profile_without_the_new_fields_still_parses() {
+        let profile = qwen21_profile("qwen-image-2.1:bf16");
+        let mut json = serde_json::to_value(&profile).unwrap();
+        let capabilities = &mut json["recipes"][0]["capabilities"];
+        capabilities.as_object_mut().unwrap().remove("transparency");
+        let references = capabilities["reference_images"].as_object_mut().unwrap();
+        references.remove("canvas");
+        references.remove("formats");
+        let parsed: GenerationProfileSet = serde_json::from_value(json).unwrap();
+        let capabilities = &parsed.default_recipe().unwrap().capabilities;
+        assert!(capabilities.transparency.is_none());
+        let references = capabilities.reference_images.as_ref().unwrap();
+        assert!(references.canvas.is_none());
+        assert!(references.formats.is_empty());
+        assert_eq!(references.accepted_formats(), ImageInputFormat::LEGACY);
+    }
+
+    /// `Flux2Engine::load_transformer` refuses an adapter over an FP8-scaled
+    /// checkpoint, because the merge widens the patched weight and drops its
+    /// `weight_scale`. A profile that still advertised the control would
+    /// offer a load that always fails.
+    #[test]
+    fn flux2_fp8_tiers_do_not_advertise_lora() {
+        for model in ["flux2-klein:fp8", "flux2-klein-9b:fp8"] {
+            let profile = resolve_generation_profile(input(model, "flux2"));
+            let lora = profile.default_recipe().unwrap().capabilities.lora.mode;
+            assert_eq!(lora, ControlMode::Hidden, "{model} must not offer LoRA");
+        }
+        // Every other Flux.2 tier still does.
+        for model in ["flux2-klein:q8", "flux2-klein-base:q8", "flux2-klein:bf16"] {
+            let profile = resolve_generation_profile(input(model, "flux2"));
+            let lora = profile.default_recipe().unwrap().capabilities.lora.mode;
+            assert_ne!(lora, ControlMode::Hidden, "{model} must still offer LoRA");
+        }
+    }
+
+    fn png_bytes() -> Vec<u8> {
+        vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+    }
+
+    /// A request the recipe would otherwise accept, so a refusal below can
+    /// only be the reference contract talking.
+    fn reference_request(profile: &GenerationProfileSet, model: &str) -> crate::GenerateRequest {
+        let recipe = profile.default_recipe().unwrap();
+        let preset = recipe
+            .resolution
+            .aspect_groups
+            .first()
+            .and_then(|group| group.presets.first())
+            .map(|preset| (preset.width, preset.height))
+            .unwrap_or((1024, 1024));
+        let mut request = request_for(profile, preset.0, preset.1);
+        request.model = model.to_string();
+        request
+    }
+
+    /// FLUX.2 [klein] speaks the SAME reference protocol as [dev] — upstream
+    /// copies the block verbatim between the two pipelines — but it is not a
+    /// dev checkpoint, so gaining references must not cost it img2img. This is
+    /// the whole point of `source_relation`: `Exclusive`, not `Replaces`.
+    #[test]
+    fn klein_advertises_references_without_losing_strength_mask_or_lora() {
+        for model in [
+            "flux2-klein:bf16",
+            "flux2-klein:q8",
+            "flux2-klein-9b:q8",
+            "flux2-klein-base:q8",
+            "flux2-klein-base-9b:q4",
+        ] {
+            let profile = resolve_generation_profile(input(model, "flux2"));
+            let recipe = profile.default_recipe().unwrap();
+            let capabilities = &recipe.capabilities;
+            let references = capabilities
+                .reference_images
+                .as_ref()
+                .unwrap_or_else(|| panic!("{model} advertises a reference block"));
+            assert_eq!(references.mode, ControlMode::Adjustable, "{model}");
+            assert!(!references.required, "{model}");
+            assert_eq!(
+                references.max_count,
+                Some(validation::FLUX2_MAX_REFERENCE_IMAGES as u32),
+                "{model}"
+            );
+            assert!(!references.primary_is_target, "{model}");
+            assert_eq!(
+                references.source_relation,
+                ReferenceSourceRelation::Exclusive,
+                "{model}"
+            );
+            assert_eq!(
+                references.max_pixels_single,
+                Some(validation::FLUX2_SINGLE_REFERENCE_MAX_PIXELS),
+                "{model}"
+            );
+            assert_eq!(
+                references.max_pixels_multi,
+                Some(validation::FLUX2_MULTI_REFERENCE_MAX_PIXELS),
+                "{model}"
+            );
+            assert!(references.reason.is_none(), "{model}");
+
+            // Everything Klein had before is still here.
+            assert!(capabilities.supports_strength, "{model} keeps strength");
+            assert_eq!(
+                capabilities.mask.mode,
+                ControlMode::Adjustable,
+                "{model} keeps the inpainting mask"
+            );
+            assert!(capabilities.supports_lora, "{model} keeps LoRA");
+            assert_ne!(
+                recipe.resolution.domain,
+                ResolutionDomain::SourceDriven,
+                "{model} picks its own canvas"
+            );
+            assert!(recipe.resolution.source_max_pixels.is_none(), "{model}");
+        }
+    }
+
+    /// One function answers the reference question for every family, and the
+    /// recipe serializes exactly what it returned.
+    /// A `Combines` recipe keeps every img2img field, which is a behavioural
+    /// FIRST: every other reference family refuses `source_image`,
+    /// `mask_image` and the ControlNet pair the moment references are
+    /// attached. IP-Adapter must not, because its injection is additive.
+    #[test]
+    fn a_combines_recipe_keeps_every_img2img_field() {
+        let profile = reference_images_for_recipe("sdxl", "sdxl-base:fp16");
+        let png = || vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+        let mut req = crate::test_support::minimal_generate_request("sdxl-base:fp16");
+        req.edit_images = Some(vec![png()]);
+        req.source_image = Some(png());
+        req.mask_image = Some(png());
+        req.control_image = Some(png());
+        req.control_model = Some("canny".to_string());
+        validate_edit_images_against(&profile, "SDXL", &req)
+            .expect("an image prompt rides with img2img, a mask and ControlNet");
+
+        // And it batches: the projected tokens are the same for every row.
+        req.batch_size = 4;
+        validate_edit_images_against(&profile, "SDXL", &req)
+            .expect("an image prompt broadcasts across a batch");
+
+        // The families that REPLACE or EXCLUDE still refuse, so the relaxation
+        // is scoped to the relation rather than to references in general.
+        let qwen = reference_images_for_recipe("qwen-image-edit", "qwen-image-edit-2511:q4");
+        let mut edit = crate::test_support::minimal_generate_request("qwen-image-edit-2511:q4");
+        edit.edit_images = Some(vec![png()]);
+        edit.source_image = Some(png());
+        assert!(validate_edit_images_against(&qwen, "Qwen Image Edit", &edit).is_err());
+        edit.source_image = None;
+        edit.batch_size = 4;
+        assert!(validate_edit_images_against(&qwen, "Qwen Image Edit", &edit).is_err());
+    }
+
+    /// A recipe with no reference protocol at all still refuses the strength.
+    ///
+    /// `Hidden` is 117 of the 176 shipped recipes, and the weight check used
+    /// to sit AFTER that early return — so `reference_weight: 99.0` on
+    /// `flux-dev:q4` was accepted, ignored, and then written into provenance
+    /// for Reuse to replay.
+    #[test]
+    fn a_hidden_recipe_refuses_a_reference_weight_rather_than_ignoring_it() {
+        for (family, model) in [
+            ("flux", "flux-dev:q4"),
+            ("wan", "wan22-t2v-a14b:q8"),
+            ("hunyuan3d", "hunyuan3d-2:q8"),
+        ] {
+            let profile = reference_images_for_recipe(family, model);
+            assert_eq!(profile.mode, ControlMode::Hidden, "{model}");
+
+            let mut req = crate::test_support::minimal_generate_request(model);
+            // No references at all: the strength alone is the whole mistake.
+            for bad in [99.0, f64::NAN, -1.0, 1.0] {
+                req.reference_weight = Some(bad);
+                let error = validate_edit_images_against(&profile, "This model", &req)
+                    .expect_err("{model} has no adapter to weight");
+                assert!(error.contains("reference_weight"), "{model}: {error}");
+            }
+
+            // Absent stays fine — this is a refusal of a named value, not a
+            // new requirement.
+            req.reference_weight = None;
+            validate_edit_images_against(&profile, "This model", &req)
+                .unwrap_or_else(|error| panic!("{model} without the field: {error}"));
+        }
+    }
+
+    /// The strength belongs to the adapter: a recipe without one refuses the
+    /// field rather than accepting and ignoring it.
+    #[test]
+    fn reference_weight_is_bounded_where_it_applies_and_refused_where_it_does_not() {
+        let ip = reference_images_for_recipe("sd15", "sd15:fp16");
+        let mut req = crate::test_support::minimal_generate_request("sd15:fp16");
+        req.edit_images = Some(vec![vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]]);
+
+        for good in [0.0, 1.0, validation::REFERENCE_WEIGHT_MAX] {
+            req.reference_weight = Some(good);
+            validate_edit_images_against(&ip, "SD 1.5", &req)
+                .unwrap_or_else(|error| panic!("{good} must be admitted: {error}"));
+        }
+        for bad in [-0.1, validation::REFERENCE_WEIGHT_MAX + 0.1, f64::NAN] {
+            req.reference_weight = Some(bad);
+            assert!(
+                validate_edit_images_against(&ip, "SD 1.5", &req).is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // A recipe with references but no adapter has no strength to set.
+        let klein = reference_images_for_recipe("flux2", "flux2-klein:bf16");
+        let mut k = crate::test_support::minimal_generate_request("flux2-klein:bf16");
+        k.reference_weight = Some(1.0);
+        let error = validate_edit_images_against(&klein, "FLUX.2 [klein]", &k)
+            .expect_err("klein has no reference adapter");
+        assert!(error.contains("reference_weight"), "{error}");
+    }
+
+    #[test]
+    fn reference_images_for_recipe_is_the_single_family_answer() {
+        let qwen = reference_images_for_recipe("qwen-image-edit", "qwen-image-edit-2511:q4");
+        assert_eq!(qwen.mode, ControlMode::Adjustable);
+        assert!(qwen.required);
+        assert_eq!(qwen.max_count, None);
+        assert!(qwen.primary_is_target);
+        assert_eq!(qwen.source_relation, ReferenceSourceRelation::Replaces);
+        assert_eq!(
+            qwen.max_pixels_single,
+            Some(validation::QWEN_IMAGE_EDIT_SOURCE_MAX_PIXELS)
+        );
+        assert_eq!(qwen.max_pixels_multi, qwen.max_pixels_single);
+
+        let dev = reference_images_for_recipe("flux2", "flux2-dev:bf16");
+        assert_eq!(dev.mode, ControlMode::Adjustable);
+        assert!(!dev.required);
+        assert_eq!(dev.source_relation, ReferenceSourceRelation::Replaces);
+        assert!(!dev.primary_is_target);
+
+        let klein = reference_images_for_recipe("flux2", "flux2-klein:bf16");
+        assert_eq!(klein.source_relation, ReferenceSourceRelation::Exclusive);
+
+        // IP-Adapter is the first — and so far only — `Combines` recipe: the
+        // image prompt rides WITH a source image rather than replacing or
+        // excluding it, so none of the img2img fields are refused.
+        for (family, model) in [("sd15", "sd15:fp16"), ("sdxl", "sdxl-base:fp16")] {
+            let ip = reference_images_for_recipe(family, model);
+            assert_eq!(ip.mode, ControlMode::Adjustable, "{model}");
+            assert!(!ip.required, "{model}");
+            assert_eq!(ip.max_count, Some(1), "{model}");
+            assert!(!ip.primary_is_target, "{model}");
+            assert_eq!(
+                ip.source_relation,
+                ReferenceSourceRelation::Combines,
+                "{model}"
+            );
+            let weight = ip.weight.as_ref().expect("an adapter has a strength");
+            assert_eq!(
+                weight.default,
+                validation::REFERENCE_WEIGHT_DEFAULT,
+                "{model}"
+            );
+            assert_eq!(weight.min, 0.0, "{model}");
+            assert_eq!(weight.max, validation::REFERENCE_WEIGHT_MAX, "{model}");
+        }
+
+        for (family, model) in [
+            ("flux", "flux-dev:q4"),
+            ("wan", "wan22-t2v-a14b:q8"),
+            ("hunyuan3d", "hunyuan3d-2:q8"),
+            ("", "not-a-model"),
+        ] {
+            let none = reference_images_for_recipe(family, model);
+            assert_eq!(none.mode, ControlMode::Hidden, "{model}");
+            assert_eq!(none.max_count, Some(0), "{model}");
+            assert!(none.weight.is_none(), "{model}");
+            assert_eq!(
+                none.reason.as_deref(),
+                Some(REFERENCE_IMAGES_UNSUPPORTED_REASON),
+                "{model}"
+            );
+        }
+
+        // The two families that DO have references but no adapter advertise no
+        // strength, so a client cannot render a slider that means nothing.
+        assert!(
+            reference_images_for_recipe("qwen-image-edit", "qwen-image-edit-2511:q4")
+                .weight
+                .is_none()
+        );
+        assert!(reference_images_for_recipe("flux2", "flux2-klein:bf16")
+            .weight
+            .is_none());
+
+        // The recipe serializes the same answer it was given.
+        let profile = resolve_generation_profile(input("flux2-klein:bf16", "flux2"));
+        assert_eq!(
+            profile
+                .default_recipe()
+                .unwrap()
+                .capabilities
+                .reference_images
+                .as_ref(),
+            Some(&klein)
+        );
+    }
+
+    /// The two families that already had references keep every refusal they
+    /// had — but now they are DERIVED from the block instead of from a family
+    /// list, which is why Klein could be added without touching them.
+    #[test]
+    fn dev_and_qwen_derive_their_refusals_from_the_reference_block() {
+        let dev = resolve_generation_profile(input("flux2-dev:bf16", "flux2"));
+        let dev_recipe = dev.default_recipe().unwrap();
+        assert!(!dev_recipe.capabilities.supports_strength);
+        assert_eq!(dev_recipe.capabilities.mask.mode, ControlMode::Hidden);
+        assert!(!dev_recipe.capabilities.supports_lora);
+        assert_ne!(dev_recipe.resolution.domain, ResolutionDomain::SourceDriven);
+
+        let qwen = resolve_generation_profile(input("qwen-image-edit-2511:q4", "qwen-image-edit"));
+        let qwen_recipe = qwen.default_recipe().unwrap();
+        assert!(!qwen_recipe.capabilities.supports_strength);
+        assert_eq!(qwen_recipe.capabilities.mask.mode, ControlMode::Hidden);
+        assert_eq!(
+            qwen_recipe.resolution.domain,
+            ResolutionDomain::SourceDriven
+        );
+        assert_eq!(
+            qwen_recipe.resolution.source_max_pixels,
+            Some(validation::QWEN_IMAGE_EDIT_SOURCE_MAX_PIXELS)
+        );
+    }
+
+    /// The recipe's dev predicate now answers only "does this checkpoint's
+    /// loader refuse a LoRA", and it must be the SAME predicate admission
+    /// uses. The old `contains("dev")` sniff was wider: any flux2 identity
+    /// with `dev` in it lost its adapter stack.
+    #[test]
+    fn recipe_dev_predicate_matches_validation_is_flux2_dev_model() {
+        for model in [
+            "flux2-dev:bf16",
+            "flux2-dev:q4",
+            "hf:black-forest-labs/FLUX.2-dev",
+            "flux2-klein:bf16",
+            "flux2-klein-base-9b:q8",
+            "hf:someone/klein-dev-merge",
+        ] {
+            let profile = resolve_generation_profile(input(model, "flux2"));
+            let capabilities = &profile.default_recipe().unwrap().capabilities;
+            assert_eq!(
+                !capabilities.supports_lora,
+                validation::is_flux2_dev_model(model),
+                "{model}"
+            );
+        }
+    }
+
+    /// Both doors refuse with the same sentence, because there is one
+    /// validator and one subject label behind them.
+    #[test]
+    fn the_profile_door_answers_references_exactly_as_family_validation_does() {
+        let klein = resolve_generation_profile(input("flux2-klein:bf16", "flux2"));
+        let mut request = reference_request(&klein, "flux2-klein:bf16");
+        request.edit_images = Some(vec![png_bytes()]);
+        request.source_image = Some(png_bytes());
+        let door = validate_request_against_generation_profile(&klein, &request).unwrap_err();
+        assert_eq!(door, "flux2-klein uses edit_images instead of source_image");
+        assert_eq!(
+            door,
+            crate::validation::validate_generate_request_with_family(&request, Some("flux2"))
+                .unwrap_err()
+        );
+
+        // A recipe advertising no reference protocol refuses the field with
+        // its own advertised sentence.
+        let flux = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        let mut plain = reference_request(&flux, "flux-dev:q4");
+        plain.edit_images = Some(vec![png_bytes()]);
+        let refusal = validate_request_against_generation_profile(&flux, &plain).unwrap_err();
+        assert_eq!(refusal, REFERENCE_IMAGES_UNSUPPORTED_REASON);
+        assert_eq!(
+            refusal,
+            crate::validation::validate_generate_request_with_family(&plain, Some("flux"))
+                .unwrap_err()
+        );
+    }
+
+    #[test]
+    fn identity_capability_is_off_in_a_build_that_cannot_execute_it() {
+        // A binary that cannot execute identity conditioning must never
+        // advertise the control, however qualified the checkpoint is. That
+        // is the feature AND the landed runtime adapter, not the feature
+        // alone.
+        let profile = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let advertised = profile
+            .default_recipe()
+            .unwrap()
+            .capabilities
+            .supports_identity;
+        assert_eq!(advertised, crate::identity::identity_runtime_available());
+        assert_eq!(
+            profile.supports_identity(),
+            crate::identity::identity_runtime_available()
+        );
+    }
+
+    /// The capability arm must not ship a promise the worker cannot execute
+    /// (the failure `CLAUDE.md` records for wan's `supports_sequence`). While
+    /// the runtime adapter is pending, NO build advertises identity — the
+    /// `pulid` feature included.
+    #[test]
+    fn identity_capability_is_unadvertised_while_the_runtime_adapter_is_pending() {
+        if crate::identity::IDENTITY_RUNTIME_READY {
+            return;
+        }
+        for model in crate::identity::identity_qualified_models() {
+            let family = crate::identity::identity_family(model)
+                .expect("qualified model has an identity family")
+                .family();
+            let profile = resolve_generation_profile(input(model, family));
+            assert!(
+                !profile.supports_identity(),
+                "{model} must not advertise identity while the adapter is pending \
+                 (feature pulid = {})",
+                cfg!(feature = "pulid")
+            );
+            assert!(
+                !profile
+                    .default_recipe()
+                    .unwrap()
+                    .capabilities
+                    .supports_identity,
+                "{model}: the default recipe must not advertise it either"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_capability_is_never_advertised_outside_supported_families_or_for_turbo() {
+        for (model, family) in [
+            ("flux2-klein", "flux2"),
+            ("sdxl-turbo:fp16", "sdxl"),
+            ("z-image-turbo:q4", "z-image"),
+        ] {
+            let profile = resolve_generation_profile(input(model, family));
+            assert!(
+                !profile.supports_identity(),
+                "{model} must not advertise identity conditioning"
+            );
+        }
+    }
+
+    #[cfg(feature = "pulid")]
+    #[test]
+    fn identity_capability_is_advertised_for_qualified_checkpoints_once_the_adapter_lands() {
+        if !crate::identity::IDENTITY_RUNTIME_READY {
+            // Pinned by `identity_capability_is_unadvertised_while_the_runtime_adapter_is_pending`
+            // until #1221 flips the constant.
+            return;
+        }
+        for model in crate::identity::identity_qualified_models() {
+            let family = crate::identity::identity_family(model)
+                .expect("qualified model has an identity family")
+                .family();
+            let profile = resolve_generation_profile(input(model, family));
+            assert!(
+                profile.supports_identity(),
+                "{model} must advertise identity conditioning"
+            );
+        }
+        for (model, family) in [("cv:123", "flux"), ("hf:owner/sdxl-finetune", "sdxl")] {
+            let profile = resolve_generation_profile(input(model, family));
+            assert!(
+                profile.supports_identity(),
+                "opaque catalog model {model} must inherit {family} identity support"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_z_image_candidates_are_profile_recommendations() {
+        let profile = resolve_generation_profile(input("z-image-turbo:q4", "z-image"));
+        let recipe = profile.default_recipe().unwrap();
+        let presets = recipe
+            .resolution
+            .aspect_groups
+            .iter()
+            .flat_map(|group| &group.presets)
+            .map(|preset| (preset.width, preset.height))
+            .collect::<std::collections::HashSet<_>>();
+        let candidates = resolution_qualification_record("z-image").unwrap();
+        assert!(candidates.qualified);
+        assert_eq!(presets.len(), candidates.candidates.len());
+        assert!(presets.contains(&(1280, 720)));
+        assert!(presets.contains(&(720, 1280)));
+    }
+
+    #[test]
+    fn wan_subfamily_selects_exact_checkpoint_contract() {
+        let mut wan = input("cv:opaque", "wan");
+        wan.sub_family = Some("wan22-ti2v-5b");
+        let recipe = resolve_generation_profile(wan)
+            .default_recipe()
+            .unwrap()
+            .clone();
+        assert_eq!(recipe.resolution.alignment, 32);
+        assert_eq!(recipe.resolution.aspect_groups.len(), 2);
+        assert!(recipe.resolution.aspect_groups.iter().all(|group| {
+            group
+                .presets
+                .iter()
+                .all(|preset| preset.width == 1280 || preset.height == 1280)
+        }));
+    }
+
+    #[test]
+    fn h3_temporal_ceiling_is_valid_on_both_grids() {
+        let mut h3 = input("minimax-h3-fl2va:official-bf16", "minimax-h3");
+        h3.default_frames = Some(crate::minimax_h3::MIN_FRAMES);
+        h3.default_fps = Some(24);
+        let temporal = resolve_generation_profile(h3)
+            .default_recipe()
+            .unwrap()
+            .temporal
+            .clone()
+            .unwrap();
+        assert_eq!(temporal.frames.max, 345);
+        assert_eq!(
+            (temporal.frames.max - temporal.frame_offset) % temporal.frames.step,
+            0
+        );
+        assert!(temporal.frames.max <= 15 * 24);
+    }
+
+    #[test]
+    fn profile_hash_is_stable_and_content_addressed() {
+        let left = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        let right = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        assert_eq!(left.profile_hash, right.profile_hash);
+        assert_eq!(left.profile_hash.len(), 64);
+    }
+
+    #[test]
+    fn advanced_and_delivery_controls_are_recipe_owned() {
+        let sd15 = resolve_generation_profile(input("sd15-base:q4", "sd15"));
+        let sd15_caps = &sd15.default_recipe().unwrap().capabilities;
+        assert_eq!(sd15_caps.controlnet.mode, ControlMode::Adjustable);
+        assert_eq!(sd15_caps.controlnet.max_count, 1);
+        assert_eq!(
+            sd15_caps.output.formats,
+            vec![OutputFormat::Png, OutputFormat::Jpeg, OutputFormat::Webp]
+        );
+
+        let wan = resolve_generation_profile(input("wan22-t2v-a14b:fp8", "wan"));
+        let wan_caps = &wan.default_recipe().unwrap().capabilities;
+        assert_eq!(wan_caps.lora.mode, ControlMode::Hidden);
+        assert_eq!(wan_caps.controlnet.mode, ControlMode::Hidden);
+        assert_eq!(wan_caps.wan_recipe.mode, ControlMode::Adjustable);
+        assert!(!wan_caps.wan_recipe.supports_distill_strength);
+        assert_eq!(
+            wan_caps.wan_recipe.first_last_frame_min_frames,
+            Some(validation::WAN_TI2V_FLF_MIN_FRAMES)
+        );
+    }
+
+    #[test]
+    fn explicit_pipeline_lookup_never_falls_back_to_default_recipe() {
+        let mut ltx = input("ltx2-distilled:q4", "ltx2");
+        ltx.default_frames = Some(121);
+        ltx.default_fps = Some(24);
+        let profile = resolve_generation_profile(ltx);
+        assert!(profile.recipe_for_pipeline(None).is_some());
+        assert!(profile
+            .recipe_for_pipeline(Some(Ltx2PipelineMode::T2a))
+            .is_none());
+    }
+
+    #[test]
+    fn t2a_dimensionless_profile_reaches_family_admission_with_zero_canvas() {
+        let mut ltx = input("ltx-2.3-22b-dev:fp8", "ltx2");
+        ltx.default_frames = Some(97);
+        ltx.default_fps = Some(24);
+        ltx.supports_audio = true;
+        let profile = resolve_generation_profile(ltx);
+        let recipe = profile
+            .recipe_for_pipeline(Some(Ltx2PipelineMode::T2a))
+            .unwrap();
+        assert_eq!(recipe.resolution.domain, ResolutionDomain::None);
+        let request: crate::GenerateRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "rain on a tin roof",
+            "model": "ltx-2.3-22b-dev:fp8",
+            "width": 0,
+            "height": 0,
+            "steps": recipe.defaults.steps,
+            "guidance": recipe.defaults.guidance,
+            "frames": recipe.defaults.frames,
+            "fps": recipe.defaults.fps,
+            "pipeline": "t2a",
+            "output_format": "wav"
+        }))
+        .unwrap();
+        validate_request_against_generation_profile(&profile, &request).unwrap();
+        crate::validation::validate_generate_request_with_family(&request, Some("ltx2")).unwrap();
+    }
+
+    /// The mesh recipe is the whole contract in one place: no canvas, no
+    /// mask, no strength, a prompt that conditions nothing, and the 3-D
+    /// controls a client renders instead of a resolution picker.
+    #[test]
+    fn hunyuan3d_profile_is_canvasless_maskless_promptless_and_carries_mesh_controls() {
+        let mut mesh = input("hunyuan3d-mini-turbo:fp16", "hunyuan3d");
+        mesh.source_image = Some(SourceImageCapability::Required);
+        mesh.default_steps = 5;
+        let profile = resolve_generation_profile(mesh);
+        let recipe = profile.default_recipe().unwrap();
+        let caps = &recipe.capabilities;
+
+        assert_eq!(recipe.resolution.domain, ResolutionDomain::None);
+        assert_eq!((recipe.defaults.width, recipe.defaults.height), (0, 0));
+        assert_eq!(caps.mask.mode, ControlMode::Hidden);
+        assert!(!caps.supports_strength);
+        assert_eq!(caps.prompt.mode, PromptRequirement::Ignored);
+        assert!(caps
+            .prompt
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("no text encoder")));
+        assert_eq!(caps.output.default_format, OutputFormat::Glb);
+        assert_eq!(caps.output.formats, vec![OutputFormat::Glb]);
+        assert_eq!(
+            caps.guidance,
+            crate::GuidanceCapabilities::ADJUSTABLE_NO_NEGATIVE
+        );
+        assert_eq!(caps.negative_prompt.mode, ControlMode::Hidden);
+
+        let mesh_caps = caps.mesh.as_ref().expect("a mesh recipe advertises mesh");
+        assert_eq!(
+            mesh_caps.octree_resolutions,
+            validation::MESH_OCTREE_RESOLUTIONS.to_vec()
+        );
+        assert_eq!(mesh_caps.octree_default, 256);
+        assert!((mesh_caps.threshold.default - 0.6).abs() < 1e-6);
+        assert_eq!(
+            (mesh_caps.threshold.min, mesh_caps.threshold.max),
+            (0.0, 1.0)
+        );
+        assert_eq!(mesh_caps.threshold.step, 0.01);
+        assert_eq!(
+            mesh_caps.target_faces_min,
+            validation::MESH_MIN_TARGET_FACES
+        );
+        assert_eq!(
+            mesh_caps.target_faces_max,
+            validation::MESH_MAX_TARGET_FACES
+        );
+        assert_eq!(
+            mesh_caps.texture.mode,
+            if cfg!(feature = "mesh-texture") {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            }
+        );
+        let named = mesh_caps.named_views.as_ref().expect("current profile");
+        assert_eq!(named.mode, ControlMode::Hidden);
+        assert_eq!(named.max_count, 0);
+        assert_eq!(
+            mesh_caps.texture_resolutions,
+            validation::MESH_TEXTURE_RESOLUTIONS
+        );
+        assert_eq!(mesh_caps.texture_default_resolution, Some(2048));
+        assert_eq!(
+            mesh_caps
+                .texture_view_count
+                .as_ref()
+                .map(|value| value.default),
+            Some(6)
+        );
+        let mut workflow_modes = vec![MeshWorkflowMode::ImageToMesh, MeshWorkflowMode::TextToMesh];
+        if cfg!(feature = "mesh-texture") {
+            workflow_modes.push(MeshWorkflowMode::MeshTexture);
+        }
+        assert_eq!(mesh_caps.workflow_modes, workflow_modes);
+        assert_eq!(
+            mesh_caps.mesh_input.as_ref().map(|input| input.mode),
+            Some(if cfg!(feature = "mesh-texture") {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            })
+        );
+        assert_eq!(
+            mesh_caps.matting.as_ref().map(|control| control.mode),
+            Some(if cfg!(feature = "mesh-matting") {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            })
+        );
+        let matting = mesh_caps.matting.as_ref().unwrap();
+        assert_eq!(matting.default, MeshMattingMode::Auto);
+        assert_eq!(
+            matting.choices,
+            if cfg!(feature = "mesh-matting") {
+                vec![
+                    MeshMattingMode::Auto,
+                    MeshMattingMode::On,
+                    MeshMattingMode::Off,
+                ]
+            } else {
+                Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn hunyuan3d_21_advertises_shape_vae_mesh_roundtrip_without_paint() {
+        let mut mesh = input("hunyuan3d-2.1:fp16", "hunyuan3d");
+        mesh.source_image = Some(SourceImageCapability::Required);
+        let profile = resolve_generation_profile(mesh);
+        let capabilities = profile
+            .default_recipe()
+            .unwrap()
+            .capabilities
+            .mesh
+            .as_ref()
+            .unwrap();
+
+        assert!(capabilities
+            .workflow_modes
+            .contains(&MeshWorkflowMode::MeshRoundtrip));
+        assert_eq!(
+            capabilities.mesh_input.as_ref().map(|input| input.mode),
+            Some(ControlMode::Adjustable)
+        );
+        assert_eq!(
+            capabilities.texture.mode,
+            if cfg!(feature = "mesh-texture") {
+                ControlMode::Adjustable
+            } else {
+                ControlMode::Hidden
+            }
+        );
+    }
+
+    #[test]
+    fn hunyuan3d_2mv_profile_names_every_view_slot() {
+        let mut mesh = input("hunyuan3d-2mv:fp16", "hunyuan3d");
+        mesh.source_image = Some(SourceImageCapability::Required);
+        let profile = resolve_generation_profile(mesh);
+        let mesh = profile
+            .default_recipe()
+            .unwrap()
+            .capabilities
+            .mesh
+            .as_ref()
+            .unwrap();
+        let named = mesh.named_views.as_ref().unwrap();
+        assert_eq!(named.mode, ControlMode::Adjustable);
+        assert_eq!((named.min_count, named.max_count), (1, 4));
+        assert_eq!(
+            mesh.threshold.default,
+            crate::validation::MESH_MULTIVIEW_DEFAULT_THRESHOLD
+        );
+        assert_eq!(
+            named.roles,
+            vec![
+                GenerationImageReferenceRole::Front,
+                GenerationImageReferenceRole::Left,
+                GenerationImageReferenceRole::Back,
+                GenerationImageReferenceRole::Right,
+            ]
+        );
+        assert_eq!(mesh.workflow_modes, vec![MeshWorkflowMode::MultiviewToMesh]);
+    }
+
+    /// Every raster and video recipe stays exactly as it was: no mesh block,
+    /// a required prompt, and strength wherever an existing latent is read.
+    ///
+    /// The tier's own `source_image` contract is carried in from the manifest
+    /// rather than left at the fixture's `None`, because that is what decides
+    /// the advertised prompt mode for a video family: `wan22-t2v-a14b:q4` is
+    /// `Unsupported` and so stays `Required`, while the fixture default reads
+    /// as "generic img2img", which is true of an image family and of nothing
+    /// in the Wan ladder.
+    #[test]
+    fn only_a_mesh_recipe_carries_mesh_controls() {
+        for (model, family) in [
+            ("flux-dev:q8", "flux"),
+            ("sdxl:fp16", "sdxl"),
+            ("wan22-t2v-a14b:q4", "wan"),
+        ] {
+            let mut profile_input = input(model, family);
+            profile_input.source_image = crate::manifest::find_manifest(model)
+                .and_then(|manifest| manifest.defaults.source_image);
+            let recipe_set = resolve_generation_profile(profile_input);
+            let caps = &recipe_set.default_recipe().unwrap().capabilities;
+            assert!(caps.mesh.is_none(), "{model} must not advertise mesh");
+            assert_eq!(caps.prompt.mode, PromptRequirement::Required, "{model}");
+            assert_eq!(caps.supports_strength, family != "wan", "{model}");
+        }
+    }
+
+    /// The advertised mode and admission must agree for an audio-only recipe.
+    /// The recipe forces the conditioning argument to `false` because an
+    /// attached still conditions nothing an audio decoder reads; admission
+    /// has to reach the same answer for the same request, or a `t2a` render
+    /// the recipe says needs a prompt is admitted without one.
+    #[test]
+    fn an_audio_only_recipe_and_admission_agree_on_the_prompt() {
+        let mut profile_input = input("ltx-2.3-22b-dev:fp8", "ltx2");
+        profile_input.source_image = Some(SourceImageCapability::Optional);
+        profile_input.default_frames = Some(97);
+        profile_input.default_fps = Some(24);
+        profile_input.supports_audio = true;
+        let profile = resolve_generation_profile(profile_input);
+        let recipe = profile
+            .recipe_for_pipeline(Some(Ltx2PipelineMode::T2a))
+            .expect("the LTX-2 profile carries an audio-only recipe");
+        assert_eq!(recipe.capabilities.prompt.mode, PromptRequirement::Required);
+
+        let mut request = crate::test_support::minimal_generate_request("ltx-2.3-22b-dev:fp8");
+        request.pipeline = Some(Ltx2PipelineMode::T2a);
+        request.source_image = Some(png_bytes());
+        assert!(
+            crate::validation::prompt_required_for(&request, Some("ltx2")),
+            "admission must answer the recipe's own advertised mode"
+        );
+    }
+
+    /// Wan and MiniMax H3 join LTX-2: the prompt is optional exactly where the
+    /// tier can be conditioned at all. The manifest's own `source_image`
+    /// contract is the authority, so every t2v tier — and `wan22-ti2v-5b:dmd`,
+    /// whose DMD ladder takes no source — keeps the prompt required for free,
+    /// with no per-tier list anywhere.
+    #[test]
+    fn wan_and_h3_advertise_an_optional_prompt_only_where_the_tier_takes_a_source() {
+        let mut optional = 0_usize;
+        let mut required = 0_usize;
+        for manifest in crate::manifest::known_manifests() {
+            let family = canonical_family(&manifest.family);
+            if family != "wan" && !crate::minimax_h3::is_family(family) {
+                continue;
+            }
+            let mut profile_input = input(manifest.name.as_str(), manifest.family.as_str());
+            profile_input.source_image = manifest.defaults.source_image;
+            profile_input.default_width = manifest.defaults.width;
+            profile_input.default_height = manifest.defaults.height;
+            profile_input.default_steps = manifest.defaults.steps;
+            profile_input.default_guidance = manifest.defaults.guidance;
+            profile_input.default_frames = manifest.defaults.frames;
+            profile_input.default_fps = manifest.defaults.fps;
+            let recipe_set = resolve_generation_profile(profile_input);
+            let mode = recipe_set
+                .default_recipe()
+                .unwrap()
+                .capabilities
+                .prompt
+                .mode;
+            let conditionable =
+                manifest.defaults.source_image != Some(SourceImageCapability::Unsupported);
+            if conditionable {
+                assert_eq!(
+                    mode,
+                    PromptRequirement::Optional,
+                    "{} takes a source, so a conditioned render needs no prompt",
+                    manifest.name
+                );
+                optional += 1;
+            } else {
+                assert_eq!(
+                    mode,
+                    PromptRequirement::Required,
+                    "{} can never be conditioned, so its prompt is the whole render",
+                    manifest.name
+                );
+                required += 1;
+            }
+        }
+        assert!(
+            optional > 0 && required > 0,
+            "the ladder must exercise both answers: {optional} optional, {required} required"
+        );
+    }
+
+    /// A `mesh` block on a raster recipe is refused with the same sentence
+    /// family validation uses — the two doors are one contract.
+    #[test]
+    fn a_raster_recipe_refuses_a_mesh_block() {
+        let profile = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let mut request = crate::test_support::minimal_generate_request("flux-dev:q8");
+        request.steps = profile.default_recipe().unwrap().defaults.steps;
+        request.guidance = profile.default_recipe().unwrap().defaults.guidance;
+        request.width = 1024;
+        request.height = 1024;
+        request.mesh = Some(crate::types::MeshRequestOptions {
+            octree_resolution: Some(256),
+            ..Default::default()
+        });
+        let error = validate_request_against_generation_profile(&profile, &request).unwrap_err();
+        assert!(error.contains("only supported by 3-D families"), "{error}");
+    }
+
+    #[test]
+    fn a_mesh_recipe_validates_its_own_controls() {
+        let mut mesh = input("hunyuan3d-mini-turbo:fp16", "hunyuan3d");
+        mesh.source_image = Some(SourceImageCapability::Required);
+        mesh.default_steps = 5;
+        let profile = resolve_generation_profile(mesh);
+        let recipe = profile.default_recipe().unwrap();
+        let base = |options: crate::types::MeshRequestOptions| {
+            let mut request =
+                crate::test_support::minimal_generate_request("hunyuan3d-mini-turbo:fp16");
+            request.steps = recipe.defaults.steps;
+            request.guidance = recipe.defaults.guidance;
+            request.width = 0;
+            request.height = 0;
+            request.output_format = Some(OutputFormat::Glb);
+            request.mesh = Some(options);
+            request
+        };
+        validate_request_against_generation_profile(
+            &profile,
+            &base(crate::types::MeshRequestOptions {
+                octree_resolution: Some(256),
+                threshold: Some(0.6),
+                target_faces: Some(50_000),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        let error = validate_request_against_generation_profile(
+            &profile,
+            &base(crate::types::MeshRequestOptions {
+                octree_resolution: Some(200),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("mesh.octree_resolution"), "{error}");
+        let error = validate_request_against_generation_profile(
+            &profile,
+            &base(crate::types::MeshRequestOptions {
+                target_faces: Some(4),
+                ..Default::default()
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("mesh.target_faces"), "{error}");
+        let textured = validate_request_against_generation_profile(
+            &profile,
+            &base(crate::types::MeshRequestOptions {
+                texture: Some(true),
+                ..Default::default()
+            }),
+        );
+        if cfg!(feature = "mesh-texture") {
+            textured.unwrap();
+        } else {
+            assert!(textured.unwrap_err().contains("mesh-texture build feature"));
+        }
+    }
+
+    /// An unadvertised format is refused by the ONE extracted check durable
+    /// admission also runs, so the 422 wording cannot drift between doors.
+    #[test]
+    fn an_unadvertised_output_format_is_refused_by_the_shared_check() {
+        let profile = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let recipe = profile.default_recipe().unwrap();
+        let error = validate_output_format_against_generation_profile(recipe, OutputFormat::Gif)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "output format 'gif' is not available for this recipe"
+        );
+        validate_output_format_against_generation_profile(recipe, OutputFormat::Png).unwrap();
+    }
+
+    /// Old servers do not send the new blocks. Their JSON must still parse,
+    /// and must not claim a capability nobody wrote.
+    #[test]
+    fn an_older_profile_without_the_new_capability_blocks_still_parses() {
+        let profile = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let mut json = serde_json::to_value(&profile).unwrap();
+        let caps = json["recipes"][0]["capabilities"].as_object_mut().unwrap();
+        caps.remove("prompt");
+        caps.remove("supports_strength");
+        caps.remove("mesh");
+        caps.remove("reference_images");
+        let parsed: GenerationProfileSet = serde_json::from_value(json).unwrap();
+        let caps = &parsed.recipes[0].capabilities;
+        assert_eq!(caps.prompt.mode, PromptRequirement::Required);
+        assert!(!caps.supports_strength);
+        assert!(caps.mesh.is_none());
+        // Absence is an OLDER SERVER, never a refusal: that host still
+        // renders flux2-dev and qwen-image-edit references, so a client must
+        // fall back to its legacy predicate rather than read a `Hidden`
+        // nobody wrote.
+        assert!(caps.reference_images.is_none());
+    }
+
+    /// The cross-surface reference fixture (§1g) pins what every surface must
+    /// believe about each tier. Rust reads it here and the browser reads the
+    /// same file, so a drift on either side fails CI.
+    #[test]
+    fn flux2_reference_parity_fixture_pins_every_surface() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/flux2/reference-parity-v1.json"
+        )))
+        .expect("fixture parses");
+        assert_eq!(
+            fixture["schema"].as_str(),
+            Some("mold.flux2.reference-parity.v1")
+        );
+        let rows = fixture["models"].as_array().expect("models array");
+        assert!(!rows.is_empty(), "the fixture must pin at least one tier");
+        for row in rows {
+            let model = row["model"].as_str().expect("model");
+            let family = row["family"].as_str().expect("family");
+            let actual = reference_images_for_recipe(family, model);
+            assert_eq!(
+                format!("{:?}", actual.mode).to_lowercase(),
+                row["mode"].as_str().expect("mode"),
+                "{model} mode"
+            );
+            assert_eq!(
+                actual.required,
+                row["required"].as_bool().expect("required"),
+                "{model} required"
+            );
+            assert_eq!(
+                actual.max_count.map(u64::from),
+                row["max_count"].as_u64(),
+                "{model} max_count"
+            );
+            assert_eq!(
+                actual.primary_is_target,
+                row["primary_is_target"]
+                    .as_bool()
+                    .expect("primary_is_target"),
+                "{model} primary_is_target"
+            );
+            assert_eq!(
+                serde_json::to_value(actual.source_relation).unwrap(),
+                row["source_relation"],
+                "{model} source_relation"
+            );
+            // Optional per-row keys: pinned exactly when a row names them,
+            // absent from the wire when it does not.
+            let wire = serde_json::to_value(&actual).unwrap();
+            for key in ["canvas", "formats"] {
+                assert_eq!(
+                    wire.get(key),
+                    row.get(key),
+                    "{model} {key} (absent in the row means absent on the wire)"
+                );
+            }
+            // The recipe every client reads must carry that same block.
+            let profile = resolve_generation_profile(input(model, family));
+            assert_eq!(
+                profile
+                    .default_recipe()
+                    .unwrap()
+                    .capabilities
+                    .reference_images
+                    .as_ref(),
+                Some(&actual),
+                "{model} recipe block"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_contract_matches_engine_solver_families() {
+        let sd = resolve_generation_profile(input("sdxl-base:q4", "sdxl"));
+        assert_eq!(
+            sd.default_recipe().unwrap().capabilities.schedulers,
+            vec![Scheduler::Ddim, Scheduler::EulerAncestral, Scheduler::UniPc]
+        );
+
+        let mut wan_input = input("wan22-t2v-a14b:q5", "wan");
+        wan_input.default_frames = Some(81);
+        wan_input.default_fps = Some(16);
+        let wan = resolve_generation_profile(wan_input);
+        assert_eq!(
+            wan.default_recipe().unwrap().capabilities.schedulers,
+            vec![Scheduler::UniPc, Scheduler::Euler, Scheduler::DpmPp]
+        );
+        let mut request = request_for(&wan, 1280, 720);
+        request.scheduler = Some(Scheduler::Ddim);
+        assert!(validate_request_against_generation_profile(&wan, &request)
+            .unwrap_err()
+            .contains("not available"));
+
+        let flux = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        let mut flux_request = request_for(&flux, 1024, 1024);
+        flux_request.scheduler = Some(Scheduler::Euler);
+        assert!(
+            validate_request_against_generation_profile(&flux, &flux_request)
+                .unwrap_err()
+                .contains("not available")
+        );
+    }
+
+    #[test]
+    fn z_and_qwen_provenance_is_pinned_and_qualification_is_explicit() {
+        for (model, family, revision, qualified, evidence_fragment) in [
+            (
+                "z-image-turbo:q4",
+                "z-image",
+                "768cb50d847cdbba97c89533ae976be69cf5a5b8",
+                true,
+                "docs/qualification/z-image-1024-tier-metal-q4.json",
+            ),
+            (
+                "qwen-image:q4",
+                "qwen-image",
+                "6b5e1f5cec987d404be5ac6657db3b9aacb56a89",
+                true,
+                "no per-size runtime-performance claim",
+            ),
+            (
+                "qwen-image-2.1:bf16",
+                "qwen-image21",
+                "b3179ad355be050328e483a9dfdd9e60cd62adfa",
+                true,
+                "docs/qualification/qwen-image-2.1-metal-uat.json",
+            ),
+        ] {
+            let profile = resolve_generation_profile(input(model, family));
+            let provenance = &profile.default_recipe().unwrap().provenance[0];
+            assert_eq!(provenance.qualified, qualified);
+            assert_eq!(provenance.revision.as_deref(), Some(revision));
+            assert!(provenance.source.contains(revision));
+            let evidence = provenance.evidence.as_deref().unwrap();
+            assert!(evidence.contains(evidence_fragment));
+        }
+    }
+
+    #[test]
+    fn qwen_image_edit_presets_are_mold_source_fitting_guidance() {
+        let profile =
+            resolve_generation_profile(input("qwen-image-edit-2511:q4", "qwen-image-edit"));
+        let recipe = profile.default_recipe().unwrap();
+        assert_eq!(recipe.resolution.domain, ResolutionDomain::SourceDriven);
+        assert_eq!(
+            recipe.resolution.source_max_pixels,
+            Some(validation::QWEN_IMAGE_EDIT_SOURCE_MAX_PIXELS)
+        );
+        assert_eq!(recipe.provenance[0].kind, ProvenanceKind::MoldPolicy);
+        assert!(recipe.provenance[0].source.contains("source-driven"));
+        assert!(resolution_qualification_record("qwen-image-edit").is_none());
+    }
+
+    #[test]
+    fn qwen_candidates_are_profile_recommendations() {
+        let profile = resolve_generation_profile(input("qwen-image:q4", "qwen-image"));
+        let presets = profile
+            .default_recipe()
+            .unwrap()
+            .resolution
+            .aspect_groups
+            .iter()
+            .flat_map(|group| &group.presets)
+            .map(|preset| (preset.width, preset.height))
+            .collect::<std::collections::HashSet<_>>();
+        let candidates = resolution_qualification_record("qwen-image").unwrap();
+        assert!(candidates.qualified);
+        assert_eq!(candidates.candidates, QWEN_UPSTREAM_CANDIDATES);
+        assert_eq!(presets.len(), candidates.candidates.len());
+        assert!(presets.contains(&(1664, 928)));
+        assert!(presets.contains(&(928, 1664)));
+    }
+
+    #[test]
+    fn adjustable_float_controls_enforce_the_advertised_step() {
+        let profile = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        let mut request = request_for(&profile, 1024, 1024);
+        request.guidance = 3.6;
+        validate_request_against_generation_profile(&profile, &request).unwrap();
+        request.guidance = 3.65;
+        assert!(
+            validate_request_against_generation_profile(&profile, &request)
+                .unwrap_err()
+                .contains("steps of 0.1")
+        );
+    }
+
+    #[test]
+    fn ltx2_frame_ceiling_tracks_the_requested_fps() {
+        let mut ltx = input("ltx2-distilled:q4", "ltx2");
+        ltx.default_width = 768;
+        ltx.default_height = 512;
+        ltx.default_frames = Some(121);
+        ltx.default_fps = Some(24);
+        let profile = resolve_generation_profile(ltx);
+        assert_eq!(
+            profile
+                .default_recipe()
+                .unwrap()
+                .temporal
+                .as_ref()
+                .unwrap()
+                .frames
+                .max,
+            validation::LTX2_MAX_FRAMES_ABSOLUTE - 3
+        );
+
+        let mut request = request_for(&profile, 768, 512);
+        request.fps = Some(12);
+        request.frames = Some(241);
+        validate_request_against_generation_profile(&profile, &request).unwrap();
+        request.frames = Some(249);
+        assert!(
+            validate_request_against_generation_profile(&profile, &request)
+                .unwrap_err()
+                .contains("frames must be")
+        );
+
+        request.fps = Some(120);
+        request.frames = Some(601);
+        validate_request_against_generation_profile(&profile, &request).unwrap();
+    }
+
+    #[test]
+    fn every_shipped_manifest_profile_is_internally_admissible() {
+        for manifest in crate::manifest::known_manifests()
+            .iter()
+            .filter(|manifest| manifest.is_generation_model())
+        {
+            let profile = generation_profile_for_manifest(manifest);
+            assert_eq!(profile.schema_version, GENERATION_PROFILE_SCHEMA_VERSION);
+            assert_eq!(profile.profile_hash.len(), 64, "{}", manifest.name);
+            assert!(profile.default_recipe().is_some(), "{}", manifest.name);
+
+            for recipe in &profile.recipes {
+                let context = format!("{} recipe {}", manifest.name, recipe.id);
+                assert!(
+                    (recipe.steps.min..=recipe.steps.max).contains(&recipe.steps.default),
+                    "{context}: step default is outside its control"
+                );
+                assert!(
+                    (recipe.guidance.min..=recipe.guidance.max).contains(&recipe.guidance.default),
+                    "{context}: guidance default is outside its control"
+                );
+
+                if let Some(temporal) = &recipe.temporal {
+                    assert!(
+                        (temporal.frames.min..=temporal.frames.max)
+                            .contains(&temporal.frames.default),
+                        "{context}: frame default is outside its control"
+                    );
+                    assert_eq!(
+                        (temporal.frames.default - temporal.frame_offset) % temporal.frames.step,
+                        0,
+                        "{context}: frame default is off-grid"
+                    );
+                }
+
+                if recipe.resolution.domain == ResolutionDomain::None {
+                    assert!(recipe.resolution.aspect_groups.is_empty(), "{context}");
+                    continue;
+                }
+                assert_resolution(
+                    &context,
+                    recipe,
+                    recipe.defaults.width,
+                    recipe.defaults.height,
+                );
+                let mut preset_ids = std::collections::HashSet::new();
+                for group in &recipe.resolution.aspect_groups {
+                    for preset in &group.presets {
+                        assert!(preset_ids.insert(&preset.id), "{context}: duplicate preset");
+                        assert_resolution(&context, recipe, preset.width, preset.height);
+                    }
+                }
+                if recipe.resolution.domain == ResolutionDomain::Buckets {
+                    assert!(
+                        recipe
+                            .resolution
+                            .aspect_groups
+                            .iter()
+                            .flat_map(|group| &group.presets)
+                            .any(|preset| {
+                                preset.width == recipe.defaults.width
+                                    && preset.height == recipe.defaults.height
+                            }),
+                        "{context}: bucket default is not advertised"
+                    );
+                }
+            }
+        }
+    }
+
+    fn assert_resolution(context: &str, recipe: &GenerationRecipeProfile, width: u32, height: u32) {
+        let resolution = &recipe.resolution;
+        assert!(width >= resolution.min_width, "{context}: width too small");
+        assert!(
+            height >= resolution.min_height,
+            "{context}: height too small"
+        );
+        assert_eq!(width % resolution.alignment, 0, "{context}: width off-grid");
+        assert_eq!(
+            height % resolution.alignment,
+            0,
+            "{context}: height off-grid"
+        );
+        assert!(
+            u64::from(width) * u64::from(height) <= resolution.max_pixels,
+            "{context}: pixel ceiling exceeded"
+        );
+        if let Some(max_axis) = resolution.max_axis_pixels {
+            assert!(
+                width <= max_axis && height <= max_axis,
+                "{context}: axis exceeded"
+            );
+        }
+        let aspect = f64::from(width) / f64::from(height);
+        if let Some(min) = resolution.min_aspect_ratio {
+            assert!(aspect >= min, "{context}: aspect below minimum");
+        }
+        if let Some(max) = resolution.max_aspect_ratio {
+            assert!(aspect <= max, "{context}: aspect above maximum");
+        }
+    }
+
+    fn request_for(
+        profile: &GenerationProfileSet,
+        width: u32,
+        height: u32,
+    ) -> crate::GenerateRequest {
+        let recipe = profile.default_recipe().unwrap();
+        serde_json::from_value(serde_json::json!({
+            "prompt": "test",
+            "model": "test",
+            "width": width,
+            "height": height,
+            "steps": recipe.defaults.steps,
+            "guidance": recipe.defaults.guidance,
+            "frames": recipe.defaults.frames,
+            "fps": recipe.defaults.fps
+        }))
+        .unwrap()
+    }
+
+    /// A DMD-distilled Wan tier walks the rungs `manifest::wan_dmd_ladder`
+    /// pins, predicting x0 at each and re-noising to the next. Steps,
+    /// guidance, the solver, and the flow shift are all properties of that
+    /// published schedule, not user preferences: a different step count has
+    /// no rungs to walk, CFG has no unconditional branch to weight, and a
+    /// UniPC or Euler pass over a DMD student is a different, worse render.
+    /// So the profile fixes all four, and admission refuses each one.
+    ///
+    /// Run over EVERY laddered tier against its own base, because the tiers
+    /// do not share a sigma table: the note must name the shift the tier was
+    /// distilled on, not a constant.
+    #[test]
+    fn wan_dmd_ladder_tiers_fix_the_whole_schedule() {
+        for (tier, base_tier) in [
+            ("wan21-t2v-1.3b:turbo", "wan21-t2v-1.3b:bf16"),
+            ("wan22-ti2v-5b:dmd", "wan22-ti2v-5b:fp16"),
+        ] {
+            let manifest = crate::manifest::find_manifest(tier).expect("the FastWan distill ships");
+            let profile = generation_profile_for_manifest(manifest);
+            let recipe = profile.default_recipe().expect("wan has a default recipe");
+            let ladder = crate::manifest::wan_dmd_ladder(tier).expect("tier is laddered");
+            let steps = ladder.rungs.len() as u32;
+
+            assert_eq!(recipe.steps.mode, ControlMode::Fixed, "{tier}");
+            assert_eq!(recipe.steps.default, steps, "{tier}");
+            assert_eq!(recipe.steps.min, steps, "{tier}");
+            assert_eq!(recipe.steps.max, steps, "{tier}");
+            let note = recipe.steps.note.clone().unwrap_or_default();
+            assert!(
+                note.to_ascii_lowercase().contains("dmd"),
+                "{tier}: the fixed step count must say why: {note:?}"
+            );
+            // The tier's OWN table, named in the sentence a user reads. A
+            // hardcoded shift here would render the 5B on the 1.3B's sigmas
+            // and say so confidently.
+            assert!(
+                note.contains(&format!("shift-{:.0}", ladder.table_shift)),
+                "{tier}: the note must name the tier's own sigma table: {note:?}"
+            );
+
+            assert_eq!(recipe.guidance.mode, ControlMode::Fixed, "{tier}");
+            assert_eq!(recipe.guidance.default, 1.0, "{tier}");
+            assert!(!recipe.capabilities.guidance.adjustable, "{tier}");
+            assert!(
+                !recipe.capabilities.guidance.supports_negative_prompt,
+                "{tier}"
+            );
+
+            // No solver is offered, and the Wan sampler group is hidden with
+            // a reason rather than shown with dead controls.
+            assert!(
+                recipe.capabilities.schedulers.is_empty(),
+                "{tier}: a DMD ladder is not a solver choice"
+            );
+            assert_eq!(
+                recipe.capabilities.wan_recipe.mode,
+                ControlMode::Hidden,
+                "{tier}: the shift/solver group has nothing to offer here"
+            );
+            assert!(recipe.capabilities.wan_recipe.reason.is_some(), "{tier}");
+            assert!(
+                !recipe.capabilities.wan_recipe.supports_distill_strength,
+                "{tier}"
+            );
+
+            // The advertised defaults are submittable.
+            let accepted = request_for(&profile, recipe.defaults.width, recipe.defaults.height);
+            validate_request_against_generation_profile(&profile, &accepted).unwrap();
+
+            let mut off_ladder = accepted.clone();
+            off_ladder.steps = steps + 1;
+            let error =
+                validate_request_against_generation_profile(&profile, &off_ladder).unwrap_err();
+            assert!(
+                error.contains(&format!("steps is fixed at {steps}")),
+                "{error}"
+            );
+
+            let mut guided = accepted.clone();
+            guided.guidance = 5.0;
+            let error = validate_request_against_generation_profile(&profile, &guided).unwrap_err();
+            assert!(error.contains("guidance is fixed at 1"), "{error}");
+
+            for scheduler in [Scheduler::UniPc, Scheduler::Euler, Scheduler::DpmPp] {
+                let mut solved = accepted.clone();
+                solved.scheduler = Some(scheduler);
+                let error =
+                    validate_request_against_generation_profile(&profile, &solved).unwrap_err();
+                assert!(
+                    error.contains("is not available for this recipe"),
+                    "{tier} {scheduler}: {error}"
+                );
+            }
+
+            // The base tier is untouched: it still takes a step range, CFG,
+            // and the family's three flow solvers.
+            let base = generation_profile_for_manifest(
+                crate::manifest::find_manifest(base_tier).expect("base tier ships"),
+            );
+            let base_recipe = base.default_recipe().unwrap();
+            assert_eq!(
+                base_recipe.steps.mode,
+                ControlMode::Adjustable,
+                "{base_tier}"
+            );
+            assert_eq!(
+                base_recipe.guidance.mode,
+                ControlMode::Adjustable,
+                "{base_tier}"
+            );
+            assert_eq!(
+                base_recipe.capabilities.wan_recipe.mode,
+                ControlMode::Adjustable,
+                "{base_tier}"
+            );
+            assert_eq!(
+                base_recipe.capabilities.schedulers,
+                vec![Scheduler::UniPc, Scheduler::Euler, Scheduler::DpmPp],
+                "{base_tier}"
+            );
+        }
+    }
+
+    /// A DMD ladder pins the SAMPLER, and nothing about the sampler decides
+    /// whether a checkpoint can be handed a first and a last frame. That is
+    /// the source-image contract's answer, and the server recomputes it from
+    /// exactly that once the runtime probe replies
+    /// (`model_manager::synchronize_generation_profile_capabilities`), so a
+    /// cold profile keyed on the ladder would disagree with the hot one.
+    ///
+    /// Both shipped ladder tiers refuse a source image today, so the manifest
+    /// alone cannot show which of the two facts gates the control. This holds
+    /// the laddered model name constant and varies only the contract.
+    #[test]
+    fn a_dmd_ladder_does_not_by_itself_refuse_keyframes() {
+        let mut conditioned = input("wan22-ti2v-5b:dmd", "wan");
+        conditioned.source_image = Some(SourceImageCapability::Optional);
+        let conditioned = resolve_generation_profile(conditioned);
+        let caps = &conditioned.default_recipe().unwrap().capabilities;
+        assert!(
+            caps.wan_recipe.supports_first_last_frame,
+            "a ladder tier that took an image would take two of them"
+        );
+        assert_eq!(
+            caps.wan_recipe.first_last_frame_min_frames,
+            Some(validation::WAN_TI2V_FLF_MIN_FRAMES)
+        );
+        // The solver group stays hidden all the same: the ladder still owns
+        // the shift and the solver, which is the half it does decide.
+        assert_eq!(caps.wan_recipe.mode, ControlMode::Hidden);
+
+        let mut plain = input("wan22-ti2v-5b:dmd", "wan");
+        plain.source_image = Some(SourceImageCapability::Unsupported);
+        let plain = resolve_generation_profile(plain);
+        assert!(
+            !plain
+                .default_recipe()
+                .unwrap()
+                .capabilities
+                .wan_recipe
+                .supports_first_last_frame
+        );
+
+        // What actually ships: the GPU A/B found this student abandons the
+        // pinned frame within ~4 frames, so its manifest refuses conditioning
+        // and the control follows.
+        for tier in ["wan22-ti2v-5b:dmd", "wan21-t2v-1.3b:turbo"] {
+            let shipped = generation_profile_for_manifest(
+                crate::manifest::find_manifest(tier).expect("ships"),
+            );
+            assert!(
+                !shipped
+                    .default_recipe()
+                    .unwrap()
+                    .capabilities
+                    .wan_recipe
+                    .supports_first_last_frame,
+                "{tier}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_admission_accepts_z_wide_and_rejects_non_bucket_wan() {
+        let z = resolve_generation_profile(input("z-image-turbo:q4", "z-image"));
+        let z_request = request_for(&z, 1280, 720);
+        validate_request_against_generation_profile(&z, &z_request).unwrap();
+
+        let mut wan_input = input("wan22-t2v-a14b:q5", "wan");
+        wan_input.default_width = 1280;
+        wan_input.default_height = 720;
+        wan_input.default_frames = Some(81);
+        wan_input.default_fps = Some(16);
+        let wan = resolve_generation_profile(wan_input);
+        let valid = request_for(&wan, 1280, 720);
+        validate_request_against_generation_profile(&wan, &valid).unwrap();
+
+        // Wan's buckets are the trained sizes, not the only runnable ones: a
+        // deliberate aligned off-bucket request is admitted (the advisory
+        // dimension-warning channel says results may vary)...
+        let off_bucket = request_for(&wan, 1024, 768);
+        validate_request_against_generation_profile(&wan, &off_bucket).unwrap();
+
+        // ...while a Reject-policy bucket profile (H3's reviewed bridge, and
+        // every profile serialized before the field existed) still refuses.
+        let mut strict = wan.clone();
+        for recipe in &mut strict.recipes {
+            recipe.resolution.off_bucket = Some(OffBucketPolicy::Reject);
+        }
+        assert!(
+            validate_request_against_generation_profile(&strict, &off_bucket)
+                .unwrap_err()
+                .contains("not an available bucket")
+        );
+
+        // The advisory helper (every client's warning source) fires exactly
+        // for the admitted off-bucket size — never for exact buckets, never for a
+        // Reject-policy recipe, never for a refused shape.
+        let recipe = wan.default_recipe().unwrap();
+        assert!(off_bucket_resolution_warning(recipe, 1024, 768)
+            .unwrap()
+            .contains("results may vary"));
+        assert!(off_bucket_resolution_warning(recipe, 1280, 720).is_none());
+        assert!(off_bucket_resolution_warning(recipe, 1023, 768).is_none());
+        let strict_recipe = strict.default_recipe().unwrap();
+        assert!(off_bucket_resolution_warning(strict_recipe, 1024, 768).is_none());
+    }
+
+    #[test]
+    fn resolution_advisory_downgrades_refusals_for_client_surfaces() {
+        // No shell ever blocks a custom size: a
+        // recipe refusal becomes an advisory naming the server as authority,
+        // an admitted warn-policy off-bucket keeps the softer message, and an
+        // exact preset stays silent.
+        let mut wan_input = input("wan22-t2v-a14b:q5", "wan");
+        wan_input.default_width = 1280;
+        wan_input.default_height = 720;
+        wan_input.default_frames = Some(81);
+        wan_input.default_fps = Some(16);
+        let wan = resolve_generation_profile(wan_input);
+        let recipe = wan.default_recipe().unwrap();
+        let refused = resolution_advisory(recipe, 1023, 768).unwrap();
+        assert!(refused.contains("server may reject"));
+        assert!(resolution_advisory(recipe, 1024, 768)
+            .unwrap()
+            .contains("results may vary"));
+        assert!(resolution_advisory(recipe, 1280, 720).is_none());
+    }
+
+    #[test]
+    fn profile_admission_rejects_unadvertised_output_format() {
+        let profile = resolve_generation_profile(input("flux-dev:q4", "flux"));
+        let mut request = request_for(&profile, 1024, 1024);
+        request.output_format = Some(OutputFormat::Mp4);
+        assert!(
+            validate_request_against_generation_profile(&profile, &request)
+                .unwrap_err()
+                .contains("output format 'mp4' is not available")
+        );
+    }
+
+    #[test]
+    fn delivery_qualification_repairs_defaults_and_withholds_mp4_only_recipes() {
+        let mut ltx2_input = input("ltx2:bf16", "ltx2");
+        ltx2_input.default_frames = Some(97);
+        ltx2_input.default_fps = Some(24);
+        let mut ltx2 = resolve_generation_profile(ltx2_input);
+        let authored_hash = ltx2.profile_hash.clone();
+        qualify_generation_profile_delivery(
+            &mut ltx2,
+            GenerationDeliveryCapabilities::new(false, false),
+        );
+        assert_ne!(ltx2.profile_hash, authored_hash);
+        assert_eq!(
+            generation_profile_default_output_format(&ltx2, None).unwrap(),
+            OutputFormat::Gif
+        );
+        let default = ltx2.default_recipe().unwrap();
+        assert_eq!(
+            default.capabilities.output.formats,
+            vec![OutputFormat::Gif, OutputFormat::Apng]
+        );
+        assert!(!default.capabilities.supports_audio);
+
+        let mut request = request_for(&ltx2, 1216, 704);
+        request.output_format = None;
+        materialize_generation_profile_output_default(&ltx2, &mut request).unwrap();
+        assert_eq!(request.output_format, Some(OutputFormat::Gif));
+        request.output_format = Some(OutputFormat::Apng);
+        materialize_generation_profile_output_default(&ltx2, &mut request).unwrap();
+        assert_eq!(request.output_format, Some(OutputFormat::Apng));
+
+        let mut h3_input = input("minimax-h3-fl2va:official-bf16", "minimax-h3");
+        h3_input.default_frames = Some(crate::minimax_h3::MIN_FRAMES);
+        h3_input.default_fps = Some(crate::minimax_h3::FIXED_FPS);
+        let mut h3 = resolve_generation_profile(h3_input);
+        qualify_generation_profile_delivery(
+            &mut h3,
+            GenerationDeliveryCapabilities::new(false, false),
+        );
+        assert!(h3.recipes.is_empty());
+        assert!(generation_profile_default_output_format(&h3, None)
+            .unwrap_err()
+            .contains("no default recipe"));
+    }
+
+    /// The family half of the audio contract. LTX-2 answers to the flag;
+    /// H3 emits sound unconditionally; nothing else has a decode path.
+    #[test]
+    fn family_emits_audio_names_the_two_audio_families() {
+        assert!(family_emits_audio("ltx2"));
+        assert!(family_emits_audio("ltx-2"));
+        assert!(family_emits_audio("minimax-h3"));
+        assert!(!family_emits_audio("ltx-video"));
+        assert!(!family_emits_audio("wan"));
+        assert!(!family_emits_audio("flux"));
+        assert!(!family_emits_audio(""));
+    }
+
+    /// Unset means the recipe's own answer, and that answer is ON wherever
+    /// the recipe can deliver audio. This is the whole default flip: a video
+    /// model that renders sound does so without the user finding a toggle.
+    #[test]
+    fn unset_enable_audio_resolves_on_for_an_audio_recipe() {
+        assert!(resolve_enable_audio(None, true));
+        assert!(!resolve_enable_audio(None, false));
+    }
+
+    /// An explicit value always wins, in both directions — including an
+    /// explicit `true` on a recipe that cannot deliver, which admission
+    /// refuses by name rather than this function silencing.
+    #[test]
+    fn explicit_enable_audio_always_wins_over_the_recipe_default() {
+        assert!(!resolve_enable_audio(Some(false), true));
+        assert!(resolve_enable_audio(Some(true), false));
+        assert!(resolve_enable_audio(Some(true), true));
+        assert!(!resolve_enable_audio(Some(false), false));
+    }
+
+    /// The recipe an LTX-2 checkpoint advertises is the input the default
+    /// reads, so the profile and the resolved value cannot drift.
+    #[test]
+    fn an_ltx2_recipe_advertises_the_capability_the_default_reads() {
+        let mut ltx = input("ltx-2.3-22b-distilled:fp8", "ltx2");
+        ltx.supports_audio = true;
+        let profile = resolve_generation_profile(ltx);
+        let recipe = profile.recipes.first().expect("ltx2 has a recipe");
+        assert!(recipe.capabilities.supports_audio);
+        assert!(resolve_enable_audio(
+            None,
+            recipe.capabilities.supports_audio
+        ));
+    }
+
+    #[test]
+    fn h3_compact_profiles_pin_the_reviewed_envelope() {
+        // The reviewed compact stack admits exactly one canvas, one step
+        // count, and one frame count. The laundered manifest defaults below
+        // are deliberately wrong (a stale user `model_pref` reaches this
+        // input through `build_model_catalog`), so the profile must derive
+        // the envelope from the identity rather than from what it was told.
+        for (model, steps) in [
+            (crate::minimax_h3::FL2VA_COMFY, 21),
+            (crate::minimax_h3::REF2VA_COMFY, 21),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP, 9),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P, 5),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_V11, 5),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_768P, 9),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21, 5),
+            (crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21, 9),
+            (crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21, 5),
+            (crate::minimax_h3::FL2VA_FASTH3_V2_INT8, 9),
+            (crate::minimax_h3::FL2VA_COMFY_DMAD_4STEP, 5),
+            (crate::minimax_h3::FL2VA_COMFY_PDMD_2STEP, 3),
+            (crate::minimax_h3::FL2VA_COMFY_PDMD_4STEP, 5),
+        ] {
+            // Fixed for every DISTILLED identity — a Turbo adapter or a
+            // distilled base tier — never only for a Turbo tag.
+            let turbo = crate::minimax_h3::fixed_steps_for_model(model).is_some();
+            let mut h3_input = input(model, "minimax-h3");
+            h3_input.default_width = 768;
+            h3_input.default_height = 768;
+            h3_input.default_steps = 30;
+            h3_input.default_frames = Some(crate::minimax_h3::MAX_FRAMES);
+            h3_input.default_fps = Some(crate::minimax_h3::FIXED_FPS);
+            let profile = resolve_generation_profile(h3_input);
+            let recipe = profile.default_recipe().unwrap();
+
+            // The compact stack is a RANGE, not a bucket set: any 32-aligned
+            // canvas inside its area ceiling is admitted and the memory
+            // estimate decides what fits.
+            assert_eq!(
+                recipe.resolution.domain,
+                ResolutionDomain::Dynamic,
+                "{model}"
+            );
+            assert_eq!(recipe.resolution.off_bucket, None, "{model}");
+            assert_eq!(
+                recipe.resolution.alignment,
+                crate::minimax_h3::VIDEO_ROW_STRIDE,
+                "{model}"
+            );
+            assert_eq!(
+                recipe.resolution.min_width,
+                crate::minimax_h3::MIN_COMPACT_AXIS_PIXELS,
+                "{model}"
+            );
+            assert_eq!(
+                recipe.resolution.min_height,
+                crate::minimax_h3::MIN_COMPACT_AXIS_PIXELS,
+                "{model}"
+            );
+            let presets = recipe
+                .resolution
+                .aspect_groups
+                .iter()
+                .flat_map(|group| &group.presets)
+                .map(|preset| (preset.width, preset.height))
+                .collect::<Vec<_>>();
+            for preset in &presets {
+                assert!(
+                    crate::minimax_h3::is_admitted_compact_canvas(preset.0, preset.1),
+                    "{model}: recommended {preset:?} must satisfy the canvas rule"
+                );
+            }
+            assert!(
+                presets.contains(&(
+                    crate::minimax_h3::DEFAULT_WIDTH,
+                    crate::minimax_h3::DEFAULT_HEIGHT
+                )),
+                "{model}"
+            );
+            assert_eq!(
+                recipe.resolution.max_pixels,
+                crate::minimax_h3::reviewed_compact_max_pixels(),
+                "{model}"
+            );
+            assert_eq!(
+                recipe.resolution.max_axis_pixels,
+                Some(crate::minimax_h3::reviewed_compact_max_axis_pixels()),
+                "{model}"
+            );
+
+            assert_eq!(recipe.defaults.width, crate::minimax_h3::DEFAULT_WIDTH);
+            assert_eq!(recipe.defaults.height, crate::minimax_h3::DEFAULT_HEIGHT);
+            assert_eq!(recipe.defaults.steps, steps, "{model}");
+            assert_eq!(
+                recipe.defaults.frames,
+                Some(crate::minimax_h3::DEFAULT_COMPACT_FRAMES),
+                "{model}"
+            );
+
+            // A Turbo tier's step count is the distilled adapter's own
+            // schedule length and stays fixed; the base tag takes a range.
+            if turbo {
+                assert_eq!(recipe.steps.mode, ControlMode::Fixed, "{model}");
+                assert_eq!(recipe.steps.min, steps, "{model}");
+                assert_eq!(recipe.steps.max, steps, "{model}");
+            } else {
+                assert_eq!(recipe.steps.mode, ControlMode::Adjustable, "{model}");
+                assert_eq!(
+                    recipe.steps.min,
+                    crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+                    "{model}"
+                );
+                assert_eq!(
+                    recipe.steps.max,
+                    crate::minimax_h3::COMPACT_MAX_STEPS,
+                    "{model}"
+                );
+            }
+            assert_eq!(recipe.steps.default, steps, "{model}");
+            // A pinned Turbo schedule has exactly one rung; the base tag
+            // offers the ladder around its default, inside the compact band.
+            if turbo {
+                assert_eq!(recipe.steps.recommended, vec![steps], "{model}");
+            } else {
+                assert_eq!(
+                    recipe.steps.recommended,
+                    steps_ladder(
+                        crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+                        steps,
+                        crate::minimax_h3::COMPACT_MAX_STEPS
+                    ),
+                    "{model}"
+                );
+            }
+
+            let temporal = recipe.temporal.as_ref().unwrap();
+            assert_eq!(temporal.frames.mode, ControlMode::Adjustable, "{model}");
+            assert_eq!(
+                temporal.frames.min,
+                crate::minimax_h3::MIN_FRAMES,
+                "{model}"
+            );
+            assert_eq!(
+                temporal.frames.max,
+                crate::minimax_h3::MAX_FRAMES,
+                "{model}"
+            );
+            assert_eq!(
+                temporal.frames.step,
+                crate::minimax_h3::FRAME_STEP,
+                "{model}"
+            );
+            assert_eq!(
+                temporal.frames.default,
+                crate::minimax_h3::DEFAULT_COMPACT_FRAMES,
+                "{model}"
+            );
+
+            let mut request = request_for(
+                &profile,
+                crate::minimax_h3::DEFAULT_WIDTH,
+                crate::minimax_h3::DEFAULT_HEIGHT,
+            );
+            request.output_format = Some(OutputFormat::Mp4);
+            validate_request_against_generation_profile(&profile, &request).unwrap();
+
+            // Every recommended canvas is submittable, and so is a canvas no
+            // campaign ran that the rule admits.
+            for &(width, height) in crate::minimax_h3::REVIEWED_COMPACT_CANVASES {
+                let mut reviewed = request_for(&profile, width, height);
+                reviewed.output_format = Some(OutputFormat::Mp4);
+                validate_request_against_generation_profile(&profile, &reviewed)
+                    .unwrap_or_else(|error| panic!("{model} {width}x{height}: {error}"));
+            }
+            for (width, height) in [(1024, 768), (1024, 576), (512, 1984)] {
+                let mut off_preset = request_for(&profile, width, height);
+                off_preset.output_format = Some(OutputFormat::Mp4);
+                validate_request_against_generation_profile(&profile, &off_preset)
+                    .unwrap_or_else(|error| panic!("{model} {width}x{height}: {error}"));
+            }
+            // Over the area ceiling is still refused, by the ceiling.
+            let mut too_large = request_for(&profile, 1056, 992);
+            too_large.output_format = Some(OutputFormat::Mp4);
+            assert!(
+                validate_request_against_generation_profile(&profile, &too_large).is_err(),
+                "{model}"
+            );
+
+            // Another clip length on the family grid is submittable now.
+            let mut longer = request.clone();
+            longer.frames =
+                Some(crate::minimax_h3::DEFAULT_COMPACT_FRAMES + crate::minimax_h3::FRAME_STEP);
+            validate_request_against_generation_profile(&profile, &longer)
+                .unwrap_or_else(|error| panic!("{model}: {error}"));
+            let mut off_grid = request.clone();
+            off_grid.frames = Some(crate::minimax_h3::DEFAULT_COMPACT_FRAMES + 1);
+            assert!(
+                validate_request_against_generation_profile(&profile, &off_grid).is_err(),
+                "{model}"
+            );
+
+            let mut wrong_steps = request.clone();
+            wrong_steps.steps = 30;
+            let outcome = validate_request_against_generation_profile(&profile, &wrong_steps);
+            if turbo {
+                assert!(
+                    outcome.unwrap_err().contains("steps is fixed at"),
+                    "{model}"
+                );
+            } else {
+                outcome.unwrap_or_else(|error| panic!("{model}: {error}"));
+            }
+            let mut too_many_steps = request.clone();
+            too_many_steps.steps = crate::minimax_h3::COMPACT_MAX_STEPS + 1;
+            assert!(
+                validate_request_against_generation_profile(&profile, &too_many_steps).is_err(),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn h3_official_profiles_keep_the_flexible_ladder() {
+        for model in [
+            crate::minimax_h3::FL2VA_OFFICIAL,
+            crate::minimax_h3::REF2VA_OFFICIAL,
+        ] {
+            let mut h3_input = input(model, "minimax-h3");
+            h3_input.default_width = crate::minimax_h3::DEFAULT_WIDTH;
+            h3_input.default_height = crate::minimax_h3::DEFAULT_HEIGHT;
+            h3_input.default_steps = crate::minimax_h3::DEFAULT_STEPS;
+            h3_input.default_frames = Some(crate::minimax_h3::MIN_FRAMES);
+            h3_input.default_fps = Some(crate::minimax_h3::FIXED_FPS);
+            let profile = resolve_generation_profile(h3_input);
+            let recipe = profile.default_recipe().unwrap();
+
+            assert_eq!(
+                recipe.resolution.domain,
+                ResolutionDomain::Dynamic,
+                "{model}"
+            );
+            assert_eq!(recipe.resolution.off_bucket, None, "{model}");
+            assert!(
+                recipe.resolution.aspect_groups.len() >= 2,
+                "{model}: the official ladder keeps every reviewed aspect"
+            );
+            assert_eq!(recipe.steps.mode, ControlMode::Adjustable, "{model}");
+            // The step FLOOR is a property of the undistilled checkpoint, not
+            // of the compact packaging, so the official references take it
+            // too; only the ceiling is the family's own wider one.
+            assert_eq!(
+                recipe.steps.min,
+                crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+                "{model}"
+            );
+            assert_eq!(recipe.steps.max, 100, "{model}");
+            assert_eq!(
+                recipe.steps.recommended,
+                steps_ladder(
+                    crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+                    crate::minimax_h3::DEFAULT_STEPS,
+                    100
+                ),
+                "{model}: an adjustable H3 tier offers the ladder"
+            );
+            assert_eq!(
+                recipe.steps.note.as_deref(),
+                Some(base_compact_steps_note().as_str()),
+                "{model}"
+            );
+
+            let temporal = recipe.temporal.as_ref().unwrap();
+            assert_eq!(temporal.frames.mode, ControlMode::Adjustable, "{model}");
+            assert_eq!(
+                temporal.frames.max,
+                crate::minimax_h3::MAX_FRAMES,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_admission_enforces_h3_fixed_controls_and_frame_cap() {
+        let mut h3_input = input("minimax-h3-fl2va:official-bf16", "minimax-h3");
+        h3_input.default_width = 768;
+        h3_input.default_height = 768;
+        // The fixture's generic 20 sits below the family's reviewed step
+        // floor, and this test is about frames and guidance.
+        h3_input.default_steps = crate::minimax_h3::DEFAULT_STEPS;
+        h3_input.default_frames = Some(crate::minimax_h3::MIN_FRAMES);
+        h3_input.default_fps = Some(crate::minimax_h3::FIXED_FPS);
+        let h3 = resolve_generation_profile(h3_input);
+        let mut request = request_for(&h3, 768, 768);
+        request.frames = Some(crate::minimax_h3::MAX_FRAMES);
+        validate_request_against_generation_profile(&h3, &request).unwrap();
+
+        request.frames = Some(362);
+        assert!(validate_request_against_generation_profile(&h3, &request)
+            .unwrap_err()
+            .contains("frames must be"));
+        request.frames = Some(crate::minimax_h3::MAX_FRAMES);
+        request.guidance = 1.0;
+        assert!(validate_request_against_generation_profile(&h3, &request)
+            .unwrap_err()
+            .contains("guidance is fixed"));
+    }
+
+    /// A fixed control's explanation is authored server-side, at the one
+    /// place the fixedness is decided. Clients render it verbatim; the old
+    /// hard-coded FLUX/LTX sentence claimed "Distilled recipe fixes CFG at
+    /// 1.0" for H3, whose guidance is pinned at 0 by a pipeline that has no
+    /// classifier-free branch and no Dev checkpoint to switch to.
+    #[test]
+    fn h3_guidance_carries_its_own_fixed_control_note() {
+        for model in [
+            crate::minimax_h3::FL2VA_COMFY,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_V11,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_768P,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21,
+            crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21,
+            crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21,
+            crate::minimax_h3::FL2VA_COMFY_DMAD_4STEP,
+            crate::minimax_h3::FL2VA_COMFY_PDMD_2STEP,
+            crate::minimax_h3::FL2VA_COMFY_PDMD_4STEP,
+        ] {
+            let profile = resolve_generation_profile(input(model, "minimax-h3"));
+            let recipe = profile.default_recipe().unwrap();
+            assert_eq!(recipe.guidance.mode, ControlMode::Fixed);
+            assert_eq!(
+                recipe.guidance.note.as_deref(),
+                Some("MiniMax H3 does not use classifier-free guidance; guidance is fixed at 0."),
+                "{model}"
+            );
+        }
+    }
+
+    /// The base compact tag takes a step RANGE, but a BOUNDED one: its floor
+    /// is the smallest schedule the undistilled checkpoint was reviewed at,
+    /// and a bound the user can see but not explain is exactly what a note is
+    /// for. So an adjustable control carries one here.
+    #[test]
+    fn h3_base_steps_are_bounded_by_the_reviewed_schedule_and_say_why() {
+        for model in [
+            crate::minimax_h3::FL2VA_COMFY,
+            crate::minimax_h3::REF2VA_COMFY,
+        ] {
+            let profile = resolve_generation_profile(input(model, "minimax-h3"));
+            let steps = &profile.default_recipe().unwrap().steps;
+            assert_eq!(steps.mode, ControlMode::Adjustable, "{model}");
+            assert_eq!(
+                steps.min,
+                crate::minimax_h3::COMPACT_BASE_MIN_STEPS,
+                "{model}"
+            );
+            assert_eq!(steps.min, 21, "{model}");
+            assert_eq!(steps.max, crate::minimax_h3::COMPACT_MAX_STEPS, "{model}");
+            assert_eq!(steps.max, 50, "{model}");
+            assert_eq!(steps.default, 21, "{model}");
+            assert_eq!(steps.recommended, vec![21, 32], "{model}");
+            assert_eq!(
+                steps.recommended,
+                steps_ladder(steps.min, steps.default, steps.max),
+                "{model}"
+            );
+            assert_eq!(
+                steps.note.as_deref(),
+                Some(base_compact_steps_note().as_str()),
+                "{model}"
+            );
+        }
+    }
+
+    /// The advertised floor is the ENFORCED floor: a client that ignores the
+    /// control's minimum is refused by the same profile it read it from.
+    #[test]
+    fn a_base_tag_request_below_the_floor_is_refused_by_the_profile() {
+        let mut h3_input = input(crate::minimax_h3::FL2VA_COMFY, "minimax-h3");
+        h3_input.default_width = crate::minimax_h3::DEFAULT_WIDTH;
+        h3_input.default_height = crate::minimax_h3::DEFAULT_HEIGHT;
+        h3_input.default_frames = Some(crate::minimax_h3::DEFAULT_COMPACT_FRAMES);
+        h3_input.default_fps = Some(crate::minimax_h3::FIXED_FPS);
+        let profile = resolve_generation_profile(h3_input);
+        let mut request = request_for(
+            &profile,
+            crate::minimax_h3::DEFAULT_WIDTH,
+            crate::minimax_h3::DEFAULT_HEIGHT,
+        );
+
+        request.steps = crate::minimax_h3::COMPACT_BASE_MIN_STEPS - 1;
+        let error = validate_request_against_generation_profile(&profile, &request).unwrap_err();
+        assert!(error.contains("steps"), "{error}");
+
+        request.steps = crate::minimax_h3::COMPACT_BASE_MIN_STEPS;
+        validate_request_against_generation_profile(&profile, &request).unwrap();
+    }
+
+    /// A Turbo tier's sentence is the tier's own, and the base floor's note
+    /// never displaces it — the base arm is asked only after the Turbo one.
+    #[test]
+    fn turbo_steps_notes_are_untouched_by_the_base_floor() {
+        for tier in crate::minimax_h3::REVIEWED_TURBO_MANIFEST_TIERS {
+            let profile = resolve_generation_profile(input(tier.model, "minimax-h3"));
+            let steps = &profile.default_recipe().unwrap().steps;
+            assert_eq!(steps.mode, ControlMode::Fixed, "{}", tier.model);
+            assert_eq!(steps.min, tier.steps, "{}", tier.model);
+            assert_eq!(steps.max, tier.steps, "{}", tier.model);
+            let note = steps.note.as_deref().expect("a Turbo tier explains itself");
+            assert!(note.starts_with("Fixed by the "), "{}: {note}", tier.model);
+            assert_ne!(note, base_compact_steps_note(), "{}", tier.model);
+        }
+    }
+
+    /// A distilled BASE tier (FastH3 V2) is as fixed as a Turbo tag, and its
+    /// sentence names its own schedule without calling it a Turbo adapter.
+    #[test]
+    fn distilled_base_tier_steps_are_fixed_and_explain_themselves() {
+        for tier in crate::minimax_h3::REVIEWED_DISTILLED_BASE_TIERS {
+            let profile = resolve_generation_profile(input(tier.model, "minimax-h3"));
+            let steps = &profile.default_recipe().unwrap().steps;
+            assert_eq!(steps.mode, ControlMode::Fixed, "{}", tier.model);
+            assert_eq!(steps.default, tier.steps, "{}", tier.model);
+            assert_eq!(steps.min, tier.steps, "{}", tier.model);
+            assert_eq!(steps.max, tier.steps, "{}", tier.model);
+            assert_eq!(steps.recommended, vec![tier.steps], "{}", tier.model);
+            assert_eq!(
+                steps.note.as_deref(),
+                Some(
+                    "Fixed by the 8-step distilled tier: 9 terminal-inclusive sampler grid points (8 denoise intervals)."
+                ),
+                "{}",
+                tier.model
+            );
+        }
+    }
+
+    /// A Turbo tier's step count is terminal-inclusive: the published N-step
+    /// schedule has N denoise intervals and N+1 sampler grid points, which is
+    /// why the field reads 9 for the 8-step tier.
+    #[test]
+    fn h3_turbo_steps_explain_the_terminal_inclusive_count() {
+        let eight = resolve_generation_profile(input(
+            crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP,
+            "minimax-h3",
+        ));
+        let steps = &eight.default_recipe().unwrap().steps;
+        assert_eq!(steps.mode, ControlMode::Fixed);
+        assert_eq!(steps.default, 9);
+        assert_eq!(
+            steps.note.as_deref(),
+            Some(
+                "Fixed by the 8-step distilled tier: 9 terminal-inclusive sampler grid points \
+                 (8 denoise intervals)."
+            )
+        );
+
+        let four = resolve_generation_profile(input(
+            crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P,
+            "minimax-h3",
+        ));
+        let steps = &four.default_recipe().unwrap().steps;
+        assert_eq!(steps.mode, ControlMode::Fixed);
+        assert_eq!(steps.default, 5);
+        assert_eq!(
+            steps.note.as_deref(),
+            Some(
+                "Fixed by the 4-step distilled tier: 5 terminal-inclusive sampler grid points \
+                 (4 denoise intervals)."
+            )
+        );
+
+        // The note explains the terminal-inclusive COUNT, not the tier, so
+        // two tiers with the same schedule length carry the same sentence by
+        // design — the tag and the display label are what tell them apart.
+        let four_v11 = resolve_generation_profile(input(
+            crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_V11,
+            "minimax-h3",
+        ));
+        let v11_steps = &four_v11.default_recipe().unwrap().steps;
+        assert_eq!(v11_steps.mode, ControlMode::Fixed);
+        assert_eq!(v11_steps.default, 5);
+        assert_eq!(v11_steps.note, steps.note);
+
+        let eight_768p = resolve_generation_profile(input(
+            crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_768P,
+            "minimax-h3",
+        ));
+        let eight_768p_steps = &eight_768p.default_recipe().unwrap().steps;
+        assert_eq!(eight_768p_steps.mode, ControlMode::Fixed);
+        assert_eq!(eight_768p_steps.default, 9);
+        assert_eq!(
+            eight_768p_steps.note.as_deref(),
+            eight.default_recipe().unwrap().steps.note.as_deref()
+        );
+
+        // The note is family-neutral: a DMAD / PDMD distill is not a Turbo
+        // adapter, and the 2-step PDMD tier is the shortest schedule shipped.
+        let two = resolve_generation_profile(input(
+            crate::minimax_h3::FL2VA_COMFY_PDMD_2STEP,
+            "minimax-h3",
+        ));
+        let two_steps = &two.default_recipe().unwrap().steps;
+        assert_eq!(two_steps.mode, ControlMode::Fixed);
+        assert_eq!(two_steps.default, 3);
+        assert_eq!(
+            two_steps.note.as_deref(),
+            Some(
+                "Fixed by the 2-step distilled tier: 3 terminal-inclusive sampler grid points \
+                 (2 denoise intervals)."
+            )
+        );
+        for four_step in [
+            crate::minimax_h3::FL2VA_COMFY_DMAD_4STEP,
+            crate::minimax_h3::FL2VA_COMFY_PDMD_4STEP,
+        ] {
+            let distilled = resolve_generation_profile(input(four_step, "minimax-h3"));
+            assert_eq!(
+                distilled.default_recipe().unwrap().steps.note,
+                steps.note,
+                "{four_step}"
+            );
+        }
+
+        // A resize changes weights, never the schedule, so a rank-21 tier
+        // carries its SOURCE tier's step count and therefore its sentence —
+        // including the Ref2VA one, whose partition has its own base recipe.
+        for (resized, source) in [
+            (
+                crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P_R21,
+                crate::minimax_h3::FL2VA_COMFY_TURBO_4STEP_768P,
+            ),
+            (
+                crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP_R21,
+                crate::minimax_h3::FL2VA_COMFY_TURBO_8STEP,
+            ),
+            (
+                crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP_R21,
+                crate::minimax_h3::REF2VA_COMFY_TURBO_4STEP,
+            ),
+        ] {
+            let resized_steps = resolve_generation_profile(input(resized, "minimax-h3"))
+                .default_recipe()
+                .unwrap()
+                .steps
+                .clone();
+            let source_steps = resolve_generation_profile(input(source, "minimax-h3"))
+                .default_recipe()
+                .unwrap()
+                .steps
+                .clone();
+            assert_eq!(resized_steps.mode, ControlMode::Fixed, "{resized}");
+            assert_eq!(resized_steps.default, source_steps.default, "{resized}");
+            assert_eq!(resized_steps.note, source_steps.note, "{resized}");
+        }
+    }
+
+    /// The distilled FLUX/LTX case keeps the sentence clients used to
+    /// hard-code, now generated from the value the recipe actually pinned.
+    #[test]
+    fn a_distilled_recipe_keeps_the_existing_fixed_cfg_sentence() {
+        const DISTILLED: &str = "Distilled recipe fixes CFG at 1.0. Choose a Dev checkpoint with \
+                                 Auto or a guided pipeline to adjust it.";
+        let ltx = resolve_generation_profile(input("ltx-2.3-22b-distilled:fp8", "ltx2"));
+        let recipe = ltx.default_recipe().unwrap();
+        assert_eq!(recipe.guidance.mode, ControlMode::Fixed);
+        assert_eq!(recipe.guidance.note.as_deref(), Some(DISTILLED));
+
+        let ltx_video = resolve_generation_profile(input("ltx-video-distilled", "ltx-video"));
+        assert_eq!(
+            ltx_video.default_recipe().unwrap().guidance.note.as_deref(),
+            Some(DISTILLED)
+        );
+    }
+
+    /// An adjustable control has nothing to explain.
+    #[test]
+    fn an_adjustable_control_carries_no_note() {
+        let flux = resolve_generation_profile(input("flux-dev:q8", "flux"));
+        let recipe = flux.default_recipe().unwrap();
+        assert_eq!(recipe.guidance.mode, ControlMode::Adjustable);
+        assert_eq!(recipe.guidance.note, None);
+        assert_eq!(recipe.steps.note, None);
+        assert_eq!(
+            recipe.temporal.as_ref().and_then(|t| t.frames.note.clone()),
+            None
+        );
+    }
+
+    /// The field is additive: an older server never sends it, and that
+    /// response must deserialize to `None` rather than failing.
+    #[test]
+    fn an_absent_note_deserializes_to_none() {
+        let integer: IntegerControl = serde_json::from_str(
+            r#"{"default":20,"min":1,"max":100,"step":1,"mode":"adjustable"}"#,
+        )
+        .unwrap();
+        assert_eq!(integer.note, None);
+        let float: FloatControl = serde_json::from_str(
+            r#"{"default":3.5,"min":0.0,"max":100.0,"step":0.1,"mode":"adjustable"}"#,
+        )
+        .unwrap();
+        assert_eq!(float.note, None);
+
+        // An absent note is never serialized, so a recipe carrying none is
+        // byte-identical to a pre-`note` build's.
+        let encoded = serde_json::to_string(&FloatControl {
+            default: 0.0,
+            min: 0.0,
+            max: 0.0,
+            step: 0.1,
+            mode: ControlMode::Fixed,
+            note: None,
+        })
+        .unwrap();
+        assert!(!encoded.contains("note"), "{encoded}");
+    }
+
+    /// The steps ladder is half the default, the default, and half again —
+    /// clamped into the control's own band and deduped.
+    #[test]
+    fn the_steps_ladder_is_three_rungs_around_the_default() {
+        // FLUX / SDXL.
+        assert_eq!(steps_ladder(1, 30, 100), vec![15, 30, 45]);
+        // FLUX.2 [klein].
+        assert_eq!(steps_ladder(1, 4, 100), vec![2, 4, 6]);
+        // Z-Image — the halves round up, never to zero.
+        assert_eq!(steps_ladder(1, 9, 100), vec![5, 9, 14]);
+        // LTX-2.
+        assert_eq!(steps_ladder(1, 8, 100), vec![4, 8, 12]);
+
+        // The band clamps both ends rather than escaping the control.
+        assert_eq!(steps_ladder(2, 4, 5), vec![2, 4, 5]);
+        assert_eq!(steps_ladder(20, 30, 35), vec![20, 30, 35]);
+
+        // A degenerate band collapses to one rung instead of repeating it.
+        assert_eq!(steps_ladder(4, 4, 4), vec![4]);
+        assert_eq!(steps_ladder(1, 1, 100), vec![1, 2]);
+    }
+
+    /// Every shipped recipe advertises a ladder a client can render as a
+    /// quality picker: sorted, deduped, inside the control, and containing
+    /// the default. A fixed control (a wan DMD tier, an H3 Turbo tier) keeps
+    /// its single pinned rung.
+    #[test]
+    fn every_shipped_recipe_offers_a_usable_steps_ladder() {
+        for manifest in crate::manifest::known_manifests()
+            .iter()
+            .filter(|manifest| manifest.is_generation_model())
+        {
+            let profile = generation_profile_for_manifest(manifest);
+            for recipe in &profile.recipes {
+                let context = format!("{} recipe {}", manifest.name, recipe.id);
+                let ladder = &recipe.steps.recommended;
+                assert!(!ladder.is_empty(), "{context}: empty steps ladder");
+                assert!(
+                    ladder.windows(2).all(|pair| pair[0] < pair[1]),
+                    "{context}: steps ladder is not sorted and deduped: {ladder:?}"
+                );
+                assert!(
+                    ladder
+                        .iter()
+                        .all(|rung| (recipe.steps.min..=recipe.steps.max).contains(rung)),
+                    "{context}: steps ladder escapes [{}, {}]: {ladder:?}",
+                    recipe.steps.min,
+                    recipe.steps.max
+                );
+                assert!(
+                    ladder.contains(&recipe.steps.default),
+                    "{context}: steps ladder omits the default {}: {ladder:?}",
+                    recipe.steps.default
+                );
+                if recipe.steps.mode == ControlMode::Fixed {
+                    assert_eq!(
+                        ladder,
+                        &vec![recipe.steps.default],
+                        "{context}: a pinned step count has exactly one rung"
+                    );
+                } else if recipe.steps.min < recipe.steps.max {
+                    assert!(
+                        ladder.len() >= 2,
+                        "{context}: an adjustable control needs a choice: {ladder:?}"
+                    );
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,28 @@
+# am2Strata's vendored copy of mold (see AM2STRATA.md): the workspace root trimmed to the six crates the media engine
+# builds. Everything else here is mold's own, at rev bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b.
+[workspace]
+members = [
+    "crates/mold-core",
+    "crates/mold-secure",
+    "crates/mold-secure-client",
+    "crates/mold-inference",
+    "crates/mold-catalog",
+    "crates/mold-candle",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.36.0"
+edition = "2021"
+license = "MIT"
+authors = [
+    "James Brink <brink.james@gmail.com>",
+    "Jeffrey Dilley <jeff.dilley@gmail.com>",
+]
+description = "CLI-native local AI image and video generation for people, scripts, and agents"
+rust-version = "1.93"
+homepage = "https://github.com/utensils/mold"
+repository = "https://github.com/utensils/mold"
+readme = "README.md"
+keywords = ["ai", "image-generation", "diffusion", "flux", "gpu"]
+categories = ["command-line-utilities", "multimedia::images", "science"]

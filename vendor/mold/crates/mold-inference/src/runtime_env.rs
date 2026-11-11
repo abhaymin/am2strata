@@ -1,0 +1,306 @@
+//! Process-frozen environment inputs that can shape engine construction or
+//! generation semantics.
+//!
+//! Planned execution must not observe a different process environment after
+//! admission. Production captures this set once, when the first frozen engine
+//! config is resolved. Unit-test builds intentionally capture per call so
+//! existing parser tests can exercise multiple values in one process; the
+//! immutable production behavior is covered by pure snapshot tests.
+
+use std::collections::BTreeMap;
+#[cfg(not(test))]
+use std::sync::OnceLock;
+
+/// Every environment variable whose value can alter device choice, concrete
+/// weights, numeric execution, memory residency, or output semantics.
+///
+/// Every name added here must also gain a matching `RuntimeSemanticVariable`
+/// arm in mold-server's `execution_plan.rs` (`runtime_semantic_variable`).
+/// `every_engine_shaping_variable_has_a_semantic_class` over there fails CI on
+/// a mismatch; at runtime an unclassified name fails the job with
+/// `ExecutionPlanError::UnclassifiedRuntimeVariable` instead of panicking the
+/// server (issue #685).
+pub const ENGINE_SHAPING_VARIABLES: &[&str] = &[
+    "MOLD_ATTN",
+    "MOLD_ATTN_CHUNK",
+    "MOLD_CFG_PLUS",
+    // #1483: selects the convolution backend, and cuDNN and im2col sum in a
+    // different order. Two renders that disagree on it are not interchangeable.
+    "MOLD_CONV",
+    "MOLD_DEVICE",
+    "MOLD_EAGER",
+    "MOLD_FLUX_DELTA_CACHE",
+    "MOLD_FLUX_KEEP_TRANSFORMER",
+    // Selects the Flux.2 GGUF quantized-linear arm on CUDA: candle's MMQ fast
+    // path (the shipped default — the algorithm stable-diffusion.cpp uses, and
+    // the one FLUX.1 has always rendered correctly through) or the per-forward
+    // dequant escape hatch. The arms differ in numerics, transient memory, and
+    // step latency, so a run on one must never share a fingerprint or a
+    // learned-timing bucket with the other.
+    "MOLD_FLUX2_QMATMUL",
+    // The FP8 tiers either widen their weights once at load (two bytes per
+    // parameter at rest) or cast the whole slab on every forward. Residency and
+    // step latency both change, so a cached run must not share a fingerprint or
+    // a learned-timing bucket with one that widened every forward — the
+    // `MOLD_QWEN_FP8_CACHE` rule, for the same reason.
+    "MOLD_FLUX2_FP8_CACHE",
+    // Opt-in, unqualified: routing FP8 layers to the native cuBLASLt FP8 GEMM
+    // quantizes the ACTIVATION, which the widen path never does. Different
+    // numerics and different latency.
+    "MOLD_FLUX2_FP8_GEMM",
+    // #1174 follow-up: the reviewed MiniMax H3 Turbo LoRA tier is selected by
+    // adapter path plus tier id until manifests own it. Both change which
+    // adapter runs, which integrator consumes it, and the step count, so both
+    // are engine-shaping.
+    // #1495: the number of occupancy-field query points the Hunyuan3D shape
+    // VAE decodes per chunk. Chunking changes only how the same points are
+    // batched, but batch boundaries move floating-point summation order, so
+    // two renders that disagree on it are not bit-identical.
+    "MOLD_HUNYUAN3D_DECODE_CHUNKS",
+    "MOLD_H3_TURBO_ADAPTER",
+    "MOLD_H3_TURBO_TIER",
+    "MOLD_KEEP_TE_RAM",
+    "MOLD_LONG_PROMPTS",
+    "MOLD_LORA_BYPASS",
+    "MOLD_LTX_DEBUG_ALT_PROMPT",
+    "MOLD_LTX_DEBUG_COMPARE_UNCOND",
+    "MOLD_LTX_DEBUG_DISABLE_CROSS_ATTENTION_ADALN",
+    "MOLD_LTX2_DEBUG_DISABLE_TRANSFORMER_GATED_ATTENTION",
+    "MOLD_LTX2_DEBUG_FORCE_CPU_PROMPT_ENCODER",
+    "MOLD_LTX2_DEBUG_LOAD_BLOCKS",
+    // #735: pins LTX-2 self-attention on the F32 chunked path instead of the
+    // BF16 dispatcher. Changes the rendered output, so it can never share an
+    // execution-equivalence class with the default route.
+    "MOLD_LTX2_ATTN_F32",
+    "MOLD_LTX2_FORCE_EAGER",
+    "MOLD_LTX2_FORCE_STREAMING",
+    "MOLD_LTX2_FP8_INPUT_SCALE_MODE",
+    "MOLD_LTX2_FP8_WEIGHT_SCALE_MODE",
+    "MOLD_LTX2_GEMMA_DEVICE",
+    "MOLD_LTX2_GEMMA_VARIANT",
+    // Selects how INT8 ConvRot transformer linears execute on CUDA: the
+    // default W8A8 kernel (upstream's own path for these checkpoints) or the
+    // per-forward widening (W8A16) escape hatch. The two arms produce
+    // different pixels and different transient memory, so a run on one must
+    // never share a fingerprint or a learned-timing bucket with the other.
+    "MOLD_LTX2_INT8",
+    // Selects the LTX-2.5 GGUF quantized-linear arm on CUDA: the default
+    // per-forward dequant (the Qwen #1048 / Z-Image NaN precedent) or
+    // candle's QMatMul fast path. The arms differ in numerics, transient
+    // memory, and step latency, so a run on one must never share a
+    // fingerprint or a learned-timing bucket with the other.
+    "MOLD_LTX2_QMATMUL",
+    "MOLD_LTX2_SPATIAL_TILE",
+    "MOLD_LTX2_VAE_DECODE_CHUNK_FRAMES",
+    "MOLD_LTX2_VAE_DECODE_CONTEXT_FRAMES",
+    "MOLD_LTX2_VAE_FORCE_FRAMEWISE",
+    "MOLD_LTX2_VAE_FORCE_FULL_DECODE",
+    "MOLD_NVFP4_BACKEND",
+    "MOLD_OFFLOAD",
+    "MOLD_OFFLOAD_PREFETCH",
+    "MOLD_PINNED_VRAM_MAX_GB",
+    "MOLD_QWEN2_TEXT_ENCODER_MODE",
+    "MOLD_QWEN2_VARIANT",
+    "MOLD_QWEN3_VARIANT",
+    // Qwen Image 2.1 Metal denoiser precision changes weights and latent storage.
+    "MOLD_QWEN_IMAGE21_DTYPE",
+    // Qwen Image 2.1 GGUF tiers: per-forward dequant (default on CUDA) vs
+    // candle's QMatMul kernels. Numerics, transient memory and step latency
+    // all differ, so the two arms never share a fingerprint or timing bucket.
+    "MOLD_QWEN_IMAGE21_QMATMUL",
+    // Qwen Image 2.1 prefix K/V retention: upstream warns that cached and
+    // uncached renders differ in BF16, so the decision moves pixels.
+    "MOLD_QWEN_IMAGE21_KV_CACHE",
+    // #1045: caching the widened BF16 FP8 weights trades VRAM for a per-forward
+    // cast, so residency and step latency both change — a cached run must not
+    // share a learned-timing bucket with one that widened every forward.
+    "MOLD_QWEN_FP8_CACHE",
+    // #1045 A/B switch: forcing the quantized Qwen linears back onto the
+    // dequantize-per-forward arm changes numerics (int8 MMQ vs a BF16 GEMM over
+    // dequantized weights), runtime, and transient VRAM.
+    "MOLD_QWEN_QMATMUL",
+    "MOLD_RESERVE_VRAM_MB",
+    "MOLD_T5_VARIANT",
+    "MOLD_UMT5_VARIANT",
+    "MOLD_VAE_DTYPE",
+    "MOLD_VAE_TILED",
+    // #775 diagnostics: forcing the quantized-matmul fallback changes
+    // numerics, runtime, and transient F32 memory; the profiler's per-phase
+    // device syncs change runtime. Neither may share a fingerprint or a
+    // learned-timing bucket with normal execution.
+    "MOLD_WAN_FORCE_DMMV",
+    // #802 item 3: the partner page-cache warm changes wall-clock (that is its
+    // purpose), so a run with it off must not share a learned-timing bucket
+    // with one that had it on.
+    "MOLD_WAN_PREFETCH",
+    // #776 item 3: parking transformer blocks in host RAM changes device
+    // residency, peak VRAM, and step latency, so a run with blocks parked must
+    // not share a learned-timing bucket with one that kept them resident.
+    "MOLD_WAN_OFFLOAD_BLOCKS",
+    // #801: residual reuse changes the rendered output, so it can never share
+    // an execution-equivalence class or a learned-timing bucket with a run
+    // that denoised every block.
+    "MOLD_WAN_STEP_CACHE",
+    "MOLD_WAN_STEP_PROFILE",
+    "MOLD_WUERSTCHEN_DECODER_GUIDANCE",
+    // Re-enables candle's quantized CUDA fast path for Z-Image, which is
+    // known to return non-finite values for its linears (black renders).
+    "MOLD_ZIMAGE_QMATMUL",
+];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FrozenRuntimeEnvironment {
+    values: BTreeMap<String, Option<String>>,
+}
+
+impl FrozenRuntimeEnvironment {
+    pub fn with_offload(mut self, offload: Option<bool>) -> Self {
+        if let Some(offload) = offload {
+            self.values.insert(
+                "MOLD_OFFLOAD".into(),
+                Some(if offload { "1" } else { "0" }.into()),
+            );
+        }
+        self
+    }
+    /// Build a snapshot from explicit values rather than from the process.
+    ///
+    /// For callers that need to ask what a named configuration RESOLVES to
+    /// without mutating the environment the rest of the process is reading —
+    /// `mold-server`'s fingerprint tests being the case this exists for.
+    /// Names outside [`ENGINE_SHAPING_VARIABLES`] are retained as given;
+    /// classification still happens where a snapshot is consumed.
+    pub fn from_values(values: impl IntoIterator<Item = (String, Option<String>)>) -> Self {
+        Self {
+            values: values.into_iter().collect(),
+        }
+    }
+
+    fn capture() -> Self {
+        Self {
+            values: ENGINE_SHAPING_VARIABLES
+                .iter()
+                .map(|name| ((*name).to_string(), std::env::var(name).ok()))
+                .collect(),
+        }
+    }
+
+    pub fn value(&self, name: &str) -> Option<&str> {
+        self.values.get(name).and_then(Option::as_deref)
+    }
+}
+
+#[cfg(not(test))]
+static PROCESS_ENVIRONMENT: OnceLock<FrozenRuntimeEnvironment> = OnceLock::new();
+
+pub fn snapshot() -> FrozenRuntimeEnvironment {
+    #[cfg(test)]
+    {
+        FrozenRuntimeEnvironment::capture()
+    }
+    #[cfg(not(test))]
+    {
+        PROCESS_ENVIRONMENT
+            .get_or_init(FrozenRuntimeEnvironment::capture)
+            .clone()
+    }
+}
+
+pub fn value(name: &str) -> Option<String> {
+    debug_assert!(
+        ENGINE_SHAPING_VARIABLES.contains(&name),
+        "runtime_env::value called for non-shaping variable {name}"
+    );
+    snapshot().value(name).map(str::to_string)
+}
+
+/// Canonical unsigned parser shared by runtime consumers and execution
+/// equivalence. Keeping one authority prevents whitespace or invalid-value
+/// handling from collapsing distinct runtime behavior into one descriptor.
+pub fn parse_u64(value: &str) -> Option<u64> {
+    value.trim().parse().ok()
+}
+
+/// Canonical floating-point parser shared by runtime consumers and execution
+/// equivalence.
+pub fn parse_f64(value: &str) -> Option<f64> {
+    value.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_covers_required_multi_gpu_engine_shaping_inputs() {
+        for required in [
+            "MOLD_CFG_PLUS",
+            "MOLD_CONV",
+            "MOLD_EAGER",
+            "MOLD_FLUX_KEEP_TRANSFORMER",
+            "MOLD_KEEP_TE_RAM",
+            "MOLD_LORA_BYPASS",
+            "MOLD_LONG_PROMPTS",
+            "MOLD_LTX2_FORCE_EAGER",
+            "MOLD_LTX2_FP8_INPUT_SCALE_MODE",
+            "MOLD_LTX2_FP8_WEIGHT_SCALE_MODE",
+            "MOLD_NVFP4_BACKEND",
+            "MOLD_OFFLOAD_PREFETCH",
+            "MOLD_PINNED_VRAM_MAX_GB",
+            "MOLD_RESERVE_VRAM_MB",
+            "MOLD_WUERSTCHEN_DECODER_GUIDANCE",
+            "MOLD_DEVICE",
+            // Selects the FLUX.2 GGUF linear arm; the two differ in numerics,
+            // transient memory and step latency.
+            "MOLD_FLUX2_QMATMUL",
+            // Selects whether FP8 weights are widened once at load or on every
+            // forward; residency and step latency both differ.
+            "MOLD_FLUX2_FP8_CACHE",
+            "MOLD_QWEN_IMAGE21_DTYPE",
+            "MOLD_QWEN_IMAGE21_QMATMUL",
+            // Retaining vs recomputing the prefix K/V moves BF16 pixels
+            // (upstream warns cached and uncached renders differ).
+            "MOLD_QWEN_IMAGE21_KV_CACHE",
+        ] {
+            assert!(
+                ENGINE_SHAPING_VARIABLES.contains(&required),
+                "missing engine-shaping environment input {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_dump_and_preview_switches_are_not_engine_shaping_authority() {
+        for diagnostic in [
+            "MOLD_FLUX2_DUMP_LATENT",
+            // Residency and wall clock only: a MiniMax H3 conditioner hit
+            // restores the same BF16 tensor the encode would have produced,
+            // and the cache key already carries every artifact and route
+            // identity. It must never join the engine fingerprint.
+            "MOLD_H3_CONDITIONER_CACHE",
+            "MOLD_LTX2_DEBUG_TIMINGS",
+            // A per-step diagnostic read: it adds a device sync and a
+            // reduction, so it changes wall clock, but it cannot change a
+            // pixel. Wall clock alone is not execution identity.
+            "MOLD_FLUX_DEBUG_NONFINITE",
+            // PNG is lossless under every profile, so the encoding choice
+            // trades wall clock against file size and changes no pixel. Two
+            // renders that disagree on it ARE interchangeable.
+            "MOLD_PNG_ENCODING",
+            "MOLD_QWEN_DEBUG",
+            "MOLD_SD3_DEBUG",
+            "MOLD_STEP_PREVIEW",
+            "MOLD_ZIMAGE_DEBUG",
+        ] {
+            assert!(!ENGINE_SHAPING_VARIABLES.contains(&diagnostic));
+        }
+    }
+
+    #[test]
+    fn shared_numeric_parsers_define_whitespace_and_invalid_value_semantics() {
+        assert_eq!(parse_u64(" 4 "), Some(4));
+        assert_eq!(parse_u64("4 frames"), None);
+        assert_eq!(parse_f64("\t1.5\n"), Some(1.5));
+        assert_eq!(parse_f64("automatic"), None);
+    }
+}

@@ -1,0 +1,1687 @@
+//! Bypass-mode LoRA primitive for FLUX.
+//!
+//! Mirrors the LTX-2 [`crate::ltx2::lora::LinearLoraAdapter`] /
+//! [`crate::ltx2::model::video_transformer::LtxLinear`] pattern and
+//! ComfyUI's `comfy/weight_adapter/bypass.py`: never modify base weights,
+//! apply the LoRA delta at forward time on top of the base matmul output.
+//!
+//! ```text
+//! Linear.forward(x)        = x @ W.T + b
+//! LoraLinear.forward(x)    = x @ W.T + b + Σᵢ scaleᵢ · (x @ Aᵢ.T) @ Bᵢ.T
+//! ```
+//!
+//! For fused-QKV targets (e.g. FLUX `img_attn.qkv` packs Q‖K‖V into one
+//! linear), an adapter that targets only Q writes its delta into the
+//! corresponding row slice of the output via `narrow` + `cat`.
+//!
+//! This module is the building block that makes "swap LoRA" cheap — no
+//! base-weight rebuilds, no dequant→merge→requant on quantized models —
+//! at the cost of a small per-step matmul (the adapters are tiny: rank
+//! is typically 4–32).
+
+use anyhow::Result;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::Linear;
+use std::collections::HashMap;
+
+use crate::quantized_linear::QuantizedLinear;
+
+/// Slice a [`LinearLoraAdapter`]'s contribution into a fused output.
+///
+/// `offset` is the row index (in output / "out_features" axis) where the
+/// adapter's delta starts; `length` is the number of rows it owns. For
+/// QKV-fused linears (FLUX `img_attn.qkv`), Q lives at `[0, h)`, K at
+/// `[h, 2h)`, V at `[2h, 3h)`. The adapter's `up` matrix has `length`
+/// rows, not `out_features`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FusedSlice {
+    pub offset: usize,
+    pub length: usize,
+}
+
+/// A LoRA delta applied at forward time, never merged into base weights.
+///
+/// `down` is the (rank, in_features) matrix usually called `lora_A` /
+/// `lora_down`. `up` is (out_features_or_slice_length, rank), usually
+/// called `lora_B` / `lora_up`. `scale` already includes the alpha/rank
+/// rescale, so `apply()` just multiplies through.
+///
+/// Tensors live wherever you put them — typically GPU. They're tiny
+/// (rank-4 to rank-32 LoRAs are a few MB total per adapter), so it's fine
+/// to keep them GPU-resident even when the host transformer is offloading
+/// blocks back to CPU between steps.
+#[derive(Clone, Debug)]
+pub struct LinearLoraAdapter {
+    pub down: Tensor,
+    pub up: Tensor,
+    pub scale: f32,
+    pub fused_slice: Option<FusedSlice>,
+}
+
+impl LinearLoraAdapter {
+    /// Compute `out += scale · (x @ down.T) @ up.T` in `out`'s dtype.
+    ///
+    /// For a fused target, the contribution lands in
+    /// `out[..., offset..offset+length]` — rows outside that range are
+    /// left untouched. Returns the new tensor (candle is functional).
+    /// Production stacks go through [`apply_adapters`], which shares one
+    /// projection cache across the stack ([`Self::apply_sharing`]).
+    #[cfg(test)]
+    pub fn apply(&self, x: &Tensor, out: &Tensor) -> Result<Tensor> {
+        self.apply_sharing(x, out, &mut LoraProjections::default())
+    }
+
+    /// [`Self::apply`], reusing any `x @ downᵀ` that `projections` already
+    /// holds for this adapter's `down` tensor. Two adapters that share one
+    /// `down` — ComfyUI's fused Qwen Image 2.1 `gate_up` LoRA split onto its
+    /// two halves (`comfy/lora.py:331-333` splits only the `up` rows) —
+    /// then project the input once. The shared projection is the very
+    /// tensor the unshared path computes, so the output is bit-identical.
+    pub(crate) fn apply_sharing(
+        &self,
+        x: &Tensor,
+        out: &Tensor,
+        projections: &mut LoraProjections,
+    ) -> Result<Tensor> {
+        // Nothing to do for zero-scale adapters; skip the matmul so a
+        // user-disabled-but-still-attached adapter is genuinely free.
+        if self.scale == 0.0 {
+            return Ok(out.clone());
+        }
+
+        let dtype = out.dtype();
+        let device = out.device();
+
+        let up = adapter_to_runtime(&self.up, device, dtype)?;
+
+        // delta = (x @ down.T) @ up.T, shape [..., adapter_out_rows]
+        let projected = projections.project(x, &self.down, device, dtype)?;
+        let delta = expand_through_lora(x, &projected, &up)?;
+
+        // scale = adapter scale; apply via affine for one fused kernel.
+        let delta = delta.affine(self.scale as f64, 0.0)?;
+
+        match self.fused_slice {
+            None => Ok(out.broadcast_add(&delta)?),
+            Some(slice) => add_into_slice(out, &delta, slice),
+        }
+    }
+}
+
+/// A `Linear` (BF16 / F32) or `quantized_nn::Linear` (GGUF) that may
+/// carry zero or more LoRA adapters.
+///
+/// `Plain` / `Quantized` are bit-identical to the underlying inner
+/// linear. `WithAdapters*` runs the inner forward, then layers each
+/// adapter on top. The split exists so callers don't pay any forward
+/// overhead when no LoRA is active — the common case.
+///
+/// The Plain↔Quantized split lets the offload path keep using the BF16
+/// `candle_nn::Linear` (it streams base weights CPU↔GPU each step) while
+/// the GGUF path stores a [`QuantizedLinear`] permanently on GPU. Both
+/// share the same `LinearLoraAdapter` math because adapter weights are
+/// always small dense BF16/F32 tensors regardless of the base.
+///
+/// The quantized arm is [`crate::quantized_linear::QuantizedLinear`] rather
+/// than `mold_candle::quantized_nn::Linear` because the GGUF transformer now
+/// runs at a working dtype the checkpoint does not choose: that type owns the
+/// activation cast boundary, materializes the bias at the kernel dtype, and
+/// hoists a densely stored tensor's dequantization out of the forward. The
+/// adapter math is unaffected — `LinearLoraAdapter::apply` takes its dtype
+/// from the linear's OUTPUT, which the cast boundary has already returned to
+/// the caller's.
+#[derive(Clone, Debug)]
+pub enum LoraLinear {
+    Plain(Linear),
+    WithAdapters {
+        inner: Linear,
+        adapters: Vec<LinearLoraAdapter>,
+    },
+    Quantized(QuantizedLinear),
+    WithAdaptersQuantized {
+        inner: QuantizedLinear,
+        adapters: Vec<LinearLoraAdapter>,
+    },
+}
+
+#[allow(dead_code)]
+impl LoraLinear {
+    /// Wrap a `Linear` in the no-adapter variant. Forward is identical.
+    pub fn plain(inner: Linear) -> Self {
+        Self::Plain(inner)
+    }
+
+    /// Wrap a `quantized_nn::Linear` in the no-adapter variant.
+    pub fn quantized(inner: QuantizedLinear) -> Self {
+        Self::Quantized(inner)
+    }
+
+    /// Read-only access to the underlying BF16/F32 `Linear`. Panics if
+    /// called on a quantized variant — those use [`Self::inner_quantized`]
+    /// instead. Legacy callers (e.g. the offload path's `to_device` copy)
+    /// only ever hold the BF16 variant so this contract preserves their
+    /// existing return-type ergonomics without `.unwrap()` noise at every
+    /// call site.
+    pub fn inner(&self) -> &Linear {
+        match self {
+            Self::Plain(l) => l,
+            Self::WithAdapters { inner, .. } => inner,
+            Self::Quantized(_) | Self::WithAdaptersQuantized { .. } => {
+                panic!("LoraLinear::inner() called on a Quantized variant — use inner_quantized()")
+            }
+        }
+    }
+
+    /// Read-only access to the underlying quantized linear, or `None`
+    /// for BF16/F32 variants.
+    pub fn inner_quantized(&self) -> Option<&QuantizedLinear> {
+        match self {
+            Self::Quantized(q) => Some(q),
+            Self::WithAdaptersQuantized { inner, .. } => Some(inner),
+            Self::Plain(_) | Self::WithAdapters { .. } => None,
+        }
+    }
+
+    /// Replace the adapter stack. Empty `adapters` collapses to the
+    /// no-adapter variant so future forward calls skip the per-adapter
+    /// loop entirely. Preserves the Plain/Quantized kind of the inner.
+    pub fn set_adapters(&mut self, adapters: Vec<LinearLoraAdapter>) {
+        let is_quantized = matches!(
+            self,
+            Self::Quantized(_) | Self::WithAdaptersQuantized { .. }
+        );
+        if is_quantized {
+            let inner = self.inner_quantized().unwrap().clone();
+            if adapters.is_empty() {
+                *self = Self::Quantized(inner);
+            } else {
+                *self = Self::WithAdaptersQuantized { inner, adapters };
+            }
+        } else {
+            let inner = self.inner().clone();
+            if adapters.is_empty() {
+                *self = Self::Plain(inner);
+            } else {
+                *self = Self::WithAdapters { inner, adapters };
+            }
+        }
+    }
+
+    /// Drop all adapters — `set_adapters(vec![])` shorthand.
+    pub fn clear_adapters(&mut self) {
+        self.set_adapters(Vec::new());
+    }
+
+    /// `inner.forward(x) + Σ adapter.apply(x, out)`.
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Plain(l) => Ok(<Linear as candle_core::Module>::forward(l, x)?),
+            Self::WithAdapters { inner, adapters } => {
+                let out = <Linear as candle_core::Module>::forward(inner, x)?;
+                apply_adapters(adapters, x, out)
+            }
+            Self::Quantized(q) => Ok(<QuantizedLinear as candle_core::Module>::forward(q, x)?),
+            Self::WithAdaptersQuantized { inner, adapters } => {
+                let out = <QuantizedLinear as candle_core::Module>::forward(inner, x)?;
+                apply_adapters(adapters, x, out)
+            }
+        }
+    }
+}
+
+/// Layer every adapter in `adapters` onto a base linear's `out`, in order.
+///
+/// The one bypass loop every adapter-carrying linear shares — FLUX's
+/// [`LoraLinear`] and Qwen Image 2.1's `Q21Linear`, whose base arms (dense,
+/// GGUF, Comfy INT8 ConvRot, torchao FP8) differ but whose adapter math is the
+/// same `out + Σ scaleᵢ · (x @ Aᵢᵀ) @ Bᵢᵀ` (ComfyUI
+/// `comfy/weight_adapter/bypass.py`).
+pub(crate) fn apply_adapters(
+    adapters: &[LinearLoraAdapter],
+    x: &Tensor,
+    out: Tensor,
+) -> Result<Tensor> {
+    apply_adapters_sharing(adapters, x, out, &mut LoraProjections::default())
+}
+
+/// [`apply_adapters`] with a caller-owned projection cache, so adapters on
+/// DIFFERENT linears fed the same input (a split `gate_layer` / `proj` pair)
+/// can share one `x @ downᵀ`.
+pub(crate) fn apply_adapters_sharing(
+    adapters: &[LinearLoraAdapter],
+    x: &Tensor,
+    mut out: Tensor,
+    projections: &mut LoraProjections,
+) -> Result<Tensor> {
+    for adapter in adapters {
+        out = adapter.apply_sharing(x, &out, projections)?;
+    }
+    Ok(out)
+}
+
+/// The down projections `x @ downᵀ` already computed for ONE input `x`,
+/// keyed by the identity of the `down` tensor (a registry hands every target
+/// of one LoRA layer a clone of the same `down`, so they share an id) and
+/// the dtype the projection ran in. A projection for a different input is
+/// never reused: asking with another `x` empties the cache first.
+#[derive(Default)]
+pub(crate) struct LoraProjections {
+    input: Option<candle_core::TensorId>,
+    computed: Vec<(candle_core::TensorId, DType, Tensor)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTIONS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many `x @ downᵀ` projections this thread has computed (not reused).
+#[cfg(test)]
+pub(crate) fn lora_projection_count() -> usize {
+    PROJECTIONS_COMPUTED.with(std::cell::Cell::get)
+}
+
+impl LoraProjections {
+    /// `x @ downᵀ` flattened to 2-D (`[tokens, rank]`), computed once per
+    /// (`down`, dtype) for this `x`.
+    fn project(
+        &mut self,
+        x: &Tensor,
+        down: &Tensor,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        if self.input != Some(x.id()) {
+            self.input = Some(x.id());
+            self.computed.clear();
+        }
+        let key = down.id();
+        if let Some((_, _, projected)) = self
+            .computed
+            .iter()
+            .find(|(id, cached_dtype, _)| *id == key && *cached_dtype == dtype)
+        {
+            return Ok(projected.clone());
+        }
+        let runtime_down = adapter_to_runtime(down, device, dtype)?;
+        let projected = project_through_lora(x, &runtime_down)?;
+        #[cfg(test)]
+        PROJECTIONS_COMPUTED.with(|count| count.set(count.get() + 1));
+        self.computed.push((key, dtype, projected.clone()));
+        Ok(projected)
+    }
+}
+
+/// Move adapter stacks to `device`, keeping every `down`/`up` that several
+/// adapters share ONE tensor after the move (so [`LoraProjections`] still
+/// recognises them as shared). `moved` carries the mapping across calls, so
+/// the two halves of a split MLP can be moved separately and stay linked.
+pub(crate) fn move_adapters_sharing(
+    adapters: &[LinearLoraAdapter],
+    device: &Device,
+    moved: &mut HashMap<candle_core::TensorId, Tensor>,
+) -> Result<Vec<LinearLoraAdapter>> {
+    let mut move_one = |tensor: &Tensor| -> Result<Tensor> {
+        if let Some(existing) = moved.get(&tensor.id()) {
+            return Ok(existing.clone());
+        }
+        let on_device = tensor.to_device(device)?;
+        moved.insert(tensor.id(), on_device.clone());
+        Ok(on_device)
+    };
+    adapters
+        .iter()
+        .map(|adapter| {
+            Ok(LinearLoraAdapter {
+                down: move_one(&adapter.down)?,
+                up: move_one(&adapter.up)?,
+                ..adapter.clone()
+            })
+        })
+        .collect()
+}
+
+impl candle_core::Module for LoraLinear {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        // Surface anyhow errors through candle_core::Error to keep the
+        // `Module` blanket impls (e.g. `Tensor::apply`) usable.
+        Self::forward(self, x).map_err(|e| candle_core::Error::Msg(e.to_string()))
+    }
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────
+
+/// Move + cast an adapter tensor onto the runtime device/dtype if needed.
+/// LoRA tensors are typically loaded on CPU as F32; runtime is GPU/BF16.
+fn adapter_to_runtime(t: &Tensor, device: &Device, dtype: DType) -> Result<Tensor> {
+    let t = if t.device().same_device(device) {
+        t.clone()
+    } else {
+        t.to_device(device)?
+    };
+    if t.dtype() != dtype {
+        Ok(t.to_dtype(dtype)?)
+    } else {
+        Ok(t)
+    }
+}
+
+/// Run `(x @ down.T) @ up.T` reshaping to a 2-D matmul where possible.
+/// Mirrors the LTX-2 helper so we share the perf characteristics.
+#[cfg(test)]
+fn matmul_through_lora(x: &Tensor, down: &Tensor, up: &Tensor) -> Result<Tensor> {
+    expand_through_lora(x, &project_through_lora(x, down)?, up)
+}
+
+/// The first half of [`matmul_through_lora`]: `x @ downᵀ`, with a rank-3/4
+/// `x` flattened to one 2-D matmul.
+fn project_through_lora(x: &Tensor, down: &Tensor) -> Result<Tensor> {
+    let down_t = down.t()?;
+    Ok(match *x.dims() {
+        [b0, b1, t, h] => x.reshape((b0 * b1 * t, h))?.matmul(&down_t)?,
+        [b, t, h] => x.reshape((b * t, h))?.matmul(&down_t)?,
+        _ => x.matmul(&down_t)?,
+    })
+}
+
+/// The second half: `projected @ upᵀ`, reshaped back to `x`'s leading dims.
+fn expand_through_lora(x: &Tensor, projected: &Tensor, up: &Tensor) -> Result<Tensor> {
+    let delta = projected.matmul(&up.t()?)?;
+    Ok(match *x.dims() {
+        [b0, b1, t, _] => delta.reshape((b0, b1, t, ()))?,
+        [b, t, _] => delta.reshape((b, t, ()))?,
+        _ => delta,
+    })
+}
+
+/// Per-Linear adapter store. Keys are FLUX candle tensor names (e.g.
+/// `double_blocks.0.img_attn.qkv.weight`). Values are the bypass
+/// adapters that should fire each time that Linear runs forward.
+///
+/// All `down`/`up` tensors live on the runtime device — typically GPU —
+/// because they're tiny (rank-32 LoRAs are a few MB total per adapter)
+/// and we don't want a CPU↔GPU round-trip in the per-step path.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct LoraRegistry {
+    by_key: HashMap<String, Vec<LinearLoraAdapter>>,
+}
+
+impl LoraRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of (key, stack) entries — useful for progress logging.
+    pub(crate) fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    /// Device bytes every installed adapter is holding.
+    ///
+    /// The bypass registry keeps the A/B matrices RESIDENT beside the
+    /// transformer for the whole render — it is what "adapters resident on
+    /// Cuda(..)" means in the load line — so they are part of what the VAE
+    /// decode has to fit beside. #276 is titled "VAE decode OOM under
+    /// KEEP_TRANSFORMER=1 **+ LoRAs**", and a residency budget that charged
+    /// only the checkpoint file could not see the ingredient the report
+    /// blamed.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.by_key
+            .values()
+            .flat_map(|stack| stack.iter())
+            .map(|adapter| {
+                let bytes =
+                    |tensor: &Tensor| (tensor.elem_count() * tensor.dtype().size_in_bytes()) as u64;
+                bytes(&adapter.down).saturating_add(bytes(&adapter.up))
+            })
+            .sum()
+    }
+
+    /// True when no adapters are installed for any tensor.
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+
+    /// All adapters that fire for `key`, or an empty slice. Cheap enough
+    /// to call from each block's `to_device` path.
+    pub(crate) fn adapters_for(&self, key: &str) -> &[LinearLoraAdapter] {
+        self.by_key.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    fn push(&mut self, key: String, adapter: LinearLoraAdapter) {
+        self.by_key.entry(key).or_default().push(adapter);
+    }
+}
+
+/// Build a [`LoraRegistry`] from an ordered LoRA stack.
+///
+/// Reuses [`super::lora::map_lora_key`] / [`super::lora::fused_slice_range`]
+/// so we accept the same diffusers/Kohya naming as the merge-time path —
+/// no second lookup table to keep in sync. `device`/`dtype` say where
+/// the adapters should live; pass GPU+BF16 for the standard FLUX flow.
+///
+/// `linear_out_dims` maps candle tensor key → fused tensor's full row
+/// count (e.g. 21504 for FLUX single-block `linear1.weight`). It's
+/// needed only for [`crate::flux::lora::LoraTarget::FusedSlice`] cases
+/// to compute the absolute slice offset; pass an empty map if you only
+/// expect Direct targets.
+pub(crate) fn build_registry(
+    specs: &[super::lora::LoraSpec<'_>],
+    linear_out_dims: &HashMap<String, usize>,
+    device: &Device,
+    dtype: DType,
+) -> Result<LoraRegistry> {
+    build_registry_with(
+        specs,
+        |diffusers_key| {
+            Ok(super::lora::map_lora_key(diffusers_key)
+                .map(|target| match target {
+                    super::lora::LoraTarget::Direct { candle_key } => {
+                        BypassTarget::Direct { candle_key }
+                    }
+                    super::lora::LoraTarget::FusedSlice {
+                        candle_key,
+                        component,
+                        num_components,
+                    } => BypassTarget::FusedSlice {
+                        candle_key,
+                        component,
+                        num_components,
+                    },
+                })
+                .into_iter()
+                .collect())
+        },
+        linear_out_dims,
+        device,
+        dtype,
+    )
+}
+
+/// Where one LoRA layer lands in a bypass registry.
+///
+/// A family's key mapper answers every LoRA stem with zero or more of these.
+/// Zero means "not a module this family adapts" and the layer is skipped;
+/// more than one is how a LoRA trained against a FUSED module lands on a
+/// model that holds the halves separately.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BypassTarget {
+    /// The adapter's whole `up` output lands on the whole linear.
+    Direct { candle_key: String },
+    /// FLUX's fused-linear convention: component `component` of
+    /// `num_components`, sized by [`super::lora::fused_slice_range`] against
+    /// the linear's full row count in `linear_out_dims`.
+    FusedSlice {
+        candle_key: String,
+        component: usize,
+        num_components: usize,
+    },
+    /// Rows `[up_offset, up_offset + rows)` of the adapter's `up` matrix
+    /// (all of them when `up_rows` is `None`) land at output rows
+    /// `[out_offset, out_offset + rows)` of `candle_key` (the whole output when
+    /// `out_offset` is `None`). `down` is shared by every target of one layer.
+    ///
+    /// Covers both directions of a fused/split mismatch: ComfyUI's Qwen Image
+    /// 2.1 `img_mlp.gate_up` LoRA split onto separate `gate_layer`/`proj`
+    /// linears (`comfy/lora.py:331-333`: `(0, half)` to the gate, `(half,
+    /// half)` to proj — gate rows first), and a split LoRA landing on a fused
+    /// `gate_up` linear (whole `up`, `out_offset` 0 or `half`).
+    #[allow(dead_code)] // Qwen Image 2.1's LoRA mapper; FLUX never needs it
+    Rows {
+        candle_key: String,
+        up_rows: Option<(usize, usize)>,
+        out_offset: Option<usize>,
+    },
+}
+
+/// Build a [`LoraRegistry`] from an ordered LoRA stack through a family's own
+/// key mapper.
+///
+/// [`build_registry`] is this with FLUX's [`super::lora::map_lora_key`]; Qwen
+/// Image 2.1 passes its module table. The scale rule, the device/dtype
+/// placement, the fused-slice arithmetic and the skip-with-warning cases are
+/// shared, so a family only owns the question it actually differs on — which
+/// linear a LoRA stem names. A mapper error aborts the build (a family can
+/// refuse a LoRA written for a different architecture rather than silently
+/// adapting nothing).
+pub(crate) fn build_registry_with(
+    specs: &[super::lora::LoraSpec<'_>],
+    mapper: impl Fn(&str) -> Result<Vec<BypassTarget>>,
+    linear_out_dims: &HashMap<String, usize>,
+    device: &Device,
+    dtype: DType,
+) -> Result<LoraRegistry> {
+    let mut registry = LoraRegistry::new();
+    for spec in specs {
+        for (diffusers_key, lora_layer) in &spec.adapter.layers {
+            let targets = mapper(diffusers_key)?;
+            if targets.is_empty() {
+                continue;
+            }
+
+            // Effective scale folds in alpha/rank just like merge mode.
+            let layer_rank = lora_layer.a.dims()[0] as f64;
+            let effective_scale = match lora_layer.alpha {
+                Some(alpha) => spec.scale * alpha / layer_rank,
+                None => spec.scale,
+            };
+
+            let down = lora_layer.a.to_device(device)?.to_dtype(dtype)?;
+            let up = lora_layer.b.to_device(device)?.to_dtype(dtype)?;
+
+            for target in targets {
+                let (candle_key, up, fused_slice) = match target {
+                    BypassTarget::Direct { candle_key } => (candle_key, up.clone(), None),
+                    BypassTarget::FusedSlice {
+                        candle_key,
+                        component,
+                        num_components,
+                    } => {
+                        let base_rows = match linear_out_dims.get(&candle_key) {
+                            Some(n) => *n,
+                            None => {
+                                tracing::warn!(
+                                    key = candle_key.as_str(),
+                                    "fused-slice target unknown to bypass registry, skipping"
+                                );
+                                continue;
+                            }
+                        };
+                        let lora_out_dim = up.dim(0)?;
+                        let (offset, length) = super::lora::fused_slice_range(
+                            base_rows,
+                            lora_out_dim,
+                            component,
+                            num_components,
+                        );
+                        if offset + length > base_rows {
+                            tracing::warn!(
+                                key = candle_key.as_str(),
+                                offset,
+                                length,
+                                base_rows,
+                                "fused slice out of bounds, skipping"
+                            );
+                            continue;
+                        }
+                        (candle_key, up.clone(), Some(FusedSlice { offset, length }))
+                    }
+                    BypassTarget::Rows {
+                        candle_key,
+                        up_rows,
+                        out_offset,
+                    } => {
+                        let up = match up_rows {
+                            None => up.clone(),
+                            Some((start, rows)) => {
+                                if start + rows > up.dim(0)? {
+                                    anyhow::bail!(
+                                        "LoRA layer {diffusers_key} has {} up rows; its target \
+                                         {candle_key} needs rows [{start}, {})",
+                                        up.dim(0)?,
+                                        start + rows
+                                    );
+                                }
+                                up.narrow(0, start, rows)?.contiguous()?
+                            }
+                        };
+                        let fused_slice = match out_offset {
+                            None => None,
+                            Some(offset) => {
+                                let length = up.dim(0)?;
+                                if let Some(base_rows) = linear_out_dims.get(&candle_key) {
+                                    if offset + length > *base_rows {
+                                        anyhow::bail!(
+                                            "LoRA layer {diffusers_key} writes rows [{offset}, {}) \
+                                             of {candle_key}, which has {base_rows}",
+                                            offset + length
+                                        );
+                                    }
+                                }
+                                Some(FusedSlice { offset, length })
+                            }
+                        };
+                        (candle_key, up, fused_slice)
+                    }
+                };
+
+                registry.push(
+                    candle_key,
+                    LinearLoraAdapter {
+                        down: down.clone(),
+                        up,
+                        scale: effective_scale as f32,
+                        fused_slice,
+                    },
+                );
+            }
+        }
+    }
+    Ok(registry)
+}
+
+/// Add `delta` (shape `[..., length]`) into the `[offset, offset+length)`
+/// slice of `out`'s last dim, leaving the rest untouched. Implemented via
+/// `narrow` + `cat` because candle has no in-place `slice_assign`.
+fn add_into_slice(out: &Tensor, delta: &Tensor, slice: FusedSlice) -> Result<Tensor> {
+    let last = out.rank().saturating_sub(1);
+    let total = out.dim(last)?;
+    if slice.offset + slice.length > total {
+        anyhow::bail!(
+            "fused-slice [{o}, {o}+{l}) out of bounds for output dim {total}",
+            o = slice.offset,
+            l = slice.length,
+        );
+    }
+    let middle = out
+        .narrow(last, slice.offset, slice.length)?
+        .broadcast_add(delta)?;
+    let mut parts: Vec<Tensor> = Vec::with_capacity(3);
+    if slice.offset > 0 {
+        parts.push(out.narrow(last, 0, slice.offset)?);
+    }
+    parts.push(middle);
+    let after = slice.offset + slice.length;
+    if after < total {
+        parts.push(out.narrow(last, after, total - after)?);
+    }
+    Ok(Tensor::cat(&parts, last)?.contiguous()?)
+}
+
+// ─── tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    use candle_core::DType;
+    use candle_core::{Device, Module, Tensor};
+
+    /// Build a deterministic Linear with explicit weight/bias on CPU/F32.
+    fn make_linear(out_dim: usize, in_dim: usize, with_bias: bool) -> Linear {
+        let device = Device::Cpu;
+        let weight: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| ((i as f32) * 0.013).sin())
+            .collect();
+        let weight = Tensor::from_vec(weight, (out_dim, in_dim), &device).unwrap();
+        let bias = if with_bias {
+            let b: Vec<f32> = (0..out_dim).map(|i| (i as f32) * 0.01).collect();
+            Some(Tensor::from_vec(b, (out_dim,), &device).unwrap())
+        } else {
+            None
+        };
+        Linear::new(weight, bias)
+    }
+
+    fn make_input(batch: usize, tokens: usize, in_dim: usize) -> Tensor {
+        let device = Device::Cpu;
+        let data: Vec<f32> = (0..batch * tokens * in_dim)
+            .map(|i| ((i as f32) * 0.017).cos())
+            .collect();
+        Tensor::from_vec(data, (batch, tokens, in_dim), &device).unwrap()
+    }
+
+    fn make_lora_pair(out_dim: usize, rank: usize, in_dim: usize, salt: f32) -> (Tensor, Tensor) {
+        let device = Device::Cpu;
+        let down: Vec<f32> = (0..rank * in_dim)
+            .map(|i| ((i as f32 + salt) * 0.011).sin())
+            .collect();
+        let up: Vec<f32> = (0..out_dim * rank)
+            .map(|i| ((i as f32 + salt) * 0.019).cos())
+            .collect();
+        let down = Tensor::from_vec(down, (rank, in_dim), &device).unwrap();
+        let up = Tensor::from_vec(up, (out_dim, rank), &device).unwrap();
+        (down, up)
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let diff = (a - b).unwrap().abs().unwrap();
+        diff.flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_plain_linear_forward_unchanged() {
+        // Bypass-mode wrapper without adapters must be bit-equal to the
+        // raw Linear — otherwise the no-LoRA hot path silently regresses.
+        let inner = make_linear(8, 4, true);
+        let x = make_input(2, 3, 4);
+        let baseline = inner.forward(&x).unwrap();
+        let wrapped = LoraLinear::plain(inner.clone()).forward(&x).unwrap();
+        let max = max_abs_diff(&baseline, &wrapped);
+        assert!(max < 1e-7, "plain-wrap diverged: max abs diff {max}");
+    }
+
+    #[test]
+    fn test_single_adapter_matches_merged() {
+        // The whole point: bypass forward (W·x + s·BA·x) must equal
+        // merged-weight forward ((W + s·BA)·x). A single adapter at
+        // a non-trivial scale is enough to catch sign/dtype/shape bugs.
+        let out_dim = 8;
+        let in_dim = 6;
+        let rank = 3;
+        let inner = make_linear(out_dim, in_dim, true);
+        let (down, up) = make_lora_pair(out_dim, rank, in_dim, 1.0);
+        let scale = 0.7f32;
+
+        // Build merged Linear: W' = W + scale * (up @ down)
+        let merged_delta = up.matmul(&down).unwrap().affine(scale as f64, 0.0).unwrap();
+        let merged_w = (inner.weight() + &merged_delta).unwrap();
+        let merged = Linear::new(merged_w, inner.bias().cloned());
+
+        let lora = LoraLinear::WithAdapters {
+            inner,
+            adapters: vec![LinearLoraAdapter {
+                down,
+                up,
+                scale,
+                fused_slice: None,
+            }],
+        };
+
+        let x = make_input(2, 5, in_dim);
+        let bypass_out = lora.forward(&x).unwrap();
+        let merged_out = merged.forward(&x).unwrap();
+        let max = max_abs_diff(&bypass_out, &merged_out);
+        assert!(max < 1e-5, "bypass != merged for f32: max abs diff {max}");
+    }
+
+    #[test]
+    fn test_two_adapters_compose() {
+        // Multi-LoRA stacking: two independent A/B pairs must compose
+        // additively, exactly as if their deltas had been pre-summed
+        // into one merged weight.
+        let out_dim = 6;
+        let in_dim = 4;
+        let rank = 2;
+        let inner = make_linear(out_dim, in_dim, false);
+        let (d1, u1) = make_lora_pair(out_dim, rank, in_dim, 2.0);
+        let (d2, u2) = make_lora_pair(out_dim, rank, in_dim, 7.0);
+        let s1 = 0.4f32;
+        let s2 = -0.3f32;
+
+        let delta_1 = u1.matmul(&d1).unwrap().affine(s1 as f64, 0.0).unwrap();
+        let delta_2 = u2.matmul(&d2).unwrap().affine(s2 as f64, 0.0).unwrap();
+        let merged_w = ((inner.weight() + &delta_1).unwrap() + &delta_2).unwrap();
+        let merged = Linear::new(merged_w, None);
+
+        let lora = LoraLinear::WithAdapters {
+            inner,
+            adapters: vec![
+                LinearLoraAdapter {
+                    down: d1,
+                    up: u1,
+                    scale: s1,
+                    fused_slice: None,
+                },
+                LinearLoraAdapter {
+                    down: d2,
+                    up: u2,
+                    scale: s2,
+                    fused_slice: None,
+                },
+            ],
+        };
+
+        let x = make_input(1, 4, in_dim);
+        let bypass_out = lora.forward(&x).unwrap();
+        let merged_out = merged.forward(&x).unwrap();
+        let max = max_abs_diff(&bypass_out, &merged_out);
+        assert!(
+            max < 1e-5,
+            "two-adapter compose != merged: max abs diff {max}"
+        );
+    }
+
+    #[test]
+    fn test_fused_slice_only_writes_target_slice() {
+        // Output dim 12, adapter targets rows [4, 8). Bypass output
+        // outside that slice must equal the un-adapted Linear forward
+        // exactly; inside the slice it must equal merged forward.
+        let out_dim = 12;
+        let in_dim = 4;
+        let rank = 2;
+        let slice = FusedSlice {
+            offset: 4,
+            length: 4,
+        };
+        let inner = make_linear(out_dim, in_dim, true);
+        let (down, up) = make_lora_pair(slice.length, rank, in_dim, 3.0);
+        let scale = 0.5f32;
+
+        let lora = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down: down.clone(),
+                up: up.clone(),
+                scale,
+                fused_slice: Some(slice),
+            }],
+        };
+
+        let x = make_input(1, 3, in_dim);
+        let plain_out = inner.forward(&x).unwrap();
+        let bypass_out = lora.forward(&x).unwrap();
+
+        // Outside-the-slice rows untouched.
+        let before = bypass_out.narrow(2, 0, slice.offset).unwrap();
+        let before_ref = plain_out.narrow(2, 0, slice.offset).unwrap();
+        let max_before = max_abs_diff(&before, &before_ref);
+        assert!(
+            max_before < 1e-7,
+            "rows < {}: drifted by {max_before}",
+            slice.offset
+        );
+
+        let after_start = slice.offset + slice.length;
+        let after = bypass_out
+            .narrow(2, after_start, out_dim - after_start)
+            .unwrap();
+        let after_ref = plain_out
+            .narrow(2, after_start, out_dim - after_start)
+            .unwrap();
+        let max_after = max_abs_diff(&after, &after_ref);
+        assert!(
+            max_after < 1e-7,
+            "rows >= {after_start}: drifted by {max_after}"
+        );
+
+        // Inside-the-slice rows = plain + delta.
+        let delta_full = up.matmul(&down).unwrap().affine(scale as f64, 0.0).unwrap();
+        // Apply x @ delta_full.T over batched input.
+        let expected_inside = {
+            let dt = delta_full.t().unwrap();
+            let (b, t, _h) = x.dims3().unwrap();
+            x.reshape((b * t, in_dim))
+                .unwrap()
+                .matmul(&dt)
+                .unwrap()
+                .reshape((b, t, slice.length))
+                .unwrap()
+        };
+        let inside_plain = plain_out.narrow(2, slice.offset, slice.length).unwrap();
+        let inside_expected = (inside_plain + expected_inside).unwrap();
+        let inside_actual = bypass_out.narrow(2, slice.offset, slice.length).unwrap();
+        let max_inside = max_abs_diff(&inside_actual, &inside_expected);
+        assert!(max_inside < 1e-5, "slice rows: max abs diff {max_inside}");
+    }
+
+    #[test]
+    fn test_clear_adapters_returns_to_plain_behavior() {
+        // Lifecycle test: install, then clear, then forward must equal
+        // the original Linear forward — guarantees `clear_adapters()`
+        // is a true reset for engine reuse across requests.
+        let inner = make_linear(8, 4, true);
+        let (down, up) = make_lora_pair(8, 2, 4, 5.0);
+        let mut lora = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down,
+                up,
+                scale: 0.6,
+                fused_slice: None,
+            }],
+        };
+        lora.clear_adapters();
+        match &lora {
+            LoraLinear::Plain(_) => {}
+            _ => panic!("clear_adapters must collapse to Plain"),
+        }
+        let x = make_input(1, 2, 4);
+        let max = max_abs_diff(&inner.forward(&x).unwrap(), &lora.forward(&x).unwrap());
+        assert!(max < 1e-7, "post-clear diverged: max abs diff {max}");
+    }
+
+    #[test]
+    fn test_zero_scale_adapter_is_identity() {
+        // A scale=0 adapter must be a no-op even though it's still
+        // "installed" — important when a multi-LoRA UI lets users
+        // toggle individual scales to 0 without removing entries.
+        let inner = make_linear(6, 4, false);
+        let (down, up) = make_lora_pair(6, 2, 4, 9.0);
+        let lora = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down,
+                up,
+                scale: 0.0,
+                fused_slice: None,
+            }],
+        };
+        let x = make_input(1, 3, 4);
+        let max = max_abs_diff(&inner.forward(&x).unwrap(), &lora.forward(&x).unwrap());
+        assert!(max < 1e-7, "zero-scale adapter changed output: {max}");
+    }
+
+    #[test]
+    fn test_set_adapters_then_replace() {
+        // Going from one adapter stack to another via `set_adapters`
+        // must equal building the second stack fresh — guards against
+        // stale state being retained between LoRA swaps.
+        let inner = make_linear(5, 3, true);
+        let (d1, u1) = make_lora_pair(5, 2, 3, 11.0);
+        let (d2, u2) = make_lora_pair(5, 2, 3, 13.0);
+        let mut lora = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down: d1,
+                up: u1,
+                scale: 0.4,
+                fused_slice: None,
+            }],
+        };
+        lora.set_adapters(vec![LinearLoraAdapter {
+            down: d2.clone(),
+            up: u2.clone(),
+            scale: 0.55,
+            fused_slice: None,
+        }]);
+        let fresh = LoraLinear::WithAdapters {
+            inner,
+            adapters: vec![LinearLoraAdapter {
+                down: d2,
+                up: u2,
+                scale: 0.55,
+                fused_slice: None,
+            }],
+        };
+        let x = make_input(2, 2, 3);
+        let max = max_abs_diff(&lora.forward(&x).unwrap(), &fresh.forward(&x).unwrap());
+        assert!(max < 1e-7, "swap-via-set_adapters drifted: {max}");
+    }
+
+    /// Compare the BF16 bypass forward (`inner(x) + s·(x·Aᵀ)·Bᵀ`) against the
+    /// BF16 merged forward (`x·(W + s·B·A)ᵀ`) on the same BF16 operands, with
+    /// the bypass scale multiplied by `bypass_scale_factor` (1.0 for the real
+    /// comparison; anything else is the negative control).
+    ///
+    /// Returns `(worst per-element difference in BF16 ulps of that element's
+    /// magnitude scale, fitted systematic slope of the difference against the
+    /// exact LoRA term)`.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn bf16_bypass_vs_merged(device: &Device, bypass_scale_factor: f32) -> (f32, f32) {
+        let out_dim = 64;
+        let in_dim = 48;
+        let rank = 8;
+        let tokens = 32;
+        let inner_cpu = make_linear(out_dim, in_dim, true);
+        let (down_cpu, up_cpu) = make_lora_pair(out_dim, rank, in_dim, 1.0);
+        let scale = 0.7f32;
+
+        let to_bf16 = |t: &Tensor| t.to_device(device).unwrap().to_dtype(DType::BF16).unwrap();
+        // The exact reference works on the SAME BF16-rounded operands, widened
+        // back to F32 on the host, so operand quantization is not part of the
+        // measured difference.
+        let to_host_f32 = |t: &Tensor| {
+            t.to_dtype(DType::F32)
+                .unwrap()
+                .to_device(&Device::Cpu)
+                .unwrap()
+        };
+        let weight = to_bf16(inner_cpu.weight());
+        let bias = to_bf16(inner_cpu.bias().unwrap());
+        let down = to_bf16(&down_cpu);
+        let up = to_bf16(&up_cpu);
+        let x = to_bf16(&make_input(1, tokens, in_dim));
+
+        let merged_delta = up.matmul(&down).unwrap().affine(scale as f64, 0.0).unwrap();
+        let merged = Linear::new((&weight + &merged_delta).unwrap(), Some(bias.clone()));
+        let lora = LoraLinear::WithAdapters {
+            inner: Linear::new(weight.clone(), Some(bias.clone())),
+            adapters: vec![LinearLoraAdapter {
+                down: down.clone(),
+                up: up.clone(),
+                scale: scale * bypass_scale_factor,
+                fused_slice: None,
+            }],
+        };
+        let a = to_host_f32(&lora.forward(&x).unwrap())
+            .flatten_all()
+            .unwrap();
+        let b = to_host_f32(&merged.forward(&x).unwrap())
+            .flatten_all()
+            .unwrap();
+
+        let (x, weight, bias, down, up) = (
+            to_host_f32(&x).squeeze(0).unwrap(),
+            to_host_f32(&weight),
+            to_host_f32(&bias),
+            to_host_f32(&down),
+            to_host_f32(&up),
+        );
+        // Signed exact LoRA term, and the absolute-value magnitudes every
+        // rounding in either path is proportional to (the standard forward
+        // error form: |x|·|W|ᵀ + |b| for the base, s·(|x|·|A|ᵀ)·|B|ᵀ for the
+        // adapter).
+        let lora_term = x
+            .matmul(&down.t().unwrap())
+            .unwrap()
+            .matmul(&up.t().unwrap())
+            .unwrap()
+            .affine(scale as f64, 0.0)
+            .unwrap();
+        let (xa, wa, da, ua) = (
+            x.abs().unwrap(),
+            weight.abs().unwrap(),
+            down.abs().unwrap(),
+            up.abs().unwrap(),
+        );
+        let magnitude = (xa
+            .matmul(&wa.t().unwrap())
+            .unwrap()
+            .broadcast_add(&bias.abs().unwrap()))
+        .unwrap()
+        .add(
+            &xa.matmul(&da.t().unwrap())
+                .unwrap()
+                .matmul(&ua.t().unwrap())
+                .unwrap()
+                .affine(scale as f64, 0.0)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let a = a.to_vec1::<f32>().unwrap();
+        let b = b.to_vec1::<f32>().unwrap();
+        let lora_term = lora_term.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let magnitude = magnitude.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // One BF16 ulp at magnitude m: 8 significant bits, so 2^(e - 7).
+        let bf16_ulp = |m: f32| 2f32.powi(m.log2().floor() as i32 - 7);
+        let worst_ulps = a
+            .iter()
+            .zip(&b)
+            .zip(&magnitude)
+            .map(|((a, b), m)| (a - b).abs() / bf16_ulp(*m))
+            .fold(0f32, f32::max);
+        let (num, den) =
+            a.iter()
+                .zip(&b)
+                .zip(&lora_term)
+                .fold((0f64, 0f64), |(num, den), ((a, b), l)| {
+                    (
+                        num + f64::from(a - b) * f64::from(*l),
+                        den + f64::from(*l) * f64::from(*l),
+                    )
+                });
+        (worst_ulps, (num / den) as f32)
+    }
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[test]
+    fn test_bf16_tolerance() {
+        // CPU candle has no BF16 matmul kernel, so this test is gated on a
+        // real GPU build and skips when the runner has no accelerator.
+        let device = if candle_core::Device::cuda_if_available(0).is_ok() {
+            candle_core::Device::cuda_if_available(0).unwrap()
+        } else if let Ok(m) = candle_core::Device::new_metal(0) {
+            m
+        } else {
+            return;
+        };
+
+        // The bound is in BF16 ulps, never an absolute epsilon: an absolute
+        // 1e-2 is below one ulp for any output past 2.0 (one rounding step at
+        // |x| in [4, 8) is 0.03125), so it failed on CUDA whenever the two
+        // paths rounded one step apart. Each path rounds a handful of times —
+        // bypass: base matmul, down matmul, up matmul, scale, add; merged:
+        // B·A, scale, W + Δ, matmul — each at most half an ulp of a quantity
+        // bounded by the element's magnitude scale |x|·|W|ᵀ + |b| +
+        // s·(|x|·|A|ᵀ)·|B|ᵀ. Four ulps of that scale covers both paths' half
+        // ulps with room to spare and still flags any divergence of a few
+        // percent on a single element.
+        const MAX_ULPS: f32 = 4.0;
+        // A real bypass/merge divergence (a wrong scale, a transposed factor,
+        // a dropped adapter) is SYSTEMATIC, while rounding differences are
+        // unbiased. Fitting the difference against the exact LoRA term over
+        // all 2,048 outputs therefore resolves a scale error far below one
+        // ulp: on CUDA (L40S) rounding alone measures a slope of -4.7e-4
+        // and one ulp, while a 1% scale error measures a slope of 1.05e-2 but
+        // only three ulps — the per-element bound alone would pass it. A
+        // quarter of a percent sits 5x above the noise and 4x below the
+        // divergence.
+        const MAX_SLOPE: f32 = 2.5e-3;
+
+        let (ulps, slope) = bf16_bypass_vs_merged(&device, 1.0);
+        assert!(
+            ulps <= MAX_ULPS,
+            "bf16 bypass vs merged: {ulps} ulps (bound {MAX_ULPS})"
+        );
+        assert!(
+            slope.abs() <= MAX_SLOPE,
+            "bf16 bypass vs merged: systematic slope {slope} (bound {MAX_SLOPE})"
+        );
+
+        // Negative control: the same comparison must REJECT a bypass whose
+        // scale is off by 1%, or the bounds above prove nothing.
+        for factor in [1.01f32, 0.99] {
+            let (ulps, slope) = bf16_bypass_vs_merged(&device, factor);
+            assert!(
+                ulps > MAX_ULPS || slope.abs() > MAX_SLOPE,
+                "a {factor}x bypass scale passed: {ulps} ulps, slope {slope}"
+            );
+        }
+    }
+
+    /// The registry reports the device bytes it is holding, summed over
+    /// every adapter in every stack.
+    ///
+    /// `still_transformer_residency` charges this beside the checkpoint, so
+    /// an empty registry must be exactly zero (today's behaviour, unchanged)
+    /// and a two-adapter stack must be the sum of both — not the first, and
+    /// not one key's worth.
+    #[test]
+    fn the_registry_reports_the_device_bytes_its_adapters_hold() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+        use std::collections::HashMap as HM;
+
+        let device = Device::Cpu;
+        assert_eq!(
+            LoraRegistry::new().resident_bytes(),
+            0,
+            "no adapters is no bytes"
+        );
+
+        let h = 16;
+        let rank = 4;
+        let make = |scale: f64| {
+            let a = Tensor::zeros((rank, h), DType::F32, &device).unwrap();
+            let b = Tensor::zeros((h, rank), DType::F32, &device).unwrap();
+            let mut layers = HashMap::new();
+            layers.insert(
+                "transformer.transformer_blocks.0.attn.to_q".to_string(),
+                LoraLayer { a, b, alpha: None },
+            );
+            (LoraAdapter::from_layers(layers, rank), scale)
+        };
+        let (first, first_scale) = make(0.5);
+        let (second, second_scale) = make(0.75);
+        let specs = [
+            LoraSpec {
+                adapter: &first,
+                scale: first_scale,
+            },
+            LoraSpec {
+                adapter: &second,
+                scale: second_scale,
+            },
+        ];
+        let mut linear_out_dims = HM::new();
+        linear_out_dims.insert("double_blocks.0.img_attn.qkv.weight".to_string(), 3 * h);
+        let registry = build_registry(&specs, &linear_out_dims, &device, DType::F32).unwrap();
+
+        // Two adapters, each an F32 (rank x h) down and an (h x rank) up.
+        let per_adapter = 2 * (rank * h) as u64 * DType::F32.size_in_bytes() as u64;
+        assert_eq!(
+            registry.resident_bytes(),
+            2 * per_adapter,
+            "both adapters in the stack are resident, so both are charged"
+        );
+    }
+
+    #[test]
+    fn test_build_registry_double_block_qkv_into_fused_slice() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+        use std::collections::HashMap as HM;
+        // Synthesize a diffusers-shaped LoRA touching the double-block
+        // image-attention Q projection. After build_registry the result
+        // must land under the fused `img_attn.qkv.weight` key with a
+        // FusedSlice covering rows [0, h) (Q is component 0).
+        let h = 16; // pretend hidden_size for this test
+        let device = Device::Cpu;
+        let a = Tensor::zeros((4, h), DType::F32, &device).unwrap();
+        let b = Tensor::zeros((h, 4), DType::F32, &device).unwrap();
+        let mut layers = HashMap::new();
+        layers.insert(
+            "transformer.transformer_blocks.0.attn.to_q".to_string(),
+            LoraLayer { a, b, alpha: None },
+        );
+        let adapter = LoraAdapter::from_layers(layers, 4);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 0.5,
+        }];
+        let mut linear_out_dims = HM::new();
+        linear_out_dims.insert("double_blocks.0.img_attn.qkv.weight".to_string(), 3 * h);
+        let registry = build_registry(&specs, &linear_out_dims, &device, DType::F32).unwrap();
+        let stack = registry.adapters_for("double_blocks.0.img_attn.qkv.weight");
+        assert_eq!(stack.len(), 1, "registry must record the Q-only adapter");
+        let slice = stack[0].fused_slice.expect("fused slice present");
+        assert_eq!(slice.offset, 0, "Q is component 0 → row offset 0");
+        assert_eq!(slice.length, h, "Q slice spans hidden_size rows");
+        assert!((stack[0].scale - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_build_registry_single_block_mlp_lands_after_qkv() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+        use std::collections::HashMap as HM;
+        // single_blocks.linear1 fuses [Q, K, V, MLP]. Verify that an
+        // MLP-targeting LoRA gets a FusedSlice that starts at 3*h and
+        // has length = mlp dim (= LoRA's `b` dim 0). This is the case
+        // most likely to silently miscompute via the equal-split path.
+        let h = 16;
+        let mlp = 64;
+        let device = Device::Cpu;
+        let a = Tensor::zeros((4, h), DType::F32, &device).unwrap();
+        let b = Tensor::zeros((mlp, 4), DType::F32, &device).unwrap();
+        let mut layers = HashMap::new();
+        layers.insert(
+            "transformer.single_transformer_blocks.0.proj_mlp".to_string(),
+            LoraLayer { a, b, alpha: None },
+        );
+        let adapter = LoraAdapter::from_layers(layers, 4);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 1.0,
+        }];
+        let mut linear_out_dims = HM::new();
+        linear_out_dims.insert("single_blocks.0.linear1.weight".to_string(), 3 * h + mlp);
+        let registry = build_registry(&specs, &linear_out_dims, &device, DType::F32).unwrap();
+        let stack = registry.adapters_for("single_blocks.0.linear1.weight");
+        assert_eq!(stack.len(), 1);
+        let slice = stack[0].fused_slice.expect("fused slice present");
+        assert_eq!(slice.offset, 3 * h, "MLP starts after Q,K,V");
+        assert_eq!(slice.length, mlp, "MLP slice spans mlp dim");
+    }
+
+    #[test]
+    fn test_build_registry_direct_target_no_fused_slice() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+        use std::collections::HashMap as HM;
+        // FF MLP `ff.net.0.proj` is a Direct target — adapter must
+        // attach without a fused slice and the registry must still
+        // expose it under the right candle key.
+        let h = 16;
+        let mlp = 64;
+        let device = Device::Cpu;
+        let a = Tensor::zeros((4, h), DType::F32, &device).unwrap();
+        let b = Tensor::zeros((mlp, 4), DType::F32, &device).unwrap();
+        let mut layers = HashMap::new();
+        layers.insert(
+            "transformer.transformer_blocks.0.ff.net.0.proj".to_string(),
+            LoraLayer { a, b, alpha: None },
+        );
+        let adapter = LoraAdapter::from_layers(layers, 4);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 0.25,
+        }];
+        let registry = build_registry(&specs, &HM::new(), &device, DType::F32).unwrap();
+        let stack = registry.adapters_for("double_blocks.0.img_mlp.0.weight");
+        assert_eq!(stack.len(), 1);
+        assert!(stack[0].fused_slice.is_none(), "Direct target = no slice");
+    }
+
+    #[test]
+    fn test_fused_slice_offset_zero_and_end() {
+        // Edge cases for the slice-cat plumbing: offset=0 (nothing
+        // before) and offset+length = total (nothing after). Both
+        // branches of `add_into_slice` must work without an extra
+        // empty-tensor concat.
+        let inner = make_linear(9, 3, false);
+        let (down, up) = make_lora_pair(3, 2, 3, 17.0);
+        let scale = 0.5f32;
+
+        // Slice [0, 3): "before" branch absent.
+        let lora_front = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down: down.clone(),
+                up: up.clone(),
+                scale,
+                fused_slice: Some(FusedSlice {
+                    offset: 0,
+                    length: 3,
+                }),
+            }],
+        };
+        // Slice [6, 9): "after" branch absent.
+        let lora_back = LoraLinear::WithAdapters {
+            inner: inner.clone(),
+            adapters: vec![LinearLoraAdapter {
+                down,
+                up,
+                scale,
+                fused_slice: Some(FusedSlice {
+                    offset: 6,
+                    length: 3,
+                }),
+            }],
+        };
+        let x = make_input(1, 2, 3);
+        // Both must be finite and match the plain output outside the slice.
+        let plain = inner.forward(&x).unwrap();
+        let front = lora_front.forward(&x).unwrap();
+        let back = lora_back.forward(&x).unwrap();
+        let front_after = front.narrow(2, 3, 6).unwrap();
+        let plain_after = plain.narrow(2, 3, 6).unwrap();
+        assert!(max_abs_diff(&front_after, &plain_after) < 1e-7);
+        let back_before = back.narrow(2, 0, 6).unwrap();
+        let plain_before = plain.narrow(2, 0, 6).unwrap();
+        assert!(max_abs_diff(&back_before, &plain_before) < 1e-7);
+    }
+
+    #[test]
+    fn lora_registry_is_empty_and_len_track_pushes() {
+        // The Default-derived registry starts empty; len/is_empty must
+        // agree, and pushing an entry must flip both.
+        let mut reg = LoraRegistry::new();
+        assert_eq!(reg.len(), 0);
+        assert!(reg.is_empty());
+        let device = Device::Cpu;
+        let down = Tensor::zeros((2, 4), DType::F32, &device).unwrap();
+        let up = Tensor::zeros((4, 2), DType::F32, &device).unwrap();
+        reg.push(
+            "double_blocks.0.img_attn.qkv.weight".to_string(),
+            LinearLoraAdapter {
+                down,
+                up,
+                scale: 1.0,
+                fused_slice: None,
+            },
+        );
+        assert_eq!(reg.len(), 1);
+        assert!(!reg.is_empty());
+        // adapters_for must round-trip the entry; an unknown key returns
+        // an empty slice without panicking.
+        assert_eq!(
+            reg.adapters_for("double_blocks.0.img_attn.qkv.weight")
+                .len(),
+            1
+        );
+        assert!(reg.adapters_for("missing.weight").is_empty());
+    }
+
+    #[test]
+    fn module_forward_delegates_to_inherent_forward() {
+        // candle's Module::forward blanket impl wraps anyhow errors as
+        // candle_core::Error::Msg. The happy path must still produce the
+        // same tensor as LoraLinear::forward — exercise the trait dispatch
+        // so the wrapping branch is recorded as covered.
+        let inner = make_linear(8, 4, true);
+        let x = make_input(2, 3, 4);
+        let lora = LoraLinear::plain(inner.clone());
+        let direct = LoraLinear::forward(&lora, &x).unwrap();
+        let trait_call = <LoraLinear as candle_core::Module>::forward(&lora, &x).unwrap();
+        assert!(max_abs_diff(&direct, &trait_call) < 1e-7);
+    }
+
+    #[test]
+    fn matmul_through_lora_handles_each_rank_branch() {
+        // Three rank branches: 4-D, 3-D, fallback. Each matmul shape
+        // covers a distinct match arm in matmul_through_lora.
+        let device = Device::Cpu;
+        let in_dim = 4;
+        let rank = 2;
+        let out_dim = 3;
+        let down = Tensor::ones((rank, in_dim), DType::F32, &device).unwrap();
+        let up = Tensor::ones((out_dim, rank), DType::F32, &device).unwrap();
+
+        // 4-D input: [b0, b1, t, h] reshape branch.
+        let x4 = Tensor::ones((1, 2, 5, in_dim), DType::F32, &device).unwrap();
+        let y4 = matmul_through_lora(&x4, &down, &up).unwrap();
+        assert_eq!(y4.dims(), &[1, 2, 5, out_dim]);
+
+        // 3-D input: [b, t, h] reshape branch (already covered elsewhere
+        // via apply(), but pin explicitly to insulate against refactors).
+        let x3 = Tensor::ones((2, 5, in_dim), DType::F32, &device).unwrap();
+        let y3 = matmul_through_lora(&x3, &down, &up).unwrap();
+        assert_eq!(y3.dims(), &[2, 5, out_dim]);
+
+        // 2-D fallback: matmul straight through, no reshape.
+        let x2 = Tensor::ones((5, in_dim), DType::F32, &device).unwrap();
+        let y2 = matmul_through_lora(&x2, &down, &up).unwrap();
+        assert_eq!(y2.dims(), &[5, out_dim]);
+    }
+
+    #[test]
+    fn adapter_to_runtime_reuses_tensor_when_device_and_dtype_match() {
+        // Same device + same dtype must short-circuit the to_device /
+        // to_dtype conversions entirely. The function still clones the
+        // tensor (candle's clone is cheap — Arc bump), but it must not
+        // produce a different shape or dtype.
+        let device = Device::Cpu;
+        let t = Tensor::zeros((4, 4), DType::F32, &device).unwrap();
+        let out = adapter_to_runtime(&t, &device, DType::F32).unwrap();
+        assert_eq!(out.dims(), t.dims());
+        assert_eq!(out.dtype(), DType::F32);
+    }
+
+    #[test]
+    fn adapter_to_runtime_casts_when_dtype_differs() {
+        // Different dtype path: F32 -> BF16 conversion must run. Asserts
+        // both the dtype switch and the shape preservation.
+        let device = Device::Cpu;
+        let src = Tensor::ones((4, 4), DType::F32, &device).unwrap();
+        let out = adapter_to_runtime(&src, &device, DType::BF16).unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        assert_eq!(out.dims(), &[4, 4]);
+    }
+
+    #[test]
+    fn inner_quantized_returns_none_on_plain_variants() {
+        // inner_quantized must yield None for the BF16/F32 variants —
+        // mirror of inner()'s panic-on-quantized contract.
+        let inner = make_linear(8, 4, true);
+        let plain = LoraLinear::plain(inner.clone());
+        assert!(plain.inner_quantized().is_none());
+        let with_adapters = LoraLinear::WithAdapters {
+            inner,
+            adapters: Vec::new(),
+        };
+        assert!(with_adapters.inner_quantized().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "LoraLinear::inner() called on a Quantized variant")]
+    fn inner_panics_on_quantized_variant() {
+        // The panic in `inner()` for quantized variants is part of the
+        // contract — call sites that hold a BF16-only handle assume the
+        // unwrap happens here, not at every use. Pin it.
+        use candle_core::quantized::{GgmlDType, QTensor};
+        let device = Device::Cpu;
+        let weight = Tensor::zeros((4, 4), DType::F32, &device).unwrap();
+        let storage = QTensor::quantize(&weight, GgmlDType::F32).unwrap();
+        let inner = QuantizedLinear::new(
+            std::sync::Arc::new(storage),
+            None,
+            &Device::Cpu,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        let q = LoraLinear::quantized(inner);
+        let _ = q.inner();
+    }
+
+    /// A LoRA trained against a FUSED `gate_up` (ComfyUI's Qwen Image 2.1
+    /// layout) must land on a model that holds the halves separately as
+    /// exactly the merged fused delta would: rows `[0, h)` of `up` to the
+    /// gate, rows `[h, 2h)` to proj, `down` shared (`comfy/lora.py:331-333`).
+    #[test]
+    fn rows_targets_split_a_fused_lora_onto_separate_halves() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+
+        let (dim, hidden, rank) = (8, 6, 2);
+        let (down, up) = make_lora_pair(2 * hidden, rank, dim, 3.0);
+        let mut layers = HashMap::new();
+        layers.insert(
+            "diffusion_model.transformer_blocks.0.img_mlp.gate_up".to_string(),
+            LoraLayer {
+                a: down.clone(),
+                b: up.clone(),
+                alpha: Some(1.0),
+            },
+        );
+        let adapter = LoraAdapter::from_layers(layers, rank);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 0.8,
+        }];
+        let registry = build_registry_with(
+            &specs,
+            |key| {
+                assert!(key.ends_with("img_mlp.gate_up"));
+                Ok(vec![
+                    BypassTarget::Rows {
+                        candle_key: "gate".into(),
+                        up_rows: Some((0, hidden)),
+                        out_offset: None,
+                    },
+                    BypassTarget::Rows {
+                        candle_key: "proj".into(),
+                        up_rows: Some((hidden, hidden)),
+                        out_offset: None,
+                    },
+                ])
+            },
+            &HashMap::new(),
+            &Device::Cpu,
+            DType::F32,
+        )
+        .unwrap();
+
+        let gate = make_linear(hidden, dim, false);
+        let proj = make_linear(hidden, dim, false);
+        let x = make_input(1, 3, dim);
+        let fused_delta = x
+            .reshape((3, dim))
+            .unwrap()
+            .matmul(&down.t().unwrap())
+            .unwrap()
+            .matmul(&up.t().unwrap())
+            .unwrap()
+            .affine(0.8 / rank as f64, 0.0)
+            .unwrap()
+            .reshape((1, 3, 2 * hidden))
+            .unwrap();
+        for (key, base, offset) in [("gate", &gate, 0), ("proj", &proj, hidden)] {
+            let stack = registry.adapters_for(key);
+            assert_eq!(stack.len(), 1, "{key} gets one half");
+            assert!(stack[0].fused_slice.is_none());
+            assert!((stack[0].scale - 0.4).abs() < 1e-7, "alpha/rank folds in");
+            let out = apply_adapters(stack, &x, base.forward(&x).unwrap()).unwrap();
+            let expected = (base.forward(&x).unwrap()
+                + fused_delta.narrow(2, offset, hidden).unwrap())
+            .unwrap();
+            assert!(max_abs_diff(&out, &expected) < 1e-5, "{key} half diverged");
+        }
+    }
+
+    /// The reverse mismatch: a split LoRA (`gate_layer`, `proj`) landing on a
+    /// fused linear writes only its own half of the output.
+    #[test]
+    fn rows_targets_place_a_split_lora_on_its_half_of_a_fused_linear() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+
+        let (dim, hidden, rank) = (8, 4, 2);
+        let (down, up) = make_lora_pair(hidden, rank, dim, 9.0);
+        let mut layers = HashMap::new();
+        layers.insert(
+            "transformer_blocks.0.img_mlp.proj".to_string(),
+            LoraLayer {
+                a: down,
+                b: up,
+                alpha: None,
+            },
+        );
+        let adapter = LoraAdapter::from_layers(layers, rank);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 1.0,
+        }];
+        let mut dims = HashMap::new();
+        dims.insert("gate_up".to_string(), 2 * hidden);
+        let registry = build_registry_with(
+            &specs,
+            |_| {
+                Ok(vec![BypassTarget::Rows {
+                    candle_key: "gate_up".into(),
+                    up_rows: None,
+                    out_offset: Some(hidden),
+                }])
+            },
+            &dims,
+            &Device::Cpu,
+            DType::F32,
+        )
+        .unwrap();
+        let stack = registry.adapters_for("gate_up");
+        assert_eq!(
+            stack[0].fused_slice,
+            Some(FusedSlice {
+                offset: hidden,
+                length: hidden
+            })
+        );
+        let fused = make_linear(2 * hidden, dim, false);
+        let x = make_input(1, 2, dim);
+        let base = fused.forward(&x).unwrap();
+        let out = apply_adapters(stack, &x, base.clone()).unwrap();
+        assert!(
+            max_abs_diff(
+                &out.narrow(2, 0, hidden).unwrap(),
+                &base.narrow(2, 0, hidden).unwrap()
+            ) == 0.0,
+            "the gate half is untouched by a proj LoRA"
+        );
+        assert!(max_abs_diff(&out, &base) > 0.0, "the proj half moved");
+    }
+
+    /// A mapper refusal aborts the build rather than adapting nothing, and an
+    /// out-of-range row request is an error rather than a panic.
+    #[test]
+    fn mapper_errors_and_bad_rows_abort_the_build() {
+        use crate::flux::lora::LoraSpec;
+        use crate::lora::{LoraAdapter, LoraLayer};
+
+        let (down, up) = make_lora_pair(4, 2, 8, 1.0);
+        let mut layers = HashMap::new();
+        layers.insert(
+            "k".to_string(),
+            LoraLayer {
+                a: down,
+                b: up,
+                alpha: None,
+            },
+        );
+        let adapter = LoraAdapter::from_layers(layers, 2);
+        let specs = [LoraSpec {
+            adapter: &adapter,
+            scale: 1.0,
+        }];
+        let refused = build_registry_with(
+            &specs,
+            |_| anyhow::bail!("wrong family"),
+            &HashMap::new(),
+            &Device::Cpu,
+            DType::F32,
+        );
+        assert!(refused.unwrap_err().to_string().contains("wrong family"));
+        let out_of_range = build_registry_with(
+            &specs,
+            |_| {
+                Ok(vec![BypassTarget::Rows {
+                    candle_key: "x".into(),
+                    up_rows: Some((2, 4)),
+                    out_offset: None,
+                }])
+            },
+            &HashMap::new(),
+            &Device::Cpu,
+            DType::F32,
+        );
+        assert!(out_of_range.is_err());
+    }
+}

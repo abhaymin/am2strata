@@ -1,0 +1,81 @@
+[package]
+name = "mold-ai-candle"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND Apache-2.0 AND BSD-3-Clause"
+repository.workspace = true
+rust-version.workspace = true
+description = "Mold-owned models and extension operations for upstream Candle"
+
+[lib]
+name = "mold_candle"
+
+[features]
+default = []
+# Developer-only binaries. Never forwarded by a shipping surface, so
+# `[[bin]] required-features` keeps them out of every default build.
+dev-bins = []
+cuda = ["candle/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+# See the note on `cudnn` in mold-inference: opt-in, never implied by `cuda`.
+cudnn = ["cuda", "candle/cudnn"]
+metal = ["candle/metal", "candle-nn/metal", "candle-transformers/metal"]
+# H3-only release-candidate qualification path. This compiles the reviewed
+# FlashAttention v2 primitive without making it reachable from the Mold CLI,
+# server factory, catalog, downloads, or any published artifact.
+h3-flash-attn-rc = ["dep:candle-flash-attn", "cuda"]
+# Shipping MiniMax H3 runtime. Device-agnostic on purpose (#1164): the CUDA
+# route additionally needs `h3-flash-attn-rc`, which a CUDA build enables
+# alongside `cuda`, while a macOS build enables `h3` + `metal` and takes the
+# chunked dense correctness route. Making `h3` imply `cuda` made an Apple
+# Silicon H3 build impossible to express at all. Qualification-only observers
+# and capture adapters remain on `h3-private-uat`.
+h3 = []
+# Development-only visibility for the authorization-bound H3 artifact runtime.
+# No Mold shipping surface forwards this feature.
+h3-private-uat = []
+# Mold's existing developer-only global attention benchmark remains a separate
+# switch. In particular, H3 qualification must not change Visual VAE Auto
+# dispatch or any other non-DiT attention path. Shipping builds omit both.
+flash-attn = ["dep:candle-flash-attn", "cuda"]
+
+[dependencies]
+candle = { package = "candle-core-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-nn = { package = "candle-nn-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-transformers = { package = "candle-transformers-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+half = "2"
+# Already in the lock file through candle-core at exactly this version, so the
+# Nix vendor set gains nothing. It MUST stay the version candle resolves to:
+# two copies of `Mmap` would be two distinct types across the seam.
+memmap2 = { version = "0.9.3", features = ["stable_deref_trait"] }
+# Already vendored transitively through candle-core, so this adds no new crates
+# to the Nix vendor set. `float8` must resolve to the same version candle uses
+# or `F8E4M3` would be a different type than its tensors hold.
+float8 = "0.7"
+# Must come from the SAME fork revision as `candle`/`candle-nn`/
+# `candle-transformers` above. crates.io's `candle-flash-attn` depends on the
+# upstream-named `candle-core`, so pinning it there puts two nominally
+# distinct `Tensor`/`Error` types in one CUDA graph and every `flash_attn`
+# call site stops typechecking (#1399). The fork's payload at this revision is
+# upstream 0.11.0 with only that package rename applied, so the H3 runtime
+# fingerprint still qualifies the exact kernel it always did.
+candle-flash-attn = { git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cudaforge = "=0.1.6"
+
+[[bin]]
+name = "gguf_load_bench"
+path = "src/bin/gguf_load_bench.rs"
+required-features = ["dev-bins", "cuda"]

@@ -1,0 +1,323 @@
+# Third-Party Notices
+
+The opt-in paint VAE numerical blocks derive from Diffusers v0.30.0 and follow
+PyTorch v2.5.1 CUDA normalization/activation semantics and layout-dependent
+linear bias rounding. Attribution and full
+license locations are recorded in `crates/mold-candle/THIRD_PARTY_NOTICES.md`.
+
+## Candle shared Stable Diffusion VAE
+
+`crates/mold-candle/src/stable_diffusion/vae.rs` is adapted from
+`candle-transformers/src/models/stable_diffusion/vae.rs` at utensils/candle
+revision `bedc287458e0d890dd6ed1c298c99e991e066fe1`. It retains the encoder,
+decoder and default posterior behavior and adds explicit posterior moments,
+optional variance bounds and caller-supplied noise. SD1.5, SDXL, SD3 and the
+Hunyuan3D paint port share this application-owned model. This copy uses Candle's
+MIT licence option, retained in `crates/mold-candle/LICENSE-CANDLE-MIT`.
+
+## FerrisMind/candle-video (LTX-Video port)
+
+Mold's legacy LTX-Video transformer, 3D causal video VAE, and flow-match Euler
+scheduler in `crates/mold-candle/src/ltx_video/` (`transformer.rs`, `vae.rs`,
+`sampling.rs`) were ported from
+[candle-video](https://github.com/FerrisMind/candle-video) by FerrisMind,
+`src/models/ltx_video/{ltx_transformer,vae,scheduler}.rs`, as of upstream
+commit `d7208cbbb07a8bb3bf286ffa447616335eecd2e5` (the tip when mold's port
+landed on 2026-04-04). candle-video is itself a Rust port of the Hugging Face
+[diffusers](https://github.com/huggingface/diffusers) LTX-Video implementation
+(`transformer_ltx.py`, `autoencoder_kl_ltx.py`,
+`scheduling_flow_match_euler_discrete.py`), which is also Apache-2.0. The LTX-2
+video transformer and video VAE in
+`crates/mold-inference/src/ltx2/model/{video_transformer,video_vae}.rs` were
+adapted from mold's copy and retain portions of that code.
+
+    Copyright 2025 FerrisMind
+
+candle-video is licensed under the Apache License, Version 2.0
+(<https://github.com/FerrisMind/candle-video/blob/main/LICENSE>). Mold's copies
+retain attribution, identify their changes in each file header (standalone
+models without the upstream pipeline traits, flash-attn gates and debug output
+removed, LTX-2 positional-embedding and config changes), and are distributed
+under Apache-2.0 alongside Mold's MIT license; the complete license text is
+included in `crates/mold-candle/LICENSE-APACHE-2.0` and
+`crates/mold-inference/LICENSE-APACHE-2.0`, and ships in both published crates
+(`mold-ai-candle`, `mold-ai-inference`). Mold's own LTX-Video pipeline, single-file loaders,
+latent upsampler, and the rest of the LTX-2 runtime are original work.
+
+## comfy-kitchen INT8 CUDA reference
+
+The MiniMax H3 native INT8 CUDA kernels and cuBLASLt operation layout are
+adapted from comfy-kitchen 0.2.26, commit
+`255a43879fe57bbcbecfdb273b46d772b00c5a90`, specifically
+`backends/cuda/ops/int8_linear.cu` and
+`backends/cuda/ops/cublas_gemm_int8.cu`.
+
+    Copyright (c) 2025 Comfy Org. All rights reserved.
+    Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Those sources are licensed under the Apache License, Version 2.0. Mold's copy
+retains attribution and identifies its changes; the complete license text is
+included in `crates/mold-candle/LICENSE-APACHE-2.0` and in the published
+`mold-ai-candle` crate.
+
+## Pillow image resampling algorithm
+
+The shared pure-Rust resampler in `crates/mold-inference/src/pillow_resize.rs`
+independently expresses the numeric behavior of Pillow's U8 LANCZOS and BICUBIC
+resamplers, used by MiniMax H3 and Hunyuan3D paint preprocessing. The reference is Pillow
+12.3.0, commit `bb1d8e8ab8d29048624d96e3ee53cecf7c13d13d`,
+`src/libImaging/Resample.c`. No Pillow source file or C implementation is
+vendored in Mold.
+
+The Python Imaging Library (PIL) is
+
+    Copyright © 1997-2011 by Secret Labs AB
+    Copyright © 1995-2011 by Fredrik Lundh and contributors
+
+Pillow is the friendly PIL fork. It is
+
+    Copyright © 2010 by Jeffrey 'Alex' Clark and contributors
+
+Like PIL, Pillow is licensed under the open source MIT-CMU License:
+
+By obtaining, using, and/or copying this software and/or its associated
+documentation, you agree that you have read, understood, and will comply
+with the following terms and conditions:
+
+Permission to use, copy, modify and distribute this software and its
+documentation for any purpose and without fee is hereby granted,
+provided that the above copyright notice appears in all copies, and that
+both that copyright notice and this permission notice appear in supporting
+documentation, and that the name of Secret Labs AB or the author not be
+used in advertising or publicity pertaining to distribution of the software
+without specific, written prior permission.
+
+SECRET LABS AB AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS
+SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS.
+IN NO EVENT SHALL SECRET LABS AB OR THE AUTHOR BE LIABLE FOR ANY SPECIAL,
+INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE
+OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+## U²-Net background matting
+
+The Hunyuan3D background-matting stage is a pure Rust/Candle implementation of
+the U²-Net architecture from `xuebinqin/U-2-Net`, pinned at commit
+`ac7e1c817ecab7c7dff5ce6b1abba61cd213ff29`. Its preprocessing and mask
+normalization follow `danielgatis/rembg`, pinned at commit
+`030a9ed79dbfcf8c58a1dc15a8dca3ccd2355709`. U²-Net is Apache-2.0 licensed;
+rembg is MIT licensed. Mold downloads the ONNX weights and does not vendor
+either upstream project's source.
+
+## torchaudio sinc resampling algorithm
+
+The pure-Rust MiniMax H3 reference-audio resampler in
+`crates/mold-inference/src/reference_media.rs` independently expresses the
+numeric behavior of torchaudio's default Hann-windowed sinc resampler. The
+reference is torchaudio 2.8.0, commit
+`6e1c7fe9ff6d82b8665d0a46d859d3357d2ebaaa`,
+`src/torchaudio/functional/functional.py`. No torchaudio source file or Python
+implementation is vendored in Mold.
+
+torchaudio is licensed under the BSD 2-Clause License:
+
+    Copyright (c) 2017 Facebook Inc. (Soumith Chintala),
+    All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## PuLID (identity conditioning)
+
+Mold's PuLID identity conditioning follows
+[PuLID](https://github.com/ToTheBeginning/PuLID) by ByteDance as its reference
+implementation, and pulls two published adapters from the same Hugging Face
+repository `guozinan/PuLID`: `pulid_flux_v0.9.1.safetensors` for FLUX (the
+`pulid-flux` bundle) and `pulid_v1.1.safetensors` for SDXL (the `pulid-sdxl`
+bundle). No PuLID source file is vendored in Mold; both ports are original
+Rust against candle.
+
+PuLID is licensed under the Apache License, Version 2.0
+(<https://github.com/ToTheBeginning/PuLID/blob/main/LICENSE>).
+
+    Copyright 2024 ByteDance Inc.
+
+## EVA-CLIP (identity vision tower)
+
+PuLID conditions on the `EVA02-CLIP-L-14-336` vision tower from
+[EVA](https://github.com/baaivision/EVA) by BAAI. Mold downloads the published
+checkpoint `EVA02_CLIP_L_336_psz14_s6B.pt` from the Hugging Face repository
+`QuanSun/EVA-CLIP` and converts it locally; no EVA source file is vendored in
+Mold.
+
+EVA and EVA-CLIP are licensed under the MIT License
+(<https://github.com/baaivision/EVA/blob/master/LICENSE>).
+
+    Copyright (c) 2022 BAAI
+
+## InsightFace antelopev2 (face detection and recognition)
+
+PuLID's identity embedding is produced by two InsightFace antelopev2 models —
+the `scrfd_10g_bnkps` face detector and the `glintr100` ArcFace recognizer.
+
+**Mold does not bundle, redistribute, or ship these files.** They are not part
+of any Mold release artifact, container image, or package. Mold downloads them
+on demand, and only after the user has explicitly recorded acceptance of the
+InsightFace model license:
+
+    mold pull pulid-flux --accept-license insightface-antelopev2
+    mold pull pulid-sdxl --accept-license insightface-antelopev2
+
+The acceptance is written to `$MOLD_HOME/license-acceptances.json` and covers
+both the `pulid-flux` and `pulid-sdxl` bundles, which pull the same two
+antelopev2 files. Without one, every download path — the CLI, the server's
+auto-pull, and every automatic client-driven pull — refuses before any byte is
+fetched.
+
+The terms Mold shows are pinned to an exact upstream revision:
+`deepinsight/insightface` commit `7fadd420c2351d0ffa8cac403421c1a3ed733365`,
+whose `README.md` was fetched on 2026-08-21 and verified to hash to
+`84606d9ab37a38606b12c10d96172c6343768d2ef72c802a16482e476f8baf22`. A
+commit-addressed URL is immutable, so that digest cannot go stale against its
+own source — which a `master` branch link could, leaving Mold recording consent
+for text that had since been rewritten. Each stored acceptance is bound to that
+`(url, sha256)` pair, so a Mold release that re-pins the license to a newer
+upstream revision invalidates every existing acceptance and asks again.
+Recording an acceptance is entirely offline; Mold never fetches the license
+text.
+
+[InsightFace](https://github.com/deepinsight/insightface) splits its terms. The
+InsightFace **code** is licensed under the MIT License with no usage
+limitation. The **pretrained models**, including antelopev2, are stated by the
+project to be available for **non-commercial research purposes only**, and that
+restriction applies to both manually downloaded models and models fetched
+automatically by their tooling (InsightFace `README.md`, "License").
+
+    Copyright (c) 2018-2024 InsightFace (DeepInsight)
+
+Mold's Rust face-extraction path (`crates/mold-inference/src/identity/`) is an
+independent reimplementation whose behaviour is derived from the MIT-licensed
+InsightFace **code** — `model_zoo/scrfd.py` (letterbox, anchor decode, NMS
+thresholds), `utils/face_align.py` (the `arcface_dst` template and the
+similarity fit), and `model_zoo/arcface_onnx.py` (input order and
+normalization). No InsightFace source file is vendored; each ported function
+cites the upstream file and line range it follows.
+
+Provenance of the files Mold pulls: InsightFace publishes the antelopev2 pack
+as an archive on GitHub releases and Google Drive, which Mold's Hugging
+Face-based downloader cannot address. PuLID itself resolves the pack from the
+Hugging Face mirror `DIAMONIK7777/antelopev2`
+(`pulid/pipeline_flux.py`, `snapshot_download('DIAMONIK7777/antelopev2', ...)`),
+and Mold pulls the same two files from the same mirror, pinned by SHA-256 and
+verified on download.
+
+## facexlib (face crop geometry and parsing)
+
+PuLID uses [facexlib](https://github.com/xinntao/facexlib) for two things, and
+Mold follows both.
+
+PuLID produces the 512x512 crop its vision tower conditions on with facexlib's
+`FaceRestoreHelper` (`PuLID/pulid/pipeline_flux.py:47-53`, `:145-147`). Mold
+reimplements that crop's geometry in Rust — facexlib's standard FFHQ five-point
+template and its constant grey warp border
+(`facexlib/utils/face_restoration_helper.py:73-74`, `:242-259`) — in
+`crates/mold-inference/src/identity/align.rs`. No facexlib source file is
+vendored for this step, and Mold downloads no model for it.
+
+PuLID also masks that crop before the vision tower sees it, using the BiSeNet
+face parser facexlib publishes (`pulid/pipeline_flux.py:53`, `:161-170`). Mold
+pulls the released checkpoint `parsing_bisenet.pth` as part of either the
+`pulid-flux` or the `pulid-sdxl` bundle — it is one of the four shared
+extraction files both bundles pull identically — from the Hugging Face mirror
+[`leonelhs/facexlib`](https://huggingface.co/leonelhs/facexlib) whose LFS
+object is byte-identical to facexlib's own GitHub release
+(<https://github.com/xinntao/facexlib/releases/download/v0.2.0/parsing_bisenet.pth>,
+sha256 `468e13ca13a9b43cc0881a9f99083a430e9c0a38abd935431d1c28ee94b26567`,
+53,289,463 bytes, verified 2026-08-21). Mold ports two facexlib source files
+rather than vendoring them — `facexlib/parsing/bisenet.py` and
+`facexlib/parsing/resnet.py`, as
+`crates/mold-inference/src/identity/parsing.rs`. Every ported function names
+the upstream file and line range it follows, and no facexlib source file is
+vendored anywhere in Mold, which ships no Python.
+
+Unlike the InsightFace pretrained models above, facexlib places **no**
+non-commercial restriction on its released weights: the project is MIT and its
+licence covers the repository as published. `mold pull pulid-flux` and
+`mold pull pulid-sdxl` therefore require no recorded acceptance for
+`parsing_bisenet.pth`.
+
+facexlib is licensed under the MIT License
+(<https://github.com/xinntao/facexlib/blob/master/LICENSE>).
+
+    MIT License
+
+    Copyright (c) 2020 Xintao Wang
+
+## xatlas (optional mesh UV unwrapping)
+
+The `mesh-texture` feature builds xatlas at revision
+`f700c7790aaa030e794b52ba7791a05c085faf0c`, the version used by the
+Hunyuan3D 2.1 reference's xatlas-python 0.0.9. Copyright (c) 2018–2020
+Jonathan Young, MIT licence. Sources and complete licence are retained in
+`crates/mold-inference/vendor/xatlas/`. The C ABI bridge is mold-owned code.
+No Python runtime is linked or invoked by mold.
+
+`xatlas.h` and `LICENSE` are unmodified. `xatlas.cpp` carries one mold change,
+which makes the chart-merge phase cancellable and alters no output; every hunk
+is marked `MOLD DIVERGENCE` in the source, the complete diff against the pinned
+revision is `crates/mold-inference/vendor/xatlas/mold-cancellable-merge.patch`,
+and the rationale is in that directory's `README.md`.
+
+## OpenCV Navier–Stokes texture fill
+
+`crates/mold-inference/src/hunyuan3d/paint_ns_fill.rs` ports the RGB radius-three
+branch of OpenCV 4.10.0 `modules/photo/src/inpaint.cpp`, revision
+`71d3237a093b60a27601c20e9ee6c3e52154e8b1`. It preserves fill ordering and
+rounding and adds bounds validation and cancellation. The original notice is:
+
+    For Open Source Computer Vision Library
+
+    Copyright (C) 2000, Intel Corporation, all rights reserved.
+    Third party copyrights are property of their respective icvers.
+
+    Redistribution and use in source and binary forms, with or without modification,
+    are permitted provided that the following conditions are met:
+
+    * Redistribution's of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+    * Redistribution's in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+
+    * The name of Intel Corporation may not be used to endorse or promote products
+    derived from this software without specific prior written permission.
+
+    This software is provided by the copyright holders and contributors "as is" and
+    any express or implied warranties, including, but not limited to, the implied
+    warranties of merchantability and fitness for a particular purpose are disclaimed.
+    In no event shall the Intel Corporation or contributors be liable for any direct,
+    indirect, incidental, special, exemplary, or consequential damages
+    (including, but not limited to, procurement of substitute goods or services;
+    loss of use, data, or profits; or business interruption) however caused
+    and on any theory of liability, whether in contract, strict liability,
+    or tort (including negligence or otherwise) arising in any way out of
+    the use of this software, even if advised of the possibility of such damage.

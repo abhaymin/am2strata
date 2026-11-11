@@ -1,0 +1,1809 @@
+use crate::manifest::{known_manifests, model_base_name, variant_quality_rank, visible_manifests};
+use crate::{Config, ModelDefaults, ModelInfo, ModelInfoExtended, RecommendedDimensions};
+
+/// Config-only discovery has no reviewed manifest identity to authorize a
+/// raw H3 artifact. The loader's artifact gate is intentionally less strict:
+/// registered H3 manifests must be able to open their pinned upstream files.
+/// Never use that loader permission alone to register a custom alias.
+fn config_artifact_registration_available(
+    path: &std::path::Path,
+    artifact_root: &std::path::Path,
+    family: Option<&str>,
+) -> bool {
+    crate::model_policy::require_user_artifact_activation(path, Some(artifact_root), family).is_ok()
+}
+
+/// The resolution contract `/api/models` advertises for one model.
+pub struct ResolutionDefaults {
+    pub max_pixels: Option<u64>,
+    pub max_axis_pixels: Option<u32>,
+    pub recommended_dimensions: Vec<RecommendedDimensions>,
+    pub dimension_alignment: Option<u32>,
+}
+
+/// One-release flattened compatibility view derived from the canonical
+/// profile. New code consumes `GenerationProfileSet` directly.
+pub fn resolution_defaults_from_profile(
+    profile: &crate::GenerationProfileSet,
+) -> ResolutionDefaults {
+    let Some(recipe) = profile.default_recipe() else {
+        return ResolutionDefaults {
+            max_pixels: None,
+            max_axis_pixels: None,
+            recommended_dimensions: Vec::new(),
+            dimension_alignment: None,
+        };
+    };
+    ResolutionDefaults {
+        max_pixels: Some(recipe.resolution.max_pixels),
+        max_axis_pixels: recipe.resolution.max_axis_pixels,
+        recommended_dimensions: recipe
+            .resolution
+            .aspect_groups
+            .iter()
+            .flat_map(|group| group.presets.iter())
+            .map(|preset| RecommendedDimensions {
+                width: preset.width,
+                height: preset.height,
+            })
+            .collect(),
+        dimension_alignment: Some(recipe.resolution.alignment),
+    }
+}
+
+/// Build the advertised resolution contract for a specific model.
+///
+/// Per model, not per family: an LTX-2 checkpoint that ships the spatial
+/// upsampler renders stage 1 halved and refines it over tiles, which is what
+/// lets it hold an axis past the trained RoPE span. One that does not cannot,
+/// and offering it the composed rungs would advertise a size it rejects.
+pub fn resolution_defaults(model: &str, family: &str) -> ResolutionDefaults {
+    // Route through the validator's own helpers rather than restating the
+    // rules: `/api/models` is the single source clients read, so an
+    // advertisement that disagrees with admission is a rejected request the
+    // user was told would work.
+    let composition = if family == "ltx2" {
+        crate::validation::ltx2_spatial_composition(model, None)
+    } else {
+        crate::validation::Ltx2SpatialComposition::SinglePass
+    };
+    ResolutionDefaults {
+        max_pixels: Some(crate::validation::max_pixels_for_family_composed(
+            Some(family),
+            composition,
+        )),
+        max_axis_pixels: crate::validation::max_axis_pixels_for_family_composed(
+            Some(family),
+            composition,
+        ),
+        recommended_dimensions: if family == "wan" {
+            // Wan buckets are per checkpoint (480p-only 1.3B vs 704-grid
+            // TI2V-5B); the family list would advertise sizes the selected
+            // model does not support.
+            crate::validation::wan_recommended_dimensions(model).to_vec()
+        } else {
+            crate::validation::recommended_dimensions_composed(family, composition)
+        }
+        .into_iter()
+        .map(|(width, height)| RecommendedDimensions { width, height })
+        .collect(),
+        // Per model, like the buckets above: `wan22-ti2v-5b`'s 2.2 VAE needs
+        // a 32px grid the rest of its family does not, and Studio source
+        // fitting floors to exactly this advertised value.
+        dimension_alignment: Some(crate::validation::dimension_alignment_for_model(
+            model,
+            Some(family),
+        )),
+    }
+}
+
+/// Build the user-facing model catalog from the manifest registry plus local config.
+/// Hidden manifests are excluded from the catalog (CLI list, model pickers).
+/// Whether a family's runtime can render sequence clips at all.
+///
+/// This is the same answer `mold-server`'s `sequence_support` gives; it lives
+/// here too because `/api/models` must advertise it per model, and the picker
+/// on every surface reads it instead of guessing from the checkpoint name.
+/// Wan joins on the `ltx-video` precedent, not the `ltx2` one: every wan
+/// checkpoint can render sequence clips, but only an image-conditioned one
+/// carries context across the seam (#783). What differs by checkpoint is the
+/// carryover, which `/api/models` advertises separately as `source_image` —
+/// so sequence *availability* stays a family fact while the seam options a
+/// picker may offer stay a checkpoint fact.
+/// Whether a concrete model can continue an existing clip.
+///
+/// LTX-2 extends through its latent motion carryover, so every checkpoint can.
+/// Wan has no latent motion tail: its continuation is seeded with the source
+/// clip's final frame, which a text-to-video checkpoint has no channel to
+/// accept — so wan's answer is per checkpoint, from the same `source_image`
+/// contract the chain carryover reads. An unclassified checkpoint is "unknown"
+/// and does not advertise extend.
+pub fn extend_capable_model(
+    family: &str,
+    source_image: Option<crate::types::SourceImageCapability>,
+) -> bool {
+    match family {
+        "ltx2" => true,
+        "wan" => matches!(
+            source_image,
+            Some(crate::types::SourceImageCapability::Required)
+                | Some(crate::types::SourceImageCapability::Optional)
+        ),
+        _ => false,
+    }
+}
+
+pub fn chain_capable_family(family: &str) -> bool {
+    crate::chain::model_supports_sequence("", family)
+}
+
+/// Whether a concrete model renders an audio track, when that is settled
+/// before any checkpoint is read.
+///
+/// `None` means "not settled here" — the server's header probe
+/// (`mold_inference::audio`) still owns the answer. LTX-2 is exactly that
+/// case: a runnable video checkpoint may omit the audio VAE and vocoder, so
+/// the family cannot answer for it.
+///
+/// MiniMax H3 is not a probe question. The family declares
+/// `synchronized_audio: true` with `audio_disable_supported: false`, so every
+/// H3 render carries audio and no request or checkpoint can turn it off.
+/// Deriving the row from that one declaration is what keeps `/api/models`
+/// truthful for a client that has never heard of H3 (#841) — the alternative
+/// is every surface hard-coding the family's AV behaviour from its name.
+pub fn declared_audio_capability(family: &str, model: &str) -> Option<bool> {
+    if crate::minimax_h3::is_family(family) {
+        let task = crate::minimax_h3::task_for_model(model)?;
+        return Some(crate::minimax_h3::capabilities(task).synchronized_audio);
+    }
+    None
+}
+
+/// The width/height/steps/frames a recipe pins when it is fixed authority.
+///
+/// `None` whenever the recipe leaves any of them adjustable — a preset on a
+/// dynamic canvas is a recommendation, and overriding a user's remembered
+/// size with it would be a regression, not a fix. Two recipes answer: H3's
+/// reviewed compact envelope (a bucket domain that refuses off-bucket sizes,
+/// with fixed steps and a fixed frame count) and any recipe whose `steps`
+/// control is `Fixed` — the Wan DMD ladder tiers, today. The second test is
+/// the recipe's own, not a family list: a fixed control means the RECIPE
+/// decided the number and admission refuses every other one.
+///
+/// The canvas is the RECIPE's own default, never the remembered one, even
+/// when the remembered one names a valid bucket. `recipe()` derives
+/// `recipe.defaults` from the identity and the profile HASH covers it, so a
+/// row whose canvas followed a user preference would disagree with the
+/// recipe every first-party client reads (`applyRecipeDefaults`), and making
+/// the recipe follow instead would mint a per-user profile hash — which
+/// `authenticated_h3_private_model_row` fences against, so the executable row
+/// would vanish.
+///
+/// This used to read "the only preset", which was the same rule while the
+/// reviewed envelope had exactly one bucket. It stopped being the same rule
+/// the moment a second canvas was qualified: left alone it would have
+/// returned `None` for a two-bucket recipe and silently stopped pinning the
+/// frame and step counts too — a row advertising "default 345 frames,
+/// maximum 124", which is the exact contradiction this function removes.
+fn pinned_recipe_defaults(
+    profile: &crate::GenerationProfileSet,
+    family: &str,
+    model: &str,
+) -> Option<(u32, u32, u32, Option<u32>)> {
+    // These recipes override their own `input.default_*` precisely because
+    // those arrive laundered through user `model_prefs`. Reading the recipe
+    // back here is what keeps the row and the profile — which a client reads
+    // in one response, and whose hash covers `recipe.defaults` — from
+    // disagreeing.
+    let recipe = profile.default_recipe()?;
+    let h3_compact = crate::minimax_h3::uses_reviewed_compact_envelope(family, model);
+    if !h3_compact && recipe.steps.mode != crate::ControlMode::Fixed {
+        return None;
+    }
+    let canvas = (recipe.defaults.width, recipe.defaults.height);
+    let frames = recipe
+        .temporal
+        .as_ref()
+        .map(|temporal| temporal.frames.default);
+    if h3_compact {
+        // Evidence, not trust: a recipe default that the compact rule or the
+        // family frame grid would refuse is not authority over anything.
+        if !crate::minimax_h3::is_admitted_compact_canvas(canvas.0, canvas.1) {
+            return None;
+        }
+        if frames.is_some_and(|frames| !crate::minimax_h3::valid_frame_count(frames)) {
+            return None;
+        }
+    }
+    Some((canvas.0, canvas.1, recipe.defaults.steps, frames))
+}
+
+pub fn build_model_catalog(
+    config: &Config,
+    loaded_model: Option<&str>,
+    engine_is_loaded: bool,
+) -> Vec<ModelInfoExtended> {
+    let mut models = Vec::with_capacity(known_manifests().len() + config.models.len());
+    let artifact_root = config.resolved_models_dir();
+
+    for manifest in visible_manifests().filter(|manifest| {
+        crate::require_model_acquisition(&manifest.name, Some(&manifest.family)).is_ok()
+    }) {
+        let model_cfg = config.resolved_model_config(&manifest.name);
+        let downloaded = config.manifest_model_is_downloaded(&manifest.name);
+        let (_, remaining_download_bytes) = crate::manifest::compute_download_size(manifest);
+        let disk_usage_bytes = downloaded.then(|| {
+            let (bytes, _gb) = model_cfg.disk_usage();
+            bytes
+        });
+        let default_steps = model_cfg.effective_steps(config);
+        let default_guidance = model_cfg.effective_guidance();
+        let default_width = model_cfg.effective_width(config);
+        let default_height = model_cfg.effective_height(config);
+        let default_frames = model_cfg.effective_frames();
+        let default_fps = model_cfg.effective_fps();
+        let default_negative_prompt =
+            crate::manifest::default_negative_prompt_for_family(&manifest.family)
+                .map(str::to_string);
+        let supports_extend =
+            extend_capable_model(&manifest.family, manifest.defaults.source_image);
+        let supports_sequence =
+            crate::chain::model_supports_sequence(&manifest.name, &manifest.family);
+        let generation_profile = crate::generation_profile_for_manifest_with_defaults(
+            manifest,
+            crate::GenerationDefaultsProfile {
+                width: default_width,
+                height: default_height,
+                steps: default_steps,
+                guidance: default_guidance,
+                frames: default_frames,
+                fps: default_fps,
+                negative_prompt: default_negative_prompt.clone(),
+            },
+        );
+        let resolution = resolution_defaults_from_profile(&generation_profile);
+        // A recipe whose controls are fixed authority owns its own defaults.
+        // Everything above is laundered through user `model_prefs`, so an
+        // entry written when H3's compact tags still advertised the official
+        // ladder would otherwise ship a row saying "default 345 frames,
+        // maximum 124" — and first-party clients seed their forms from the
+        // default, not the maximum, which is the request the runtime then
+        // refuses. `recipe()` already forces these for the compact envelope;
+        // this reads them back rather than restating the rule.
+        let (default_width, default_height, default_steps, default_frames) =
+            pinned_recipe_defaults(&generation_profile, &manifest.family, &manifest.name)
+                .unwrap_or((default_width, default_height, default_steps, default_frames));
+
+        // `minimax_h3::model_runtime_availability` is the same authority
+        // `model_activation` consults before generation, so a row can never
+        // advertise runnable while the route refuses it — and, since #1276,
+        // it answers the whole question rather than only the layout half:
+        // Ref2VA has no qualified route on any released build, and only the
+        // sm89 recipe compiles the engine at all. Scoped to H3: no other
+        // family has a pinned identity it cannot execute, and `None` keeps
+        // every other row byte-identical on the wire.
+        let h3_runtime = crate::minimax_h3::is_family(&manifest.family)
+            .then(|| crate::minimax_h3::model_runtime_availability(&manifest.name));
+
+        let presentation = crate::model_presentation::presentation(manifest);
+        models.push(ModelInfoExtended {
+            downloaded,
+            supports_duration_prediction: None,
+            runtime_ready: None,
+            runtime_readiness_error: None,
+            runtime_available: h3_runtime.map(crate::minimax_h3::RuntimeAvailability::is_available),
+            runtime_unavailable_reason: h3_runtime
+                .and_then(crate::minimax_h3::RuntimeAvailability::reason)
+                .map(|reason| reason.message().to_string()),
+            defaults: ModelDefaults {
+                default_steps,
+                default_guidance,
+                default_width,
+                default_height,
+                default_frames,
+                default_fps,
+                min_frames: crate::validation::min_frames_for_model(
+                    &manifest.family,
+                    &manifest.name,
+                ),
+                max_frames: crate::validation::max_frames_for_model_at_fps(
+                    &manifest.family,
+                    &manifest.name,
+                    model_cfg
+                        .effective_fps()
+                        .unwrap_or(crate::validation::LTX2_DEFAULT_FPS),
+                ),
+                max_runtime_seconds: crate::validation::max_runtime_seconds_for_family(
+                    &manifest.family,
+                ),
+                max_frames_absolute: crate::validation::max_frames_absolute_for_model(
+                    &manifest.family,
+                    &manifest.name,
+                ),
+                frame_step: crate::validation::frame_step_for_family(&manifest.family),
+                frame_offset: crate::validation::frame_offset_for_family(&manifest.family),
+                // Strictly the engine-applied absence fallback (wan). NOT
+                // `manifest.defaults.negative_prompt`: wuerstchen's manifest
+                // carries a CLI-layer default the server never substitutes,
+                // and advertising it would promise behavior an HTTP request
+                // does not get.
+                default_negative_prompt,
+                max_pixels: resolution.max_pixels,
+                max_axis_pixels: resolution.max_axis_pixels,
+                recommended_dimensions: resolution.recommended_dimensions,
+                dimension_alignment: resolution.dimension_alignment,
+                description: model_cfg
+                    .description
+                    .unwrap_or_else(|| manifest.name.clone()),
+            },
+            info: ModelInfo {
+                name: manifest.name.clone(),
+                family: manifest.family.clone(),
+                size_gb: manifest.model_size_gb(),
+                is_loaded: loaded_model
+                    .is_some_and(|name| engine_is_loaded && name == manifest.name),
+                last_used: None,
+                // Sharded checkpoints (e.g. qwen-image:bf16) carry their
+                // weights as TransformerShard files — without the fallback
+                // they'd report no repo and lose their source mark and
+                // model-page link in clients.
+                hf_repo: manifest
+                    .files
+                    .iter()
+                    .find(|f| f.component == crate::manifest::ModelComponent::Transformer)
+                    .or_else(|| {
+                        manifest.files.iter().find(|f| {
+                            f.component == crate::manifest::ModelComponent::TransformerShard
+                        })
+                    })
+                    .map(|f| f.hf_repo.clone())
+                    .unwrap_or_default(),
+            },
+            disk_usage_bytes,
+            remaining_download_bytes: Some(remaining_download_bytes),
+            display_name: Some(presentation.display_name()),
+            title: Some(presentation.title.clone()),
+            variant: presentation.variant.clone(),
+            summary: presentation.summary.clone(),
+            family_label: presentation.family_label.clone(),
+            kind: None,
+            modality: None,
+            nsfw: None,
+            // Settled only where the family itself declares it (H3). LTX-2
+            // and everything else stay `None` so the server's checkpoint
+            // probe remains the authority.
+            supports_audio: declared_audio_capability(&manifest.family, &manifest.name),
+            // One authority: the profile this entry already advertises.
+            supports_identity: Some(generation_profile.supports_identity()),
+            // Wan continues a clip the way its chain seam does — the source's
+            // final frame becomes image conditioning — so only an
+            // image-conditioned checkpoint can extend. `source_image` is that
+            // classification (#783).
+            supports_extend: Some(supports_extend),
+            supports_sequence: Some(supports_sequence),
+            // Per family, because the overlap a continuation defaults to is
+            // its carryover: LTX-2 re-encodes a 17-frame latent motion tail,
+            // wan re-renders the one frame it was seeded with (#783).
+            extend_default_overlap_frames: Some(
+                crate::validation::default_extend_overlap_frames_for_family(Some(&manifest.family)),
+            ),
+            guidance_capabilities: Some(crate::GuidanceCapabilities::for_recipe(
+                &manifest.family,
+                &manifest.name,
+                None,
+            )),
+            // Recorded where the manifest was built — the one place that
+            // structurally knows the task (#772). Cold tiers advertise
+            // correctly before any file exists.
+            source_image: manifest.defaults.source_image,
+            generation_profile: Some(generation_profile),
+        });
+    }
+
+    let mut config_only: Vec<_> = config
+        .models
+        .iter()
+        .filter(|(name, model_cfg)| {
+            crate::manifest::find_manifest(name).is_none()
+                && crate::require_model_activation(name, model_cfg.family.as_deref()).is_ok()
+                && model_cfg.all_file_paths().iter().all(|path| {
+                    config_artifact_registration_available(
+                        std::path::Path::new(path),
+                        &artifact_root,
+                        model_cfg.family.as_deref(),
+                    )
+                })
+        })
+        .collect();
+    config_only.sort_by_key(|(name, _)| *name);
+
+    for (name, model_cfg) in config_only {
+        let (disk_usage_bytes, size_gb_f64) = model_cfg.disk_usage();
+        let size_gb = size_gb_f64 as f32;
+        // A path-only custom model has no architecture identity. Treating it
+        // as FLUX made every client advertise FLUX controls and presets even
+        // though neither admission nor the engine had established that fact.
+        let family = model_cfg
+            .family
+            .clone()
+            .unwrap_or_else(|| "custom".to_string());
+        let has_profile_identity = model_cfg.family.is_some();
+        let sequence_capable = crate::chain::model_supports_sequence(name, &family);
+        // Config-only models have local weights but no manifest task
+        // structure, so checkpoint-dependent conditioning stays unknown for
+        // the server's header probe. Legacy LTX-Video is the exception: the
+        // engine itself has no source-image path, so the family resolves to
+        // Unsupported even without manifest metadata. Never infer support —
+        // `extend_capable_model` is the one authority, and it answers `false`
+        // for an unclassified wan checkpoint rather than promising a
+        // continuation a text-to-video export cannot accept (#783).
+        let source_image_contract =
+            crate::validation::source_image_capability_for_engine(Some(&family), None);
+        let guidance_identity = format!(
+            "{} {}",
+            name,
+            model_cfg.description.as_deref().unwrap_or_default()
+        );
+        let default_steps = model_cfg.default_steps.unwrap_or(if has_profile_identity {
+            config.default_steps
+        } else {
+            20
+        });
+        let default_guidance = model_cfg
+            .default_guidance
+            .unwrap_or(if has_profile_identity {
+                model_cfg.effective_guidance()
+            } else {
+                7.5
+            });
+        let default_width = model_cfg.default_width.unwrap_or(if has_profile_identity {
+            config.default_width
+        } else {
+            512
+        });
+        let default_height = model_cfg.default_height.unwrap_or(if has_profile_identity {
+            config.default_height
+        } else {
+            512
+        });
+        let default_frames = model_cfg.effective_frames();
+        let default_fps = model_cfg.effective_fps();
+        let default_negative_prompt =
+            crate::manifest::default_negative_prompt_for_family(&family).map(str::to_string);
+        let generation_profile = crate::resolve_generation_profile(crate::GenerationProfileInput {
+            model: name,
+            family: &family,
+            sub_family: None,
+            default_width,
+            default_height,
+            default_steps,
+            default_guidance,
+            default_frames,
+            default_fps,
+            default_negative_prompt: default_negative_prompt.clone(),
+            source_image: None,
+            supports_sequence: sequence_capable,
+            supports_extend: extend_capable_model(&family, source_image_contract),
+            // Same authority as the row below. A config-only entry can reach
+            // this branch for a reviewed H3 id that `find_manifest` missed
+            // (policy matches the id case-insensitively, the manifest lookup
+            // does not), and a recipe saying `false` beside a row saying
+            // `true` is worse than either alone: a client may let the profile
+            // win.
+            supports_audio: declared_audio_capability(&family, name).unwrap_or(family == "ltx2"),
+        });
+        let resolution = resolution_defaults_from_profile(&generation_profile);
+        // Same authority as the manifest branch above: a config-only entry
+        // reaches here for a reviewed H3 id that `find_manifest` missed, and
+        // narrowing its ceiling while leaving a remembered 345-frame default
+        // in place rebuilds the exact contradiction this fix removes.
+        let (default_width, default_height, default_steps, default_frames) =
+            pinned_recipe_defaults(&generation_profile, &family, name).unwrap_or((
+                default_width,
+                default_height,
+                default_steps,
+                default_frames,
+            ));
+
+        models.push(ModelInfoExtended {
+            downloaded: true,
+            supports_duration_prediction: None,
+            runtime_ready: None,
+            runtime_readiness_error: None,
+            // Catalog-installed `cv:`/`hf:` rows are never H3 manifest
+            // identities; H3 is manifest-pinned only.
+            runtime_available: None,
+            runtime_unavailable_reason: None,
+            defaults: ModelDefaults {
+                default_steps,
+                default_guidance,
+                default_width,
+                default_height,
+                default_frames,
+                default_fps,
+                min_frames: crate::validation::min_frames_for_model(&family, name),
+                max_frames: crate::validation::max_frames_for_model_at_fps(
+                    &family,
+                    name,
+                    model_cfg
+                        .effective_fps()
+                        .unwrap_or(crate::validation::LTX2_DEFAULT_FPS),
+                ),
+                max_runtime_seconds: crate::validation::max_runtime_seconds_for_family(&family),
+                max_frames_absolute: crate::validation::max_frames_absolute_for_model(
+                    &family, name,
+                ),
+                frame_step: crate::validation::frame_step_for_family(&family),
+                frame_offset: crate::validation::frame_offset_for_family(&family),
+                default_negative_prompt,
+                max_pixels: resolution.max_pixels,
+                max_axis_pixels: resolution.max_axis_pixels,
+                recommended_dimensions: resolution.recommended_dimensions,
+                dimension_alignment: resolution.dimension_alignment,
+                description: model_cfg
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| name.clone()),
+            },
+            info: ModelInfo {
+                name: name.clone(),
+                family: family.clone(),
+                size_gb,
+                is_loaded: loaded_model.is_some_and(|loaded| engine_is_loaded && loaded == name),
+                last_used: None,
+                hf_repo: String::new(),
+            },
+            disk_usage_bytes: Some(disk_usage_bytes),
+            remaining_download_bytes: None,
+            display_name: None,
+            title: None,
+            variant: None,
+            summary: None,
+            family_label: None,
+            kind: None,
+            modality: None,
+            nsfw: None,
+            supports_audio: declared_audio_capability(&family, name),
+            // One authority: the profile this entry already advertises.
+            supports_identity: Some(generation_profile.supports_identity()),
+            supports_extend: Some(extend_capable_model(&family, source_image_contract)),
+            supports_sequence: Some(sequence_capable),
+            extend_default_overlap_frames: Some(
+                crate::validation::default_extend_overlap_frames_for_family(Some(&family)),
+            ),
+            guidance_capabilities: Some(crate::GuidanceCapabilities::for_recipe(
+                &family,
+                &guidance_identity,
+                None,
+            )),
+            // Config-only checkpoint-dependent models are refined by the
+            // server probe. Engine-wide limitations are already concrete.
+            source_image: source_image_contract,
+            generation_profile: Some(generation_profile),
+        });
+    }
+
+    // Sort variants within each model family by quality (bf16 > fp16 > fp8 > q8 > q6 > q5 > q4 > q3).
+    // Preserve the manifest-defined order for different base model names.
+    sort_models_by_variant_quality(&mut models);
+
+    models
+}
+
+/// Apply a concrete binary's delivery encoders to every catalog profile.
+pub fn qualify_catalog_generation_delivery(
+    catalog: &mut [ModelInfoExtended],
+    delivery: crate::GenerationDeliveryCapabilities,
+) {
+    for entry in catalog {
+        if let Some(profile) = &mut entry.generation_profile {
+            crate::qualify_generation_profile_delivery(profile, delivery);
+        }
+    }
+}
+
+/// Sort models so variants of the same base name are grouped together,
+/// ordered by quality rank (best first). Different base names keep their
+/// original relative order (stable sort).
+fn sort_models_by_variant_quality(models: &mut [ModelInfoExtended]) {
+    // Assign each base name a sequence number based on its first appearance.
+    let mut base_order: Vec<String> = Vec::new();
+    for m in models.iter() {
+        let base = model_base_name(&m.name).to_string();
+        if !base_order.contains(&base) {
+            base_order.push(base);
+        }
+    }
+
+    models.sort_by(|a, b| {
+        let base_a = model_base_name(&a.name);
+        let base_b = model_base_name(&b.name);
+        let ord_a = base_order
+            .iter()
+            .position(|s| s == base_a)
+            .unwrap_or(usize::MAX);
+        let ord_b = base_order
+            .iter()
+            .position(|s| s == base_b)
+            .unwrap_or(usize::MAX);
+
+        ord_a
+            .cmp(&ord_b)
+            .then_with(|| variant_quality_rank(&a.name).cmp(&variant_quality_rank(&b.name)))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn curated_catalog_publishes_short_stable_titles() {
+        let rows = super::build_model_catalog(&crate::Config::default(), None, false);
+        let row = rows.iter().find(|row| row.name == "flux-dev:q4").unwrap();
+        assert_eq!(row.display_name.as_deref(), Some("FLUX.1 Dev Q4"));
+        assert_eq!(row.human_name(), "FLUX.1 Dev Q4");
+        assert_eq!(row.name, "flux-dev:q4");
+        for (id, title) in [
+            ("flux2-dev:bf16", "FLUX.2 Dev BF16"),
+            (
+                "qwen-image-lightning:fp8",
+                "Qwen Image 2512 Lightning 4-step FP8",
+            ),
+            (
+                "qwen-image-lightning:fp8-8step",
+                "Qwen Image 2512 Lightning 8-step FP8",
+            ),
+            ("qwen-image-2.1:q8", "Qwen Image 2.1 Q8_0"),
+            ("qwen-image-2.1-turbo:q8", "Qwen Image 2.1 Turbo Q8_0"),
+            ("ltx-2.5-22b-dev:bf16-conv", "LTX-2.5 22B Dev Conv VAE BF16"),
+        ] {
+            assert_eq!(
+                crate::manifest::model_display_name(id).as_deref(),
+                Some(title),
+                "{id}"
+            );
+        }
+        assert!(crate::manifest::model_display_name("cv:1759168").is_none());
+        let mut seen = std::collections::HashMap::new();
+        for row in &rows {
+            if let Some(title) = &row.display_name {
+                assert!(!title.trim().is_empty(), "empty title for {}", row.name);
+                if let Some(previous) = seen.insert(title, &row.name) {
+                    panic!("duplicate title {title}: {previous}, {}", row.name);
+                }
+            }
+        }
+    }
+
+    /// Every reviewed-compact H3 row must advertise exactly the envelope its
+    /// own generation profile pins. The two are read by the same client in
+    /// the same response, so a row that offers 345 frames beside a profile
+    /// that fixes 124 is a slider the user can move into a guaranteed
+    /// refusal. This caught `max_frames_for_family_at_fps` answering the
+    /// official BF16 ladder for a compact identity, because it discriminates
+    /// on family and the envelope is a property of the layout.
+    /// A remembered preference must not survive into a row whose recipe is
+    /// fixed authority. `model_prefs` entries written before the compact tags
+    /// were pinned can hold the official ladder's 345 frames and a canvas the
+    /// engine refuses; clients seed their forms from `default_*`, not from the
+    /// ceilings, so a stale default is a request that is guaranteed to fail
+    /// however correct the maximum beside it is.
+    #[test]
+    fn a_stale_model_pref_cannot_reach_a_compact_h3_row() {
+        let mut config = crate::Config::default();
+        config.models.insert(
+            crate::minimax_h3::FL2VA_COMFY.to_string(),
+            crate::config::ModelConfig {
+                default_frames: Some(345),
+                default_width: Some(768),
+                default_height: Some(768),
+                default_steps: Some(30),
+                ..Default::default()
+            },
+        );
+
+        let catalog = super::build_model_catalog(&config, None, false);
+        let row = catalog
+            .iter()
+            .find(|row| row.info.name == crate::minimax_h3::FL2VA_COMFY)
+            .expect("the compact FL2VA row is always catalogued");
+
+        assert_eq!(row.defaults.default_frames, Some(124));
+        assert_eq!(
+            row.defaults.default_steps,
+            crate::minimax_h3::COMFY_DEFAULT_STEPS
+        );
+        // 768x768 became a reviewed bucket, but the row's default is still
+        // the RECIPE's — the profile hash covers `recipe.defaults`, so a row
+        // whose canvas followed a user preference would disagree with the
+        // recipe every client actually reads.
+        assert_eq!(row.defaults.default_width, crate::minimax_h3::DEFAULT_WIDTH);
+        assert_eq!(
+            row.defaults.default_height,
+            crate::minimax_h3::DEFAULT_HEIGHT
+        );
+
+        let mut off_envelope = crate::Config::default();
+        off_envelope.models.insert(
+            crate::minimax_h3::FL2VA_COMFY.to_string(),
+            crate::config::ModelConfig {
+                default_frames: Some(345),
+                default_width: Some(1024),
+                default_height: Some(1024),
+                default_steps: Some(30),
+                ..Default::default()
+            },
+        );
+        let healed = super::build_model_catalog(&off_envelope, None, false);
+        let healed_row = healed
+            .iter()
+            .find(|row| row.info.name == crate::minimax_h3::FL2VA_COMFY)
+            .expect("the compact FL2VA row is always catalogued");
+        assert_eq!(healed_row.defaults.default_frames, Some(124));
+        assert_eq!(
+            healed_row.defaults.default_width,
+            crate::minimax_h3::DEFAULT_WIDTH
+        );
+        assert_eq!(
+            healed_row.defaults.default_height,
+            crate::minimax_h3::DEFAULT_HEIGHT
+        );
+        assert_eq!(
+            healed_row.defaults.default_steps,
+            crate::minimax_h3::COMFY_DEFAULT_STEPS
+        );
+
+        // A dynamic-canvas family keeps honouring the same preference, so the
+        // pinning is scoped to fixed authority rather than applied to every
+        // row that happens to advertise a preset.
+        let mut flux_config = crate::Config::default();
+        flux_config.models.insert(
+            "flux-dev:q8".to_string(),
+            crate::config::ModelConfig {
+                default_width: Some(768),
+                default_height: Some(768),
+                ..Default::default()
+            },
+        );
+        let flux = super::build_model_catalog(&flux_config, None, false);
+        let flux_row = flux
+            .iter()
+            .find(|row| row.info.name == "flux-dev:q8")
+            .expect("flux-dev:q8 is always catalogued");
+        assert_eq!(flux_row.defaults.default_width, 768);
+        assert_eq!(flux_row.defaults.default_height, 768);
+    }
+
+    /// The same rule, on the family that proved it is not H3's: a Wan DMD
+    /// ladder tier fixes its step count at the rung count, so a `model_prefs`
+    /// entry naming 20 steps must not reach the row. Clients seed their forms
+    /// from `default_steps`, and admission refuses anything but the rung
+    /// count — a laundered 20 there is a guaranteed 422.
+    #[test]
+    fn a_stale_model_pref_cannot_reach_a_fixed_step_wan_row() {
+        for tier in ["wan21-t2v-1.3b:turbo", "wan22-ti2v-5b:dmd"] {
+            let ladder = crate::manifest::wan_dmd_ladder(tier).expect("tier is laddered");
+            let mut config = crate::Config::default();
+            config.models.insert(
+                tier.to_string(),
+                crate::config::ModelConfig {
+                    default_steps: Some(20),
+                    ..Default::default()
+                },
+            );
+
+            let catalog = super::build_model_catalog(&config, None, false);
+            let row = catalog
+                .iter()
+                .find(|row| row.info.name == tier)
+                .expect("every DMD row is always catalogued");
+            assert_eq!(
+                row.defaults.default_steps,
+                ladder.rungs.len() as u32,
+                "{tier}"
+            );
+        }
+
+        // The base tier's steps stay adjustable, so its preference survives.
+        let mut base_config = crate::Config::default();
+        base_config.models.insert(
+            "wan21-t2v-1.3b:bf16".to_string(),
+            crate::config::ModelConfig {
+                default_steps: Some(20),
+                ..Default::default()
+            },
+        );
+        let base = super::build_model_catalog(&base_config, None, false);
+        let base_row = base
+            .iter()
+            .find(|row| row.info.name == "wan21-t2v-1.3b:bf16")
+            .expect("the base tier is always catalogued");
+        assert_eq!(base_row.defaults.default_steps, 20);
+    }
+
+    #[test]
+    fn compact_h3_rows_advertise_their_own_profile_envelope() {
+        let config = crate::Config::default();
+        let catalog = super::build_model_catalog(&config, None, false);
+        let mut checked = 0usize;
+        for row in &catalog {
+            if !crate::minimax_h3::uses_reviewed_compact_envelope(&row.info.family, &row.info.name)
+            {
+                continue;
+            }
+            let profile = crate::generation_profile_for_manifest_with_defaults(
+                crate::manifest::find_manifest(&row.info.name)
+                    .expect("every compact H3 row has a built-in manifest"),
+                crate::GenerationDefaultsProfile {
+                    width: row.defaults.default_width,
+                    height: row.defaults.default_height,
+                    steps: row.defaults.default_steps,
+                    guidance: row.defaults.default_guidance,
+                    frames: row.defaults.default_frames,
+                    fps: row.defaults.default_fps,
+                    negative_prompt: None,
+                },
+            );
+            let recipe = profile
+                .default_recipe()
+                .expect("every H3 profile has a default recipe");
+            let frames = recipe
+                .temporal
+                .as_ref()
+                .map(|temporal| &temporal.frames)
+                .expect("every H3 recipe carries a temporal block");
+            assert_eq!(
+                row.defaults.max_frames,
+                Some(frames.max),
+                "{} row max_frames disagrees with its profile",
+                row.info.name
+            );
+            assert_eq!(
+                row.defaults.max_frames_absolute,
+                Some(frames.max),
+                "{} row max_frames_absolute disagrees with its profile",
+                row.info.name
+            );
+            assert_eq!(
+                row.defaults.min_frames,
+                Some(frames.min),
+                "{} row min_frames disagrees with its profile",
+                row.info.name
+            );
+            // The spatial half of the same rule. A family-blind fallback here
+            // would offer a compact row the official BF16 ladder's ceiling
+            // and no axis bound at all, which is exactly the row-vs-profile
+            // divergence the model-metadata presentation invariant forbids —
+            // and it would become an active lie the moment the row's task
+            // became runnable (#825).
+            let resolution = resolution_defaults_from_profile(&profile);
+            assert_eq!(
+                row.defaults.max_pixels, resolution.max_pixels,
+                "{} row max_pixels disagrees with its profile",
+                row.info.name
+            );
+            assert_eq!(
+                row.defaults.max_axis_pixels, resolution.max_axis_pixels,
+                "{} row max_axis_pixels disagrees with its profile",
+                row.info.name
+            );
+            assert_eq!(
+                row.defaults.max_pixels,
+                Some(crate::minimax_h3::reviewed_compact_max_pixels()),
+                "{} row must carry the compact area ceiling",
+                row.info.name
+            );
+            // Both compact task partitions execute wherever the engine is
+            // built (#825), and the row is the sentence a client reads before
+            // a 21-42 GB pull, so it must agree with the one authority
+            // generation itself asks.
+            assert_eq!(
+                row.runtime_available,
+                Some(crate::minimax_h3::model_runtime_availability(&row.info.name).is_available()),
+                "{} row runtime availability disagrees with the activation authority",
+                row.info.name
+            );
+            if crate::minimax_h3::layout_for_model(&row.info.name)
+                == Some(crate::minimax_h3::Layout::ComfyPrunedInt8ConvrotNvfp4Awq)
+            {
+                assert_eq!(
+                    row.runtime_available,
+                    Some(crate::minimax_h3::engine_is_built()),
+                    "{} is a runnable compact layout on every build that links the engine",
+                    row.info.name
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected both compact H3 task partitions in the catalog, saw {checked}"
+        );
+    }
+
+    /// The Ref2VA compact row specifically: it is the one whose runtime
+    /// answer flipped in #825, and the one whose row a client reads before
+    /// deciding whether an ordered reference set is worth uploading.
+    #[test]
+    fn the_compact_ref2va_row_is_runnable_wherever_the_engine_is_built() {
+        let config = crate::Config::default();
+        let catalog = super::build_model_catalog(&config, None, false);
+        let row = catalog
+            .iter()
+            .find(|row| row.info.name == crate::minimax_h3::REF2VA_COMFY)
+            .expect("the compact Ref2VA acquisition row is always listed");
+        assert_eq!(
+            row.runtime_available,
+            Some(crate::minimax_h3::engine_is_built())
+        );
+        assert_eq!(
+            row.runtime_unavailable_reason.is_some(),
+            !crate::minimax_h3::engine_is_built()
+        );
+        // Every H3 render carries synchronized audio, cold row included.
+        assert_eq!(row.supports_audio, Some(true));
+        // The compact envelope, never the official BF16 ladder.
+        assert_eq!(
+            row.defaults.max_pixels,
+            Some(crate::minimax_h3::reviewed_compact_max_pixels())
+        );
+        assert_eq!(
+            row.defaults.max_axis_pixels,
+            Some(crate::minimax_h3::reviewed_compact_max_axis_pixels())
+        );
+        assert_eq!(
+            row.defaults.default_frames,
+            Some(crate::minimax_h3::DEFAULT_COMPACT_FRAMES)
+        );
+        assert_eq!(
+            (row.defaults.default_width, row.defaults.default_height),
+            (
+                crate::minimax_h3::DEFAULT_WIDTH,
+                crate::minimax_h3::DEFAULT_HEIGHT
+            )
+        );
+    }
+
+    use super::*;
+    use crate::manifest::{find_manifest, storage_path};
+    use crate::test_support::ENV_LOCK;
+    use crate::ModelConfig;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn test_models_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "mold-catalog-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    fn populate_manifest_files(root: &std::path::Path, model: &str) {
+        let manifest = find_manifest(model).unwrap();
+        for file in &manifest.files {
+            let path = root.join(storage_path(manifest, file));
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, b"test").unwrap();
+            // Stamp a `.sha256-verified` marker so post-B3 acceptance
+            // logic recognises the fixture as installed (4-byte stub
+            // would otherwise fail the size-match fallback).
+            crate::download::write_sha256_marker(&path, "deadbeef").unwrap();
+        }
+    }
+
+    /// Models advertise both their family frame contract and the exact
+    /// runnable resolution buckets consumed by every Studio surface.
+    #[test]
+    fn build_model_catalog_emits_video_frame_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let config = Config::default();
+        let catalog = build_model_catalog(&config, None, false);
+
+        let ltx2 = catalog
+            .iter()
+            .find(|model| model.family == "ltx2")
+            .expect("an ltx2 manifest model should exist");
+        assert_eq!(ltx2.defaults.default_frames, Some(97));
+        assert_eq!(ltx2.defaults.default_fps, Some(24));
+        // The LTX-2 ceiling is a 20s duration, so the advertised scalar is
+        // the frame count that budget buys at this model's own default fps —
+        // snapped onto the 8n+1 grid so a client can submit it.
+        assert_eq!(
+            ltx2.defaults.max_frames,
+            Some(crate::validation::ltx2_max_frames_on_grid_at_fps(24)),
+            "temporal RoPE ceiling at the model's default fps",
+        );
+        assert_eq!(ltx2.defaults.max_runtime_seconds, Some(20));
+        assert_eq!(
+            ltx2.defaults.max_frames_absolute,
+            Some(crate::validation::LTX2_MAX_FRAMES_ABSOLUTE)
+        );
+        assert_eq!(ltx2.defaults.frame_step, Some(8));
+        // Every manifest LTX-2 checkpoint ships the spatial upsampler, so it
+        // composes: stage 1 halved, one x2 rung, tiled stage-2 refinement.
+        // Its advertised ceiling is the composed one, not the family's
+        // single-pass value.
+        assert_eq!(
+            ltx2.defaults.max_pixels,
+            Some(crate::validation::LTX2_COMPOSED_MAX_PIXELS),
+            "a composing LTX-2 checkpoint advertises the composed ceiling"
+        );
+        assert_eq!(
+            ltx2.defaults.max_axis_pixels,
+            Some(crate::validation::LTX2_COMPOSED_MAX_AXIS_PIXELS),
+            "the per-axis span is advertised separately from the pixel budget"
+        );
+        // 64, not the family's single-pass 32: a composing checkpoint halves
+        // the requested shape for stage 1, so the request itself has to sit on
+        // the doubled grid for that halved shape to land on the VAE's /32.
+        assert_eq!(
+            ltx2.defaults.dimension_alignment,
+            Some(crate::validation::LTX2_TWO_STAGE_ALIGNMENT)
+        );
+        assert!(
+            ltx2.defaults
+                .recommended_dimensions
+                .iter()
+                .any(|size| size.width == 1216 && size.height == 704),
+            "LTX-2's default landscape bucket must be advertised to every client",
+        );
+        assert!(
+            ltx2.defaults
+                .recommended_dimensions
+                .iter()
+                .any(|size| size.width == 3840 && size.height == 2112),
+            "a composing checkpoint must advertise the 4K UHD rung",
+        );
+        // Every advertised bucket has to be admissible for this exact model,
+        // or the picker offers a size the server rejects.
+        for size in &ltx2.defaults.recommended_dimensions {
+            assert!(
+                crate::validation::validate_generation_dimensions_composed(
+                    size.width,
+                    size.height,
+                    Some("ltx2"),
+                    crate::validation::ltx2_spatial_composition(&ltx2.info.name, None),
+                )
+                .is_ok(),
+                "{}x{} is advertised for {} but not admissible",
+                size.width,
+                size.height,
+                ltx2.info.name
+            );
+        }
+
+        let ltx_video = catalog
+            .iter()
+            .find(|model| model.family == "ltx-video")
+            .expect("an ltx-video manifest model should exist");
+        assert_eq!(ltx_video.defaults.default_frames, Some(25));
+        assert_eq!(ltx_video.defaults.default_fps, Some(30));
+        assert_eq!(ltx_video.defaults.max_frames, Some(257));
+        assert_eq!(ltx_video.defaults.frame_step, Some(8));
+
+        let flux = catalog
+            .iter()
+            .find(|model| model.family == "flux")
+            .expect("a flux manifest model should exist");
+        assert_eq!(flux.defaults.default_frames, None);
+        assert_eq!(flux.defaults.default_fps, None);
+        assert_eq!(flux.defaults.max_frames, None);
+        assert_eq!(flux.defaults.frame_step, None);
+        assert_eq!(
+            flux.defaults.max_pixels,
+            Some(crate::validation::MAX_PIXELS)
+        );
+        assert_eq!(flux.defaults.dimension_alignment, Some(16));
+        assert!(!flux.defaults.recommended_dimensions.is_empty());
+    }
+
+    #[test]
+    fn ltx25_catalog_uses_the_shared_duration_and_frame_grid_authority() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let model = catalog
+            .iter()
+            .find(|model| model.name == crate::ltx25_manifest::DISTILLED_INT8_CONV)
+            .expect("LTX-2.5 distilled INT8 manifest row");
+
+        assert_eq!(model.defaults.default_frames, Some(121));
+        assert_eq!(model.defaults.default_fps, Some(24));
+        assert_eq!(model.defaults.max_runtime_seconds, Some(20));
+        assert_eq!(model.defaults.max_frames, Some(481));
+        assert_eq!(model.defaults.max_frames_absolute, Some(604));
+        assert_eq!(model.defaults.frame_step, Some(8));
+        assert_eq!(model.defaults.frame_offset, Some(1));
+    }
+
+    /// `/api/models` is the single source Studio surfaces read the grid from:
+    /// the 5B must advertise its 2.2 VAE's 32px grid while the 2.1-VAE
+    /// checkpoints keep the family's 16, and every advertised bucket must sit
+    /// on its own model's grid or source fitting floors to a canvas that
+    /// admission rejects.
+    #[test]
+    fn model_catalog_advertises_wan_alignment_per_checkpoint() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let alignment = |name: &str| {
+            catalog
+                .iter()
+                .find(|model| model.name == name)
+                .unwrap_or_else(|| panic!("{name} should be in the catalog"))
+                .defaults
+                .dimension_alignment
+        };
+        assert_eq!(alignment("wan22-ti2v-5b:fp16"), Some(32));
+        assert_eq!(alignment("wan21-t2v-1.3b:bf16"), Some(16));
+        assert_eq!(alignment("wan22-t2v-a14b:q8"), Some(16));
+
+        for model in catalog.iter().filter(|model| model.family == "wan") {
+            let align = model
+                .defaults
+                .dimension_alignment
+                .expect("wan rows always advertise a grid");
+            for size in &model.defaults.recommended_dimensions {
+                assert!(
+                    size.width % align == 0 && size.height % align == 0,
+                    "{}: advertised {}x{} is off its own {align}px grid",
+                    model.name,
+                    size.width,
+                    size.height,
+                );
+            }
+        }
+    }
+
+    /// A shipped visual generation profile without any aspect preset leaves
+    /// web, desktop, and iPhone with an empty Shape control. Audio-only
+    /// recipes are the sole intentional exception because they have no canvas.
+    #[test]
+    fn every_shipped_visual_generation_profile_advertises_aspect_presets() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        for model in catalog {
+            if !model.is_generation_model() {
+                continue;
+            }
+            let Some(profile) = &model.generation_profile else {
+                continue;
+            };
+            for recipe in &profile.recipes {
+                if recipe.resolution.domain == crate::generation_profile::ResolutionDomain::None {
+                    continue;
+                }
+                assert!(
+                    !recipe.resolution.aspect_groups.is_empty(),
+                    "{} recipe {} advertises a visual canvas without aspect presets",
+                    model.name,
+                    recipe.id,
+                );
+            }
+        }
+    }
+
+    /// The low-VRAM Wan tiers (#794) surface in the catalog with their
+    /// manifests' own recipes — the Q4_K_M A14B pair keeps the Lightning
+    /// 4-step contract and the TI2V-5B Q8_0 keeps the 5B's 121@24 — and the
+    /// quality sort keeps them behind the higher-precision variants of the
+    /// same base name (bare-name defaults are unchanged).
+    #[test]
+    fn wan_low_vram_tiers_surface_in_catalog_with_manifest_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let position = |name: &str| {
+            catalog
+                .iter()
+                .position(|model| model.name == name)
+                .unwrap_or_else(|| panic!("{name} must be in the catalog"))
+        };
+
+        let ti2v_q8 = &catalog[position("wan22-ti2v-5b:q8")];
+        assert_eq!(ti2v_q8.family, "wan");
+        assert_eq!(ti2v_q8.defaults.default_steps, 20);
+        assert_eq!(ti2v_q8.defaults.default_guidance, 5.0);
+        assert_eq!(ti2v_q8.defaults.default_frames, Some(121));
+        assert_eq!(ti2v_q8.defaults.default_fps, Some(24));
+        assert_eq!(ti2v_q8.info.hf_repo, "QuantStack/Wan2.2-TI2V-5B-GGUF");
+
+        for base in ["wan22-t2v-a14b", "wan22-i2v-a14b"] {
+            let q4 = &catalog[position(&format!("{base}:q4"))];
+            assert_eq!(q4.family, "wan");
+            assert_eq!(q4.defaults.default_steps, 4);
+            assert_eq!(q4.defaults.default_guidance, 1.0);
+            // 81 since #776 item 3: block offload reaches the checkpoint's
+            // trained clip length on a 24 GB card, and Q4's resident expert is
+            // smaller than the Q5 the measurement was taken on.
+            assert_eq!(q4.defaults.default_frames, Some(81));
+            assert_eq!(q4.defaults.default_fps, Some(16));
+
+            // Quality order within the base name: q8 > q5 > q4.
+            assert!(position(&format!("{base}:q8")) < position(&format!("{base}:q5")));
+            assert!(position(&format!("{base}:q5")) < position(&format!("{base}:q4")));
+        }
+
+        // fp16 stays the 5B's lead (and bare-name default) variant.
+        assert!(position("wan22-ti2v-5b:fp16") < position("wan22-ti2v-5b:q8"));
+    }
+
+    #[test]
+    fn model_catalog_advertises_default_ltx_guidance_recipe() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let capability = |name: &str| {
+            catalog
+                .iter()
+                .find(|model| model.name == name)
+                .and_then(|model| model.guidance_capabilities)
+                .expect("current model rows advertise guidance capabilities")
+        };
+        assert_eq!(
+            capability("ltx-2.3-22b-distilled:fp8"),
+            crate::GuidanceCapabilities::FIXED_ONE,
+        );
+        assert_eq!(
+            capability("ltx-2.3-22b-dev:fp8"),
+            crate::GuidanceCapabilities::ADJUSTABLE_CFG,
+        );
+        assert_eq!(
+            capability("ltx-video-0.9.8-13b-distilled:bf16"),
+            crate::GuidanceCapabilities::FIXED_ONE,
+        );
+        assert_eq!(
+            capability("ltx-video-0.9.8-13b-dev:bf16"),
+            crate::GuidanceCapabilities::ADJUSTABLE_CFG,
+        );
+    }
+
+    #[test]
+    fn build_model_catalog_marks_downloaded_manifest_models() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let models_dir = test_models_dir("downloaded");
+        populate_manifest_files(&models_dir, "flux-schnell:q8");
+        std::env::set_var("MOLD_MODELS_DIR", &models_dir);
+
+        let config = Config {
+            ..Config::default()
+        };
+
+        let entry = build_model_catalog(&config, Some("flux-schnell:q8"), true)
+            .into_iter()
+            .find(|model| model.name == "flux-schnell:q8")
+            .expect("manifest model should exist");
+
+        assert!(entry.downloaded);
+        assert!(entry.is_loaded);
+        assert_eq!(entry.defaults.default_steps, 4);
+
+        std::env::remove_var("MOLD_MODELS_DIR");
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn sharded_checkpoints_report_their_transformer_shard_repo() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // qwen-image:bf16 has no single Transformer file — its weights are
+        // TransformerShard entries. The repo must come from the shards, not
+        // fall back to empty (which strips the source mark in clients).
+        let entry = build_model_catalog(&Config::default(), None, false)
+            .into_iter()
+            .find(|model| model.name == "qwen-image:bf16")
+            .expect("manifest model should exist");
+        assert_eq!(entry.info.hf_repo, "Qwen/Qwen-Image");
+    }
+
+    /// Wan rows advertise the engine's tuned absence-fallback negative so
+    /// clients can show, edit, and explicitly disable it; families whose
+    /// engines apply no default keep the field absent on the wire.
+    #[test]
+    fn catalog_advertises_wan_default_negative_prompt_only() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let models = build_model_catalog(&Config::default(), None, false);
+        let wan = models
+            .iter()
+            .find(|model| model.family == "wan")
+            .expect("wan manifests exist");
+        assert_eq!(
+            wan.defaults.default_negative_prompt.as_deref(),
+            Some(crate::manifest::WAN_DEFAULT_NEGATIVE_PROMPT)
+        );
+        let flux = models
+            .iter()
+            .find(|model| model.family == "flux")
+            .expect("flux manifests exist");
+        assert_eq!(flux.defaults.default_negative_prompt, None);
+    }
+
+    #[test]
+    fn build_model_catalog_keeps_config_only_models() {
+        let mut models = HashMap::new();
+        models.insert(
+            "custom-model".to_string(),
+            ModelConfig {
+                family: Some("custom".to_string()),
+                description: Some("Custom".to_string()),
+                default_steps: Some(12),
+                ..ModelConfig::default()
+            },
+        );
+        let config = Config {
+            models,
+            ..Config::default()
+        };
+
+        let entry = build_model_catalog(&config, None, false)
+            .into_iter()
+            .find(|model| model.name == "custom-model")
+            .expect("config-only model should exist");
+
+        assert!(entry.downloaded);
+        assert_eq!(entry.family, "custom");
+        assert_eq!(entry.defaults.default_steps, 12);
+    }
+
+    #[test]
+    fn config_only_model_without_family_gets_conservative_custom_profile() {
+        let mut models = HashMap::new();
+        models.insert("path-only-model".to_string(), ModelConfig::default());
+        let config = Config {
+            default_width: 1024,
+            default_height: 1024,
+            default_steps: 28,
+            models,
+            ..Config::default()
+        };
+
+        let entry = build_model_catalog(&config, None, false)
+            .into_iter()
+            .find(|model| model.name == "path-only-model")
+            .expect("config-only model should exist");
+        assert_eq!(entry.family, "custom");
+        assert_eq!(entry.defaults.default_width, 512);
+        assert_eq!(entry.defaults.default_height, 512);
+        assert_eq!(entry.defaults.default_steps, 20);
+        let profile = entry.generation_profile.expect("profile is advertised");
+        assert!(profile.profile_id.starts_with("custom."));
+        assert!(profile
+            .default_recipe()
+            .unwrap()
+            .resolution
+            .aspect_groups
+            .is_empty());
+    }
+
+    #[test]
+    fn config_only_legacy_ltx_video_advertises_the_engine_refusal() {
+        let mut models = HashMap::new();
+        models.insert(
+            "local-ltx-video".to_string(),
+            ModelConfig {
+                family: Some("ltx-video".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        let config = Config {
+            models,
+            ..Config::default()
+        };
+
+        let entry = build_model_catalog(&config, None, false)
+            .into_iter()
+            .find(|model| model.name == "local-ltx-video")
+            .expect("config-only legacy model should exist");
+        assert_eq!(
+            entry.source_image,
+            Some(crate::SourceImageCapability::Unsupported)
+        );
+        assert_eq!(
+            entry
+                .generation_profile
+                .as_ref()
+                .and_then(|profile| profile.default_recipe())
+                .and_then(|recipe| recipe.capabilities.source_image),
+            Some(crate::SourceImageCapability::Unsupported)
+        );
+    }
+
+    #[test]
+    fn config_registration_distinguishes_storage_root_from_unreviewed_artifact_identity() {
+        let root = std::path::Path::new("/storage/minimax-h3/models");
+        assert!(config_artifact_registration_available(
+            &root.join("flux/transformer.safetensors"),
+            root,
+            Some("custom")
+        ));
+        assert!(!config_artifact_registration_available(
+            &root.join("private/MiniMax-H3/transformer.safetensors"),
+            root,
+            Some("custom")
+        ));
+        assert!(!config_artifact_registration_available(
+            std::path::Path::new("/outside/MiniMax-H3/transformer.safetensors"),
+            root,
+            Some("custom")
+        ));
+        // Loader permission remains independently available in the shipping
+        // graph for the exact registered manifests that were already admitted.
+        if cfg!(feature = "h3") {
+            assert!(crate::require_model_artifact_activation(
+                &root.join("MiniMax-H3/transformer.safetensors"),
+                Some(root),
+                Some("minimax-h3")
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn build_model_catalog_lists_only_registered_h3_acquisitions() {
+        let mut models = HashMap::new();
+        models.insert(
+            "private-checkpoint".to_string(),
+            ModelConfig {
+                family: Some("minimax-h3".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        models.insert(
+            "ordinary-custom-model".to_string(),
+            ModelConfig {
+                family: Some("custom".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        models.insert(
+            "disguised-checkpoint".to_string(),
+            ModelConfig {
+                family: Some("custom".to_string()),
+                transformer: Some("/models/MiniMax-H3/transformer.safetensors".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+
+        let catalog = build_model_catalog(
+            &Config {
+                models,
+                ..Config::default()
+            },
+            None,
+            false,
+        );
+
+        assert!(!catalog
+            .iter()
+            .any(|model| model.name == "private-checkpoint"));
+        assert!(!catalog
+            .iter()
+            .any(|model| model.name == "disguised-checkpoint"));
+        assert!(catalog
+            .iter()
+            .any(|model| model.name == "ordinary-custom-model"));
+        assert!(crate::require_model_activation("private-checkpoint", Some("minimax-h3")).is_err());
+        for model in [
+            crate::minimax_h3::FL2VA_COMFY,
+            crate::minimax_h3::REF2VA_COMFY,
+        ] {
+            assert!(catalog.iter().any(|entry| entry.name == model));
+            // Acquisition is the authority that puts a row in the catalog.
+            // Execution is a separate question this build may well answer
+            // "no" to (#1276): only the sm89 recipe compiles the engine, and
+            // Ref2VA runs on no released build at all.
+            crate::require_model_acquisition(model, Some("minimax-h3")).unwrap();
+        }
+    }
+
+    /// H3 always renders synchronized audio: the family declares
+    /// `synchronized_audio: true` with `audio_disable_supported: false`, and
+    /// no checkpoint can turn it off. Every reviewed identity must advertise
+    /// that on the row AND inside the profile recipe, so a third-party client
+    /// never has to guess the family's AV behaviour from its name (#841).
+    #[test]
+    fn h3_rows_advertise_the_families_synchronized_audio_declaration() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+
+        for model in crate::minimax_h3::REVIEWED_COMPACT_MODELS {
+            let entry = catalog
+                .iter()
+                .find(|entry| entry.info.name == *model)
+                .unwrap_or_else(|| panic!("{model} is missing from the model catalog"));
+            let task = crate::minimax_h3::task_for_model(model).unwrap();
+            let declared = crate::minimax_h3::capabilities(task).synchronized_audio;
+            assert!(declared, "{model} must declare synchronized audio");
+            assert_eq!(
+                entry.supports_audio,
+                Some(declared),
+                "{model} must advertise the declared audio capability, not null",
+            );
+            for recipe in &entry.generation_profile.as_ref().unwrap().recipes {
+                assert!(
+                    recipe.capabilities.supports_audio,
+                    "{model} recipe {} must carry the declared audio capability",
+                    recipe.id,
+                );
+            }
+        }
+    }
+
+    /// The probe-backed families keep answering `None` here: LTX-2 audio is a
+    /// checkpoint fact the server fills from safetensors headers, and a
+    /// pre-empted `Some(false)` would erase that probe.
+    #[test]
+    fn non_declaring_families_leave_audio_capability_unresolved() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+
+        for entry in catalog
+            .iter()
+            .filter(|entry| !crate::minimax_h3::is_family(&entry.info.family))
+        {
+            assert_eq!(
+                entry.supports_audio, None,
+                "{} must leave audio capability to the server probe",
+                entry.info.name,
+            );
+        }
+    }
+
+    #[test]
+    fn build_model_catalog_marks_manifest_models_available_when_override_dir_is_empty() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let models_dir = test_models_dir("empty");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::env::set_var("MOLD_MODELS_DIR", &models_dir);
+
+        let entry = build_model_catalog(&Config::default(), None, false)
+            .into_iter()
+            .find(|model| model.name == "flux-schnell:q8")
+            .expect("manifest model should exist");
+
+        assert!(!entry.downloaded);
+        assert!(entry.remaining_download_bytes.is_some());
+
+        std::env::remove_var("MOLD_MODELS_DIR");
+        let _ = std::fs::remove_dir_all(models_dir);
+    }
+
+    #[test]
+    fn sort_models_by_variant_quality_groups_and_orders() {
+        use super::sort_models_by_variant_quality;
+
+        fn stub(name: &str) -> ModelInfoExtended {
+            ModelInfoExtended {
+                supports_duration_prediction: None,
+                runtime_ready: None,
+                runtime_readiness_error: None,
+                runtime_available: None,
+                runtime_unavailable_reason: None,
+                info: ModelInfo {
+                    name: name.to_string(),
+                    family: "flux".to_string(),
+                    size_gb: 0.0,
+                    is_loaded: false,
+                    last_used: None,
+                    hf_repo: String::new(),
+                },
+                defaults: ModelDefaults {
+                    default_steps: 4,
+                    default_guidance: 0.0,
+                    default_width: 1024,
+                    default_height: 1024,
+                    description: String::new(),
+                    ..Default::default()
+                },
+                downloaded: false,
+                disk_usage_bytes: None,
+                remaining_download_bytes: None,
+                display_name: None,
+                title: None,
+                variant: None,
+                summary: None,
+                family_label: None,
+                kind: None,
+                modality: None,
+                nsfw: None,
+                supports_audio: None,
+                supports_identity: None,
+                supports_extend: None,
+                supports_sequence: None,
+                extend_default_overlap_frames: None,
+                guidance_capabilities: None,
+                source_image: None,
+                generation_profile: None,
+            }
+        }
+
+        let mut models = vec![
+            stub("flux-schnell:q4"),
+            stub("flux-dev:q4"),
+            stub("flux-schnell:bf16"),
+            stub("flux-dev:bf16"),
+            stub("flux-schnell:q8"),
+            stub("flux-dev:q8"),
+        ];
+
+        sort_models_by_variant_quality(&mut models);
+
+        let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+        // flux-schnell appeared first, so all its variants come first (bf16 > q8 > q4)
+        // then flux-dev variants (bf16 > q8 > q4)
+        assert_eq!(
+            names,
+            vec![
+                "flux-schnell:bf16",
+                "flux-schnell:q8",
+                "flux-schnell:q4",
+                "flux-dev:bf16",
+                "flux-dev:q8",
+                "flux-dev:q4",
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_contains_upscaler_models() {
+        // The full catalog should still include upscaler models (for mold list / Models tab).
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        assert!(
+            catalog.iter().any(|m| m.is_upscaler()),
+            "catalog should include upscaler models"
+        );
+    }
+
+    #[test]
+    fn generation_model_filter_excludes_upscalers() {
+        // When filtering for generation models, upscalers must not appear.
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let generation: Vec<_> = catalog.iter().filter(|m| m.is_generation_model()).collect();
+
+        assert!(
+            !generation.is_empty(),
+            "there should be generation models in the catalog"
+        );
+        for m in &generation {
+            assert!(
+                !m.is_upscaler(),
+                "generation model filter should exclude upscaler '{}'",
+                m.name
+            );
+            assert!(
+                !m.is_utility(),
+                "generation model filter should exclude utility model '{}'",
+                m.name
+            );
+            assert!(
+                !m.is_auxiliary(),
+                "generation model filter should exclude auxiliary model '{}'",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn generation_model_filter_excludes_utility_models() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+        let utility_in_generation: Vec<_> = catalog
+            .iter()
+            .filter(|m| m.is_generation_model() && m.is_utility())
+            .collect();
+        assert!(
+            utility_in_generation.is_empty(),
+            "no utility models should pass is_generation_model(): {:?}",
+            utility_in_generation
+                .iter()
+                .map(|m| &m.name)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn upscaler_config_only_model_excluded_from_generation() {
+        // A config-only model with upscaler family should not be a generation model.
+        let mut models = HashMap::new();
+        models.insert(
+            "my-custom-upscaler".to_string(),
+            ModelConfig {
+                family: Some("upscaler".to_string()),
+                description: Some("Custom upscaler".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        let config = Config {
+            models,
+            ..Config::default()
+        };
+
+        let catalog = build_model_catalog(&config, None, false);
+        let entry = catalog
+            .iter()
+            .find(|m| m.name == "my-custom-upscaler")
+            .expect("config-only upscaler should be in catalog");
+
+        assert!(entry.is_upscaler());
+        assert!(!entry.is_generation_model());
+    }
+
+    /// `/api/models` must advertise the overlap the *engine* will accept.
+    /// Wan's continuation carries exactly the one frame it was seeded with, so
+    /// advertising LTX-2's 17 promised a value wan's engine refuses (#783).
+    #[test]
+    fn advertised_extend_overlap_default_is_per_family() {
+        let catalog = build_model_catalog(&Config::default(), None, false);
+
+        let wan = catalog
+            .iter()
+            .find(|m| m.info.family == "wan")
+            .expect("catalog should include wan checkpoints");
+        assert_eq!(
+            wan.extend_default_overlap_frames,
+            Some(crate::validation::WAN_HANDOFF_DUPLICATED_FRAMES),
+            "{} advertises an overlap its engine refuses",
+            wan.info.name
+        );
+
+        let ltx2 = catalog
+            .iter()
+            .find(|m| m.info.family == "ltx2")
+            .expect("catalog should include ltx2 checkpoints");
+        assert_eq!(
+            ltx2.extend_default_overlap_frames,
+            Some(crate::validation::DEFAULT_EXTEND_OVERLAP_FRAMES)
+        );
+    }
+
+    /// `extend_capable_model` is the only authority for `supports_extend`.
+    ///
+    /// Every advertised row — manifest tier or config-only entry — must
+    /// derive from it, never from a second `family == "ltx2"` test. Wan
+    /// extends per checkpoint, so a duplicated family literal advertises
+    /// `false` for the very checkpoints this exists to unblock while the
+    /// paired `extend_default_overlap_frames` already says `wan` (#783).
+    #[test]
+    fn advertised_extend_support_comes_only_from_extend_capable_model() {
+        let mut models = HashMap::new();
+        models.insert(
+            "local-wan-i2v".to_string(),
+            ModelConfig {
+                family: Some("wan".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        models.insert(
+            "local-ltx2".to_string(),
+            ModelConfig {
+                family: Some("ltx2".to_string()),
+                ..ModelConfig::default()
+            },
+        );
+        let config = Config {
+            models,
+            ..Config::default()
+        };
+        let catalog = build_model_catalog(&config, None, false);
+
+        for entry in &catalog {
+            assert_eq!(
+                entry.supports_extend,
+                Some(extend_capable_model(&entry.info.family, entry.source_image)),
+                "{} advertises supports_extend from a second policy",
+                entry.info.name
+            );
+        }
+
+        // The config-only rows really did land, so the loop above is not
+        // vacuous over the interesting case.
+        let config_only_ltx2 = catalog
+            .iter()
+            .find(|m| m.info.name == "local-ltx2")
+            .expect("config-only ltx2 entry");
+        assert_eq!(config_only_ltx2.supports_extend, Some(true));
+        let config_only_wan = catalog
+            .iter()
+            .find(|m| m.info.name == "local-wan-i2v")
+            .expect("config-only wan entry");
+        // Unclassified: mold-core cannot read checkpoint headers, so the
+        // server's annotate pass is what upgrades this one.
+        assert_eq!(config_only_wan.source_image, None);
+        assert_eq!(config_only_wan.supports_extend, Some(false));
+    }
+}

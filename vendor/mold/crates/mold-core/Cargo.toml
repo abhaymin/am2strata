@@ -1,0 +1,76 @@
+[package]
+name = "mold-ai-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Shared types, API protocol, and HTTP client for mold"
+
+[lib]
+name = "mold_core"
+
+[features]
+default = []
+# Public MiniMax H3 policy edge. Runtime crates forward this only from their
+# explicit H3 feature; it removes the historical family-wide compliance denial
+# while retaining the two reviewed, revision-pinned acquisition manifests.
+h3 = []
+# Validation-only edge consumed by the authenticated private H3 server. This
+# does not expose artifacts, loaders, or model activation.
+h3-private-uat = []
+# PuLID-FLUX face-identity conditioning. Contract-only in mold-core: it flips
+# the advertised `supports_identity` capability so a client never offers a
+# control the binary cannot execute. Request validation is deliberately
+# feature-independent, because the wire shape does not change with the build.
+pulid = []
+# Advertise and admit the native Hunyuan3D PBR paint runtime. Runtime crates
+# forward this only when the xatlas/native paint path is compiled.
+mesh-texture = []
+mesh-matting = []
+mesh-delight = ["mesh-matting"]
+
+[dependencies]
+mold-ai-secure-client = { path = "../mold-secure-client" }
+anyhow = "1"
+http = "1"
+http-body-util = "0.1"
+futures-util = "0.3"
+console = "0.15"
+dirs = "6"
+fs2 = "0.4"
+hf-hub = { version = "0.5", default-features = false, features = ["tokio", "ureq", "rustls-tls"] }
+indicatif = "0.17"
+libc = "0.2"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+zeroize = "=1.8.2"
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+ts-rs = { version = "11", features = ["serde-compat"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+strsim = "0.11"
+utoipa = { version = "5", features = ["preserve_order"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+hex = "0.4"
+mold-ai-secure = { path = "../mold-secure" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

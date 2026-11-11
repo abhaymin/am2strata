@@ -1,0 +1,78 @@
+//! Hunyuan3D 2.0 image-to-3D shape generation.
+//!
+//! Pipeline, in the order the engine runs it:
+//!
+//! 1. [`dino2`] — a DINOv2-giant vision tower encodes the (background-removed,
+//!    letterboxed) source image into a token sequence. This is the ONLY
+//!    conditioning; there is no text encoder anywhere in the family.
+//! 2. [`transformer`] — a flow-matching DiT denoises a 1-D latent token
+//!    sequence (3072 tokens x 64 channels) conditioned on those tokens.
+//! 3. [`shape_vae`] — the vecset VAE turns the latents into an occupancy field
+//!    and evaluates it on a dense query grid, producing logits per grid point.
+//! 4. [`mesh`] — surface nets extract a triangle mesh from that grid on the CPU.
+//! 5. [`glb`] — the mesh is written as binary glTF.
+//!
+//! Every checkpoint is ONE safetensors file carrying all three networks under
+//! the `model.`, `vae.` and `conditioner.main_image_encoder.model.` prefixes;
+//! see `crates/mold-core/src/manifest.rs` `hunyuan3d_manifests`.
+//!
+//! Upstream references, in preference order:
+//!   - ComfyUI (the executable oracle): `comfy/ldm/hunyuan3d/{model,vae}.py`,
+//!     `comfy_extras/nodes_hunyuan3d.py`, `comfy_extras/nodes_save_3d.py`.
+//!   - Tencent: `hy3dgen/shapegen/` in `Tencent-Hunyuan/Hunyuan3D-2`, and the
+//!     per-checkpoint `config.yaml` shipped beside each weights file.
+
+pub mod backend;
+#[cfg(feature = "mesh-matting")]
+pub mod background_matting;
+#[cfg(feature = "mesh-delight")]
+pub mod delight;
+pub mod dino2;
+pub mod engine;
+pub mod glb;
+#[cfg(feature = "mesh-matting")]
+pub mod matting_engine;
+pub mod mesh;
+pub mod multiview;
+pub mod obj;
+pub mod paint_attention;
+pub mod paint_back_sample;
+pub mod paint_bake;
+pub mod paint_block;
+pub mod paint_camera;
+pub mod paint_conv;
+pub mod paint_denoiser;
+pub mod paint_edges;
+pub mod paint_fill;
+pub mod paint_guidance;
+pub mod paint_images;
+pub mod paint_materials;
+pub mod paint_ns_fill;
+pub mod paint_pipeline;
+pub mod paint_pixels;
+pub mod paint_positions;
+pub mod paint_projector;
+pub mod paint_raster;
+pub mod paint_reliability;
+#[cfg(feature = "mesh-texture")]
+pub mod paint_runtime;
+pub mod paint_sampler;
+pub mod paint_stages;
+pub mod paint_unet;
+pub mod paint_upscale;
+pub mod paint_uv;
+pub mod paint_vae;
+pub mod paint_vertex_fill;
+pub mod paint_views;
+mod paint_weights;
+pub mod poster;
+pub mod quantization;
+pub mod raster;
+pub mod sampler;
+pub mod shape_vae;
+pub mod transformer;
+pub mod transformer21;
+pub mod turntable;
+
+#[cfg(feature = "mesh-texture")]
+pub mod uv;

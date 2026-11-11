@@ -2166,7 +2166,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-candle"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "candle-core-mold",
  "candle-nn-mold",
@@ -2187,7 +2186,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-catalog"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "mold-ai-core",
  "reqwest",
@@ -2203,7 +2201,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-core"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2239,7 +2236,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-inference"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2284,7 +2280,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-secure"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -2304,7 +2299,6 @@ dependencies = [
 [[package]]
 name = "mold-ai-secure-client"
 version = "0.36.0"
-source = "git+https://github.com/utensils/mold.git?rev=bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b#bf0ea4a0b8276fb60e7ea0dbb431967f76ee035b"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

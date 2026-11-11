@@ -1,0 +1,197 @@
+use anyhow::{anyhow, bail, Result};
+use mold_core::manifest::{find_manifest, storage_path, ModelComponent};
+use mold_core::{download, Ltx2SpatialUpscale, Ltx2TemporalUpscale, ModelPaths};
+use std::path::{Path, PathBuf};
+
+pub(crate) fn gemma_root(paths: &ModelPaths) -> Result<PathBuf> {
+    let path = paths
+        .text_encoder_files
+        .first()
+        .ok_or_else(|| anyhow!("LTX-2 requires Gemma text encoder files to be available"))?;
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains("gemma4"))
+    {
+        return Ok(path.clone());
+    }
+    path.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("LTX-2 Gemma text encoder path has no parent directory"))
+}
+
+pub(crate) fn resolve_spatial_upscaler_path(
+    model_name: &str,
+    paths: &ModelPaths,
+    mode: Option<Ltx2SpatialUpscale>,
+) -> Result<Option<PathBuf>> {
+    match mode {
+        None | Some(Ltx2SpatialUpscale::X2) => Ok(paths.spatial_upscaler.clone()),
+        Some(Ltx2SpatialUpscale::X1_5) => {
+            // The preset owns the capability: LTX-2.3 publishes an x1.5
+            // upsampler, the 19B and the 2.5 split packs do not, and the
+            // refusal must come from the same flag `/api/models` advertises
+            // rather than a second substring rule that can disagree with it.
+            let preset = super::preset::preset_for_model_with_hint(model_name, None)?;
+            if !preset.supports_spatial_upscale_x1_5 {
+                bail!(
+                    "x1.5 spatial upscaling is not published for {} (preset {})",
+                    model_name,
+                    preset.name
+                );
+            }
+            resolve_manifest_file(
+                model_name,
+                ModelComponent::SpatialUpscaler,
+                "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors",
+            )
+            .map(Some)
+        }
+    }
+}
+
+pub(crate) fn resolve_temporal_upscaler_path(
+    paths: &ModelPaths,
+    mode: Option<Ltx2TemporalUpscale>,
+) -> Result<Option<PathBuf>> {
+    match mode {
+        None => Ok(None),
+        Some(Ltx2TemporalUpscale::X2) => paths
+            .temporal_upscaler
+            .clone()
+            .ok_or_else(|| {
+                anyhow!("LTX-2 temporal upscaling requires a configured temporal upsampler asset")
+            })
+            .map(Some),
+    }
+}
+
+fn resolve_manifest_file(
+    model_name: &str,
+    component: ModelComponent,
+    hf_filename: &str,
+) -> Result<PathBuf> {
+    let manifest = find_manifest(model_name)
+        .ok_or_else(|| anyhow!("no manifest found for model '{model_name}'"))?;
+    let file = manifest
+        .files
+        .iter()
+        .find(|file| file.component == component && file.hf_filename == hf_filename)
+        .ok_or_else(|| {
+            anyhow!(
+                "manifest for '{model_name}' is missing required asset '{}'",
+                hf_filename
+            )
+        })?;
+    let canonical = storage_path(manifest, file);
+    let target_subdir = canonical
+        .parent()
+        .map(|path| path.to_string_lossy().to_string());
+    download::cached_file_path(&file.hf_repo, &file.hf_filename, target_subdir.as_deref())
+        .ok_or_else(|| {
+            anyhow!(
+                "required asset '{}' is not installed; run `mold pull {}` first",
+                hf_filename,
+                manifest.name
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_paths() -> ModelPaths {
+        ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer: PathBuf::from("/tmp/transformer"),
+            transformer_shards: vec![],
+            vae: PathBuf::from("/tmp/unused"),
+            spatial_upscaler: Some(PathBuf::from("/tmp/spatial-x2.safetensors")),
+            temporal_upscaler: Some(PathBuf::from("/tmp/temporal.safetensors")),
+            distilled_lora: Some(PathBuf::from("/tmp/distilled-lora.safetensors")),
+            t5_encoder: None,
+            clip_encoder: None,
+            t5_tokenizer: None,
+            clip_tokenizer: None,
+            clip_encoder_2: None,
+            clip_tokenizer_2: None,
+            text_encoder_files: vec![PathBuf::from("/tmp/gemma/tokenizer.model")],
+            text_tokenizer: None,
+            decoder: None,
+        }
+    }
+
+    #[test]
+    fn gemma_root_uses_parent_directory() {
+        let root = gemma_root(&dummy_paths()).unwrap();
+        assert_eq!(root, PathBuf::from("/tmp/gemma"));
+    }
+
+    #[test]
+    fn x2_spatial_upscaling_uses_configured_asset() {
+        let path = resolve_spatial_upscaler_path(
+            "ltx-2-19b-distilled:fp8",
+            &dummy_paths(),
+            Some(Ltx2SpatialUpscale::X2),
+        )
+        .unwrap();
+        assert_eq!(path, Some(PathBuf::from("/tmp/spatial-x2.safetensors")));
+    }
+
+    #[test]
+    fn x1_5_spatial_upscaling_follows_the_presets_flag() {
+        for model in ["ltx-2-19b-distilled:fp8", "ltx-2.5-22b-distilled:int8-conv"] {
+            let err = resolve_spatial_upscaler_path(
+                model,
+                &dummy_paths(),
+                Some(Ltx2SpatialUpscale::X1_5),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("x1.5 spatial upscaling is not published"),
+                "{model}: {err}"
+            );
+        }
+        // LTX-2.3 keeps its manifest asset: the answer is the resolved file
+        // on a host that has it, or an asset-resolution error — never the
+        // capability refusal.
+        if let Err(err) = resolve_spatial_upscaler_path(
+            "ltx-2.3-22b-distilled:fp8",
+            &dummy_paths(),
+            Some(Ltx2SpatialUpscale::X1_5),
+        ) {
+            assert!(
+                !err.to_string().contains("not published"),
+                "2.3 must not be refused by the capability flag: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn x1_5_spatial_upscaling_uses_manifest_asset_entry() {
+        let manifest = find_manifest("ltx-2.3-22b-distilled:fp8").unwrap();
+        assert!(manifest.files.iter().any(|file| {
+            file.component == ModelComponent::SpatialUpscaler
+                && file.hf_filename == "ltx-2.3-spatial-upscaler-x1.5-1.0.safetensors"
+        }));
+    }
+
+    #[test]
+    fn temporal_upscaling_uses_configured_asset() {
+        let path =
+            resolve_temporal_upscaler_path(&dummy_paths(), Some(Ltx2TemporalUpscale::X2)).unwrap();
+        assert_eq!(path, Some(PathBuf::from("/tmp/temporal.safetensors")));
+    }
+
+    #[test]
+    fn temporal_upscaling_requires_configured_asset() {
+        let mut paths = dummy_paths();
+        paths.temporal_upscaler = None;
+        let err =
+            resolve_temporal_upscaler_path(&paths, Some(Ltx2TemporalUpscale::X2)).unwrap_err();
+        assert!(err.to_string().contains("temporal upsampler asset"));
+    }
+}

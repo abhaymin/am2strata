@@ -1,0 +1,86 @@
+use std::process::Command;
+mod build_git_watch;
+
+/// Keep in sync with `build_info::SHORT_SHA_LENGTH`, which pins the display
+/// width so chrome layouts cannot be shifted by the exact SHA's length.
+const SHORT_SHA_LENGTH: usize = 7;
+
+fn main() {
+    // Try git SHA from environment first (Nix builds pass MOLD_GIT_SHA),
+    // then fall back to running git.
+    let sha = std::env::var("MOLD_GIT_SHA")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+
+    // Try build date from environment first (Nix builds pass MOLD_BUILD_DATE),
+    // then fall back to git commit date.
+    let date = std::env::var("MOLD_BUILD_DATE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            Command::new("git")
+                .args(["log", "-1", "--format=%cs"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        });
+
+    // Human-readable surfaces abbreviate. `MOLD_GIT_SHA` is exact because the
+    // private H3 campaign identity needs an unambiguous commit, but a 40-char
+    // SHA in a status line is 33 columns of chrome nobody reads.
+    let short_sha = if sha == "unknown" {
+        sha.clone()
+    } else {
+        sha.chars().take(SHORT_SHA_LENGTH).collect::<String>()
+    };
+
+    println!("cargo:rustc-env=MOLD_GIT_SHA={sha}");
+    println!("cargo:rustc-env=MOLD_GIT_SHA_SHORT={short_sha}");
+    println!("cargo:rustc-env=MOLD_BUILD_DATE={date}");
+    let build_channel = std::env::var("MOLD_BUILD_CHANNEL")
+        .ok()
+        .filter(|channel| matches!(channel.as_str(), "stable" | "nightly"))
+        .unwrap_or_else(|| "development".to_string());
+    println!("cargo:rustc-env=MOLD_BUILD_CHANNEL={build_channel}");
+
+    // Build a full version string as a compile-time constant for clap's
+    // #[command(version = ...)] which requires &'static str.
+    // Native macOS Nightly sets this to the app's resolved marketing version.
+    // Cargo's package version stays at the workspace base until release-plz
+    // cuts the next stable release.
+    let version = std::env::var("MOLD_BUILD_VERSION")
+        .ok()
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap());
+    println!("cargo:rustc-env=MOLD_BUILD_VERSION={version}");
+    let full_version = if sha == "unknown" {
+        version
+    } else {
+        format!("{version} ({short_sha} {date})")
+    };
+    println!("cargo:rustc-env=MOLD_FULL_VERSION={full_version}");
+
+    // Rerun when HEAD changes (new commit, branch switch, etc.)
+    // Linked worktrees have a .git FILE. Missing watched paths cause Cargo to
+    // rerun this script and rebuild every dependent crate on every invocation.
+    for path in build_git_watch::watch_paths(std::path::Path::new(".")) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    println!("cargo:rerun-if-env-changed=MOLD_GIT_SHA");
+    println!("cargo:rerun-if-env-changed=MOLD_BUILD_DATE");
+    println!("cargo:rerun-if-env-changed=MOLD_BUILD_CHANNEL");
+    println!("cargo:rerun-if-env-changed=MOLD_BUILD_VERSION");
+}

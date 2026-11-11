@@ -165,8 +165,9 @@ refused plainly when it named the text-only model.
    - The first try failed at the end with "device mismatch in add, lhs: Cpu, rhs: Cuda". The full VAE decode needs
      more than 16 GB at this size, and mold's tiled retry (`WanVideoVae::decode_tiled`) adds GPU tiles to its CPU
      totals. It's fixed by moving each tile and its mask to the CPU (two lines).
-   - **That fix is not in the repository yet:** it was built here against a local copy of mold. Ship it by vendoring
-     mold, a fork, or upstream: the owner's choice.
+   - **The fix is vendored** (owner's go-ahead, 2026-11-11): `vendor/mold` holds mold at its pinned revision with the
+     fix, and strata-media's `[patch]` points at it (`vendor/mold/AM2STRATA.md` says what differs and when to
+     remove it). An issue for upstream is drafted for the owner.
    - A 30 s video at this size is about 6-7 clips, so about 5 hours. That is for a finished piece rendered overnight,
      not for a quick request.
 3. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan

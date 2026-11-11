@@ -1,0 +1,1863 @@
+//! Video encoding utilities for LTX Video output.
+
+use anyhow::{Context, Result};
+use image::RgbImage;
+use std::io::{Cursor, Seek, SeekFrom, Write};
+
+struct BoundedCursor {
+    inner: Cursor<Vec<u8>>,
+    max_bytes: usize,
+}
+
+impl BoundedCursor {
+    fn new(max_bytes: usize) -> Result<Self> {
+        anyhow::ensure!(
+            max_bytes > 0,
+            "bounded media output requires a nonzero limit"
+        );
+        let bytes = if max_bytes == usize::MAX {
+            Vec::new()
+        } else {
+            Vec::with_capacity(max_bytes)
+        };
+        anyhow::ensure!(
+            max_bytes == usize::MAX || bytes.capacity() == max_bytes,
+            "bounded media allocator did not honor the exact capacity"
+        );
+        Ok(Self {
+            inner: Cursor::new(bytes),
+            max_bytes,
+        })
+    }
+
+    fn into_inner(self) -> Result<Vec<u8>> {
+        let bytes = self.inner.into_inner();
+        anyhow::ensure!(
+            bytes.len() <= self.max_bytes
+                && (self.max_bytes == usize::MAX || bytes.capacity() == self.max_bytes),
+            "bounded media output violated its allocation limit"
+        );
+        Ok(bytes)
+    }
+}
+
+impl Write for BoundedCursor {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = usize::try_from(self.inner.position())
+            .ok()
+            .and_then(|position| position.checked_add(buf.len()))
+            .ok_or_else(|| std::io::Error::other("bounded media output size overflow"))?;
+        if end > self.max_bytes {
+            return Err(std::io::Error::other(
+                "bounded media output exceeds its limit",
+            ));
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for BoundedCursor {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let previous = self.inner.position();
+        let next = self.inner.seek(position)?;
+        if next > self.max_bytes as u64 {
+            self.inner.set_position(previous);
+            return Err(std::io::Error::other(
+                "bounded media seek exceeds its limit",
+            ));
+        }
+        Ok(next)
+    }
+}
+
+/// Generation metadata embedded as tEXt chunks in APNG output.
+pub struct VideoMetadata {
+    pub prompt: String,
+    pub model: String,
+    pub seed: u64,
+    pub steps: u32,
+    pub guidance: f64,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub fps: u32,
+}
+
+impl VideoMetadata {
+    /// Canonical form for the shared PNG chunk writer, so APNG output
+    /// carries the same composite `mold:parameters` block still images do.
+    fn to_output_metadata(&self) -> mold_core::OutputMetadata {
+        mold_core::OutputMetadata {
+            family: mold_core::validation::resolved_family_for(&self.model).map(str::to_owned),
+            video_only: None,
+            attention_path: None,
+            mesh_workflow: None,
+            int8_arm: None,
+            collection: None,
+            tags: None,
+            title: None,
+            generation_time_ms: None,
+            source_fit: None,
+            guidance_overrides: None,
+            sample_shift: None,
+            distill_strength_high: None,
+            distill_strength_low: None,
+            job_id: None,
+            prompt: self.prompt.clone(),
+            negative_prompt: None,
+            original_prompt: None,
+            prompt_transform: None,
+            batch_id: None,
+            batch_index: None,
+            batch_count: None,
+            output_mode: Some(mold_core::GenerationOutputMode::OneShot),
+            model: self.model.clone(),
+            seed: self.seed,
+            steps: self.steps,
+            guidance: self.guidance,
+            width: self.width,
+            height: self.height,
+            generation_width: Some(self.width),
+            mesh: None,
+            generation_height: Some(self.height),
+            strength: None,
+            source_image_name: None,
+            source_image_sha256: None,
+            edit_image_sha256s: None,
+            reference_weight: None,
+            references: None,
+            keyframes: None,
+            scheduler: None,
+            output_format: Some(mold_core::OutputFormat::Apng),
+            cfg_plus: None,
+            lora: None,
+            lora_scale: None,
+            loras: None,
+            control_model: None,
+            control_scale: None,
+            upscale_model: None,
+            gif_preview: None,
+            enable_audio: None,
+            audio_file_path: None,
+            source_video_path: None,
+            extend_video_path: None,
+            extend_overlap_frames: None,
+            pipeline: None,
+            pipeline_requested: None,
+            duration_prediction_requested: None,
+            pipeline_provenance_sha256: None,
+            source_preprocessing: None,
+            ic_lora_control: None,
+            hdr_exr_dir: None,
+            hdr_exr_full_float: false,
+            retake_range: None,
+            spatial_upscale: None,
+            temporal_upscale: None,
+            frames: Some(self.frames),
+            fps: Some(self.fps),
+            chain_job_id: None,
+            chain: None,
+            video_job: None,
+            version: mold_core::build_info::version_string(),
+            id_image_name: None,
+            id_image_sha256: None,
+            id_weight: None,
+            id_start_step: None,
+            id_image_names: None,
+            id_image_sha256s: None,
+            true_cfg: None,
+            cfg_start_step: None,
+            has_alpha: None,
+            prefix_cache: None,
+            transparent_background: None,
+        }
+    }
+}
+
+/// Encode a sequence of RGB frames into an animated GIF.
+///
+/// Uses per-frame NeuQuant palette quantization (256 colors).
+pub fn encode_gif(frames: &[RgbImage], fps: u32) -> Result<Vec<u8>> {
+    encode_gif_with_options(frames, fps, false, true)
+}
+
+/// GIF timing precision is 10 ms; refuse ineffective one-shot loop pauses.
+pub fn validate_gif_pause(bounce: bool, repeat_forever: bool, pause_ms: u32) -> Result<()> {
+    anyhow::ensure!(
+        pause_ms <= 5000 && pause_ms.is_multiple_of(10),
+        "pause_ms must be between 0 and 5000 in 10 ms increments"
+    );
+    anyhow::ensure!(
+        pause_ms == 0 || bounce || repeat_forever,
+        "pause_ms requires looping or bounce playback"
+    );
+    Ok(())
+}
+
+/// Encode GIF frames with export-time playback controls.
+///
+/// `bounce` appends the interior frames in reverse order so the first and last
+/// frames are not held twice at each turn. `repeat_forever = false` emits a
+/// single play-through rather than an infinite animation.
+pub fn encode_gif_with_options(
+    frames: &[RgbImage],
+    fps: u32,
+    bounce: bool,
+    repeat_forever: bool,
+) -> Result<Vec<u8>> {
+    encode_gif_with_pause(frames, fps, bounce, repeat_forever, 0)
+}
+
+/// Encode with an extra boundary pause; zero preserves the original cadence.
+pub fn encode_gif_with_pause(
+    frames: &[RgbImage],
+    fps: u32,
+    bounce: bool,
+    repeat_forever: bool,
+    pause_ms: u32,
+) -> Result<Vec<u8>> {
+    validate_gif_pause(bounce, repeat_forever, pause_ms)?;
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+    anyhow::ensure!(fps > 0, "GIF frame rate must be greater than zero");
+
+    let (width, height) = (frames[0].width() as u16, frames[0].height() as u16);
+    let delay_cs = (100.0 / fps as f64).round() as u16;
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(&mut buf, width, height, &[])
+            .context("failed to create GIF encoder")?;
+        encoder
+            .set_repeat(if repeat_forever {
+                gif::Repeat::Infinite
+            } else {
+                gif::Repeat::Finite(0)
+            })
+            .context("failed to set GIF repeat")?;
+
+        let mut write_frame = |index: usize, frame_img: &RgbImage| -> Result<()> {
+            let rgba: image::RgbaImage =
+                image::DynamicImage::ImageRgb8(frame_img.clone()).into_rgba8();
+            let mut pixels = rgba.into_raw();
+
+            let mut gif_frame = gif::Frame::from_rgba_speed(width, height, &mut pixels, 10);
+            let boundary = (index == frames.len() - 1
+                && (repeat_forever || (bounce && frames.len() > 1)))
+                || (index == 0 && bounce && repeat_forever);
+            gif_frame.delay = delay_cs + if boundary { (pause_ms / 10) as u16 } else { 0 };
+            gif_frame.dispose = gif::DisposalMethod::Any;
+
+            encoder
+                .write_frame(&gif_frame)
+                .context("failed to write GIF frame")?;
+            Ok(())
+        };
+
+        for (index, frame_img) in frames.iter().enumerate() {
+            write_frame(index, frame_img)?;
+        }
+        if bounce && frames.len() > 1 {
+            let reverse_start = usize::from(repeat_forever);
+            for index in (reverse_start..frames.len() - 1).rev() {
+                write_frame(index, &frames[index])?;
+            }
+        }
+    }
+    Ok(buf)
+}
+
+/// [`encode_gif_with_options`] for frames that carry their own alpha.
+///
+/// GIF transparency is one palette index, not a channel, so the alpha is
+/// thresholded: a pixel the caller left fully clear becomes the transparent
+/// index and everything else is opaque. That is why the mesh turntable
+/// renders its silhouette antialiased and then hard-cuts here — a GIF cannot
+/// hold the soft edge, and dithering coverage would fringe it.
+///
+/// Every frame disposes to the background. With the opaque encoder's
+/// `DisposalMethod::Any` a cleared pixel would keep whatever the previous
+/// frame drew there, so a spinning object would smear its own trail across
+/// the transparent area.
+pub fn encode_gif_rgba_with_options(
+    frames: &[image::RgbaImage],
+    fps: u32,
+    bounce: bool,
+    repeat_forever: bool,
+) -> Result<Vec<u8>> {
+    encode_gif_rgba_with_pause(frames, fps, bounce, repeat_forever, 0)
+}
+
+/// Encode with an extra boundary pause; zero preserves the original cadence.
+pub fn encode_gif_rgba_with_pause(
+    frames: &[image::RgbaImage],
+    fps: u32,
+    bounce: bool,
+    repeat_forever: bool,
+    pause_ms: u32,
+) -> Result<Vec<u8>> {
+    validate_gif_pause(bounce, repeat_forever, pause_ms)?;
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+    anyhow::ensure!(fps > 0, "GIF frame rate must be greater than zero");
+
+    let (width, height) = (frames[0].width() as u16, frames[0].height() as u16);
+    let delay_cs = (100.0 / fps as f64).round() as u16;
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = gif::Encoder::new(&mut buf, width, height, &[])
+            .context("failed to create GIF encoder")?;
+        encoder
+            .set_repeat(if repeat_forever {
+                gif::Repeat::Infinite
+            } else {
+                gif::Repeat::Finite(0)
+            })
+            .context("failed to set GIF repeat")?;
+
+        let mut write_frame = |index: usize, frame_img: &image::RgbaImage| -> Result<()> {
+            let mut pixels = frame_img.as_raw().clone();
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                if pixel[3] >= ALPHA_CUTOFF {
+                    pixel[3] = 255;
+                } else {
+                    // Cleared pixels are stamped with ONE colour so the
+                    // transparent palette entry is deterministic:
+                    // `Frame::from_rgba_speed` takes its transparent colour
+                    // from the LAST sub-cutoff pixel in scan order, and the
+                    // renderer only writes a bare `[0, 0, 0, 0]` for fully
+                    // cleared pixels — the antialiased edge arrives carrying
+                    // the object's own RGB under a low alpha. Left alone,
+                    // which colour ends up standing for "transparent" depends
+                    // on where the silhouette happens to end.
+                    *pixel = CLEAR_SENTINEL;
+                }
+            }
+            let mut gif_frame = gif::Frame::from_rgba_speed(width, height, &mut pixels, 10);
+            let boundary = (index == frames.len() - 1
+                && (repeat_forever || (bounce && frames.len() > 1)))
+                || (index == 0 && bounce && repeat_forever);
+            gif_frame.delay = delay_cs + if boundary { (pause_ms / 10) as u16 } else { 0 };
+            gif_frame.dispose = gif::DisposalMethod::Background;
+
+            encoder
+                .write_frame(&gif_frame)
+                .context("failed to write GIF frame")?;
+            Ok(())
+        };
+
+        for (index, frame_img) in frames.iter().enumerate() {
+            write_frame(index, frame_img)?;
+        }
+        if bounce && frames.len() > 1 {
+            let reverse_start = usize::from(repeat_forever);
+            for index in (reverse_start..frames.len() - 1).rev() {
+                write_frame(index, &frames[index])?;
+            }
+        }
+    }
+    Ok(buf)
+}
+
+/// Alpha at or above which a GIF pixel is drawn rather than left clear.
+///
+/// The midpoint: the rasterizer's antialiased silhouette is symmetric about
+/// it, so a hard cut here keeps the object the size it was rendered at
+/// instead of eroding or dilating its outline.
+const ALPHA_CUTOFF: u8 = 128;
+
+/// The RGBA a cleared pixel is stamped with before quantization.
+///
+/// Transparent black, which is what [`Backdrop::Transparent`] already writes
+/// for a fully cleared pixel, so this only restates it for the antialiased
+/// edge. It is NOT a garish sentinel on purpose: the entry is never drawn by
+/// a decoder that honours transparency, but one that ignores it composites
+/// this colour, and black is the backdrop the poster would have used anyway.
+///
+/// [`Backdrop::Transparent`]: crate::hunyuan3d::poster::Backdrop
+const CLEAR_SENTINEL: [u8; 4] = [0, 0, 0, 0];
+
+/// [`encode_apng`] for frames that carry their own alpha. APNG holds the full
+/// channel, so the antialiased silhouette survives intact.
+pub fn encode_apng_rgba(frames: &[image::RgbaImage], fps: u32) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+
+    let (width, height) = (frames[0].width(), frames[0].height());
+    let num_frames = frames.len() as u32;
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_animated(num_frames, 0)?;
+        encoder.set_frame_delay(1, fps as u16)?;
+
+        let mut writer = encoder
+            .write_header()
+            .context("failed to write APNG header")?;
+
+        for (i, frame) in frames.iter().enumerate() {
+            if i > 0 {
+                // Replace rather than blend, and clear first: a transparent
+                // pixel must show through to the page, not to frame i - 1.
+                writer.set_blend_op(png::BlendOp::Source)?;
+                writer.set_dispose_op(png::DisposeOp::Background)?;
+            }
+            writer
+                .write_image_data(frame.as_raw())
+                .with_context(|| format!("failed to write APNG frame {i}"))?;
+        }
+
+        writer.finish().context("failed to finalize APNG")?;
+    }
+    Ok(buf)
+}
+
+/// [`encode_webp`] for frames that carry their own alpha.
+#[cfg(feature = "webp")]
+pub fn encode_webp_rgba(frames: &[image::RgbaImage], fps: u32) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+
+    let (width, height) = (frames[0].width(), frames[0].height());
+    let frame_duration_ms = (1000.0 / fps as f64).round() as i32;
+
+    let mut encoder = webp_animation::Encoder::new((width, height))
+        .map_err(|e| anyhow::anyhow!("failed to create WebP encoder: {e}"))?;
+
+    for (i, frame_img) in frames.iter().enumerate() {
+        let timestamp_ms = i as i32 * frame_duration_ms;
+        encoder
+            .add_frame(frame_img.as_raw(), timestamp_ms)
+            .map_err(|e| anyhow::anyhow!("failed to add WebP frame {i}: {e}"))?;
+    }
+
+    let final_timestamp_ms = frames.len() as i32 * frame_duration_ms;
+    let webp_data = encoder
+        .finalize(final_timestamp_ms)
+        .map_err(|e| anyhow::anyhow!("failed to finalize WebP animation: {e}"))?;
+
+    Ok(webp_data.to_vec())
+}
+
+/// Extract the first frame as a PNG thumbnail.
+pub fn first_frame_png(frames: &[RgbImage]) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames for thumbnail");
+
+    let mut buf = std::io::Cursor::new(Vec::new());
+    frames[0]
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .context("failed to encode thumbnail PNG")?;
+    Ok(buf.into_inner())
+}
+
+/// Extract the first frame while rejecting output growth beyond `max_bytes`.
+pub fn first_frame_png_bounded(frames: &[RgbImage], max_bytes: usize) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames for thumbnail");
+    let mut output = BoundedCursor::new(max_bytes)?;
+    frames[0]
+        .write_to(&mut output, image::ImageFormat::Png)
+        .context("failed to encode bounded thumbnail PNG")?;
+    output.into_inner()
+}
+
+/// Encode a sequence of RGB frames into an animated PNG (APNG).
+///
+/// Loops infinitely. Optionally embeds generation metadata as tEXt/iTXt chunks.
+pub fn encode_apng(
+    frames: &[RgbImage],
+    fps: u32,
+    metadata: Option<&VideoMetadata>,
+) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+
+    let (width, height) = (frames[0].width(), frames[0].height());
+    let num_frames = frames.len() as u32;
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_animated(num_frames, 0)?;
+        encoder.set_frame_delay(1, fps as u16)?;
+
+        if let Some(meta) = metadata {
+            crate::image::add_metadata_chunks(&mut encoder, &meta.to_output_metadata())?;
+        }
+
+        let mut writer = encoder
+            .write_header()
+            .context("failed to write APNG header")?;
+
+        for (i, frame) in frames.iter().enumerate() {
+            if i > 0 {
+                writer.set_blend_op(png::BlendOp::Source)?;
+                writer.set_dispose_op(png::DisposeOp::Background)?;
+            }
+            writer
+                .write_image_data(frame.as_raw())
+                .with_context(|| format!("failed to write APNG frame {i}"))?;
+        }
+
+        writer.finish().context("failed to finalize APNG")?;
+    }
+    Ok(buf)
+}
+
+/// Encode a sequence of RGB frames into an animated WebP.
+///
+/// Uses the `webp-animation` crate (statically linked libwebp).
+#[cfg(feature = "webp")]
+pub fn encode_webp(frames: &[RgbImage], fps: u32) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+
+    let (width, height) = (frames[0].width(), frames[0].height());
+    let frame_duration_ms = (1000.0 / fps as f64).round() as i32;
+
+    let mut encoder = webp_animation::Encoder::new((width, height))
+        .map_err(|e| anyhow::anyhow!("failed to create WebP encoder: {e}"))?;
+
+    for (i, frame_img) in frames.iter().enumerate() {
+        let rgba: image::RgbaImage = image::DynamicImage::ImageRgb8(frame_img.clone()).into_rgba8();
+        let timestamp_ms = i as i32 * frame_duration_ms;
+        encoder
+            .add_frame(rgba.as_raw(), timestamp_ms)
+            .map_err(|e| anyhow::anyhow!("failed to add WebP frame {i}: {e}"))?;
+    }
+
+    let final_timestamp_ms = frames.len() as i32 * frame_duration_ms;
+    let webp_data = encoder
+        .finalize(final_timestamp_ms)
+        .map_err(|e| anyhow::anyhow!("failed to finalize WebP animation: {e}"))?;
+
+    Ok(webp_data.to_vec())
+}
+
+/// Split Annex B byte stream (00 00 00 01 or 00 00 01 delimited) into NAL units.
+fn split_annex_b_nals(data: &[u8]) -> Vec<&[u8]> {
+    let mut nals = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        // Find start code (00 00 00 01 or 00 00 01)
+        let sc_len = if i + 4 <= data.len() && data[i..i + 4] == [0, 0, 0, 1] {
+            4
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0, 0, 1] {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
+        let nal_start = i + sc_len;
+        // Find next start code or end
+        let mut nal_end = data.len();
+        let mut j = nal_start;
+        while j + 3 <= data.len() {
+            if data[j..j + 3] == [0, 0, 1]
+                || (j + 4 <= data.len() && data[j..j + 4] == [0, 0, 0, 1])
+            {
+                // Trim trailing zeros that are part of the start code
+                nal_end = j;
+                while nal_end > nal_start && data[nal_end - 1] == 0 {
+                    nal_end -= 1;
+                }
+                break;
+            }
+            j += 1;
+        }
+        if nal_start < nal_end {
+            nals.push(&data[nal_start..nal_end]);
+        }
+        i = if j < data.len() { j } else { data.len() };
+    }
+    nals
+}
+
+/// Incremental MP4 encoder: push frames one at a time, mux on `finish()`.
+///
+/// Peak memory is the encoded H.264 samples (~100× smaller than raw RGB),
+/// not the frame set — this is what lets chain finalize stream arbitrarily
+/// long videos through a bounded window. `encode_mp4` is a thin wrapper
+/// over this type; the two produce byte-identical output for the same
+/// frames (asserted by `stream_encoder_matches_slice_encoder_byte_for_byte`).
+pub struct Mp4StreamEncoder {
+    encoder: openh264::encoder::Encoder,
+    samples: Vec<(Box<[u8]>, bool)>,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    width: u32,
+    height: u32,
+    fps: u32,
+    max_mp4_bytes: Option<usize>,
+    sample_payload_bytes: usize,
+}
+
+impl Mp4StreamEncoder {
+    pub fn new(width: u32, height: u32, fps: u32) -> Result<Self> {
+        Self::new_with_limit(width, height, fps, None)
+    }
+
+    pub fn new_bounded(width: u32, height: u32, fps: u32, max_mp4_bytes: usize) -> Result<Self> {
+        anyhow::ensure!(
+            max_mp4_bytes > 0,
+            "bounded MP4 output requires a nonzero limit"
+        );
+        Self::new_with_limit(width, height, fps, Some(max_mp4_bytes))
+    }
+
+    fn new_with_limit(
+        width: u32,
+        height: u32,
+        fps: u32,
+        max_mp4_bytes: Option<usize>,
+    ) -> Result<Self> {
+        use openh264::encoder::{EncoderConfig, FrameRate, VuiConfig};
+
+        let config = EncoderConfig::new()
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
+            .bitrate(openh264::encoder::BitRate::from_bps(10_000_000))
+            .rate_control_mode(openh264::encoder::RateControlMode::Quality)
+            // Every pushed frame must become exactly one MP4 sample: generated
+            // clips promise an exact frame count and duration downstream
+            // (H3's publication contract validates mdhd duration against
+            // frames/fps). openh264 defaults to rate-control frame skipping,
+            // which emits an empty bitstream for the skipped frame and would
+            // silently shorten the track.
+            .skip_frames(false)
+            .profile(openh264::encoder::Profile::High)
+            .vui(VuiConfig::bt601()); // BT.601 limited range — matches YUVBuffer::from_rgb_source()
+
+        let api = openh264::OpenH264API::from_source();
+        let encoder = openh264::encoder::Encoder::with_api_config(api, config)
+            .context("failed to create H.264 encoder")?;
+        Ok(Self {
+            encoder,
+            samples: Vec::new(),
+            sps: None,
+            pps: None,
+            width,
+            height,
+            fps,
+            max_mp4_bytes,
+            sample_payload_bytes: 0,
+        })
+    }
+
+    pub fn push(&mut self, frame: &RgbImage) -> Result<()> {
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        anyhow::ensure!(
+            frame.width() == self.width && frame.height() == self.height,
+            "frame is {}x{} but encoder expects {}x{}",
+            frame.width(),
+            frame.height(),
+            self.width,
+            self.height,
+        );
+
+        let rgb = RgbSliceU8::new(frame.as_raw(), (self.width as usize, self.height as usize));
+        let yuv = YUVBuffer::from_rgb_source(rgb);
+        let bitstream = self
+            .encoder
+            .encode(&yuv)
+            .context("failed to encode H.264 frame")?;
+        let is_key = matches!(bitstream.frame_type(), openh264::encoder::FrameType::IDR);
+
+        let annex_b = bitstream.to_vec();
+        let mut frame_nals = Vec::new();
+        let mut has_vcl_nal = false;
+        for nal in split_annex_b_nals(&annex_b) {
+            if nal.is_empty() {
+                continue;
+            }
+            let nal_type = nal[0] & 0x1F;
+            match nal_type {
+                7 => self.sps = Some(nal.to_vec()),
+                8 => self.pps = Some(nal.to_vec()),
+                _ => {
+                    // Types 1 (non-IDR slice) and 5 (IDR slice) are the VCL
+                    // NALs this AVC configuration can produce; anything else
+                    // (SEI etc.) rides along but is not a picture.
+                    if matches!(nal_type, 1 | 5) {
+                        has_vcl_nal = true;
+                    }
+                    let len = nal.len() as u32;
+                    frame_nals.extend_from_slice(&len.to_be_bytes());
+                    frame_nals.extend_from_slice(nal);
+                }
+            }
+        }
+        drop(annex_b);
+        if !has_vcl_nal {
+            // A pushed frame that yields no picture slice (a rate-control
+            // skip, a parameter-set-only bitstream, or an SEI-only access
+            // unit) would either be absent from the sample table or sit in it
+            // undecodable — both leave the track disagreeing with the pushed
+            // frame count. Fail loudly instead of publishing such a clip.
+            anyhow::bail!(
+                "H.264 encoder produced no VCL NAL for a pushed frame \
+                 (frame type {:?})",
+                bitstream.frame_type()
+            );
+        }
+        let payload_bytes = self
+            .sample_payload_bytes
+            .checked_add(frame_nals.len())
+            .context("H.264 sample payload size overflowed")?;
+        if self
+            .max_mp4_bytes
+            .is_some_and(|max_bytes| payload_bytes > max_bytes)
+        {
+            anyhow::bail!("H.264 sample payload exceeds its bounded MP4 limit");
+        }
+        self.sample_payload_bytes = payload_bytes;
+        self.samples.push((frame_nals.into_boxed_slice(), is_key));
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        anyhow::ensure!(!self.samples.is_empty(), "no frames to encode");
+        let sps = self.sps.context("H.264 encoder produced no SPS")?;
+        let pps = self.pps.context("H.264 encoder produced no PPS")?;
+        mp4_mux::write_mp4(
+            &self.samples,
+            &sps,
+            &pps,
+            self.width,
+            self.height,
+            self.fps,
+            self.max_mp4_bytes,
+        )
+    }
+}
+
+/// File-backed H.264 encoder. Only one encoded picture remains in memory.
+pub struct Mp4FileEncoder {
+    encoder: Mp4StreamEncoder,
+    writer: Option<mp4_rs::Mp4Writer<std::fs::File>>,
+    output: std::fs::File,
+    frames: u64,
+    poisoned: bool,
+}
+
+impl Mp4FileEncoder {
+    pub fn new(output: std::fs::File, width: u32, height: u32, fps: u32) -> Result<Self> {
+        anyhow::ensure!(
+            output.metadata()?.len() == 0,
+            "encoder staging file must be empty"
+        );
+        anyhow::ensure!(
+            width > 0
+                && height > 0
+                && width <= u16::MAX as u32
+                && height <= u16::MAX as u32
+                && fps > 0
+                && fps.checked_mul(1000).is_some(),
+            "invalid encoder dimensions or frame rate"
+        );
+        Ok(Self {
+            encoder: Mp4StreamEncoder::new(width, height, fps)?,
+            writer: None,
+            output,
+            frames: 0,
+            poisoned: false,
+        })
+    }
+
+    pub fn push(&mut self, frame: &RgbImage) -> Result<()> {
+        anyhow::ensure!(!self.poisoned, "file encoder already failed");
+        let result = self.push_inner(frame);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    fn push_inner(&mut self, frame: &RgbImage) -> Result<()> {
+        anyhow::ensure!(
+            self.frames < u64::from(u32::MAX),
+            "MP4 sample table exhausted"
+        );
+        // Bounded GOPs make tail extraction independent of the movie length.
+        if self.frames > 0 && self.frames.is_multiple_of(u64::from(self.encoder.fps) * 2) {
+            self.encoder.encoder.force_intra_frame();
+        }
+        let old_sps = self.encoder.sps.clone();
+        let old_pps = self.encoder.pps.clone();
+        self.encoder.push(frame)?;
+        anyhow::ensure!(
+            old_sps
+                .as_ref()
+                .is_none_or(|sps| Some(sps) == self.encoder.sps.as_ref())
+                && old_pps
+                    .as_ref()
+                    .is_none_or(|pps| Some(pps) == self.encoder.pps.as_ref()),
+            "encoder decoder configuration changed"
+        );
+        if self.writer.is_none() {
+            use mp4_rs::{AvcConfig, MediaConfig, Mp4Config, Mp4Writer, TrackConfig, TrackType};
+            let config = Mp4Config {
+                major_brand: "isom".parse()?,
+                minor_version: 0x200,
+                compatible_brands: vec![
+                    "isom".parse()?,
+                    "iso2".parse()?,
+                    "avc1".parse()?,
+                    "mp41".parse()?,
+                ],
+                timescale: self.encoder.fps * 1000,
+            };
+            let mut writer = Mp4Writer::write_start(self.output.try_clone()?, &config)?;
+            writer.add_track(&TrackConfig {
+                track_type: TrackType::Video,
+                timescale: config.timescale,
+                language: "und".into(),
+                media_conf: MediaConfig::AvcConfig(AvcConfig {
+                    width: self.encoder.width as u16,
+                    height: self.encoder.height as u16,
+                    seq_param_set: self.encoder.sps.clone().context("missing SPS")?,
+                    pic_param_set: self.encoder.pps.clone().context("missing PPS")?,
+                }),
+            })?;
+            self.writer = Some(writer);
+        }
+        let (bytes, is_sync) = self
+            .encoder
+            .samples
+            .pop()
+            .context("missing encoded picture")?;
+        self.encoder.sample_payload_bytes = 0;
+        self.writer
+            .as_mut()
+            .context("missing writer")?
+            .write_sample(
+                1,
+                &mp4_rs::Mp4Sample {
+                    start_time: self.frames * 1000,
+                    duration: 1000,
+                    rendering_offset: 0,
+                    is_sync,
+                    bytes: bytes.into_vec().into(),
+                },
+            )?;
+        self.frames += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<u64> {
+        anyhow::ensure!(
+            !self.poisoned && self.frames > 0,
+            "cannot finish failed or empty file encoder"
+        );
+        self.writer
+            .as_mut()
+            .context("missing writer")?
+            .write_end()?;
+        drop(self.writer.take());
+        let stsd = mp4_mux::build_stsd(
+            self.encoder.sps.as_ref().context("missing SPS")?,
+            self.encoder.pps.as_ref().context("missing PPS")?,
+            self.encoder.width,
+            self.encoder.height,
+        );
+        crate::video_assembly_boxes::replace_track_box(
+            &mut self.output,
+            1,
+            &[*b"mdia", *b"minf", *b"stbl", *b"stsd"],
+            &stsd,
+        )?;
+        self.output.sync_all()?;
+        Ok(self.frames)
+    }
+}
+
+/// Encode a sequence of RGB frames into an MP4 (H.264/AVC) video.
+///
+/// Uses OpenH264 for H.264 encoding with a minimal QuickTime-compatible MP4 muxer.
+/// Produces `ftyp[isom,iso2,avc1,mp41] + moov + mdat` (faststart layout).
+pub fn encode_mp4(frames: &[RgbImage], fps: u32) -> Result<Vec<u8>> {
+    anyhow::ensure!(!frames.is_empty(), "no frames to encode");
+    let (width, height) = (frames[0].width(), frames[0].height());
+    let mut enc = Mp4StreamEncoder::new(width, height, fps)?;
+    for frame in frames {
+        enc.push(frame)?;
+    }
+    enc.finish()
+}
+
+/// Minimal MP4 muxer producing QuickTime/macOS-compatible output.
+///
+/// Writes ftyp(isom,iso2,avc1,mp41) + moov(mvhd,trak(tkhd,edts,mdia(mdhd,hdlr,minf(vmhd,dinf,stbl)))) + mdat.
+mod mp4_mux {
+    use anyhow::Result;
+
+    fn write_u16(buf: &mut Vec<u8>, v: u16) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn write_u32(buf: &mut Vec<u8>, v: u32) {
+        buf.extend_from_slice(&v.to_be_bytes());
+    }
+
+    /// Write an MP4 box: size(4) + type(4) + content
+    fn write_box(buf: &mut Vec<u8>, box_type: &[u8; 4], content: &[u8]) {
+        write_u32(buf, (8 + content.len()) as u32);
+        buf.extend_from_slice(box_type);
+        buf.extend_from_slice(content);
+    }
+
+    fn build_ftyp() -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut content = Vec::new();
+        content.extend_from_slice(b"isom"); // major_brand
+        write_u32(&mut content, 0x200); // minor_version
+        content.extend_from_slice(b"isom"); // compatible brands
+        content.extend_from_slice(b"iso2");
+        content.extend_from_slice(b"avc1");
+        content.extend_from_slice(b"mp41");
+        write_box(&mut b, b"ftyp", &content);
+        b
+    }
+
+    fn build_mvhd(duration_ticks: u32, timescale: u32) -> Vec<u8> {
+        let mut c = Vec::new();
+        write_u32(&mut c, 0); // version + flags
+        write_u32(&mut c, 0); // creation_time
+        write_u32(&mut c, 0); // modification_time
+        write_u32(&mut c, timescale); // timescale
+        write_u32(&mut c, duration_ticks); // duration
+        write_u32(&mut c, 0x0001_0000); // rate (1.0 fixed point)
+        write_u16(&mut c, 0x0100); // volume (1.0 fixed point)
+        c.extend_from_slice(&[0u8; 10]); // reserved
+                                         // Unity matrix (identity 3x3)
+        for &v in &[0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+            write_u32(&mut c, v);
+        }
+        c.extend_from_slice(&[0u8; 24]); // pre_defined
+        write_u32(&mut c, 2); // next_track_ID
+        let mut b = Vec::new();
+        write_box(&mut b, b"mvhd", &c);
+        b
+    }
+
+    fn build_avc_c(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+        let profile_idc = if sps.len() > 1 { sps[1] } else { 0x42 };
+        let compat = if sps.len() > 2 { sps[2] } else { 0xC0 };
+        let level_idc = if sps.len() > 3 { sps[3] } else { 0x1E };
+
+        let mut c = vec![
+            1, // configurationVersion
+            profile_idc,
+            compat,
+            level_idc,
+            0xFF, // lengthSizeMinusOne = 3 (4-byte NAL lengths)
+            0xE1, // numOfSequenceParameterSets = 1
+        ];
+        write_u16(&mut c, sps.len() as u16);
+        c.extend_from_slice(sps);
+        c.push(1); // numOfPictureParameterSets = 1
+        write_u16(&mut c, pps.len() as u16);
+        c.extend_from_slice(pps);
+        let mut b = Vec::new();
+        write_box(&mut b, b"avcC", &c);
+        b
+    }
+
+    pub(super) fn build_stsd(sps: &[u8], pps: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let mut stsd_content = Vec::new();
+        write_u32(&mut stsd_content, 0); // version + flags
+        write_u32(&mut stsd_content, 1); // entry_count
+        {
+            // avc1 visual sample entry
+            let mut avc1 = Vec::new();
+            avc1.extend_from_slice(&[0u8; 6]); // reserved
+            write_u16(&mut avc1, 1); // data_reference_index
+            avc1.extend_from_slice(&[0u8; 16]); // pre_defined + reserved
+            write_u16(&mut avc1, width as u16);
+            write_u16(&mut avc1, height as u16);
+            write_u32(&mut avc1, 0x0048_0000); // horizresolution (72 dpi)
+            write_u32(&mut avc1, 0x0048_0000); // vertresolution (72 dpi)
+            write_u32(&mut avc1, 0); // reserved
+            write_u16(&mut avc1, 1); // frame_count
+            avc1.extend_from_slice(&[0u8; 32]); // compressorname
+            write_u16(&mut avc1, 0x0018); // depth (24-bit)
+            write_u16(&mut avc1, 0xFFFF); // pre_defined (-1)
+                                          // avcC box
+            avc1.extend_from_slice(&build_avc_c(sps, pps));
+            // colr box (BT.601/SMPTE 170M — matches YUVBuffer::from_rgb_source() conversion)
+            let mut colr = Vec::new();
+            colr.extend_from_slice(b"nclx");
+            write_u16(&mut colr, 6); // colour_primaries (SMPTE 170M / BT.601)
+            write_u16(&mut colr, 6); // transfer_characteristics (SMPTE 170M)
+            write_u16(&mut colr, 6); // matrix_coefficients (SMPTE 170M / BT.601)
+            colr.push(0x00); // full_range_flag=0 (limited range, matches SPS VUI)
+            write_box(&mut avc1, b"colr", &colr);
+            // pasp box (square pixels)
+            let mut pasp = Vec::new();
+            write_u32(&mut pasp, 1); // hSpacing
+            write_u32(&mut pasp, 1); // vSpacing
+            write_box(&mut avc1, b"pasp", &pasp);
+
+            write_box(&mut stsd_content, b"avc1", &avc1);
+        }
+        let mut result = Vec::new();
+        write_box(&mut result, b"stsd", &stsd_content);
+        result
+    }
+
+    pub fn write_mp4(
+        samples: &[(Box<[u8]>, bool)],
+        sps: &[u8],
+        pps: &[u8],
+        width: u32,
+        height: u32,
+        fps: u32,
+        max_output_bytes: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let timescale = fps * 1000;
+        let sample_duration = 1000u32; // each frame = 1000 ticks at timescale = fps*1000
+        let duration_ticks = samples.len() as u32 * sample_duration;
+
+        // Compute sample sizes and total mdat size
+        let sample_sizes: Vec<u32> = samples.iter().map(|(d, _)| d.len() as u32).collect();
+        let mdat_payload: usize = sample_sizes.iter().map(|&s| s as usize).sum();
+
+        let stsd = build_stsd(sps, pps, width, height);
+
+        // stts: sample-to-time (all frames same duration)
+        let mut stts = Vec::new();
+        write_u32(&mut stts, 0); // version + flags
+        write_u32(&mut stts, 1); // entry_count
+        write_u32(&mut stts, samples.len() as u32);
+        write_u32(&mut stts, sample_duration);
+
+        // stsc: sample-to-chunk (1 chunk with all samples)
+        let mut stsc = Vec::new();
+        write_u32(&mut stsc, 0); // version + flags
+        write_u32(&mut stsc, 1); // entry_count
+        write_u32(&mut stsc, 1); // first_chunk
+        write_u32(&mut stsc, samples.len() as u32); // samples_per_chunk
+        write_u32(&mut stsc, 1); // sample_description_index
+
+        // stsz: per-sample sizes
+        let mut stsz = Vec::new();
+        write_u32(&mut stsz, 0); // version + flags
+        write_u32(&mut stsz, 0); // sample_size (0 = variable)
+        write_u32(&mut stsz, sample_sizes.len() as u32);
+        for &sz in &sample_sizes {
+            write_u32(&mut stsz, sz);
+        }
+
+        // stss: sync sample table (keyframes)
+        let keyframes: Vec<u32> = samples
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, is_key))| *is_key)
+            .map(|(i, _)| (i + 1) as u32) // 1-indexed
+            .collect();
+        let mut stss = Vec::new();
+        write_u32(&mut stss, 0); // version + flags
+        write_u32(&mut stss, keyframes.len() as u32);
+        for &kf in &keyframes {
+            write_u32(&mut stss, kf);
+        }
+
+        // Build moov with stco pointing at correct mdat offset.
+        // Two-pass: first to measure moov size, second with correct offset.
+        let build_moov = |mdat_offset: u32| -> Vec<u8> {
+            let mut stco = Vec::new();
+            write_u32(&mut stco, 0); // version + flags
+            write_u32(&mut stco, 1); // entry_count
+            write_u32(&mut stco, mdat_offset + 8); // offset to mdat payload
+
+            let mut stbl = Vec::new();
+            stbl.extend_from_slice(&stsd);
+            write_box(&mut stbl, b"stts", &stts);
+            write_box(&mut stbl, b"stsc", &stsc);
+            write_box(&mut stbl, b"stsz", &stsz);
+            write_box(&mut stbl, b"stco", &stco);
+            write_box(&mut stbl, b"stss", &stss);
+
+            let mut dinf = Vec::new();
+            {
+                // ISO 14496-12 §8.7.2: dinf → dref → url entries
+                let mut dref_payload = Vec::new();
+                write_u32(&mut dref_payload, 0); // version + flags
+                write_u32(&mut dref_payload, 1); // entry_count
+                write_box(&mut dref_payload, b"url ", &[0, 0, 0, 1]); // self-contained flag
+                let mut dinf_content = Vec::new();
+                write_box(&mut dinf_content, b"dref", &dref_payload);
+                write_box(&mut dinf, b"dinf", &dinf_content);
+            }
+
+            let mut vmhd = Vec::new();
+            write_u32(&mut vmhd, 1); // version=0 + flags=1
+            vmhd.extend_from_slice(&[0u8; 8]); // graphicsmode + opcolor
+
+            let mut minf = Vec::new();
+            write_box(&mut minf, b"vmhd", &vmhd);
+            minf.extend_from_slice(&dinf);
+            write_box(&mut minf, b"stbl", &stbl);
+
+            let mut hdlr = Vec::new();
+            write_u32(&mut hdlr, 0); // version + flags
+            write_u32(&mut hdlr, 0); // pre_defined
+            hdlr.extend_from_slice(b"vide"); // handler_type
+            hdlr.extend_from_slice(&[0u8; 12]); // reserved
+            hdlr.extend_from_slice(b"VideoHandler\0");
+
+            let mut mdhd = Vec::new();
+            write_u32(&mut mdhd, 0); // version + flags
+            write_u32(&mut mdhd, 0); // creation_time
+            write_u32(&mut mdhd, 0); // modification_time
+            write_u32(&mut mdhd, timescale); // timescale
+            write_u32(&mut mdhd, duration_ticks); // duration
+            write_u32(&mut mdhd, 0x55C40000); // language (und) + pre_defined
+
+            let mut mdia = Vec::new();
+            write_box(&mut mdia, b"mdhd", &mdhd);
+            write_box(&mut mdia, b"hdlr", &hdlr);
+            write_box(&mut mdia, b"minf", &minf);
+
+            let mut tkhd = Vec::new();
+            write_u32(&mut tkhd, 3); // version=0 + flags=3 (enabled+in_movie)
+            write_u32(&mut tkhd, 0); // creation_time
+            write_u32(&mut tkhd, 0); // modification_time
+            write_u32(&mut tkhd, 1); // track_ID
+            write_u32(&mut tkhd, 0); // reserved
+            write_u32(&mut tkhd, duration_ticks); // duration (in mvhd timescale)
+            tkhd.extend_from_slice(&[0u8; 8]); // reserved
+            write_u16(&mut tkhd, 0); // layer
+            write_u16(&mut tkhd, 0); // alternate_group
+            write_u16(&mut tkhd, 0); // volume
+            write_u16(&mut tkhd, 0); // reserved
+            for &v in &[0x0001_0000u32, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000] {
+                write_u32(&mut tkhd, v);
+            }
+            write_u32(&mut tkhd, width << 16); // width (fixed point)
+            write_u32(&mut tkhd, height << 16); // height (fixed point)
+
+            // edts/elst: identity edit list (playback starts at media time 0)
+            let mut elst = Vec::new();
+            write_u32(&mut elst, 0); // version + flags
+            write_u32(&mut elst, 1); // entry_count
+            write_u32(&mut elst, duration_ticks); // segment_duration
+            write_u32(&mut elst, 0); // media_time (start at 0)
+            write_u32(&mut elst, 0x0001_0000); // media_rate (1.0 fixed point)
+            let mut edts = Vec::new();
+            write_box(&mut edts, b"elst", &elst);
+
+            let mut trak = Vec::new();
+            write_box(&mut trak, b"tkhd", &tkhd);
+            write_box(&mut trak, b"edts", &edts);
+            write_box(&mut trak, b"mdia", &mdia);
+
+            let mut moov = Vec::new();
+            moov.extend_from_slice(&build_mvhd(duration_ticks, timescale));
+            write_box(&mut moov, b"trak", &trak);
+
+            let mut out = Vec::new();
+            write_box(&mut out, b"moov", &moov);
+            out
+        };
+
+        // First pass: build moov with placeholder to measure its size
+        let ftyp = build_ftyp();
+        let moov_pass1 = build_moov(0);
+        let mdat_offset = (ftyp.len() + moov_pass1.len()) as u32;
+
+        // Second pass: build moov with correct mdat offset
+        let moov = build_moov(mdat_offset);
+        anyhow::ensure!(
+            moov.len() == moov_pass1.len(),
+            "moov size changed between passes ({} vs {})",
+            moov.len(),
+            moov_pass1.len()
+        );
+
+        // Build mdat (reject if payload exceeds u32 box size limit)
+        let mdat_total = 8 + mdat_payload;
+        anyhow::ensure!(
+            mdat_total <= u32::MAX as usize,
+            "MP4 mdat exceeds 4 GB limit ({} bytes) — reduce frames or resolution",
+            mdat_total
+        );
+        let output_bytes = ftyp
+            .len()
+            .checked_add(moov.len())
+            .and_then(|bytes| bytes.checked_add(mdat_total))
+            .ok_or_else(|| anyhow::anyhow!("MP4 output size overflowed"))?;
+        if max_output_bytes.is_some_and(|max_bytes| output_bytes > max_bytes) {
+            anyhow::bail!("MP4 output exceeds its configured byte limit");
+        }
+        // Assemble directly into one exactly bounded output allocation. The
+        // exact-size boxed samples stay live, but no second full mdat copy does.
+        let mut out = Vec::with_capacity(output_bytes);
+        out.extend_from_slice(&ftyp);
+        out.extend_from_slice(&moov);
+        write_u32(&mut out, mdat_total as u32);
+        out.extend_from_slice(b"mdat");
+        for (data, _) in samples {
+            out.extend_from_slice(data);
+        }
+        anyhow::ensure!(out.len() == output_bytes, "MP4 assembly length changed");
+        if let Some(max_bytes) = max_output_bytes {
+            anyhow::ensure!(
+                out.capacity() <= max_bytes,
+                "bounded MP4 assembly violated its allocation limit"
+            );
+        }
+
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn file_encoder_keeps_long_movie_boundaries_in_short_independent_gops() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder = Mp4FileEncoder::new(output.reopen().unwrap(), 32, 32, 24).unwrap();
+        for index in 0..180 {
+            encoder
+                .push(&RgbImage::from_pixel(
+                    32,
+                    32,
+                    image::Rgb([(index % 200) as u8, 80, 40]),
+                ))
+                .unwrap();
+        }
+        assert_eq!(encoder.finish().unwrap(), 180);
+        let reader =
+            crate::video_assembly_input::checked_reader(output.reopen().unwrap(), &mut || Ok(()))
+                .unwrap();
+        let keyframes = &reader.tracks()[&1]
+            .trak
+            .mdia
+            .minf
+            .stbl
+            .stss
+            .as_ref()
+            .unwrap()
+            .entries;
+        assert_eq!(keyframes, &[1, 49, 97, 145]);
+        let (_, oracle) = crate::ltx2::media::decode_video_frames_from_path(output.path()).unwrap();
+        let boundary = crate::video_assembly_frames::tail(
+            output.reopen().unwrap(),
+            153,
+            3,
+            32,
+            32,
+            &mut || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(boundary, oracle[150..153]);
+    }
+    #[test]
+    fn file_encoder_preserves_existing_picture_packets_and_presentation() {
+        use super::*;
+        let frames: Vec<_> = (0..12)
+            .map(|index| RgbImage::from_pixel(32, 32, image::Rgb([index * 10, 40, 90])))
+            .collect();
+        let expected = encode_mp4(&frames, 24).unwrap();
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let mut encoder =
+            Mp4FileEncoder::new(output.as_file().try_clone().unwrap(), 32, 32, 24).unwrap();
+        for frame in &frames {
+            encoder.push(frame).unwrap();
+        }
+        assert_eq!(encoder.finish().unwrap(), 12);
+        let mut old =
+            mp4_rs::Mp4Reader::read_header(std::io::Cursor::new(&expected), expected.len() as u64)
+                .unwrap();
+        let mut actual =
+            crate::video_assembly_input::checked_reader(output.reopen().unwrap(), &mut || Ok(()))
+                .unwrap();
+        assert_eq!(actual.tracks()[&1].sample_count(), 12);
+        for index in 1..=12 {
+            assert_eq!(
+                old.read_sample(1, index).unwrap().unwrap().bytes,
+                actual.read_sample(1, index).unwrap().unwrap().bytes
+            );
+        }
+        let original = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(original.path(), expected).unwrap();
+        let path = [*b"mdia", *b"minf", *b"stbl", *b"stsd"];
+        assert_eq!(
+            crate::video_assembly_boxes::read_track_box(
+                &mut original.reopen().unwrap(),
+                1,
+                &path,
+                4096
+            )
+            .unwrap(),
+            crate::video_assembly_boxes::read_track_box(
+                &mut output.reopen().unwrap(),
+                1,
+                &path,
+                4096
+            )
+            .unwrap()
+        );
+    }
+    use super::*;
+
+    /// Create a simple test frame with a gradient pattern.
+    fn test_frame(width: u32, height: u32, seed: u8) -> RgbImage {
+        let mut img = RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let r = ((x as f32 / width as f32) * 255.0) as u8;
+                let g = ((y as f32 / height as f32) * 255.0) as u8;
+                let b = seed.wrapping_mul(37).wrapping_add((x ^ y) as u8);
+                img.put_pixel(x, y, image::Rgb([r, g, b]));
+            }
+        }
+        img
+    }
+
+    fn test_frames(width: u32, height: u32, count: usize) -> Vec<RgbImage> {
+        (0..count)
+            .map(|i| test_frame(width, height, i as u8))
+            .collect()
+    }
+
+    #[test]
+    fn gif_encodes_valid_output() {
+        let frames = test_frames(64, 64, 3);
+        let data = encode_gif(&frames, 10).unwrap();
+        assert!(
+            data.len() > 100,
+            "GIF output too small: {} bytes",
+            data.len()
+        );
+        assert_eq!(&data[..6], b"GIF89a"); // GIF89a magic
+    }
+
+    #[test]
+    fn gif_empty_frames_rejected() {
+        assert!(encode_gif(&[], 24).is_err());
+    }
+
+    #[test]
+    fn gif_export_supports_bounce_and_single_playback() {
+        let frames = test_frames(16, 16, 4);
+        let data = encode_gif_with_options(&frames, 12, true, false).unwrap();
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options.read_info(std::io::Cursor::new(data)).unwrap();
+        assert_eq!(decoder.repeat(), gif::Repeat::Finite(0));
+
+        let mut decoded = Vec::new();
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            decoded.push(frame.buffer.to_vec());
+        }
+        assert_eq!(
+            decoded.len(),
+            7,
+            "one-shot bounce returns all the way to the first frame"
+        );
+        assert_eq!(decoded.first(), decoded.last());
+    }
+
+    fn gif_delays(bytes: Vec<u8>) -> Vec<u16> {
+        let mut decoder = gif::DecodeOptions::new()
+            .read_info(std::io::Cursor::new(bytes))
+            .unwrap();
+        let mut delays = Vec::new();
+        while let Some(frame) = decoder.read_next_frame().unwrap() {
+            delays.push(frame.delay);
+        }
+        delays
+    }
+
+    #[test]
+    fn gif_pause_changes_only_boundary_delays() {
+        let frames = test_frames(16, 16, 4);
+        assert_eq!(
+            gif_delays(encode_gif_with_pause(&frames, 10, false, true, 250).unwrap()),
+            [10, 10, 10, 35]
+        );
+        assert_eq!(
+            gif_delays(encode_gif_with_pause(&frames, 10, true, true, 250).unwrap()),
+            [35, 10, 10, 35, 10, 10]
+        );
+        assert_eq!(
+            gif_delays(encode_gif_with_pause(&frames, 10, true, false, 250).unwrap()),
+            [10, 10, 10, 35, 10, 10, 10]
+        );
+        assert_eq!(
+            encode_gif_with_pause(&frames, 12, true, true, 0).unwrap(),
+            encode_gif_with_options(&frames, 12, true, true).unwrap()
+        );
+        for (bounce, forever) in [(false, true), (true, true), (true, false)] {
+            let rgba: Vec<_> = frames
+                .iter()
+                .map(|f| image::DynamicImage::ImageRgb8(f.clone()).into_rgba8())
+                .collect();
+            assert_eq!(
+                gif_delays(encode_gif_rgba_with_pause(&rgba, 10, bounce, forever, 250).unwrap()),
+                gif_delays(encode_gif_with_pause(&frames, 10, bounce, forever, 250).unwrap())
+            );
+        }
+        assert_eq!(
+            gif_delays(encode_gif_with_pause(&frames[..1], 10, true, true, 250).unwrap()),
+            [35]
+        );
+        assert_eq!(
+            gif_delays(encode_gif_with_pause(&frames[..2], 10, true, true, 250).unwrap()),
+            [35, 35]
+        );
+        assert!(encode_gif_with_pause(&frames, 10, false, false, 250).is_err());
+        assert!(encode_gif_with_pause(&frames, 10, true, true, 11).is_err());
+        assert!(encode_gif_with_pause(&frames, 10, true, true, 5010).is_err());
+    }
+
+    #[test]
+    fn apng_encodes_valid_output() {
+        let frames = test_frames(64, 64, 3);
+        let data = encode_apng(&frames, 10, None).unwrap();
+        assert!(
+            data.len() > 100,
+            "APNG output too small: {} bytes",
+            data.len()
+        );
+        assert_eq!(&data[..8], &[137, 80, 78, 71, 13, 10, 26, 10]); // PNG magic
+    }
+
+    #[test]
+    fn apng_with_metadata() {
+        let frames = test_frames(64, 64, 2);
+        let meta = VideoMetadata {
+            prompt: "a test prompt".to_string(),
+            model: "test-model".to_string(),
+            seed: 42,
+            steps: 30,
+            guidance: 3.0,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 10,
+        };
+        let data = encode_apng(&frames, 10, Some(&meta)).unwrap();
+        assert!(data.len() > 100);
+        // Metadata should be embedded — the file should be larger than without
+        let data_no_meta = encode_apng(&frames, 10, None).unwrap();
+        assert!(
+            data.len() > data_no_meta.len(),
+            "metadata should increase file size"
+        );
+    }
+
+    #[test]
+    fn apng_empty_frames_rejected() {
+        assert!(encode_apng(&[], 24, None).is_err());
+    }
+
+    /// APNG output must carry the same composite `mold:parameters` iTXt
+    /// block still images get — the gallery reconcile path reads it back
+    /// via `read_png_metadata`, so a partial per-field-chunks-only embed
+    /// silently loses prompt/model/seed on import.
+    #[test]
+    fn apng_embeds_full_mold_parameters_block() {
+        let frames = test_frames(64, 64, 2);
+        let meta = VideoMetadata {
+            prompt: "a stoic owl".to_string(),
+            model: "ltx-video".to_string(),
+            seed: 42,
+            steps: 30,
+            guidance: 3.0,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 10,
+        };
+        let data = encode_apng(&frames, 10, Some(&meta)).unwrap();
+
+        let decoder = png::Decoder::new(std::io::Cursor::new(&data));
+        let reader = decoder.read_info().unwrap();
+        let params = reader
+            .info()
+            .utf8_text
+            .iter()
+            .find(|c| c.keyword == "mold:parameters")
+            .expect("mold:parameters iTXt chunk missing from APNG");
+        let parsed: mold_core::OutputMetadata =
+            serde_json::from_str(&params.get_text().unwrap()).unwrap();
+        assert_eq!(parsed.prompt, "a stoic owl");
+        assert_eq!(parsed.model, "ltx-video");
+        assert_eq!(parsed.seed, 42);
+        assert_eq!(parsed.frames, Some(2));
+        assert_eq!(parsed.fps, Some(10));
+    }
+
+    #[test]
+    fn first_frame_png_works() {
+        let frames = test_frames(32, 32, 3);
+        let data = first_frame_png(&frames).unwrap();
+        assert_eq!(&data[..8], &[137, 80, 78, 71, 13, 10, 26, 10]); // PNG magic
+    }
+
+    #[test]
+    fn bounded_first_frame_png_rejects_growth_before_publication() {
+        let frames = test_frames(32, 32, 1);
+        let exact = first_frame_png_bounded(&frames, usize::MAX).unwrap();
+        assert!(first_frame_png_bounded(&frames, 8).is_err());
+        assert_eq!(&exact[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+    }
+
+    #[test]
+    fn noisy_h3_thumbnail_fits_the_enforced_output_cap() {
+        let frame = RgbImage::from_fn(960, 544, |x, y| {
+            let mixed = x
+                .wrapping_mul(0x9e37_79b9)
+                .rotate_left(y & 31)
+                .wrapping_add(y.wrapping_mul(0x85eb_ca6b));
+            image::Rgb([mixed as u8, (mixed >> 8) as u8, (mixed >> 16) as u8])
+        });
+        let bytes = first_frame_png_bounded(&[frame], 4 * 1024 * 1024).unwrap();
+        assert!(bytes.len() <= 4 * 1024 * 1024);
+        assert_eq!(bytes.capacity(), 4 * 1024 * 1024);
+    }
+
+    #[cfg(feature = "webp")]
+    #[test]
+    fn webp_encodes_valid_output() {
+        let frames = test_frames(64, 64, 3);
+        let data = encode_webp(&frames, 10).unwrap();
+        assert!(
+            data.len() > 100,
+            "WebP output too small: {} bytes",
+            data.len()
+        );
+        assert_eq!(&data[..4], b"RIFF"); // WebP RIFF magic
+    }
+
+    #[cfg(feature = "mp4")]
+    #[test]
+    fn mp4_encodes_valid_output() {
+        let frames = test_frames(64, 64, 3);
+        let data = encode_mp4(&frames, 10).unwrap();
+        // MP4 should have ftyp box
+        assert!(
+            data.len() > 1000,
+            "MP4 output too small: {} bytes",
+            data.len()
+        );
+        let ftyp = &data[4..8];
+        assert_eq!(ftyp, b"ftyp", "MP4 should start with ftyp box");
+    }
+
+    #[cfg(feature = "mp4")]
+    #[test]
+    fn mp4_768x512_reasonable_size() {
+        // Regression: 768x512 at 2 Mbps produced only ~10KB/frame
+        let frames = test_frames(768, 512, 3);
+        let data = encode_mp4(&frames, 24).unwrap();
+        // At quality mode with 10 Mbps, 3 frames should be at least 50KB
+        assert!(
+            data.len() > 50_000,
+            "MP4 768x512 output too small: {} bytes (expected >50KB)",
+            data.len()
+        );
+    }
+
+    /// Every pushed frame must land in the sample table so the track's mdhd
+    /// duration is exactly frames/fps — H3's publication contract validates
+    /// the muxed duration against the request. A rate-control frame skip
+    /// (openh264's default) breaks this silently; `skip_frames(false)` plus
+    /// the empty-bitstream bail in `push()` keep it structural.
+    #[cfg(feature = "mp4")]
+    #[test]
+    fn mp4_track_duration_is_exactly_frames_over_fps() {
+        for (n, fps) in [(3u32, 10u32), (8, 24)] {
+            let frames = test_frames(64, 64, n as usize);
+            let data = encode_mp4(&frames, fps).unwrap();
+            let size = data.len() as u64;
+            let reader = mp4_rs::Mp4Reader::read_header(std::io::Cursor::new(data), size).unwrap();
+            let (_, track) = reader
+                .tracks()
+                .iter()
+                .find(|(_, t)| matches!(t.track_type(), Ok(mp4_rs::TrackType::Video)))
+                .expect("video track");
+            assert_eq!(track.sample_count(), n, "one sample per pushed frame");
+            assert_eq!(track.timescale(), fps * 1000);
+            assert_eq!(
+                track.trak.mdia.mdhd.duration,
+                u64::from(n) * 1000,
+                "mdhd duration must be exactly frames x 1000 ticks"
+            );
+        }
+    }
+
+    #[cfg(feature = "mp4")]
+    fn gradient_frames(n: u32, w: u32, h: u32) -> Vec<RgbImage> {
+        (0..n)
+            .map(|i| {
+                RgbImage::from_fn(w, h, |x, y| {
+                    image::Rgb([
+                        (x * 3 + i * 11) as u8,
+                        (y * 5 + i * 7) as u8,
+                        (i * 29) as u8,
+                    ])
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    #[cfg(feature = "mp4")]
+    fn stream_encoder_matches_slice_encoder_byte_for_byte() {
+        // encode_mp4 must be a pure wrapper over Mp4StreamEncoder: same frames
+        // in, identical MP4 bytes out. openh264's software encoder is
+        // deterministic for identical input + config, so byte equality holds.
+        let frames = gradient_frames(8, 64, 48);
+        let via_slice = encode_mp4(&frames, 24).expect("slice encode");
+
+        let mut enc = Mp4StreamEncoder::new(64, 48, 24).expect("create");
+        for f in &frames {
+            enc.push(f).expect("push");
+        }
+        let via_stream = enc.finish().expect("finish");
+
+        assert_eq!(
+            via_slice, via_stream,
+            "wrapper and stream outputs must be identical"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mp4")]
+    fn bounded_stream_encoder_rejects_container_growth() {
+        let frames = gradient_frames(8, 64, 48);
+        let exact = encode_mp4(&frames, 24).expect("reference encode");
+        let mut bounded =
+            Mp4StreamEncoder::new_bounded(64, 48, 24, exact.len() - 1).expect("bounded encoder");
+        for frame in &frames {
+            bounded.push(frame).expect("bounded sample push");
+        }
+        assert!(bounded.finish().is_err());
+
+        let mut exact_bound =
+            Mp4StreamEncoder::new_bounded(64, 48, 24, exact.len()).expect("exact encoder");
+        for frame in &frames {
+            exact_bound.push(frame).expect("exact sample push");
+        }
+        assert_eq!(exact_bound.finish().unwrap(), exact);
+    }
+
+    #[test]
+    #[cfg(feature = "mp4")]
+    fn stream_encoder_finish_with_no_frames_errors() {
+        let enc = Mp4StreamEncoder::new(64, 48, 24).expect("create");
+        let err = enc.finish().expect_err("zero frames must fail");
+        assert!(
+            format!("{err:#}").contains("no frames"),
+            "error must say no frames were pushed, got: {err:#}",
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "mp4")]
+    fn stream_encoder_rejects_mismatched_frame_dimensions() {
+        let mut enc = Mp4StreamEncoder::new(64, 48, 24).expect("create");
+        let wrong = RgbImage::from_pixel(32, 32, image::Rgb([0, 0, 0]));
+        let err = enc.push(&wrong).expect_err("dim mismatch must fail");
+        assert!(
+            format!("{err:#}").contains("64x48"),
+            "error must name the expected dimensions, got: {err:#}",
+        );
+    }
+
+    #[cfg(feature = "mp4")]
+    mod mp4_quicktime_compat {
+        use super::*;
+
+        /// Find a named MP4 box in a byte slice, returning its content (after the 8-byte header).
+        fn find_box(data: &[u8], name: &[u8; 4]) -> Option<(usize, Vec<u8>)> {
+            let mut pos = 0;
+            while pos + 8 <= data.len() {
+                let size =
+                    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                        as usize;
+                if size < 8 || pos + size > data.len() {
+                    break;
+                }
+                if &data[pos + 4..pos + 8] == name {
+                    return Some((pos, data[pos + 8..pos + size].to_vec()));
+                }
+                pos += size;
+            }
+            None
+        }
+
+        #[test]
+        fn colr_atom_declares_limited_range() {
+            let frames = test_frames(64, 64, 3);
+            let data = encode_mp4(&frames, 10).unwrap();
+
+            // Navigate: ftyp -> moov -> trak -> ... find colr inside the stsd/avc1
+            // The colr box is inside avc1, which is inside stsd, inside stbl, inside minf,
+            // inside mdia, inside trak, inside moov. Search for "colr" in the raw bytes.
+            let colr_tag = b"colr";
+            let colr_pos = data
+                .windows(4)
+                .position(|w| w == colr_tag)
+                .expect("colr box not found in MP4 output");
+
+            // colr box layout: size(4) + "colr"(4) + "nclx"(4) + primaries(2) + transfer(2) + matrix(2) + full_range(1)
+            // The "colr" we found is at offset colr_pos, which is the type field (bytes 4-7 of the box).
+            // So the box starts at colr_pos - 4.
+            let nclx_start = colr_pos + 4; // after "colr" type
+            assert_eq!(
+                &data[nclx_start..nclx_start + 4],
+                b"nclx",
+                "colr should use nclx type"
+            );
+
+            // full_range_flag is the last byte of the colr nclx content
+            let full_range_offset = nclx_start + 4 + 2 + 2 + 2; // nclx + primaries + transfer + matrix
+            assert_eq!(
+                data[full_range_offset], 0x00,
+                "colr full_range_flag should be 0 (limited range) for QuickTime compatibility"
+            );
+
+            // Verify BT.601/SMPTE 170M primaries/transfer/matrix (value 6)
+            let primaries = u16::from_be_bytes([data[nclx_start + 4], data[nclx_start + 5]]);
+            let transfer = u16::from_be_bytes([data[nclx_start + 6], data[nclx_start + 7]]);
+            let matrix = u16::from_be_bytes([data[nclx_start + 8], data[nclx_start + 9]]);
+            assert_eq!(primaries, 6, "colour_primaries should be SMPTE 170M");
+            assert_eq!(transfer, 6, "transfer_characteristics should be SMPTE 170M");
+            assert_eq!(matrix, 6, "matrix_coefficients should be SMPTE 170M");
+        }
+
+        #[test]
+        fn edts_elst_box_present() {
+            let frames = test_frames(64, 64, 3);
+            let data = encode_mp4(&frames, 10).unwrap();
+
+            // Find moov box
+            let moov = find_box(data.as_slice(), b"moov")
+                .expect("moov box not found")
+                .1;
+
+            // Find trak inside moov
+            let trak = find_box(&moov, b"trak").expect("trak box not found").1;
+
+            // Find edts inside trak
+            let edts = find_box(&trak, b"edts")
+                .expect("edts box not found in trak")
+                .1;
+
+            // Find elst inside edts
+            let elst = find_box(&edts, b"elst")
+                .expect("elst box not found in edts")
+                .1;
+
+            // elst content: version(4) + entry_count(4) + segment_duration(4) + media_time(4) + media_rate(4)
+            assert!(
+                elst.len() >= 20,
+                "elst content too short: {} bytes",
+                elst.len()
+            );
+            let entry_count = u32::from_be_bytes([elst[4], elst[5], elst[6], elst[7]]);
+            assert_eq!(entry_count, 1, "elst should have exactly 1 entry");
+            let media_time = u32::from_be_bytes([elst[12], elst[13], elst[14], elst[15]]);
+            assert_eq!(media_time, 0, "media_time should be 0");
+            let media_rate = u32::from_be_bytes([elst[16], elst[17], elst[18], elst[19]]);
+            assert_eq!(
+                media_rate, 0x0001_0000,
+                "media_rate should be 1.0 (fixed point)"
+            );
+        }
+
+        #[test]
+        fn sps_contains_vui_parameters() {
+            let frames = test_frames(64, 64, 3);
+            let data = encode_mp4(&frames, 10).unwrap();
+
+            // Find avcC box — search for "avcC" in the raw bytes
+            let avcc_tag = b"avcC";
+            let avcc_pos = data
+                .windows(4)
+                .position(|w| w == avcc_tag)
+                .expect("avcC box not found");
+
+            // avcC box: size(4) + "avcC"(4) + configurationVersion(1) + profile(1) + compat(1) + level(1)
+            //           + lengthSizeMinusOne(1) + numSPS(1) + spsLen(2) + sps_data...
+            let box_start = avcc_pos - 4;
+            let box_size = u32::from_be_bytes([
+                data[box_start],
+                data[box_start + 1],
+                data[box_start + 2],
+                data[box_start + 3],
+            ]) as usize;
+            let content = &data[avcc_pos + 4..box_start + box_size];
+
+            // content[0] = configVersion, [1] = profile, [2] = compat, [3] = level
+            // content[4] = 0xFF (lengthSizeMinusOne), [5] = 0xE1 (numSPS)
+            // content[6..8] = SPS length (big-endian)
+            assert!(content.len() >= 8, "avcC content too short");
+            let sps_len = u16::from_be_bytes([content[6], content[7]]) as usize;
+            assert!(content.len() >= 8 + sps_len, "avcC too short for SPS data");
+            let sps = &content[8..8 + sps_len];
+
+            // An SPS with VUI (colour description) is significantly longer than without.
+            // Minimal SPS (no VUI) is typically ~7-10 bytes; with BT.601 VUI colour
+            // info it's 15+ bytes. Empirically, openh264 High profile + VuiConfig::bt601()
+            // produces ~18-20 byte SPS. Threshold of 15 ensures VUI is present while
+            // staying above any non-VUI SPS length.
+            assert!(
+                sps.len() >= 15,
+                "SPS too short ({} bytes) — VUI parameters likely missing (expected >= 15 with colour description)",
+                sps.len()
+            );
+        }
+    }
+
+    /// A transparent GIF must not eat the object it is cutting out.
+    ///
+    /// `Frame::from_rgba_speed` picks the transparent palette entry by nearest
+    /// neighbour over RGBA. When a cleared pixel was left transparent BLACK,
+    /// the near-black texels of a dark PAINTED mesh were the nearest thing to
+    /// it and got mapped onto that entry — which is never drawn — so the mesh
+    /// came out with holes punched through it. Hence [`CLEAR_SENTINEL`].
+    #[test]
+    fn a_transparent_gif_keeps_the_dark_pixels_of_a_painted_mesh() {
+        // A near-black object on a cleared (transparent black) background,
+        // which is exactly what the turntable renderer hands the encoder.
+        let mut frame = image::RgbaImage::from_pixel(32, 32, image::Rgba([0, 0, 0, 0]));
+        for y in 8..24 {
+            for x in 8..24 {
+                frame.put_pixel(x, y, image::Rgba([6, 6, 8, 255]));
+            }
+        }
+        let data = encode_gif_rgba_with_options(&[frame], 10, false, false).unwrap();
+
+        let mut options = gif::DecodeOptions::new();
+        options.set_color_output(gif::ColorOutput::RGBA);
+        let mut decoder = options.read_info(std::io::Cursor::new(data)).unwrap();
+        let decoded = decoder.read_next_frame().unwrap().unwrap();
+
+        // Every pixel of the object survives opaque, and the background is
+        // still cut away — a fix that simply stopped clearing would pass the
+        // first assertion and fail the second.
+        let px = |x: usize, y: usize| {
+            let i = (y * 32 + x) * 4;
+            &decoded.buffer[i..i + 4]
+        };
+        for y in 8..24 {
+            for x in 8..24 {
+                assert_eq!(
+                    px(x, y)[3],
+                    255,
+                    "object pixel ({x}, {y}) was punched out of the mesh"
+                );
+            }
+        }
+        assert_eq!(px(0, 0)[3], 0, "background should still be transparent");
+        assert_eq!(px(31, 31)[3], 0, "background should still be transparent");
+    }
+}

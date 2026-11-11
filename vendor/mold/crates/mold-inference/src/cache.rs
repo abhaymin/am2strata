@@ -1,0 +1,468 @@
+use anyhow::Result;
+use candle_core::{DType, Device, Tensor};
+use std::collections::{HashMap, VecDeque};
+use std::hash::Hash;
+use std::hash::{DefaultHasher, Hasher};
+use std::sync::Mutex;
+
+pub(crate) const DEFAULT_PROMPT_CACHE_CAPACITY: usize = 16;
+pub(crate) const DEFAULT_IMAGE_CACHE_CAPACITY: usize = 8;
+
+/// Cache key for CFG-based pipelines that cache the **concatenated**
+/// `(uncond, cond)` conditioning tensor produced from `(prompt, negative_prompt)`.
+///
+/// Keying only on the positive prompt is a silent-wrong-output bug: changing
+/// just the negative prompt returns the cached tensor built with the *previous*
+/// negative, which the denoise loop then uses as the "unconditional" branch.
+/// The result is plausible but not what the user asked for. This key fixes that
+/// by including the negative prompt and the guidance scale that decides whether
+/// the uncond branch is computed at all.
+///
+/// Used by every CFG-capable pipeline in this crate (SD1.5, SDXL, SD3) — there
+/// used to be a `PromptCacheKey` keyed only on `(prompt, guidance)` for SD1.5,
+/// but it carried the silent-wrong-output bug above and was migrated to this
+/// shape. See the per-family regression tests in each `pipeline.rs::tests`
+/// module (e.g. `sd15_prompt_cache_distinguishes_negative_prompt_changes`).
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct CfgPromptCacheKey {
+    prompt: String,
+    negative_prompt: String,
+    guidance_bits: u64,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct ImageSizeCacheKey {
+    image_hash: u64,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub(crate) struct LatentSizeCacheKey {
+    image_hash: u64,
+    latent_h: usize,
+    latent_w: usize,
+}
+
+/// Hash image bytes for cache keying. Uses `DefaultHasher` for speed;
+/// collisions are astronomically unlikely at cache sizes <= 256 entries.
+/// Not stable across Rust versions — used only for in-process LRU lookup.
+pub(crate) fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
+}
+
+pub(crate) fn cfg_prompt_cache_key(
+    prompt: &str,
+    negative_prompt: &str,
+    guidance: f64,
+) -> CfgPromptCacheKey {
+    CfgPromptCacheKey {
+        prompt: prompt.to_string(),
+        negative_prompt: negative_prompt.to_string(),
+        guidance_bits: guidance.to_bits(),
+    }
+}
+
+pub(crate) fn prompt_text_key(prompt: &str) -> String {
+    prompt.to_string()
+}
+
+pub(crate) fn image_size_cache_key(bytes: &[u8], width: u32, height: u32) -> ImageSizeCacheKey {
+    ImageSizeCacheKey {
+        image_hash: hash_bytes(bytes),
+        width,
+        height,
+    }
+}
+
+pub(crate) fn latent_size_cache_key(
+    bytes: &[u8],
+    latent_h: usize,
+    latent_w: usize,
+) -> LatentSizeCacheKey {
+    LatentSizeCacheKey {
+        image_hash: hash_bytes(bytes),
+        latent_h,
+        latent_w,
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LruCache<K, V> {
+    capacity: usize,
+    order: VecDeque<K>,
+    entries: HashMap<K, V>,
+}
+
+impl<K, V> LruCache<K, V>
+where
+    K: Eq + Hash + Clone,
+{
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn get_cloned(&mut self, key: &K) -> Option<V>
+    where
+        V: Clone,
+    {
+        let value = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(value)
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) {
+        if self.entries.insert(key.clone(), value).is_some() {
+            self.order.retain(|existing| existing != &key);
+        }
+        self.order.push_back(key);
+        self.evict_if_needed();
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.order.clear();
+        self.entries.clear();
+    }
+
+    pub(crate) fn remove(&mut self, key: &K) {
+        self.entries.remove(key);
+        self.order.retain(|existing| existing != key);
+    }
+
+    fn touch(&mut self, key: &K) {
+        self.order.retain(|existing| existing != key);
+        self.order.push_back(key.clone());
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.entries.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedTensor {
+    tensor: Tensor,
+}
+
+impl CachedTensor {
+    pub(crate) fn from_tensor(tensor: &Tensor) -> Result<Self> {
+        Ok(Self {
+            tensor: tensor.to_device(&Device::Cpu)?,
+        })
+    }
+
+    pub(crate) fn restore(&self, device: &Device, dtype: DType) -> Result<Tensor> {
+        Ok(self.tensor.to_device(device)?.to_dtype(dtype)?)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedTensorPair {
+    pub(crate) first: CachedTensor,
+    pub(crate) second: CachedTensor,
+}
+
+impl CachedTensorPair {
+    pub(crate) fn from_tensors(first: &Tensor, second: &Tensor) -> Result<Self> {
+        Ok(Self {
+            first: CachedTensor::from_tensor(first)?,
+            second: CachedTensor::from_tensor(second)?,
+        })
+    }
+}
+
+pub(crate) fn restore_cached_tensor<K>(
+    cache: &Mutex<LruCache<K, CachedTensor>>,
+    key: &K,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<Tensor>>
+where
+    K: Eq + Hash + Clone,
+{
+    restore_or_evict(cache, key, |cached| cached.restore(device, dtype))
+}
+
+pub(crate) fn store_cached_tensor<K>(
+    cache: &Mutex<LruCache<K, CachedTensor>>,
+    key: K,
+    tensor: &Tensor,
+) -> Result<()>
+where
+    K: Eq + Hash + Clone,
+{
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, CachedTensor::from_tensor(tensor)?);
+    Ok(())
+}
+
+pub(crate) fn get_or_insert_cached_tensor<K, F>(
+    cache: &Mutex<LruCache<K, CachedTensor>>,
+    key: K,
+    device: &Device,
+    dtype: DType,
+    build: F,
+) -> Result<(Tensor, bool)>
+where
+    K: Eq + Hash + Clone,
+    F: FnOnce() -> Result<Tensor>,
+{
+    if let Some(tensor) = restore_cached_tensor(cache, &key, device, dtype)? {
+        return Ok((tensor, true));
+    }
+
+    let tensor = build()?;
+    store_cached_tensor(cache, key, &tensor)?;
+    Ok((tensor, false))
+}
+
+pub(crate) fn restore_cached_tensor_pair<K>(
+    cache: &Mutex<LruCache<K, CachedTensorPair>>,
+    key: &K,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<(Tensor, Tensor)>>
+where
+    K: Eq + Hash + Clone,
+{
+    restore_or_evict(cache, key, |cached| {
+        Ok((
+            cached.first.restore(device, dtype)?,
+            cached.second.restore(device, dtype)?,
+        ))
+    })
+}
+
+pub(crate) fn store_cached_tensor_pair<K>(
+    cache: &Mutex<LruCache<K, CachedTensorPair>>,
+    key: K,
+    first: &Tensor,
+    second: &Tensor,
+) -> Result<()>
+where
+    K: Eq + Hash + Clone,
+{
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, CachedTensorPair::from_tensors(first, second)?);
+    Ok(())
+}
+
+pub(crate) fn get_or_insert_cached_tensor_pair<K, F>(
+    cache: &Mutex<LruCache<K, CachedTensorPair>>,
+    key: K,
+    device: &Device,
+    dtype: DType,
+    build: F,
+) -> Result<((Tensor, Tensor), bool)>
+where
+    K: Eq + Hash + Clone,
+    F: FnOnce() -> Result<(Tensor, Tensor)>,
+{
+    if let Some((first, second)) = restore_cached_tensor_pair(cache, &key, device, dtype)? {
+        return Ok(((first, second), true));
+    }
+
+    let (first, second) = build()?;
+    store_cached_tensor_pair(cache, key, &first, &second)?;
+    Ok(((first, second), false))
+}
+
+pub(crate) fn clear_cache<K, V>(cache: &Mutex<LruCache<K, V>>)
+where
+    K: Eq + Hash + Clone,
+{
+    cache.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+fn restore_or_evict<K, V, T, F>(
+    cache: &Mutex<LruCache<K, V>>,
+    key: &K,
+    restore: F,
+) -> Result<Option<T>>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+    F: FnOnce(V) -> Result<T>,
+{
+    let cached = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_cloned(key);
+    match cached {
+        Some(cached) => match restore(cached) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) => {
+                cache.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+                Ok(None)
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lru_cache_evicts_oldest_entry() {
+        let mut cache = LruCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        cache.insert("c", 3);
+
+        assert!(cache.get_cloned(&"a").is_none());
+        assert_eq!(cache.get_cloned(&"b"), Some(2));
+        assert_eq!(cache.get_cloned(&"c"), Some(3));
+    }
+
+    #[test]
+    fn lru_cache_updates_recently_used_order() {
+        let mut cache = LruCache::new(2);
+        cache.insert("a", 1);
+        cache.insert("b", 2);
+        assert_eq!(cache.get_cloned(&"a"), Some(1));
+        cache.insert("c", 3);
+
+        assert_eq!(cache.get_cloned(&"a"), Some(1));
+        assert!(cache.get_cloned(&"b").is_none());
+        assert_eq!(cache.get_cloned(&"c"), Some(3));
+    }
+
+    #[test]
+    fn cfg_prompt_cache_key_includes_guidance_bits() {
+        // Guidance scale matters because cfg_active toggles whether the
+        // uncond branch is computed; the cached tensor's shape differs
+        // accordingly.
+        assert_ne!(
+            cfg_prompt_cache_key("hello", "", 1.0),
+            cfg_prompt_cache_key("hello", "", 7.5),
+        );
+    }
+
+    #[test]
+    fn cfg_prompt_cache_key_distinguishes_negative_prompt() {
+        // Same positive prompt + same guidance + different negative prompt must
+        // produce a different cache key — otherwise the (uncond, cond) tensor
+        // pair built with the previous negative would silently override the new
+        // user intent.
+        let a = cfg_prompt_cache_key("a cat", "blurry", 7.0);
+        let b = cfg_prompt_cache_key("a cat", "low quality", 7.0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cfg_prompt_cache_key_distinguishes_guidance() {
+        // Guidance flips CFG on/off (cfg_active(1.0) == false), so it changes
+        // whether the cached tensor is `(uncond, cond)` or just `cond`.
+        let a = cfg_prompt_cache_key("a cat", "blurry", 1.0);
+        let b = cfg_prompt_cache_key("a cat", "blurry", 7.0);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cfg_prompt_cache_key_stable_for_identical_inputs() {
+        let a = cfg_prompt_cache_key("a cat", "blurry", 7.0);
+        let b = cfg_prompt_cache_key("a cat", "blurry", 7.0);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn image_size_cache_key_hashes_bytes_and_dimensions() {
+        assert_ne!(
+            image_size_cache_key(b"abc", 512, 512),
+            image_size_cache_key(b"abc", 1024, 1024)
+        );
+        assert_ne!(
+            image_size_cache_key(b"abc", 512, 512),
+            image_size_cache_key(b"def", 512, 512)
+        );
+    }
+
+    #[test]
+    fn restore_or_evict_removes_entry_after_restore_failure() {
+        let cache = Mutex::new(LruCache::new(1));
+        cache.lock().unwrap().insert("a", 1usize);
+
+        let restored: Option<usize> = restore_or_evict(&cache, &"a", |_value| {
+            anyhow::bail!("simulated restore failure")
+        })
+        .unwrap();
+
+        assert!(restored.is_none());
+        assert!(cache.lock().unwrap().get_cloned(&"a").is_none());
+    }
+
+    #[test]
+    fn store_cached_tensor_recovers_from_poisoned_mutex() {
+        use candle_core::{DType, Device, Tensor};
+
+        let cache: Mutex<LruCache<String, CachedTensor>> = Mutex::new(LruCache::new(4));
+        let tensor = Tensor::zeros((1, 1), DType::F32, &Device::Cpu).unwrap();
+        store_cached_tensor(&cache, "before".to_string(), &tensor).unwrap();
+
+        // Poison the mutex by panicking while holding the lock.
+        // Note: this poisons with a clean cache state. A panic mid-operation
+        // (e.g. during insert between entries.insert and order.push_back) would
+        // leave entries/order out of sync — non-fatal for a tensor cache (worst
+        // case: extra cache miss or stale entry retained), but not tested here
+        // because we can't reliably trigger a panic mid-LruCache-operation.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("intentional poison");
+        }));
+        assert!(cache.lock().is_err(), "mutex should be poisoned");
+
+        // Operations should recover via unwrap_or_else, not panic.
+        store_cached_tensor(&cache, "after".to_string(), &tensor).unwrap();
+        let restored =
+            restore_cached_tensor(&cache, &"after".to_string(), &Device::Cpu, DType::F32).unwrap();
+        assert!(restored.is_some());
+    }
+
+    #[test]
+    fn poisoned_cache_with_inconsistent_state_degrades_gracefully() {
+        // Simulate what happens when entries and order are out of sync
+        // (as would occur if a panic happened mid-insert).
+        let cache: Mutex<LruCache<&str, usize>> = Mutex::new(LruCache::new(4));
+
+        // Manually create an inconsistent state: entry in map but not in order.
+        {
+            let mut guard = cache.lock().unwrap();
+            guard.entries.insert("orphan", 1);
+            // Deliberately don't add to order — simulates mid-insert panic.
+        }
+
+        // Poison the mutex.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("intentional poison");
+        }));
+
+        // Recovery should work despite the inconsistency.
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        // The orphan exists in entries but not in order — get still works.
+        assert_eq!(guard.get_cloned(&"orphan"), Some(1));
+        // New inserts work normally on the recovered cache.
+        guard.insert("a", 2);
+        guard.insert("b", 3);
+        assert_eq!(guard.get_cloned(&"a"), Some(2));
+        assert_eq!(guard.get_cloned(&"b"), Some(3));
+    }
+}

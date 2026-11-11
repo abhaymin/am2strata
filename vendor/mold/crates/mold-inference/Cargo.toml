@@ -1,0 +1,245 @@
+[package]
+name = "mold-ai-inference"
+version.workspace = true
+edition.workspace = true
+# The LTX-2 video transformer/VAE retain Apache-2.0 portions ported from
+# FerrisMind/candle-video; see this crate's THIRD_PARTY_NOTICES.md and
+# LICENSE-APACHE-2.0 (both ship in the published package).
+license = "MIT AND Apache-2.0"
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Candle-based inference engine for mold — FLUX, SDXL, SD3.5, Z-Image diffusion models"
+autobins = false
+
+[lib]
+name = "mold_inference"
+
+[features]
+default = []
+# Narrow native exception: pinned xatlas UV unwrapping, with Rust inference.
+mesh-texture = ["dep:cc", "mold-core/mesh-texture"]
+mesh-matting = ["mold-core/mesh-matting", "dep:candle-onnx", "dep:prost"]
+mesh-delight = ["mesh-matting", "mold-core/mesh-delight"]
+cuda = [
+    "candle-core/cuda",
+    "candle-nn/cuda",
+    "candle-transformers/cuda",
+    "mold-candle/cuda",
+    "dep:cudarc",
+]
+metal = ["dep:objc2-metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "mold-candle/metal"]
+# FlashAttention v2 dispatch path. Implies `cuda` (flash-attn is CUDA-only).
+# Off by default — pulls in the candle-flash-attn build, which requires the
+# CUDA toolkit. Tensors that aren't CUDA + fp16/bf16 transparently fall back
+# to the math path inside `crate::attention`.
+flash-attn = ["dep:candle-flash-attn", "cuda", "mold-candle/flash-attn"]
+# NVIDIA cuDNN convolutions. Implies `cuda`. Deliberately NOT implied BY
+# `cuda`: cudarc links `libcudnn` and needs its headers at build time, so
+# folding it into `cuda` would break every `cargo check --features cuda` on
+# a machine without the cuDNN SDK, CI check jobs included. Enabling it only
+# makes the path available; `crate::conv_policy` decides per family whether
+# a render takes it (#1483).
+cudnn = ["cuda", "candle-core/cudnn", "mold-candle/cudnn"]
+# H3-only kernel qualification. Unlike `flash-attn`, this does not change the
+# global attention default and is intentionally not forwarded by mold-ai.
+h3-attention-rc = ["cuda", "mold-candle/h3-flash-attn-rc"]
+expand = []
+webp = ["webp-animation", "dep:libwebp-sys2"]
+mp4 = ["dep:fdk-aac"]
+dev-bins = []
+# Public compact MiniMax H3 runtime. MP4 audio muxing and the public core
+# policy move with the family; the DEVICE does not (#1164). A CUDA build pairs
+# `h3` with `cuda` + `h3-attention-rc`; a macOS build pairs it with `metal` and
+# takes the chunked dense correctness route. `h3` implying `cuda` made an Apple
+# Silicon H3 build inexpressible, since `cuda` cannot compile there at all.
+h3 = [
+    "mp4",
+    "mold-candle/h3",
+    "mold-core/h3",
+]
+# The shipping CUDA H3 route: the family plus the SM89 attention kernel, plus
+# the global FlashAttention dispatch (#735). `candle-flash-attn` was already
+# compiled and linked through `h3-attention-rc`, so this adds zero build cost;
+# it makes `MOLD_ATTN=flash` reachable in the shipped sm89 artifact. The
+# default attention backend stays `Math` in every build (#736) — compiling the
+# kernel never switches it on.
+h3-cuda = ["h3", "cuda", "h3-attention-rc", "flash-attn"]
+# Development-only access to the authorization-bound MiniMax H3 artifact
+# qualifier. This feature is intentionally not forwarded by mold-ai or any
+# shipping surface; release verification rejects its embedded claim marker.
+h3-private-uat = ["mold-candle/h3-private-uat"]
+# PuLID-FLUX face-identity conditioning. Off by default; the runtime adapter
+# lands separately, so today this only forwards the core contract edge.
+pulid = ["mold-core/pulid", "dep:candle-onnx", "dep:prost"]
+
+[[bin]]
+name = "ltx2_checkpoint_probe"
+path = "src/bin/ltx2_checkpoint_probe.rs"
+required-features = ["dev-bins"]
+
+[[bin]]
+name = "ltx2_review"
+path = "src/bin/ltx2_review.rs"
+required-features = ["dev-bins"]
+
+[[bin]]
+name = "ltx2_vae_probe"
+path = "src/bin/ltx2_vae_probe.rs"
+required-features = ["dev-bins", "mp4"]
+
+[[bin]]
+name = "hunyuan3d_matting_probe"
+path = "src/bin/hunyuan3d_matting_probe.rs"
+required-features = ["dev-bins", "mesh-matting"]
+
+[[bin]]
+name = "hunyuan3d_shape_vae_encoder_probe"
+path = "src/bin/hunyuan3d_shape_vae_encoder_probe.rs"
+required-features = ["dev-bins", "cuda"]
+
+[[bin]]
+name = "hunyuan3d_shape_vae_roundtrip_probe"
+path = "src/bin/hunyuan3d_shape_vae_roundtrip_probe.rs"
+required-features = ["dev-bins", "cuda"]
+
+[[bin]]
+name = "sd_singlefile_inspect"
+path = "src/bin/sd_singlefile_inspect.rs"
+required-features = ["dev-bins"]
+
+# Step-0 decision probe for #1222: ONNX op inventory and the warm-latency
+# measurement that qualified (or would have disqualified) `candle-onnx`.
+[[bin]]
+name = "pulid_face_probe"
+path = "src/bin/pulid_face_probe.rs"
+required-features = ["dev-bins", "pulid"]
+
+# Needs `flash-attn` on top of `dev-bins` to measure anything: without it the
+# flash column silently benchmarks the math fallback.
+[[bin]]
+name = "attention_bench"
+path = "src/bin/attention_bench.rs"
+required-features = ["dev-bins", "cuda"]
+
+[[bin]]
+name = "h3_attention_qualification"
+path = "src/bin/h3_attention_qualification.rs"
+required-features = ["dev-bins", "h3-attention-rc"]
+
+[[bin]]
+name = "h3_metal_campaign_watch"
+path = "src/bin/h3_metal_campaign_watch.rs"
+required-features = ["dev-bins"]
+
+[[bin]]
+name = "h3_attention_benchmark"
+path = "src/bin/h3_attention_benchmark.rs"
+required-features = ["dev-bins", "h3-attention-rc"]
+
+[[bin]]
+name = "h3_artifact_qualification"
+path = "src/bin/h3_artifact_qualification.rs"
+required-features = ["dev-bins", "h3-private-uat"]
+
+[[bin]]
+name = "h3_runtime_qualification_record"
+path = "src/bin/h3_runtime_qualification_record.rs"
+required-features = ["dev-bins", "h3-cuda"]
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+sha2 = "0.10"
+
+[[bin]]
+name = "h3_qwen_layer50_capture"
+path = "src/bin/h3_qwen_layer50_capture.rs"
+required-features = ["dev-bins", "h3-private-uat"]
+
+[[bin]]
+name = "h3_visual_vae_capture"
+path = "src/bin/h3_visual_vae_capture.rs"
+required-features = ["dev-bins", "h3-private-uat", "cuda"]
+
+[[bin]]
+name = "h3_audio_vae_capture"
+path = "src/bin/h3_audio_vae_capture.rs"
+required-features = ["dev-bins", "h3-private-uat"]
+
+[[bin]]
+name = "h3_transformer_capture"
+path = "src/bin/h3_transformer_capture.rs"
+required-features = ["dev-bins", "h3-private-uat"]
+
+[dependencies]
+mold-core = { path = "../mold-core", package = "mold-ai-core", version = "0.36.0" }
+mold-catalog = { path = "../mold-catalog", package = "mold-ai-catalog", version = "0.36.0" }
+mold-candle = { path = "../mold-candle", package = "mold-ai-candle", version = "0.36.0" }
+anyhow = "1"
+zip = { version = "8.6", default-features = false }
+candle-core = { package = "candle-core-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-nn = { package = "candle-nn-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-transformers = { package = "candle-transformers-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+cudarc = { version = "0.19.8", default-features = false, features = ["driver"], optional = true }
+# Optional flash-attention v2. Pulled in only by the `flash-attn` feature.
+#
+# Pinned to the same fork revision as every other candle crate above, so its
+# `Tensor` type is identical to ours. A crates.io `candle-flash-attn` depends
+# on the upstream-named `candle-core` and breaks the CUDA build (#1399).
+candle-flash-attn = { git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f", optional = true }
+# ONNX protobuf support for the hand-ported U²-Net and InsightFace models.
+# Pinned to the same fork revision as every other candle crate above, so its
+# `Tensor` type is identical to ours. CPU-only by
+# construction: `candle-onnx`'s `get_tensor` materializes every initializer on
+# `Device::Cpu` (candle-onnx/src/eval.rs:191-232).
+candle-onnx = { git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f", optional = true }
+# `candle-onnx` does not re-export `prost`, and mold decodes the `ModelProto`
+# from a retained descriptor rather than through that crate's path-based
+# `read_file`. Same 0.14 release candle-onnx builds against, so cargo unifies
+# the two and the generated types keep implementing this crate's `Message`.
+prost = { version = "0.14", optional = true }
+gif = "0.13"
+webp-animation = { version = "0.10", features = ["static"], optional = true }
+# libwebp's simple still API (`WebPEncodeRGB`/`WebPEncodeRGBA`) for
+# non-animated WebP stills (`webp_still.rs`). The same crate and version
+# webp-animation already links, so no new native code enters the build.
+libwebp-sys2 = { version = "0.2", features = ["static"], optional = true }
+image = "0.25"
+moxcms = "0.8"
+half = "2"
+# Already vendored transitively through candle-core, so these add no new
+# crates to the Nix vendor set. `float8` must resolve to the same version
+# candle uses or `F8E4M3` would be a different type than its tensors hold.
+float8 = "0.7"
+rayon = "1"
+libc = "0.2"
+# Already vendored transitively via image's default features, so a direct
+# dependency adds no new crates to the Nix vendor set. Pure Rust: no system
+# OpenEXR, no cmake, nothing to cross-compile for the sm86/89/100/120 matrix.
+exr = "1.74"
+base64 = "0.22"
+fs2 = "0.4"
+mp4-rs = { package = "mp4", version = "0.14" }
+openh264 = { version = "0.9", features = ["source"] }
+png = "0.18"
+rand = "0.8"
+rand_distr = "0.4"
+regex = "1"
+rustfft = "6"
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+symphonia = { version = "0.5", default-features = false, features = ["aac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+tempfile = "3"
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+zeroize = "=1.8.2"
+fdk-aac = { version = "0.8", optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std", "MTLDevice"] }

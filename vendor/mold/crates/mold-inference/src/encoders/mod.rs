@@ -1,0 +1,23 @@
+pub(crate) mod clip;
+pub(crate) mod clip_image_preprocess;
+pub(crate) mod eva_clip_preprocess;
+pub(crate) mod eva_clip_vision;
+pub(crate) mod legacy_pth;
+pub(crate) mod mistral3;
+pub(crate) mod openclip_vision;
+pub(crate) mod park;
+pub(crate) mod pickle_convert;
+pub(crate) mod qwen2_text;
+pub(crate) mod qwen2_text_gguf;
+pub(crate) mod qwen2_vision;
+pub(crate) mod qwen3;
+pub(crate) mod qwen3_bf16;
+pub(crate) mod qwen3_gguf;
+#[cfg(test)]
+mod qwen3_vl_gguf_parity;
+pub(crate) mod qwen3_vl_inject;
+pub(crate) mod sd3_clip;
+pub(crate) mod secure_dir;
+pub(crate) mod t5;
+pub(crate) mod t5_gguf;
+pub(crate) mod variant_resolution;

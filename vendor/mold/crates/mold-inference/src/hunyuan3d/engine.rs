@@ -1,0 +1,2020 @@
+//! The Hunyuan3D image-to-3D engine.
+//!
+//! # Stage layout, and where each one runs
+//!
+//! | Stage | Device | Reported as |
+//! | --- | --- | --- |
+//! | DINOv2-giant image encode | GPU | `ProgressPhase::PromptEncode` |
+//! | Shape DiT sampling | GPU | `DenoiseStep` |
+//! | Chunked occupancy decode | GPU | `StageProgress` per chunk |
+//! | Surface extraction, normals, GLB, poster | **CPU** | `StageProgress` |
+//!
+//! The split is deliberate and is the whole reason the decode is chunked. At
+//! octree resolution 256 the shape VAE evaluates its occupancy field on
+//! `257^3` ≈ 17 million query points; materialising those coordinates and
+//! their logits at once is gigabytes before any attention runs. Chunking also
+//! gives the only honest progress signal the stage has, and a cancellation
+//! checkpoint between chunks — without it a cancelled mesh render would keep
+//! a GPU busy for minutes after the user gave up.
+//!
+//! Everything after the occupancy grid is pure CPU and does not touch the
+//! device, so a long surface extraction does not hold the card. It still runs
+//! inside `generate` today (one lease, one job); moving it to the scheduler's
+//! host-utility lane is #1496.
+//!
+//! # No text encoder
+//!
+//! There is none, anywhere in this family. The source image is the only
+//! conditioning, which is why `validation::validate_mesh_request` refuses a
+//! request without one rather than falling back to an empty prompt. The
+//! prompt, if the caller sent one, is recorded as provenance and never read.
+
+use anyhow::{bail, Context, Result};
+use candle_core::{DType, Device, Tensor};
+use mold_core::{
+    GenerateRequest, GenerateResponse, GenerationReference, GenerationReferenceAuthority, MeshData,
+    MeshReferenceFormat, MeshUpAxis, ModelPaths, OutputFormat,
+};
+#[cfg(feature = "mesh-matting")]
+use mold_core::{GenerationImageReferenceRole, MeshDerivedMedia, MeshMattingMode};
+
+use crate::engine::{rand_seed, GenerationReferenceBinding, InferenceEngine, LoadStrategy};
+use crate::engine_base::EngineBase;
+#[cfg(feature = "mesh-matting")]
+use crate::progress::ProgressReporter;
+use crate::progress::{ProgressEvent, ProgressPhase};
+
+use super::dino2::{Dinov2Config, Dinov2Model};
+use super::glb::{write_glb, GlbMaterial};
+use super::mesh::{Mesh, MeshAlgorithm, OccupancyGrid};
+use super::quantization::SUPPORTED_POLICY_VERSIONS;
+use super::sampler::{self, SamplingPlan};
+use super::shape_vae::{ShapeVae, ShapeVaeConfig, ShapeVaeEncoder, ShapeVaeEncoderConfig};
+use super::transformer::{Config as DitConfig, Hunyuan3dDit};
+use super::transformer21::{Config as Dit21Config, Hunyuan3dDit21};
+
+/// Prefixes the three networks live under inside the single checkpoint.
+const DIT_PREFIX: &str = "model";
+const VAE_PREFIX: &str = "vae";
+const VISION_PREFIX: &str = "conditioner.main_image_encoder.model";
+
+fn ensure_quantized_shape_backend(is_cuda: bool, quantized: bool) -> Result<()> {
+    if quantized && !is_cuda {
+        bail!(
+            "quantized Hunyuan3D shape checkpoints are CUDA-only; select an fp16 tier on CPU or Metal"
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_header(
+    path: &std::path::Path,
+) -> Result<mold_core::safetensors_probe::SafetensorsHeader> {
+    let is_gguf = matches!(
+        crate::artifact_format::probe(path),
+        Ok(crate::artifact_format::ArtifactStorageFormat::Gguf { .. })
+    );
+    if !is_gguf {
+        return mold_core::safetensors_probe::read_safetensors_header(path)
+            .with_context(|| format!("read safetensors header at {}", path.display()));
+    }
+
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open Hunyuan3D GGUF at {}", path.display()))?;
+    let content = candle_core::quantized::gguf_file::Content::read(&mut file)
+        .with_context(|| format!("read Hunyuan3D GGUF header at {}", path.display()))?;
+    let string = |key: &str| match content.metadata.get(key) {
+        Some(candle_core::quantized::gguf_file::Value::String(value)) => Ok(value.as_str()),
+        _ => bail!("Hunyuan3D GGUF is missing string metadata `{key}`"),
+    };
+    anyhow::ensure!(
+        string("general.architecture")? == "hunyuan3d",
+        "GGUF architecture is not Hunyuan3D"
+    );
+    anyhow::ensure!(
+        SUPPORTED_POLICY_VERSIONS.contains(&string("mold.quantization.policy")?),
+        "Hunyuan3D GGUF uses an unsupported quantization policy"
+    );
+    let _: super::quantization::ShapeQuantization = string("mold.quantization.tier")?.parse()?;
+    let digest = string("mold.source.sha256")?;
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "Hunyuan3D GGUF has an invalid source digest"
+    );
+    anyhow::ensure!(
+        matches!(
+            content.metadata.get("mold.source.size"),
+            Some(candle_core::quantized::gguf_file::Value::U64(size)) if *size > 0
+        ),
+        "Hunyuan3D GGUF has an invalid source size"
+    );
+
+    let mut tensor_shapes = std::collections::BTreeMap::new();
+    let mut tensor_names = content.tensor_infos.keys().cloned().collect::<Vec<_>>();
+    tensor_names.sort();
+    for name in &tensor_names {
+        tensor_shapes.insert(
+            name.clone(),
+            content.tensor_infos[name].shape.dims().to_vec(),
+        );
+    }
+    Ok(mold_core::safetensors_probe::SafetensorsHeader {
+        metadata: std::collections::BTreeMap::new(),
+        tensor_names,
+        tensor_shapes,
+    })
+}
+
+fn dense_components_from_gguf(
+    vb: &mold_candle::quantized::VarBuilder,
+    dtype: DType,
+    device: &Device,
+) -> Result<candle_nn::VarBuilder<'static>> {
+    let mut tensors = std::collections::HashMap::new();
+    for (name, tensor) in vb.tensors() {
+        if name.starts_with("vae.") || name.starts_with("conditioner.") {
+            tensors.insert(
+                name.clone(),
+                tensor
+                    .dequantize(device)?
+                    .to_dtype(dtype)
+                    .with_context(|| format!("materialize Hunyuan3D GGUF tensor {name}"))?,
+            );
+        }
+    }
+    Ok(candle_nn::VarBuilder::from_tensors(tensors, dtype, device))
+}
+
+/// Default query-grid resolution. Upstream's `VAEDecodeHunyuan3D` default.
+///
+/// Taken from the core constant the generation profile advertises, so the
+/// number a client sees pre-selected is the number an omitted field renders.
+pub const DEFAULT_OCTREE_RESOLUTION: usize =
+    mold_core::validation::MESH_DEFAULT_OCTREE_RESOLUTION as usize;
+/// Default surface-net iso-level. Upstream's `VoxelToMesh` default — note it
+/// is 0.6, not the 0.5 a reader might assume for a binary occupancy field.
+///
+/// It is a level on the OCCUPANCY scale produced by [`occupancy_from_logits`],
+/// not on the raw VAE logits: ComfyUI's node thresholds what the VAE wrapper
+/// hands it, and that wrapper has already mapped the logits through the
+/// image post-process `(x + 1) / 2` clamped to `[0, 1]`. On raw logits 0.6
+/// means 0.2. Thresholding the raw logits at 0.6 instead — what the first cut
+/// did — shrinks every surface inward and drops half the triangles.
+///
+/// Same authority as [`DEFAULT_OCTREE_RESOLUTION`]: the profile advertises
+/// `mold_core::validation::MESH_DEFAULT_THRESHOLD` and this renders it.
+pub const DEFAULT_THRESHOLD: f32 = mold_core::validation::MESH_DEFAULT_THRESHOLD as f32;
+/// Half-width of the query cube. `VanillaVolumeDecoder`'s `bounds` default.
+const QUERY_BOUNDS: f32 = 1.01;
+/// Query points per decode chunk on CUDA and the CPU. Upstream's `num_chunks`
+/// default. Metal takes a larger, measured default — see
+/// [`super::backend::decode_chunk_default`].
+const DEFAULT_DECODE_CHUNK: usize = 8_000;
+/// Env override for the decode chunk size.
+const DECODE_CHUNK_ENV: &str = "MOLD_HUNYUAN3D_DECODE_CHUNKS";
+/// Edge length of the gallery poster.
+const POSTER_SIZE: u32 = 512;
+
+/// How many chunks to decode before emitting a progress tick. One event per
+/// chunk at 17M points would be ~2,100 SSE frames for a single stage.
+const DECODE_TICKS: usize = 64;
+
+fn normalize_supplied_mesh_coordinates(
+    mesh: &mut Mesh,
+    up_axis: MeshUpAxis,
+    meters_per_unit: f64,
+) -> Result<()> {
+    anyhow::ensure!(
+        meters_per_unit.is_finite() && (1.0e-9..=1.0e6).contains(&meters_per_unit),
+        "supplied mesh meters_per_unit is outside the supported range"
+    );
+    let scale = meters_per_unit as f32;
+    for vertex in &mut mesh.vertices {
+        *vertex = vertex.map(|value| value * scale);
+        if up_axis == MeshUpAxis::Z {
+            *vertex = [vertex[0], vertex[2], -vertex[1]];
+        }
+    }
+    if up_axis == MeshUpAxis::Z {
+        if let Some(normals) = mesh.normals.as_mut() {
+            for normal in normals {
+                *normal = [normal[0], normal[2], -normal[1]];
+            }
+        }
+    }
+    mesh.validate()?;
+    Ok(())
+}
+
+#[cfg(feature = "mesh-matting")]
+fn matte_images<'a>(
+    images: impl IntoIterator<
+        Item = (
+            Option<GenerationImageReferenceRole>,
+            &'a mut image::RgbaImage,
+        ),
+    >,
+    policy: MeshMattingMode,
+    model_path: Option<&std::path::Path>,
+    gpu_ordinal: usize,
+    progress: &ProgressReporter,
+) -> Result<Vec<MeshDerivedMedia>> {
+    let mut images = images.into_iter().collect::<Vec<_>>();
+    let should_run = images
+        .iter()
+        .map(|(_, image)| match policy {
+            MeshMattingMode::Off => false,
+            MeshMattingMode::On => true,
+            MeshMattingMode::Auto => !super::background_matting::has_useful_alpha(image),
+        })
+        .collect::<Vec<_>>();
+    let total = should_run.iter().filter(|run| **run).count();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+
+    let total_pixels = images
+        .iter()
+        .zip(&should_run)
+        .filter(|(_, run)| **run)
+        .try_fold(0_u64, |sum, ((_, image), _)| {
+            sum.checked_add(u64::from(image.width()) * u64::from(image.height()))
+        })
+        .context("matting input pixel count overflowed")?;
+    anyhow::ensure!(
+        total_pixels <= super::background_matting::MAX_MATTING_PIXELS,
+        "combined matting inputs exceed {} pixels",
+        super::background_matting::MAX_MATTING_PIXELS
+    );
+
+    progress.stage_start("Removing background");
+    let started = std::time::Instant::now();
+    let path = model_path.context(
+        "background matting was requested but the U²-Net dependency was not materialized",
+    )?;
+    let device = crate::device::create_device(gpu_ordinal, progress)?;
+    let network = super::background_matting::U2Net::load(path, &device)?;
+    let mut artifacts = Vec::with_capacity(total);
+    for ((role, image), run) in images.iter_mut().zip(should_run) {
+        if !run {
+            continue;
+        }
+        **image = network.matte(image)?;
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8((*image).clone())
+            .write_to(&mut output, image::ImageFormat::Png)
+            .context("encode the processed matting image")?;
+        artifacts.push(MeshDerivedMedia {
+            role: *role,
+            data: output.into_inner(),
+        });
+        progress.stage_progress("Removing background", artifacts.len(), total);
+    }
+    // Drop all graph tensors before the shape checkpoint is loaded.
+    drop(network);
+    progress.stage_done("Removing background", started.elapsed());
+    Ok(artifacts)
+}
+
+#[cfg(feature = "mesh-delight")]
+fn delight_images<'a>(
+    images: impl IntoIterator<
+        Item = (
+            Option<GenerationImageReferenceRole>,
+            &'a mut image::RgbaImage,
+        ),
+    >,
+    enabled: bool,
+    paths: Option<&mold_core::ModelPaths>,
+    gpu_ordinal: usize,
+    progress: &ProgressReporter,
+) -> Result<Vec<MeshDerivedMedia>> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    let paths = paths.context(
+        "delighting was requested but the pinned lighting-removal pipeline was not materialized",
+    )?;
+    let mut artifacts = Vec::new();
+    for (role, image) in images {
+        progress.checkpoint()?;
+        *image = super::delight::delight_rgba(paths, gpu_ordinal, image, progress)?;
+        let mut output = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image.clone())
+            .write_to(&mut output, image::ImageFormat::Png)
+            .context("encode the delighted intermediate")?;
+        artifacts.push(MeshDerivedMedia {
+            role,
+            data: output.into_inner(),
+        });
+    }
+    Ok(artifacts)
+}
+
+enum DecodedConditioning {
+    Single(image::RgbaImage),
+    Multi(Vec<(mold_core::GenerationImageReferenceRole, image::RgbaImage)>),
+}
+
+/// The two edge lengths a source image passes through on its way to the
+/// vision tower.
+///
+/// They are separate `config.yaml` entries and are NOT the same number on
+/// every tier, which is why they travel together. See
+/// [`super::dino2::preprocess`] for what each one does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Conditioning {
+    /// `image_processor.params.size` — the white square the alpha-cropped
+    /// subject is centred on.
+    letterbox: u32,
+    /// `conditioner.params.main_image_encoder.kwargs.image_size` — what
+    /// DINOv2 actually receives. Always a whole number of 14px patches.
+    encoder: u32,
+}
+
+enum ShapeDit {
+    V20(Box<Hunyuan3dDit>),
+    V21(Box<Hunyuan3dDit21>),
+}
+
+impl ShapeDit {
+    fn guidance_embed(&self) -> bool {
+        match self {
+            Self::V20(dit) => dit.config().guidance_embed,
+            Self::V21(_) => false,
+        }
+    }
+
+    fn channels(&self) -> usize {
+        match self {
+            Self::V20(dit) => dit.config().in_channels,
+            Self::V21(dit) => dit.in_channels(),
+        }
+    }
+
+    fn forward(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        context: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> candle_core::Result<Tensor> {
+        match self {
+            Self::V20(dit) => dit.forward(x, t, context, guidance),
+            Self::V21(dit) => dit.forward(x, t, context),
+        }
+    }
+}
+
+struct Loaded {
+    dit: ShapeDit,
+    vae: ShapeVae,
+    vision: Dinov2Model,
+    device: Device,
+    dtype: DType,
+    /// The letterbox and encoder edge lengths this checkpoint conditions at.
+    /// Per-tier, and derived from the DiT geometry rather than the model
+    /// name — see [`conditioning_for`].
+    conditioning: Conditioning,
+    /// Number of latent tokens the DiT denoises.
+    num_latents: usize,
+}
+
+pub struct Hunyuan3dEngine {
+    base: EngineBase<Loaded>,
+    paint_assets: Option<mold_core::hunyuan3d_paint_assets::Hunyuan3dPaintPaths>,
+    matting_asset: Option<std::path::PathBuf>,
+    delight_paths: Option<mold_core::ModelPaths>,
+}
+
+impl Hunyuan3dEngine {
+    pub fn new(
+        model_name: String,
+        paths: ModelPaths,
+        load_strategy: LoadStrategy,
+        gpu_ordinal: usize,
+    ) -> Self {
+        Self {
+            base: EngineBase::new(model_name, paths, load_strategy, gpu_ordinal),
+            paint_assets: None,
+            matting_asset: None,
+            delight_paths: None,
+        }
+    }
+
+    pub fn with_matting_asset(mut self, asset: Option<std::path::PathBuf>) -> Self {
+        self.matting_asset = asset;
+        self
+    }
+
+    pub fn with_delight_paths(mut self, paths: Option<mold_core::ModelPaths>) -> Self {
+        self.delight_paths = paths;
+        self
+    }
+
+    pub fn with_paint_assets(
+        mut self,
+        assets: Option<mold_core::hunyuan3d_paint_assets::Hunyuan3dPaintPaths>,
+    ) -> Self {
+        self.paint_assets = assets;
+        self
+    }
+
+    /// Query points per decode chunk, honouring the env override.
+    ///
+    /// Clamped rather than trusted: a zero would loop forever and a value
+    /// larger than the grid just allocates the whole thing, which is exactly
+    /// what chunking exists to avoid.
+    fn decode_chunk(device: &Device) -> usize {
+        crate::runtime_env::value(DECODE_CHUNK_ENV)
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.clamp(256, 1_000_000))
+            .unwrap_or_else(|| super::backend::decode_chunk_default(device, DEFAULT_DECODE_CHUNK))
+    }
+
+    fn load_inner(&mut self) -> Result<Loaded> {
+        let checkpoint = self.base.paths.transformer.clone();
+        if !checkpoint.is_file() {
+            bail!("Hunyuan3D checkpoint not found at {}", checkpoint.display());
+        }
+
+        // Geometry comes from the FILE, not the filename, mirroring
+        // `comfy/model_detection.py:784-797`. A repack or a community
+        // re-quantization then loads without a manifest entry describing its
+        // internals, and a manifest that drifts from the weights is caught
+        // here instead of producing garbage.
+        let header = checkpoint_header(&checkpoint)?;
+        let dit21_cfg = detect_shape21_config(&header)?;
+        let dit20_cfg = if dit21_cfg.is_none() {
+            Some(detect_dit_config(&header)?)
+        } else {
+            None
+        };
+        let (vae_cfg, conditioning, vision_cfg) = if let Some(dit) = &dit20_cfg {
+            (
+                detect_vae_config(dit),
+                conditioning_for(dit),
+                Dinov2Config::giant(),
+            )
+        } else {
+            (
+                ShapeVaeConfig::v2_1(),
+                Conditioning {
+                    letterbox: 512,
+                    encoder: 518,
+                },
+                Dinov2Config::large(),
+            )
+        };
+
+        let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+        // F16 on every accelerator, not the crate's usual BF16-on-CUDA. See
+        // `super::backend`: ComfyUI runs all three networks in fp16, and
+        // BF16 cannot resolve the query grid the shape VAE is evaluated on.
+        let dtype = super::backend::compute_dtype(&device);
+
+        let storage = crate::artifact_format::probe(&checkpoint);
+        let quantized = matches!(
+            &storage,
+            Ok(crate::artifact_format::ArtifactStorageFormat::Gguf { .. })
+        );
+        let fp8 = matches!(
+            &storage,
+            Ok(crate::artifact_format::ArtifactStorageFormat::Safetensors {
+                tensor_dtypes,
+                ..
+            }) if tensor_dtypes.contains(&crate::artifact_format::TensorDType::F8E4M3)
+        );
+        ensure_quantized_shape_backend(device.is_cuda(), quantized || fp8)?;
+        let (dit, vb) = if quantized {
+            let qvb = crate::weight_loader::load_gguf_var_builder(
+                &checkpoint,
+                &device,
+                "Hunyuan3D shape checkpoint (GGUF)",
+                &self.base.progress,
+            )
+            .with_context(|| format!("load Hunyuan3D GGUF at {}", checkpoint.display()))?;
+            let dit = match (&dit20_cfg, &dit21_cfg) {
+                (Some(cfg), None) => ShapeDit::V20(Box::new(
+                    Hunyuan3dDit::new_quantized(cfg, qvb.pp(DIT_PREFIX), dtype, false)
+                        .context("build the quantized Hunyuan3D 2.0 shape transformer")?,
+                )),
+                (None, Some(cfg)) => ShapeDit::V21(Box::new(
+                    Hunyuan3dDit21::new_quantized(cfg, qvb.pp(DIT_PREFIX), dtype, false)
+                        .context("build the quantized Hunyuan3D 2.1 shape transformer")?,
+                )),
+                _ => bail!("ambiguous Hunyuan3D shape architecture"),
+            };
+            let dense = dense_components_from_gguf(&qvb, dtype, &device)?;
+            (dit, dense)
+        } else {
+            if fp8 {
+                super::quantization::validate_fp8_checkpoint(&checkpoint)?;
+            }
+            let vb = if fp8 {
+                crate::weight_loader::load_native_safetensors_with_progress(
+                    std::slice::from_ref(&checkpoint),
+                    dtype,
+                    &device,
+                    "Hunyuan3D FP8 checkpoint",
+                    &self.base.progress,
+                )?
+            } else {
+                crate::weight_loader::load_safetensors_with_progress(
+                    std::slice::from_ref(&checkpoint),
+                    dtype,
+                    &device,
+                    "Hunyuan3D checkpoint",
+                    &self.base.progress,
+                )?
+            };
+            let dit = match (&dit20_cfg, &dit21_cfg) {
+                (Some(cfg), None) => ShapeDit::V20(Box::new(
+                    Hunyuan3dDit::new(cfg, vb.pp(DIT_PREFIX))
+                        .context("build the Hunyuan3D 2.0 shape transformer")?,
+                )),
+                (None, Some(cfg)) => ShapeDit::V21(Box::new(
+                    Hunyuan3dDit21::new(cfg, vb.pp(DIT_PREFIX))
+                        .context("build the Hunyuan3D 2.1 shape transformer")?,
+                )),
+                _ => bail!("ambiguous Hunyuan3D shape architecture"),
+            };
+            (dit, vb)
+        };
+        let vae =
+            ShapeVae::new(&vae_cfg, vb.pp(VAE_PREFIX)).context("build the Hunyuan3D shape VAE")?;
+        let vision = Dinov2Model::new(&vision_cfg, vb.pp(VISION_PREFIX))
+            .context("build the Hunyuan3D image conditioner")?;
+
+        Ok(Loaded {
+            dit,
+            vae,
+            vision,
+            device,
+            dtype,
+            conditioning,
+            num_latents: vae_cfg.num_latents,
+        })
+    }
+
+    fn generate_inner(
+        &mut self,
+        req: &GenerateRequest,
+        bindings: &[GenerationReferenceBinding],
+    ) -> Result<GenerateResponse> {
+        let started = std::time::Instant::now();
+        let options = req.mesh.clone().unwrap_or_default();
+        let octree = options
+            .octree_resolution
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_OCTREE_RESOLUTION);
+        let threshold = options.threshold.unwrap_or_else(|| {
+            mold_core::validation::mesh_default_threshold_for_model(&self.base.model_name) as f32
+        });
+        #[cfg(not(feature = "mesh-texture"))]
+        if options.texture == Some(true) {
+            bail!("PBR texture generation requires the mesh-texture build feature");
+        }
+        #[cfg(feature = "mesh-texture")]
+        let has_mesh_reference = req.references.as_deref().is_some_and(|references| {
+            references
+                .iter()
+                .any(|reference| matches!(reference, GenerationReference::Mesh { .. }))
+        });
+        #[cfg(not(feature = "mesh-texture"))]
+        let has_mesh_reference = req.references.as_deref().is_some_and(|references| {
+            references
+                .iter()
+                .any(|reference| matches!(reference, GenerationReference::Mesh { .. }))
+        });
+        if has_mesh_reference {
+            #[cfg(feature = "mesh-texture")]
+            if options.texture == Some(true) {
+                return self.generate_supplied_mesh_texture(req, bindings, &options, started);
+            }
+            return self.generate_supplied_mesh_roundtrip(req, bindings, &options, started);
+        }
+
+        // Decode and matte before the shape checkpoint is loaded. On a cold
+        // engine this guarantees U²-Net tensors are released before DINO, the
+        // DiT, and the shape VAE take the accelerator. A warm resident engine
+        // retains its shape weights by policy, but never retains U²-Net.
+        let multiview = mold_core::manifest::hunyuan3d_multiview_model(&self.base.model_name);
+        let (decoded, derived_media) = if multiview {
+            anyhow::ensure!(
+                req.source_image
+                    .as_deref()
+                    .is_none_or(|bytes| bytes.is_empty()),
+                "Hunyuan3D 2mv cannot combine source_image with named views"
+            );
+            let references = req
+                .references
+                .as_deref()
+                .context("Hunyuan3D 2mv requires named image views")?;
+            anyhow::ensure!(
+                (1..=4).contains(&references.len()),
+                "Hunyuan3D 2mv requires one to four named image views"
+            );
+            anyhow::ensure!(
+                bindings.is_empty() || bindings.len() == references.len(),
+                "Hunyuan3D 2mv resolved binding count differs from its named views"
+            );
+            let mut views = Vec::with_capacity(references.len());
+            for (index, reference) in references.iter().enumerate() {
+                self.base.progress.checkpoint()?;
+                let GenerationReference::NamedImage { role, media, .. } = reference else {
+                    bail!("Hunyuan3D 2mv accepts named image views only")
+                };
+                let rgba = if let Some(binding) = bindings.get(index) {
+                    anyhow::ensure!(
+                        binding.metadata().image_role == Some(*role),
+                        "Hunyuan3D 2mv resolved view role changed before inference"
+                    );
+                    crate::reference_media::decode_rgba_image_from_binding(binding, &mut || {
+                        Ok(self.base.progress.checkpoint()?)
+                    })?
+                } else {
+                    let GenerationReferenceAuthority::Inline { data } = media else {
+                        bail!("Hunyuan3D 2mv non-inline views require resolved server bindings")
+                    };
+                    crate::img_utils::decode_oriented_srgb_rgba(data)
+                        .context("decode a named Hunyuan3D view")?
+                };
+                views.push((*role, rgba));
+            }
+            views.sort_by_key(|(role, _)| super::multiview::view_slot(*role));
+            #[cfg(feature = "mesh-matting")]
+            let derived_media = matte_images(
+                views.iter_mut().map(|(role, image)| (Some(*role), image)),
+                options.matting.unwrap_or_default(),
+                self.matting_asset.as_deref(),
+                self.base.gpu_ordinal,
+                &self.base.progress,
+            )?;
+            #[cfg(feature = "mesh-delight")]
+            let derived_media = if options.delight == Some(true) {
+                delight_images(
+                    views.iter_mut().map(|(role, image)| (Some(*role), image)),
+                    true,
+                    self.delight_paths.as_ref(),
+                    self.base.gpu_ordinal,
+                    &self.base.progress,
+                )?
+            } else {
+                derived_media
+            };
+            #[cfg(not(feature = "mesh-matting"))]
+            let derived_media = Vec::new();
+            (DecodedConditioning::Multi(views), derived_media)
+        } else {
+            anyhow::ensure!(
+                bindings.is_empty(),
+                "single-view Hunyuan3D does not consume generation references"
+            );
+            let source = req
+                .source_image
+                .as_deref()
+                .filter(|bytes| !bytes.is_empty())
+                .context("3-D generation requires a source image")?;
+            let image = crate::img_utils::decode_oriented_srgb_rgba(source)
+                .context("decode the source image")?;
+            #[cfg(feature = "mesh-matting")]
+            let (image, derived_media) = {
+                let mut image = image;
+                let derived_media = matte_images(
+                    std::iter::once((None, &mut image)),
+                    options.matting.unwrap_or_default(),
+                    self.matting_asset.as_deref(),
+                    self.base.gpu_ordinal,
+                    &self.base.progress,
+                )?;
+                #[cfg(feature = "mesh-delight")]
+                let derived_media = if options.delight == Some(true) {
+                    delight_images(
+                        std::iter::once((None, &mut image)),
+                        true,
+                        self.delight_paths.as_ref(),
+                        self.base.gpu_ordinal,
+                        &self.base.progress,
+                    )?
+                } else {
+                    derived_media
+                };
+                (image, derived_media)
+            };
+            #[cfg(not(feature = "mesh-matting"))]
+            let derived_media = Vec::new();
+            (DecodedConditioning::Single(image), derived_media)
+        };
+
+        if self.base.loaded.is_none() {
+            let loaded = self.load_inner()?;
+            self.base.loaded = Some(loaded);
+        }
+        let loaded = self.base.loaded.as_ref().expect("loaded above");
+
+        self.base.progress.stage_start(if multiview {
+            "Encoding views"
+        } else {
+            "Encoding image"
+        });
+        let phase_started = std::time::Instant::now();
+        let (cond, source_rgba) = match decoded {
+            DecodedConditioning::Multi(views) => {
+                let source_rgba = views[0].1.clone();
+                let mut encoded = Vec::with_capacity(views.len());
+                for (role, rgba) in views {
+                    self.base.progress.checkpoint()?;
+                    let pixels = super::dino2::preprocess(
+                        &image::DynamicImage::ImageRgba8(rgba),
+                        loaded.conditioning.letterbox,
+                        loaded.conditioning.encoder,
+                        &loaded.device,
+                        loaded.dtype,
+                    )?;
+                    encoded.push((role, loaded.vision.forward(&pixels)?));
+                }
+                (
+                    super::multiview::compose_view_conditioning(encoded)?,
+                    source_rgba,
+                )
+            }
+            DecodedConditioning::Single(source_rgba) => {
+                let pixels = super::dino2::preprocess(
+                    &image::DynamicImage::ImageRgba8(source_rgba.clone()),
+                    loaded.conditioning.letterbox,
+                    loaded.conditioning.encoder,
+                    &loaded.device,
+                    loaded.dtype,
+                )?;
+                (loaded.vision.forward(&pixels)?, source_rgba)
+            }
+        };
+        self.base.progress.stage_complete(
+            ProgressPhase::PromptEncode,
+            if multiview {
+                "Encoding views"
+            } else {
+                "Encoding image"
+            },
+            phase_started.elapsed(),
+        );
+        #[cfg(not(feature = "mesh-texture"))]
+        drop(source_rgba);
+
+        // ── Sampling ────────────────────────────────────────────────────
+        let plan = if self.base.model_name == mold_core::manifest::HUNYUAN3D_2MV_TURBO_MODEL {
+            sampler::multiview_turbo_plan(req.steps as usize, req.guidance)
+        } else if self.base.model_name == mold_core::manifest::HUNYUAN3D_2MV_MODEL {
+            sampler::multiview_plan(req.steps as usize, req.guidance)
+        } else {
+            sampler::plan(
+                req.steps as usize,
+                sampler::DEFAULT_SHIFT,
+                req.guidance,
+                loaded.dit.guidance_embed(),
+            )
+        };
+        let seed = req.seed.unwrap_or_else(rand_seed);
+        // Named as its own stage. Without it the log jumped from a 0.1 s
+        // encode straight to the volume decode, so the whole denoise read as
+        // decode time and no report could attribute it.
+        self.base.progress.stage_start("Sampling");
+        let sample_started = std::time::Instant::now();
+        let latents = self.sample(loaded, &cond, &plan, seed)?;
+        self.base
+            .progress
+            .stage_done("Sampling", sample_started.elapsed());
+
+        // ── Occupancy field ─────────────────────────────────────────────
+        let grid = self.decode_occupancy(loaded, &latents, octree)?;
+
+        // ── Surface, normals, GLB, poster (CPU) ─────────────────────────
+        let mesh = self.extract_surface(
+            &grid,
+            threshold,
+            mold_core::validation::resolve_mesh_target_faces(&options),
+        )?;
+        drop(grid);
+        #[cfg(feature = "mesh-texture")]
+        if options.texture == Some(true) {
+            let assets = self
+                .paint_assets
+                .clone()
+                .context("Hunyuan3D Paint assets were not frozen before execution")?;
+            // Shape and paint are disjoint residency phases. Release the
+            // checkpoint carrying DiT, shape VAE, and DINO before opening the
+            // first paint network; keeping it here exceeds a 24 GB device.
+            let shape = self.base.loaded.take();
+            drop(shape);
+            let _ = crate::device::post_drop_free_vram_bytes(self.base.gpu_ordinal);
+            self.base.progress.checkpoint()?;
+            let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+            let texture_size = options.texture_resolution.unwrap_or(2048);
+            let textured = super::paint_runtime::PaintRuntime {
+                assets: &assets,
+                device: &device,
+                gpu_ordinal: self.base.gpu_ordinal,
+                progress: &self.base.progress,
+            }
+            .generate(&mesh, &source_rgba, texture_size, seed)?;
+            let (bounds_min, bounds_max) = textured.mesh.bounds();
+            // The poster is read back out of the GLB that was just written
+            // rather than shaded off `textured.mesh`, so the tile saved at
+            // generation time is the same picture the server derives from the
+            // stored file later — baked baseColorTexture and all.
+            let poster = super::glb::read_glb_scene(&textured.glb)
+                .context("read back the textured mesh for its poster")
+                .and_then(|scene| {
+                    let (mesh, appearance) = scene.split();
+                    super::poster::render_poster_with(&mesh, &appearance, POSTER_SIZE)
+                })
+                .context("render the gallery poster")?;
+            return Ok(GenerateResponse {
+                images: Vec::new(),
+                video: None,
+                audio: None,
+                mesh: Some(MeshData {
+                    data: textured.glb,
+                    format: OutputFormat::Glb,
+                    vertex_count: textured.mesh.vertex_count() as u32,
+                    face_count: textured.mesh.face_count() as u32,
+                    bounds_min,
+                    bounds_max,
+                    textured: true,
+                    poster,
+                    poster_width: POSTER_SIZE,
+                    poster_height: POSTER_SIZE,
+                    derived_media,
+                }),
+                generation_time_ms: started.elapsed().as_millis() as u64,
+                model: self.base.model_name.clone(),
+                seed_used: seed,
+                gpu: Some(self.base.gpu_ordinal),
+                request_warnings: Vec::new(),
+                prefix_cache: None,
+            });
+        }
+        let (bounds_min, bounds_max) = mesh.bounds();
+
+        self.base.progress.stage_start("Writing mesh");
+        let write_started = std::time::Instant::now();
+        let glb = write_glb(&mesh, &GlbMaterial::default(), None)?;
+        let poster = super::poster::render_poster(&mesh, POSTER_SIZE)
+            .context("render the gallery poster")?;
+        self.base
+            .progress
+            .stage_done("Writing mesh", write_started.elapsed());
+
+        Ok(GenerateResponse {
+            images: Vec::new(),
+            video: None,
+            audio: None,
+            mesh: Some(MeshData {
+                data: glb,
+                format: OutputFormat::Glb,
+                vertex_count: mesh.vertex_count() as u32,
+                face_count: mesh.face_count() as u32,
+                bounds_min,
+                bounds_max,
+                textured: false,
+                poster,
+                poster_width: POSTER_SIZE,
+                poster_height: POSTER_SIZE,
+                derived_media,
+            }),
+            generation_time_ms: started.elapsed().as_millis() as u64,
+            model: self.base.model_name.clone(),
+            seed_used: seed,
+            gpu: Some(self.base.gpu_ordinal),
+            request_warnings: Vec::new(),
+            prefix_cache: None,
+        })
+    }
+
+    fn generate_supplied_mesh_roundtrip(
+        &mut self,
+        req: &GenerateRequest,
+        bindings: &[GenerationReferenceBinding],
+        options: &mold_core::MeshRequestOptions,
+        started: std::time::Instant,
+    ) -> Result<GenerateResponse> {
+        anyhow::ensure!(
+            options.texture != Some(true),
+            "mesh round-trip cannot request texture generation"
+        );
+        anyhow::ensure!(
+            req.source_image
+                .as_deref()
+                .is_none_or(|bytes| bytes.is_empty()),
+            "mesh round-trip does not accept an appearance image"
+        );
+        let references = req
+            .references
+            .as_deref()
+            .context("mesh round-trip requires a mesh reference")?;
+        anyhow::ensure!(
+            references.len() == 1,
+            "mesh round-trip requires exactly one mesh reference"
+        );
+        let GenerationReference::Mesh {
+            media,
+            format,
+            coordinates,
+            ..
+        } = &references[0]
+        else {
+            bail!("mesh round-trip accepts a mesh reference only")
+        };
+        anyhow::ensure!(
+            bindings.is_empty() || bindings.len() == 1,
+            "mesh round-trip binding count differs from its request"
+        );
+        let mesh_bytes = if let Some(binding) = bindings.first() {
+            anyhow::ensure!(
+                binding.metadata().kind == mold_core::GenerationReferenceKind::Mesh,
+                "mesh round-trip binding changed kind before inference"
+            );
+            crate::reference_media::read_verified_binding(binding, &mut || {
+                Ok(self.base.progress.checkpoint()?)
+            })?
+        } else {
+            let GenerationReferenceAuthority::Inline { data } = media else {
+                bail!("non-inline mesh round-trip requires a resolved server binding")
+            };
+            data.clone()
+        };
+        let mut source = match format {
+            MeshReferenceFormat::Glb => super::glb::read_glb(&mesh_bytes)
+                .map_err(|error| anyhow::anyhow!(error))
+                .context("parse round-trip GLB")?,
+            MeshReferenceFormat::Obj => {
+                let text = std::str::from_utf8(&mesh_bytes)
+                    .context("round-trip OBJ must be UTF-8 text")?;
+                super::obj::read_obj(text).context("parse round-trip OBJ")?
+            }
+        };
+        normalize_supplied_mesh_coordinates(
+            &mut source,
+            coordinates.up_axis,
+            coordinates.meters_per_unit,
+        )?;
+
+        let checkpoint = self.base.paths.transformer.clone();
+        let header = checkpoint_header(&checkpoint)?;
+        anyhow::ensure!(
+            detect_shape21_config(&header)?.is_some()
+                && header
+                    .tensor_names
+                    .iter()
+                    .any(|name| name == "vae.encoder.input_proj.weight")
+                && header
+                    .tensor_names
+                    .iter()
+                    .any(|name| name == "vae.pre_kl.weight"),
+            "mesh round-trip requires a Hunyuan3D 2.1 checkpoint with shape-VAE encoder weights"
+        );
+
+        let resident = self.base.loaded.take();
+        drop(resident);
+        let _ = crate::device::post_drop_free_vram_bytes(self.base.gpu_ordinal);
+        let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+        let dtype = super::backend::compute_dtype(&device);
+        let quantized = matches!(
+            crate::artifact_format::probe(&checkpoint),
+            Ok(crate::artifact_format::ArtifactStorageFormat::Gguf { .. })
+        );
+        ensure_quantized_shape_backend(device.is_cuda(), quantized)?;
+        let vb = if quantized {
+            let qvb = crate::weight_loader::load_gguf_var_builder(
+                &checkpoint,
+                &device,
+                "Hunyuan3D shape checkpoint (GGUF)",
+                &self.base.progress,
+            )
+            .with_context(|| format!("load Hunyuan3D GGUF at {}", checkpoint.display()))?;
+            dense_components_from_gguf(&qvb, dtype, &device)?
+        } else {
+            crate::weight_loader::load_safetensors_with_progress(
+                std::slice::from_ref(&checkpoint),
+                dtype,
+                &device,
+                "Hunyuan3D 2.1 shape VAE",
+                &self.base.progress,
+            )?
+        };
+        let encoder = ShapeVaeEncoder::new(&ShapeVaeEncoderConfig::v2_1(), vb.pp(VAE_PREFIX))?;
+        let decoder = ShapeVae::new(&ShapeVaeConfig::v2_1(), vb.pp(VAE_PREFIX))?;
+        let seed = req.seed.unwrap_or_else(rand_seed);
+        self.base.progress.stage_start("Encoding mesh");
+        let phase = std::time::Instant::now();
+        let encoded = encoder.encode_mesh_sampled(&source, seed, 64)?;
+        self.base
+            .progress
+            .stage_done("Encoding mesh", phase.elapsed());
+
+        let octree = options
+            .octree_resolution
+            .map(|value| value as usize)
+            .unwrap_or(DEFAULT_OCTREE_RESOLUTION);
+        let grid = self.decode_roundtrip_occupancy(
+            &decoder,
+            &device,
+            dtype,
+            &encoded.for_decoder()?,
+            octree,
+        )?;
+        let threshold = options.threshold.unwrap_or(0.5);
+        let mesh = self.extract_surface(
+            &grid,
+            threshold,
+            mold_core::validation::resolve_mesh_target_faces(options),
+        )?;
+        let (bounds_min, bounds_max) = mesh.bounds();
+        let glb = write_glb(&mesh, &GlbMaterial::default(), None)?;
+        let poster = super::poster::render_poster(&mesh, POSTER_SIZE)?;
+        Ok(GenerateResponse {
+            images: Vec::new(),
+            video: None,
+            audio: None,
+            mesh: Some(MeshData {
+                data: glb,
+                format: OutputFormat::Glb,
+                vertex_count: mesh.vertex_count() as u32,
+                face_count: mesh.face_count() as u32,
+                bounds_min,
+                bounds_max,
+                textured: false,
+                poster,
+                poster_width: POSTER_SIZE,
+                poster_height: POSTER_SIZE,
+                derived_media: Vec::new(),
+            }),
+            generation_time_ms: started.elapsed().as_millis() as u64,
+            model: self.base.model_name.clone(),
+            seed_used: seed,
+            gpu: Some(self.base.gpu_ordinal),
+            request_warnings: Vec::new(),
+            prefix_cache: None,
+        })
+    }
+
+    fn decode_roundtrip_occupancy(
+        &self,
+        vae: &ShapeVae,
+        device: &Device,
+        dtype: DType,
+        latents: &Tensor,
+        octree: usize,
+    ) -> Result<OccupancyGrid> {
+        self.base.progress.stage_start("Decoding volume");
+        let prepared = vae.prepare_latents(latents)?;
+        let cross_kv = vae.prepare_cross_kv(&prepared)?;
+        let total = super::shape_vae::query_grid_len(octree);
+        let chunk = Self::decode_chunk(device);
+        let mut logits = Vec::with_capacity(total);
+        for start in (0..total).step_by(chunk) {
+            self.base.progress.checkpoint()?;
+            let len = chunk.min(total - start);
+            let queries = super::shape_vae::query_grid_chunk(
+                octree,
+                QUERY_BOUNDS,
+                start,
+                len,
+                device,
+                dtype,
+            )?
+            .unsqueeze(0)?;
+            logits.extend(
+                vae.decode_queries_cached(&queries, &cross_kv)?
+                    .flatten_all()?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?,
+            );
+            self.base
+                .progress
+                .stage_progress("Decoding volume", start + len, total);
+        }
+        let dim = octree + 1;
+        let flat = Tensor::from_vec(logits, (1, total), &Device::Cpu)?;
+        let mut ordered = ShapeVae::reshape_grid_logits(&flat, octree)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        occupancy_from_logits(&mut ordered);
+        OccupancyGrid::new(ordered, [dim, dim, dim])
+    }
+
+    #[cfg(feature = "mesh-texture")]
+    fn generate_supplied_mesh_texture(
+        &mut self,
+        req: &GenerateRequest,
+        bindings: &[GenerationReferenceBinding],
+        options: &mold_core::MeshRequestOptions,
+        started: std::time::Instant,
+    ) -> Result<GenerateResponse> {
+        anyhow::ensure!(
+            options.texture == Some(true),
+            "supplied mesh generation requires mesh.texture=true"
+        );
+        let references = req
+            .references
+            .as_deref()
+            .context("supplied mesh texturing requires a mesh reference")?;
+        anyhow::ensure!(
+            references.len() == 1,
+            "supplied mesh texturing requires exactly one mesh reference"
+        );
+        let GenerationReference::Mesh {
+            media,
+            format,
+            coordinates,
+            ..
+        } = &references[0]
+        else {
+            bail!("supplied mesh texturing accepts a mesh reference only")
+        };
+        anyhow::ensure!(
+            bindings.is_empty() || bindings.len() == 1,
+            "supplied mesh binding count differs from its request"
+        );
+        let source = req
+            .source_image
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .context("supplied mesh texturing requires an appearance image")?;
+        let source_rgba = crate::img_utils::decode_oriented_srgb_rgba(source)
+            .context("decode the supplied mesh appearance image")?;
+        #[cfg(feature = "mesh-matting")]
+        let (source_rgba, derived_media) = {
+            let mut source_rgba = source_rgba;
+            let derived_media = matte_images(
+                std::iter::once((None, &mut source_rgba)),
+                options.matting.unwrap_or_default(),
+                self.matting_asset.as_deref(),
+                self.base.gpu_ordinal,
+                &self.base.progress,
+            )?;
+            #[cfg(feature = "mesh-delight")]
+            let derived_media = if options.delight == Some(true) {
+                delight_images(
+                    std::iter::once((None, &mut source_rgba)),
+                    true,
+                    self.delight_paths.as_ref(),
+                    self.base.gpu_ordinal,
+                    &self.base.progress,
+                )?
+            } else {
+                derived_media
+            };
+            (source_rgba, derived_media)
+        };
+        #[cfg(not(feature = "mesh-matting"))]
+        let derived_media = Vec::new();
+
+        let mesh_bytes = if let Some(binding) = bindings.first() {
+            anyhow::ensure!(
+                binding.metadata().kind == mold_core::GenerationReferenceKind::Mesh,
+                "supplied mesh binding changed kind before inference"
+            );
+            crate::reference_media::read_verified_binding(binding, &mut || {
+                Ok(self.base.progress.checkpoint()?)
+            })?
+        } else {
+            let GenerationReferenceAuthority::Inline { data } = media else {
+                bail!("non-inline supplied mesh requires a resolved server binding")
+            };
+            data.clone()
+        };
+        let mut mesh = match format {
+            MeshReferenceFormat::Glb => super::glb::read_glb(&mesh_bytes)
+                .map_err(|error| anyhow::anyhow!(error))
+                .context("parse supplied GLB")?,
+            MeshReferenceFormat::Obj => {
+                let source =
+                    std::str::from_utf8(&mesh_bytes).context("supplied OBJ must be UTF-8 text")?;
+                super::obj::read_obj(source).context("parse supplied OBJ")?
+            }
+        };
+        normalize_supplied_mesh_coordinates(
+            &mut mesh,
+            coordinates.up_axis,
+            coordinates.meters_per_unit,
+        )?;
+        // Upstream's `use_remesh` applies to exactly this shape: the mesh the
+        // paint pipeline is handed. A caller who uploads a dense scan would
+        // otherwise unwrap it whole, which is the same stall a generated
+        // shape used to hit (#1666).
+        if let Some(target) = mold_core::validation::resolve_mesh_target_faces(options) {
+            mesh = self.simplify_surface(mesh, target)?;
+        }
+
+        // A texture-only request must not carry shape residency, even if this
+        // engine instance previously served image-to-mesh work.
+        let shape = self.base.loaded.take();
+        drop(shape);
+        let _ = crate::device::post_drop_free_vram_bytes(self.base.gpu_ordinal);
+        let assets = self
+            .paint_assets
+            .clone()
+            .context("Hunyuan3D Paint assets were not frozen before execution")?;
+        let device = crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)?;
+        let seed = req.seed.unwrap_or_else(rand_seed);
+        let texture_size = options.texture_resolution.unwrap_or(2048);
+        let textured = super::paint_runtime::PaintRuntime {
+            assets: &assets,
+            device: &device,
+            gpu_ordinal: self.base.gpu_ordinal,
+            progress: &self.base.progress,
+        }
+        .generate(&mesh, &source_rgba, texture_size, seed)?;
+        let (bounds_min, bounds_max) = textured.mesh.bounds();
+        let poster = super::poster::render_poster(&textured.mesh, POSTER_SIZE)
+            .context("render the gallery poster")?;
+        Ok(GenerateResponse {
+            images: Vec::new(),
+            video: None,
+            audio: None,
+            mesh: Some(MeshData {
+                data: textured.glb,
+                format: OutputFormat::Glb,
+                vertex_count: textured.mesh.vertex_count() as u32,
+                face_count: textured.mesh.face_count() as u32,
+                bounds_min,
+                bounds_max,
+                textured: true,
+                poster,
+                poster_width: POSTER_SIZE,
+                poster_height: POSTER_SIZE,
+                derived_media,
+            }),
+            generation_time_ms: started.elapsed().as_millis() as u64,
+            model: self.base.model_name.clone(),
+            seed_used: seed,
+            gpu: Some(self.base.gpu_ordinal),
+            request_warnings: Vec::new(),
+            prefix_cache: None,
+        })
+    }
+
+    /// Run the flow-matching loop, returning `[1, in_channels, num_latents]`.
+    fn sample(
+        &self,
+        loaded: &Loaded,
+        cond: &Tensor,
+        plan: &SamplingPlan,
+        seed: u64,
+    ) -> Result<Tensor> {
+        let channels = loaded.dit.channels();
+        // `seeded_randn` is the shared implementation of the family
+        // capability's `SeedContract::CpuSeededNoiseTransferredToExecutionDevice`.
+        // Calling candle's own `set_seed` + `randn` instead would produce a
+        // DIFFERENT stream — candle's per-backend RNG is not the crate-wide
+        // `StdRng` — so a seed would not reproduce across a CPU/CUDA/Metal
+        // move, which is exactly what the contract promises.
+        let mut latents = crate::engine::seeded_randn(
+            seed,
+            &[1, channels, loaded.num_latents],
+            &loaded.device,
+            loaded.dtype,
+        )?;
+
+        // The unconditional branch is a zero context of the same shape, not an
+        // empty one: `Hunyuan3Dv2Conditioning` builds it as
+        // `torch.zeros_like(embeds)` (`nodes_hunyuan3d.py:51`).
+        let uncond = if plan.cfg_scale.is_some() {
+            Some(cond.zeros_like()?)
+        } else {
+            None
+        };
+        let guidance = plan
+            .guidance_embed
+            .map(|value| guidance_tensor(value, &loaded.device))
+            .transpose()?;
+
+        let total = plan.steps();
+        let started = std::time::Instant::now();
+        for (step, window) in plan.sigmas.windows(2).enumerate() {
+            self.base.progress.checkpoint()?;
+            let (sigma, sigma_next) = (window[0], window[1]);
+            // `timestep(sigma) == sigma` at multiplier 1.0 — see the sampler
+            // module doc for the derivation.
+            let timestep = timestep_tensor(sigma, &loaded.device)?;
+
+            let velocity = match (&uncond, plan.cfg_scale) {
+                (Some(uncond), Some(scale)) => {
+                    let conditioned =
+                        loaded
+                            .dit
+                            .forward(&latents, &timestep, cond, guidance.as_ref())?;
+                    let unconditioned =
+                        loaded
+                            .dit
+                            .forward(&latents, &timestep, uncond, guidance.as_ref())?;
+                    sampler::apply_cfg(&conditioned, &unconditioned, scale)?
+                }
+                _ => loaded
+                    .dit
+                    .forward(&latents, &timestep, cond, guidance.as_ref())?,
+            };
+            latents = sampler::euler_step(&latents, &velocity, sigma, sigma_next)?;
+            self.base.progress.emit(ProgressEvent::DenoiseStep {
+                step: step + 1,
+                total,
+                elapsed: started.elapsed(),
+            });
+        }
+        Ok(latents)
+    }
+
+    /// Evaluate the occupancy field on the query grid, chunk by chunk.
+    fn decode_occupancy(
+        &self,
+        loaded: &Loaded,
+        latents: &Tensor,
+        octree: usize,
+    ) -> Result<OccupancyGrid> {
+        self.base.progress.stage_start("Decoding volume");
+        let phase_started = std::time::Instant::now();
+
+        // The scale factor belongs to the sampler's output contract, not to
+        // the decoder — see `ShapeVae::unscale_latents`.
+        let unscaled = loaded.vae.unscale_latents(latents)?;
+        let prepared = loaded.vae.prepare_latents(&unscaled)?;
+        // Hoisted out of the loop: the cross-attention keys and values depend
+        // only on the latents, so projecting them per chunk would repeat the
+        // same GEMM two thousand times.
+        let cross_kv = loaded.vae.prepare_cross_kv(&prepared)?;
+        drop(prepared);
+
+        let total = super::shape_vae::query_grid_len(octree);
+        let chunk = Self::decode_chunk(&loaded.device);
+        let chunks = total.div_ceil(chunk);
+        let tick_every = chunks.div_ceil(DECODE_TICKS).max(1);
+
+        let mut logits: Vec<f32> = Vec::with_capacity(total);
+        let mut start = 0usize;
+        let mut index = 0usize;
+        while start < total {
+            self.base.progress.checkpoint()?;
+            let len = chunk.min(total - start);
+            let queries = super::shape_vae::query_grid_chunk(
+                octree,
+                QUERY_BOUNDS,
+                start,
+                len,
+                &loaded.device,
+                loaded.dtype,
+            )?
+            .unsqueeze(0)?;
+            let chunk_logits = loaded.vae.decode_queries_cached(&queries, &cross_kv)?;
+            logits.extend(
+                chunk_logits
+                    .flatten_all()?
+                    .to_dtype(DType::F32)?
+                    .to_vec1::<f32>()?,
+            );
+            start += len;
+            index += 1;
+            if index.is_multiple_of(tick_every) || start >= total {
+                self.base
+                    .progress
+                    .stage_progress("Decoding volume", start, total);
+            }
+        }
+
+        self.base.progress.stage_complete(
+            ProgressPhase::Vae,
+            "Decoding volume",
+            phase_started.elapsed(),
+        );
+
+        // `reshape_grid_logits` reproduces BOTH upstream moves between the
+        // decoder and the mesher (`vae.py:976`, then `comfy/sd.py:1277`);
+        // either one alone rotates the mesh. Doing them on the flat Vec would
+        // mean re-implementing two transposes by hand, so it goes through the
+        // tensor.
+        let dim = octree + 1;
+        let flat = Tensor::from_vec(logits, (1, total), &Device::Cpu)?;
+        let reshaped = ShapeVae::reshape_grid_logits(&flat, octree)?;
+        let mut ordered = reshaped.flatten_all()?.to_vec1::<f32>()?;
+        occupancy_from_logits(&mut ordered);
+        OccupancyGrid::new(ordered, [dim, dim, dim])
+    }
+
+    /// Surface extraction and everything after it. Pure CPU.
+    fn extract_surface(
+        &self,
+        grid: &OccupancyGrid,
+        threshold: f32,
+        target_faces: Option<u32>,
+    ) -> Result<Mesh> {
+        self.base.progress.stage_start("Extracting surface");
+        let phase_started = std::time::Instant::now();
+        let progress = &self.base.progress;
+        let mut mesh = super::mesh::extract(
+            grid,
+            MeshAlgorithm::SurfaceNet,
+            threshold,
+            &mut |current, total| {
+                progress.checkpoint()?;
+                progress.stage_progress("Extracting surface", current as usize, total as usize);
+                Ok(())
+            },
+        )?;
+        if mesh.is_empty() {
+            // A blank GLB is worse than an error: it publishes a gallery row
+            // for a print with nothing in it. The usual cause is a threshold
+            // the occupancy field never crosses.
+            bail!(
+                "the shape model produced no surface at threshold {threshold}; \
+                 try a different source image or a lower --mesh-threshold"
+            );
+        }
+        super::mesh::compute_smooth_normals(&mut mesh);
+        self.base.progress.stage_complete(
+            ProgressPhase::VisualDecode,
+            "Extracting surface",
+            phase_started.elapsed(),
+        );
+        if let Some(target) = target_faces {
+            mesh = self.simplify_surface(mesh, target)?;
+        }
+        Ok(mesh)
+    }
+
+    /// Decimate to `target_faces` as its own reported, cancellable stage.
+    ///
+    /// It used to run silently inside "Extracting surface", which left the
+    /// row showing a frozen "Extracting surface N of N" and ignored a cancel
+    /// for the whole collapse loop. Both callers go through here so the
+    /// generated and the supplied mesh reach the paint stage the same way.
+    fn simplify_surface(&self, mesh: Mesh, target_faces: u32) -> Result<Mesh> {
+        if mesh.faces.len() <= target_faces as usize {
+            return Ok(mesh);
+        }
+        self.base.progress.stage_start("Simplifying mesh");
+        let started = std::time::Instant::now();
+        let progress = &self.base.progress;
+        let mut out = super::mesh::simplify_with_progress(
+            &mesh,
+            target_faces as usize,
+            &mut |current, total| {
+                progress.checkpoint()?;
+                progress.stage_progress("Simplifying mesh", current as usize, total as usize);
+                Ok(())
+            },
+        )?;
+        // Decimation invalidates the old normals.
+        super::mesh::compute_smooth_normals(&mut out);
+        // The collapse loop stops when no legal collapse remains, which on a
+        // non-manifold surface can be far above the target — and the stage
+        // still reports 100%, because the progress denominator is the faces it
+        // MEANT to retire. A silent miss is what made #1669 read as an xatlas
+        // problem for two rounds: the mesh handed to the unwrap was 2.4x the
+        // budget the request recorded. Say so rather than let the next one hide.
+        if out.faces.len() > target_faces as usize {
+            tracing::warn!(
+                target_faces,
+                reached = out.faces.len(),
+                "mesh decimation stopped above its face budget: no legal \
+                 collapse remains, which usually means the surface is \
+                 non-manifold. UV unwrapping it may be slow."
+            );
+        }
+        self.base
+            .progress
+            .stage_done("Simplifying mesh", started.elapsed());
+        Ok(out)
+    }
+}
+
+/// Recover the DiT geometry from a checkpoint header.
+/// The 2.1 architecture is identified from its own tensor inventory, never
+/// the model name. ComfyUI model_detection.py:800-811 uses the same embedder.
+fn detect_shape21_config(
+    header: &mold_core::safetensors_probe::SafetensorsHeader,
+) -> Result<Option<Dit21Config>> {
+    let Some(embed) = header.tensor_shapes.get("model.x_embedder.weight") else {
+        return Ok(None);
+    };
+    if header.tensor_shapes.contains_key("model.latent_in.weight") {
+        bail!("checkpoint mixes Hunyuan3D 2.0 and 2.1 transformers");
+    }
+    if embed.len() != 2 || embed[0] == 0 || !embed[0].is_multiple_of(16) || embed[1] == 0 {
+        bail!("invalid Hunyuan3D 2.1 x_embedder shape");
+    }
+    let context = header
+        .tensor_shapes
+        .get("model.blocks.0.attn2.to_k.weight")
+        .filter(|shape| shape.len() == 2 && shape[0] == embed[0] && shape[1] == 1024)
+        .context("Hunyuan3D 2.1 requires a 1024-wide image context")?;
+    let mut blocks = std::collections::BTreeSet::new();
+    let mut moe_blocks = std::collections::BTreeSet::new();
+    for name in &header.tensor_names {
+        if let Some(suffix) = name.strip_prefix("model.blocks.") {
+            if let Some((index, parameter)) = suffix.split_once('.') {
+                if let Ok(index) = index.parse::<usize>() {
+                    blocks.insert(index);
+                    if parameter == "moe.gate.weight" {
+                        moe_blocks.insert(index);
+                    }
+                }
+            }
+        }
+    }
+    let depth = blocks.len();
+    if depth == 0 || depth.is_multiple_of(2) || blocks.iter().copied().ne(0..depth) {
+        bail!("Hunyuan3D 2.1 requires contiguous odd-depth transformer blocks");
+    }
+    if moe_blocks.is_empty()
+        || moe_blocks
+            .iter()
+            .copied()
+            .ne(depth - moe_blocks.len()..depth)
+    {
+        bail!("Hunyuan3D 2.1 MoE blocks must occupy the end of the transformer");
+    }
+    let gate = header
+        .tensor_shapes
+        .get(&format!("model.blocks.{}.moe.gate.weight", depth - 1))
+        .filter(|shape| shape.len() == 2 && shape[0] >= 2 && shape[1] == embed[0])
+        .context("invalid Hunyuan3D 2.1 expert router shape")?;
+    Ok(Some(Dit21Config {
+        in_channels: embed[1],
+        hidden_size: embed[0],
+        context_dim: context[1],
+        depth,
+        num_heads: 16,
+        num_moe_layers: moe_blocks.len(),
+        num_experts: gate[0],
+        top_k: 2,
+    }))
+}
+
+fn detect_dit_config(
+    header: &mold_core::safetensors_probe::SafetensorsHeader,
+) -> Result<DitConfig> {
+    let latent_in = header
+        .tensor_shapes
+        .get(&format!("{DIT_PREFIX}.latent_in.weight"))
+        .filter(|shape| shape.len() == 2)
+        .context("checkpoint has no model.latent_in.weight; not a Hunyuan3D shape model")?;
+    let cond_in = header
+        .tensor_shapes
+        .get(&format!("{DIT_PREFIX}.cond_in.weight"))
+        .filter(|shape| shape.len() == 2)
+        .context("checkpoint has no model.cond_in.weight")?;
+    let prefix = format!("{DIT_PREFIX}.");
+    let cfg = DitConfig::from_state_dict(
+        (latent_in[0], latent_in[1]),
+        cond_in[1],
+        header
+            .tensor_names
+            .iter()
+            .filter_map(|name| name.strip_prefix(&prefix)),
+    );
+    if cfg.depth == 0 || cfg.depth_single_blocks == 0 {
+        bail!("checkpoint declares no transformer blocks; not a Hunyuan3D shape model");
+    }
+    Ok(cfg)
+}
+
+/// DiT depth of the 0.6B mini tier.
+///
+/// This ONE number separates the two published tiers, and ComfyUI keys on it
+/// exactly this way: `Hunyuan3Dv2mini.unet_config` is
+/// `{"image_model": "hunyuan3d2", "depth": 8}`
+/// (`comfy/supported_models.py:1593-1597`), against the base
+/// `Hunyuan3Dv2`'s `{"image_model": "hunyuan3d2"}` at `:1543-1546`.
+const MINI_TIER_DIT_DEPTH: usize = 8;
+
+/// Whether a detected DiT geometry is the 0.6B mini tier.
+fn is_mini_tier(dit: &DitConfig) -> bool {
+    dit.depth == MINI_TIER_DIT_DEPTH
+}
+
+/// Map raw occupancy logits onto the scale ComfyUI's mesher thresholds.
+///
+/// `VAEDecodeHunyuan3D` reaches `ShapeVAE.decode` through the generic
+/// `comfy.sd.VAE.decode` wrapper, and the ShapeVAE branch of that class
+/// (`comfy/sd.py:838-856`) never overrides `process_output`, so the default
+/// image post-process — `image.add_(1.0).div_(2.0).clamp_(0.0, 1.0)`
+/// (`comfy/sd.py:505`) — is applied in place to the voxel grid
+/// (`comfy/sd.py:1233`) before `VoxelToMesh` ever sees it. The node's 0.6
+/// default, and every threshold a user types, is a level on THIS scale.
+/// Mirroring it keeps `--mesh-threshold` meaning what it means in the oracle,
+/// and keeps the surface-net interpolation identical, clamp included.
+fn occupancy_from_logits(logits: &mut [f32]) {
+    for value in logits.iter_mut() {
+        *value = ((*value + 1.0) * 0.5).clamp(0.0, 1.0);
+    }
+}
+
+/// Pick the shape-VAE config.
+///
+/// Only ONE field differs between the published tiers — `scale_factor` — and
+/// it is not recoverable from the tensors, because it is a scalar the
+/// `config.yaml` carries and the checkpoint does not. It is recoverable from
+/// the DiT DEPTH though, which the header does carry, so the tier comes from
+/// the weights rather than from whatever name the file was installed under.
+/// A repack, a re-quantization, or a locally renamed checkpoint then takes
+/// the right scale instead of silently rendering a subtly wrong mesh.
+///
+/// The values match `comfy/latent_formats.py`: `Hunyuan3Dv2mini.scale_factor`
+/// is 1.0188137142395404 (`:945`) and `Hunyuan3Dv2`'s is 0.9990943042622529
+/// (`:935`).
+fn detect_vae_config(dit: &DitConfig) -> ShapeVaeConfig {
+    if is_mini_tier(dit) {
+        ShapeVaeConfig::v2_0_mini()
+    } else {
+        ShapeVaeConfig::v2_0()
+    }
+}
+
+/// The letterbox and encoder edge lengths this checkpoint conditions at.
+///
+/// Both are `config.yaml` entries the safetensors does not carry, so like the
+/// VAE scale factor they key on the detected DiT depth:
+///
+/// | Tier | `image_processor.params.size` | `...main_image_encoder.kwargs.image_size` |
+/// | --- | --- | --- |
+/// | 1.1B (`hunyuan3d-dit-v2-0`, `-turbo`) | 512 | 518 |
+/// | 0.6B (`hunyuan3d-dit-v2-mini-turbo`) | 1022 | 1022 |
+///
+/// 518 is also DINOv2-giant's own stored resolution
+/// (`comfy/image_encoders/dino2_giant.json`) and ComfyUI's conditioning size
+/// for this family (`comfy/clip_vision.py:38`, `:68`). 512 is not a legal
+/// encoder size at all — it is not a multiple of the 14px patch — so
+/// conflating the two made the base tiers fail at image encode rather than
+/// render differently.
+fn conditioning_for(dit: &DitConfig) -> Conditioning {
+    if is_mini_tier(dit) {
+        Conditioning {
+            letterbox: 1022,
+            encoder: 1022,
+        }
+    } else {
+        Conditioning {
+            letterbox: 512,
+            encoder: 518,
+        }
+    }
+}
+
+/// The timestep tensor for one sampler step. **Always F32**, never the
+/// compute dtype.
+///
+/// Upstream floats the timestep before the model sees it
+/// (`comfy/model_base.py:222`) and casts only the finished sinusoidal
+/// embedding (`comfy/ldm/hunyuan3d/model.py:82`, built by
+/// `comfy/ldm/flux/layers.py:38-47`). Building this in F16 instead would round
+/// the sigma to about three significant digits and then let the 1000x
+/// `time_factor` multiply amplify the error into every cosine argument, which
+/// is a different denoising trajectory rather than a slightly noisier one.
+fn timestep_tensor(sigma: f64, device: &Device) -> Result<Tensor> {
+    Ok(Tensor::new(&[sigma as f32], device)?)
+}
+
+/// The guidance tensor for a distilled checkpoint. **Always F32**, matching
+/// `torch.FloatTensor([guidance])` (`comfy/model_base.py:2098-2100`); it goes
+/// through the same [`super::transformer::timestep_embedding`] and takes the
+/// same cast at the end.
+fn guidance_tensor(value: f64, device: &Device) -> Result<Tensor> {
+    Ok(Tensor::new(&[value as f32], device)?)
+}
+
+impl InferenceEngine for Hunyuan3dEngine {
+    fn generate(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        self.base.progress.checkpoint()?;
+        self.generate_inner(req, &[])
+    }
+
+    fn generate_with_reference_bindings(
+        &mut self,
+        req: &GenerateRequest,
+        bindings: &[GenerationReferenceBinding],
+    ) -> Result<GenerateResponse> {
+        self.base.progress.checkpoint()?;
+        self.generate_inner(req, bindings)
+    }
+
+    fn model_name(&self) -> &str {
+        self.base.model_name()
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.base.is_loaded()
+    }
+
+    fn load(&mut self) -> Result<()> {
+        if self.base.load_strategy == LoadStrategy::Sequential {
+            // Sequential mode loads inside `generate` and drops afterwards;
+            // eagerly loading here would double the peak.
+            return Ok(());
+        }
+        if self.base.loaded.is_none() {
+            self.base.loaded = Some(self.load_inner()?);
+        }
+        Ok(())
+    }
+
+    fn unload(&mut self) {
+        self.base.unload();
+        // Best effort: a failed VRAM query must not turn an unload into an
+        // error, because the caller is already discarding this engine.
+        let _ = crate::device::post_drop_free_vram_bytes(self.base.gpu_ordinal);
+    }
+
+    fn set_on_progress(&mut self, callback: crate::progress::ProgressCallback) {
+        self.base.set_on_progress(callback);
+    }
+
+    fn clear_on_progress(&mut self) {
+        self.base.clear_on_progress();
+    }
+
+    fn set_cancellation_token(&mut self, token: crate::progress::InferenceCancellationToken) {
+        self.base.set_cancellation_token(token);
+    }
+
+    fn clear_cancellation_token(&mut self) {
+        self.base.clear_cancellation_token();
+    }
+
+    fn batch_execution_capability(&self) -> crate::BatchExecutionCapability {
+        crate::batch_execution_capability_for_family(mold_core::manifest::HUNYUAN3D_FAMILY)
+            .expect("production Hunyuan3D batch capability must be registered")
+    }
+
+    fn model_paths(&self) -> Option<&ModelPaths> {
+        Some(&self.base.paths)
+    }
+
+    fn configured_load_strategy(&self) -> Option<LoadStrategy> {
+        Some(self.base.load_strategy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quantized_shape_execution_is_cuda_only() {
+        ensure_quantized_shape_backend(true, true).unwrap();
+        ensure_quantized_shape_backend(false, false).unwrap();
+        let error = ensure_quantized_shape_backend(false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("CUDA-only"), "{error}");
+        assert!(error.contains("fp16"), "{error}");
+    }
+    use mold_core::safetensors_probe::SafetensorsHeader;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn generated_gguf_exposes_the_same_shape_header_as_its_source() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("shape.safetensors");
+        let output = directory.path().join("shape-q8.gguf");
+        candle_core::safetensors::save(
+            &std::collections::HashMap::from([
+                (
+                    "model.x_embedder.weight".to_string(),
+                    Tensor::zeros((32, 32), DType::F32, &Device::Cpu)?,
+                ),
+                (
+                    "vae.decoder.weight".to_string(),
+                    Tensor::zeros((4, 32), DType::F32, &Device::Cpu)?,
+                ),
+            ]),
+            &source,
+        )?;
+        super::super::quantization::quantize_checkpoint(
+            &source,
+            &output,
+            "fixture:fp16",
+            super::super::quantization::ShapeQuantization::Q8,
+        )?;
+
+        let source_header = checkpoint_header(&source)?;
+        let gguf_header = checkpoint_header(&output)?;
+        assert_eq!(gguf_header.tensor_shapes, source_header.tensor_shapes);
+        assert_eq!(gguf_header.tensor_names, source_header.tensor_names);
+        Ok(())
+    }
+
+    #[test]
+    fn shape21_uses_large_vision_and_4096_latents_from_its_architecture() {
+        let mut header = header(0, 0, false);
+        header.tensor_names.clear();
+        header.tensor_shapes.clear();
+        for (name, shape) in [
+            ("model.x_embedder.weight", vec![2048, 64]),
+            ("model.blocks.0.attn2.to_k.weight", vec![2048, 1024]),
+            ("model.blocks.20.moe.gate.weight", vec![8, 2048]),
+        ] {
+            header.tensor_names.push(name.into());
+            header.tensor_shapes.insert(name.into(), shape);
+        }
+        for i in 0..21 {
+            header
+                .tensor_names
+                .push(format!("model.blocks.{i}.norm1.weight"));
+        }
+        for i in 15..21 {
+            header
+                .tensor_names
+                .push(format!("model.blocks.{i}.moe.gate.weight"));
+        }
+        let config = detect_shape21_config(&header).unwrap().unwrap();
+        assert_eq!(config.hidden_size, 2048);
+        assert_eq!(config.context_dim, 1024);
+        assert_eq!(config.depth, 21);
+        assert_eq!(config.num_moe_layers, 6);
+        assert_eq!(config.num_experts, 8);
+        assert_eq!(ShapeVaeConfig::v2_1().num_latents, 4096);
+        assert_eq!(ShapeVaeConfig::v2_1().scale_factor, 1.003_950_615_875_240_3);
+        assert_eq!(Dinov2Config::large().hidden_size, 1024);
+        assert!(!Dinov2Config::large().use_swiglu_ffn);
+    }
+
+    #[test]
+    fn legacy_shape_does_not_select_shape21() {
+        assert!(detect_shape21_config(&header(16, 32, false))
+            .unwrap()
+            .is_none());
+    }
+
+    fn header(depth: usize, single: usize, guidance: bool) -> SafetensorsHeader {
+        let mut shapes = BTreeMap::new();
+        let mut names = Vec::new();
+        shapes.insert("model.latent_in.weight".to_string(), vec![1024, 64]);
+        shapes.insert("model.cond_in.weight".to_string(), vec![1024, 1536]);
+        names.push("model.latent_in.weight".to_string());
+        names.push("model.cond_in.weight".to_string());
+        for index in 0..depth {
+            names.push(format!("model.double_blocks.{index}.img_attn.qkv.weight"));
+        }
+        for index in 0..single {
+            names.push(format!("model.single_blocks.{index}.linear1.weight"));
+        }
+        if guidance {
+            names.push("model.guidance_in.in_layer.weight".to_string());
+        }
+        SafetensorsHeader {
+            metadata: BTreeMap::new(),
+            tensor_names: names,
+            tensor_shapes: shapes,
+        }
+    }
+
+    #[test]
+    fn dit_geometry_comes_from_the_file_not_the_filename() {
+        let cfg = detect_dit_config(&header(16, 32, false)).unwrap();
+        assert_eq!(cfg, DitConfig::v2_0());
+
+        let mini = detect_dit_config(&header(8, 16, true)).unwrap();
+        assert_eq!(mini.depth, 8);
+        assert_eq!(mini.depth_single_blocks, 16);
+        assert!(mini.guidance_embed);
+    }
+
+    #[test]
+    fn a_checkpoint_without_the_marker_tensors_is_refused_by_name() {
+        let mut empty = header(16, 32, false);
+        empty.tensor_shapes.remove("model.latent_in.weight");
+        let error = detect_dit_config(&empty).unwrap_err().to_string();
+        assert!(error.contains("not a Hunyuan3D shape model"), "{error}");
+    }
+
+    #[test]
+    fn a_checkpoint_with_no_blocks_is_refused() {
+        let error = detect_dit_config(&header(0, 0, false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no transformer blocks"), "{error}");
+    }
+
+    /// Tier identity is a property of the WEIGHTS, not of the name mold
+    /// happened to install them under.
+    ///
+    /// ComfyUI keys the mini tier on the DiT depth — `Hunyuan3Dv2mini`'s
+    /// `unet_config` is `{"image_model": "hunyuan3d2", "depth": 8}`
+    /// (`comfy/supported_models.py:1593-1597`) — and mold already detects
+    /// that depth from the checkpoint header. Keying on
+    /// `model_name.contains("mini")` instead made a repack, a community
+    /// re-quantization, or a renamed local file take the wrong scale factor
+    /// and the wrong conditioning size, silently: the mesh still renders.
+    #[test]
+    fn tier_identity_comes_from_the_dit_depth() {
+        let mini_dit = detect_dit_config(&header(8, 16, true)).unwrap();
+        let mini = detect_vae_config(&mini_dit);
+        assert_eq!(mini, ShapeVaeConfig::v2_0_mini());
+        assert_eq!(
+            conditioning_for(&mini_dit),
+            Conditioning {
+                letterbox: 1022,
+                encoder: 1022,
+            }
+        );
+
+        for dit in [DitConfig::v2_0(), DitConfig::v2_0_turbo()] {
+            let vae = detect_vae_config(&dit);
+            assert_eq!(
+                vae,
+                ShapeVaeConfig::v2_0(),
+                "depth {} is a base tier",
+                dit.depth
+            );
+
+            // `image_processor.params.size` is the letterbox and
+            // `conditioner.params.main_image_encoder.kwargs.image_size` is
+            // what DINOv2 actually receives. They are NOT the same number on
+            // the base tiers, and 512 is not even a legal encoder size:
+            // 512 % 14 == 8, so `Dinov2Model::forward` refuses it.
+            let sizes = conditioning_for(&dit);
+            assert_eq!(
+                sizes,
+                Conditioning {
+                    letterbox: 512,
+                    encoder: 518,
+                }
+            );
+            assert_eq!(
+                sizes.encoder % 14,
+                0,
+                "the encoder size must be a whole number of patches"
+            );
+            assert_eq!(
+                sizes.encoder as usize,
+                Dinov2Config::giant().image_size,
+                "the base tiers condition at the tower's own stored resolution"
+            );
+        }
+    }
+
+    /// The mesher thresholds ComfyUI's post-processed occupancy, not the raw
+    /// logits: `(x + 1) / 2` clamped to `[0, 1]` (`comfy/sd.py:505`, applied
+    /// at `:1233`). A raw logit of 0.2 is the node's default 0.6 iso-level,
+    /// and anything past ±1 saturates exactly as it does upstream.
+    #[test]
+    fn occupancy_is_the_vae_wrappers_image_post_process_of_the_logits() {
+        let mut values = vec![-3.0, -1.0, -0.5, 0.0, 0.2, 1.0, 5.0];
+        occupancy_from_logits(&mut values);
+        let expected = [0.0, 0.0, 0.25, 0.5, 0.6, 1.0, 1.0];
+        for (got, want) in values.iter().zip(expected) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "occupancy {got} should be {want} (from {values:?})"
+            );
+        }
+    }
+
+    /// Both scalars are f32 on every device and in every build. The DiT
+    /// widens defensively, but the sigma has to arrive intact: the 1000x
+    /// `time_factor` multiply inside the sinusoidal embedding amplifies
+    /// whatever precision the caller threw away.
+    #[test]
+    fn the_timestep_and_guidance_tensors_are_always_f32() {
+        let device = Device::Cpu;
+
+        let timestep = timestep_tensor(0.9, &device).unwrap();
+        assert_eq!(timestep.dtype(), DType::F32);
+        assert_eq!(timestep.dims(), &[1]);
+        assert!((timestep.to_vec1::<f32>().unwrap()[0] - 0.9).abs() < 1e-7);
+
+        let guidance = guidance_tensor(5.0, &device).unwrap();
+        assert_eq!(guidance.dtype(), DType::F32);
+        assert_eq!(guidance.dims(), &[1]);
+        assert!((guidance.to_vec1::<f32>().unwrap()[0] - 5.0).abs() < 1e-7);
+    }
+
+    #[test]
+    fn the_decode_chunk_override_is_clamped_not_trusted() {
+        // The default holds when nothing is set. The clamp itself is asserted
+        // through the public constant bounds rather than by mutating the
+        // process environment, which `runtime_env` deliberately caches.
+        assert_eq!(
+            Hunyuan3dEngine::decode_chunk(&Device::Cpu),
+            DEFAULT_DECODE_CHUNK
+        );
+    }
+
+    /// Metal's default is the measured one, not upstream's, and the env
+    /// override still wins over it (asserted through the resolver's shape:
+    /// with nothing set, the backend default is what comes back).
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_takes_the_measured_decode_chunk_default() {
+        let Ok(metal) = Device::new_metal(0) else {
+            return;
+        };
+        assert_eq!(
+            Hunyuan3dEngine::decode_chunk(&metal),
+            super::super::backend::decode_chunk_default(&metal, DEFAULT_DECODE_CHUNK)
+        );
+        assert_ne!(Hunyuan3dEngine::decode_chunk(&metal), DEFAULT_DECODE_CHUNK);
+    }
+}

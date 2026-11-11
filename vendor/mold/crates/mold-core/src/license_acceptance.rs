@@ -1,0 +1,960 @@
+//! Explicit, recorded acceptance of third-party model licenses.
+//!
+//! A few manifest files are published under terms mold cannot accept on the
+//! user's behalf — most notably the InsightFace antelopev2 pretrained models,
+//! which are licensed for non-commercial research only. Mold does not bundle
+//! those weights and refuses to download them until the user has recorded an
+//! acceptance, so an automatic or server-side auto-pull can never silently
+//! acquire them.
+//!
+//! The acceptance record is an authorization record, not a model artifact:
+//! it is written owner-only (`0o600`) via a temp-file + rename, exactly like
+//! the server's catalog credentials. (The "model storage permissions
+//! invariant" deliberately does not apply here — it protects runnable model
+//! files from group/other mode-bit rejection, never authorization evidence.)
+//!
+//! An acceptance is bound to the exact license text mold showed. If the
+//! pinned `sha256` changes because the upstream terms changed, the old
+//! record no longer counts and the user must accept again.
+
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// File name of the acceptance record under `$MOLD_HOME`.
+pub const ACCEPTANCE_FILE: &str = "license-acceptances.json";
+
+/// A third-party license the user must accept before mold will download the
+/// files it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThirdPartyLicense {
+    /// Stable identifier used by `mold pull --accept-license <id>` and by the
+    /// on-disk record. Never renamed — a rename invalidates every acceptance.
+    pub id: &'static str,
+    /// Human-readable name for prompts and error messages.
+    pub name: &'static str,
+    /// **Immutable** URL of the exact license text mold pinned — a
+    /// content-addressed upstream revision, never a moving branch ref.
+    ///
+    /// This is load-bearing, not cosmetic. A `.../master/README.md` URL is
+    /// mutable: upstream can rewrite the terms, and mold would go on
+    /// recording a hard-coded digest of text nobody can fetch any more while
+    /// showing the user a link whose contents no longer match. Old
+    /// acceptances would keep passing and the "changed terms require
+    /// re-acceptance" promise would be hollow. Pinning the revision makes
+    /// `(url, sha256)` a closed pair: the bytes at this URL cannot change, so
+    /// the digest cannot go stale, and adopting new terms is necessarily a
+    /// visible edit to this constant.
+    pub url: &'static str,
+    /// SHA-256 of the exact license text served at [`Self::url`]. Verified at
+    /// pin time; an acceptance recorded against a different digest does not
+    /// count.
+    pub sha256: &'static str,
+    /// Human-readable landing page for the project's current terms.
+    ///
+    /// Shown alongside [`Self::url`] so a user can read today's terms in
+    /// context, but deliberately NOT part of the accepted identity — its
+    /// contents move, which is exactly what `url` must not do.
+    pub canonical: &'static str,
+    /// One-sentence statement of the restriction the user is accepting.
+    pub summary: &'static str,
+}
+
+impl ThirdPartyLicense {
+    /// The identity an acceptance is bound to: the immutable text location
+    /// and its digest.
+    ///
+    /// Re-pinning either half — a new upstream revision, or a corrected
+    /// digest — invalidates every stored acceptance, which is the whole point
+    /// of binding both.
+    pub fn accepted_identity(&self) -> (&'static str, &'static str) {
+        (self.url, self.sha256)
+    }
+}
+
+/// InsightFace pretrained models (the antelopev2 pack PuLID conditions on).
+///
+/// InsightFace splits its terms: the code is MIT with no usage limitation,
+/// but "the training data containing the annotation (and the models trained
+/// with these data) are available for non-commercial research purposes only",
+/// and that applies to both manually downloaded and auto-downloaded models
+/// (InsightFace README, "License" section).
+///
+/// The terms are pinned to upstream commit
+/// `7fadd420c2351d0ffa8cac403421c1a3ed733365`, whose `README.md` was fetched
+/// and verified on 2026-08-21 to hash to `sha256` below. GitHub serves a
+/// commit-addressed raw URL immutably, so that digest can never go stale
+/// against its own URL — re-pinning to a later revision is a deliberate edit
+/// here, and it invalidates every recorded acceptance so users are re-shown
+/// whatever the new text says.
+pub const INSIGHTFACE_ANTELOPEV2: ThirdPartyLicense = ThirdPartyLicense {
+    id: "insightface-antelopev2",
+    name: "InsightFace pretrained models (antelopev2)",
+    url: "https://raw.githubusercontent.com/deepinsight/insightface/7fadd420c2351d0ffa8cac403421c1a3ed733365/README.md",
+    sha256: "84606d9ab37a38606b12c10d96172c6343768d2ef72c802a16482e476f8baf22",
+    canonical: "https://github.com/deepinsight/insightface#license",
+    summary: "InsightFace pretrained models (antelopev2: scrfd_10g_bnkps, glintr100) are licensed for non-commercial research purposes only.",
+};
+
+/// The Tencent Hunyuan 3D 2.0 Community License.
+///
+/// Two clauses make this a gate rather than a footnote. The agreement opens
+/// with "THIS LICENSE AGREEMENT DOES NOT APPLY IN THE EUROPEAN UNION, UNITED
+/// KINGDOM AND SOUTH KOREA", so a user in those territories has no licence at
+/// all for these weights; and it requires a separate written grant from
+/// Tencent once the licensee's products exceed 1 million monthly active
+/// users. Outputs are unencumbered — "Tencent claims no rights in Outputs You
+/// generate" — so nothing a user renders is affected, only the act of
+/// acquiring the weights.
+///
+/// Pinned to upstream commit `f8db63096c8282cb27354314d896feba5ba6ff8a`,
+/// fetched and verified on 2026-08-31.
+pub const TENCENT_HUNYUAN3D_2_0: ThirdPartyLicense = ThirdPartyLicense {
+    id: "tencent-hunyuan3d-2.0",
+    name: "Tencent Hunyuan 3D 2.0 Community License",
+    url: "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2/f8db63096c8282cb27354314d896feba5ba6ff8a/LICENSE",
+    sha256: "94259df223918a5733677965c1bfe1774a2dba25042d9c3b47a3418ea6c1f324",
+    canonical: "https://github.com/Tencent-Hunyuan/Hunyuan3D-2/blob/main/LICENSE",
+    summary: "Tencent Hunyuan 3D 2.0 weights: the licence does NOT apply in the European Union, the United Kingdom or South Korea, and a separate Tencent licence is required above 1 million monthly active users. Tencent claims no rights in the meshes you generate.",
+};
+
+/// The Tencent Hunyuan 3D 2.1 Community License. Same territorial exclusion
+/// and same 1M-MAU threshold as [`TENCENT_HUNYUAN3D_2_0`], but a distinct
+/// document covering the 2.1 release — including the PBR paint weights.
+///
+/// Pinned to upstream commit `82920d643c0dc2f7bfd7255f45f62d386edfe60c`,
+/// fetched and verified on 2026-08-31.
+pub const TENCENT_HUNYUAN3D_2_1: ThirdPartyLicense = ThirdPartyLicense {
+    id: "tencent-hunyuan3d-2.1",
+    name: "Tencent Hunyuan 3D 2.1 Community License",
+    url: "https://raw.githubusercontent.com/Tencent-Hunyuan/Hunyuan3D-2.1/82920d643c0dc2f7bfd7255f45f62d386edfe60c/LICENSE",
+    sha256: "b79ac5e11ce063b6c6570dbe9686a45a03ba08bd248aa6aa82fb342a23a81c0c",
+    canonical: "https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1/blob/main/LICENSE",
+    summary: "Tencent Hunyuan 3D 2.1 weights: the licence does NOT apply in the European Union, the United Kingdom or South Korea, and a separate Tencent licence is required above 1 million monthly active users. Tencent claims no rights in the meshes you generate.",
+};
+
+/// The Qwen Research License Agreement (2026-09-20) that Qwen Image 2.1 is
+/// published under — "FOR NON-COMMERCIAL PURPOSES ONLY" (§2a), a commercial
+/// licence being a separate request to Qwen (§2b).
+///
+/// It covers the WHOLE family, not only the turbo adapter: the base
+/// repository's own model card declares `license_name: qwen-research`, the
+/// community tiers mold pins (Comfy-Org's INT8, unsloth's FP8, leejet's GGUF)
+/// are conversions of those weights and carry the same card licence, and
+/// Viggle's turbo LoRA ships a `LICENSE` byte-identical to the base's. One
+/// document, so one acceptance unblocks every tier. The gate is on
+/// ACQUISITION like every licence here: files already installed keep running.
+///
+/// Pinned to `Qwen/Qwen-Image-2.1` revision
+/// `b3179ad355be050328e483a9dfdd9e60cd62adfa`, fetched and verified on
+/// 2026-09-26 (identical bytes at `790c926` and in Viggle's repository at
+/// `bb26a0f`).
+pub const QWEN_RESEARCH: ThirdPartyLicense = ThirdPartyLicense {
+    id: "qwen-research",
+    name: "Qwen Research License Agreement",
+    url: "https://huggingface.co/Qwen/Qwen-Image-2.1/raw/b3179ad355be050328e483a9dfdd9e60cd62adfa/LICENSE",
+    sha256: "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d",
+    canonical: "https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE",
+    summary: "Qwen Image 2.1 weights (every tier, and the Viggle turbo LoRA) are licensed for non-commercial research and evaluation only; commercial use needs a separate licence from Qwen.",
+};
+
+/// Every license mold knows how to gate on.
+pub const THIRD_PARTY_LICENSES: &[&ThirdPartyLicense] = &[
+    &INSIGHTFACE_ANTELOPEV2,
+    &TENCENT_HUNYUAN3D_2_0,
+    &TENCENT_HUNYUAN3D_2_1,
+    &QWEN_RESEARCH,
+];
+
+/// Resolve a license by its stable id.
+pub fn license_by_id(id: &str) -> Option<&'static ThirdPartyLicense> {
+    THIRD_PARTY_LICENSES
+        .iter()
+        .copied()
+        .find(|license| license.id == id)
+}
+
+/// Whether one registered license covers one manifest file.
+///
+/// Keep policy in this registry predicate rather than in callers. A future
+/// file may be covered by more than one license; every consumer enumerates
+/// [`licenses_for_manifest_file`] and therefore enforces all of them.
+fn license_covers_manifest_file(
+    license: &ThirdPartyLicense,
+    manifest_name: &str,
+    hf_filename: &str,
+) -> bool {
+    // Every PuLID bundle carries the same two antelopev2 graphs, because the
+    // face extractor is shared across families. The gate follows the FILES,
+    // never one bundle's name — `pulid-sdxl` fetches the identical restricted
+    // weights and must ask the identical question.
+    let is_pulid_bundle = matches!(
+        manifest_name,
+        crate::manifest::PULID_FLUX_MANIFEST | crate::manifest::PULID_SDXL_MANIFEST
+    );
+    if license.id == INSIGHTFACE_ANTELOPEV2.id {
+        return is_pulid_bundle && matches!(hf_filename, "scrfd_10g_bnkps.onnx" | "glintr100.onnx");
+    }
+
+    // Hunyuan3D gates on the REPOSITORY the file comes from, expressed through
+    // the manifest name, because each release carries its own licence
+    // document: the 2.0 shape checkpoints are covered by the 2.0 agreement and
+    // the 2.1 paint bundle by the 2.1 one. Both must be accepted separately if
+    // a user installs both, which is the honest answer — they are two
+    // documents with two release dates.
+    if license.id == TENCENT_HUNYUAN3D_2_0.id {
+        return manifest_name.starts_with("hunyuan3d")
+            && !crate::manifest::hunyuan3d_uses_21_license(manifest_name);
+    }
+    if license.id == TENCENT_HUNYUAN3D_2_1.id {
+        return crate::manifest::hunyuan3d_uses_21_license(manifest_name);
+    }
+    // Every file of every Qwen Image 2.1 manifest — base, quantized and turbo
+    // tiers alike — is Qwen Research material (see [`QWEN_RESEARCH`]).
+    if license.id == QWEN_RESEARCH.id {
+        return matches!(
+            crate::manifest::model_base_name(manifest_name),
+            "qwen-image-2.1" | "qwen-image-2.1-turbo"
+        );
+    }
+
+    false
+}
+
+/// Every license covering one manifest file.
+///
+/// Keyed on `(manifest name, hf filename)` rather than on the repository so a
+/// mirror that also hosts unrestricted files is not over-gated.
+pub fn licenses_for_manifest_file<'a>(
+    manifest_name: &'a str,
+    hf_filename: &'a str,
+) -> impl Iterator<Item = &'static ThirdPartyLicense> + 'a {
+    THIRD_PARTY_LICENSES
+        .iter()
+        .copied()
+        .filter(move |license| license_covers_manifest_file(license, manifest_name, hf_filename))
+}
+
+/// Every distinct license required by a manifest.
+pub fn licenses_for_manifest(
+    manifest: &crate::manifest::ModelManifest,
+) -> Vec<&'static ThirdPartyLicense> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for license in manifest
+        .files
+        .iter()
+        .flat_map(|file| licenses_for_manifest_file(&manifest.name, &file.hf_filename))
+    {
+        by_id.entry(license.id).or_insert(license);
+    }
+    by_id.into_values().collect()
+}
+
+/// Manifest names that cannot be downloaded until `license` is accepted.
+///
+/// Derived from the manifest registry rather than hard-coded, so adding a
+/// gated file to a manifest cannot leave `GET /api/licenses` telling users the
+/// wrong thing about what they are unblocking.
+pub fn manifests_requiring(license: &ThirdPartyLicense) -> Vec<String> {
+    crate::manifest::known_manifests()
+        .iter()
+        .filter(|manifest| {
+            manifest.files.iter().any(|file| {
+                licenses_for_manifest_file(&manifest.name, &file.hf_filename)
+                    .any(|found| found.id == license.id)
+            })
+        })
+        .map(|manifest| manifest.name.clone())
+        .collect()
+}
+
+/// The styles `manifests_requiring(license)` names, each with the plain
+/// words the registry describes it by — the friendly line a licence row
+/// leads with. Same order as `required_by`.
+pub fn styles_requiring(license: &ThirdPartyLicense) -> Vec<crate::types::LicensedStyle> {
+    crate::manifest::known_manifests()
+        .iter()
+        .filter(|manifest| {
+            manifest.files.iter().any(|file| {
+                licenses_for_manifest_file(&manifest.name, &file.hf_filename)
+                    .any(|found| found.id == license.id)
+            })
+        })
+        .map(|manifest| crate::types::LicensedStyle {
+            name: manifest.name.clone(),
+            description: manifest.description.clone(),
+        })
+        .collect()
+}
+
+/// Every known license plus this root's acceptance state, for `GET /api/licenses`.
+pub fn license_statuses(mold_home: &Path) -> Vec<crate::types::ThirdPartyLicenseStatus> {
+    THIRD_PARTY_LICENSES
+        .iter()
+        .map(|license| crate::types::ThirdPartyLicenseStatus {
+            id: license.id.to_string(),
+            name: license.name.to_string(),
+            url: license.url.to_string(),
+            canonical: license.canonical.to_string(),
+            sha256: license.sha256.to_string(),
+            summary: license.summary.to_string(),
+            accepted: is_accepted(mold_home, license),
+            required_by: manifests_requiring(license),
+            required_by_styles: styles_requiring(license),
+        })
+        .collect()
+}
+
+/// The machine-readable refusal payload for `license`.
+pub fn refusal(license: &ThirdPartyLicense) -> crate::types::LicenseRefusal {
+    crate::types::LicenseRefusal {
+        id: license.id.to_string(),
+        name: license.name.to_string(),
+        url: license.url.to_string(),
+        canonical: license.canonical.to_string(),
+        sha256: license.sha256.to_string(),
+        summary: license.summary.to_string(),
+    }
+}
+
+/// Exact outstanding terms for one installable manifest bundle.
+///
+/// This is the registry-driven bridge between model acquisition and every UI:
+/// callers never special-case a model or license id, and a future manifest
+/// license automatically rides the same placement/download contract.
+pub fn unaccepted_for_manifest(
+    manifest_name: &str,
+    mold_home: &Path,
+) -> Vec<crate::types::LicenseRefusal> {
+    let Some(manifest) = crate::manifest::known_manifests()
+        .iter()
+        .find(|manifest| manifest.name == manifest_name)
+    else {
+        return Vec::new();
+    };
+    unaccepted_for_manifest_files(
+        manifest_name,
+        manifest.files.iter().map(|file| file.hf_filename.as_str()),
+        mold_home,
+    )
+}
+
+/// Exact outstanding terms for selected files in one installable bundle.
+///
+/// Placement previews pass only files they actually need to fetch. This keeps
+/// an already-present gated asset from prompting merely because a different,
+/// unrestricted file in the same bundle is missing.
+pub fn unaccepted_for_manifest_files<'a>(
+    manifest_name: &'a str,
+    hf_filenames: impl IntoIterator<Item = &'a str>,
+    mold_home: &Path,
+) -> Vec<crate::types::LicenseRefusal> {
+    let mut seen = std::collections::BTreeSet::new();
+    hf_filenames
+        .into_iter()
+        .flat_map(|filename| licenses_for_manifest_file(manifest_name, filename))
+        .filter(|license| !is_accepted(mold_home, license))
+        .filter(|license| seen.insert(license.id))
+        .map(refusal)
+        .collect()
+}
+
+/// An `accept_licenses` entry naming a license this build does not know.
+///
+/// Rejected rather than ignored: silently dropping an unrecognised id would
+/// let a client believe it had accepted something, then fail the download with
+/// a refusal that looks like a server bug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownLicenseId(pub String);
+
+impl std::fmt::Display for UnknownLicenseId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let known = THIRD_PARTY_LICENSES
+            .iter()
+            .map(|license| license.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "unknown license id '{}'. Known licenses: {known}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnknownLicenseId {}
+
+/// Resolve and VERIFY every acceptance, then record them all.
+///
+/// Two things are checked before anything is written, for the whole list:
+/// that the id is known, and that the `(url, sha256)` the caller displayed is
+/// the document this build pins. The second check is the point of the whole
+/// struct — the caller may be a client on a different Mold release, and
+/// recording its consent against terms of OUR choosing would store agreement
+/// to text the user never read.
+///
+/// Nothing is written until every entry passes, so a rejected request leaves a
+/// root the caller can describe as untouched.
+pub fn record_acceptances(
+    mold_home: &Path,
+    acceptances: &[crate::types::LicenseAcceptance],
+) -> Result<Vec<&'static ThirdPartyLicense>, RecordAcceptancesError> {
+    let mut resolved = Vec::with_capacity(acceptances.len());
+    for acceptance in acceptances {
+        let license = license_by_id(&acceptance.id).ok_or_else(|| {
+            RecordAcceptancesError::Unknown(UnknownLicenseId(acceptance.id.clone()))
+        })?;
+        if !acceptance.matches(license.url, license.sha256) {
+            return Err(RecordAcceptancesError::TermsMismatch(license));
+        }
+        resolved.push(license);
+    }
+    for license in &resolved {
+        record_acceptance(mold_home, license).map_err(RecordAcceptancesError::Io)?;
+    }
+    Ok(resolved)
+}
+
+/// Failure modes of [`record_acceptances`].
+#[derive(Debug)]
+pub enum RecordAcceptancesError {
+    /// The request named a license this build does not know — a client error.
+    Unknown(UnknownLicenseId),
+    /// The caller accepted a DIFFERENT revision of a license this build knows.
+    /// Carries our pinned license so the refusal can show the caller what it
+    /// would have to accept instead.
+    TermsMismatch(&'static ThirdPartyLicense),
+    /// The record could not be written — a server error.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for RecordAcceptancesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unknown(error) => write!(f, "{error}"),
+            Self::TermsMismatch(license) => write!(
+                f,
+                "the accepted terms for '{}' are not the ones this server pins. \
+                 This server pins {} (sha256 {}). Review those terms and accept again.",
+                license.id, license.url, license.sha256
+            ),
+            Self::Io(error) => write!(f, "failed to record license acceptance: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for RecordAcceptancesError {}
+
+/// The acceptance payload for `license` as this build pins it.
+///
+/// Used by the CLI's older-server fallback, and by tests.
+pub fn acceptance_for(license: &ThirdPartyLicense) -> crate::types::LicenseAcceptance {
+    crate::types::LicenseAcceptance {
+        id: license.id.to_string(),
+        url: license.url.to_string(),
+        sha256: license.sha256.to_string(),
+    }
+}
+
+/// Path of the acceptance record inside a Mold data root.
+pub fn acceptance_path(mold_home: &Path) -> PathBuf {
+    mold_home.join(ACCEPTANCE_FILE)
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct AcceptanceRecord {
+    #[serde(default)]
+    acceptances: Vec<Acceptance>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Acceptance {
+    id: String,
+    url: String,
+    sha256: String,
+    accepted_at_unix_ms: u64,
+}
+
+fn load(mold_home: &Path) -> AcceptanceRecord {
+    match fs::read(acceptance_path(mold_home)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => AcceptanceRecord::default(),
+    }
+}
+
+/// True when `license` has been accepted against its CURRENT pinned text.
+///
+/// The record must match the license's whole [`ThirdPartyLicense::accepted_identity`]
+/// — BOTH the immutable text URL and the digest — not just the id. Either
+/// half moving means the terms mold would show today are not the terms the
+/// user agreed to, so a Mold release that re-pins the license to a newer
+/// upstream revision asks every user again rather than silently inheriting
+/// consent given for different text. Checking only the digest would let a
+/// re-pin whose text happens to be byte-identical slip through, and checking
+/// only the URL would miss a corrected digest.
+pub fn is_accepted(mold_home: &Path, license: &ThirdPartyLicense) -> bool {
+    let (url, sha256) = license.accepted_identity();
+    load(mold_home).acceptances.iter().any(|accepted| {
+        accepted.id == license.id
+            && accepted.sha256.eq_ignore_ascii_case(sha256)
+            && accepted.url == url
+    })
+}
+
+/// True when the license with `id` is known and accepted.
+pub fn is_accepted_by_id(mold_home: &Path, id: &str) -> bool {
+    license_by_id(id).is_some_and(|license| is_accepted(mold_home, license))
+}
+
+/// Record the user's acceptance of `license`, replacing any stale record for
+/// the same id.
+///
+/// Written owner-only through a temp file and an atomic rename so a partially
+/// written record can never be read as an acceptance.
+pub fn record_acceptance(mold_home: &Path, license: &ThirdPartyLicense) -> io::Result<()> {
+    let (url, sha256) = license.accepted_identity();
+    let mut record = load(mold_home);
+    record.acceptances.retain(|entry| entry.id != license.id);
+    record.acceptances.push(Acceptance {
+        id: license.id.to_string(),
+        url: url.to_string(),
+        sha256: sha256.to_string(),
+        accepted_at_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default(),
+    });
+    write_owner_only(&acceptance_path(mold_home), &record)
+}
+
+fn write_owner_only(path: &Path, record: &AcceptanceRecord) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("license acceptance path has no parent"))?;
+    fs::create_dir_all(parent)?;
+
+    let bytes = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
+    let tmp = path.with_extension(format!("json.tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// The actionable message shown when a gated download is refused.
+///
+/// Names the restriction, the exact text the user would be accepting, and the
+/// one command that records acceptance — a refusal that does not say how to
+/// proceed is a dead end.
+pub fn acceptance_required_message(model: &str, license: &ThirdPartyLicense) -> String {
+    format!(
+        "{model} includes files under a license that must be accepted before download.\n\n  {}\n  {}\n  Terms (pinned): {}\n  Project terms: {}\n\nReview the terms, then accept explicitly:\n\n  mold pull {model} --accept-license {}\n",
+        license.name, license.summary, license.url, license.canonical, license.id
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antelopev2_files_are_gated_and_nothing_else_is() {
+        assert_eq!(
+            licenses_for_manifest_file("pulid-flux", "scrfd_10g_bnkps.onnx").collect::<Vec<_>>(),
+            vec![&INSIGHTFACE_ANTELOPEV2]
+        );
+        assert_eq!(
+            licenses_for_manifest_file("pulid-flux", "glintr100.onnx").collect::<Vec<_>>(),
+            vec![&INSIGHTFACE_ANTELOPEV2]
+        );
+        assert!(
+            licenses_for_manifest_file("pulid-flux", "pulid_flux_v0.9.1.safetensors")
+                .next()
+                .is_none()
+        );
+        assert!(
+            licenses_for_manifest_file("pulid-flux", "EVA02_CLIP_L_336_psz14_s6B.pt")
+                .next()
+                .is_none()
+        );
+        // facexlib is MIT, weights included, so the BiSeNet parser carries
+        // none of the antelopev2 restriction even though it arrives in the
+        // same bundle (#1225).
+        assert!(
+            licenses_for_manifest_file("pulid-flux", "parsing_bisenet.pth")
+                .next()
+                .is_none()
+        );
+        // Same filename under a different manifest is not gated.
+        assert!(licenses_for_manifest_file("flux-dev:q4", "glintr100.onnx")
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn hunyuan3d_checkpoints_are_gated_and_each_release_carries_its_own_terms() {
+        assert_eq!(
+            licenses_for_manifest_file("hunyuan3d-2.1:fp16", "hunyuan_3d_v2.1.safetensors")
+                .collect::<Vec<_>>(),
+            vec![&TENCENT_HUNYUAN3D_2_1],
+        );
+        // Hunyuan3D gates the WHOLE manifest by name, unlike antelopev2 which
+        // gates two files inside a bundle. Every shipped shape checkpoint is
+        // covered and the file name is irrelevant.
+        for manifest in [
+            "hunyuan3d:fp16",
+            "hunyuan3d-turbo:fp16",
+            "hunyuan3d-mini-turbo:fp16",
+        ] {
+            assert_eq!(
+                licenses_for_manifest_file(manifest, "model.fp16.safetensors").collect::<Vec<_>>(),
+                vec![&TENCENT_HUNYUAN3D_2_0],
+                "{manifest} must carry the 2.0 terms"
+            );
+        }
+        // The paint bundle is a separate document with its own release date,
+        // so it carries 2.1 and never 2.0.
+        assert_eq!(
+            licenses_for_manifest_file(
+                crate::manifest::HUNYUAN3D_PAINT_MANIFEST,
+                "hunyuan3d-paintpbr-v2-1/unet/diffusion_pytorch_model.fp16.safetensors"
+            )
+            .collect::<Vec<_>>(),
+            vec![&TENCENT_HUNYUAN3D_2_1]
+        );
+        // A model that merely ships a same-named file is not gated.
+        assert!(
+            licenses_for_manifest_file("flux-dev:q4", "model.fp16.safetensors")
+                .next()
+                .is_none()
+        );
+    }
+
+    /// A registered license must be reachable through the product, and the
+    /// only thing that makes it reachable is a manifest requiring it. With no
+    /// such manifest `GET /api/licenses` reports it with an empty
+    /// `required_by`, `LicenseSettingsPanel` renders zero acceptable rows for
+    /// it, and `mold licenses` prints a literal `<model>` placeholder — it can
+    /// be read on every surface and accepted on none.
+    #[test]
+    fn every_registered_license_is_required_by_some_manifest() {
+        for license in THIRD_PARTY_LICENSES {
+            assert!(
+                !manifests_requiring(license).is_empty(),
+                "license '{}' is registered but no manifest requires it, so no surface can accept it",
+                license.id
+            );
+        }
+    }
+
+    /// The friendly line is the registry's own description of each gated
+    /// style, one per `required_by` entry in the same order, never empty —
+    /// a row that led with a blank would be worse than one that led with
+    /// the id.
+    #[test]
+    fn every_status_names_the_styles_it_gates_in_plain_words() {
+        let home = tempfile::tempdir().unwrap();
+        for status in license_statuses(home.path()) {
+            assert_eq!(
+                status
+                    .required_by_styles
+                    .iter()
+                    .map(|style| style.name.as_str())
+                    .collect::<Vec<_>>(),
+                status
+                    .required_by
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                "{}",
+                status.id
+            );
+            for style in &status.required_by_styles {
+                assert!(
+                    !style.description.trim().is_empty(),
+                    "{} gates {} which has no description",
+                    status.id,
+                    style.name
+                );
+            }
+        }
+        let json = serde_json::to_value(license_statuses(home.path())).unwrap();
+        assert!(json[0]["required_by_styles"][0]["description"].is_string());
+    }
+
+    #[test]
+    fn outstanding_terms_are_derived_from_the_manifest_registry() {
+        let home = tempfile::tempdir().unwrap();
+        let outstanding = unaccepted_for_manifest("pulid-flux", home.path());
+        assert_eq!(outstanding, vec![refusal(&INSIGHTFACE_ANTELOPEV2)]);
+        assert!(unaccepted_for_manifest("flux-dev:q4", home.path()).is_empty());
+        assert!(unaccepted_for_manifest("not-a-model", home.path()).is_empty());
+
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        assert!(unaccepted_for_manifest("pulid-flux", home.path()).is_empty());
+    }
+
+    #[test]
+    fn acceptance_round_trips_and_stale_hashes_do_not_count() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!is_accepted(home.path(), &INSIGHTFACE_ANTELOPEV2));
+
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        assert!(is_accepted(home.path(), &INSIGHTFACE_ANTELOPEV2));
+        assert!(is_accepted_by_id(home.path(), "insightface-antelopev2"));
+
+        // Terms changed upstream: the stored acceptance no longer applies.
+        let revised = ThirdPartyLicense {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..INSIGHTFACE_ANTELOPEV2
+        };
+        assert!(!is_accepted(home.path(), &revised));
+    }
+
+    /// The other half of the binding: a Mold release that re-pins the license
+    /// to a NEWER upstream revision must ask again, even in the degenerate
+    /// case where the new revision's text hashes the same. Consent was given
+    /// for one exact document, identified by where it lives as well as what
+    /// it says.
+    #[test]
+    fn re_pinning_to_a_new_revision_invalidates_the_acceptance() {
+        let home = tempfile::tempdir().unwrap();
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        assert!(is_accepted(home.path(), &INSIGHTFACE_ANTELOPEV2));
+
+        let repinned = ThirdPartyLicense {
+            url: "https://raw.githubusercontent.com/deepinsight/insightface/0000000000000000000000000000000000000000/README.md",
+            ..INSIGHTFACE_ANTELOPEV2
+        };
+        assert!(
+            !is_accepted(home.path(), &repinned),
+            "a new pinned revision must require a fresh acceptance"
+        );
+
+        // And accepting the re-pin replaces rather than accumulates, so the
+        // superseded revision does not linger as a second standing consent.
+        record_acceptance(home.path(), &repinned).unwrap();
+        assert!(is_accepted(home.path(), &repinned));
+        assert!(!is_accepted(home.path(), &INSIGHTFACE_ANTELOPEV2));
+        assert_eq!(load(home.path()).acceptances.len(), 1);
+    }
+
+    /// The guarantee this whole design rests on: the accepted URL must be
+    /// content-addressed. A branch ref such as `.../master/README.md` can be
+    /// rewritten upstream, which would leave the pinned digest describing
+    /// text nobody can fetch while old acceptances kept passing.
+    #[test]
+    fn every_pinned_license_url_is_immutable() {
+        for license in THIRD_PARTY_LICENSES {
+            let url = license.url;
+            assert!(
+                !url.contains("/master/") && !url.contains("/main/") && !url.contains("/HEAD/"),
+                "{} pins a mutable branch ref: {url}",
+                license.id
+            );
+            // GitHub raw URLs are immutable only when the ref is a full
+            // 40-hex commit SHA.
+            let looks_commit_pinned = url.split('/').any(|segment| {
+                segment.len() == 40 && segment.chars().all(|c| c.is_ascii_hexdigit())
+            });
+            assert!(
+                looks_commit_pinned,
+                "{} must pin an exact upstream commit: {url}",
+                license.id
+            );
+            assert_eq!(
+                license.sha256.len(),
+                64,
+                "{} must pin a full sha256",
+                license.id
+            );
+            assert_ne!(
+                license.url, license.canonical,
+                "{} must keep the browsable page separate from the accepted identity",
+                license.id
+            );
+        }
+    }
+
+    #[test]
+    fn re_accepting_replaces_rather_than_appends() {
+        let home = tempfile::tempdir().unwrap();
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        let record = load(home.path());
+        assert_eq!(record.acceptances.len(), 1);
+    }
+
+    /// The consent-integrity rule: a caller may only have its acceptance
+    /// recorded against the document it actually displayed.
+    #[test]
+    fn recording_requires_the_terms_the_caller_displayed() {
+        let home = tempfile::tempdir().unwrap();
+        let ours = &INSIGHTFACE_ANTELOPEV2;
+
+        let honest = [acceptance_for(ours)];
+        record_acceptances(home.path(), &honest).unwrap();
+        assert!(is_accepted(home.path(), ours));
+
+        // A caller on a different release, resolving the same id to its own
+        // pinned revision.
+        let fresh = tempfile::tempdir().unwrap();
+        let other_revision = crate::types::LicenseAcceptance {
+            id: ours.id.to_string(),
+            url: "https://raw.githubusercontent.com/deepinsight/insightface/0000000000000000000000000000000000000000/README.md".to_string(),
+            sha256: ours.sha256.to_string(),
+        };
+        let error = record_acceptances(fresh.path(), &[other_revision]).unwrap_err();
+        assert!(matches!(
+            error,
+            RecordAcceptancesError::TermsMismatch(license) if license.id == ours.id
+        ));
+        assert!(
+            !is_accepted(fresh.path(), ours),
+            "a mismatched acceptance must record nothing"
+        );
+
+        // Same URL, different digest, is equally a mismatch — the URL alone
+        // is not the identity.
+        let wrong_digest = crate::types::LicenseAcceptance {
+            id: ours.id.to_string(),
+            url: ours.url.to_string(),
+            sha256: "0".repeat(64),
+        };
+        assert!(matches!(
+            record_acceptances(fresh.path(), &[wrong_digest]).unwrap_err(),
+            RecordAcceptancesError::TermsMismatch(_)
+        ));
+        assert!(!is_accepted(fresh.path(), ours));
+    }
+
+    #[test]
+    fn digest_casing_is_not_part_of_the_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let ours = &INSIGHTFACE_ANTELOPEV2;
+        let upper = crate::types::LicenseAcceptance {
+            id: ours.id.to_string(),
+            url: ours.url.to_string(),
+            sha256: ours.sha256.to_ascii_uppercase(),
+        };
+        record_acceptances(home.path(), &[upper]).unwrap();
+        assert!(is_accepted(home.path(), ours));
+    }
+
+    /// A rejected entry must not leave earlier entries in the same request
+    /// applied — the refusal describes a root that was not touched.
+    #[test]
+    fn a_mismatch_late_in_the_list_writes_nothing_at_all() {
+        let home = tempfile::tempdir().unwrap();
+        let ours = &INSIGHTFACE_ANTELOPEV2;
+        let bad = crate::types::LicenseAcceptance {
+            id: ours.id.to_string(),
+            url: ours.url.to_string(),
+            sha256: "0".repeat(64),
+        };
+        let error = record_acceptances(home.path(), &[acceptance_for(ours), bad]).unwrap_err();
+        assert!(matches!(error, RecordAcceptancesError::TermsMismatch(_)));
+        assert!(!is_accepted(home.path(), ours));
+    }
+
+    #[test]
+    fn unknown_license_id_is_never_accepted() {
+        let home = tempfile::tempdir().unwrap();
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        assert!(!is_accepted_by_id(home.path(), "not-a-license"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_record_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().unwrap();
+        record_acceptance(home.path(), &INSIGHTFACE_ANTELOPEV2).unwrap();
+        let mode = fs::metadata(acceptance_path(home.path()))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "acceptance record must be owner-only");
+    }
+
+    #[test]
+    fn refusal_message_names_the_terms_and_the_command() {
+        let message = acceptance_required_message("pulid-flux", &INSIGHTFACE_ANTELOPEV2);
+        assert!(message.contains("non-commercial research"));
+        assert!(message.contains(INSIGHTFACE_ANTELOPEV2.url));
+        assert!(message.contains(INSIGHTFACE_ANTELOPEV2.canonical));
+        assert!(message.contains("mold pull pulid-flux --accept-license insightface-antelopev2"));
+    }
+
+    #[test]
+    fn corrupt_record_is_not_an_acceptance() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(acceptance_path(home.path()), b"{not json").unwrap();
+        assert!(!is_accepted(home.path(), &INSIGHTFACE_ANTELOPEV2));
+    }
+}
+
+#[cfg(test)]
+mod qwen_research_tests {
+    use super::*;
+
+    /// One document covers the family: every tier's files and the turbo
+    /// adapter ask for the same acceptance, and nothing outside it does.
+    #[test]
+    fn the_qwen_research_licence_gates_every_qwen_image21_download() {
+        for manifest in crate::manifest::known_manifests() {
+            let licenses = licenses_for_manifest(manifest);
+            let gated = licenses
+                .iter()
+                .any(|license| license.id == QWEN_RESEARCH.id);
+            assert_eq!(
+                gated,
+                manifest.family == "qwen-image21",
+                "{} ({})",
+                manifest.name,
+                manifest.family
+            );
+        }
+        let turbo = crate::manifest::find_manifest("qwen-image-2.1-turbo:q8").unwrap();
+        let adapter = turbo
+            .files
+            .iter()
+            .find(|file| file.component == crate::manifest::ModelComponent::DistilledLora)
+            .unwrap();
+        assert!(
+            licenses_for_manifest_file(&turbo.name, &adapter.hf_filename)
+                .any(|license| license.id == QWEN_RESEARCH.id)
+        );
+        assert!(
+            manifests_requiring(&QWEN_RESEARCH).contains(&"qwen-image-2.1-turbo:bf16".to_string())
+        );
+        assert_eq!(license_by_id("qwen-research"), Some(&QWEN_RESEARCH));
+        assert!(QWEN_RESEARCH
+            .url
+            .contains("b3179ad355be050328e483a9dfdd9e60cd62adfa"));
+    }
+}

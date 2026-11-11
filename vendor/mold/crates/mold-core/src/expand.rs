@@ -1,0 +1,2201 @@
+//! LLM-powered prompt expansion.
+//!
+//! Provides a `PromptExpander` trait with two backends:
+//! - `ApiExpander`: calls any OpenAI-compatible `/v1/chat/completions` endpoint
+//! - Local GGUF inference (in `mold-inference`, behind the `expand` feature flag)
+
+use std::collections::{HashMap, HashSet};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::expand_prompts::{
+    build_batch_messages_with_context_for_task, build_remix_messages_with_context_for_task,
+    build_single_messages_for_task,
+};
+use crate::{ExpandContext, ExpandTask, PromptTransformOperation, RemixDimension};
+
+/// Maximum number of prompt variations for Discord (embed character limit).
+pub const DISCORD_MAX_VARIATIONS: usize = 5;
+
+/// Maximum number of prompts requested from an expansion model in one
+/// completion. Large logical batches are assembled from bounded chunks so the
+/// response remains reliable without imposing a product-level batch limit.
+pub const EXPANSION_CHUNK_SIZE: usize = 4;
+
+/// Number of non-progress attempts allowed for each bounded chunk. A partial
+/// response keeps its distinct non-empty prompts without spending this budget.
+/// At most chunk_target + EXPANSION_CHUNK_ATTEMPTS - 1 completions can run.
+pub const EXPANSION_CHUNK_ATTEMPTS: usize = 3;
+
+/// Per-request safety ceiling for prepared prompt expansion.
+///
+/// The total number of prints remains unbounded because clients may queue
+/// additional prepared batches. Keeping one reviewed set bounded prevents an
+/// accidental value from retaining billions of prompts and jobs in memory.
+pub const MAX_EXPANSION_VARIATIONS: usize = 10_000;
+
+/// Logical position metadata for one bounded expansion attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExpansionAttempt {
+    /// One-based position of the first requested prompt.
+    pub start: usize,
+    /// Total prompts in the logical batch.
+    pub total: usize,
+}
+
+/// Per-family word limit and style notes override.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FamilyOverride {
+    /// Word limit for expanded prompts (overrides built-in default for this family).
+    pub word_limit: Option<u32>,
+    /// Style notes injected into the system prompt (overrides built-in default).
+    pub style_notes: Option<String>,
+}
+
+/// Configuration for a prompt expansion request.
+#[derive(Debug, Clone)]
+pub struct ExpandConfig {
+    /// Diffusion model family (e.g. "flux", "sd15", "sdxl").
+    pub model_family: String,
+    /// Resolved generation task and conditioning policy.
+    pub task: ExpandTask,
+    /// Internal transform mode. Ordinary expansion remains the default.
+    pub operation: PromptTransformOperation,
+    /// Resolved, task-safe dimensions used only for Remix.
+    pub remix_dimensions: Vec<RemixDimension>,
+    /// Number of prompt variations to generate (1 = single expansion).
+    pub variations: usize,
+    /// Sampling temperature (0.0-2.0). Higher = more creative.
+    pub temperature: f64,
+    /// Nucleus sampling threshold.
+    pub top_p: f64,
+    /// Maximum tokens for the LLM response.
+    pub max_tokens: u32,
+    /// Enable Qwen3 thinking mode for higher quality (slower).
+    pub thinking: bool,
+    /// Custom single-expansion system prompt template (overrides built-in).
+    /// Placeholders: `{WORD_LIMIT}`, `{MODEL_NOTES}`
+    pub system_prompt: Option<String>,
+    /// Custom batch-variation system prompt template (overrides built-in).
+    /// Placeholders: `{N}`, `{WORD_LIMIT}`, `{MODEL_NOTES}`
+    pub batch_prompt: Option<String>,
+    /// Per-family overrides for word limits and style notes.
+    pub family_overrides: HashMap<String, FamilyOverride>,
+    /// Optional visual style to weave into the expansion (per-request, set by
+    /// the route handler from `ExpandRequest::style` — never from settings).
+    pub style: Option<String>,
+    /// Exact identity, canvas, clip, and ordered references of the target
+    /// generation, rendered into the system prompt after the family guide.
+    pub context: Option<ExpandContext>,
+}
+
+impl Default for ExpandConfig {
+    fn default() -> Self {
+        Self {
+            model_family: "flux".to_string(),
+            task: ExpandTask::TextToImage,
+            operation: PromptTransformOperation::Expand,
+            remix_dimensions: Vec::new(),
+            variations: 1,
+            temperature: 0.7,
+            top_p: 0.9,
+            max_tokens: 300,
+            thinking: false,
+            system_prompt: None,
+            batch_prompt: None,
+            family_overrides: HashMap::new(),
+            style: None,
+            context: None,
+        }
+    }
+}
+
+/// Resolve a Remix request's dimensions without silently weakening source
+/// authority. Explicit unsafe dimensions are rejected; an omitted list uses a
+/// task-aware default. A locked style is never treated as variable.
+pub fn resolve_remix_dimensions(
+    requested: &[RemixDimension],
+    task: ExpandTask,
+    style_locked: bool,
+) -> Result<Vec<RemixDimension>> {
+    let allowed: &[RemixDimension] = match task {
+        ExpandTask::TextToImage | ExpandTask::TextToVideo => &[
+            RemixDimension::Composition,
+            RemixDimension::Camera,
+            RemixDimension::Lighting,
+            RemixDimension::Setting,
+            RemixDimension::Mood,
+            RemixDimension::Movement,
+            RemixDimension::Style,
+        ],
+        ExpandTask::ImageToVideo
+        | ExpandTask::VideoToVideo
+        | ExpandTask::Retake
+        | ExpandTask::KeyframeInterpolation
+        | ExpandTask::AudioDrivenVideo
+        | ExpandTask::ReferenceToAudioVideo => &[RemixDimension::Movement],
+        ExpandTask::TextToAudio => &[RemixDimension::Mood, RemixDimension::Movement],
+    };
+    let candidates = if requested.is_empty() {
+        allowed
+            .iter()
+            .copied()
+            .filter(|dimension| !(style_locked && *dimension == RemixDimension::Style))
+            .collect::<Vec<_>>()
+    } else {
+        requested.to_vec()
+    };
+    let mut resolved = Vec::new();
+    for dimension in candidates {
+        anyhow::ensure!(
+            allowed.contains(&dimension),
+            "remix dimension '{dimension}' conflicts with the {task} conditioning authority"
+        );
+        anyhow::ensure!(
+            !(style_locked && dimension == RemixDimension::Style),
+            "remix dimension 'style' cannot vary while a locked style constraint is set"
+        );
+        if !resolved.contains(&dimension) {
+            resolved.push(dimension);
+        }
+    }
+    anyhow::ensure!(
+        !resolved.is_empty(),
+        "remix requires at least one safe dimension"
+    );
+    Ok(resolved)
+}
+
+/// Deterministic one-dimension assignment for a one-based logical variation.
+pub fn remix_dimensions_for_position(
+    dimensions: &[RemixDimension],
+    position: usize,
+) -> Vec<RemixDimension> {
+    dimensions
+        .get(position.saturating_sub(1) % dimensions.len().max(1))
+        .copied()
+        .into_iter()
+        .collect()
+}
+
+/// Result of a prompt expansion.
+#[derive(Debug, Clone)]
+pub struct ExpandResult {
+    /// The original user prompt.
+    pub original: String,
+    /// Expanded prompt(s). Length equals `ExpandConfig::variations`.
+    pub expanded: Vec<String>,
+}
+
+/// Trait for prompt expansion backends.
+pub trait PromptExpander: Send + Sync {
+    /// Expand a user prompt into one or more detailed image generation prompts.
+    fn expand(&self, prompt: &str, config: &ExpandConfig) -> Result<ExpandResult>;
+}
+
+/// Validate the size of one reviewed expansion set before any model or network
+/// work begins.
+pub fn validate_expansion_variation_count(variations: usize) -> Result<()> {
+    anyhow::ensure!(variations > 0, "variations must be at least 1");
+    anyhow::ensure!(
+        variations <= MAX_EXPANSION_VARIATIONS,
+        "variations exceeds the per-request safety limit of {}",
+        MAX_EXPANSION_VARIATIONS
+    );
+    Ok(())
+}
+
+/// Split `remaining` prompts into the fewest chunks of at most
+/// `EXPANSION_CHUNK_SIZE`, then even those chunks out.
+///
+/// Taking `EXPANSION_CHUNK_SIZE` greedily leaves every batch of `4k + 1` ending
+/// on a chunk of exactly one, which is rendered through the BATCH template —
+/// "Generate 1 distinct prompts ... Output as a JSON array of 1 strings". A
+/// small local model answers that degenerate instruction with prose often
+/// enough to matter, and prose is what `parse_variations` must refuse to
+/// truncate. Evening the chunks costs no extra completions (the chunk count is
+/// unchanged) and no chunk is ever asked for one prompt unless the whole batch
+/// is one, where the single-prompt template is used instead.
+///
+/// A retry can still ask for one — a chunk of three that collected two needs
+/// one more — so this narrows the trigger rather than removing it. The attempt
+/// budget covers the rest.
+fn balanced_chunk_target(remaining: usize) -> usize {
+    let chunks = remaining.div_ceil(EXPANSION_CHUNK_SIZE).max(1);
+    remaining.div_ceil(chunks)
+}
+
+/// Generate an exact logical expansion from bounded backend completions.
+///
+/// `generate` receives a cloned config whose `variations` and `max_tokens` are
+/// scoped to one attempt. The configured token allowance is per prompt, rather
+/// than one fixed allowance shared by an arbitrarily large batch.
+pub fn expand_exact_with<F>(config: &ExpandConfig, mut generate: F) -> Result<Vec<String>>
+where
+    F: FnMut(&ExpandConfig, ExpansionAttempt) -> Result<Vec<String>>,
+{
+    validate_expansion_variation_count(config.variations)?;
+
+    // A family that reads no prompt has nothing to expand: answer with the
+    // guide's image advice and request no completion at all. Every surface
+    // answers earlier, before a backend is even created; this is the last
+    // door, so a backend can never be handed a guide that says "write no
+    // prompt" and asked to write one. The answer is one text whatever
+    // `variations` says, because there is exactly one thing to say.
+    if let Some(advice) = crate::expand_prompts::ignored_prompt_advice(&config.model_family) {
+        return Ok(vec![advice.text()]);
+    }
+
+    // Never reserve the caller-controlled logical count up front. Only the
+    // active completion chunk has bounded allocation.
+    let mut expanded = Vec::new();
+    let mut normalized = HashSet::new();
+    while expanded.len() < config.variations {
+        let chunk_target = balanced_chunk_target(config.variations - expanded.len());
+        let mut chunk = Vec::with_capacity(chunk_target);
+
+        // Records the last attempt that over-delivered, so an exhausted budget
+        // can name that cause instead of the generic shortfall. Cleared by any
+        // later attempt, which is what actually ended the chunk.
+        let mut overshoot: Option<(usize, usize)> = None;
+
+        let mut stalled_attempts = 0;
+        while stalled_attempts < EXPANSION_CHUNK_ATTEMPTS {
+            let missing = chunk_target - chunk.len();
+            if missing == 0 {
+                break;
+            }
+
+            let mut attempt_config = config.clone();
+            attempt_config.variations = missing;
+            attempt_config.max_tokens = config.max_tokens.saturating_mul(missing as u32);
+
+            let attempt_context = ExpansionAttempt {
+                start: expanded.len() + chunk.len() + 1,
+                total: config.variations,
+            };
+            let attempt = generate(&attempt_config, attempt_context)?;
+            let returned = attempt.len();
+            if returned > missing {
+                // An over-delivering completion is ambiguous: `parse_variations`
+                // deliberately refuses to truncate a response it cannot prove is
+                // all prompts, so the extras may be reasoning rather than
+                // variations and none of them may be kept. Spend one of this
+                // chunk's attempts and ask again — a single ambiguous completion
+                // must never fail a whole batch.
+                overshoot = Some((returned, missing));
+                stalled_attempts += 1;
+                tracing::warn!(
+                    requested = missing,
+                    returned,
+                    accepted = 0,
+                    assembled = expanded.len() + chunk.len(),
+                    total = config.variations,
+                    stalled_attempts,
+                    "expansion completion over-delivered"
+                );
+                continue;
+            }
+            overshoot = None;
+            let before = chunk.len();
+            for prompt in attempt {
+                let key = normalize_expanded_prompt(&prompt);
+                if !key.is_empty() && normalized.insert(key) {
+                    chunk.push(prompt);
+                }
+            }
+            let accepted = chunk.len() - before;
+            // A model returning one new prompt per completion can fill a chunk
+            // of four. Counting productive partials as failures stopped at three.
+            // Do not reset stalls on progress: even intermittent duplicates are
+            // bounded by chunk_target + the non-progress budget minus one.
+            if accepted == 0 {
+                stalled_attempts += 1;
+            }
+            if accepted < missing {
+                tracing::warn!(
+                    requested = missing,
+                    returned,
+                    accepted,
+                    assembled = expanded.len() + chunk.len(),
+                    total = config.variations,
+                    stalled_attempts,
+                    "expansion completion needs more distinct prompts"
+                );
+            }
+        }
+
+        if chunk.len() != chunk_target {
+            if let Some((returned, requested)) = overshoot {
+                anyhow::bail!(
+                    "expansion backend returned {returned} prompts when exactly {requested} were requested, and did not return a usable count in {EXPANSION_CHUNK_ATTEMPTS} non-progress attempts; assembled {} of {} prompts",
+                    expanded.len() + chunk.len(),
+                    config.variations
+                );
+            }
+            anyhow::bail!(
+                "expected exactly {} distinct non-empty prompts, but the expansion backend returned {}",
+                config.variations,
+                expanded.len() + chunk.len()
+            );
+        }
+        expanded.extend(chunk);
+    }
+
+    debug_assert_eq!(expanded.len(), config.variations);
+    Ok(expanded)
+}
+
+/// Validate an expansion received across a protocol boundary.
+///
+/// New expanders enforce this internally; clients use it defensively when
+/// talking to older or third-party hosts.
+pub fn validate_expanded_prompts(prompts: &[String], expected: usize) -> Result<()> {
+    let distinct: HashSet<String> = prompts
+        .iter()
+        .map(|prompt| normalize_expanded_prompt(prompt))
+        .filter(|prompt| !prompt.is_empty())
+        .collect();
+    anyhow::ensure!(
+        prompts.len() == expected && distinct.len() == expected,
+        "Expected exactly {expected} distinct non-empty prompts, but the host returned {}",
+        distinct.len()
+    );
+    Ok(())
+}
+
+fn normalize_expanded_prompt(prompt: &str) -> String {
+    prompt
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect::<String>()
+}
+
+// ── API expander ─────────────────────────────────────────────────────────────
+
+/// OpenAI-compatible chat completion message.
+#[derive(Debug, Serialize, Deserialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+/// Request body for `/v1/chat/completions`.
+#[derive(Debug, Serialize)]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    temperature: f64,
+    top_p: f64,
+    max_tokens: u32,
+    /// Qwen3/vLLM thinking mode — only serialized when `true`.
+    /// NOTE: this is a non-standard extension; strict OpenAI-compatible
+    /// endpoints may reject it. Only enable when the backend supports it
+    /// (e.g. Ollama, vLLM with Qwen3 models).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    enable_thinking: bool,
+}
+
+/// Response from `/v1/chat/completions`.
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessageResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessageResponse {
+    content: String,
+}
+
+/// Select messages for one bounded attempt, identically for API and local engines.
+pub fn messages_for_attempt(
+    prompt: &str,
+    config: &ExpandConfig,
+    attempt: ExpansionAttempt,
+) -> Vec<(String, String)> {
+    let family_override = config.family_overrides.get(&config.model_family);
+    if config.operation == PromptTransformOperation::Remix {
+        build_remix_messages_with_context_for_task(
+            prompt,
+            &config.model_family,
+            config.variations,
+            config.task,
+            Some((attempt.start, attempt.total)),
+            family_override,
+            config.style.as_deref(),
+            &config.remix_dimensions,
+            config.context.as_ref(),
+        )
+    } else if attempt.total > 1 {
+        build_batch_messages_with_context_for_task(
+            prompt,
+            &config.model_family,
+            config.variations,
+            config.task,
+            Some((attempt.start, attempt.total)),
+            config.batch_prompt.as_deref(),
+            family_override,
+            config.style.as_deref(),
+            config.context.as_ref(),
+        )
+    } else {
+        build_single_messages_for_task(
+            prompt,
+            &config.model_family,
+            config.task,
+            config.system_prompt.as_deref(),
+            family_override,
+            config.style.as_deref(),
+            config.context.as_ref(),
+        )
+    }
+}
+
+/// Expander that calls an OpenAI-compatible API endpoint.
+pub struct ApiExpander {
+    endpoint: String,
+    model: String,
+}
+
+impl ApiExpander {
+    pub fn new(endpoint: &str, model: &str) -> Self {
+        // Strip trailing slash for consistent URL building
+        let endpoint = endpoint.trim_end_matches('/').to_string();
+        Self {
+            endpoint,
+            model: model.to_string(),
+        }
+    }
+}
+
+impl PromptExpander for ApiExpander {
+    fn expand(&self, prompt: &str, config: &ExpandConfig) -> Result<ExpandResult> {
+        let expanded = expand_exact_with(config, |attempt_config, attempt| {
+            let messages = messages_for_attempt(prompt, attempt_config, attempt);
+
+            let chat_messages: Vec<ChatMessage> = messages
+                .into_iter()
+                .map(|(role, content)| ChatMessage { role, content })
+                .collect();
+
+            let req_body = ChatCompletionRequest {
+                model: self.model.clone(),
+                messages: chat_messages,
+                temperature: attempt_config.temperature,
+                top_p: attempt_config.top_p,
+                max_tokens: attempt_config.max_tokens,
+                enable_thinking: attempt_config.thinking,
+            };
+
+            let url = format!("{}/v1/chat/completions", self.endpoint);
+
+            // Use ureq (blocking HTTP) — this trait method is sync and may be
+            // called from within a tokio runtime via spawn_blocking, so we cannot
+            // use async reqwest or Handle::block_on (which panics inside a runtime).
+            let body = serde_json::to_string(&req_body)?;
+            let response_text: String = ureq::post(&url)
+                .header("Content-Type", "application/json")
+                .send(body.as_str())
+                .map_err(|e| anyhow::anyhow!("expand API request failed: {e}"))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| anyhow::anyhow!("failed to read expand API response: {e}"))?;
+
+            let completion: ChatCompletionResponse = serde_json::from_str(&response_text)
+                .map_err(|e| anyhow::anyhow!("failed to parse expand API response: {e}"))?;
+
+            let content = completion
+                .choices
+                .first()
+                .map(|c| c.message.content.clone())
+                .filter(|c| !c.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "expand API returned empty response (no choices or empty content)"
+                    )
+                })?;
+
+            Ok(
+                if attempt_config.operation == PromptTransformOperation::Remix || attempt.total > 1
+                {
+                    parse_variations(&content, attempt_config.variations)
+                } else {
+                    vec![clean_expanded_prompt(&content)]
+                },
+            )
+        })?;
+
+        Ok(ExpandResult {
+            original: prompt.to_string(),
+            expanded,
+        })
+    }
+}
+
+/// Public wrapper for `parse_variations` (used by mold-inference local expander).
+pub fn parse_variations_public(text: &str, expected: usize) -> Vec<String> {
+    parse_variations(text, expected)
+}
+
+/// Public wrapper for `clean_expanded_prompt` (used by mold-inference local expander).
+pub fn clean_expanded_prompt_public(text: &str) -> String {
+    clean_expanded_prompt(text)
+}
+
+/// Parse multiple variations from LLM output.
+/// Tries JSON array first, then numbered list, then line-separated.
+fn parse_variations(text: &str, expected: usize) -> Vec<String> {
+    let trimmed = strip_thinking_preamble(text);
+
+    // Try JSON array
+    if let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed) {
+        if !arr.is_empty() {
+            return arr
+                .into_iter()
+                .take(expected)
+                .map(|s| clean_expanded_prompt(&s))
+                .collect();
+        }
+    }
+
+    // Try every bracket-bounded slice so prose brackets cannot swallow a
+    // later JSON array. Prefer an exact candidate; a sole short candidate is
+    // retained for the exact-count retry. Multiple singleton arrays belong to
+    // the line-oriented compatibility fallback below.
+    let starts = trimmed.match_indices('[').map(|(index, _)| index);
+    let ends = trimmed
+        .match_indices(']')
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut embedded = Vec::new();
+    for start in starts {
+        for &end in ends.iter().filter(|&&end| end > start) {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&trimmed[start..=end]) {
+                if !arr.is_empty() {
+                    if arr.len() == expected {
+                        return arr.into_iter().map(|s| clean_expanded_prompt(&s)).collect();
+                    }
+                    embedded.push(arr);
+                }
+            }
+        }
+    }
+    if embedded.len() == 1 {
+        return embedded
+            .pop()
+            .unwrap()
+            .into_iter()
+            .take(expected)
+            .map(|s| clean_expanded_prompt(&s))
+            .collect();
+    }
+
+    // Fall back to a genuine consecutive numbered list (1. ... 2. ... etc.).
+    // An oversize unnumbered response is ambiguous and must reach the exact
+    // count guard unchanged rather than turning reasoning into prompts.
+    let raw_lines = trimmed
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>();
+    let numbered = raw_lines
+        .iter()
+        .map(|line| parse_numbered_variation(line))
+        .collect::<Option<Vec<_>>>();
+    if let Some(numbered) = numbered {
+        if numbered
+            .iter()
+            .enumerate()
+            .all(|(index, (number, _))| *number == index + 1)
+            && numbered.len() >= expected
+        {
+            return numbered
+                .into_iter()
+                .take(expected)
+                .map(|(_, prompt)| prompt)
+                .collect();
+        }
+    }
+
+    // A response whose every line is a singleton JSON array is the one-array-per
+    // -variation shape some local backends emit. Unquoted prose cannot parse as
+    // JSON, so the structure is as good a delimiter as a consecutive numbered
+    // list and an overshoot may be capped the same way. It is not proof that
+    // every line is a PROMPT — a model that wrapped its own preamble in the
+    // requested syntax would pass — which is the same bounded trade the
+    // numbered-list cap already makes. A short response is retained for the
+    // exact-count retry rather than left to the paragraph fallback, which would
+    // otherwise join these lines into one literal `["a"] ["b"]` prompt.
+    let singleton_arrays = raw_lines
+        .iter()
+        .map(|line| singleton_json_array_item(line))
+        .collect::<Option<Vec<_>>>();
+    if let Some(items) = singleton_arrays {
+        let items = items
+            .iter()
+            .map(|item| clean_expanded_prompt(item))
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            return items.into_iter().take(expected).collect();
+        }
+    }
+
+    let lines = raw_lines
+        .iter()
+        .map(|line| clean_expanded_prompt(line))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() >= expected {
+        return lines;
+    }
+
+    // Last resort: split on double newlines
+    let paragraphs: Vec<String> = trimmed
+        .split("\n\n")
+        .map(|p| clean_expanded_prompt(p.trim()))
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    if !paragraphs.is_empty() {
+        return paragraphs;
+    }
+
+    // Ultimate fallback: return the whole text as a single variation
+    vec![clean_expanded_prompt(trimmed)]
+}
+
+/// Remove a complete Qwen-style reasoning preamble before structural parsing.
+/// Thinking may still appear even when disabled, and its prose can contain
+/// brackets or numbered lines that must never be mistaken for variations.
+fn strip_thinking_preamble(text: &str) -> &str {
+    let trimmed = text.trim();
+    if trimmed.starts_with("<think>") {
+        if let Some(end) = trimmed.rfind("</think>") {
+            return trimmed[end + "</think>".len()..].trim();
+        }
+    }
+    trimmed
+}
+
+fn parse_numbered_variation(line: &str) -> Option<(usize, String)> {
+    let digit_len = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_len == 0 {
+        return None;
+    }
+    let number = line[..digit_len].parse().ok()?;
+    let rest = line[digit_len..].trim_start();
+    let rest = rest.strip_prefix(['.', ')', ':', '-'])?.trim();
+    let prompt = clean_expanded_prompt(rest);
+    (!prompt.is_empty()).then_some((number, prompt))
+}
+
+/// Unwrap a lone `["prompt"]` array. Some OpenAI-compatible and local backends
+/// emit one JSON array per requested variation (`["prompt"]\n["prompt"]`)
+/// instead of one shared array. Never flattens a real multi-item array.
+fn singleton_json_array_item(text: &str) -> Option<String> {
+    serde_json::from_str::<Vec<String>>(text.trim())
+        .ok()
+        .and_then(|items| (items.len() == 1).then(|| items.into_iter().next().unwrap()))
+}
+
+/// Clean up an expanded prompt: trim whitespace, remove quotes, collapse whitespace.
+fn clean_expanded_prompt(text: &str) -> String {
+    // The line fallback feeds each singleton array here, so unwrap it before
+    // ordinary quote/whitespace cleanup.
+    let singleton = singleton_json_array_item(text);
+    let trimmed = singleton
+        .as_deref()
+        .unwrap_or(text)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+
+    // Strip any thinking block if present
+    let cleaned = if let Some(end_idx) = trimmed.find("</think>") {
+        trimmed[end_idx + "</think>".len()..].trim()
+    } else {
+        trimmed
+    };
+
+    // Collapse multiple whitespace/newlines into single spaces
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Expand configuration from the mold config file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ExpandSettings {
+    /// Enable prompt expansion by default (overridden by --expand/--no-expand).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Backend: "local" for built-in GGUF inference, or a URL for OpenAI-compatible API.
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    /// Model name for local GGUF expansion.
+    #[serde(default = "default_expand_model")]
+    pub model: String,
+    /// Model name when using API backend (e.g. "qwen2.5:3b" for Ollama).
+    #[serde(default = "default_api_model")]
+    pub api_model: String,
+    /// Sampling temperature.
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    /// Nucleus sampling threshold.
+    #[serde(default = "default_top_p")]
+    pub top_p: f64,
+    /// Maximum tokens for the LLM response.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    /// Enable thinking mode for Qwen3 (higher quality, slower).
+    #[serde(default)]
+    pub thinking: bool,
+    /// Custom single-expansion system prompt template.
+    /// Available placeholders: `{WORD_LIMIT}`, `{MODEL_NOTES}`
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Custom batch-variation system prompt template.
+    /// Available placeholders: `{N}`, `{WORD_LIMIT}`, `{MODEL_NOTES}`
+    #[serde(default)]
+    pub batch_prompt: Option<String>,
+    /// Per-family word limit and style notes overrides.
+    #[serde(default)]
+    pub families: HashMap<String, FamilyOverride>,
+}
+
+fn default_backend() -> String {
+    "local".to_string()
+}
+
+fn default_expand_model() -> String {
+    "qwen3-expand:q8".to_string()
+}
+
+fn default_api_model() -> String {
+    "qwen2.5:3b".to_string()
+}
+
+fn default_temperature() -> f64 {
+    0.7
+}
+
+fn default_top_p() -> f64 {
+    0.9
+}
+
+fn default_max_tokens() -> u32 {
+    300
+}
+
+impl Default for ExpandSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: default_backend(),
+            model: default_expand_model(),
+            api_model: default_api_model(),
+            temperature: default_temperature(),
+            top_p: default_top_p(),
+            max_tokens: default_max_tokens(),
+            thinking: false,
+            system_prompt: None,
+            batch_prompt: None,
+            families: HashMap::new(),
+        }
+    }
+}
+
+impl ExpandSettings {
+    /// Load from environment variables, falling back to provided defaults.
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(v) = std::env::var("MOLD_EXPAND") {
+            self.enabled = matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_BACKEND") {
+            if !v.is_empty() {
+                self.backend = v;
+            }
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_MODEL") {
+            if !v.is_empty() {
+                if self.is_local() {
+                    self.model = v;
+                } else {
+                    self.api_model = v;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_TEMPERATURE") {
+            if let Ok(t) = v.parse::<f64>() {
+                self.temperature = t;
+            }
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_THINKING") {
+            self.thinking = matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes");
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_SYSTEM_PROMPT") {
+            if !v.is_empty() {
+                self.system_prompt = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("MOLD_EXPAND_BATCH_PROMPT") {
+            if !v.is_empty() {
+                self.batch_prompt = Some(v);
+            }
+        }
+        self
+    }
+
+    /// Build an `ExpandConfig` for a specific request.
+    pub fn to_expand_config(&self, model_family: &str, variations: usize) -> ExpandConfig {
+        ExpandConfig {
+            model_family: model_family.to_string(),
+            task: ExpandTask::for_family(model_family),
+            operation: PromptTransformOperation::Expand,
+            remix_dimensions: Vec::new(),
+            variations,
+            temperature: self.temperature,
+            top_p: self.top_p,
+            max_tokens: self.max_tokens,
+            thinking: self.thinking,
+            system_prompt: self.system_prompt.clone(),
+            batch_prompt: self.batch_prompt.clone(),
+            family_overrides: self.families.clone(),
+            // Style and context are per-request state; the route handler sets
+            // them from the incoming request, never from persisted settings.
+            style: None,
+            context: None,
+        }
+    }
+
+    /// Validate that custom templates contain expected placeholders.
+    /// Returns a list of warnings (empty = valid). Callers should treat
+    /// these as non-fatal hints — expansion still runs with partial templates.
+    pub fn validate_templates(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if let Some(ref tmpl) = self.system_prompt {
+            for placeholder in ["{WORD_LIMIT}", "{MODEL_NOTES}"] {
+                if !tmpl.contains(placeholder) {
+                    warnings.push(format!(
+                        "system_prompt is missing placeholder {placeholder} — it won't be substituted"
+                    ));
+                }
+            }
+        }
+        if let Some(ref tmpl) = self.batch_prompt {
+            for placeholder in ["{N}", "{WORD_LIMIT}", "{MODEL_NOTES}"] {
+                if !tmpl.contains(placeholder) {
+                    warnings.push(format!(
+                        "batch_prompt is missing placeholder {placeholder} — it won't be substituted"
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    /// Model identity selected by the configured backend.
+    pub fn active_model(&self) -> &str {
+        if self.is_local() {
+            &self.model
+        } else {
+            &self.api_model
+        }
+    }
+
+    /// Create the appropriate expander backend after enforcing model access.
+    /// Returns `None` if the backend is "local" (handled by mold-inference).
+    pub fn create_api_expander(&self) -> Result<Option<ApiExpander>, crate::ModelActivationError> {
+        crate::require_model_activation(self.active_model(), None)?;
+        Ok(if self.is_local() {
+            None
+        } else {
+            Some(ApiExpander::new(&self.backend, &self.api_model))
+        })
+    }
+
+    /// Check if this is configured for local (GGUF) expansion.
+    pub fn is_local(&self) -> bool {
+        self.backend == "local"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expand_prompts::build_batch_messages_with_context;
+
+    #[test]
+    fn message_selection_preserves_single_batch_and_remix_contracts() {
+        let mut config = ExpandConfig {
+            system_prompt: Some("single-marker {WORD_LIMIT}".into()),
+            batch_prompt: Some("batch-marker {N}".into()),
+            ..ExpandConfig::default()
+        };
+        let single =
+            messages_for_attempt("a fox", &config, ExpansionAttempt { start: 1, total: 1 });
+        assert!(single[0].1.contains("single-marker"));
+        let batch = messages_for_attempt("a fox", &config, ExpansionAttempt { start: 5, total: 5 });
+        assert!(batch[0].1.contains("batch-marker"));
+        assert!(!batch[0].1.contains("single-marker"));
+        config.operation = PromptTransformOperation::Remix;
+        config.remix_dimensions = vec![RemixDimension::Lighting];
+        let remix = messages_for_attempt("a fox", &config, ExpansionAttempt { start: 1, total: 1 });
+        let expected = build_remix_messages_with_context_for_task(
+            "a fox",
+            &config.model_family,
+            1,
+            config.task,
+            Some((1, 1)),
+            None,
+            None,
+            &config.remix_dimensions,
+            None,
+        );
+        assert_eq!(remix, expected);
+        assert_ne!(remix, single);
+    }
+
+    // ── prompt-Ignored families ──────────────────────────────────────────
+
+    #[test]
+    fn a_prompt_ignored_family_never_reaches_the_expansion_backend() {
+        let config = ExpandConfig {
+            model_family: "hunyuan3d".to_string(),
+            variations: 3,
+            ..ExpandConfig::default()
+        };
+        let expanded = expand_exact_with(&config, |_, _| {
+            unreachable!("a family with no text encoder must not request a completion")
+        })
+        .unwrap();
+        let advice = crate::expand_prompts::ignored_prompt_advice("hunyuan3d").unwrap();
+        assert_eq!(expanded, vec![advice.text()]);
+        // The count guard still runs first: a bad count is a bad count.
+        let zero = ExpandConfig {
+            variations: 0,
+            ..config
+        };
+        assert!(expand_exact_with(&zero, |_, _| unreachable!()).is_err());
+    }
+
+    // ── clean_expanded_prompt ────────────────────────────────────────────
+
+    #[test]
+    fn clean_prompt_strips_quotes() {
+        assert_eq!(clean_expanded_prompt("\"a cat on mars\""), "a cat on mars");
+    }
+
+    #[test]
+    fn clean_prompt_strips_single_quotes() {
+        assert_eq!(clean_expanded_prompt("'a cat on mars'"), "a cat on mars");
+    }
+
+    #[test]
+    fn clean_prompt_unwraps_singleton_json_array() {
+        assert_eq!(
+            clean_expanded_prompt(r#"["a cat on mars"]"#),
+            "a cat on mars"
+        );
+    }
+
+    #[test]
+    fn clean_prompt_strips_thinking() {
+        let input = "<think>hmm let me think</think>\n\na cat on mars";
+        assert_eq!(clean_expanded_prompt(input), "a cat on mars");
+    }
+
+    #[test]
+    fn clean_prompt_strips_multiline_thinking() {
+        let input = "<think>\nstep 1: analyze\nstep 2: expand\n</think>\n\ndetailed prompt here";
+        assert_eq!(clean_expanded_prompt(input), "detailed prompt here");
+    }
+
+    #[test]
+    fn clean_prompt_collapses_whitespace() {
+        assert_eq!(
+            clean_expanded_prompt("a  cat\n\non   mars"),
+            "a cat on mars"
+        );
+    }
+
+    #[test]
+    fn clean_prompt_empty_input() {
+        assert_eq!(clean_expanded_prompt(""), "");
+        assert_eq!(clean_expanded_prompt("   "), "");
+    }
+
+    #[test]
+    fn clean_prompt_only_thinking_block() {
+        let input = "<think>some reasoning</think>";
+        assert_eq!(clean_expanded_prompt(input), "");
+    }
+
+    #[test]
+    fn clean_prompt_preserves_content_without_thinking() {
+        let input = "a beautiful sunset over the ocean, golden light, dramatic clouds";
+        assert_eq!(clean_expanded_prompt(input), input);
+    }
+
+    // ── parse_variations ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_variations_json_array() {
+        let input = r#"["a cat", "a dog", "a bird"]"#;
+        let result = parse_variations(input, 3);
+        assert_eq!(result, vec!["a cat", "a dog", "a bird"]);
+    }
+
+    #[test]
+    fn parse_variations_embedded_json() {
+        let input = "Here are 3 prompts:\n[\"a cat\", \"a dog\", \"a bird\"]";
+        let result = parse_variations(input, 3);
+        assert_eq!(result, vec!["a cat", "a dog", "a bird"]);
+    }
+
+    #[test]
+    fn parse_variations_json_with_thinking() {
+        let input =
+            "<think>let me think</think>\n\n[\"expanded cat\", \"expanded dog\", \"expanded bird\"]";
+        // The thinking block is inside individual items, not wrapping the JSON.
+        // parse_variations should find the embedded JSON array.
+        let result = parse_variations(input, 3);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn parse_variations_ignores_brackets_and_lines_in_thinking() {
+        let input = r#"<think>
+I need four alternatives [composition, camera, lighting, setting].
+1. Preserve the subject.
+2. Keep the action.
+3. Return JSON.
+</think>
+["wide composition", "low camera", "rim lighting", "desert setting"]"#;
+        let result = parse_variations(input, 4);
+        assert_eq!(
+            result,
+            vec![
+                "wide composition",
+                "low camera",
+                "rim lighting",
+                "desert setting"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_variations_caps_backend_overshoot_to_requested_count() {
+        let json = r#"["one", "two", "three", "four", "five"]"#;
+        assert_eq!(
+            parse_variations(json, 4),
+            vec!["one", "two", "three", "four"]
+        );
+
+        let numbered = "1. one\n2. two\n3. three\n4. four\n5. five";
+        assert_eq!(
+            parse_variations(numbered, 4),
+            vec!["one", "two", "three", "four"]
+        );
+    }
+
+    #[test]
+    fn parse_variations_does_not_truncate_ambiguous_overshoot() {
+        let input =
+            "First I will preserve the subject.\nThen vary the camera.\none\ntwo\nthree\nfour";
+        let result = parse_variations(input, 4);
+        assert_eq!(result.len(), 6);
+        assert_eq!(result[0], "First I will preserve the subject.");
+    }
+
+    #[test]
+    fn parse_variations_accepts_short_json_after_prose_brackets_for_retry() {
+        let input = "Consider [composition and lighting].\n[\"prompt one\", \"prompt two\"]";
+        assert_eq!(parse_variations(input, 4), vec!["prompt one", "prompt two"]);
+    }
+
+    #[test]
+    fn parse_variations_numbered_list() {
+        let input = "1. a cat on mars\n2. a dog in space\n3. a bird underwater";
+        let result = parse_variations(input, 3);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].contains("cat"));
+        assert!(result[1].contains("dog"));
+        assert!(result[2].contains("bird"));
+    }
+
+    #[test]
+    fn parse_variations_numbered_with_parens() {
+        let input = "1) a cat\n2) a dog\n3) a bird";
+        let result = parse_variations(input, 3);
+        assert_eq!(result.len(), 3);
+        assert!(result[0].contains("cat"));
+    }
+
+    #[test]
+    fn parse_variations_numbered_with_quotes() {
+        let input = "1. \"a cat on mars\"\n2. \"a dog in space\"";
+        let result = parse_variations(input, 2);
+        assert_eq!(result.len(), 2);
+        // Quotes should be stripped by clean_expanded_prompt
+        assert!(!result[0].starts_with('"'));
+        assert!(result[0].contains("cat"));
+    }
+
+    #[test]
+    fn parse_variations_paragraph_fallback() {
+        let input = "A majestic cat sitting on mars\n\nA playful dog floating in space";
+        let result = parse_variations(input, 2);
+        assert_eq!(result.len(), 2);
+        assert!(result[0].contains("cat"));
+        assert!(result[1].contains("dog"));
+    }
+
+    #[test]
+    fn parse_variations_single_text_fallback() {
+        // When nothing else matches, return the whole text as one variation
+        let input = "just a single prompt with no structure";
+        let result = parse_variations(input, 3);
+        assert!(!result.is_empty());
+        assert!(result[0].contains("single prompt"));
+    }
+
+    #[test]
+    fn parse_variations_empty_json_array_falls_through() {
+        // Empty JSON array should fall through to other parsers
+        let input = "[]";
+        let result = parse_variations(input, 3);
+        // Should not panic; falls through to numbered list / paragraph / fallback
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn parse_variations_cleans_each_item() {
+        let input = r#"["  a cat  ", "  a dog  "]"#;
+        let result = parse_variations(input, 2);
+        assert_eq!(result[0], "a cat");
+        assert_eq!(result[1], "a dog");
+    }
+
+    #[test]
+    fn parse_variations_repeated_singleton_json_arrays() {
+        let input = "[\"a cat\"]\n[\"a dog\"]\n[\"a bird\"]";
+        let result = parse_variations(input, 3);
+        assert_eq!(result, vec!["a cat", "a dog", "a bird"]);
+    }
+
+    #[test]
+    fn parse_variations_caps_repeated_singleton_json_arrays() {
+        // Every line is a singleton array, so no line can be prose. That is as
+        // structurally unambiguous as a consecutive numbered list, and an
+        // overshoot may be capped rather than forced through a retry.
+        let input = "[\"a cat\"]\n[\"a dog\"]\n[\"a bird\"]";
+        assert_eq!(parse_variations(input, 1), vec!["a cat"]);
+        assert_eq!(parse_variations(input, 2), vec!["a cat", "a dog"]);
+    }
+
+    #[test]
+    fn parse_variations_keeps_a_short_singleton_array_run_for_the_retry() {
+        // Never let the paragraph fallback join these into one literal
+        // `["a cat"] ["a dog"]` prompt. Two real prompts reach the exact-count
+        // guard, which asks for the third.
+        let input = "[\"a cat\"]\n[\"a dog\"]";
+        assert_eq!(parse_variations(input, 3), vec!["a cat", "a dog"]);
+    }
+
+    #[test]
+    fn parse_variations_caps_a_singleton_run_it_cannot_prove_is_all_prompts() {
+        // Documented trade, not an accident: a model that wrapped its preamble
+        // in the requested syntax passes the structural test. This is the same
+        // exposure the consecutive-numbered-list cap already accepts, and it is
+        // pinned so a future change to that trade is deliberate.
+        let input = "[\"Here are the prompts\"]\n[\"a cat\"]\n[\"a dog\"]";
+        assert_eq!(
+            parse_variations(input, 2),
+            vec!["Here are the prompts", "a cat"]
+        );
+    }
+
+    #[test]
+    fn parse_variations_keeps_mixed_prose_and_singleton_arrays_ambiguous() {
+        // One prose line among the arrays means the structure no longer proves
+        // which lines are prompts, so the exact-count guard must still see it.
+        let input = "Here are the prompts:\n[\"a cat\"]\n[\"a dog\"]";
+        assert_eq!(parse_variations(input, 2).len(), 3);
+    }
+
+    // ── bounded exact expansion ─────────────────────────────────────────
+
+    #[test]
+    fn exact_expansion_chunks_large_batches_and_scales_token_budget() {
+        let config = ExpandConfig {
+            variations: 10,
+            max_tokens: 300,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+
+        let expanded = expand_exact_with(&config, |attempt, context| {
+            attempts.push((
+                attempt.variations,
+                attempt.max_tokens,
+                context.start,
+                context.total,
+            ));
+            Ok((0..attempt.variations)
+                .map(|index| format!("prompt {}", context.start + index))
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(expanded.len(), 10);
+        assert_eq!(
+            attempts,
+            vec![(4, 1200, 1, 10), (3, 900, 5, 10), (3, 900, 8, 10)]
+        );
+    }
+
+    #[test]
+    fn no_chunk_is_ever_asked_for_a_lone_prompt_inside_a_larger_batch() {
+        // The degenerate `4k + 1` tail is what routed a one-prompt ask through
+        // the batch template. Sweep every reachable batch size rather than
+        // pinning the one that was reported.
+        for variations in 2..=256usize {
+            let mut remaining = variations;
+            let mut chunks = Vec::new();
+            while remaining > 0 {
+                let target = balanced_chunk_target(remaining);
+                assert!(
+                    (2..=EXPANSION_CHUNK_SIZE).contains(&target),
+                    "variations {variations} produced a chunk of {target}"
+                );
+                chunks.push(target);
+                remaining -= target;
+            }
+            assert_eq!(chunks.iter().sum::<usize>(), variations);
+            assert_eq!(chunks.len(), variations.div_ceil(EXPANSION_CHUNK_SIZE));
+        }
+        // A one-print request stays one chunk, which takes the single template.
+        assert_eq!(balanced_chunk_target(1), 1);
+    }
+
+    #[test]
+    fn ten_prompts_complete_when_every_completion_returns_one_new_prompt() {
+        // Production symptom: batch 10 failed with 3 collected. Exercise the
+        // real parser as well as assembly, including singleton JSON retries.
+        for variations in [10, 4, 5, 8, 17, 32] {
+            let config = ExpandConfig {
+                variations,
+                ..Default::default()
+            };
+            let mut calls = 0;
+            let prompts = expand_exact_with(&config, |attempt, context| {
+                calls += 1;
+                assert_eq!(context.start, calls);
+                assert_eq!(context.total, variations);
+                assert!(attempt.variations <= EXPANSION_CHUNK_SIZE);
+                assert_eq!(
+                    attempt.max_tokens,
+                    config.max_tokens * attempt.variations as u32
+                );
+                Ok(parse_variations(
+                    &format!(r#"["prompt {}"]"#, context.start),
+                    attempt.variations,
+                ))
+            })
+            .unwrap();
+            assert_eq!(calls, variations);
+            assert_eq!(
+                prompts,
+                (1..=variations)
+                    .map(|n| format!("prompt {n}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_expansion_assembles_ten_partial_completions() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let call = observed.fetch_add(1, Ordering::SeqCst) + 1;
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let count = [4, 3, 2, 1, 3, 2, 1, 3, 2, 1][call - 1];
+                assert_eq!(body["max_tokens"], count * 300);
+                assert_eq!(body["messages"][1]["content"], "a lighthouse");
+                let system = body["messages"][0]["content"].as_str().unwrap();
+                assert!(system.contains(&format!("variations {call} through {} of 10", call + count - 1)));
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": format!(r#"["lighthouse variation {call}"]"#)}}]
+                }))
+            })
+            .expect(10)
+            .mount(&server).await;
+        let endpoint = server.uri();
+        let result = tokio::task::spawn_blocking(move || {
+            ApiExpander::new(&endpoint, "test-expander").expand(
+                "a lighthouse",
+                &ExpandConfig {
+                    variations: 10,
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.original, "a lighthouse");
+        assert_eq!(calls.load(Ordering::SeqCst), 10);
+        validate_expanded_prompts(&result.expanded, 10).unwrap();
+        assert_eq!(
+            result.expanded,
+            (1..=10)
+                .map(|n| format!("lighthouse variation {n}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn productive_partials_do_not_spend_the_stall_budget() {
+        let config = ExpandConfig {
+            variations: 10,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let prompts = expand_exact_with(&config, |attempt, context| {
+            calls += 1;
+            match calls {
+                1 => Ok(vec!["prompt 1".into()]),
+                2 => Ok(vec!["  PROMPT   1 ".into()]), // normalized duplicate
+                3 => Ok(vec!["prompt 2".into()]),
+                4 => Ok(vec!["  ".into()]),
+                _ => Ok((0..attempt.variations)
+                    .map(|n| format!("prompt {}", context.start + n))
+                    .collect()),
+            }
+        })
+        .unwrap();
+        assert_eq!(prompts.len(), 10);
+        validate_expanded_prompts(&prompts, 10).unwrap();
+        assert_eq!(calls, 7);
+    }
+
+    #[test]
+    fn intermittent_progress_cannot_reset_the_stall_budget() {
+        let config = ExpandConfig {
+            variations: 10,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error = expand_exact_with(&config, |_, context| {
+            calls += 1;
+            if calls % 2 == 1 {
+                Ok(vec![format!("prompt {}", context.start)])
+            } else {
+                Ok(vec![])
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls, EXPANSION_CHUNK_SIZE + EXPANSION_CHUNK_ATTEMPTS - 1);
+        assert!(error.to_string().contains("backend returned 3"), "{error}");
+    }
+
+    #[test]
+    fn backend_error_after_progress_aborts_without_retry_or_partial_success() {
+        let config = ExpandConfig {
+            variations: 10,
+            ..Default::default()
+        };
+        let mut calls = 0;
+        let error = expand_exact_with(&config, |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(vec!["prompt 1".into()])
+            } else {
+                anyhow::bail!("cancelled")
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.to_string(), "cancelled");
+    }
+
+    #[test]
+    fn exact_expansion_retries_only_missing_prompts() {
+        let config = ExpandConfig {
+            variations: 8,
+            ..Default::default()
+        };
+        let mut requested = Vec::new();
+
+        let expanded = expand_exact_with(&config, |attempt, context| {
+            requested.push(attempt.variations);
+            let returned = match requested.as_slice() {
+                [4] => 3,
+                [4, 1] => {
+                    let messages = build_batch_messages_with_context(
+                        "source",
+                        "flux",
+                        attempt.variations,
+                        Some((context.start, context.total)),
+                        None,
+                        None,
+                        None,
+                    );
+                    assert!(messages[0].1.contains("variations 4 through 4 of 8"));
+                    1
+                }
+                _ => attempt.variations,
+            };
+            Ok((0..returned)
+                .map(|index| format!("prompt {}", context.start + index))
+                .collect())
+        })
+        .unwrap();
+
+        assert_eq!(expanded.len(), 8);
+        assert_eq!(requested, vec![4, 1, 4]);
+    }
+
+    #[test]
+    fn exact_expansion_fails_after_bounded_partial_attempts() {
+        let config = ExpandConfig {
+            variations: 8,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let error = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            Ok(vec!["only one".to_string()])
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1 + EXPANSION_CHUNK_ATTEMPTS);
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly 8 distinct non-empty prompts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exact_expansion_rejects_zero_variations() {
+        let config = ExpandConfig {
+            variations: 0,
+            ..Default::default()
+        };
+        let error = expand_exact_with(&config, |_, _| unreachable!()).unwrap_err();
+        assert!(error.to_string().contains("at least 1"));
+    }
+
+    #[test]
+    fn exact_expansion_rejects_counts_above_the_safety_limit_without_allocating() {
+        let config = ExpandConfig {
+            variations: MAX_EXPANSION_VARIATIONS + 1,
+            ..Default::default()
+        };
+        let error = expand_exact_with(&config, |_, _| unreachable!()).unwrap_err();
+        assert!(error.to_string().contains("safety limit"), "{error}");
+    }
+
+    #[test]
+    fn exact_expansion_rejects_excess_results_instead_of_truncating() {
+        let config = ExpandConfig {
+            variations: 2,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+        let error = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            Ok(vec!["one".into(), "two".into(), "three".into()])
+        })
+        .unwrap_err();
+        assert_eq!(attempts, EXPANSION_CHUNK_ATTEMPTS);
+        assert!(error.to_string().contains("exactly 2 were requested"));
+    }
+
+    #[test]
+    fn an_ambiguous_overshoot_spends_an_attempt_instead_of_failing_the_batch() {
+        let config = ExpandConfig {
+            variations: 2,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let expanded = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            if attempts == 1 {
+                // One ambiguous completion: reasoning plus the requested pair.
+                Ok(vec![
+                    "first I will vary the camera".into(),
+                    "one".into(),
+                    "two".into(),
+                ])
+            } else {
+                Ok(vec!["one".into(), "two".into()])
+            }
+        })
+        .unwrap();
+
+        assert_eq!(expanded, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn a_tail_chunk_overshoot_recovers_the_whole_logical_batch() {
+        // The reported failure shape, reachable now only through a partial
+        // fill: a five-print batch chunks into 3 + 2, chunk two answers with
+        // one prompt, and the retry that asks for the single missing one draws
+        // a three-line completion from the local model. That last ambiguous
+        // completion must not kill a batch with four prompts already in hand.
+        let config = ExpandConfig {
+            variations: 5,
+            ..Default::default()
+        };
+        let mut asks = Vec::new();
+
+        let expanded = expand_exact_with(&config, |attempt, context| {
+            asks.push(attempt.variations);
+            match asks.as_slice() {
+                [3] => Ok(vec![
+                    "prompt 1".into(),
+                    "prompt 2".into(),
+                    "prompt 3".into(),
+                ]),
+                [3, 2] => Ok(vec!["prompt 4".into()]),
+                [3, 2, 1] => {
+                    assert_eq!(context.start, 5);
+                    Ok(vec![
+                        "here is the final direction".into(),
+                        "prompt 5".into(),
+                        "and that keeps the subject".into(),
+                    ])
+                }
+                _ => Ok(vec!["prompt 5".into()]),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(expanded.len(), 5);
+        assert_eq!(expanded[4], "prompt 5");
+        assert_eq!(asks, vec![3, 2, 1, 1]);
+    }
+
+    #[test]
+    fn an_overshooting_attempt_contributes_none_of_its_prompts() {
+        let config = ExpandConfig {
+            variations: 1,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let expanded = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            if attempts == 1 {
+                Ok(vec!["reasoning line".into(), "trailing note".into()])
+            } else {
+                Ok(vec!["the real prompt".into()])
+            }
+        })
+        .unwrap();
+
+        assert_eq!(expanded, vec!["the real prompt".to_string()]);
+    }
+
+    #[test]
+    fn a_persistent_overshoot_reports_both_counts_after_the_attempt_budget() {
+        let config = ExpandConfig {
+            variations: 1,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let error = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            Ok(vec!["one".into(), "two".into(), "three".into()])
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, EXPANSION_CHUNK_ATTEMPTS);
+        let message = error.to_string();
+        assert!(
+            message.contains("returned 3 prompts when exactly 1 were requested"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "in {EXPANSION_CHUNK_ATTEMPTS} non-progress attempts"
+            )),
+            "{message}"
+        );
+        assert!(message.contains("assembled 0 of 1 prompts"), "{message}");
+    }
+
+    #[test]
+    fn an_overshoot_in_an_early_chunk_does_not_diagnose_a_later_one() {
+        // `overshoot` state is per chunk. If a refactor ever hoists it out of
+        // the loop, chunk two's shortfall would be reported as chunk one's
+        // overshoot.
+        let config = ExpandConfig {
+            variations: 8,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let error = expand_exact_with(&config, |attempt, context| {
+            attempts += 1;
+            if context.start <= 4 {
+                if attempts == 1 {
+                    // Chunk one over-delivers once, then answers cleanly.
+                    return Ok(vec![
+                        "a".into(),
+                        "b".into(),
+                        "c".into(),
+                        "d".into(),
+                        "e".into(),
+                    ]);
+                }
+                return Ok((0..attempt.variations)
+                    .map(|index| format!("prompt {}", context.start + index))
+                    .collect());
+            }
+            // Chunk two simply under-delivers, forever.
+            Ok(Vec::new())
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly 8 distinct non-empty prompts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_overshoot_then_a_partial_fill_still_completes_the_chunk() {
+        let config = ExpandConfig {
+            variations: 4,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let expanded = expand_exact_with(&config, |attempt, _| {
+            attempts += 1;
+            match attempts {
+                1 => Ok(vec!["x".into(); 5]),
+                2 => Ok(vec!["one".into(), "two".into()]),
+                _ => {
+                    assert_eq!(attempt.variations, 2);
+                    Ok(vec!["three".into(), "four".into()])
+                }
+            }
+        })
+        .unwrap();
+
+        assert_eq!(expanded, vec!["one", "two", "three", "four"]);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn an_overshoot_does_not_mask_a_later_shortfall() {
+        // The final diagnosis must describe the attempt state that actually
+        // ended the chunk, not an earlier one that a retry moved past.
+        let config = ExpandConfig {
+            variations: 2,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let error = expand_exact_with(&config, |_, _| {
+            attempts += 1;
+            if attempts == 1 {
+                Ok(vec!["one".into(), "two".into(), "three".into()])
+            } else {
+                Ok(Vec::new())
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, EXPANSION_CHUNK_ATTEMPTS);
+        assert!(
+            error
+                .to_string()
+                .contains("expected exactly 2 distinct non-empty prompts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn exact_expansion_retries_duplicates_from_prior_chunks() {
+        let config = ExpandConfig {
+            variations: 6,
+            ..Default::default()
+        };
+        let mut attempts = 0;
+
+        let expanded = expand_exact_with(&config, |attempt, context| {
+            attempts += 1;
+            if context.start == 4 && attempts == 2 {
+                // One of the three repeats a prompt chunk one already used.
+                Ok(vec![
+                    "prompt 1".into(),
+                    "prompt 4".into(),
+                    "prompt 5".into(),
+                ])
+            } else {
+                Ok((0..attempt.variations)
+                    .map(|index| format!("prompt {}", context.start + index))
+                    .collect())
+            }
+        })
+        .unwrap();
+
+        assert_eq!(expanded.len(), 6);
+        assert_eq!(expanded[4], "prompt 5");
+        assert_eq!(expanded[5], "prompt 6");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn protocol_validation_rejects_duplicate_or_empty_prompts() {
+        let duplicate = vec!["A cat".into(), " a  cat! ".into()];
+        let error = validate_expanded_prompts(&duplicate, 2).unwrap_err();
+        assert!(error.to_string().contains("returned 1"), "{error}");
+
+        let empty = vec!["A cat".into(), "   ".into()];
+        let error = validate_expanded_prompts(&empty, 2).unwrap_err();
+        assert!(error.to_string().contains("returned 1"), "{error}");
+    }
+
+    // ── ExpandSettings ───────────────────────────────────────────────────
+
+    #[test]
+    fn expand_settings_defaults() {
+        let settings = ExpandSettings::default();
+        assert!(!settings.enabled);
+        assert_eq!(settings.backend, "local");
+        assert_eq!(settings.model, "qwen3-expand:q8");
+        assert_eq!(settings.api_model, "qwen2.5:3b");
+        assert_eq!(settings.temperature, 0.7);
+        assert_eq!(settings.top_p, 0.9);
+        assert_eq!(settings.max_tokens, 300);
+        assert!(!settings.thinking);
+        assert!(settings.system_prompt.is_none());
+        assert!(settings.batch_prompt.is_none());
+        assert!(settings.families.is_empty());
+    }
+
+    #[test]
+    fn expand_settings_is_local() {
+        let settings = ExpandSettings::default();
+        assert!(settings.is_local());
+
+        let api_settings = ExpandSettings {
+            backend: "http://localhost:11434".to_string(),
+            ..Default::default()
+        };
+        assert!(!api_settings.is_local());
+    }
+
+    #[test]
+    fn expand_settings_create_api_expander_none_for_local() {
+        let settings = ExpandSettings::default();
+        assert!(settings.create_api_expander().unwrap().is_none());
+    }
+
+    #[test]
+    fn expand_settings_create_api_expander_some_for_url() {
+        let settings = ExpandSettings {
+            backend: "http://localhost:11434".to_string(),
+            api_model: "llama3:8b".to_string(),
+            ..Default::default()
+        };
+        let expander = settings.create_api_expander().unwrap();
+        assert!(expander.is_some());
+    }
+
+    #[test]
+    fn expand_settings_gate_the_selected_local_or_api_model() {
+        let local_h3 = ExpandSettings {
+            model: "MiniMax-H3".to_string(),
+            api_model: "ordinary-inactive-api-model".to_string(),
+            ..Default::default()
+        };
+        let error = local_h3
+            .create_api_expander()
+            .err()
+            .expect("the selected local H3 model must be gated");
+        assert!(error
+            .to_string()
+            .contains(crate::MINIMAX_H3_AUTHORIZATION_REQUIRED));
+
+        let api_h3 = ExpandSettings {
+            backend: "http://localhost:11434".to_string(),
+            model: "ordinary-inactive-local-model".to_string(),
+            api_model: "MiniMaxAI/MiniMax-H3".to_string(),
+            ..Default::default()
+        };
+        assert!(api_h3.create_api_expander().is_err());
+
+        let inactive_h3 = ExpandSettings {
+            backend: "http://localhost:11434".to_string(),
+            model: "MiniMax-H3".to_string(),
+            api_model: "llama3:8b".to_string(),
+            ..Default::default()
+        };
+        assert!(inactive_h3.create_api_expander().unwrap().is_some());
+    }
+
+    #[test]
+    fn expand_settings_to_expand_config() {
+        let settings = ExpandSettings {
+            temperature: 0.5,
+            top_p: 0.8,
+            max_tokens: 200,
+            thinking: true,
+            ..Default::default()
+        };
+        let config = settings.to_expand_config("sdxl", 3);
+        assert_eq!(config.model_family, "sdxl");
+        assert_eq!(config.variations, 3);
+        assert_eq!(config.temperature, 0.5);
+        assert_eq!(config.top_p, 0.8);
+        assert_eq!(config.max_tokens, 200);
+        assert!(config.thinking);
+    }
+
+    #[test]
+    fn expand_settings_serde_roundtrip() {
+        let mut families = HashMap::new();
+        families.insert(
+            "sd15".to_string(),
+            FamilyOverride {
+                word_limit: Some(80),
+                style_notes: Some("Custom SD1.5 notes.".to_string()),
+            },
+        );
+        let settings = ExpandSettings {
+            enabled: true,
+            backend: "http://example.com".to_string(),
+            model: "qwen3-expand-small:q8".to_string(),
+            api_model: "gpt-4".to_string(),
+            temperature: 1.2,
+            top_p: 0.95,
+            max_tokens: 500,
+            thinking: true,
+            system_prompt: Some("Custom system prompt {WORD_LIMIT} {MODEL_NOTES}".to_string()),
+            batch_prompt: Some("Custom batch {N} {WORD_LIMIT} {MODEL_NOTES}".to_string()),
+            families,
+        };
+        let toml_str = toml::to_string(&settings).unwrap();
+        let deserialized: ExpandSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.enabled, settings.enabled);
+        assert_eq!(deserialized.backend, settings.backend);
+        assert_eq!(deserialized.model, settings.model);
+        assert_eq!(deserialized.api_model, settings.api_model);
+        assert_eq!(deserialized.temperature, settings.temperature);
+        assert_eq!(deserialized.max_tokens, settings.max_tokens);
+        assert_eq!(deserialized.thinking, settings.thinking);
+        assert_eq!(deserialized.system_prompt, settings.system_prompt);
+        assert_eq!(deserialized.batch_prompt, settings.batch_prompt);
+        assert_eq!(deserialized.families.len(), 1);
+        let sd15 = deserialized.families.get("sd15").unwrap();
+        assert_eq!(sd15.word_limit, Some(80));
+        assert_eq!(sd15.style_notes.as_deref(), Some("Custom SD1.5 notes."));
+    }
+
+    #[test]
+    fn expand_settings_serde_defaults_on_empty() {
+        // Deserializing an empty table should produce all defaults
+        let deserialized: ExpandSettings = toml::from_str("").unwrap();
+        let defaults = ExpandSettings::default();
+        assert_eq!(deserialized.enabled, defaults.enabled);
+        assert_eq!(deserialized.backend, defaults.backend);
+        assert_eq!(deserialized.model, defaults.model);
+        assert_eq!(deserialized.temperature, defaults.temperature);
+    }
+
+    // ── ApiExpander ──────────────────────────────────────────────────────
+
+    #[test]
+    fn api_expander_strips_trailing_slash() {
+        let expander = ApiExpander::new("http://localhost:11434/", "qwen2.5:3b");
+        assert_eq!(expander.endpoint, "http://localhost:11434");
+    }
+
+    #[test]
+    fn api_expander_no_slash_unchanged() {
+        let expander = ApiExpander::new("http://localhost:11434", "qwen2.5:3b");
+        assert_eq!(expander.endpoint, "http://localhost:11434");
+    }
+
+    // ── ExpandConfig ─────────────────────────────────────────────────────
+
+    #[test]
+    fn expand_config_default() {
+        let config = ExpandConfig::default();
+        assert_eq!(config.model_family, "flux");
+        assert_eq!(config.variations, 1);
+        assert_eq!(config.temperature, 0.7);
+        assert_eq!(config.max_tokens, 300);
+        assert!(!config.thinking);
+    }
+
+    // ── env overrides ────────────────────────────────────────────────────
+    // These tests use a serial approach to avoid env var races.
+
+    #[test]
+    fn env_override_model_routes_to_local() {
+        // When backend is "local", MOLD_EXPAND_MODEL should set self.model
+        let settings = ExpandSettings::default();
+        assert!(settings.is_local());
+        // We can't safely set env vars in parallel tests, but we can test
+        // the routing logic directly:
+        let mut s = settings;
+        let v = "qwen3-expand-small:q8".to_string();
+        if s.is_local() {
+            s.model = v.clone();
+        } else {
+            s.api_model = v.clone();
+        }
+        assert_eq!(s.model, "qwen3-expand-small:q8");
+        assert_eq!(s.api_model, "qwen2.5:3b"); // unchanged
+    }
+
+    #[test]
+    fn env_override_model_routes_to_api() {
+        // When backend is a URL, MOLD_EXPAND_MODEL should set self.api_model
+        let mut s = ExpandSettings {
+            backend: "http://localhost:11434".to_string(),
+            ..Default::default()
+        };
+        assert!(!s.is_local());
+        let v = "llama3:70b".to_string();
+        if s.is_local() {
+            s.model = v.clone();
+        } else {
+            s.api_model = v.clone();
+        }
+        assert_eq!(s.api_model, "llama3:70b");
+        assert_eq!(s.model, "qwen3-expand:q8"); // unchanged
+    }
+
+    // ── template overrides in ExpandConfig ───────────────────────────────
+
+    #[test]
+    fn to_expand_config_passes_overrides() {
+        let mut families = HashMap::new();
+        families.insert(
+            "flux".to_string(),
+            FamilyOverride {
+                word_limit: Some(200),
+                style_notes: None,
+            },
+        );
+        let settings = ExpandSettings {
+            system_prompt: Some("Custom {WORD_LIMIT} {MODEL_NOTES}".to_string()),
+            batch_prompt: Some("Batch {N} {WORD_LIMIT} {MODEL_NOTES}".to_string()),
+            families,
+            ..Default::default()
+        };
+        let config = settings.to_expand_config("flux", 3);
+        assert_eq!(
+            config.system_prompt.as_deref(),
+            Some("Custom {WORD_LIMIT} {MODEL_NOTES}")
+        );
+        assert_eq!(
+            config.batch_prompt.as_deref(),
+            Some("Batch {N} {WORD_LIMIT} {MODEL_NOTES}")
+        );
+        assert_eq!(config.family_overrides.len(), 1);
+        assert_eq!(
+            config.family_overrides.get("flux").unwrap().word_limit,
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn expand_config_default_has_no_overrides() {
+        let config = ExpandConfig::default();
+        assert!(config.system_prompt.is_none());
+        assert!(config.batch_prompt.is_none());
+        assert!(config.family_overrides.is_empty());
+    }
+
+    #[test]
+    fn expand_config_default_style_is_none() {
+        assert!(ExpandConfig::default().style.is_none());
+    }
+
+    #[test]
+    fn to_expand_config_never_sets_style() {
+        // Style is per-request state owned by the route handler, not settings.
+        let settings = ExpandSettings::default();
+        let config = settings.to_expand_config("flux", 3);
+        assert!(config.style.is_none());
+    }
+
+    // ── validate_templates ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_templates_valid() {
+        let settings = ExpandSettings {
+            system_prompt: Some("You are a writer. {WORD_LIMIT} words. {MODEL_NOTES}".to_string()),
+            batch_prompt: Some(
+                "Generate {N} prompts. {WORD_LIMIT} words. {MODEL_NOTES}".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert!(settings.validate_templates().is_empty());
+    }
+
+    #[test]
+    fn validate_templates_none_is_valid() {
+        let settings = ExpandSettings::default();
+        assert!(settings.validate_templates().is_empty());
+    }
+
+    #[test]
+    fn validate_templates_missing_word_limit() {
+        let settings = ExpandSettings {
+            system_prompt: Some("You are a writer. {MODEL_NOTES}".to_string()),
+            ..Default::default()
+        };
+        let errors = settings.validate_templates();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("{WORD_LIMIT}"));
+    }
+
+    #[test]
+    fn validate_templates_missing_model_notes() {
+        let settings = ExpandSettings {
+            system_prompt: Some("You are a writer. {WORD_LIMIT} words.".to_string()),
+            ..Default::default()
+        };
+        let errors = settings.validate_templates();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("{MODEL_NOTES}"));
+    }
+
+    #[test]
+    fn validate_templates_batch_missing_n() {
+        let settings = ExpandSettings {
+            batch_prompt: Some("Generate prompts. {WORD_LIMIT} {MODEL_NOTES}".to_string()),
+            ..Default::default()
+        };
+        let errors = settings.validate_templates();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("{N}"));
+    }
+
+    #[test]
+    fn validate_templates_batch_missing_all() {
+        let settings = ExpandSettings {
+            batch_prompt: Some("Generate prompts.".to_string()),
+            ..Default::default()
+        };
+        let errors = settings.validate_templates();
+        assert_eq!(errors.len(), 3);
+    }
+
+    // ── FamilyOverride serde ────────────────────────────────────────────
+
+    #[test]
+    fn family_override_serde_roundtrip() {
+        let ov = FamilyOverride {
+            word_limit: Some(100),
+            style_notes: Some("Be creative.".to_string()),
+        };
+        let json = serde_json::to_string(&ov).unwrap();
+        let deserialized: FamilyOverride = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.word_limit, Some(100));
+        assert_eq!(deserialized.style_notes.as_deref(), Some("Be creative."));
+    }
+
+    #[test]
+    fn family_override_partial_toml() {
+        let toml_str = "word_limit = 75\n";
+        let ov: FamilyOverride = toml::from_str(toml_str).unwrap();
+        assert_eq!(ov.word_limit, Some(75));
+        assert!(ov.style_notes.is_none());
+    }
+
+    // ── full config with families in TOML ───────────────────────────────
+
+    #[test]
+    fn expand_settings_toml_with_families() {
+        let toml_str = r#"
+enabled = true
+system_prompt = "Custom prompt. {WORD_LIMIT} words. {MODEL_NOTES}"
+
+[families.sd15]
+word_limit = 40
+style_notes = "Short keywords only."
+
+[families.flux]
+word_limit = 250
+"#;
+        let settings: ExpandSettings = toml::from_str(toml_str).unwrap();
+        assert!(settings.enabled);
+        assert!(settings.system_prompt.is_some());
+        assert_eq!(settings.families.len(), 2);
+        let sd15 = settings.families.get("sd15").unwrap();
+        assert_eq!(sd15.word_limit, Some(40));
+        assert_eq!(sd15.style_notes.as_deref(), Some("Short keywords only."));
+        let flux = settings.families.get("flux").unwrap();
+        assert_eq!(flux.word_limit, Some(250));
+        assert!(flux.style_notes.is_none());
+    }
+
+    #[test]
+    fn remix_dimensions_are_task_safe_and_deterministic() {
+        let text = resolve_remix_dimensions(&[], ExpandTask::TextToImage, false).unwrap();
+        assert!(text.contains(&RemixDimension::Composition));
+        assert!(text.contains(&RemixDimension::Style));
+        assert_eq!(
+            remix_dimensions_for_position(&text, text.len() + 1),
+            vec![RemixDimension::Composition]
+        );
+
+        let conditioned = resolve_remix_dimensions(&[], ExpandTask::ImageToVideo, false).unwrap();
+        assert_eq!(conditioned, vec![RemixDimension::Movement]);
+        let error = resolve_remix_dimensions(
+            &[RemixDimension::Composition],
+            ExpandTask::ImageToVideo,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conditioning authority"));
+    }
+
+    #[test]
+    fn locked_style_cannot_be_a_remix_dimension() {
+        let defaults = resolve_remix_dimensions(&[], ExpandTask::TextToImage, true).unwrap();
+        assert!(!defaults.contains(&RemixDimension::Style));
+        assert!(
+            resolve_remix_dimensions(&[RemixDimension::Style], ExpandTask::TextToImage, true)
+                .is_err()
+        );
+    }
+}

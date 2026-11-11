@@ -7,6 +7,10 @@ Bundled third-party files keep their own licenses:
 - poppler/ (the Windows download only): Poppler's pdftotext and pdftoppm, GPL-2.0-or-later, run as separate
   programs to read PDFs (poppler/README.txt says where their source is)
 
+vendor/mold is a copy of mold (https://github.com/utensils/mold, MIT, Copyright (c) James Brink and Jeffrey Dilley;
+parts Apache-2.0 and others, see its LICENSE-* and THIRD_PARTY_NOTICES.md files) at rev bf0ea4a0, with one fix of
+ours (vendor/mold/AM2STRATA.md).
+
 The media engine (crates/strata-media, built only on request) links, through mold (MIT):
 - OpenH264 (BSD-2-Clause, Cisco) for MP4 / H.264 video output;
 - the Fraunhofer FDK AAC codec (fdk-aac crate; "Software License for The Fraunhofer FDK AAC Codec Library for

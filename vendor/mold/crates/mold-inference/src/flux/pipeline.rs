@@ -1,0 +1,4924 @@
+use anyhow::{bail, Result};
+use candle_core::{DType, Device, IndexOp, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::flux;
+use mold_core::{GenerateRequest, GenerateResponse, ImageData, ModelPaths};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use crate::cache::{
+    clear_cache, prompt_text_key, restore_cached_tensor_pair, store_cached_tensor_pair,
+    CachedTensorPair, LruCache, DEFAULT_PROMPT_CACHE_CAPACITY,
+};
+use crate::device::{
+    check_memory_budget, effective_device_ref, fmt_gb, free_vram_bytes, memory_status_string,
+    preflight_memory_check, should_offload, should_use_gpu, usable_free_vram_bytes,
+    CLIP_VRAM_THRESHOLD, MIN_OFFLOAD_VRAM,
+};
+use crate::encoders;
+use crate::engine::{rand_seed, InferenceEngine, LoadStrategy, OptionRestoreGuard};
+use crate::engine_base::EngineBase;
+use crate::image::{build_output_metadata, encode_image};
+use crate::lora::{fence_fingerprint, fingerprint_stack, LoraFingerprint};
+use crate::progress::{ProgressCallback, ProgressReporter};
+
+use super::identity::{EngineIdentityState, RenderIdentity};
+use super::transformer::FluxTransformer;
+use super::transformer::TrueCfgBranch;
+
+/// Some FLUX safetensors checkpoints store transformer tensors at the root
+/// while others nest them under `model.diffusion_model`.
+fn flux_transformer_var_builder<'a>(vb: VarBuilder<'a>) -> VarBuilder<'a> {
+    if vb.contains_tensor("img_in.weight") {
+        vb
+    } else if vb.contains_tensor("model.diffusion_model.img_in.weight") {
+        vb.pp("model.diffusion_model")
+    } else if vb.contains_tensor("diffusion_model.img_in.weight") {
+        vb.pp("diffusion_model")
+    } else {
+        vb
+    }
+}
+
+/// Some FLUX single-file checkpoints bundle the VAE under a wrapper prefix
+/// while the candle FLUX autoencoder expects root `encoder.*` / `decoder.*`
+/// keys.
+fn flux_vae_var_builder<'a>(vb: VarBuilder<'a>) -> VarBuilder<'a> {
+    if vb.contains_tensor("encoder.conv_in.weight") {
+        vb
+    } else if vb.contains_tensor("first_stage_model.encoder.conv_in.weight") {
+        vb.pp("first_stage_model")
+    } else if vb.contains_tensor("vae.encoder.conv_in.weight") {
+        vb.pp("vae")
+    } else {
+        vb
+    }
+}
+
+/// Check if a FLUX safetensors checkpoint stores weights in FP8 (F8_E4M3).
+/// Uses candle's DType after loading a single small tensor on CPU (img_in.weight
+/// is typically only a few KB).
+fn flux_safetensors_transformer_is_fp8(path: &std::path::Path) -> Result<bool> {
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&[path])? };
+    for key in [
+        "img_in.weight",
+        "model.diffusion_model.img_in.weight",
+        "diffusion_model.img_in.weight",
+    ] {
+        if let Ok(tensor) = tensors.load(key, &Device::Cpu) {
+            return Ok(tensor.dtype() == DType::F8E4M3);
+        }
+    }
+    Ok(false)
+}
+
+fn flux_runtime_dtype(is_cuda: bool, is_quantized: bool, transformer_is_fp8: bool) -> DType {
+    if is_quantized {
+        if is_cuda {
+            DType::BF16
+        } else {
+            DType::F32
+        }
+    } else if is_cuda && transformer_is_fp8 {
+        // FP8 safetensors must go through F16 on CUDA (candle has a kernel naming
+        // bug that prevents direct CUDA FP8→BF16 casts). The lazy mmap VarBuilder
+        // handles dtype conversion during model construction.
+        DType::F16
+    } else if is_cuda {
+        DType::BF16
+    } else {
+        DType::F32
+    }
+}
+
+/// The activation dtype a GGUF FLUX transformer is built and run at.
+///
+/// `flux_runtime_dtype` already answers BF16 on CUDA for a quantized model;
+/// what this adds is the kernel-side veto. `MOLD_WAN_FORCE_DMMV=1` is a
+/// process switch mold itself flips and never clears, and it routes every
+/// CUDA quantized matmul into `dequantize_matmul`, which reads the activation
+/// as f32 — so a BF16 transformer built while it is set would fail on its
+/// first linear. Metal and CPU answer F32 for the reasons in
+/// `crate::quantized_linear::gguf_activation_dtype`, which is the one rule
+/// every GGUF family reads.
+/// The dtype every state tensor of a render is cast to — noise, conditioning,
+/// and therefore what the PuLID adapter and every hook must feed.
+///
+/// A GGUF transformer runs at [`gguf_transformer_dtype`]; a dense one at the
+/// dtype it was loaded with. The eager identity site and
+/// `generate_with_embeddings` both ask THIS function, because when the GGUF
+/// path stopped pinning F32 the identity site kept its own copy of the old
+/// answer and PuLID renders died with "dtype mismatch in ternary op".
+fn render_state_dtype_for(is_quantized: bool, device: &Device, loaded_dtype: DType) -> DType {
+    if is_quantized {
+        gguf_transformer_dtype(device, loaded_dtype)
+    } else {
+        loaded_dtype
+    }
+}
+
+fn gguf_transformer_dtype(device: &Device, requested: DType) -> DType {
+    crate::quantized_linear::gguf_activation_dtype(
+        crate::quantized_linear::LinearDevice::of(device),
+        requested,
+        crate::quantized_dmmv::force_dmmv_enabled(),
+    )
+}
+
+/// Build the GGUF FLUX transformer — the ONE place a `.gguf` becomes a
+/// `FluxTransformer`, whether or not a LoRA is stacked on it.
+///
+/// Before the FLUX performance campaign a no-LoRA GGUF took
+/// `flux::quantized_model::Flux` from the candle fork instead. That model has
+/// no attention-policy hook — `flux/model.rs:64-76` is unchunked F32 math —
+/// so the common case could not reach FlashAttention however the artifact was
+/// built, and its F32 `LayerNorm` weights pinned the whole render to F32
+/// activations. The two were verified bit-identical before the arm was
+/// deleted (`f32_bypass_forward_matches_the_upstream_quantized_model`).
+fn build_gguf_transformer(
+    flux_cfg: &flux::model::Config,
+    vb: mold_candle::quantized::VarBuilder,
+    registry: Option<&crate::flux::lora_bypass::LoraRegistry>,
+    progress: &ProgressReporter,
+    device: &Device,
+    requested_dtype: DType,
+) -> Result<FluxTransformer> {
+    let dtype = gguf_transformer_dtype(device, requested_dtype);
+    Ok(FluxTransformer::QuantizedBypass(
+        crate::flux::quantized_transformer::QuantizedFluxTransformer::load(
+            flux_cfg, vb, registry, progress, dtype,
+        )?,
+    ))
+}
+
+/// Path for the Q8 GGUF cache of an FP8 safetensors file.
+/// Cache key: stem + file size + FNV-1a hash of 4KB sampled from the weight
+/// data region (past the JSON header). This avoids collisions between
+/// different fine-tunes that share the same tensor layout and header.
+fn fp8_gguf_cache_path(path: &Path) -> PathBuf {
+    use std::io::{Read, Seek, SeekFrom};
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("transformer");
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Sample 4KB from the weight data region (past the safetensors JSON header).
+    // The header is typically ~30-60KB; sampling from 25% into the file ensures
+    // we're reading actual weight data, not the identical JSON layout.
+    let sample_offset = size / 4;
+    let content_hash = std::fs::File::open(path)
+        .and_then(|mut f| {
+            f.seek(SeekFrom::Start(sample_offset))?;
+            let mut buf = vec![0u8; 4096];
+            let n = f.read(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        })
+        .map(|buf| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+            for &b in &buf {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3); // FNV-1a prime
+            }
+            format!("{h:016x}")
+        })
+        .unwrap_or_else(|_| "0".to_string());
+    let cache_root = mold_core::Config::mold_dir()
+        .unwrap_or_else(|| PathBuf::from(".mold"))
+        .join("cache")
+        .join("flux-q8");
+    cache_root.join(format!("{stem}-{size}-{content_hash}.q8_0.gguf"))
+}
+
+fn q8_0_can_quantize_dims(dims: &[usize]) -> bool {
+    if dims.len() < 2 {
+        return false;
+    }
+    let block_size = candle_core::quantized::GgmlDType::Q8_0.block_size();
+    dims.last()
+        .is_some_and(|last_dim| *last_dim >= block_size && *last_dim % block_size == 0)
+}
+
+fn fp8_cache_should_skip_tensor(name: &str, dims: &[usize]) -> bool {
+    dims.is_empty() || name.starts_with("text_encoders.")
+}
+
+fn fp8_gguf_tmp_path(cache_path: &Path) -> PathBuf {
+    static NEXT_TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache_path.with_extension(format!("tmp.{}.{}", std::process::id(), seq))
+}
+
+/// Convert an FP8 safetensors checkpoint to Q8_0 GGUF (one-time).
+///
+/// FP8 safetensors cannot run directly through candle on a 24 GB card because
+/// expanding to F16/BF16 doubles the VRAM requirement. Q8_0 GGUF keeps the
+/// model at ~12 GB and uses candle's efficient quantized matmul path.
+fn ensure_fp8_gguf_cache(path: &Path, progress: &ProgressReporter) -> Result<PathBuf> {
+    let cache_path = fp8_gguf_cache_path(path);
+    if cache_path.exists() {
+        progress.info(&format!("Using cached Q8 GGUF: {}", cache_path.display()));
+        return Ok(cache_path);
+    }
+
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid cache path: {}", cache_path.display()))?;
+
+    // Clean up orphaned caches from older naming schemes only.
+    // v1: {stem}.q8_0.gguf  (no size/hash — exactly "stem.q8_0.gguf")
+    // v2: {stem}-{size}.q8_0.gguf  (size only, no content hash — one dash)
+    // Current v3: {stem}-{size}-{hash}.q8_0.gguf  (two dashes — NOT cleaned)
+    // We only remove v1/v2 formats. Valid v3 caches for other checkpoints
+    // (different size/hash) are preserved to avoid expensive re-quantization.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("transformer");
+    std::fs::create_dir_all(parent)?;
+    let old_v1 = parent.join(format!("{stem}.q8_0.gguf"));
+    if old_v1.exists() {
+        tracing::info!(path = %old_v1.display(), "removing v1 orphaned FP8 cache");
+        let _ = std::fs::remove_file(&old_v1);
+    }
+    // v2 format: {stem}-{digits}.q8_0.gguf (one dash, no hash)
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        let v2_prefix = format!("{stem}-");
+        let suffix = ".q8_0.gguf";
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if !name_str.starts_with(&v2_prefix) || !name_str.ends_with(suffix) {
+                continue;
+            }
+            // Extract the middle part between prefix and suffix
+            let middle = &name_str[v2_prefix.len()..name_str.len() - suffix.len()];
+            // v2 has no dash in the middle (just digits for size).
+            // v3 has a dash (size-hash). Only remove v2.
+            if !middle.contains('-') && middle.chars().all(|c| c.is_ascii_digit()) {
+                tracing::info!(path = %entry.path().display(), "removing v2 orphaned FP8 cache");
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    progress.info("Converting FP8 checkpoint to Q8 GGUF cache (one-time, may take a few minutes)");
+    tracing::info!(
+        source = %path.display(),
+        cache = %cache_path.display(),
+        "converting FP8 safetensors to Q8_0 GGUF cache"
+    );
+
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&[path])? };
+
+    // Detect and strip the common prefix used in some checkpoints
+    let prefix = if tensors.get("img_in.weight").is_ok() {
+        ""
+    } else if tensors.get("model.diffusion_model.img_in.weight").is_ok() {
+        "model.diffusion_model."
+    } else if tensors.get("diffusion_model.img_in.weight").is_ok() {
+        "diffusion_model."
+    } else {
+        ""
+    };
+
+    // Enumerate all tensor names via MmapedSafetensors::tensors()
+    let all_names: Vec<String> = tensors
+        .tensors()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut qtensors: Vec<(String, candle_core::quantized::QTensor)> = Vec::new();
+
+    let total = all_names.len();
+    for (i, name) in all_names.iter().enumerate() {
+        if (i + 1) % 50 == 0 || i + 1 == total {
+            progress.info(&format!("Quantizing tensor {}/{total}", i + 1));
+        }
+
+        let tensor = tensors.load(name, &Device::Cpu)?;
+        // Strip prefix for GGUF (quantized model expects unprefixed names)
+        let out_name = if !prefix.is_empty() && name.starts_with(prefix) {
+            name[prefix.len()..].to_string()
+        } else {
+            name.clone()
+        };
+
+        if fp8_cache_should_skip_tensor(&out_name, tensor.dims()) {
+            continue;
+        }
+
+        let can_quantize = q8_0_can_quantize_dims(tensor.dims());
+
+        let qt = if can_quantize {
+            candle_core::quantized::QTensor::quantize(
+                &tensor,
+                candle_core::quantized::GgmlDType::Q8_0,
+            )?
+        } else {
+            // Small/odd-shaped tensors (norms, biases): store as F32
+            candle_core::quantized::QTensor::quantize(
+                &tensor,
+                candle_core::quantized::GgmlDType::F32,
+            )?
+        };
+        qtensors.push((out_name, qt));
+    }
+
+    // Write GGUF cache (clean up temp file on error)
+    let tmp_path = fp8_gguf_tmp_path(&cache_path);
+    let write_result = (|| -> Result<()> {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let tensor_refs: Vec<(&str, &candle_core::quantized::QTensor)> =
+            qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+        candle_core::quantized::gguf_file::write(&mut writer, &[], &tensor_refs)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    if cache_path.exists() {
+        let _ = std::fs::remove_file(&tmp_path);
+        progress.info(&format!("Using cached Q8 GGUF: {}", cache_path.display()));
+        return Ok(cache_path);
+    }
+    std::fs::rename(&tmp_path, &cache_path)?;
+
+    progress.info(&format!("Q8 GGUF cache created: {}", cache_path.display()));
+    tracing::info!(cache = %cache_path.display(), "FP8→Q8_0 GGUF cache created");
+    Ok(cache_path)
+}
+
+// ── City96-format GGUF embedding patching ──────────────────────────────────
+
+/// Embedding tensors required by all FLUX models (schnell and dev).
+const FLUX_EMBEDDING_TENSORS: &[&str] = &[
+    "img_in.weight",
+    "img_in.bias",
+    "time_in.in_layer.weight",
+    "time_in.in_layer.bias",
+    "time_in.out_layer.weight",
+    "time_in.out_layer.bias",
+    "vector_in.in_layer.weight",
+    "vector_in.in_layer.bias",
+    "vector_in.out_layer.weight",
+    "vector_in.out_layer.bias",
+];
+
+/// Additional embedding tensors for FLUX-dev (guidance-based) models.
+const FLUX_GUIDANCE_EMBEDDING_TENSORS: &[&str] = &[
+    "guidance_in.in_layer.weight",
+    "guidance_in.in_layer.bias",
+    "guidance_in.out_layer.weight",
+    "guidance_in.out_layer.bias",
+];
+
+/// Lightweight check: does a GGUF file contain the FLUX embedding layers?
+/// Reads only the GGUF header (tensor_infos), not the tensor data.
+///
+/// Relies on the city96-format property that embedding tensors are either
+/// all present or all absent. A GGUF with `img_in.weight` but missing other
+/// embeddings would pass this check.
+fn gguf_has_embeddings(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+    Ok(content.tensor_infos.contains_key("img_in.weight"))
+}
+
+/// Does a GGUF contain the flux-dev-only `guidance_in` tensors? Schnell GGUFs
+/// return false because the schnell architecture is distilled without guidance.
+fn gguf_has_guidance(path: &Path) -> Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
+    Ok(content
+        .tensor_infos
+        .contains_key("guidance_in.in_layer.weight"))
+}
+
+/// Search for a downloaded FLUX GGUF that contains complete embeddings.
+///
+/// Prefers larger quantizations (more likely downloaded) first. When
+/// `needs_guidance` is true, schnell candidates are skipped and dev candidates
+/// are verified to contain `guidance_in` tensors — a schnell GGUF passes the
+/// basic `img_in` check but cannot supply `guidance_in` for a dev-family target.
+///
+/// When `models_dir_override` is `Some`, searches that directory instead of
+/// the config-resolved models dir (used by tests to avoid global state).
+fn find_flux_reference_gguf(
+    needs_guidance: bool,
+    models_dir_override: Option<&Path>,
+) -> Option<PathBuf> {
+    let config = mold_core::Config::load_or_default();
+    let models_dir = models_dir_override
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.resolved_models_dir());
+
+    // Dev candidates satisfy both schnell and dev targets (schnell tensors are a
+    // subset of dev). Schnell candidates only satisfy schnell targets.
+    // flux-krea is a dev-family fine-tune shipped as complete GGUFs by
+    // QuantStack, so it carries the full embedding set including guidance_in —
+    // fall back to it before asking the user to download flux-dev.
+    let mut candidates: Vec<&str> = vec![
+        "flux-dev:q8",
+        "flux-dev:q6",
+        "flux-dev:q4",
+        "flux-krea:q8",
+        "flux-krea:q6",
+        "flux-krea:q4",
+    ];
+    if !needs_guidance {
+        candidates.extend(["flux-schnell:q8", "flux-schnell:q4"]);
+    }
+
+    for name in candidates {
+        let Some(manifest) = mold_core::manifest::find_manifest(name) else {
+            continue;
+        };
+        // Find the transformer file in the manifest
+        let Some(xformer_file) = manifest
+            .files
+            .iter()
+            .find(|f| f.component == mold_core::manifest::ModelComponent::Transformer)
+        else {
+            continue;
+        };
+        let xformer_path =
+            models_dir.join(mold_core::manifest::storage_path(manifest, xformer_file));
+        if !xformer_path.exists() {
+            continue;
+        }
+        // Verify it actually has the embeddings (don't assume)
+        match gguf_has_embeddings(&xformer_path) {
+            Ok(true) => {
+                if needs_guidance {
+                    match gguf_has_guidance(&xformer_path) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::debug!(
+                                model = name,
+                                "reference candidate lacks guidance_in, skipping for dev target"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                model = name,
+                                err = %e,
+                                "failed to probe guidance tensors"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                tracing::info!(
+                    reference = %xformer_path.display(),
+                    model = name,
+                    needs_guidance,
+                    "found reference FLUX GGUF with embeddings"
+                );
+                return Some(xformer_path);
+            }
+            Ok(false) => {
+                tracing::debug!(
+                    model = name,
+                    "reference candidate also missing embeddings, skipping"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(model = name, err = %e, "failed to probe reference candidate");
+            }
+        }
+    }
+    None
+}
+
+/// Cache path for a GGUF patched with missing embedding layers.
+/// Same FNV-1a content hashing scheme as `fp8_gguf_cache_path`.
+fn embedding_patched_cache_path(path: &Path) -> PathBuf {
+    use std::io::{Read, Seek, SeekFrom};
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("transformer");
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let sample_offset = size / 4;
+    let content_hash = std::fs::File::open(path)
+        .and_then(|mut f| {
+            f.seek(SeekFrom::Start(sample_offset))?;
+            let mut buf = vec![0u8; 4096];
+            let n = f.read(&mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        })
+        .map(|buf| {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for &b in &buf {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            format!("{h:016x}")
+        })
+        .unwrap_or_else(|_| "0".to_string());
+    let cache_root = mold_core::Config::mold_dir()
+        .unwrap_or_else(|| PathBuf::from(".mold"))
+        .join("cache")
+        .join("flux-embeddings");
+    cache_root.join(format!("{stem}-{size}-{content_hash}.patched.gguf"))
+}
+
+/// Ensure a GGUF file has complete FLUX embedding layers.
+///
+/// City96-format GGUFs (used by community fine-tune quantizations like
+/// UltraReal) only include the diffusion blocks but omit input embedding
+/// layers (`img_in`, `time_in`, `vector_in`, `guidance_in`). This function
+/// detects incomplete GGUFs and patches them by sourcing the missing
+/// embeddings from a reference FLUX GGUF (e.g. flux-dev:q8).
+///
+/// Returns the original path if the GGUF is already complete, or the path
+/// to a patched cache file.
+///
+/// `models_dir_override` is forwarded to `find_flux_reference_gguf` and
+/// only used by tests to avoid mutating process-global environment variables.
+fn ensure_gguf_embeddings(
+    path: &Path,
+    is_schnell: bool,
+    progress: &ProgressReporter,
+    models_dir_override: Option<&Path>,
+) -> Result<PathBuf> {
+    let cache_path = embedding_patched_cache_path(path);
+    if cache_path.exists() {
+        progress.info(&format!(
+            "Using cached embedding-patched GGUF: {}",
+            cache_path.display()
+        ));
+        return Ok(cache_path);
+    }
+
+    // Probe whether embeddings are actually missing
+    if gguf_has_embeddings(path)? {
+        return Ok(path.to_path_buf());
+    }
+
+    progress.info(
+        "GGUF is missing FLUX embedding layers (city96 format) — patching from reference model",
+    );
+    tracing::info!(
+        path = %path.display(),
+        is_schnell,
+        "GGUF missing embedding layers, searching for reference model"
+    );
+
+    let source_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>");
+    let needs_guidance = !is_schnell;
+    let reference_path =
+        find_flux_reference_gguf(needs_guidance, models_dir_override).ok_or_else(|| {
+            let family = if needs_guidance { "dev" } else { "schnell" };
+            anyhow::anyhow!(
+                "{source_name} is a city96-format GGUF that ships only the diffusion \
+                 blocks — its FLUX input embedding layers (img_in, time_in, vector_in{guidance}) \
+                 must be sourced from a complete flux-{family} GGUF, but none is downloaded.\n\n\
+                 To fix this:\n\n  mold pull flux-dev:q8\n\n\
+                 Then retry — mold will patch the incomplete GGUF from the reference.",
+                guidance = if needs_guidance { ", guidance_in" } else { "" },
+            )
+        })?;
+
+    // Determine which embedding tensors we need
+    let mut needed: Vec<&str> = FLUX_EMBEDDING_TENSORS.to_vec();
+    if !is_schnell {
+        needed.extend_from_slice(FLUX_GUIDANCE_EMBEDDING_TENSORS);
+    }
+
+    // Read source (incomplete) GGUF
+    progress.info("Reading source GGUF tensors...");
+    let mut src_file = std::fs::File::open(path)?;
+    let src_content = candle_core::quantized::gguf_file::Content::read(&mut src_file)?;
+
+    // Read only the needed embedding tensors from the reference GGUF
+    progress.info(&format!(
+        "Extracting {} embedding tensors from reference: {}",
+        needed.len(),
+        reference_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    ));
+    let mut ref_file = std::fs::File::open(&reference_path)?;
+    let ref_content = candle_core::quantized::gguf_file::Content::read(&mut ref_file)?;
+
+    let cpu = Device::Cpu;
+
+    // Load all source tensors
+    let mut qtensors: Vec<(String, candle_core::quantized::QTensor)> = Vec::new();
+    let total = src_content.tensor_infos.len();
+    for (i, name) in src_content.tensor_infos.keys().enumerate() {
+        if (i + 1) % 100 == 0 || i + 1 == total {
+            progress.info(&format!("Loading source tensor {}/{total}", i + 1));
+        }
+        let tensor = src_content.tensor(&mut src_file, name, &cpu)?;
+        qtensors.push((name.clone(), tensor));
+    }
+
+    // Load missing embedding tensors from reference
+    let mut patched_count = 0usize;
+    for name in &needed {
+        if src_content.tensor_infos.contains_key(*name) {
+            continue; // already present in source
+        }
+        if !ref_content.tensor_infos.contains_key(*name) {
+            bail!(
+                "while patching {source_name}: the only downloaded reference ({}) \
+                 is also missing '{name}'. This model needs a complete flux-dev GGUF \
+                 — run 'mold pull flux-dev:q8' and retry.",
+                reference_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>"),
+            );
+        }
+        let tensor = ref_content.tensor(&mut ref_file, name, &cpu)?;
+        tracing::debug!(tensor = name, "patching embedding tensor from reference");
+        qtensors.push((name.to_string(), tensor));
+        patched_count += 1;
+    }
+
+    progress.info(&format!(
+        "Patched {patched_count} embedding tensors from reference"
+    ));
+
+    // Write patched GGUF
+    let parent = cache_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid cache path: {}", cache_path.display()))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp_path = cache_path.with_extension(format!("tmp.{}", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        let tensor_refs: Vec<(&str, &candle_core::quantized::QTensor)> =
+            qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+        candle_core::quantized::gguf_file::write(&mut writer, &[], &tensor_refs)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    std::fs::rename(&tmp_path, &cache_path)?;
+
+    progress.info(&format!(
+        "Embedding-patched GGUF cache created: {}",
+        cache_path.display()
+    ));
+    tracing::info!(
+        cache = %cache_path.display(),
+        patched_count,
+        "embedding-patched GGUF cache created"
+    );
+    Ok(cache_path)
+}
+
+fn flux_safetensors_var_builder<'a>(
+    path: &std::path::Path,
+    dtype: DType,
+    device: &Device,
+    component: &str,
+    progress: &ProgressReporter,
+) -> Result<VarBuilder<'a>> {
+    let aliases = flux_rms_norm_scale_aliases(path)?;
+    if aliases.is_empty() {
+        crate::weight_loader::load_safetensors_with_progress(
+            std::slice::from_ref(&path),
+            dtype,
+            device,
+            component,
+            progress,
+        )
+    } else {
+        tracing::info!(
+            alias_count = aliases.len(),
+            path = %path.display(),
+            "FLUX checkpoint uses RMSNorm .weight keys; aliasing .scale lookups"
+        );
+        crate::weight_loader::load_safetensors_with_aliases(
+            std::slice::from_ref(&path),
+            dtype,
+            device,
+            component,
+            progress,
+            aliases,
+        )
+    }
+}
+
+fn flux_rms_norm_scale_aliases(path: &std::path::Path) -> Result<BTreeMap<String, String>> {
+    let tensors = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&[path])? };
+    let mut aliases = BTreeMap::new();
+    for prefix in ["", "model.diffusion_model.", "diffusion_model."] {
+        for i in 0..64 {
+            for stream in ["img_attn", "txt_attn"] {
+                for norm in ["query_norm", "key_norm"] {
+                    let target = format!("{prefix}double_blocks.{i}.{stream}.norm.{norm}.scale");
+                    let source = format!("{prefix}double_blocks.{i}.{stream}.norm.{norm}.weight");
+                    if tensors.get(&target).is_err() && tensors.get(&source).is_ok() {
+                        aliases.insert(target, source);
+                    }
+                }
+            }
+        }
+        for i in 0..128 {
+            for norm in ["query_norm", "key_norm"] {
+                let target = format!("{prefix}single_blocks.{i}.norm.{norm}.scale");
+                let source = format!("{prefix}single_blocks.{i}.norm.{norm}.weight");
+                if tensors.get(&target).is_err() && tensors.get(&source).is_ok() {
+                    aliases.insert(target, source);
+                }
+            }
+        }
+    }
+    Ok(aliases)
+}
+
+/// Build a LoRA-patching VarBuilder that wraps mmap'd base weights.
+///
+/// Uses a custom `SimpleBackend` that intercepts every `vb.get()` call during
+/// model construction.  Each tensor loads from mmap directly to GPU with LoRA
+/// deltas applied inline — identical memory profile to the non-LoRA mmap path.
+///
+/// Multi-LoRA: pass a slice with more than one weight and the deltas merge
+/// additively. Each adapter's contribution is independently cached (per
+/// path + scale) so a stack of (cinematic, dramatic-light) reuses both
+/// matmuls when the user toggles either back on later.
+fn flux_lora_var_builder<'a>(
+    transformer_path: &Path,
+    loras: &[mold_core::LoraWeight],
+    dtype: DType,
+    device: &Device,
+    progress: &ProgressReporter,
+    delta_cache: Option<std::sync::Arc<std::sync::Mutex<super::lora::LoraDeltaCache>>>,
+) -> Result<VarBuilder<'a>> {
+    use super::lora;
+
+    let adapters: Vec<std::sync::Arc<lora::LoraAdapter>> = loras
+        .iter()
+        .map(|w| {
+            progress.info("Loading LoRA adapter");
+            let adapter = lora::get_or_load_adapter(Path::new(&w.path))?;
+            progress.info(&format!(
+                "LoRA: {} layers, rank {}, scale {:.2}",
+                adapter.layers.len(),
+                adapter.rank,
+                w.scale,
+            ));
+            anyhow::Ok(adapter)
+        })
+        .collect::<Result<_>>()?;
+
+    let specs: Vec<lora::LoraSpec<'_>> = adapters
+        .iter()
+        .zip(loras.iter())
+        .map(|(adapter, w)| lora::LoraSpec {
+            adapter: adapter.as_ref(),
+            scale: w.scale,
+        })
+        .collect();
+
+    lora::lora_var_builder(
+        transformer_path,
+        &specs,
+        dtype,
+        device,
+        progress,
+        delta_cache,
+    )
+}
+
+/// Same wrapper for the GGUF (quantized) path.
+fn flux_gguf_lora_var_builder(
+    transformer_path: &Path,
+    loras: &[mold_core::LoraWeight],
+    device: &Device,
+    progress: &ProgressReporter,
+    delta_cache: Option<std::sync::Arc<std::sync::Mutex<super::lora::LoraDeltaCache>>>,
+) -> Result<mold_candle::quantized::VarBuilder> {
+    use super::lora;
+
+    let adapters: Vec<std::sync::Arc<lora::LoraAdapter>> = loras
+        .iter()
+        .map(|w| {
+            progress.info("Loading LoRA adapter");
+            let adapter = lora::get_or_load_adapter(Path::new(&w.path))?;
+            progress.info(&format!(
+                "LoRA: {} layers, rank {}, scale {:.2}",
+                adapter.layers.len(),
+                adapter.rank,
+                w.scale,
+            ));
+            anyhow::Ok(adapter)
+        })
+        .collect::<Result<_>>()?;
+
+    let specs: Vec<lora::LoraSpec<'_>> = adapters
+        .iter()
+        .zip(loras.iter())
+        .map(|(adapter, w)| lora::LoraSpec {
+            adapter: adapter.as_ref(),
+            scale: w.scale,
+        })
+        .collect();
+
+    lora::gguf_lora_var_builder(transformer_path, &specs, device, progress, delta_cache)
+}
+
+/// Three-state opt-in for bypass-mode LoRA. `auto` enables bypass on
+/// every supported path: the offload transformer (avoids the ~24 GB
+/// CPU-resident BF16 merge) and the GGUF transformer (avoids the
+/// minutes-long, ~95 GB peak dequant→merge→requant cycle on Q8 with
+/// a stack of LoRAs). `on` forces bypass; `off` reverts to the
+/// legacy `flux_lora_var_builder` / `gguf_lora_var_builder` so users
+/// can regression-check a build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoraBypassMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl LoraBypassMode {
+    fn from_env() -> Self {
+        match crate::runtime_env::value("MOLD_LORA_BYPASS")
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("on") | Some("1") | Some("true") => Self::On,
+            Some("off") | Some("0") | Some("false") => Self::Off,
+            _ => Self::Auto,
+        }
+    }
+}
+
+fn should_use_offload_bypass_registry(
+    use_offload: bool,
+    has_lora: bool,
+    bypass_mode: LoraBypassMode,
+) -> bool {
+    use_offload && has_lora && bypass_mode != LoraBypassMode::Off
+}
+
+/// Build a [`super::lora_bypass::LoraRegistry`] for any bypass-capable
+/// path (offload or GGUF/quantized).
+///
+/// Adapters are placed on `device` at `dtype` (typically GPU + BF16) so
+/// the per-step path never round-trips them CPU↔GPU. Both paths use the
+/// same registry shape: keys are FLUX candle tensor names, values are
+/// the bypass adapters that fire each time that Linear runs forward.
+///
+/// Returns `Ok(None)` when `loras` is empty so callers keep their
+/// no-LoRA hot path.
+fn build_lora_registry(
+    loras: &[mold_core::LoraWeight],
+    cfg: &flux::model::Config,
+    device: &Device,
+    dtype: DType,
+    progress: &ProgressReporter,
+) -> Result<Option<super::lora_bypass::LoraRegistry>> {
+    use super::lora;
+    use super::lora_bypass;
+
+    if loras.is_empty() {
+        return Ok(None);
+    }
+
+    let adapters: Vec<lora::LoraAdapter> = loras
+        .iter()
+        .map(|w| {
+            progress.info("Loading LoRA adapter (bypass)");
+            let adapter = lora::LoraAdapter::load(Path::new(&w.path))?;
+            progress.info(&format!(
+                "LoRA: {} layers, rank {}, scale {:.2}",
+                adapter.layers.len(),
+                adapter.rank,
+                w.scale,
+            ));
+            anyhow::Ok(adapter)
+        })
+        .collect::<Result<_>>()?;
+
+    let specs: Vec<lora::LoraSpec<'_>> = adapters
+        .iter()
+        .zip(loras.iter())
+        .map(|(adapter, w)| lora::LoraSpec {
+            adapter,
+            scale: w.scale,
+        })
+        .collect();
+
+    // Pre-compute the fused linear out-row counts that bypass-mode
+    // needs to translate component-index targets (e.g. "Q only") into
+    // absolute slice offsets.
+    let h = cfg.hidden_size;
+    let mlp_sz = (h as f64 * cfg.mlp_ratio) as usize;
+    let mut linear_out_dims: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for idx in 0..cfg.depth {
+        // Double blocks: img_attn.qkv / txt_attn.qkv each 3*h.
+        linear_out_dims.insert(format!("double_blocks.{idx}.img_attn.qkv.weight"), 3 * h);
+        linear_out_dims.insert(format!("double_blocks.{idx}.txt_attn.qkv.weight"), 3 * h);
+    }
+    for idx in 0..cfg.depth_single_blocks {
+        // Single block linear1 fuses [Q, K, V, MLP] = 3*h + mlp_sz.
+        linear_out_dims.insert(
+            format!("single_blocks.{idx}.linear1.weight"),
+            3 * h + mlp_sz,
+        );
+    }
+
+    let registry = lora_bypass::build_registry(&specs, &linear_out_dims, device, dtype)?;
+    progress.info(&format!(
+        "LoRA bypass: {} target tensors, adapters resident on {device:?}",
+        registry.len()
+    ));
+    Ok(Some(registry))
+}
+
+/// Resolve the effective LoRA list for a request.
+///
+/// Wire format intentionally accepts both `lora` (single) and `loras`
+/// (plural) for back-compat with older clients. When both are set,
+/// `loras` wins — single-form callers haven't been updated yet but
+/// new clients always populate the plural shape.
+///
+/// Entries whose `scale.abs() < ZERO_SCALE_EPS` are dropped: a slider
+/// pinned to zero is a no-op patch and forcing the transformer to
+/// rebuild for it is pure overhead. A `tracing::debug!` records each
+/// drop so a user wondering "why didn't my LoRA apply" can spot it
+/// in `RUST_LOG=debug` output.
+pub(crate) fn effective_loras(req: &mold_core::GenerateRequest) -> Vec<mold_core::LoraWeight> {
+    /// Threshold below which a LoRA scale is treated as off. Matches
+    /// the precision of an f64 scrubbed by a UI slider — anything
+    /// closer to zero than this is the user nudging the slider, not
+    /// a deliberate negative weight.
+    const ZERO_SCALE_EPS: f64 = 1e-8;
+
+    let raw: Vec<mold_core::LoraWeight> = if let Some(plural) = &req.loras {
+        if !plural.is_empty() {
+            plural.clone()
+        } else {
+            req.lora.iter().cloned().collect()
+        }
+    } else {
+        req.lora.iter().cloned().collect()
+    };
+
+    raw.into_iter()
+        .filter(|w| {
+            let keep = w.scale.abs() > ZERO_SCALE_EPS;
+            if !keep {
+                tracing::debug!(
+                    path = w.path.as_str(),
+                    scale = w.scale,
+                    "dropping zero-scale LoRA from effective stack"
+                );
+            }
+            keep
+        })
+        .collect()
+}
+
+/// Attention heads in every shipped FLUX.1 checkpoint — dev, schnell, krea,
+/// kontext and fill all carry `num_heads: 24` over a 3072-wide stream
+/// (`candle-transformers`' `flux::model::Config::{dev,schnell}`). The score
+/// tile the math attention budget charges is per head, so this is a term in
+/// [`crate::device::flux_activation_budget_bytes_for`].
+const FLUX1_ATTENTION_HEADS: u64 = 24;
+
+/// Both still families resolve residency through ONE function, and FLUX.1
+/// reaches it under the name it has always had here.
+///
+/// It moved to [`crate::device`] beside `still_transformer_residency` when
+/// FLUX.2 was found to be calling the budget directly and never reading
+/// `MOLD_FLUX_KEEP_TRANSFORMER` at all: two families answering the same
+/// question must not answer it in two places.
+pub(crate) use crate::device::{
+    resolve_keep_transformer as resolve_flux_keep_transformer, ResidencyDecision,
+};
+
+/// Loaded FLUX model components, ready for inference.
+/// FLUX transformer and VAE always run on GPU. T5 and CLIP run on GPU or CPU
+/// depending on available VRAM (checked at load time after the transformer is loaded).
+/// When T5/CLIP are loaded on GPU, they are dropped after encoding to free VRAM
+/// for the denoising pass (their weights are only needed for prompt encoding).
+struct LoadedFlux {
+    /// None after being dropped for VAE decode VRAM; reloaded on next generate.
+    flux_model: Option<FluxTransformer>,
+    t5: encoders::t5::T5Encoder,
+    clip: encoders::clip::ClipEncoder,
+    vae: flux::autoencoder::AutoEncoder,
+    /// GPU device for FLUX transformer + VAE
+    device: Device,
+    dtype: DType,
+    /// Effective VAE dtype after `MOLD_VAE_DTYPE` resolution. Stored so the
+    /// post-denoise cast and the decode forward pass agree on precision —
+    /// the eager path loads the VAE once at startup so this is captured at
+    /// load time and persists for the engine's lifetime. Sequential reloads
+    /// re-resolve per request.
+    vae_dtype: DType,
+    is_schnell: bool,
+    /// True if using quantized GGUF model (state tensors must be F32)
+    is_quantized: bool,
+    /// Resolved transformer path (may be a GGUF cache for FP8 models).
+    transformer_path: PathBuf,
+    /// The actual T5 encoder path used (may be a quantized GGUF, not the original FP16 path).
+    t5_encoder_path: std::path::PathBuf,
+    /// Device bytes the bypass registry's LoRA adapters hold beside the
+    /// transformer, for as long as the transformer lives.
+    ///
+    /// Recorded at load because the registry is consumed INTO the transformer
+    /// and is not separately reachable at decode time — and the residency
+    /// budget needs it, because #276's OOM was reported with LoRAs attached
+    /// and the budget charged only the checkpoint file.
+    lora_resident_bytes: u64,
+    /// Device bytes the transformer's weights occupy while resident — see
+    /// [`crate::device::transformer_resident_bytes_for`]. Recorded at load
+    /// because the
+    /// answer depends on the checkpoint's HEADER, which the per-render
+    /// residency decision must not re-open the file to read.
+    transformer_resident_bytes: u64,
+}
+
+/// FLUX inference engine backed by candle.
+pub struct FluxEngine {
+    base: EngineBase<LoadedFlux>,
+    /// Optional explicit override for is_schnell; if None, auto-detect from transformer filename.
+    is_schnell_override: Option<bool>,
+    /// T5 variant preference: None/"auto" = auto-select, "fp16" = force FP16, "q8"/"q5"/etc = specific quantized.
+    t5_variant: Option<String>,
+    prompt_cache: Mutex<LruCache<String, CachedTensorPair>>,
+    /// Cached result of FP8 safetensors probe (None = not yet checked).
+    transformer_is_fp8: Option<bool>,
+    /// Cached resolved transformer path (GGUF cache for FP8, or original path).
+    /// Avoids re-computing the cache key (file I/O) on every sequential generation.
+    cached_transformer_path: Option<PathBuf>,
+    /// Force block-level offloading (--offload / MOLD_OFFLOAD=1).
+    offload: bool,
+    /// Fingerprint of the currently applied LoRA (None = no LoRA baked in).
+    /// Empty when no LoRAs are active. Order-sensitive: changing the
+    /// stack triggers a transformer rebuild on the next generate.
+    active_lora: Vec<LoraFingerprint>,
+    /// CPU-resident cache of pre-computed LoRA deltas, shared across transformer rebuilds.
+    lora_delta_cache: Arc<Mutex<super::lora::LoraDeltaCache>>,
+    /// Optional shared tokenizer pool for cross-engine caching.
+    shared_pool: Option<Arc<Mutex<crate::shared_pool::SharedPool>>>,
+    /// Per-request placement override. Set at the start of `generate()`,
+    /// cleared on exit. `None` preserves the existing VRAM-aware auto logic.
+    pending_placement: Option<mold_core::types::DevicePlacement>,
+    /// PuLID face-identity conditioning: the frozen asset paths, the resident
+    /// adapter, and the pending identity embedding. Inert for every request
+    /// that does not condition on a face.
+    identity: EngineIdentityState,
+}
+
+impl FluxEngine {
+    /// Create a new FluxEngine. Does not load models until `load()` is called.
+    /// `is_schnell_override` lets callers explicitly set the scheduler family.
+    /// `t5_variant` controls T5 encoder selection: None/"auto" = VRAM-based auto-select,
+    /// "fp16" = force FP16, "q8"/"q5"/etc = specific quantized variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        model_name: String,
+        paths: ModelPaths,
+        is_schnell_override: Option<bool>,
+        t5_variant: Option<String>,
+        load_strategy: LoadStrategy,
+        gpu_ordinal: usize,
+        offload: bool,
+        shared_pool: Option<Arc<Mutex<crate::shared_pool::SharedPool>>>,
+        identity_assets: Option<mold_core::pulid_assets::PulidPaths>,
+    ) -> Self {
+        Self {
+            base: EngineBase::new(model_name, paths, load_strategy, gpu_ordinal),
+            is_schnell_override,
+            t5_variant,
+            prompt_cache: Mutex::new(LruCache::new(DEFAULT_PROMPT_CACHE_CAPACITY)),
+            transformer_is_fp8: None,
+            cached_transformer_path: None,
+            offload,
+            active_lora: Vec::new(),
+            lora_delta_cache: Arc::new(Mutex::new(super::lora::LoraDeltaCache::new())),
+            shared_pool,
+            pending_placement: None,
+            identity: EngineIdentityState::new(identity_assets),
+        }
+    }
+
+    /// Install the identity signal the next face-conditioned request will use.
+    ///
+    /// This is the seam the face extractor (#1223) fills: it turns
+    /// `GenerateRequest::id_image` into a `[1, 32, 2048]`
+    /// [`crate::flux::pulid::IdentityEmbedding`] and installs it here, after
+    /// which every injection site downstream is already wired. Until that
+    /// lands, only a test or dev harness calls this, and a conditioned request
+    /// with nothing installed is an explicit error rather than a silently
+    /// unconditioned render.
+    /// `uncond` is the unconditional identity a PuLID true-CFG render's
+    /// negative branch injects; `None` for every render that does not run one.
+    pub fn set_identity_embedding(
+        &mut self,
+        embedding: Option<crate::flux::pulid::IdentityEmbedding>,
+        uncond: Option<crate::flux::pulid::IdentityEmbedding>,
+    ) {
+        self.identity.set_embedding(embedding, uncond);
+    }
+
+    /// The frozen PuLID adapter path, when admission prepared the bundle.
+    pub fn identity_adapter_path(&self) -> Option<&PathBuf> {
+        self.identity.adapter_path()
+    }
+
+    /// Device bytes the PuLID adapter is currently holding, or 0.
+    ///
+    /// The `InferenceEngine` trait has no resident-bytes method to fold this
+    /// into, so it is exposed here: it is the only way a caller can confirm
+    /// that a park or an unload actually released the adapter rather than
+    /// leaving device memory nothing accounts for.
+    pub fn identity_resident_bytes(&self) -> u64 {
+        self.identity.resident_bytes()
+    }
+
+    /// Free the GPU state VAE decode competes with, before the decode starts.
+    ///
+    /// The eager path's decision to keep the transformer hot is
+    /// [`resolve_flux_keep_transformer`]; whatever it decides, the PuLID
+    /// adapter follows. Both live here rather than at the call site so the
+    /// pair cannot drift — a drop that released the transformer and left
+    /// 0.8–1.7 GB of adapter resident would hand the VAE back part of the
+    /// headroom the drop just created, on exactly the machines that needed it.
+    ///
+    /// Takes `&mut Option<FluxTransformer>` rather than `&mut LoadedFlux` so a
+    /// test can drive it with a synthetic transformer and no encoders or VAE.
+    /// Returns whether the transformer was dropped.
+    /// Device bytes the resident transformer holds, from the checkpoint that
+    /// produced it.
+    ///
+    /// The file length is the right measure for both arms: a GGUF stays
+    /// quantized at rest so its resident bytes ARE its file bytes, and a BF16
+    /// safetensors is materialized one-for-one. `transformer_path` is the
+    /// RESOLVED path, so an fp8 checkpoint reports its Q8 cache rather than
+    /// the original it was converted from — which is the file that is actually
+    /// on the card.
+    fn resident_transformer_bytes(loaded: &LoadedFlux) -> u64 {
+        if loaded.flux_model.is_none() {
+            return 0;
+        }
+        loaded.transformer_resident_bytes
+    }
+
+    fn free_gpu_state_before_vae_decode(
+        flux_model: &mut Option<FluxTransformer>,
+        identity: &mut RenderIdentity<'_>,
+        decision: ResidencyDecision,
+    ) -> bool {
+        if decision == ResidencyDecision::KeepResident {
+            return false;
+        }
+        *flux_model = None;
+        identity.release();
+        true
+    }
+
+    /// The adapter's residency follows the transformer's.
+    ///
+    /// Called once at the end of every `generate`, so the two drop sites
+    /// inside the render — the sequential path's unconditional
+    /// `drop(flux_model)` and the eager path's VAE-decode drop, which
+    /// `MOLD_FLUX_KEEP_TRANSFORMER` and the quantized stay-hot path can skip —
+    /// do not each need their own copy of this rule, and neither can forget
+    /// it. Whenever the transformer did not survive the render, the ~1.7 GB
+    /// adapter must not either: nothing is going to use it before the next
+    /// conditioned request, which reloads it anyway.
+    fn release_identity_adapter_unless_transformer_resident(&mut self) {
+        let transformer_resident = self
+            .base
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded.flux_model.is_some());
+        if !transformer_resident {
+            self.identity.drop_adapter();
+        }
+    }
+
+    /// Return the LoRA delta cache handle, or `None` when disabled via
+    /// `MOLD_FLUX_DELTA_CACHE=0`. The cache stores CPU-resident F32 delta
+    /// tensors, bounded to 256 MiB per engine and released on unload.
+    /// Evicted, oversized, or disabled entries are recomputed on demand.
+    fn lora_delta_cache_handle(&self) -> Option<Arc<Mutex<super::lora::LoraDeltaCache>>> {
+        if crate::runtime_env::value("MOLD_FLUX_DELTA_CACHE")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
+            None
+        } else {
+            Some(self.lora_delta_cache.clone())
+        }
+    }
+
+    /// Try to get a cached tokenizer from the shared pool.
+    fn get_cached_tokenizer(&self, path: &std::path::Path) -> Option<Arc<tokenizers::Tokenizer>> {
+        let pool = self.shared_pool.as_ref()?;
+        let pool = pool.lock().unwrap();
+        pool.get_tokenizer(&path.to_string_lossy())
+    }
+
+    /// Store a tokenizer in the shared pool.
+    fn cache_tokenizer(&self, path: &std::path::Path, tokenizer: Arc<tokenizers::Tokenizer>) {
+        if let Some(ref pool) = self.shared_pool {
+            let mut pool = pool.lock().unwrap();
+            pool.insert_tokenizer(path.to_string_lossy().into_owned(), tokenizer);
+        }
+    }
+
+    /// Load VAE weights through the shared CPU tensor cache when available.
+    fn load_vae_var_builder<'a>(
+        &self,
+        dtype: DType,
+        device: &Device,
+        component: &str,
+    ) -> Result<VarBuilder<'a>> {
+        if let Some(pool) = &self.shared_pool {
+            let cached = pool
+                .lock()
+                .unwrap()
+                .load_cpu_tensors(std::slice::from_ref(&self.base.paths.vae))?;
+            let vb = crate::encoders::park::varbuilder_from_parked(cached.as_ref(), dtype, device);
+            return Ok(flux_vae_var_builder(vb));
+        }
+
+        let vb = crate::weight_loader::load_safetensors_with_progress(
+            std::slice::from_ref(&self.base.paths.vae),
+            dtype,
+            device,
+            component,
+            &self.base.progress,
+        )?;
+        Ok(flux_vae_var_builder(vb))
+    }
+
+    fn get_cached_safetensors(&self, path: &Path) -> Result<Option<Arc<HashMap<String, Tensor>>>> {
+        let Some(pool) = &self.shared_pool else {
+            return Ok(None);
+        };
+        let paths = [path];
+        pool.lock().unwrap().load_safetensors_cpu_tensors(&paths)
+    }
+
+    fn restore_prompt_cache(
+        progress: &ProgressReporter,
+        prompt_cache: &Mutex<LruCache<String, CachedTensorPair>>,
+        prompt: &str,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Option<(candle_core::Tensor, candle_core::Tensor)>> {
+        let restored =
+            restore_cached_tensor_pair(prompt_cache, &prompt_text_key(prompt), device, dtype)?;
+        let Some(restored) = restored else {
+            return Ok(None);
+        };
+        progress.cache_hit("prompt conditioning");
+        Ok(Some(restored))
+    }
+
+    fn store_prompt_cache(
+        prompt_cache: &Mutex<LruCache<String, CachedTensorPair>>,
+        prompt: &str,
+        t5_emb: &candle_core::Tensor,
+        clip_emb: &candle_core::Tensor,
+    ) -> Result<()> {
+        store_cached_tensor_pair(prompt_cache, prompt_text_key(prompt), t5_emb, clip_emb)
+    }
+}
+
+/// Move a conditioning tensor to host RAM if it currently lives on GPU.
+///
+/// ComfyUI keeps text-encoder outputs on CPU between encode and denoise so the
+/// transformer load and LoRA merge see ~50–200 MB more headroom. mirroring
+/// that here: after `t5.encode(...)` / `clip.encode(...)` we call this, then
+/// move the tensor back to GPU only at `State::new` time inside the denoise
+/// loop. Idempotent — when the encoder already produced a CPU tensor (the
+/// GGUF / Q8 dequant path) this is a cheap pass-through with no copy.
+pub(crate) fn park_cond_to_cpu(tensor: &candle_core::Tensor) -> Result<candle_core::Tensor> {
+    if tensor.device().is_cpu() {
+        return Ok(tensor.clone());
+    }
+    Ok(tensor.to_device(&Device::Cpu)?)
+}
+
+impl FluxEngine {
+    /// Detect is_schnell from override, model name, or transformer filename.
+    fn detect_is_schnell(&self) -> bool {
+        self.is_schnell_override.unwrap_or_else(|| {
+            self.base.model_name.contains("schnell")
+                || self
+                    .base
+                    .paths
+                    .transformer
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_ascii_lowercase().contains("schnell"))
+                    .unwrap_or(false)
+        })
+    }
+
+    /// Detect if the transformer is quantized (GGUF).
+    /// Check if the transformer is FP8 safetensors, caching the result so the
+    /// file is only probed once (not on every `generate_sequential` call).
+    fn check_transformer_is_fp8(&mut self, is_quantized: bool) -> bool {
+        if let Some(cached) = self.transformer_is_fp8 {
+            return cached;
+        }
+        let result = !is_quantized
+            && flux_safetensors_transformer_is_fp8(&self.base.paths.transformer).unwrap_or(false);
+        self.transformer_is_fp8 = Some(result);
+        result
+    }
+
+    fn detect_is_quantized(&self) -> bool {
+        self.base
+            .paths
+            .transformer
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("gguf"))
+            .unwrap_or(false)
+    }
+
+    /// Validate that all required paths exist.
+    fn validate_paths(
+        &self,
+    ) -> Result<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let t5_encoder_path = self
+            .base
+            .paths
+            .t5_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("T5 encoder path required for FLUX models"))?
+            .clone();
+        let t5_tokenizer_path = self
+            .base
+            .paths
+            .t5_tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("T5 tokenizer path required for FLUX models"))?
+            .clone();
+        let clip_encoder_path = self
+            .base
+            .paths
+            .clip_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP encoder path required for FLUX models"))?
+            .clone();
+        let clip_tokenizer_path = self
+            .base
+            .paths
+            .clip_tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("CLIP tokenizer path required for FLUX models"))?
+            .clone();
+
+        for (label, path) in [
+            ("transformer", &self.base.paths.transformer),
+            ("vae", &self.base.paths.vae),
+            ("t5_encoder", &t5_encoder_path),
+            ("clip_encoder", &clip_encoder_path),
+            ("t5_tokenizer", &t5_tokenizer_path),
+            ("clip_tokenizer", &clip_tokenizer_path),
+        ] {
+            if !path.exists() {
+                bail!("{label} file not found: {}", path.display());
+            }
+        }
+
+        Ok((
+            t5_encoder_path,
+            t5_tokenizer_path,
+            clip_encoder_path,
+            clip_tokenizer_path,
+        ))
+    }
+
+    /// Load all model components into GPU memory (Eager mode).
+    ///
+    /// On error, `self.base.loaded` remains `None` — all components are assembled into
+    /// local variables and only stored in `self.base.loaded` on success, so partial loads
+    /// cannot leave the engine in an inconsistent state.
+    pub fn load(&mut self) -> Result<()> {
+        self.active_lora = Vec::new();
+        if self.base.loaded.is_some() {
+            return Ok(());
+        }
+
+        // Sequential/offloaded mode defers loading to generate_sequential().
+        // The offloaded BF16 transformer is built per request after prompt
+        // encoding; eager preload would put the full transformer on GPU and
+        // bypass block streaming.
+        if self.defers_eager_load() {
+            return Ok(());
+        }
+
+        let is_schnell = self.detect_is_schnell();
+        tracing::info!(model = %self.base.model_name, "loading FLUX model components...");
+
+        let (t5_encoder_path, t5_tokenizer_path, clip_encoder_path, clip_tokenizer_path) =
+            self.validate_paths()?;
+
+        let cpu = Device::Cpu;
+        let transformer_ref = effective_device_ref(
+            self.pending_placement.as_ref(),
+            |adv| Some(adv.transformer.clone()),
+            false,
+        );
+        let device = crate::device::resolve_device(Some(transformer_ref), || {
+            crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)
+        })?;
+        let mut is_quantized = self.detect_is_quantized();
+        let transformer_is_fp8 = self.check_transformer_is_fp8(is_quantized);
+
+        // FP8 safetensors → Q8 GGUF cache: candle lacks native FP8 compute and
+        // expanding to F16 doubles VRAM (OOM on 24 GB). Q8 GGUF keeps the model
+        // compact (~12 GB) and uses candle's efficient quantized matmul.
+        let transformer_path = if transformer_is_fp8 {
+            let p = ensure_fp8_gguf_cache(&self.base.paths.transformer, &self.base.progress)?;
+            is_quantized = true;
+            p
+        } else {
+            self.base.paths.transformer.clone()
+        };
+
+        // Patch city96-format GGUFs missing embedding layers (img_in, time_in, etc.)
+        let transformer_path = if is_quantized {
+            ensure_gguf_embeddings(&transformer_path, is_schnell, &self.base.progress, None)?
+        } else {
+            transformer_path
+        };
+
+        let gpu_dtype = flux_runtime_dtype(device.is_cuda(), is_quantized, false);
+
+        tracing::info!("GPU device: {:?}, GPU dtype: {:?}", device, gpu_dtype);
+
+        // --- Load FLUX transformer + VAE on GPU first (variable size) ---
+        // This must happen before T5/CLIP so we can measure remaining VRAM.
+
+        // Check if full-precision transformer fits in VRAM before attempting load.
+        if !is_quantized {
+            let xformer_size = std::fs::metadata(&transformer_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            // Budget decision: subtract the OS / cuBLAS reserve so we don't
+            // promise space the next allocator call cannot deliver.
+            let free = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+            if free > 0 && xformer_size > free {
+                bail!(
+                    "transformer ({:.1} GB) exceeds available VRAM ({:.1} GB) — \
+                     use a quantized model (q8/q4) instead of full-precision for this GPU",
+                    xformer_size as f64 / 1e9,
+                    free as f64 / 1e9,
+                );
+            }
+        }
+
+        let flux_cfg = if is_schnell {
+            flux::model::Config::schnell()
+        } else {
+            flux::model::Config::dev()
+        };
+
+        let xformer_label = if is_quantized {
+            "Loading FLUX transformer (GPU, quantized)"
+        } else {
+            "Loading FLUX transformer (GPU, BF16)"
+        };
+        self.base.progress.stage_start(xformer_label);
+        let xformer_stage = Instant::now();
+        tracing::info!(
+            path = %transformer_path.display(),
+            quantized = is_quantized,
+            "loading FLUX transformer on GPU..."
+        );
+
+        // The eager load carries no adapters; a LoRA request rebuilds the
+        // transformer below and records what its registry holds.
+        let lora_resident_bytes = 0u64;
+        let flux_model = if is_quantized {
+            let vb = crate::weight_loader::load_gguf_var_builder(
+                &transformer_path,
+                &device,
+                "FLUX transformer (GGUF)",
+                &self.base.progress,
+            )?;
+            build_gguf_transformer(&flux_cfg, vb, None, &self.base.progress, &device, gpu_dtype)?
+        } else {
+            let flux_vb = flux_transformer_var_builder(flux_safetensors_var_builder(
+                &transformer_path,
+                gpu_dtype,
+                &device,
+                "FLUX transformer",
+                &self.base.progress,
+            )?);
+            FluxTransformer::BF16(flux::model::Flux::new(&flux_cfg, flux_vb)?)
+        };
+        // What the card is holding, which the file length answers only while
+        // the loader leaves the checkpoint's dtype alone. A dense checkpoint
+        // is materialized at `gpu_dtype`, which off CUDA is F32 whatever the
+        // file stores; a GGUF keeps its GGML dtype on both LoRA paths.
+        let transformer_resident_bytes = crate::device::transformer_resident_bytes_for(
+            is_quantized,
+            std::fs::metadata(&transformer_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            if is_quantized {
+                None
+            } else {
+                crate::device::safetensors_parameter_count(std::slice::from_ref(&transformer_path))
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            path = %transformer_path.display(),
+                            %error,
+                            "could not read the transformer's parameter count; the residency \
+                             budget falls back to the checkpoint's file length"
+                        );
+                    })
+                    .ok()
+            },
+            gpu_dtype,
+        );
+        self.base
+            .progress
+            .stage_done(xformer_label, xformer_stage.elapsed());
+        tracing::info!("FLUX transformer loaded on GPU");
+
+        // Load VAE on GPU (small, ~300MB)
+        // Tier 2: honor `advanced.vae` override.
+        let vae_ref = effective_device_ref(
+            self.pending_placement.as_ref(),
+            |adv| Some(adv.vae.clone()),
+            false,
+        );
+        let vae_device = crate::device::resolve_device(Some(vae_ref), || Ok(device.clone()))?;
+        self.base.progress.stage_start("Loading VAE (GPU)");
+        let vae_stage = Instant::now();
+        tracing::info!(path = %self.base.paths.vae.display(), "loading VAE on GPU...");
+        // Resolve VAE precision once at load time — see LoadedFlux::vae_dtype.
+        let vae_dtype = crate::device::resolve_vae_dtype(gpu_dtype);
+        let vae_vb = self.load_vae_var_builder(vae_dtype, &vae_device, "VAE")?;
+        let vae_cfg = if is_schnell {
+            flux::autoencoder::Config::schnell()
+        } else {
+            flux::autoencoder::Config::dev()
+        };
+        let vae = flux::autoencoder::AutoEncoder::new(&vae_cfg, vae_vb)?;
+        self.base
+            .progress
+            .stage_done("Loading VAE (GPU)", vae_stage.elapsed());
+        tracing::info!("VAE loaded on GPU");
+
+        // --- Decide where to place T5 and CLIP based on remaining VRAM ---
+        // Log the raw driver reading (matches `nvidia-smi`) but pass the
+        // reserve-adjusted budget to variant resolution so quantized
+        // encoders aren't picked when their footprint would push past the
+        // OS / cuBLAS workspace headroom.
+        let free_raw = free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+        let free = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+        if free_raw > 0 {
+            self.base.progress.info(&format!(
+                "Free VRAM after transformer+VAE: {}",
+                fmt_gb(free_raw)
+            ));
+            tracing::info!(
+                free_vram = free_raw,
+                free_vram_usable = free,
+                "free VRAM after loading transformer + VAE"
+            );
+        }
+
+        // --- T5 encoder: auto-select variant based on VRAM or explicit preference ---
+        self.base.progress.stage_start("Selecting T5 encoder");
+        let t5_resolve_start = Instant::now();
+        let t5_preference = self.t5_variant.as_deref();
+        let (resolved_t5_path, t5_on_gpu, _t5_auto_device_label) =
+            crate::encoders::variant_resolution::resolve_t5_variant(
+                &self.base.progress,
+                t5_preference,
+                &device,
+                free,
+                &t5_encoder_path,
+            )?;
+        self.base
+            .progress
+            .stage_done("Selecting T5 encoder", t5_resolve_start.elapsed());
+        // Tier 2 (if `advanced.t5` populated) overrides Tier 1 text_encoders group knob.
+        let t5_ref =
+            effective_device_ref(self.pending_placement.as_ref(), |adv| adv.t5.clone(), true);
+        let auto_t5_device = if t5_on_gpu {
+            device.clone()
+        } else {
+            cpu.clone()
+        };
+        let t5_device_owned =
+            crate::device::resolve_device(Some(t5_ref), || Ok(auto_t5_device.clone()))?;
+        let t5_device = &t5_device_owned;
+        let t5_on_gpu = !t5_device.is_cpu();
+        let t5_device_label = if t5_on_gpu { "GPU" } else { "CPU" };
+        let t5_dtype = if t5_on_gpu { gpu_dtype } else { DType::F32 };
+
+        // Load T5 encoder
+        let t5_stage_label = format!("Loading T5 encoder ({t5_device_label})");
+        self.base.progress.stage_start(&t5_stage_label);
+        let t5_stage = Instant::now();
+        tracing::info!(
+            path = %resolved_t5_path.display(),
+            device = %t5_device_label,
+            "loading T5 encoder..."
+        );
+        let cached_t5_tok = self.get_cached_tokenizer(&t5_tokenizer_path);
+        let cached_t5_tensors = self.get_cached_safetensors(&resolved_t5_path)?;
+        let t5 = encoders::t5::T5Encoder::load_with_tokenizer_and_tensors(
+            &resolved_t5_path,
+            &t5_tokenizer_path,
+            t5_device,
+            t5_dtype,
+            &self.base.progress,
+            cached_t5_tok,
+            cached_t5_tensors,
+        )?;
+        self.cache_tokenizer(&t5_tokenizer_path, t5.tokenizer_arc());
+        self.base
+            .progress
+            .stage_done(&t5_stage_label, t5_stage.elapsed());
+        tracing::info!(device = %t5_device_label, "T5 encoder loaded");
+
+        // Re-check VRAM after T5 (it may have consumed GPU memory). Budget
+        // decision → reserve-adjusted reading.
+        let free_after_t5 = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+        let clip_on_gpu = should_use_gpu(
+            device.is_cuda(),
+            device.is_metal(),
+            free_after_t5,
+            CLIP_VRAM_THRESHOLD,
+        );
+        let clip_ref = effective_device_ref(
+            self.pending_placement.as_ref(),
+            |adv| adv.clip_l.clone(),
+            true,
+        );
+        let auto_clip_device = if clip_on_gpu {
+            device.clone()
+        } else {
+            cpu.clone()
+        };
+        let clip_device_owned =
+            crate::device::resolve_device(Some(clip_ref), || Ok(auto_clip_device.clone()))?;
+        let clip_device = &clip_device_owned;
+        let clip_on_gpu = !clip_device.is_cpu();
+        let clip_dtype = if clip_on_gpu { gpu_dtype } else { DType::F32 };
+        let clip_device_label = if clip_on_gpu { "GPU" } else { "CPU" };
+
+        // Load CLIP encoder
+        let clip_stage_label = format!("Loading CLIP encoder ({clip_device_label})");
+        self.base.progress.stage_start(&clip_stage_label);
+        let clip_stage = Instant::now();
+        tracing::info!(
+            path = %clip_encoder_path.display(),
+            device = clip_device_label,
+            "loading CLIP encoder..."
+        );
+        let cached_clip_tok = self.get_cached_tokenizer(&clip_tokenizer_path);
+        let cached_clip_tensors = self.get_cached_safetensors(&clip_encoder_path)?;
+        let clip = encoders::clip::ClipEncoder::load_with_tokenizer_and_tensors(
+            &clip_encoder_path,
+            &clip_tokenizer_path,
+            clip_device,
+            clip_dtype,
+            &self.base.progress,
+            cached_clip_tok,
+            cached_clip_tensors,
+        )?;
+        self.cache_tokenizer(&clip_tokenizer_path, clip.tokenizer_arc());
+        self.base
+            .progress
+            .stage_done(&clip_stage_label, clip_stage.elapsed());
+        tracing::info!(device = clip_device_label, "CLIP encoder loaded");
+
+        self.base.loaded = Some(LoadedFlux {
+            flux_model: Some(flux_model),
+            t5,
+            clip,
+            vae,
+            device,
+            dtype: gpu_dtype,
+            vae_dtype,
+            is_schnell,
+            is_quantized,
+            transformer_path,
+            t5_encoder_path: resolved_t5_path,
+            lora_resident_bytes,
+            transformer_resident_bytes,
+        });
+
+        tracing::info!(model = %self.base.model_name, "all model components loaded successfully");
+        Ok(())
+    }
+
+    /// Generate an image using sequential loading strategy.
+    ///
+    /// Loads components one at a time and drops them when done to minimize peak memory:
+    /// 1. Load T5 → encode → drop T5
+    /// 2. Load CLIP → encode → drop CLIP
+    /// 3. Load transformer + VAE → denoise → drop transformer
+    /// 4. VAE decode → drop VAE
+    ///
+    /// Peak memory: max(T5_size, transformer_size + VAE_size) instead of sum(all).
+    fn generate_sequential(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        let is_schnell = self.detect_is_schnell();
+        let mut is_quantized = self.detect_is_quantized();
+
+        let (t5_encoder_path, t5_tokenizer_path, clip_encoder_path, clip_tokenizer_path) =
+            self.validate_paths()?;
+
+        // Check memory budget
+        if let Some(warning) = check_memory_budget(&self.base.paths, LoadStrategy::Sequential) {
+            self.base.progress.info(&warning);
+        }
+
+        let transformer_ref = effective_device_ref(
+            self.pending_placement.as_ref(),
+            |adv| Some(adv.transformer.clone()),
+            false,
+        );
+        let device = crate::device::resolve_device(Some(transformer_ref), || {
+            crate::device::create_device(self.base.gpu_ordinal, &self.base.progress)
+        })?;
+
+        // Use cached transformer path to avoid file I/O on every sequential call.
+        let transformer_path = if let Some(ref cached) = self.cached_transformer_path {
+            if cached
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("gguf"))
+                .unwrap_or(false)
+            {
+                is_quantized = true;
+            }
+            cached.clone()
+        } else {
+            let transformer_is_fp8 = self.check_transformer_is_fp8(is_quantized);
+            let p = if transformer_is_fp8 {
+                let p = ensure_fp8_gguf_cache(&self.base.paths.transformer, &self.base.progress)?;
+                is_quantized = true;
+                p
+            } else {
+                self.base.paths.transformer.clone()
+            };
+            // Patch city96-format GGUFs missing embedding layers
+            let p = if is_quantized {
+                ensure_gguf_embeddings(&p, is_schnell, &self.base.progress, None)?
+            } else {
+                p
+            };
+            self.cached_transformer_path = Some(p.clone());
+            p
+        };
+
+        let gpu_dtype = flux_runtime_dtype(device.is_cuda(), is_quantized, false);
+
+        let start = Instant::now();
+        let seed = req.seed.unwrap_or_else(rand_seed);
+
+        let width = req.width as usize;
+        let height = req.height as usize;
+
+        tracing::info!(
+            prompt = %req.prompt,
+            seed, width, height,
+            steps = req.steps,
+            "starting sequential FLUX generation"
+        );
+
+        self.base
+            .progress
+            .info("Using sequential loading (load-use-drop) to minimize peak memory");
+
+        // True CFG needs a SECOND conditioning pair, from the negative prompt.
+        // FLUX is guidance-distilled and has never encoded one, so it is
+        // encoded here, beside the positive, while the encoders are loaded —
+        // there is no later point in this path where they still exist. Absent
+        // for every request that does not run the branch, which is the gate
+        // that keeps an ordinary render paying nothing
+        // (`PuLID/app_flux.py:111`: `prepare(..., prompt=neg_prompt) if
+        // use_true_cfg else None`).
+        let true_cfg_negative: Option<String> = mold_core::identity::request_uses_true_cfg(req)
+            .then(|| req.negative_prompt.clone().unwrap_or_default());
+
+        // Both halves come from the cache or neither does: restoring only the
+        // positive would let this path skip loading the encoders the negative
+        // still needs.
+        let cached_conditioning = match Self::restore_prompt_cache(
+            &self.base.progress,
+            &self.prompt_cache,
+            &req.prompt,
+            &device,
+            gpu_dtype,
+        )? {
+            Some(positive) => match true_cfg_negative.as_deref() {
+                None => Some((positive, None)),
+                Some(negative) => Self::restore_prompt_cache(
+                    &self.base.progress,
+                    &self.prompt_cache,
+                    negative,
+                    &device,
+                    gpu_dtype,
+                )?
+                .map(|negative| (positive, Some(negative))),
+            },
+            None => None,
+        };
+
+        let (t5_emb, clip_emb, neg_t5_emb, neg_clip_emb) =
+            if let Some(((t5_emb, clip_emb), negative)) = cached_conditioning {
+                let (neg_t5_emb, neg_clip_emb) = negative.unzip();
+                (t5_emb, clip_emb, neg_t5_emb, neg_clip_emb)
+            } else {
+                // --- Phase 1: T5 encoding ---
+                // Reserve-adjusted reading drives the variant choice.
+                let free = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+                self.base.progress.stage_start("Selecting T5 encoder");
+                let t5_resolve_start = Instant::now();
+                let t5_preference = self.t5_variant.as_deref();
+                let (resolved_t5_path, t5_on_gpu, _t5_auto_device_label) =
+                    crate::encoders::variant_resolution::resolve_t5_variant(
+                        &self.base.progress,
+                        t5_preference,
+                        &device,
+                        free,
+                        &t5_encoder_path,
+                    )?;
+                self.base
+                    .progress
+                    .stage_done("Selecting T5 encoder", t5_resolve_start.elapsed());
+
+                let t5_ref = effective_device_ref(
+                    self.pending_placement.as_ref(),
+                    |adv| adv.t5.clone(),
+                    true,
+                );
+                let auto_t5_device = if t5_on_gpu {
+                    device.clone()
+                } else {
+                    Device::Cpu
+                };
+                let t5_device_owned =
+                    crate::device::resolve_device(Some(t5_ref), || Ok(auto_t5_device.clone()))?;
+                let t5_device = &t5_device_owned;
+                let t5_on_gpu = !t5_device.is_cpu();
+                let t5_device_label = if t5_on_gpu { "GPU" } else { "CPU" };
+                let t5_dtype = if t5_on_gpu { gpu_dtype } else { DType::F32 };
+
+                let t5_size = std::fs::metadata(&resolved_t5_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                // T5 activations: ~256 MB workspace (floor) — small relative to
+                // the 9 GB encoder weights and only resident during encoding.
+                let t5_activation_budget = crate::device::activation_bytes(
+                    req.width,
+                    req.height,
+                    1,
+                    crate::device::dtype_bytes(t5_dtype),
+                    crate::device::ActivationFamily::SmallTransformer,
+                );
+                preflight_memory_check("T5 encoder", t5_size, t5_activation_budget)?;
+                if let Some(status) = memory_status_string() {
+                    self.base.progress.info(&status);
+                }
+
+                let t5_stage_label = format!("Loading T5 encoder ({t5_device_label})");
+                self.base.progress.stage_start(&t5_stage_label);
+                let t5_stage = Instant::now();
+                let cached_t5_tok = self.get_cached_tokenizer(&t5_tokenizer_path);
+                let cached_t5_tensors = self.get_cached_safetensors(&resolved_t5_path)?;
+                let mut t5 = encoders::t5::T5Encoder::load_with_tokenizer_and_tensors(
+                    &resolved_t5_path,
+                    &t5_tokenizer_path,
+                    t5_device,
+                    t5_dtype,
+                    &self.base.progress,
+                    cached_t5_tok,
+                    cached_t5_tensors,
+                )?;
+                self.cache_tokenizer(&t5_tokenizer_path, t5.tokenizer_arc());
+                self.base
+                    .progress
+                    .stage_done(&t5_stage_label, t5_stage.elapsed());
+
+                self.base.progress.stage_start("Encoding prompt (T5)");
+                let encode_t5 = Instant::now();
+                // Park to CPU immediately so the transformer load + LoRA merge
+                // window (next 200–500 ms) doesn't have to budget for ~12 MB of
+                // T5 output sitting on GPU. Idempotent on the GGUF path where T5
+                // already produces CPU tensors.
+                let t5_emb = park_cond_to_cpu(&t5.encode(&req.prompt, &device, gpu_dtype)?)?;
+                // The negative branch's T5 conditioning, while T5 is still here.
+                let neg_t5_emb = match true_cfg_negative.as_deref() {
+                    Some(negative) => {
+                        Some(park_cond_to_cpu(&t5.encode(negative, &device, gpu_dtype)?)?)
+                    }
+                    None => None,
+                };
+                self.base.progress.phase_done(
+                    crate::ProgressPhase::PromptEncode,
+                    "Encoding prompt (T5)",
+                    encode_t5.elapsed(),
+                );
+
+                drop(t5);
+                self.base.progress.info("Freed T5 encoder");
+                tracing::info!("T5 encoder dropped (sequential mode)");
+
+                // --- Phase 2: CLIP encoding ---
+                // Reserve-adjusted reading — should_use_gpu must respect the
+                // same OS / cuBLAS workspace headroom as the T5 placement above.
+                let free_for_clip = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+                let clip_on_gpu = should_use_gpu(
+                    device.is_cuda(),
+                    device.is_metal(),
+                    free_for_clip,
+                    CLIP_VRAM_THRESHOLD,
+                );
+                let clip_ref = effective_device_ref(
+                    self.pending_placement.as_ref(),
+                    |adv| adv.clip_l.clone(),
+                    true,
+                );
+                let auto_clip_device = if clip_on_gpu {
+                    device.clone()
+                } else {
+                    Device::Cpu
+                };
+                let clip_device_owned =
+                    crate::device::resolve_device(Some(clip_ref), || Ok(auto_clip_device.clone()))?;
+                let clip_device = &clip_device_owned;
+                let clip_on_gpu = !clip_device.is_cpu();
+                let clip_dtype = if clip_on_gpu { gpu_dtype } else { DType::F32 };
+                let clip_device_label = if clip_on_gpu { "GPU" } else { "CPU" };
+
+                let clip_stage_label = format!("Loading CLIP encoder ({clip_device_label})");
+                self.base.progress.stage_start(&clip_stage_label);
+                let clip_stage = Instant::now();
+                let cached_clip_tok = self.get_cached_tokenizer(&clip_tokenizer_path);
+                let cached_clip_tensors = self.get_cached_safetensors(&clip_encoder_path)?;
+                let clip = encoders::clip::ClipEncoder::load_with_tokenizer_and_tensors(
+                    &clip_encoder_path,
+                    &clip_tokenizer_path,
+                    clip_device,
+                    clip_dtype,
+                    &self.base.progress,
+                    cached_clip_tok,
+                    cached_clip_tensors,
+                )?;
+                self.cache_tokenizer(&clip_tokenizer_path, clip.tokenizer_arc());
+                self.base
+                    .progress
+                    .stage_done(&clip_stage_label, clip_stage.elapsed());
+
+                self.base.progress.stage_start("Encoding prompt (CLIP)");
+                let encode_clip = Instant::now();
+                // Park to CPU for the same reason as T5 above — keeps the
+                // TE→transformer transition window from carrying GPU residency
+                // we don't need.
+                let (clip_emb, neg_clip_emb) = {
+                    let mut clip = clip;
+                    let positive =
+                        park_cond_to_cpu(&clip.encode(&req.prompt, &device, gpu_dtype)?)?;
+                    let negative = match true_cfg_negative.as_deref() {
+                        Some(negative) => Some(park_cond_to_cpu(
+                            &clip.encode(negative, &device, gpu_dtype)?,
+                        )?),
+                        None => None,
+                    };
+                    (positive, negative)
+                };
+                self.base.progress.phase_done(
+                    crate::ProgressPhase::PromptEncode,
+                    "Encoding prompt (CLIP)",
+                    encode_clip.elapsed(),
+                );
+
+                self.base.progress.info("Freed CLIP encoder");
+                tracing::info!("CLIP encoder dropped (sequential mode)");
+
+                // Cache stores via `CachedTensor::from_tensor`, which itself
+                // moves to CPU; passing CPU tensors here avoids an unnecessary
+                // round-trip on the GGUF path.
+                Self::store_prompt_cache(&self.prompt_cache, &req.prompt, &t5_emb, &clip_emb)?;
+                if let (Some(negative), Some(neg_t5), Some(neg_clip)) = (
+                    true_cfg_negative.as_deref(),
+                    neg_t5_emb.as_ref(),
+                    neg_clip_emb.as_ref(),
+                ) {
+                    Self::store_prompt_cache(&self.prompt_cache, negative, neg_t5, neg_clip)?;
+                }
+                (t5_emb, clip_emb, neg_t5_emb, neg_clip_emb)
+            };
+
+        // Synchronize to ensure freed T5/CLIP VRAM is reclaimed before
+        // loading the transformer (critical for FP8 models that expand to F16).
+        device.synchronize()?;
+
+        // --- Phase 3: Load transformer, denoise ---
+        let xformer_size = std::fs::metadata(&transformer_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let vae_file_size = std::fs::metadata(&self.base.paths.vae)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // LoRA + GGUF: supported via selective dequantization.
+        // LoRA-affected layers are dequantized to F32 on CPU, patched, then
+        // re-quantized back to the original GGML dtype. Non-LoRA tensors are
+        // left quantized and untouched.
+
+        // Per-request activation budget — replaces the fixed 3 GB
+        // INFERENCE_HEADROOM. Scales with resolution and dtype, so a 768²
+        // generation isn't false-offloaded on a 16 GB card while a 2048²
+        // generation isn't under-budgeted.
+        let activation_budget = crate::device::activation_bytes(
+            req.width,
+            req.height,
+            1, // FLUX is guidance-distilled — single forward per step.
+            crate::device::dtype_bytes(gpu_dtype),
+            crate::device::ActivationFamily::FluxDit,
+        );
+
+        // Determine if block-level offloading should be used.
+        let use_offload = if !is_quantized {
+            // Reserve-adjusted reading: subtract the OS reserve before passing
+            // to `should_offload`, which budgets transformer + activation
+            // headroom against this number.
+            let free = usable_free_vram_bytes(self.base.gpu_ordinal).unwrap_or(0);
+            if self.offload || should_offload(xformer_size, free, activation_budget) {
+                if free > 0 && free < MIN_OFFLOAD_VRAM {
+                    bail!(
+                        "GPU only has {:.1} GB free — at least {:.1} GB is required \
+                         for block-level offloading",
+                        free as f64 / 1e9,
+                        MIN_OFFLOAD_VRAM as f64 / 1e9,
+                    );
+                }
+                true
+            } else if free > 0 && xformer_size > free {
+                bail!(
+                    "transformer ({:.1} GB) exceeds available VRAM ({:.1} GB) — \
+                     use a quantized model (q8/q4) or --offload for block-level streaming",
+                    xformer_size as f64 / 1e9,
+                    free as f64 / 1e9,
+                );
+            } else {
+                false
+            }
+        } else {
+            if self.offload {
+                tracing::warn!(
+                    "block-level offloading is not supported for quantized models; \
+                     --offload / MOLD_OFFLOAD=1 will be ignored"
+                );
+            }
+            false
+        };
+
+        // Even when offloading, blocks must still fit in system RAM on unified-memory
+        // (Metal) hosts — preflight catches machines with insufficient total memory.
+        if !use_offload || device.is_metal() {
+            preflight_memory_check(
+                "FLUX transformer + VAE",
+                xformer_size + vae_file_size,
+                activation_budget,
+            )?;
+        }
+        if let Some(status) = memory_status_string() {
+            self.base.progress.info(&status);
+        }
+
+        let flux_cfg = if is_schnell {
+            flux::model::Config::schnell()
+        } else {
+            flux::model::Config::dev()
+        };
+
+        let active_loras = effective_loras(req);
+        let has_lora = !active_loras.is_empty();
+        let xformer_label = if has_lora && use_offload {
+            "Loading FLUX transformer + LoRA (offloaded)"
+        } else if has_lora && is_quantized {
+            "Loading FLUX transformer + LoRA (GPU, quantized + selective deq)"
+        } else if has_lora {
+            "Loading FLUX transformer + LoRA (GPU, BF16)"
+        } else if use_offload {
+            "Loading FLUX transformer (offloaded, blocks on CPU)"
+        } else if is_quantized {
+            "Loading FLUX transformer (GPU, quantized)"
+        } else {
+            "Loading FLUX transformer (GPU, BF16)"
+        };
+        self.base.progress.stage_start(xformer_label);
+        let xformer_stage = Instant::now();
+
+        let bypass_mode = LoraBypassMode::from_env();
+        // For the offloaded path, bypass is the obvious win whenever
+        // LoRAs are active: the legacy merge path runs `B@A·scale` on
+        // every targeted CPU-resident BF16 tensor and rebuilds the
+        // ~24 GB block buffer on every LoRA swap. Bypass keeps adapters
+        // GPU-resident, so a swap is just a registry replace.
+        let use_offload_bypass =
+            should_use_offload_bypass_registry(use_offload, has_lora, bypass_mode);
+        let offload_lora_registry = if use_offload_bypass {
+            // Build the registry before adaptive residency planning so its
+            // GPU-resident adapter tensors are included in the free-VRAM
+            // reading used to decide how many base blocks can stay resident.
+            build_lora_registry(
+                &active_loras,
+                &flux_cfg,
+                &device,
+                gpu_dtype,
+                &self.base.progress,
+            )?
+        } else {
+            None
+        };
+
+        let flux_model = if use_offload {
+            // Load transformer blocks on CPU. With bypass enabled the
+            // base weights are loaded *unmodified* (LoRA contributions
+            // are added at forward time); without bypass we fall back
+            // to the merge-on-load path.
+            let cpu_vb: VarBuilder = if has_lora && !use_offload_bypass {
+                // Legacy LoRA backend: loads from mmap to CPU, patches inline
+                flux_lora_var_builder(
+                    &transformer_path,
+                    &active_loras,
+                    gpu_dtype,
+                    &Device::Cpu,
+                    &self.base.progress,
+                    self.lora_delta_cache_handle(),
+                )?
+            } else {
+                flux_transformer_var_builder(flux_safetensors_var_builder(
+                    &transformer_path,
+                    gpu_dtype,
+                    &Device::Cpu,
+                    "FLUX transformer",
+                    &self.base.progress,
+                )?)
+            };
+            let offloaded = crate::flux::offload::OffloadedFluxTransformer::load(
+                cpu_vb,
+                &flux_cfg,
+                &device,
+                self.base.gpu_ordinal,
+                activation_budget,
+                offload_lora_registry,
+                &self.base.progress,
+            )?;
+            FluxTransformer::Offloaded(offloaded)
+        } else if is_quantized && has_lora {
+            // GGUF + LoRA: bypass-mode keeps base weights untouched and
+            // applies LoRA deltas at forward time. Saves the
+            // dequant→merge→requant cycle that previously cost minutes
+            // and ~95 GB CPU peak per LoRA load on Q8.
+            let bypass_quantized = bypass_mode != LoraBypassMode::Off;
+            if bypass_quantized {
+                let registry = build_lora_registry(
+                    &active_loras,
+                    &flux_cfg,
+                    &device,
+                    gpu_dtype,
+                    &self.base.progress,
+                )?;
+                let vb = crate::weight_loader::load_gguf_var_builder(
+                    &transformer_path,
+                    &device,
+                    "FLUX transformer (GGUF)",
+                    &self.base.progress,
+                )?;
+                build_gguf_transformer(
+                    &flux_cfg,
+                    vb,
+                    registry.as_ref(),
+                    &self.base.progress,
+                    &device,
+                    gpu_dtype,
+                )?
+            } else {
+                // Legacy fallback: dequantize LoRA-affected layers, keep rest quantized.
+                let vb = flux_gguf_lora_var_builder(
+                    &transformer_path,
+                    &active_loras,
+                    &device,
+                    &self.base.progress,
+                    self.lora_delta_cache_handle(),
+                )?;
+                build_gguf_transformer(
+                    &flux_cfg,
+                    vb,
+                    None,
+                    &self.base.progress,
+                    &device,
+                    gpu_dtype,
+                )?
+            }
+        } else if is_quantized {
+            let vb = crate::weight_loader::load_gguf_var_builder(
+                &transformer_path,
+                &device,
+                "FLUX transformer (GGUF)",
+                &self.base.progress,
+            )?;
+            build_gguf_transformer(&flux_cfg, vb, None, &self.base.progress, &device, gpu_dtype)?
+        } else if has_lora {
+            // LoRA without offload (GPU has enough VRAM for full model)
+            let flux_vb = flux_lora_var_builder(
+                &transformer_path,
+                &active_loras,
+                gpu_dtype,
+                &device,
+                &self.base.progress,
+                self.lora_delta_cache_handle(),
+            )?;
+            FluxTransformer::BF16(flux::model::Flux::new(&flux_cfg, flux_vb)?)
+        } else {
+            let flux_vb = flux_transformer_var_builder(flux_safetensors_var_builder(
+                &transformer_path,
+                gpu_dtype,
+                &device,
+                "FLUX transformer",
+                &self.base.progress,
+            )?);
+            FluxTransformer::BF16(flux::model::Flux::new(&flux_cfg, flux_vb)?)
+        };
+        self.base
+            .progress
+            .stage_done(xformer_label, xformer_stage.elapsed());
+        if let Some(status) = memory_status_string() {
+            self.base.progress.info(&status);
+        }
+
+        // Generate noise and build state.
+        //
+        // The GGUF path used to pin this to F32 on the premise that candle's
+        // quantized matmul is f32-only. It is not: `fast_mmq::try_fwd` takes
+        // BF16/F16/F32 and returns what it was fed
+        // (`candle-core/src/quantized/fast_mmq.rs:218-221`, `:349-358`), and
+        // the transformer is now built at the dtype its activations will
+        // arrive in. The latent's dtype is also what the position ids and the
+        // RoPE tables take (`flux/sampling.rs:25,43,47`, `model.rs:92`), which
+        // is exactly what the dense BF16 arm has always done.
+        let noise_dtype = gguf_transformer_dtype(&device, gpu_dtype);
+        let latent_h = height / 16 * 2;
+        let latent_w = width / 16 * 2;
+        // Pre-compute timestep schedule (needed before mixing for img2img).
+        // For non-schnell models the schedule depends on image_seq_len which
+        // we can derive from latent dimensions without the actual tensor.
+        let image_seq_len = (latent_h / 2) * (latent_w / 2);
+        let mut timesteps = if is_schnell {
+            flux::sampling::get_schedule(req.steps as usize, None)
+        } else {
+            flux::sampling::get_schedule(req.steps as usize, Some((image_seq_len, 0.5, 1.15)))
+        };
+
+        // How far into the FULL schedule this render starts. img2img truncates
+        // the tail off the front, and every gate measured against `req.steps`
+        // — `id_start_step`, `cfg_start_step` — has to be told about it, so
+        // the offset outlives the truncation rather than dying with the `if`.
+        let mut step_offset = 0usize;
+        if req.source_image.is_some() {
+            let start_index = crate::img2img::img2img_start_index(req.steps as usize, req.strength);
+            timesteps = timesteps[start_index..].to_vec();
+            step_offset = start_index;
+            tracing::info!(
+                strength = req.strength,
+                start_index,
+                start_timestep = timesteps[0],
+                schedule = ?timesteps,
+                remaining_steps = timesteps.len().saturating_sub(1),
+                "img2img: truncated schedule from strength"
+            );
+        }
+
+        // For img2img we need the VAE before denoising (to encode the source image).
+        // For txt2img we defer VAE loading until after denoising to maximize VRAM
+        // available for the transformer — critical for FP8 models expanded to F16.
+        let vae_cfg = if is_schnell {
+            flux::autoencoder::Config::schnell()
+        } else {
+            flux::autoencoder::Config::dev()
+        };
+        // Resolve once so the early img2img encode and the later decode load
+        // the VAE at the same precision; fixes shape mismatch when
+        // `MOLD_VAE_DTYPE=fp32` would otherwise upgrade only the decode path.
+        let early_vae_dtype = crate::device::resolve_vae_dtype(gpu_dtype);
+
+        let (img, inpaint_ctx, early_vae) = if let Some(ref source_bytes) = req.source_image {
+            let start_t = timesteps[0];
+
+            // Load VAE early for source image encoding
+            self.base.progress.stage_start("Loading VAE (GPU)");
+            let vae_stage = Instant::now();
+            let vae_vb = self.load_vae_var_builder(early_vae_dtype, &device, "VAE")?;
+            let vae = flux::autoencoder::AutoEncoder::new(&vae_cfg, vae_vb)?;
+            self.base
+                .progress
+                .stage_done("Loading VAE (GPU)", vae_stage.elapsed());
+
+            self.base
+                .progress
+                .stage_start("Encoding source image (VAE)");
+            let encode_start = Instant::now();
+            let source_tensor = crate::img_utils::decode_source_image(
+                source_bytes,
+                req.width,
+                req.height,
+                crate::img_utils::NormalizeRange::MinusOneToOne,
+                &device,
+                early_vae_dtype,
+            )?;
+            // FLUX VAE expects pixels in [-1, 1]; encode applies shift/scale internally
+            let encoded = {
+                let _conv = crate::conv_policy::ConvScope::for_family("flux");
+                vae.encode(&source_tensor)?
+            };
+            self.base.progress.phase_done(
+                crate::ProgressPhase::Vae,
+                "Encoding source image (VAE)",
+                encode_start.elapsed(),
+            );
+
+            // Flow-matching img2img: interpolate between encoded latents and noise
+            // at the exact noise level matching the first timestep in the schedule
+            let noise = crate::engine::seeded_randn(
+                seed,
+                &[1, 16, latent_h, latent_w],
+                &device,
+                noise_dtype,
+            )?;
+            let encoded = encoded.to_dtype(noise_dtype)?;
+
+            // Build inpaint context if mask provided
+            let inpaint_ctx = if let Some(ref mask_bytes) = req.mask_image {
+                let mask = crate::img_utils::decode_mask_image(
+                    mask_bytes,
+                    latent_h,
+                    latent_w,
+                    &device,
+                    noise_dtype,
+                )?;
+                Some(crate::img_utils::InpaintContext {
+                    original_latents: encoded.clone(),
+                    mask,
+                    noise: noise.clone(),
+                })
+            } else {
+                None
+            };
+
+            // latent = (1 - t) * encoded + t * noise
+            // t matches the first schedule timestep, so denoising starts at the correct level
+            let img = ((&encoded * (1.0 - start_t))? + (&noise * start_t)?)?;
+            (img, inpaint_ctx, Some(vae))
+        } else {
+            let img = crate::engine::seeded_randn(
+                seed,
+                &[1, 16, latent_h, latent_w],
+                &device,
+                noise_dtype,
+            )?;
+            (img, None, None)
+        };
+
+        // Migrate the parked conditioning tensors back to GPU now that the
+        // transformer load + LoRA merge phase is over. `to_device` on a
+        // tensor already on `device` is a no-op clone, so the cache-restore
+        // path (which returns GPU tensors) costs nothing here.
+        let t5_emb = t5_emb.to_device(&device)?;
+        let clip_emb = clip_emb.to_device(&device)?;
+        // Conditioning follows the transformer's working dtype, whether the
+        // weights are dense or quantized — `noise_dtype` is that answer.
+        let (t5_emb_state, clip_emb_state, img_state) = (
+            t5_emb.to_dtype(noise_dtype)?,
+            clip_emb.to_dtype(noise_dtype)?,
+            img.to_dtype(noise_dtype)?,
+        );
+
+        let state = flux::sampling::State::new(&t5_emb_state, &clip_emb_state, &img_state)?;
+        // The negative branch's conditioning, prepared exactly as the positive
+        // one is and over the SAME image latent — upstream's
+        // `prepare(t5, clip, img=x, prompt=neg_prompt)`
+        // (`PuLID/app_flux.py:111`).
+        let negative_state = negative_conditioning_state(
+            neg_t5_emb.as_ref(),
+            neg_clip_emb.as_ref(),
+            &img_state,
+            &device,
+            noise_dtype,
+        )?;
+        let inpaint_ctx = inpaint_ctx
+            .as_ref()
+            .map(crate::img2img::pack_flux_inpaint_context)
+            .transpose()?;
+
+        // Face identity. Resolved against the working dtype the state tensors
+        // were just cast to, so the adapter feeds the transformer what it
+        // expects; an inactive handle here is the whole "no PuLID compute"
+        // story. The handle is released below, at the transformer drop point.
+        let mut identity =
+            self.identity
+                .resolve_for_render(req, &device, img_state.dtype(), &flux_cfg)?;
+        if identity.is_active() {
+            self.base.progress.info(&format!(
+                "PuLID identity conditioning active ({} cross-attention modules, resident)",
+                identity.module_count()
+            ));
+        }
+
+        let denoise_label = format!("Denoising ({} steps)", timesteps.len().saturating_sub(1));
+        self.base.progress.stage_start(&denoise_label);
+        let denoise_start = Instant::now();
+
+        let previewer = crate::latent_preview::LatentPreviewer::flux1(height, width);
+        // Scoped so both immutable borrows of `identity` end before the
+        // release below needs it mutably.
+        let img = {
+            let true_cfg = resolve_true_cfg_branch(&identity, negative_state.as_ref())?;
+            flux_model.denoise(
+                &state.img,
+                &state.img_ids,
+                &state.txt,
+                &state.txt_ids,
+                &state.vec,
+                &timesteps,
+                step_offset,
+                req.guidance,
+                &self.base.progress,
+                inpaint_ctx.as_ref(),
+                Some(&previewer),
+                identity.runtime(),
+                true_cfg.as_ref(),
+            )?
+        };
+
+        let img = flux::sampling::unpack(&img, height, width)?;
+        self.base
+            .progress
+            .stage_done(&denoise_label, denoise_start.elapsed());
+
+        // Drop transformer + state to free memory for VAE decode
+        drop(inpaint_ctx);
+        drop(flux_model);
+        // The PuLID adapter goes with it, before the sync below and before the
+        // VAE is loaded. This path drops the transformer precisely because the
+        // machine cannot hold it and the decode at once, so leaving 0.8–1.7 GB
+        // of adapter resident would hand the VAE back a chunk of the headroom
+        // this drop just created. `generate`'s end-of-render check is only the
+        // backstop for paths that never reach here.
+        identity.release();
+        drop(identity);
+        self.base.progress.info("Freed FLUX transformer");
+        drop(state);
+        drop(t5_emb_state);
+        drop(clip_emb_state);
+        drop(img_state);
+        // Synchronize to ensure CUDA frees dropped memory before VAE allocates
+        device.synchronize()?;
+        tracing::info!("Transformer dropped (sequential mode), decoding VAE...");
+
+        // --- Phase 4: VAE decode ---
+        // Use VAE from img2img path if already loaded, otherwise load now
+        // (deferred loading saves ~300MB VRAM during denoising for FP8 models).
+        // Sequential path resolves MOLD_VAE_DTYPE per request — env changes
+        // take effect on the next generate() without an engine reload.
+        let vae_dtype = crate::device::resolve_vae_dtype(gpu_dtype);
+        let vae = if let Some(vae) = early_vae {
+            vae
+        } else {
+            self.base.progress.stage_start("Loading VAE (GPU)");
+            let vae_stage = Instant::now();
+            let vae_vb = self.load_vae_var_builder(vae_dtype, &device, "VAE")?;
+            let vae = flux::autoencoder::AutoEncoder::new(&vae_cfg, vae_vb)?;
+            self.base
+                .progress
+                .stage_done("Loading VAE (GPU)", vae_stage.elapsed());
+            vae
+        };
+        self.base.progress.stage_start("VAE decode");
+        let vae_decode_start = Instant::now();
+        let img_for_vae = img.to_dtype(vae_dtype)?;
+        let device_for_sync = device.clone();
+        // FLUX's only convolutions are in the VAE, and the family renders
+        // under `ConvPolicy::FastStill` (#1483's machinery, the flux entry).
+        // The scope restores the previous backend on drop, including on an
+        // error return, so a failed decode cannot leave the next still on a
+        // path that would move its bytes.
+        let cudnn_dispatches_before = crate::conv_policy::cudnn_dispatch_count();
+        let _conv = crate::conv_policy::ConvScope::for_family("flux");
+        let img = crate::vae_tiling::decode_with_oom_fallback(
+            &img_for_vae,
+            |latents| vae.decode(latents).map_err(Into::into),
+            || {
+                if let Err(e) = device_for_sync.synchronize() {
+                    tracing::warn!(
+                        "FLUX (sequential) device.synchronize() after VAE OOM failed: {e}"
+                    );
+                }
+            },
+        )?;
+        crate::conv_policy::report_vae_decode_backend("flux", cudnn_dispatches_before);
+
+        let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+        let img = img.i(0)?;
+
+        self.base.progress.phase_done(
+            crate::ProgressPhase::Vae,
+            "VAE decode",
+            vae_decode_start.elapsed(),
+        );
+        // VAE dropped here
+
+        let output_metadata = build_output_metadata(req, seed, None);
+        let image_bytes = encode_image(
+            &img,
+            req.resolved_output_format(),
+            req.width,
+            req.height,
+            output_metadata.as_ref(),
+        )?;
+
+        let generation_time_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(generation_time_ms, seed, "sequential generation complete");
+
+        Ok(GenerateResponse {
+            mesh: None,
+            request_warnings: Vec::new(),
+            audio: None,
+            images: vec![ImageData {
+                data: image_bytes,
+                format: req.resolved_output_format(),
+                width: req.width,
+                height: req.height,
+                index: 0,
+            }],
+            generation_time_ms,
+            model: req.model.clone(),
+            seed_used: seed,
+            video: None,
+            gpu: None,
+            prefix_cache: None,
+        })
+    }
+}
+
+impl FluxEngine {
+    fn defers_eager_load(&mut self) -> bool {
+        self.base.load_strategy == LoadStrategy::Sequential
+            || (self.offload && !self.detect_is_quantized())
+    }
+
+    fn uses_sequential_generate_path(&mut self) -> bool {
+        self.defers_eager_load()
+    }
+
+    fn generate_inner(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        if req.scheduler.is_some() {
+            tracing::warn!("scheduler selection not supported for FLUX (flow-matching), ignoring");
+        }
+
+        // Sequential mode: load-use-drop each component. Forced FLUX offload
+        // also routes here because block streaming is chosen after prompt
+        // encoding; eager preload would put the full BF16 transformer on GPU
+        // before offload can take effect.
+        if self.uses_sequential_generate_path() {
+            return self.generate_sequential(req);
+        }
+
+        // Eager mode: use pre-loaded components
+        // LoRA is supported — the transformer is rebuilt from disk on each generation
+        // (dropped for VAE decode), so LoRA is applied during the rebuild via a
+        // patched VarBuilder. No additional overhead compared to non-LoRA eager mode.
+        // Borrow progress reporter separately from loaded state.
+        let progress = &self.base.progress;
+        let prompt_cache = &self.prompt_cache;
+
+        // Grab path references before borrowing loaded mutably
+        let t5_encoder_path = self
+            .base
+            .loaded
+            .as_ref()
+            .map(|l| l.t5_encoder_path.clone())
+            .or_else(|| self.base.paths.t5_encoder.clone())
+            .ok_or_else(|| anyhow::anyhow!("T5 encoder path required for FLUX models"))?;
+        let clip_encoder_path = self
+            .base
+            .paths
+            .clip_encoder
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("CLIP encoder path required for FLUX models"))?;
+        let transformer_path = self
+            .base
+            .loaded
+            .as_ref()
+            .map(|l| l.transformer_path.clone())
+            .unwrap_or_else(|| self.base.paths.transformer.clone());
+
+        // Captured before we mutably borrow `self.base.loaded` via the
+        // OptionRestoreGuard below — once that borrow is live, calling
+        // `self.lora_delta_cache_handle()` would conflict.
+        let cache_handle = self.lora_delta_cache_handle();
+
+        // Face identity. Resolved here — after the last whole-`self` borrow
+        // above and before `loaded` is taken — because the handle borrows the
+        // engine's resident adapter slot for the rest of the render, which is
+        // what lets the transformer drop point release it. An inactive handle
+        // is the whole "no PuLID compute" story: the denoise loop then takes
+        // the exact code path a build with no identity request takes.
+        let mut identity = {
+            let (device, dtype, is_schnell) = self
+                .base
+                .loaded
+                .as_ref()
+                .map(|loaded| {
+                    (
+                        loaded.device.clone(),
+                        // The adapter must feed the SAME dtype the render's
+                        // state tensors are cast to, which for a GGUF is the
+                        // working dtype (BF16 on CUDA) and not the F32 the
+                        // quantized path used to pin. One function answers
+                        // both sites so they cannot drift again: a BF16 state
+                        // against F32 adapter norms is "dtype mismatch in
+                        // ternary op" at the first denoise step.
+                        render_state_dtype_for(loaded.is_quantized, &loaded.device, loaded.dtype),
+                        loaded.is_schnell,
+                    )
+                })
+                .ok_or_else(|| anyhow::anyhow!("model not loaded — call load() first"))?;
+            let cfg = if is_schnell {
+                flux::model::Config::schnell()
+            } else {
+                flux::model::Config::dev()
+            };
+            self.identity
+                .resolve_for_render(req, &device, dtype, &cfg)?
+        };
+
+        let mut loaded = OptionRestoreGuard::take(&mut self.base.loaded)
+            .ok_or_else(|| anyhow::anyhow!("model not loaded — call load() first"))?;
+
+        let start = Instant::now();
+        let seed = req.seed.unwrap_or_else(rand_seed);
+
+        let width = req.width as usize;
+        let height = req.height as usize;
+        let loaded_dtype = loaded.dtype;
+        let loaded_device = loaded.device.clone();
+
+        tracing::info!(
+            prompt = %req.prompt,
+            seed,
+            width,
+            height,
+            steps = req.steps,
+            "starting generation"
+        );
+
+        (|| -> Result<GenerateResponse> {
+            // Only rebuild the transformer when the LoRA stack changes
+            // (any adapter swap, scale change, add, remove, or reorder).
+            let active_loras = effective_loras(req);
+            let requested_stack = fingerprint_stack(&active_loras);
+            if requested_stack != self.active_lora {
+                if loaded.flux_model.is_some() {
+                    loaded.flux_model = None;
+                    loaded.device.synchronize()?;
+                }
+                self.active_lora.clear();
+            }
+
+            if loaded.flux_model.is_none() {
+                let has_lora = !active_loras.is_empty();
+                let xformer_label = match (loaded.is_quantized, has_lora) {
+                    (true, true) => "Reloading FLUX transformer (GPU, quantized + LoRA)",
+                    (true, false) => "Reloading FLUX transformer (GPU, quantized)",
+                    (false, true) if loaded.dtype == DType::F16 => {
+                        "Reloading FLUX transformer (GPU, FP16 + LoRA)"
+                    }
+                    (false, true) => "Reloading FLUX transformer (GPU, BF16 + LoRA)",
+                    (false, false) if loaded.dtype == DType::F16 => {
+                        "Reloading FLUX transformer (GPU, FP16)"
+                    }
+                    (false, false) => "Reloading FLUX transformer (GPU, BF16)",
+                };
+                progress.stage_start(xformer_label);
+                let reload_start = Instant::now();
+                let flux_cfg = if loaded.is_schnell {
+                    flux::model::Config::schnell()
+                } else {
+                    flux::model::Config::dev()
+                };
+                let bypass_mode = LoraBypassMode::from_env();
+                loaded.flux_model = Some(if loaded.is_quantized && has_lora {
+                    // Quantized + LoRA stack. Bypass-mode (default `auto`)
+                    // installs the LoRA at forward time on top of the
+                    // quantized base — no dequant→merge→requant. Legacy
+                    // fallback (MOLD_LORA_BYPASS=off) goes through
+                    // `gguf_lora_var_builder`.
+                    let bypass_quantized = bypass_mode != LoraBypassMode::Off;
+                    if bypass_quantized {
+                        let registry = build_lora_registry(
+                            &active_loras,
+                            &flux_cfg,
+                            &loaded.device,
+                            loaded.dtype,
+                            progress,
+                        )?;
+                        // These adapters stay on the card for the whole
+                        // render, so the residency budget has to see them.
+                        loaded.lora_resident_bytes = registry
+                            .as_ref()
+                            .map_or(0, |registry| registry.resident_bytes());
+                        let vb = crate::weight_loader::load_gguf_var_builder(
+                            &transformer_path,
+                            &loaded.device,
+                            "FLUX transformer (GGUF)",
+                            progress,
+                        )?;
+                        build_gguf_transformer(
+                            &flux_cfg,
+                            vb,
+                            registry.as_ref(),
+                            progress,
+                            &loaded.device,
+                            loaded.dtype,
+                        )?
+                    } else {
+                        let vb = flux_gguf_lora_var_builder(
+                            &transformer_path,
+                            &active_loras,
+                            &loaded.device,
+                            progress,
+                            cache_handle.clone(),
+                        )?;
+                        build_gguf_transformer(
+                            &flux_cfg,
+                            vb,
+                            None,
+                            progress,
+                            &loaded.device,
+                            loaded.dtype,
+                        )?
+                    }
+                } else if loaded.is_quantized {
+                    let vb = crate::weight_loader::load_gguf_var_builder(
+                        &transformer_path,
+                        &loaded.device,
+                        "FLUX transformer (GGUF)",
+                        progress,
+                    )?;
+                    build_gguf_transformer(
+                        &flux_cfg,
+                        vb,
+                        None,
+                        progress,
+                        &loaded.device,
+                        loaded.dtype,
+                    )?
+                } else if has_lora {
+                    // BF16 + LoRA stack: merge all deltas during construction
+                    let flux_vb = flux_lora_var_builder(
+                        &transformer_path,
+                        &active_loras,
+                        loaded.dtype,
+                        &loaded.device,
+                        progress,
+                        cache_handle.clone(),
+                    )?;
+                    FluxTransformer::BF16(flux::model::Flux::new(&flux_cfg, flux_vb)?)
+                } else {
+                    let flux_vb = flux_transformer_var_builder(flux_safetensors_var_builder(
+                        &transformer_path,
+                        loaded.dtype,
+                        &loaded.device,
+                        "FLUX transformer",
+                        progress,
+                    )?);
+                    FluxTransformer::BF16(flux::model::Flux::new(&flux_cfg, flux_vb)?)
+                });
+                self.active_lora =
+                    fence_fingerprint(requested_stack, fingerprint_stack(&active_loras));
+                progress.stage_done(xformer_label, reload_start.elapsed());
+            }
+
+            // True CFG needs a second conditioning pair, from the negative
+            // prompt (`PuLID/app_flux.py:111`). Absent for every request that
+            // does not run the branch.
+            let true_cfg_negative: Option<String> = mold_core::identity::request_uses_true_cfg(req)
+                .then(|| req.negative_prompt.clone().unwrap_or_default());
+
+            // Both halves or neither: a cache hit that returned only the
+            // positive would skip the encoder reload the negative still needs.
+            let cached_conditioning = match Self::restore_prompt_cache(
+                progress,
+                prompt_cache,
+                &req.prompt,
+                &loaded_device,
+                loaded_dtype,
+            )? {
+                Some(positive) => match true_cfg_negative.as_deref() {
+                    None => Some((positive, None)),
+                    Some(negative) => Self::restore_prompt_cache(
+                        progress,
+                        prompt_cache,
+                        negative,
+                        &loaded_device,
+                        loaded_dtype,
+                    )?
+                    .map(|negative| (positive, Some(negative))),
+                },
+                None => None,
+            };
+            if let Some(((t5_emb, clip_emb), negative)) = cached_conditioning {
+                let (neg_t5_emb, neg_clip_emb) = negative.unzip();
+                return Self::generate_with_embeddings(
+                    progress,
+                    req,
+                    &mut loaded,
+                    t5_emb,
+                    clip_emb,
+                    neg_t5_emb,
+                    neg_clip_emb,
+                    seed,
+                    width,
+                    height,
+                    start,
+                    self.base.gpu_ordinal,
+                    &mut identity,
+                );
+            }
+
+            if loaded.t5.model.is_none() {
+                let label = if loaded.t5.is_parked() {
+                    "Unparking T5 encoder (CPU→GPU)"
+                } else {
+                    "Reloading T5 encoder (GPU)"
+                };
+                progress.stage_start(label);
+                let reload_start = Instant::now();
+                if loaded.t5.is_parked() {
+                    loaded.t5.unpark_to_gpu(loaded_dtype, progress)?;
+                } else {
+                    loaded.t5.reload(&t5_encoder_path, loaded_dtype, progress)?;
+                }
+                progress.stage_done(label, reload_start.elapsed());
+            }
+            if loaded.clip.model.is_none() {
+                let label = if loaded.clip.is_parked() {
+                    "Unparking CLIP encoder (CPU→GPU)"
+                } else {
+                    "Reloading CLIP encoder (GPU)"
+                };
+                progress.stage_start(label);
+                let reload_start = Instant::now();
+                if loaded.clip.is_parked() {
+                    loaded.clip.unpark_to_gpu(loaded_dtype, progress)?;
+                } else {
+                    loaded
+                        .clip
+                        .reload(&clip_encoder_path, loaded_dtype, progress)?;
+                }
+                progress.stage_done(label, reload_start.elapsed());
+            }
+
+            progress.stage_start("Encoding prompt (T5)");
+            let encode_t5 = Instant::now();
+            // Park to CPU between encode and denoise so the transformer
+            // load + LoRA merge window (next ~200–500 ms) doesn't have to
+            // budget for this tensor sitting on GPU. Idempotent on GGUF.
+            let t5_emb = park_cond_to_cpu(&loaded.t5.encode(
+                &req.prompt,
+                &loaded_device,
+                loaded_dtype,
+            )?)?;
+            // The negative branch's T5 conditioning, while T5 is still loaded.
+            let neg_t5_emb = match true_cfg_negative.as_deref() {
+                Some(negative) => Some(park_cond_to_cpu(&loaded.t5.encode(
+                    negative,
+                    &loaded_device,
+                    loaded_dtype,
+                )?)?),
+                None => None,
+            };
+            progress.phase_done(
+                crate::ProgressPhase::PromptEncode,
+                "Encoding prompt (T5)",
+                encode_t5.elapsed(),
+            );
+            tracing::info!("T5 encoding complete");
+
+            progress.stage_start("Encoding prompt (CLIP)");
+            let encode_clip = Instant::now();
+            let clip_emb = park_cond_to_cpu(&loaded.clip.encode(
+                &req.prompt,
+                &loaded_device,
+                loaded_dtype,
+            )?)?;
+            let neg_clip_emb = match true_cfg_negative.as_deref() {
+                Some(negative) => Some(park_cond_to_cpu(&loaded.clip.encode(
+                    negative,
+                    &loaded_device,
+                    loaded_dtype,
+                )?)?),
+                None => None,
+            };
+            progress.phase_done(
+                crate::ProgressPhase::PromptEncode,
+                "Encoding prompt (CLIP)",
+                encode_clip.elapsed(),
+            );
+            tracing::info!("CLIP encoding complete");
+            // CachedTensor::from_tensor already moves to CPU — passing CPU
+            // tensors here avoids the round-trip on the GGUF path.
+            Self::store_prompt_cache(prompt_cache, &req.prompt, &t5_emb, &clip_emb)?;
+            if let (Some(negative), Some(neg_t5), Some(neg_clip)) = (
+                true_cfg_negative.as_deref(),
+                neg_t5_emb.as_ref(),
+                neg_clip_emb.as_ref(),
+            ) {
+                Self::store_prompt_cache(prompt_cache, negative, neg_t5, neg_clip)?;
+            }
+
+            // Drop or park encoders to free GPU memory for denoising.
+            //
+            // Default (`MOLD_KEEP_TE_RAM=0`): drop weights from RAM too. The
+            // next request re-mmaps from disk (~2-4 s for T5 Q8+LoRAs).
+            //
+            // Park mode (`MOLD_KEEP_TE_RAM=1`): move parameters to CPU host
+            // RAM and drop the GPU copy. Next request only pays a CPU→GPU
+            // tensor copy (~100-300 ms vs 2-4 s) — mirrors ComfyUI's
+            // `text_encoder_offload_device()` behavior.
+            //
+            // On Metal (unified memory) parking is not a win since CPU and
+            // GPU share the same physical pool, so we still drop there.
+            let is_metal = loaded.device.is_metal();
+            let park_mode = crate::device::keep_te_in_ram() && !is_metal;
+            let mut dropped_gpu_encoder = false;
+            if loaded.t5.on_gpu || is_metal {
+                if loaded.t5.on_gpu {
+                    dropped_gpu_encoder = true;
+                }
+                if park_mode {
+                    loaded.t5.park_to_cpu()?;
+                    tracing::info!(
+                        on_gpu = loaded.t5.on_gpu,
+                        "T5 encoder parked to CPU host RAM"
+                    );
+                } else {
+                    loaded.t5.drop_weights();
+                    tracing::info!(
+                        on_gpu = loaded.t5.on_gpu,
+                        "T5 encoder dropped to free memory for denoising"
+                    );
+                }
+            }
+            if loaded.clip.on_gpu || is_metal {
+                if loaded.clip.on_gpu {
+                    dropped_gpu_encoder = true;
+                }
+                if park_mode {
+                    loaded.clip.park_to_cpu()?;
+                    tracing::info!(
+                        on_gpu = loaded.clip.on_gpu,
+                        "CLIP encoder parked to CPU host RAM"
+                    );
+                } else {
+                    loaded.clip.drop_weights();
+                    tracing::info!(
+                        on_gpu = loaded.clip.on_gpu,
+                        "CLIP encoder dropped to free memory for denoising"
+                    );
+                }
+            }
+            // Force CUDA to complete the encoder cuMemFreeAsync before denoising
+            // begins. Without this, the freed encoder VRAM (~5–6 GB for T5 Q8 +
+            // CLIP) may not be available when the first denoising step allocates,
+            // and on a tight 24 GB budget (Q8 transformer kept loaded + LoRAs)
+            // that pushes VAE decode past the limit later in the pipeline.
+            if dropped_gpu_encoder {
+                loaded.device.synchronize()?;
+            }
+
+            Self::generate_with_embeddings(
+                progress,
+                req,
+                &mut loaded,
+                t5_emb,
+                clip_emb,
+                neg_t5_emb,
+                neg_clip_emb,
+                seed,
+                width,
+                height,
+                start,
+                self.base.gpu_ordinal,
+                &mut identity,
+            )
+        })()
+    }
+}
+
+/// Prepare the negative branch's conditioning, or `None` when this render does
+/// not run one.
+///
+/// Mirrors the positive path exactly — the same device migration, the same
+/// cast to the working dtype, and the same `State::new` over the SAME image
+/// latent — because upstream builds it with the identical `prepare()` call
+/// (`PuLID/app_flux.py:111`) and any divergence here would be a difference the
+/// guidance formula then amplifies. `dtype` is therefore the positive path's
+/// resolved activation dtype, never a second decision.
+fn negative_conditioning_state(
+    neg_t5_emb: Option<&candle_core::Tensor>,
+    neg_clip_emb: Option<&candle_core::Tensor>,
+    img_state: &candle_core::Tensor,
+    device: &Device,
+    dtype: DType,
+) -> Result<Option<flux::sampling::State>> {
+    let (Some(t5), Some(clip)) = (neg_t5_emb, neg_clip_emb) else {
+        return Ok(None);
+    };
+    let t5 = t5.to_device(device)?.to_dtype(dtype)?;
+    let clip = clip.to_device(device)?.to_dtype(dtype)?;
+    Ok(Some(flux::sampling::State::new(&t5, &clip, img_state)?))
+}
+
+/// Pair the resolved unconditional identity with the negative conditioning.
+///
+/// `None` — the ordinary case — is what makes the denoise loop take the path it
+/// always took. The mismatch arm is deliberately an error rather than a silent
+/// downgrade: `req.guidance` is chosen for whichever regime is running, so
+/// dropping the branch would render at a distilled guidance value the caller
+/// picked for a true-CFG render and say nothing.
+fn resolve_true_cfg_branch<'a>(
+    identity: &'a RenderIdentity<'_>,
+    negative_state: Option<&'a flux::sampling::State>,
+) -> Result<Option<TrueCfgBranch<'a>>> {
+    let Some((pulid, scale, start_step)) = identity.negative() else {
+        return Ok(None);
+    };
+    let state = negative_state.ok_or_else(|| {
+        anyhow::anyhow!(
+            "true classifier-free guidance was resolved for this render but its negative \
+             prompt was never encoded"
+        )
+    })?;
+    Ok(Some(TrueCfgBranch {
+        scale,
+        start_step,
+        txt: &state.txt,
+        txt_ids: &state.txt_ids,
+        vec_: &state.vec,
+        pulid: Some(pulid),
+    }))
+}
+
+impl InferenceEngine for FluxEngine {
+    /// FLUX is the one family that can honour this, so it is the one family
+    /// that overrides the trait's refusal.
+    fn install_identity_embedding(
+        &mut self,
+        embedding: Option<&mold_core::identity::FrozenIdentityEmbedding>,
+    ) -> Result<()> {
+        // Both halves come from the same frozen value, so a true-CFG render
+        // cannot end up with this request's identity and a previous request's
+        // unconditional one.
+        let uncond = embedding
+            .map(crate::flux::pulid::IdentityEmbedding::uncond_from_frozen)
+            .transpose()?
+            .flatten();
+        let embedding = embedding
+            .map(crate::flux::pulid::IdentityEmbedding::from_frozen)
+            .transpose()?;
+        self.set_identity_embedding(embedding, uncond);
+        Ok(())
+    }
+
+    fn generate(&mut self, req: &GenerateRequest) -> Result<GenerateResponse> {
+        self.base.progress.checkpoint()?;
+        self.pending_placement = req.placement.clone();
+        let result = self.generate_inner(req);
+        self.pending_placement = None;
+        self.release_identity_adapter_unless_transformer_resident();
+        result
+    }
+
+    fn model_name(&self) -> &str {
+        self.base.model_name()
+    }
+
+    fn is_loaded(&self) -> bool {
+        // Sequential mode is always "ready" — it loads on demand
+        self.base.is_loaded()
+    }
+
+    fn load(&mut self) -> Result<()> {
+        FluxEngine::load(self)
+    }
+
+    fn load_for_request(&mut self, req: &GenerateRequest) -> Result<()> {
+        self.pending_placement = req.placement.clone();
+        let result = FluxEngine::load(self);
+        self.pending_placement = None;
+        result
+    }
+
+    /// What this engine is holding on the card that it can hand straight back.
+    ///
+    /// FLUX.1 keeps its transformer across renders whenever the residency
+    /// budget fits and the operator has not asked otherwise, so the same
+    /// question FLUX.2's sequential slot answers applies here — the card can
+    /// be full of a model nobody is rendering. It is a DIFFERENT shape: the
+    /// transformer lives inside `base.loaded` beside the VAE and whatever
+    /// encoders stayed resident, and the cache already measured that whole set
+    /// as `vram_load_delta` around `load()`. So this reports only the part a
+    /// release can actually return — the transformer, its resident LoRA
+    /// matrices, and the PuLID adapter whose residency follows it — and the
+    /// cache takes it as a FLOOR under its own measurement rather than as a
+    /// replacement for it.
+    ///
+    /// `None` while no transformer is resident, so a parked or
+    /// transformer-released engine offers nothing and is never chosen as a
+    /// reclaim target twice.
+    fn resident_vram_bytes(&self) -> Option<u64> {
+        let loaded = self.base.loaded.as_ref()?;
+        loaded.flux_model.as_ref()?;
+        Some(
+            loaded
+                .transformer_resident_bytes
+                .saturating_add(loaded.lora_resident_bytes)
+                .saturating_add(self.identity.resident_bytes()),
+        )
+    }
+
+    /// Hand the transformer back without destroying the engine.
+    ///
+    /// The next render reloads it on demand — `generate`'s eager path already
+    /// rebuilds whenever `flux_model.is_none()`, which is the same door
+    /// `MOLD_FLUX_KEEP_TRANSFORMER=0` and a LoRA-stack change go through — so
+    /// the engine keeps its VAE, its encoders, its prompt cache and its warm
+    /// shell, and only the weights that were being held speculatively go.
+    ///
+    /// The adapter follows the transformer, by the same rule the render's own
+    /// drop site obeys: nothing will use it before the next conditioned
+    /// request, which reloads it anyway.
+    fn release_retained_residency(&mut self) -> u64 {
+        let Some(loaded) = self.base.loaded.as_mut() else {
+            return 0;
+        };
+        if loaded.flux_model.is_none() {
+            return 0;
+        }
+        let freed = loaded
+            .transformer_resident_bytes
+            .saturating_add(loaded.lora_resident_bytes);
+        loaded.flux_model = None;
+        // `active_lora` describes the stack merged into a transformer that no
+        // longer exists; leaving it would let the next render skip a rebuild
+        // it must do.
+        self.active_lora = Vec::new();
+        let adapter = self.identity.resident_bytes();
+        self.release_identity_adapter_unless_transformer_resident();
+        freed.saturating_add(adapter.saturating_sub(self.identity.resident_bytes()))
+    }
+
+    fn unload(&mut self) {
+        self.base.unload();
+        // prompt_cache holds GPU-resident T5/CLIP embedding tensors; clear so
+        // the unload actually frees VRAM.
+        clear_cache(&self.prompt_cache);
+        // active_lora reflects the LoRA currently merged into the loaded
+        // transformer. After unload there is no transformer, so clear the
+        // marker — the next reload re-applies whatever is in the request.
+        self.active_lora = Vec::new();
+        // The PuLID adapter is device-resident and ~1.7 GB. `ModelCache`
+        // parks by calling this, zeroing the entry's `vram_bytes` and keeping
+        // the engine alive in the cache — so an adapter that survived here
+        // would be device memory nothing accounts for, and a later model
+        // switch would fail its preflight or OOM against it.
+        self.identity.drop_adapter();
+        self.lora_delta_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn set_on_progress(&mut self, callback: ProgressCallback) {
+        self.base.set_on_progress(callback);
+    }
+
+    fn clear_on_progress(&mut self) {
+        self.base.clear_on_progress();
+    }
+
+    fn set_cancellation_token(&mut self, token: crate::progress::InferenceCancellationToken) {
+        self.base.set_cancellation_token(token);
+    }
+
+    fn clear_cancellation_token(&mut self) {
+        self.base.clear_cancellation_token();
+    }
+
+    fn batch_execution_capability(&self) -> crate::BatchExecutionCapability {
+        crate::batch_execution_capability_for_family("flux")
+            .expect("production FLUX batch capability must be registered")
+    }
+
+    fn model_paths(&self) -> Option<&mold_core::ModelPaths> {
+        Some(&self.base.paths)
+    }
+}
+
+impl FluxEngine {
+    #[allow(clippy::too_many_arguments)]
+    fn generate_with_embeddings(
+        progress: &ProgressReporter,
+        req: &GenerateRequest,
+        loaded: &mut LoadedFlux,
+        t5_emb: candle_core::Tensor,
+        clip_emb: candle_core::Tensor,
+        // `neg_t5_emb` / `neg_clip_emb` are the negative prompt's conditioning,
+        // present only for a render that runs the PuLID true-CFG branch.
+        neg_t5_emb: Option<candle_core::Tensor>,
+        neg_clip_emb: Option<candle_core::Tensor>,
+        seed: u64,
+        width: usize,
+        height: usize,
+        start: Instant,
+        gpu_ordinal: usize,
+        identity: &mut RenderIdentity<'_>,
+    ) -> Result<GenerateResponse> {
+        // 3. Generate initial noise at the transformer's working dtype — see
+        //    the sequential path for why a GGUF no longer pins F32.
+        let noise_dtype = render_state_dtype_for(loaded.is_quantized, &loaded.device, loaded.dtype);
+        let latent_h = height / 16 * 2;
+        let latent_w = width / 16 * 2;
+
+        // Pre-compute timestep schedule (needed before mixing for img2img).
+        let image_seq_len = (latent_h / 2) * (latent_w / 2);
+        let mut timesteps = if loaded.is_schnell {
+            flux::sampling::get_schedule(req.steps as usize, None)
+        } else {
+            flux::sampling::get_schedule(req.steps as usize, Some((image_seq_len, 0.5, 1.15)))
+        };
+
+        // How far into the FULL schedule this render starts. img2img truncates
+        // the tail off the front, and every gate measured against `req.steps`
+        // — `id_start_step`, `cfg_start_step` — has to be told about it, so
+        // the offset outlives the truncation rather than dying with the `if`.
+        let mut step_offset = 0usize;
+        if req.source_image.is_some() {
+            let start_index = crate::img2img::img2img_start_index(req.steps as usize, req.strength);
+            timesteps = timesteps[start_index..].to_vec();
+            step_offset = start_index;
+            tracing::info!(
+                strength = req.strength,
+                start_index,
+                start_timestep = timesteps[0],
+                schedule = ?timesteps,
+                remaining_steps = timesteps.len().saturating_sub(1),
+                "img2img: truncated schedule from strength"
+            );
+        }
+
+        let (img, inpaint_ctx) = if let Some(ref source_bytes) = req.source_image {
+            let start_t = timesteps[0];
+
+            progress.stage_start("Encoding source image (VAE)");
+            let encode_start = Instant::now();
+            let source_tensor = crate::img_utils::decode_source_image(
+                source_bytes,
+                req.width,
+                req.height,
+                crate::img_utils::NormalizeRange::MinusOneToOne,
+                &loaded.device,
+                loaded.vae_dtype,
+            )?;
+            let encoded = {
+                let _conv = crate::conv_policy::ConvScope::for_family("flux");
+                loaded.vae.encode(&source_tensor)?
+            };
+            progress.phase_done(
+                crate::ProgressPhase::Vae,
+                "Encoding source image (VAE)",
+                encode_start.elapsed(),
+            );
+
+            let noise = crate::engine::seeded_randn(
+                seed,
+                &[1, 16, latent_h, latent_w],
+                &loaded.device,
+                noise_dtype,
+            )?;
+            let encoded = encoded.to_dtype(noise_dtype)?;
+
+            let inpaint_ctx = if let Some(ref mask_bytes) = req.mask_image {
+                let mask = crate::img_utils::decode_mask_image(
+                    mask_bytes,
+                    latent_h,
+                    latent_w,
+                    &loaded.device,
+                    noise_dtype,
+                )?;
+                Some(crate::img_utils::InpaintContext {
+                    original_latents: encoded.clone(),
+                    mask,
+                    noise: noise.clone(),
+                })
+            } else {
+                None
+            };
+
+            // latent = (1 - t) * encoded + t * noise
+            let img = ((&encoded * (1.0 - start_t))? + (&noise * start_t)?)?;
+            (img, inpaint_ctx)
+        } else {
+            let img = crate::engine::seeded_randn(
+                seed,
+                &[1, 16, latent_h, latent_w],
+                &loaded.device,
+                noise_dtype,
+            )?;
+            (img, None)
+        };
+
+        // Migrate parked conditioning tensors back to GPU now that the
+        // transformer load + LoRA merge phase is over. `to_device` on a
+        // tensor already on `loaded.device` is a no-op clone, so the
+        // cache-restore path costs nothing here.
+        let t5_emb = t5_emb.to_device(&loaded.device)?;
+        let clip_emb = clip_emb.to_device(&loaded.device)?;
+        // Conditioning follows the transformer's working dtype.
+        let (t5_emb_state, clip_emb_state, img_state) = (
+            t5_emb.to_dtype(noise_dtype)?,
+            clip_emb.to_dtype(noise_dtype)?,
+            img.to_dtype(noise_dtype)?,
+        );
+
+        // Build sampling state
+        let state = flux::sampling::State::new(&t5_emb_state, &clip_emb_state, &img_state)?;
+        // Upstream's `prepare(t5, clip, img=x, prompt=neg_prompt)`
+        // (`PuLID/app_flux.py:111`) — the same image latent, the other prompt.
+        let negative_state = negative_conditioning_state(
+            neg_t5_emb.as_ref(),
+            neg_clip_emb.as_ref(),
+            &img_state,
+            &loaded.device,
+            noise_dtype,
+        )?;
+        let inpaint_ctx = inpaint_ctx
+            .as_ref()
+            .map(crate::img2img::pack_flux_inpaint_context)
+            .transpose()?;
+
+        let denoise_label = format!("Denoising ({} steps)", timesteps.len().saturating_sub(1));
+        progress.stage_start(&denoise_label);
+        let denoise_start = Instant::now();
+        tracing::info!(
+            steps = timesteps.len().saturating_sub(1),
+            quantized = loaded.is_quantized,
+            "running denoising loop..."
+        );
+
+        // Denoise — guidance from request (0.0 for schnell, 3.5+ for dev/finetuned)
+        let img = {
+            let true_cfg = resolve_true_cfg_branch(identity, negative_state.as_ref())?;
+            loaded
+                .flux_model
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("transformer not loaded"))?
+                .denoise(
+                    &state.img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &state.vec,
+                    &timesteps,
+                    step_offset,
+                    req.guidance,
+                    progress,
+                    inpaint_ctx.as_ref(),
+                    Some(&crate::latent_preview::LatentPreviewer::flux1(
+                        height, width,
+                    )),
+                    identity.runtime(),
+                    true_cfg.as_ref(),
+                )?
+        };
+
+        // 7. Unpack latent to spatial
+        let img = flux::sampling::unpack(&img, height, width)?;
+        progress.stage_done(&denoise_label, denoise_start.elapsed());
+        tracing::info!("denoising complete, decoding VAE...");
+
+        // Free denoising intermediates and transformer before VAE decode.
+        //
+        // Whether the transformer goes with them is a BUDGET, not a default.
+        // On discrete GPUs the BF16 transformer alone is ~24 GB and the VAE
+        // decode needs a large contiguous conv2d workspace, so it has to go;
+        // a Q8 (~12.6 GB) on the same card does not, and dropping it forces a
+        // full `gguf_lora_var_builder` rebuild on the next generation (8.4 s
+        // measured, peaking at ~95 GB host when LoRAs are applied) for no
+        // reason. `crate::device::still_transformer_residency` decides, and
+        // `MOLD_FLUX_KEEP_TRANSFORMER=0` is the opt-out.
+        drop(state);
+        drop(t5_emb_state);
+        drop(clip_emb_state);
+        drop(img_state);
+
+        // The three terms the budget weighs at this moment: the weights that
+        // are resident right now, the denoise workspace the next render will
+        // want, and the decode workspace this render is about to allocate.
+        //
+        // `free_vram_bytes` is sampled with the transformer STILL RESIDENT, so
+        // its bytes are added back — `still_transformer_residency` is defined
+        // against the card as if nothing this render loaded were on it, the
+        // same convention `memory_preflight` uses with `active_vram_bytes`.
+        // Charging them twice would drop every warm render on every card.
+        let transformer_bytes = Self::resident_transformer_bytes(loaded);
+        // The two things #276 named that the checkpoint's file length cannot
+        // see: the bypass registry's resident LoRA matrices, and the ~1.7 GB
+        // PuLID adapter that `free_gpu_state_before_vae_decode` releases only
+        // on a drop. Both are on the card while the VAE decode allocates.
+        let companion_resident_bytes = loaded
+            .lora_resident_bytes
+            .saturating_add(identity.resident_bytes());
+        let budget = crate::device::StillTransformerBudget {
+            transformer_bytes,
+            companion_resident_bytes,
+            activation_bytes: crate::device::flux_activation_budget_bytes_for(
+                req.width,
+                req.height,
+                1,
+                crate::device::dtype_bytes(loaded.dtype),
+                crate::device::ActivationFamily::FluxDit,
+                FLUX1_ATTENTION_HEADS,
+                crate::device::flux_effective_attention_backend(),
+            ),
+            vae_decode_peak_bytes: crate::device::flux_vae_decode_peak_bytes(
+                req.width,
+                req.height,
+                crate::device::dtype_bytes(loaded.vae_dtype),
+            ),
+            runtime_headroom_bytes: crate::device::STILL_RESIDENCY_RUNTIME_HEADROOM_BYTES,
+        };
+        let free_before_vae = crate::device::free_vram_bytes(gpu_ordinal).unwrap_or(0);
+        // The add-back covers the COMPANIONS as well as the checkpoint: the
+        // sample above was taken with the adapters on the card, so charging
+        // them in `required_bytes` while also letting them shrink the reading
+        // counts them twice and drops every warm LoRA render.
+        let usable_free = crate::device::usable_free_for_residency(
+            &loaded.device,
+            gpu_ordinal,
+            transformer_bytes.saturating_add(companion_resident_bytes),
+        );
+        let decision = resolve_flux_keep_transformer(
+            crate::runtime_env::value("MOLD_FLUX_KEEP_TRANSFORMER").as_deref(),
+            crate::device::still_transformer_residency(&budget, usable_free),
+        );
+
+        // The PuLID adapter follows the transformer, and is released here —
+        // before the sync below — so the bytes are actually available to the
+        // decode rather than freed after it.
+        if Self::free_gpu_state_before_vae_decode(&mut loaded.flux_model, identity, decision) {
+            match decision {
+                ResidencyDecision::DropForHeadroom => tracing::info!(
+                    free_mb = free_before_vae / 1024 / 1024,
+                    required_mb = budget.required_bytes() / 1024 / 1024,
+                    usable = ?usable_free,
+                    "Transformer dropped before VAE decode: the residency budget does not fit \
+                     this card at this resolution"
+                ),
+                ResidencyDecision::DropRequested => tracing::info!(
+                    "Transformer dropped before VAE decode (MOLD_FLUX_KEEP_TRANSFORMER=0)"
+                ),
+                ResidencyDecision::KeepResident => unreachable!("a keep does not drop"),
+            }
+        } else {
+            tracing::info!(
+                free_mb = free_before_vae / 1024 / 1024,
+                required_mb = budget.required_bytes() / 1024 / 1024,
+                "Transformer kept resident: the residency budget fits, so the next render \
+                 skips the reload"
+            );
+        }
+        // Force CUDA to complete pending operations and release freed memory
+        // before VAE decode allocates its conv2d intermediates. cuMemFree is
+        // asynchronous, so the drops above (denoising state + embeddings, plus
+        // the optional transformer drop) may not have actually returned VRAM
+        // to the allocator yet. Without this synchronize, VAE decode at 1024²
+        // OOMs on the first conv allocation — observable on the keep-transformer
+        // path even on iteration 1 (the drop path used to synchronize here, the
+        // keep path didn't, which made the bug branch-specific).
+        loaded.device.synchronize()?;
+
+        // 8. Decode with VAE — cast to the VAE's actual loaded dtype (which
+        // may differ from `loaded.dtype` when MOLD_VAE_DTYPE forces fp32 to
+        // suppress banding; the quantized-model F32-state case is also
+        // handled by this cast).
+        progress.stage_start("VAE decode");
+        let vae_decode_start = Instant::now();
+        let img_for_vae = img.to_dtype(loaded.vae_dtype)?;
+        let vae = &loaded.vae;
+        let device_for_sync = loaded.device.clone();
+        let cudnn_dispatches_before = crate::conv_policy::cudnn_dispatch_count();
+        let _conv = crate::conv_policy::ConvScope::for_family("flux");
+        let img = crate::vae_tiling::decode_with_oom_fallback(
+            &img_for_vae,
+            |latents| vae.decode(latents).map_err(Into::into),
+            || {
+                if let Err(e) = device_for_sync.synchronize() {
+                    tracing::warn!(
+                        "FLUX (parallel) device.synchronize() after VAE OOM failed: {e}"
+                    );
+                }
+            },
+        )?;
+        crate::conv_policy::report_vae_decode_backend("flux", cudnn_dispatches_before);
+
+        // 9. Convert to u8 image: clamp to [-1, 1], map to [0, 255]
+        let img = ((img.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+        let img = img.i(0)?; // remove batch dim: [3, H, W]
+
+        progress.phase_done(
+            crate::ProgressPhase::Vae,
+            "VAE decode",
+            vae_decode_start.elapsed(),
+        );
+        tracing::info!("VAE decode complete, encoding output image...");
+
+        // 10. Convert candle tensor to image bytes
+        let output_metadata = build_output_metadata(req, seed, None);
+        let image_bytes = encode_image(
+            &img,
+            req.resolved_output_format(),
+            req.width,
+            req.height,
+            output_metadata.as_ref(),
+        )?;
+
+        let generation_time_ms = start.elapsed().as_millis() as u64;
+        tracing::info!(generation_time_ms, seed, "generation complete");
+
+        Ok(GenerateResponse {
+            mesh: None,
+            request_warnings: Vec::new(),
+            audio: None,
+            images: vec![ImageData {
+                data: image_bytes,
+                format: req.resolved_output_format(),
+                width: req.width,
+                height: req.height,
+                index: 0,
+            }],
+            generation_time_ms,
+            model: req.model.clone(),
+            seed_used: seed,
+            video: None,
+            gpu: None,
+            prefix_cache: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn audit_unload_releases_cached_lora_deltas() {
+        let mut engine = super::FluxEngine::new(
+            "flux-dev:q8".into(),
+            dummy_paths("unused.gguf"),
+            Some(false),
+            None,
+            LoadStrategy::Eager,
+            0,
+            false,
+            None,
+            None,
+        );
+        let key = crate::lora::LoraCacheKey {
+            tensor_name: "qkv.weight".into(),
+            source_layer: "to_q".into(),
+            adapter_identity: crate::lora::AdapterIdentity::Synthetic(1),
+            scale_bits: 1.0f64.to_bits(),
+        };
+        engine
+            .lora_delta_cache
+            .lock()
+            .unwrap()
+            .insert(
+                key.clone(),
+                &Tensor::ones(1, DType::F32, &Device::Cpu).unwrap(),
+            )
+            .unwrap();
+        assert!(engine.lora_delta_cache.lock().unwrap().get(&key).is_some());
+        InferenceEngine::unload(&mut engine);
+        assert!(engine.lora_delta_cache.lock().unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn audit_resident_lora_fingerprint_changes_after_file_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("adapter.safetensors");
+        std::fs::write(&path, b"old").unwrap();
+        let stack = [mold_core::LoraWeight {
+            path: path.to_string_lossy().into_owned(),
+            scale: 1.0,
+            expert: None,
+        }];
+        let before = super::fingerprint_stack(&stack);
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"new-adapter").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(
+            before != super::fingerprint_stack(&stack),
+            "replacement must invalidate resident weights"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            super::fingerprint_stack(&stack) != super::fingerprint_stack(&stack),
+            "unobservable adapters must not be reusable"
+        );
+    }
+
+    use super::{
+        build_gguf_transformer, effective_loras, flux_rms_norm_scale_aliases, flux_runtime_dtype,
+        flux_transformer_var_builder, gguf_transformer_dtype, park_cond_to_cpu,
+        render_state_dtype_for, should_use_offload_bypass_registry, FluxTransformer,
+        LoraBypassMode, ProgressReporter, FLUX1_ATTENTION_HEADS,
+    };
+    use crate::device::transformer_resident_bytes_for;
+    use crate::{InferenceEngine, LoadStrategy};
+    use candle_core::{DType, Device, Result, Tensor};
+    use candle_nn::VarBuilder;
+    use mold_core::{GenerateRequest, LoraWeight, ModelPaths, OutputFormat};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    /// `MOLD_LORA_BYPASS=on` and `=off` are the two boundaries we
+    /// document. Any other value (including unset) must collapse to
+    /// `Auto` so we never silently change behaviour because of
+    /// stale `MOLD_*` env vars in a developer's shell.
+    #[test]
+    fn lora_bypass_mode_env_parsing() {
+        let with_env = |val: Option<&str>| -> LoraBypassMode {
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var("MOLD_LORA_BYPASS", v),
+                    None => std::env::remove_var("MOLD_LORA_BYPASS"),
+                }
+            }
+            let mode = LoraBypassMode::from_env();
+            unsafe {
+                std::env::remove_var("MOLD_LORA_BYPASS");
+            }
+            mode
+        };
+        assert_eq!(with_env(Some("on")), LoraBypassMode::On);
+        assert_eq!(with_env(Some("ON")), LoraBypassMode::On);
+        assert_eq!(with_env(Some("1")), LoraBypassMode::On);
+        assert_eq!(with_env(Some("off")), LoraBypassMode::Off);
+        assert_eq!(with_env(Some("0")), LoraBypassMode::Off);
+        assert_eq!(with_env(Some("auto")), LoraBypassMode::Auto);
+        assert_eq!(with_env(Some("garbage")), LoraBypassMode::Auto);
+        assert_eq!(with_env(None), LoraBypassMode::Auto);
+    }
+
+    #[test]
+    fn offload_lora_registry_is_built_before_adaptive_planning_when_enabled() {
+        assert!(should_use_offload_bypass_registry(
+            true,
+            true,
+            LoraBypassMode::Auto
+        ));
+        assert!(should_use_offload_bypass_registry(
+            true,
+            true,
+            LoraBypassMode::On
+        ));
+        assert!(!should_use_offload_bypass_registry(
+            true,
+            true,
+            LoraBypassMode::Off
+        ));
+        assert!(!should_use_offload_bypass_registry(
+            false,
+            true,
+            LoraBypassMode::Auto
+        ));
+        assert!(!should_use_offload_bypass_registry(
+            true,
+            false,
+            LoraBypassMode::Auto
+        ));
+    }
+
+    #[test]
+    fn flux_rms_norm_aliases_detect_weight_suffix_checkpoint() {
+        use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+
+        let dir = std::env::temp_dir().join(format!(
+            "mold-flux-rms-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flux-rms-weight.safetensors");
+
+        let data = 1.0f32.to_le_bytes();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.weight".to_string(),
+            TensorView::new(SafeDtype::F32, vec![1], &data).unwrap(),
+        );
+        serialize_to_file(&tensors, &None, &path).unwrap();
+
+        let aliases = flux_rms_norm_scale_aliases(&path).unwrap();
+        assert_eq!(
+            aliases.get("model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.scale"),
+            Some(
+                &"model.diffusion_model.double_blocks.0.img_attn.norm.query_norm.weight"
+                    .to_string()
+            )
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dummy_paths(transformer: &str) -> ModelPaths {
+        ModelPaths {
+            low_noise_transformer: None,
+            low_noise_distilled_lora: None,
+            transformer: PathBuf::from(transformer),
+            transformer_shards: Vec::new(),
+            vae: PathBuf::from("ae.safetensors"),
+            spatial_upscaler: None,
+            temporal_upscaler: None,
+            distilled_lora: None,
+            t5_encoder: Some(PathBuf::from("t5.safetensors")),
+            clip_encoder: Some(PathBuf::from("clip.safetensors")),
+            t5_tokenizer: Some(PathBuf::from("t5-tokenizer.json")),
+            clip_tokenizer: Some(PathBuf::from("clip-tokenizer.json")),
+            clip_encoder_2: None,
+            clip_tokenizer_2: None,
+            text_encoder_files: Vec::new(),
+            text_tokenizer: None,
+            decoder: None,
+        }
+    }
+
+    /// An engine holding a resident PuLID adapter, with no transformer —
+    /// exactly the state a parked engine is in.
+    fn engine_holding_an_identity_adapter() -> super::FluxEngine {
+        let mut engine = super::FluxEngine::new(
+            "flux-dev:q8".to_string(),
+            dummy_paths("flux1-dev-Q8_0.gguf"),
+            Some(false),
+            None,
+            LoadStrategy::Eager,
+            0,
+            false,
+            None,
+            None,
+        );
+        engine.identity = super::super::identity::tests::state_holding_an_adapter();
+        assert!(
+            engine.identity_resident_bytes() > 0,
+            "the fixture must actually hold something"
+        );
+        engine
+    }
+
+    /// `ModelCache` parks an engine by calling `unload()`, zeroing the entry's
+    /// `vram_bytes`, and keeping the engine in the cache. An adapter that
+    /// survived that would be device memory nothing accounts for, and the next
+    /// model switch would size its preflight against a number that is wrong by
+    /// the whole adapter.
+    #[test]
+    fn unloading_releases_the_identity_adapter() {
+        let mut engine = engine_holding_an_identity_adapter();
+        InferenceEngine::unload(&mut engine);
+        assert_eq!(
+            engine.identity_resident_bytes(),
+            0,
+            "parking must leave no adapter behind"
+        );
+    }
+
+    /// The render-time rule, checked without running a render: the adapter's
+    /// residency follows the transformer's, so a render the transformer did
+    /// not survive — the sequential path always, the eager path unless it kept
+    /// the transformer hot — releases the adapter too.
+    #[test]
+    fn a_render_the_transformer_does_not_survive_releases_the_adapter() {
+        let mut engine = engine_holding_an_identity_adapter();
+        assert!(
+            engine.base.loaded.is_none(),
+            "the sequential path never populates `loaded`, which is the case under test"
+        );
+        engine.release_identity_adapter_unless_transformer_resident();
+        assert_eq!(engine.identity_resident_bytes(), 0);
+    }
+
+    /// The P1 this exists for: every path that drops the transformer before
+    /// VAE decode does it to create decode headroom, on machines that took
+    /// that path precisely because they could not hold both at once. An
+    /// adapter still resident at that moment hands part of that headroom
+    /// straight back to the VAE.
+    ///
+    /// Driven with a real synthetic transformer and a real `RenderIdentity`
+    /// carrying BOTH references the render holds, so the assertion is that the
+    /// engine slot and the render's own clone go together — releasing one
+    /// would free nothing.
+    #[test]
+    fn dropping_the_transformer_for_vae_headroom_releases_the_adapter() {
+        for decision in [
+            super::ResidencyDecision::DropForHeadroom,
+            super::ResidencyDecision::DropRequested,
+        ] {
+            let mut state = super::super::identity::tests::state_holding_an_adapter();
+            let watched = state
+                .resident_adapter_for_test()
+                .expect("the fixture holds an adapter");
+            let mut identity = state.render_identity_for_test();
+            assert!(identity.is_active(), "the fixture conditions on a face");
+            assert!(identity.resident_bytes() > 0);
+            assert_eq!(
+                Arc::strong_count(&watched),
+                3,
+                "the engine slot, the render's clone, and this test's watch"
+            );
+
+            let mut flux_model = Some(crate::flux::pulid_variants::tiny_dense_transformer());
+            let dropped = super::FluxEngine::free_gpu_state_before_vae_decode(
+                &mut flux_model,
+                &mut identity,
+                decision,
+            );
+
+            assert!(dropped, "{decision:?} must drop");
+            assert!(flux_model.is_none(), "the transformer must be gone");
+            assert_eq!(
+                identity.resident_bytes(),
+                0,
+                "the adapter must be gone before VAE decode, not after generate returns"
+            );
+            assert_eq!(
+                Arc::strong_count(&watched),
+                1,
+                "both of the render's references must go, or the memory is still held"
+            );
+        }
+    }
+
+    /// The stay-hot path keeps the transformer, so it keeps the adapter: there
+    /// is no headroom being created for the adapter to eat into, and the next
+    /// conditioned request would only reload it.
+    #[test]
+    fn keeping_the_transformer_hot_keeps_the_adapter() {
+        let mut state = super::super::identity::tests::state_holding_an_adapter();
+        let mut identity = state.render_identity_for_test();
+        let before = identity.resident_bytes();
+        assert!(before > 0);
+
+        let mut flux_model = Some(crate::flux::pulid_variants::tiny_dense_transformer());
+        let dropped = super::FluxEngine::free_gpu_state_before_vae_decode(
+            &mut flux_model,
+            &mut identity,
+            super::ResidencyDecision::KeepResident,
+        );
+
+        assert!(!dropped);
+        assert!(flux_model.is_some(), "a budget that fits keeps it");
+        assert_eq!(identity.resident_bytes(), before);
+        assert!(
+            identity.is_active(),
+            "and the render keeps its conditioning"
+        );
+    }
+
+    /// What the residency budget charges for the weights is what the DEVICE
+    /// is holding, which is the checkpoint file only when the loader does not
+    /// widen it.
+    ///
+    /// A GGUF checkpoint stays in its GGML dtype on the card on BOTH LoRA
+    /// paths — the bypass registry never touches the base weights, and the
+    /// legacy `MOLD_LORA_BYPASS=off` merge dequantizes to CPU F32, adds the
+    /// delta, and `quantize_onto`s straight back to the ORIGINAL dtype, so
+    /// the file length is exact there too.
+    ///
+    /// A dense safetensors checkpoint is a different story:
+    /// `flux_runtime_dtype` answers F32 off CUDA, so a BF16 file is TWICE its
+    /// own length once resident, and `fs::metadata().len()` understates a
+    /// 23.8 GB checkpoint by 23.8 GB. That is the case where a card would
+    /// Keep a transformer that no longer fits.
+    #[test]
+    fn the_weight_term_follows_the_loaded_dtype_not_the_file_length() {
+        // FLUX.1 dev: ~11.9 B parameters, shipped as a 23.8 GB BF16
+        // safetensors and a 12.6 GB Q8_0 GGUF.
+        const PARAMS: u64 = 11_900_000_000;
+        const BF16_FILE: u64 = 23_800_000_000;
+        const Q8_FILE: u64 = 12_600_000_000;
+
+        // Quantized: the file length, on both LoRA paths, because neither
+        // changes the on-device dtype. `dense_parameter_count` is irrelevant.
+        assert_eq!(
+            transformer_resident_bytes_for(true, Q8_FILE, None, DType::BF16),
+            Q8_FILE
+        );
+        assert_eq!(
+            transformer_resident_bytes_for(true, Q8_FILE, Some(PARAMS), DType::F32),
+            Q8_FILE,
+            "a GGUF's weights stay quantized however the activations run"
+        );
+
+        // Dense at the dtype it was stored at: unchanged from today.
+        assert_eq!(
+            transformer_resident_bytes_for(false, BF16_FILE, Some(PARAMS), DType::BF16),
+            PARAMS * 2
+        );
+
+        // Dense WIDENED to F32 — the Metal/CPU answer — is twice the file.
+        assert_eq!(
+            transformer_resident_bytes_for(false, BF16_FILE, Some(PARAMS), DType::F32),
+            PARAMS * 4
+        );
+
+        // An unreadable header falls back to TODAY'S behaviour, the file
+        // length, rather than guessing.
+        assert_eq!(
+            transformer_resident_bytes_for(false, BF16_FILE, None, DType::F32),
+            BF16_FILE
+        );
+    }
+
+    /// The 24 GiB rows, on the decision the budget actually makes.
+    ///
+    /// Both LoRA paths on a Q8 checkpoint KEEP at 1024°, because both hold
+    /// the same quantized bytes. The row that flips is the widened dense one:
+    /// charged at its file length a 46 GiB L40S keeps 23.8 GB of weights it
+    /// is actually holding 47.6 GB of.
+    #[test]
+    fn the_widened_checkpoint_drops_where_the_file_length_kept() {
+        use crate::device::{
+            still_transformer_residency, ActivationFamily, StillTransformerBudget, UsableFreeVram,
+            STILL_RESIDENCY_RUNTIME_HEADROOM_BYTES,
+        };
+
+        const PARAMS: u64 = 11_900_000_000;
+        const BF16_FILE: u64 = 23_800_000_000;
+        const Q8_FILE: u64 = 12_600_000_000;
+        // `usable_free_vram_bytes`'s reserve-adjusted totals for the two cards
+        // the campaign measures on, in the binary units `nvidia-smi` reports.
+        const RTX_4090_USABLE: u64 = (24_564 - 400) * 1024 * 1024;
+        const L40S_USABLE: u64 = (46_068 - 400) * 1024 * 1024;
+
+        let budget = |transformer_bytes: u64, dtype_bytes: u32| StillTransformerBudget {
+            transformer_bytes,
+            companion_resident_bytes: 0,
+            activation_bytes: crate::device::flux_activation_budget_bytes_for(
+                1024,
+                1024,
+                1,
+                dtype_bytes,
+                ActivationFamily::FluxDit,
+                FLUX1_ATTENTION_HEADS,
+                crate::attention::AttentionBackend::Math,
+            ),
+            vae_decode_peak_bytes: crate::device::flux_vae_decode_peak_bytes(
+                1024,
+                1024,
+                dtype_bytes,
+            ),
+            runtime_headroom_bytes: STILL_RESIDENCY_RUNTIME_HEADROOM_BYTES,
+        };
+
+        // A Q8 checkpoint keeps on a 24 GiB card whichever LoRA path built
+        // it: `is_quantized` is what both paths hand this function, and the
+        // legacy merge requantizes, so the answer is one figure, not two.
+        let quantized = transformer_resident_bytes_for(true, Q8_FILE, Some(PARAMS), DType::BF16);
+        assert_eq!(quantized, Q8_FILE);
+        assert!(
+            still_transformer_residency(
+                &budget(quantized, 2),
+                UsableFreeVram::Measured(RTX_4090_USABLE)
+            )
+            .keeps(),
+            "a Q8 transformer is 12.6 GB on the card on the bypass path and on the \
+             legacy merge path alike"
+        );
+
+        // The widened dense checkpoint, charged honestly, does NOT fit an
+        // L40S — and the file length said it did.
+        let by_file = still_transformer_residency(
+            &budget(BF16_FILE, 4),
+            UsableFreeVram::Measured(L40S_USABLE),
+        );
+        assert!(
+            by_file.keeps(),
+            "the file length is what made this row a Keep"
+        );
+
+        let honest = transformer_resident_bytes_for(false, BF16_FILE, Some(PARAMS), DType::F32);
+        let by_residency =
+            still_transformer_residency(&budget(honest, 4), UsableFreeVram::Measured(L40S_USABLE));
+        assert!(
+            !by_residency.keeps(),
+            "47.6 GB of F32 weights cannot stay resident on a 46 GiB card"
+        );
+        assert!(by_residency.shortfall_bytes() > 0);
+    }
+
+    #[test]
+    fn adapter_bytes_are_the_stack_geometry_times_the_dtype() {
+        use crate::flux::pulid::{tests::tiny_config, PulidAdapterConfig};
+        // FLUX.1: 20 modules of 3072-wide image tokens against 2048-wide
+        // identity tokens, 16 heads x 128 => inner 2048.
+        let full = PulidAdapterConfig::default();
+        let inner = full.dim_head * full.heads;
+        let per_module = 2 * full.kv_dim
+            + 2 * full.dim
+            + inner * full.dim
+            + 2 * inner * full.kv_dim
+            + full.dim * inner;
+        let expected_f32 = (per_module * 20) as u64 * 4;
+        assert_eq!(
+            expected_f32, 1_678_540_800,
+            "the FLUX.1 stack is ~1.68 GB in f32 — the number the residency rule exists for"
+        );
+
+        // The tiny geometry the hermetic fixtures use, through the real accessor.
+        let adapter = crate::flux::pulid::tests::synthetic_adapter(
+            tiny_config(),
+            4,
+            8,
+            DType::F32,
+            &Device::Cpu,
+        );
+        let tiny = tiny_config();
+        let tiny_inner = tiny.dim_head * tiny.heads;
+        let tiny_per_module = 2 * tiny.kv_dim
+            + 2 * tiny.dim
+            + tiny_inner * tiny.dim
+            + 2 * tiny_inner * tiny.kv_dim
+            + tiny.dim * tiny_inner;
+        assert_eq!(adapter.len(), 4);
+        assert_eq!(adapter.resident_bytes(), (tiny_per_module * 4) as u64 * 4);
+    }
+
+    #[test]
+    fn forced_offload_uses_sequential_generation_path_for_bf16_flux() {
+        let mut engine = super::FluxEngine::new(
+            "flux-dev:bf16".to_string(),
+            dummy_paths("flux1-dev.safetensors"),
+            Some(false),
+            None,
+            LoadStrategy::Eager,
+            0,
+            true,
+            None,
+            None,
+        );
+
+        assert!(engine.uses_sequential_generate_path());
+    }
+
+    #[test]
+    fn forced_offload_defers_eager_load_for_bf16_flux() {
+        let mut engine = super::FluxEngine::new(
+            "flux-dev:bf16".to_string(),
+            dummy_paths("flux1-dev.safetensors"),
+            Some(false),
+            None,
+            LoadStrategy::Eager,
+            0,
+            true,
+            None,
+            None,
+        );
+
+        assert!(engine.defers_eager_load());
+    }
+
+    /// Minimal `GenerateRequest` carrying only the fields `effective_loras`
+    /// touches (`lora`, `loras`). Every other field is set to a benign
+    /// default so the tests don't drift when unrelated request shapes
+    /// change.
+    fn req_with_loras(
+        single: Option<LoraWeight>,
+        plural: Option<Vec<LoraWeight>>,
+    ) -> GenerateRequest {
+        GenerateRequest {
+            mesh_workflow: None,
+            offload: None,
+            mesh: None,
+            video_only: None,
+            collection: None,
+            tags: None,
+            title: None,
+            source_fit: None,
+            hdr_exr_dir: None,
+            hdr_exr_full_float: false,
+            guidance_overrides: None,
+            sample_shift: None,
+            distill_strength_high: None,
+            distill_strength_low: None,
+            prompt: String::new(),
+            negative_prompt: None,
+            model: "flux-dev".to_string(),
+            width: 1024,
+            height: 1024,
+            steps: 4,
+            guidance: 0.0,
+            seed: None,
+            batch_size: 1,
+            output_format: Some(OutputFormat::Png),
+            embed_metadata: None,
+            scheduler: None,
+            cfg_plus: None,
+            source_image: None,
+            source_image_name: None,
+            edit_images: None,
+            reference_weight: None,
+            references: None,
+            strength: 0.75,
+            mask_image: None,
+            control_image: None,
+            control_model: None,
+            control_scale: 1.0,
+            expand: None,
+            save_to_gallery: None,
+            original_prompt: None,
+            prompt_transform: None,
+            batch_id: None,
+            batch_index: None,
+            batch_count: None,
+            lora: single,
+            frames: None,
+            fps: None,
+            upscale_model: None,
+            gif_preview: false,
+            enable_audio: None,
+            audio_file: None,
+            audio_file_path: None,
+            source_video: None,
+            source_video_path: None,
+            extend_video: None,
+            extend_video_path: None,
+            extend_overlap_frames: None,
+            keyframes: None,
+            pipeline: None,
+            ic_lora_control: None,
+            loras: plural,
+            retake_range: None,
+            spatial_upscale: None,
+            temporal_upscale: None,
+            placement: None,
+            id_image: None,
+            id_image_name: None,
+            id_weight: None,
+            id_start_step: None,
+            id_images: None,
+            id_image_names: None,
+            true_cfg: None,
+            cfg_start_step: None,
+            transparent_background: None,
+        }
+    }
+
+    /// A slider scrubbed to zero on one of three stacked LoRAs must
+    /// drop ONLY that entry from the effective stack.
+    #[test]
+    fn effective_loras_drops_zero_scale() {
+        let req = req_with_loras(
+            None,
+            Some(vec![
+                LoraWeight {
+                    path: "p1".into(),
+                    scale: 0.8,
+
+                    expert: None,
+                },
+                LoraWeight {
+                    path: "p2".into(),
+                    scale: 0.0,
+
+                    expert: None,
+                },
+                LoraWeight {
+                    path: "p3".into(),
+                    scale: 0.5,
+
+                    expert: None,
+                },
+            ]),
+        );
+        let stack = effective_loras(&req);
+        let paths: Vec<&str> = stack.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["p1", "p3"],
+            "p2 (scale=0.0) must be dropped from the effective stack"
+        );
+        assert!((stack[0].scale - 0.8).abs() < 1e-9);
+        assert!((stack[1].scale - 0.5).abs() < 1e-9);
+    }
+
+    /// Negative scales are a legitimate "anti-style" use case.
+    #[test]
+    fn effective_loras_keeps_negative_scales() {
+        let req = req_with_loras(
+            None,
+            Some(vec![LoraWeight {
+                path: "p1".into(),
+                scale: -0.3,
+
+                expert: None,
+            }]),
+        );
+        let stack = effective_loras(&req);
+        assert_eq!(stack.len(), 1);
+        assert!((stack[0].scale - (-0.3)).abs() < 1e-9);
+    }
+
+    /// Single `lora` form: `scale: 0.0` should be dropped too.
+    #[test]
+    fn effective_loras_drops_zero_scale_on_single_form() {
+        let req = req_with_loras(
+            Some(LoraWeight {
+                path: "p1".into(),
+                scale: 0.0,
+
+                expert: None,
+            }),
+            None,
+        );
+        assert!(effective_loras(&req).is_empty());
+    }
+
+    /// Idempotency: a tensor already on CPU comes back on CPU and equals the
+    /// input — `park_cond_to_cpu` must not pay for a redundant copy on the
+    /// GGUF / Q8 path where T5 already produces CPU tensors.
+    #[test]
+    fn park_cond_to_cpu_is_idempotent_for_cpu_tensors() {
+        let cpu_tensor = Tensor::zeros((2, 4), DType::F32, &Device::Cpu).unwrap();
+        let parked = park_cond_to_cpu(&cpu_tensor).unwrap();
+        assert!(parked.device().is_cpu(), "CPU input must stay on CPU");
+        assert_eq!(parked.shape(), cpu_tensor.shape());
+    }
+
+    /// `park_cond_to_cpu` output is on CPU regardless of input device.
+    #[test]
+    fn park_cond_to_cpu_returns_cpu_tensor_for_any_input() {
+        let input = Tensor::ones((1, 3), DType::F32, &Device::Cpu).unwrap();
+        let parked = park_cond_to_cpu(&input).unwrap();
+        assert!(parked.device().is_cpu(), "output must be on CPU");
+        assert_eq!(parked.shape(), input.shape());
+        assert_eq!(parked.dtype(), input.dtype());
+    }
+
+    #[test]
+    fn flux_var_builder_uses_root_tensors_when_present() -> Result<()> {
+        let tensors = HashMap::from([(
+            "img_in.weight".to_string(),
+            Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+        )]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let resolved = flux_transformer_var_builder(vb);
+
+        assert!(resolved.contains_tensor("img_in.weight"));
+        assert_eq!(resolved.prefix(), "");
+        Ok(())
+    }
+
+    #[test]
+    fn flux_var_builder_uses_model_diffusion_model_prefix_when_present() -> Result<()> {
+        let tensors = HashMap::from([(
+            "model.diffusion_model.img_in.weight".to_string(),
+            Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?,
+        )]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &Device::Cpu);
+        let resolved = flux_transformer_var_builder(vb);
+
+        assert!(resolved.contains_tensor("img_in.weight"));
+        assert_eq!(resolved.prefix(), "model.diffusion_model");
+        Ok(())
+    }
+
+    #[test]
+    fn flux_runtime_dtype_prefers_f16_for_cuda_fp8_safetensors() {
+        assert_eq!(flux_runtime_dtype(true, false, true), DType::F16);
+        assert_eq!(flux_runtime_dtype(true, false, false), DType::BF16);
+        assert_eq!(flux_runtime_dtype(false, false, true), DType::F32);
+    }
+
+    /// Every GGUF load — with or without a LoRA — goes through
+    /// `build_gguf_transformer` and lands on the mold-owned bypass arm. The
+    /// candle fork's `flux::quantized_model::Flux` used to serve the no-LoRA
+    /// case, and because it carries no attention-policy hook that silently
+    /// excluded the COMMONEST FLUX render from every fast path the artifact
+    /// compiled.
+    #[test]
+    fn no_lora_gguf_builds_the_bypass_transformer() {
+        use crate::flux::pulid_variants::{gguf_weights, shared_weights, tiny_flux_config};
+
+        let device = Device::Cpu;
+        let cfg = tiny_flux_config();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tiny-flux.gguf");
+        gguf_weights(&shared_weights(&cfg), &path).unwrap();
+
+        let vb = mold_candle::quantized::VarBuilder::from_gguf(&path, &device).unwrap();
+        let built = build_gguf_transformer(
+            &cfg,
+            vb,
+            None,
+            &ProgressReporter::default(),
+            &device,
+            DType::BF16,
+        )
+        .unwrap();
+        assert!(
+            matches!(built, FluxTransformer::QuantizedBypass(_)),
+            "a no-LoRA GGUF must take the mold-owned transformer"
+        );
+    }
+
+    /// The requested working dtype survives only where the kernels accept it.
+    /// CPU is the case this suite can reach: a BF16 request there resolves to
+    /// F32, because candle's CPU `QMatMul` bails on anything but f32/f16 and
+    /// the dequant arm it would otherwise take reads f32.
+    #[test]
+    fn render_state_dtype_is_the_gguf_working_dtype_for_quantized_models() {
+        // Off CUDA the GGUF working dtype narrows to F32 (Metal kernels and the
+        // dequantize fallback are f32-only); a dense model keeps its own dtype.
+        assert_eq!(
+            render_state_dtype_for(true, &Device::Cpu, DType::BF16),
+            gguf_transformer_dtype(&Device::Cpu, DType::BF16)
+        );
+        assert_eq!(
+            render_state_dtype_for(false, &Device::Cpu, DType::BF16),
+            DType::BF16
+        );
+        assert_eq!(
+            render_state_dtype_for(false, &Device::Cpu, DType::F16),
+            DType::F16
+        );
+    }
+
+    #[test]
+    fn gguf_transformer_dtype_narrows_to_f32_off_cuda() {
+        assert_eq!(
+            gguf_transformer_dtype(&Device::Cpu, DType::BF16),
+            DType::F32
+        );
+        assert_eq!(gguf_transformer_dtype(&Device::Cpu, DType::F32), DType::F32);
+    }
+
+    #[test]
+    fn flux_runtime_dtype_quantized_matches_gpu_policy() {
+        assert_eq!(flux_runtime_dtype(true, true, false), DType::BF16);
+        assert_eq!(flux_runtime_dtype(false, true, false), DType::F32);
+        assert_eq!(flux_runtime_dtype(true, true, true), DType::BF16);
+        assert_eq!(flux_runtime_dtype(false, true, true), DType::F32);
+    }
+
+    #[test]
+    fn fp8_cache_path_includes_file_size() {
+        // Create a temp file with known size to test cache path generation
+        let dir = std::env::temp_dir().join(format!("mold-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fp8_file = dir.join("transformer.safetensors");
+        std::fs::write(&fp8_file, vec![0u8; 1024]).unwrap();
+
+        let cache_path = super::fp8_gguf_cache_path(&fp8_file);
+        let filename = cache_path.file_name().unwrap().to_str().unwrap();
+
+        // Should contain the file stem and the size
+        assert!(
+            filename.contains("transformer"),
+            "should contain stem: {filename}"
+        );
+        assert!(
+            filename.contains("1024"),
+            "should contain file size: {filename}"
+        );
+        assert!(
+            filename.ends_with(".q8_0.gguf"),
+            "should end with .q8_0.gguf: {filename}"
+        );
+
+        // Different size → different cache path
+        std::fs::write(&fp8_file, vec![0u8; 2048]).unwrap();
+        let cache_path2 = super::fp8_gguf_cache_path(&fp8_file);
+        assert_ne!(
+            cache_path, cache_path2,
+            "different file sizes should produce different cache paths"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fp8_q8_cache_quantizes_only_block_aligned_last_dim() {
+        assert!(super::q8_0_can_quantize_dims(&[3072, 3072]));
+        assert!(super::q8_0_can_quantize_dims(&[1, 64]));
+        assert!(
+            !super::q8_0_can_quantize_dims(&[256, 256, 3, 3]),
+            "conv kernels have total elements divisible by 32, but Q8_0 \
+             requires the last dimension itself to be block-aligned"
+        );
+        assert!(!super::q8_0_can_quantize_dims(&[512, 512, 1, 1]));
+        assert!(!super::q8_0_can_quantize_dims(&[3072]));
+    }
+
+    #[test]
+    fn fp8_q8_cache_skips_bundled_text_encoder_and_scalar_tensors() {
+        assert!(super::fp8_cache_should_skip_tensor(
+            "text_encoders.clip_l.logit_scale",
+            &[]
+        ));
+        assert!(super::fp8_cache_should_skip_tensor(
+            "text_encoders.t5xxl.encoder.block.0.layer.0.SelfAttention.q.weight",
+            &[4096, 4096]
+        ));
+        assert!(super::fp8_cache_should_skip_tensor("some.scalar", &[]));
+        assert!(!super::fp8_cache_should_skip_tensor(
+            "double_blocks.0.img_attn.qkv.weight",
+            &[9216, 3072]
+        ));
+    }
+
+    #[test]
+    fn fp8_cache_path_lives_under_cache_flux_q8() {
+        let path = std::path::Path::new("/some/model/my-model.safetensors");
+        // File doesn't exist so size will be 0
+        let cache_path = super::fp8_gguf_cache_path(path);
+        let cache_str = cache_path.to_str().unwrap();
+        assert!(
+            cache_str.contains("cache/flux-q8"),
+            "cache should be under cache/flux-q8: {cache_str}"
+        );
+    }
+
+    #[test]
+    fn fp8_cache_temp_paths_are_unique_per_writer() {
+        let cache_path =
+            std::path::Path::new("/tmp/agfluxSchnell_realistic23-1234-deadbeef.q8_0.gguf");
+
+        let first = super::fp8_gguf_tmp_path(cache_path);
+        let second = super::fp8_gguf_tmp_path(cache_path);
+
+        assert_ne!(first, second);
+        assert_ne!(first, cache_path);
+        assert_ne!(second, cache_path);
+    }
+
+    #[test]
+    fn detects_schnell_from_uppercase_filename() {
+        let engine = super::FluxEngine::new(
+            "cv:1153358".to_string(),
+            dummy_paths("agfluxSchnell_realistic23.safetensors"),
+            None,
+            None,
+            LoadStrategy::Sequential,
+            0,
+            false,
+            None,
+            None,
+        );
+
+        assert!(engine.detect_is_schnell());
+    }
+
+    #[test]
+    fn flux_vae_var_builder_accepts_vae_prefix() {
+        use safetensors::tensor::{serialize_to_file, Dtype as SafeDtype, TensorView};
+        use std::collections::HashMap;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mold-flux-vae-prefix-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vae-prefix.safetensors");
+
+        let data = vec![0u8; 128 * 3 * 3 * 3 * std::mem::size_of::<f32>()];
+        let shape = vec![128, 3, 3, 3];
+        let view = TensorView::new(SafeDtype::F32, shape, &data).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("vae.encoder.conv_in.weight".to_string(), view);
+        serialize_to_file(&tensors, &None, &path).unwrap();
+
+        let vb = crate::weight_loader::load_safetensors_with_progress(
+            std::slice::from_ref(&path),
+            DType::F32,
+            &Device::Cpu,
+            "test VAE",
+            &crate::progress::ProgressReporter::default(),
+        )
+        .unwrap();
+        let vb = super::flux_vae_var_builder(vb);
+
+        assert!(vb.contains_tensor("encoder.conv_in.weight"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Embedding patching tests ────────────────────────────────────────
+
+    /// Helper: write a minimal GGUF file containing the given tensor names.
+    /// Each tensor is a tiny 1-element F32 QTensor.
+    fn write_test_gguf(path: &std::path::Path, tensor_names: &[&str]) {
+        let device = Device::Cpu;
+        let qtensors: Vec<(String, candle_core::quantized::QTensor)> = tensor_names
+            .iter()
+            .map(|name| {
+                let t = Tensor::zeros(1, DType::F32, &device).unwrap();
+                let qt = candle_core::quantized::QTensor::quantize(
+                    &t,
+                    candle_core::quantized::GgmlDType::F32,
+                )
+                .unwrap();
+                (name.to_string(), qt)
+            })
+            .collect();
+        let refs: Vec<(&str, &candle_core::quantized::QTensor)> =
+            qtensors.iter().map(|(n, q)| (n.as_str(), q)).collect();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        candle_core::quantized::gguf_file::write(&mut writer, &[], &refs).unwrap();
+    }
+
+    #[test]
+    fn gguf_has_embeddings_true_for_complete() {
+        let dir =
+            std::env::temp_dir().join(format!("mold-emb-test-complete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("complete.gguf");
+        write_test_gguf(
+            &path,
+            &[
+                "img_in.weight",
+                "img_in.bias",
+                "double_blocks.0.img_mod.lin.weight",
+            ],
+        );
+        assert!(super::gguf_has_embeddings(&path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gguf_has_embeddings_false_for_incomplete() {
+        let dir =
+            std::env::temp_dir().join(format!("mold-emb-test-incomplete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("incomplete.gguf");
+        write_test_gguf(
+            &path,
+            &[
+                "double_blocks.0.img_mod.lin.weight",
+                "single_blocks.0.linear1.weight",
+                "txt_in.weight",
+            ],
+        );
+        assert!(!super::gguf_has_embeddings(&path).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedding_patched_cache_path_format() {
+        let dir = std::env::temp_dir().join(format!("mold-emb-cache-fmt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gguf_file = dir.join("ultrareal.gguf");
+        std::fs::write(&gguf_file, vec![0u8; 512]).unwrap();
+
+        let cache_path = super::embedding_patched_cache_path(&gguf_file);
+        let cache_str = cache_path.to_str().unwrap();
+        assert!(
+            cache_str.contains("cache/flux-embeddings"),
+            "should be under cache/flux-embeddings: {cache_str}"
+        );
+        let filename = cache_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            filename.contains("ultrareal"),
+            "should contain stem: {filename}"
+        );
+        assert!(
+            filename.contains("512"),
+            "should contain file size: {filename}"
+        );
+        assert!(
+            filename.ends_with(".patched.gguf"),
+            "should end with .patched.gguf: {filename}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_gguf_embeddings_noop_for_complete() {
+        let dir = std::env::temp_dir().join(format!("mold-emb-noop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("complete.gguf");
+
+        // Write a GGUF with img_in.weight present
+        write_test_gguf(
+            &path,
+            &["img_in.weight", "double_blocks.0.img_mod.lin.weight"],
+        );
+
+        let progress = crate::progress::ProgressReporter::default();
+        let result = super::ensure_gguf_embeddings(&path, false, &progress, None).unwrap();
+
+        // Should return the original path unchanged
+        assert_eq!(result, path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ensure_gguf_embeddings_patches_incomplete_with_reference() {
+        // Test the full patching flow using a synthetic reference GGUF.
+        // Uses models_dir_override to avoid mutating process-global env vars.
+        let dir = std::env::temp_dir().join(format!("mold-emb-patch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Create an incomplete GGUF (city96 format — only diffusion blocks)
+        let incomplete_path = dir.join("ultrareal-test.gguf");
+        write_test_gguf(
+            &incomplete_path,
+            &[
+                "double_blocks.0.img_mod.lin.weight",
+                "single_blocks.0.linear1.weight",
+                "txt_in.weight",
+                "txt_in.bias",
+                "final_layer.linear.weight",
+            ],
+        );
+
+        // Create a fake reference model at the expected manifest path.
+        // flux-dev:q8 transformer lives at <models_dir>/flux-dev-q8/flux1-dev-Q8_0.gguf
+        let models_dir = dir.join("models");
+        let ref_model_dir = models_dir.join("flux-dev-q8");
+        std::fs::create_dir_all(&ref_model_dir).unwrap();
+        let ref_path = ref_model_dir.join("flux1-dev-Q8_0.gguf");
+
+        // The reference GGUF has all embedding tensors
+        let mut all_tensors: Vec<&str> = super::FLUX_EMBEDDING_TENSORS.to_vec();
+        all_tensors.extend_from_slice(super::FLUX_GUIDANCE_EMBEDDING_TENSORS);
+        all_tensors.extend_from_slice(&[
+            "double_blocks.0.img_mod.lin.weight",
+            "txt_in.weight",
+            "txt_in.bias",
+        ]);
+        write_test_gguf(&ref_path, &all_tensors);
+
+        let progress = crate::progress::ProgressReporter::default();
+        let result =
+            super::ensure_gguf_embeddings(&incomplete_path, false, &progress, Some(&models_dir));
+
+        let patched_path = result.unwrap();
+        assert_ne!(
+            patched_path, incomplete_path,
+            "should return a different cached path"
+        );
+        assert!(patched_path.exists(), "patched GGUF should exist on disk");
+        assert!(
+            patched_path.to_str().unwrap().contains("flux-embeddings"),
+            "patched file should be in flux-embeddings cache"
+        );
+
+        // Verify the patched file contains the embedding tensors
+        assert!(
+            super::gguf_has_embeddings(&patched_path).unwrap(),
+            "patched GGUF should have embeddings"
+        );
+
+        // Clean up
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&patched_path).ok();
+        let _ = std::fs::remove_dir(patched_path.parent().unwrap());
+    }
+
+    #[test]
+    fn ensure_gguf_embeddings_cache_is_reused() {
+        // If a cache file already exists, it should be returned directly
+        let dir = std::env::temp_dir().join(format!("mold-emb-reuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let incomplete_path = dir.join("model-for-cache.gguf");
+        write_test_gguf(&incomplete_path, &["double_blocks.0.img_mod.lin.weight"]);
+
+        // Pre-create the cache file
+        let cache_path = super::embedding_patched_cache_path(&incomplete_path);
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        write_test_gguf(
+            &cache_path,
+            &["img_in.weight", "double_blocks.0.img_mod.lin.weight"],
+        );
+
+        let progress = crate::progress::ProgressReporter::default();
+        let result =
+            super::ensure_gguf_embeddings(&incomplete_path, true, &progress, None).unwrap();
+
+        assert_eq!(result, cache_path, "should return cached file");
+
+        // Clean up
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&cache_path).ok();
+        // Try to clean up cache parent dir (may fail if other tests use it)
+        let _ = std::fs::remove_dir(cache_path.parent().unwrap());
+    }
+
+    #[test]
+    fn find_flux_reference_skips_schnell_when_dev_needed() {
+        // Regression: if only flux-schnell is downloaded, a dev-family target
+        // (e.g. ultrareal-v4:q8) would previously pick schnell as reference and
+        // then fail mid-patch because schnell lacks guidance_in.
+        let dir = std::env::temp_dir().join(format!(
+            "mold-ref-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        let schnell_dir = models_dir.join("flux-schnell-q8");
+        std::fs::create_dir_all(&schnell_dir).unwrap();
+        let schnell_path = schnell_dir.join("flux1-schnell-Q8_0.gguf");
+
+        // Schnell has img_in but not guidance_in — mirrors the real city96 schnell GGUF
+        let mut schnell_tensors: Vec<&str> = super::FLUX_EMBEDDING_TENSORS.to_vec();
+        schnell_tensors.push("double_blocks.0.img_mod.lin.weight");
+        write_test_gguf(&schnell_path, &schnell_tensors);
+
+        // needs_guidance=true must reject the schnell-only state
+        let result = super::find_flux_reference_gguf(true, Some(&models_dir));
+        assert!(
+            result.is_none(),
+            "schnell must not be picked as reference for dev targets: got {result:?}"
+        );
+
+        // needs_guidance=false (schnell target) accepts the schnell reference
+        let result = super::find_flux_reference_gguf(false, Some(&models_dir));
+        assert_eq!(result.as_deref(), Some(schnell_path.as_path()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_flux_reference_accepts_dev_candidate_with_guidance() {
+        // Happy path for the needs_guidance branch: a dev reference that has
+        // guidance_in is accepted; a dev reference lacking guidance (truncated
+        // or swapped file) is rejected.
+        let dir = std::env::temp_dir().join(format!(
+            "mold-ref-dev-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        let dev_dir = models_dir.join("flux-dev-q8");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        let dev_path = dev_dir.join("flux1-dev-Q8_0.gguf");
+
+        // Reference without guidance — needs_guidance=true must reject it.
+        let incomplete: Vec<&str> = super::FLUX_EMBEDDING_TENSORS.to_vec();
+        write_test_gguf(&dev_path, &incomplete);
+        assert!(
+            super::find_flux_reference_gguf(true, Some(&models_dir)).is_none(),
+            "dev candidate without guidance_in must be rejected for dev targets"
+        );
+
+        // Now add guidance tensors — same path should be accepted.
+        let mut complete: Vec<&str> = super::FLUX_EMBEDDING_TENSORS.to_vec();
+        complete.extend_from_slice(super::FLUX_GUIDANCE_EMBEDDING_TENSORS);
+        write_test_gguf(&dev_path, &complete);
+        let picked = super::find_flux_reference_gguf(true, Some(&models_dir))
+            .expect("complete dev reference must be accepted");
+        assert_eq!(picked, dev_path);
+
+        // Schnell target (needs_guidance=false) also accepts the dev candidate.
+        let picked = super::find_flux_reference_gguf(false, Some(&models_dir))
+            .expect("dev candidate satisfies schnell targets too");
+        assert_eq!(picked, dev_path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn find_flux_reference_accepts_krea_when_no_base_dev() {
+        // flux-krea is a dev-family fine-tune shipped as complete GGUFs — it
+        // should serve as a reference for city96-format fine-tunes (UltraReal,
+        // etc.) even when the base flux-dev GGUF isn't downloaded.
+        let dir = std::env::temp_dir().join(format!(
+            "mold-ref-krea-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let models_dir = dir.join("models");
+        let krea_dir = models_dir.join("flux-krea-q8");
+        std::fs::create_dir_all(&krea_dir).unwrap();
+        let krea_path = krea_dir.join("flux1-krea-dev-Q8_0.gguf");
+
+        let mut complete: Vec<&str> = super::FLUX_EMBEDDING_TENSORS.to_vec();
+        complete.extend_from_slice(super::FLUX_GUIDANCE_EMBEDDING_TENSORS);
+        write_test_gguf(&krea_path, &complete);
+
+        let picked = super::find_flux_reference_gguf(true, Some(&models_dir))
+            .expect("complete flux-krea reference must be accepted for dev targets");
+        assert_eq!(picked, krea_path);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn embedding_tensor_names_are_exhaustive() {
+        // Verify the const arrays cover all non-diffusion-block tensors that
+        // Flux::new() in quantized_model.rs expects (lines 378-416).
+        // The model loads: img_in, txt_in, time_in, vector_in, guidance_in (optional),
+        // double_blocks, single_blocks, final_layer, pe_embedder (computed, no tensors).
+        // txt_in is present in city96 GGUFs. double/single/final are the diffusion blocks.
+        // Only the embedding layers (img_in, time_in, vector_in, guidance_in) are missing.
+        let all_embedding_names: Vec<&str> = super::FLUX_EMBEDDING_TENSORS
+            .iter()
+            .chain(super::FLUX_GUIDANCE_EMBEDDING_TENSORS.iter())
+            .copied()
+            .collect();
+
+        // img_in: linear (weight + bias)
+        assert!(all_embedding_names.contains(&"img_in.weight"));
+        assert!(all_embedding_names.contains(&"img_in.bias"));
+
+        // time_in: MlpEmbedder (in_layer + out_layer, each with weight + bias)
+        assert!(all_embedding_names.contains(&"time_in.in_layer.weight"));
+        assert!(all_embedding_names.contains(&"time_in.in_layer.bias"));
+        assert!(all_embedding_names.contains(&"time_in.out_layer.weight"));
+        assert!(all_embedding_names.contains(&"time_in.out_layer.bias"));
+
+        // vector_in: MlpEmbedder
+        assert!(all_embedding_names.contains(&"vector_in.in_layer.weight"));
+        assert!(all_embedding_names.contains(&"vector_in.in_layer.bias"));
+        assert!(all_embedding_names.contains(&"vector_in.out_layer.weight"));
+        assert!(all_embedding_names.contains(&"vector_in.out_layer.bias"));
+
+        // guidance_in: MlpEmbedder (dev only)
+        assert!(all_embedding_names.contains(&"guidance_in.in_layer.weight"));
+        assert!(all_embedding_names.contains(&"guidance_in.in_layer.bias"));
+        assert!(all_embedding_names.contains(&"guidance_in.out_layer.weight"));
+        assert!(all_embedding_names.contains(&"guidance_in.out_layer.bias"));
+
+        // Total: 14 tensors
+        assert_eq!(all_embedding_names.len(), 14);
+    }
+}

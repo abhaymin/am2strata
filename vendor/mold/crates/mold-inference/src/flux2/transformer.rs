@@ -1,0 +1,4064 @@
+//! Flux.2 Klein-4B Transformer (diffusers weight format)
+//!
+//! Architecture: DoubleStreamBlock + SingleStreamBlock (same as FLUX.1) but with:
+//! - `in_channels`: 128 (patchified latent_channels=32 * 2x2)
+//! - `axes_dims_rope`: 4D [32, 32, 32, 32]
+//! - `joint_attention_dim`: 7680 (Qwen3 hidden_size=2560, stacked 3x)
+//! - `mlp_ratio`: 3.0, `rope_theta`: 2000
+//! - Shared modulation across all blocks (not per-block)
+//! - All linear layers bias=False
+//! - 5 double + 20 single blocks for Klein-4B
+//!
+//! Loads from HuggingFace diffusers `Flux2Transformer2DModel` safetensors format.
+
+use crate::adaptive_offload::{
+    plan_adaptive_residency, AdaptiveResidencyPlan, ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM,
+};
+use crate::progress::ProgressReporter;
+use candle_core::{DType, IndexOp, Module, Result, Tensor, D};
+use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
+use std::sync::{Arc, OnceLock};
+
+// ---------------------------------------------------------------------------
+// Linear (BF16 + FP8 + NVFP4 streaming)
+// ---------------------------------------------------------------------------
+
+/// Linear layer supporting BF16 (`Standard`), FP8 manual-cast (`Fp8`), and
+/// NVFP4 streaming-dequant (`Nvfp4Streaming`).
+///
+/// `Standard` mirrors `candle_nn::Linear`. `Fp8` mirrors
+/// `qwen_image::transformer::QwenLinear::Fp8` — F8E4M3 weights resident on the
+/// model device, cast to the activation dtype at forward.
+///
+/// `Nvfp4Streaming` keeps the packed FP4 + FP8 block scales mmap'd on CPU and
+/// dequantizes lazily on first forward into a BF16 weight, also cached on
+/// CPU. Subsequent forwards copy the cached BF16 weight to the activation
+/// device for matmul (no re-dequant). For sliced fused QKV the cache is shared
+/// across `to_q`/`to_k`/`to_v` via `Arc<OnceLock<Tensor>>` so the FP4 →
+/// BF16 dequant runs exactly once per fused source. Memory: ~18 GB BF16 +
+/// ~5.6 GB packed source on CPU for Klein-9B; per-forward GPU peak is one
+/// layer's BF16 weight (≈ 64-200 MB). This is what makes Klein-9B fit on
+/// a 24 GB 3090.
+///
+/// Auto-detection in `load_with_bias`:
+///   `vb.contains_tensor("weight.nvfp4_packed")` → `Nvfp4Streaming`
+///   `vb.get(...).dtype() == F8E4M3`              → `Fp8`
+///   otherwise                                     → `Standard`
+#[derive(Debug, Clone)]
+pub(crate) enum Flux2Linear {
+    Standard(candle_nn::Linear),
+    Fp8 {
+        weight: Tensor,
+        scale: Option<Tensor>,
+        bias: Option<Tensor>,
+    },
+    /// An FP8 layer widened ONCE at load, under [`Flux2Fp8Widen::AtLoad`].
+    ///
+    /// `weight` is what [`Flux2Linear::Fp8`]'s forward builds on every call —
+    /// the F8E4M3 slab cast to the working dtype, with a structured (non
+    /// rank-0) `scale_weight` already folded in. A rank-0 scale is retained
+    /// and still rides the matmul OUTPUT, the Qwen-Image FP8 rule, so the two
+    /// arms are the same arithmetic in the same order. The F8 slab is dropped
+    /// at load, so this costs two bytes per parameter at rest rather than
+    /// three, and the per-forward full-size cast disappears.
+    Fp8Widened {
+        weight: Tensor,
+        scale: Option<Tensor>,
+        bias: Option<Tensor>,
+    },
+    Nvfp4Streaming {
+        /// Packed FP4 nibbles, U8 `[N_full, K/2]` on CPU.
+        packed: Tensor,
+        /// FP8-E4M3 per-block scales `[N_full, K/16]` on CPU.
+        block_scales: Tensor,
+        /// Per-tensor F32 scalar (as `f32` to skip a per-forward host read).
+        tensor_scale: f32,
+        /// Output dim *after* slicing — what the caller's matmul expects.
+        out_dim: usize,
+        /// Input dim K (matches `block_scales.dim(1) * 16`). Stored for
+        /// post-load introspection; the forward path derives K from `packed`.
+        #[allow(dead_code)]
+        in_dim: usize,
+        /// Optional `(axis, component, num_components)` slice descriptor.
+        /// `None` for unfused layers; `Some((0, c, 3))` for sliced QKV.
+        slice: Option<(usize, usize, usize)>,
+        /// Bias on the model device (NVFP4 layers in cv:2759597 have none).
+        bias: Option<Tensor>,
+        /// Lazy CPU BF16 cache of the FULL (un-sliced) dequanted weight,
+        /// shape `[N_full, K]`. Sliced QKV variants share this cache via
+        /// `Arc<OnceLock>`, so the FP4 → BF16 dequant happens exactly once
+        /// per fused source even when three sliced linears reference it.
+        cache: Arc<OnceLock<Tensor>>,
+    },
+}
+
+impl Flux2Linear {
+    /// The dtype this layer's weight is HELD at.
+    ///
+    /// Only [`Self::Fp8`] — an FP8 slab that declined the load-time widen —
+    /// differs from the working dtype the layer was built with: it keeps one
+    /// byte per parameter and casts on every forward, so the checkpoint's own
+    /// file length is its resident figure. [`Self::Fp8Widened`] holds
+    /// `vb.dtype()`, and [`Self::Standard`] was materialized at it.
+    /// [`Self::Nvfp4Streaming`] keeps its packed weights on the HOST and is
+    /// charged as a quantized tier, which never asks this.
+    pub(crate) fn resident_weight_dtype(&self, loaded_dtype: DType) -> DType {
+        match self {
+            Self::Fp8 { .. } => DType::F8E4M3,
+            Self::Standard(_) | Self::Fp8Widened { .. } | Self::Nvfp4Streaming { .. } => {
+                loaded_dtype
+            }
+        }
+    }
+
+    fn load_with_bias(
+        in_dim: usize,
+        out_dim: usize,
+        has_bias: bool,
+        widen: Flux2Fp8Widen,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        // NVFP4 streaming path: probe for the sub-key the backend emits for
+        // every NVFP4-quantised layer. If present, all three components plus
+        // the optional slice-meta marker live alongside it.
+        if vb.contains_tensor("weight.nvfp4_packed") {
+            // Explicit-dtype lookups: each NVFP4 sub-key has a native dtype
+            // distinct from the VarBuilder's default (BF16). `get_unchecked`
+            // would request the default and ask the backend to cast — which
+            // breaks for U8 (packed), F8E4M3 (block scales), F32 (tensor
+            // scale), and U32 (slice meta).
+            let packed = vb.get_unchecked_dtype("weight.nvfp4_packed", DType::U8)?;
+            let block_scales =
+                vb.get_unchecked_dtype("weight.nvfp4_block_scales", DType::F8E4M3)?;
+            let tensor_scale_t = vb.get_unchecked_dtype("weight.nvfp4_tensor_scale", DType::F32)?;
+            // The backend already returns these on CPU; defensive `to_device`
+            // keeps the contract local to this constructor in case the
+            // backend's invariant changes.
+            let cpu = candle_core::Device::Cpu;
+            let packed = packed.to_device(&cpu)?;
+            let block_scales = block_scales.to_device(&cpu)?;
+            let tensor_scale: f32 = tensor_scale_t.to_dtype(DType::F32)?.to_scalar()?;
+
+            let slice = if vb.contains_tensor("weight.nvfp4_slice_meta") {
+                let meta = vb
+                    .get_unchecked_dtype("weight.nvfp4_slice_meta", DType::U32)?
+                    .to_device(&cpu)?;
+                let v: Vec<u32> = meta.flatten_all()?.to_vec1()?;
+                if v.len() != 3 {
+                    candle_core::bail!(
+                        "NVFP4 slice meta tensor must have length 3, got {}",
+                        v.len()
+                    );
+                }
+                Some((v[0] as usize, v[1] as usize, v[2] as usize))
+            } else {
+                None
+            };
+
+            // Validate shapes against the requested (out_dim, in_dim) given
+            // any slicing — catches a bad rename table early.
+            let packed_dims = packed.dims();
+            if packed_dims.len() != 2 {
+                candle_core::bail!("NVFP4 packed weight must be rank 2, got {:?}", packed_dims,);
+            }
+            let n_full = packed_dims[0];
+            let k_half = packed_dims[1];
+            let k = k_half * 2;
+            if k != in_dim {
+                candle_core::bail!(
+                    "NVFP4: in_dim mismatch — checkpoint K={}, module expected {}",
+                    k,
+                    in_dim,
+                );
+            }
+            let expected_n_full = match slice {
+                Some((_, _, n_components)) => out_dim * n_components,
+                None => out_dim,
+            };
+            if n_full != expected_n_full {
+                candle_core::bail!(
+                    "NVFP4: out_dim mismatch — checkpoint N_full={}, module expected {} (out_dim={}, slice={:?})",
+                    n_full,
+                    expected_n_full,
+                    out_dim,
+                    slice,
+                );
+            }
+
+            let bias = if has_bias {
+                vb.get_unchecked("bias").ok()
+            } else {
+                None
+            };
+
+            return Ok(Self::Nvfp4Streaming {
+                packed,
+                block_scales,
+                tensor_scale,
+                out_dim,
+                in_dim,
+                slice,
+                bias,
+                cache: Arc::new(OnceLock::new()),
+            });
+        }
+
+        let weight = vb.get((out_dim, in_dim), "weight")?;
+        if weight.dtype() == DType::F8E4M3 {
+            // Every producer writes the scale as F32 (BFL's `weight_scale`,
+            // ComfyUI's `scale_weight` — the single-file backend normalizes
+            // the spelling), so asking for F32 is the identity cast on every
+            // shipped checkpoint and keeps the stored value intact through
+            // load. `forward` still multiplies in the working dtype, like
+            // every other weight in the block.
+            let scale = vb
+                .get_unchecked_dtype("scale_weight", DType::F32)
+                .or_else(|_| vb.get_unchecked("scale_weight"))
+                .ok();
+            let bias = if has_bias {
+                vb.get_unchecked("bias").ok()
+            } else {
+                None
+            };
+            match widen {
+                Flux2Fp8Widen::PerForward => Ok(Self::Fp8 {
+                    weight,
+                    scale,
+                    bias,
+                }),
+                // The F8 slab is consumed here and never stored: `weight`
+                // moves into the cast and the widened copy is what the layer
+                // keeps.
+                Flux2Fp8Widen::AtLoad => {
+                    let (weight, scale) = widen_fp8_weight(&weight, scale, vb.dtype())?;
+                    Ok(Self::Fp8Widened {
+                        weight,
+                        scale,
+                        bias,
+                    })
+                }
+            }
+        } else {
+            let bias = if has_bias {
+                Some(vb.get(out_dim, "bias")?)
+            } else {
+                None
+            };
+            Ok(Self::Standard(candle_nn::Linear::new(weight, bias)))
+        }
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        match self {
+            Self::Standard(linear) => Ok(Self::Standard(linear_to_device(linear, device)?)),
+            Self::Fp8 {
+                weight,
+                scale,
+                bias,
+            } => Ok(Self::Fp8 {
+                weight: weight.to_device(device)?,
+                scale: scale.as_ref().map(|t| t.to_device(device)).transpose()?,
+                bias: bias.as_ref().map(|t| t.to_device(device)).transpose()?,
+            }),
+            Self::Fp8Widened {
+                weight,
+                scale,
+                bias,
+            } => Ok(Self::Fp8Widened {
+                weight: weight.to_device(device)?,
+                scale: scale.as_ref().map(|t| t.to_device(device)).transpose()?,
+                bias: bias.as_ref().map(|t| t.to_device(device)).transpose()?,
+            }),
+            Self::Nvfp4Streaming { .. } => {
+                candle_core::bail!("Flux.2 block offload does not support NVFP4 streaming layers")
+            }
+        }
+    }
+}
+
+fn linear_to_device(linear: &Linear, device: &candle_core::Device) -> Result<Linear> {
+    let weight = linear.weight().to_device(device)?;
+    let bias = linear
+        .bias()
+        .map(|bias| bias.to_device(device))
+        .transpose()?;
+    Ok(Linear::new(weight, bias))
+}
+
+/// Move a `LayerNorm` to `device`, materializing a zero bias for a bias-less
+/// one so the moved copy reaches the same fused kernel `layer_norm` builds for.
+fn layer_norm_to_device(norm: &LayerNorm, device: &candle_core::Device) -> Result<LayerNorm> {
+    let weight = norm.weight().to_device(device)?;
+    let bias = match norm.bias() {
+        Some(bias) => bias.to_device(device)?,
+        None => Tensor::zeros(weight.shape(), weight.dtype(), device)?,
+    };
+    Ok(LayerNorm::new(weight, bias, 1e-6))
+}
+
+fn rms_norm_to_device(norm: &RmsNorm, device: &candle_core::Device) -> Result<RmsNorm> {
+    let inner = norm.clone().into_inner();
+    Ok(RmsNorm::new(inner.weight().to_device(device)?, 1e-6))
+}
+
+fn tensor_bytes(t: &Tensor) -> usize {
+    t.elem_count() * t.dtype().size_in_bytes()
+}
+
+fn flux2_linear_bytes(linear: &Flux2Linear) -> usize {
+    match linear {
+        Flux2Linear::Standard(linear) => {
+            tensor_bytes(linear.weight()) + linear.bias().map(tensor_bytes).unwrap_or(0)
+        }
+        Flux2Linear::Fp8 {
+            weight,
+            scale,
+            bias,
+        } => {
+            // The FP8 slab is 1 byte per parameter at rest, but `forward`
+            // materializes a full working-dtype copy of it on every call, and
+            // this figure drives the block-offload residency plan. Charging
+            // the at-rest bytes would let the planner keep twice as many
+            // blocks resident as the forward actually fits.
+            tensor_bytes(weight) * (DType::BF16.size_in_bytes() / DType::F8E4M3.size_in_bytes())
+                + scale.as_ref().map(tensor_bytes).unwrap_or(0)
+                + bias.as_ref().map(tensor_bytes).unwrap_or(0)
+        }
+        Flux2Linear::Fp8Widened {
+            weight,
+            scale,
+            bias,
+        } => {
+            // Already widened: what it holds is what it costs, and `forward`
+            // materializes nothing. No 2x charge, unlike the arm above.
+            tensor_bytes(weight)
+                + scale.as_ref().map(tensor_bytes).unwrap_or(0)
+                + bias.as_ref().map(tensor_bytes).unwrap_or(0)
+        }
+        Flux2Linear::Nvfp4Streaming {
+            packed,
+            block_scales,
+            bias,
+            cache,
+            ..
+        } => {
+            tensor_bytes(packed)
+                + tensor_bytes(block_scales)
+                + bias.as_ref().map(tensor_bytes).unwrap_or(0)
+                + cache.get().map(tensor_bytes).unwrap_or(0)
+        }
+    }
+}
+
+fn layer_norm_bytes(norm: &LayerNorm) -> usize {
+    tensor_bytes(norm.weight()) + norm.bias().map(tensor_bytes).unwrap_or(0)
+}
+
+fn rms_norm_bytes(norm: &RmsNorm) -> usize {
+    tensor_bytes(norm.clone().into_inner().weight())
+}
+
+impl Module for Flux2Linear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Standard(l) => l.forward(x),
+            Self::Fp8 {
+                weight,
+                scale,
+                bias,
+            } => {
+                let dtype = x.dtype();
+                // A per-tensor scale is linear in the matmul, so it rides on
+                // the OUTPUT — which is orders of magnitude smaller than the
+                // weight — instead of costing a second full-size pass over the
+                // dequantized slab. Mirrors the Qwen-Image FP8 rule. Anything
+                // with per-row structure still scales the weight.
+                let scalar_scale = scale.as_ref().filter(|s| s.rank() == 0);
+                // Opt-in, unqualified: keep the weight in F8 and quantize the
+                // activation instead of widening. Only reachable when no
+                // structured scale has to ride the weight — that one needs a
+                // widened copy by definition.
+                if scale.is_none() || scalar_scale.is_some() {
+                    if let Some(out) = fp8_native_gemm(x, weight)? {
+                        let out = out.to_dtype(dtype)?;
+                        let out = match scalar_scale {
+                            Some(s) => out.broadcast_mul(&s.to_dtype(dtype)?)?,
+                            None => out,
+                        };
+                        return match bias {
+                            Some(b) => out.broadcast_add(&b.to_dtype(dtype)?),
+                            None => Ok(out),
+                        };
+                    }
+                }
+                let w = weight.to_dtype(dtype)?;
+                let w = match scale {
+                    Some(s) if scalar_scale.is_none() => w.broadcast_mul(&s.to_dtype(dtype)?)?,
+                    _ => w,
+                };
+                let out = flux2_matmul(x, &w.t()?)?;
+                let out = match scalar_scale {
+                    Some(s) => out.broadcast_mul(&s.to_dtype(dtype)?)?,
+                    None => out,
+                };
+                match bias {
+                    Some(b) => out.broadcast_add(&b.to_dtype(dtype)?),
+                    None => Ok(out),
+                }
+            }
+            Self::Fp8Widened {
+                weight,
+                scale,
+                bias,
+            } => {
+                let dtype = x.dtype();
+                // `weight` was cast at load, and a structured scale folded in
+                // there; only a rank-0 scale is left, and it rides the output
+                // exactly as the per-forward arm applies it.
+                let w = if weight.dtype() == dtype {
+                    weight.clone()
+                } else {
+                    weight.to_dtype(dtype)?
+                };
+                let out = flux2_matmul(x, &w.t()?)?;
+                let out = match scale {
+                    Some(s) => out.broadcast_mul(&s.to_dtype(dtype)?)?,
+                    None => out,
+                };
+                match bias {
+                    Some(b) => out.broadcast_add(&b.to_dtype(dtype)?),
+                    None => Ok(out),
+                }
+            }
+            Self::Nvfp4Streaming {
+                packed,
+                block_scales,
+                tensor_scale,
+                out_dim,
+                slice,
+                bias,
+                cache,
+                ..
+            } => {
+                let _backend = crate::nvfp4::resolve_nvfp4_backend(x.device())?;
+                // First forward: dequant FULL weight to BF16 on CPU and stash
+                // it. Subsequent forwards skip straight to the slice + DMA.
+                // OnceLock::get_or_try_init isn't stable yet; emulate it.
+                let bf16_full = match cache.get() {
+                    Some(t) => t,
+                    None => {
+                        let dequanted = crate::nvfp4::dequant_nvfp4_to_bf16_cpu(
+                            packed,
+                            block_scales,
+                            *tensor_scale,
+                        )?;
+                        // Race-safe set: if another thread won, we drop ours
+                        // and use theirs. Either way the value cached is the
+                        // same dequant of the same source.
+                        let _ = cache.set(dequanted);
+                        cache.get().expect("cache populated above")
+                    }
+                };
+
+                // Slice if needed. `bf16_full` lives on CPU; narrow is a
+                // view, no copy.
+                let bf16_sliced_cpu = match slice {
+                    Some((axis, component, _n_components)) => {
+                        bf16_full.narrow(*axis, component * out_dim, *out_dim)?
+                    }
+                    None => bf16_full.clone(),
+                };
+
+                let dtype = x.dtype();
+                let w_dev = bf16_sliced_cpu.to_device(x.device())?.to_dtype(dtype)?;
+                let w = w_dev.t()?;
+
+                let out = match *x.dims() {
+                    [b1, b2, m, k] => {
+                        x.reshape((b1 * b2 * m, k))?
+                            .matmul(&w)?
+                            .reshape((b1, b2, m, ()))?
+                    }
+                    [bsize, m, k] => {
+                        x.reshape((bsize * m, k))?
+                            .matmul(&w)?
+                            .reshape((bsize, m, ()))?
+                    }
+                    _ => x.matmul(&w)?,
+                };
+
+                match bias {
+                    Some(b) => out.broadcast_add(&b.to_dtype(dtype)?),
+                    None => Ok(out),
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FP8 widen-once policy
+// ---------------------------------------------------------------------------
+
+/// What an FP8 layer does with its weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flux2Fp8Widen {
+    /// Widen once at load and drop the F8 slab. Two bytes per parameter at
+    /// rest, no per-forward cast.
+    AtLoad,
+    /// Keep the F8 slab and widen on every forward — one byte per parameter at
+    /// rest, and a full-size cast of every weight on every call. The
+    /// historical behaviour and the fallback whenever the budget is unknown.
+    PerForward,
+}
+
+/// Peak copies of the FP8 checkpoint that widening at load has to fit.
+///
+/// One for the F8 slab, two for its working-dtype copy. The slab is dropped
+/// per layer as the cast consumes it, so the true peak is lower — charging
+/// the whole three keeps the decision on the safe side of a card it would
+/// otherwise OOM halfway through a load.
+const FLUX2_FP8_WIDEN_COPIES: u64 = 3;
+
+/// Whether the FP8 weights can be widened once at load, given what the card
+/// has free before the transformer lands.
+///
+/// Pure so the matrix can be asserted without a GPU. `usable_free_bytes` is
+/// the card's free VRAM less mold's reserve, measured BEFORE any weight is
+/// uploaded, which is why the whole checkpoint is charged rather than a
+/// delta.
+pub(crate) fn flux2_fp8_widen_policy(fp8_bytes: u64, usable_free_bytes: u64) -> Flux2Fp8Widen {
+    let required = fp8_bytes
+        .checked_mul(FLUX2_FP8_WIDEN_COPIES)
+        .and_then(|bytes| bytes.checked_add(ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM));
+    match required {
+        Some(required) if required <= usable_free_bytes => Flux2Fp8Widen::AtLoad,
+        _ => Flux2Fp8Widen::PerForward,
+    }
+}
+
+/// Extra RESIDENT bytes the widen decision adds beyond the checkpoint's own
+/// file length, for a server-side estimate.
+///
+/// The widen is decided inside the engine at load, from the card's free VRAM
+/// alone, and until this existed nothing outside knew: `estimate_peak_memory`,
+/// `select_server_load_strategy_for_device` and the preflight guard all
+/// charged the FILE, while a widened checkpoint holds two bytes per parameter
+/// instead of one. On a 32 GB card a klein-9B fp8 then planned as 9.08 GB,
+/// resided as 18.16 GB, and quietly cost Qwen3 its GPU slot — the encoder
+/// variant selector re-measured, found no room, and fell back to a Q8 GGUF or
+/// to the CPU, which is the F32 encode this campaign exists to remove. The
+/// two decisions could not see each other.
+///
+/// Returns the SECOND copy only (`fp8_bytes`), because the first is already
+/// the file length every estimate charges. Zero when the policy resolves to
+/// `PerForward`, so a card that cannot afford the widen is priced exactly as
+/// it is today.
+pub fn flux2_fp8_widen_extra_resident_bytes(
+    fp8_bytes: u64,
+    usable_free_bytes: u64,
+    cache_override: Option<&str>,
+) -> u64 {
+    let resolved = resolve_flux2_fp8_widen(
+        cache_override,
+        flux2_fp8_widen_policy(fp8_bytes, usable_free_bytes),
+    );
+    match resolved {
+        Flux2Fp8Widen::AtLoad => fp8_bytes,
+        Flux2Fp8Widen::PerForward => 0,
+    }
+}
+
+/// The widen's extra resident bytes for a CHECKPOINT, resolved exactly as the
+/// engine resolves them.
+///
+/// This is the one function both sides call. It takes the checkpoint rather
+/// than a byte count so the planner cannot size the gate differently from the
+/// load: the engine derives from `Flux2Config` (parameter count x 1 byte) and
+/// the server used to pass the FILE length, which on a Comfy-Org `fp8mixed`
+/// checkpoint is materially larger because its attention stays BF16 — so the
+/// server's `3 x bytes + headroom <= free` gate could answer `PerForward` and
+/// charge zero where the engine answered `AtLoad` and widened. That is the
+/// under-charge direction, and it is structural, not a tuning error.
+///
+/// The override is read from the process's FROZEN snapshot, the same
+/// authority the engine reads, rather than from the live environment.
+pub fn flux2_fp8_widen_extra_resident_bytes_for_checkpoint(
+    transformer: &std::path::Path,
+    model_name: &str,
+    usable_free_bytes: u64,
+) -> u64 {
+    let Some(cfg) = super::pipeline::resolve_flux2_config(transformer, model_name) else {
+        return 0;
+    };
+    flux2_fp8_widen_extra_resident_bytes(
+        flux2_fp8_checkpoint_bytes(&cfg),
+        usable_free_bytes,
+        crate::runtime_env::value("MOLD_FLUX2_FP8_CACHE").as_deref(),
+    )
+}
+
+/// The denoise activation geometry for a CHECKPOINT, resolved exactly as the
+/// engine resolves its config.
+///
+/// The twin of `flux2_fp8_widen_extra_resident_bytes_for_checkpoint`, and it
+/// exists for the same reason: the planner must size a FLUX.2 render from the
+/// `Flux2Config` the transformer will actually be built with, not from a name
+/// heuristic of its own. `None` means the checkpoint names no variant this
+/// build knows, and the caller keeps its previous estimate.
+pub fn flux2_activation_geometry_for_checkpoint(
+    transformer: &std::path::Path,
+    model_name: &str,
+) -> Option<crate::device::Flux2ActivationGeometry> {
+    super::pipeline::resolve_flux2_config(transformer, model_name)
+        .map(|cfg| crate::device::Flux2ActivationGeometry::from_config(&cfg))
+}
+
+/// `MOLD_FLUX2_FP8_CACHE`: `1` forces the widened arm, `0` forces the
+/// per-forward one, anything else (including unset) defers to the budget.
+///
+/// Classified like `MOLD_QWEN_FP8_CACHE`, which it mirrors: the choice changes
+/// residency and step latency, so a cached run must not share a fingerprint or
+/// a learned-timing bucket with one that widened every forward.
+pub(crate) fn parse_flux2_fp8_cache(value: Option<&str>) -> Option<Flux2Fp8Widen> {
+    match value.map(str::trim) {
+        Some("1") => Some(Flux2Fp8Widen::AtLoad),
+        Some("0") => Some(Flux2Fp8Widen::PerForward),
+        _ => None,
+    }
+}
+
+/// The env override, else the budget's answer.
+pub(crate) fn resolve_flux2_fp8_widen(env: Option<&str>, budget: Flux2Fp8Widen) -> Flux2Fp8Widen {
+    parse_flux2_fp8_cache(env).unwrap_or(budget)
+}
+
+/// The FP8 checkpoint's size, derived from the config rather than the file.
+///
+/// The decision has to be made before the first weight is read, so this counts
+/// the transformer's parameters and charges one byte each (F8E4M3). A mixed
+/// checkpoint — Comfy-Org's `fp8mixed` leaves the attention projections in
+/// BF16 — has fewer FP8 bytes than this, so the estimate errs toward keeping
+/// today's behaviour, never toward an OOM.
+pub(crate) fn flux2_fp8_checkpoint_bytes(cfg: &Flux2Config) -> u64 {
+    let h = cfg.hidden_size as u64;
+    let mlp = (cfg.hidden_size as f64 * cfg.mlp_ratio) as u64;
+    let mut params = 0u64;
+    // Stems.
+    params += cfg.in_channels as u64 * h;
+    params += cfg.context_in_dim as u64 * h;
+    // Timestep embedder (256 -> h -> h), and the guidance one when present.
+    let embedder = 256 * h + h * h;
+    params += embedder;
+    if cfg.vec_in_dim > 0 {
+        params += cfg.vec_in_dim as u64 * h + h * h;
+    }
+    if cfg.guidance_embed {
+        params += embedder;
+    }
+    // Shared modulation: two 6x for the double streams, one 3x for the single.
+    params += (6 + 6 + 3) * h * h;
+    // Double blocks: two streams, each four square attention projections and a
+    // SwiGLU MLP (h -> 2*mlp, mlp -> h).
+    params += cfg.depth as u64 * 2 * (4 * h * h + 3 * h * mlp);
+    // Single blocks: one fused QKV+MLP projection and one fused output.
+    params += cfg.depth_single_blocks as u64 * (h * (3 * h + 2 * mlp) + (h + mlp) * h);
+    // Final layer.
+    params += h * cfg.in_channels as u64 + 2 * h * h;
+    params * DType::F8E4M3.size_in_bytes() as u64
+}
+
+/// Resolve the widen policy for a load onto `device`.
+///
+/// Kept here, and deliberately small, so the public constructor signature does
+/// not change and no caller has to learn about FP8 at all. Without a readable
+/// VRAM figure — CPU, Metal, a build without NVML — the answer is today's
+/// behaviour.
+fn flux2_fp8_widen_for_load(cfg: &Flux2Config, device: &candle_core::Device) -> Flux2Fp8Widen {
+    let ordinal = match device.location() {
+        candle_core::DeviceLocation::Cuda { gpu_id } => Some(gpu_id),
+        _ => None,
+    };
+    let budget = match ordinal.and_then(crate::device::usable_free_vram_bytes) {
+        Some(free) => flux2_fp8_widen_policy(flux2_fp8_checkpoint_bytes(cfg), free),
+        None => Flux2Fp8Widen::PerForward,
+    };
+    let resolved = resolve_flux2_fp8_widen(
+        crate::runtime_env::value("MOLD_FLUX2_FP8_CACHE").as_deref(),
+        budget,
+    );
+    if resolved == Flux2Fp8Widen::AtLoad {
+        tracing::info!(
+            fp8_bytes = flux2_fp8_checkpoint_bytes(cfg),
+            "flux2: widening FP8 weights once at load"
+        );
+    }
+    resolved
+}
+
+/// Reproduce, once, exactly what [`Flux2Linear::Fp8`]'s forward builds every
+/// call: the F8E4M3 slab cast to `dtype`, with a non-scalar `scale_weight`
+/// folded in. The returned scale is the rank-0 one, which still rides the
+/// matmul output.
+fn widen_fp8_weight(
+    weight: &Tensor,
+    scale: Option<Tensor>,
+    dtype: DType,
+) -> Result<(Tensor, Option<Tensor>)> {
+    let scalar_scale = scale.as_ref().filter(|s| s.rank() == 0).cloned();
+    let widened = weight.to_dtype(dtype)?;
+    let widened = match &scale {
+        Some(s) if scalar_scale.is_none() => widened.broadcast_mul(&s.to_dtype(dtype)?)?,
+        _ => widened,
+    };
+    Ok((widened, scalar_scale))
+}
+
+/// F8E4M3's largest finite magnitude.
+///
+/// ComfyUI clamps the activation to it before the cast
+/// (`comfy/ops.py:872`, `torch.clamp(input, min=-448, max=448)`); anything
+/// past it casts to `inf` and poisons every output element that reads the row.
+pub(crate) const FP8_E4M3_MAX: f64 = 448.0;
+
+/// The clamp half of ComfyUI's activation quantization, pure and testable
+/// without a CUDA device.
+pub(crate) fn clamp_activation_for_fp8(x: &Tensor) -> Result<Tensor> {
+    x.clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
+}
+
+/// `MOLD_FLUX2_FP8_GEMM=1` routes FP8 layers to the fork's cuBLASLt
+/// `(F8E4M3, F8E4M3) -> BF16` GEMM instead of widening the weight.
+///
+/// **Unqualified.** It is off by default and stays off until a ComfyUI
+/// `torch._scaled_mm` parity fixture exists: the quantization of the
+/// ACTIVATION is lossy in a way the widen path is not, and nothing here has
+/// been compared against upstream's output on a real checkpoint.
+fn flux2_fp8_gemm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = matches!(
+            crate::runtime_env::value("MOLD_FLUX2_FP8_GEMM")
+                .as_deref()
+                .map(str::trim),
+            Some("1")
+        );
+        if enabled {
+            tracing::warn!(
+                "flux2: MOLD_FLUX2_FP8_GEMM=1 — native FP8 GEMM is UNQUALIFIED \
+                 (no ComfyUI parity fixture); renders may differ from the default path"
+            );
+        }
+        enabled
+    })
+}
+
+/// ComfyUI's activation quantization: clamp into range, cast, make contiguous
+/// (`comfy/ops.py:872-873`).
+fn quantize_activation_to_fp8(x: &Tensor) -> Result<Tensor> {
+    clamp_activation_for_fp8(x)?
+        .to_dtype(DType::F8E4M3)?
+        .contiguous()
+}
+
+/// The native FP8 GEMM, when the flag is on and the request fits it.
+///
+/// `Ok(None)` means "not routed" and the caller widens as usual. The fork
+/// takes `(F8E4M3, F8E4M3) -> BF16` through cuBLASLt only in TN layout
+/// (`candle-core/src/cuda_backend/mod.rs:2684-2691`), which `x.matmul(w.t())`
+/// is, and casts to BF16 itself for anything else.
+fn fp8_native_gemm(x: &Tensor, weight: &Tensor) -> Result<Option<Tensor>> {
+    if !flux2_fp8_gemm_enabled() || !matches!(x.device(), candle_core::Device::Cuda(_)) {
+        return Ok(None);
+    }
+    let quantized = quantize_activation_to_fp8(x)?;
+    Ok(Some(flux2_matmul(&quantized, &weight.t()?)?))
+}
+
+/// The one matmul every mold-owned FLUX.2 projection uses — both FP8 arms and
+/// the fused QKV — so they cannot drift in shape handling.
+fn flux2_matmul(x: &Tensor, w_t: &Tensor) -> Result<Tensor> {
+    match *x.dims() {
+        [b1, b2, m, k] => x
+            .reshape((b1 * b2 * m, k))?
+            .matmul(w_t)?
+            .reshape((b1, b2, m, ())),
+        [bsize, m, k] => x
+            .reshape((bsize * m, k))?
+            .matmul(w_t)?
+            .reshape((bsize, m, ())),
+        _ => x.matmul(w_t),
+    }
+}
+
+/// Convenience: load a bias-free Flux2Linear from `vb`. Matches the
+/// `candle_nn::linear_no_bias` ergonomics it replaces.
+fn flux2_linear_no_bias(
+    in_dim: usize,
+    out_dim: usize,
+    widen: Flux2Fp8Widen,
+    vb: VarBuilder,
+) -> Result<Flux2Linear> {
+    Flux2Linear::load_with_bias(in_dim, out_dim, false, widen, vb)
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/// Flux.2 transformer configuration.
+#[derive(Debug, Clone)]
+pub struct Flux2Config {
+    pub in_channels: usize,
+    pub vec_in_dim: usize,
+    pub context_in_dim: usize,
+    pub hidden_size: usize,
+    pub mlp_ratio: f64,
+    pub num_heads: usize,
+    pub depth: usize,
+    pub depth_single_blocks: usize,
+    pub axes_dim: Vec<usize>,
+    pub theta: usize,
+    pub guidance_embed: bool,
+}
+
+impl Flux2Config {
+    /// Configuration for the full FLUX.2 [dev] checkpoint.
+    pub fn dev() -> Self {
+        Self {
+            in_channels: 128,
+            vec_in_dim: 0,
+            context_in_dim: 15360,
+            hidden_size: 6144,
+            mlp_ratio: 3.0,
+            num_heads: 48,
+            depth: 8,
+            depth_single_blocks: 48,
+            axes_dim: vec![32, 32, 32, 32],
+            theta: 2000,
+            guidance_embed: true,
+        }
+    }
+
+    /// Configuration for Flux.2 Klein-4B (Apache 2.0, distilled).
+    pub fn klein() -> Self {
+        Self {
+            in_channels: 128,
+            vec_in_dim: 0,
+            context_in_dim: 7680,
+            hidden_size: 3072,
+            mlp_ratio: 3.0,
+            num_heads: 24,
+            depth: 5,
+            depth_single_blocks: 20,
+            axes_dim: vec![32, 32, 32, 32],
+            theta: 2000,
+            guidance_embed: false,
+        }
+    }
+
+    /// Configuration for Flux.2 Klein-9B (Non-Commercial, distilled).
+    /// Larger Qwen3 encoder (hidden_size=4096, joint_attention_dim=12288).
+    pub fn klein_9b() -> Self {
+        Self {
+            in_channels: 128,
+            vec_in_dim: 0,
+            context_in_dim: 12288, // 4096 * 3 (Qwen3 hidden_size stacked 3x)
+            hidden_size: 4096,
+            mlp_ratio: 3.0,
+            num_heads: 32,
+            depth: 8,
+            depth_single_blocks: 24,
+            axes_dim: vec![32, 32, 32, 32],
+            theta: 2000,
+            guidance_embed: false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
+
+/// FLUX.2's affine-less LayerNorm, built so it reaches candle's fused kernel.
+///
+/// `LayerNorm::forward` takes `ops::layer_norm` only when a bias is present
+/// (`candle-nn/src/layer_norm.rs:116-122`); `new_no_bias` therefore always
+/// falls to the ten-op sum/div/sqrt sequence. An explicit zero bias is the
+/// same affine — upstream's `elementwise_affine=False` — and one fused launch.
+fn layer_norm(dim: usize, vb: &VarBuilder) -> Result<LayerNorm> {
+    let ws = Tensor::ones(dim, vb.dtype(), vb.device())?;
+    let bs = Tensor::zeros(dim, vb.dtype(), vb.device())?;
+    Ok(LayerNorm::new(ws, bs, 1e-6))
+}
+
+pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    // Single dispatch point — FlashAttention / math is selected at process
+    // start via `MOLD_ATTN` and the `flash-attn` cargo feature, defaulting to
+    // flash for FLUX.2 under `AttentionPolicy::FastStill`.
+    crate::attention::attention_default_scale_for(
+        crate::attention::AttentionPolicy::FastStill,
+        q,
+        k,
+        v,
+    )
+}
+
+pub(crate) fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
+    if dim % 2 == 1 {
+        candle_core::bail!("dim {dim} is odd")
+    }
+    let dev = pos.device();
+    let theta = theta as f64;
+    let inv_freq: Vec<_> = (0..dim)
+        .step_by(2)
+        .map(|i| 1f32 / theta.powf(i as f64 / dim as f64) as f32)
+        .collect();
+    let inv_freq_len = inv_freq.len();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, 1, inv_freq_len), dev)?;
+    let freqs = pos
+        .to_dtype(DType::F32)?
+        .unsqueeze(2)?
+        .broadcast_mul(&inv_freq)?;
+    let cos = freqs.cos()?;
+    let sin = freqs.sin()?;
+    let out = Tensor::stack(&[&cos, &sin.neg()?, &sin, &cos], 3)?;
+    let (b, n, d, _ij) = out.dims4()?;
+    out.reshape((b, n, d, 2, 2))
+}
+
+pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
+    let output_dtype = x.dtype();
+    let x = &x.to_dtype(DType::F32)?;
+    // One fused launch over contiguous memory when the layout allows; the
+    // broadcast form below is the fallback and the definition.
+    if let Some(out) = crate::flux_rope::fused_interleaved_rope(x, freq_cis)? {
+        return out.to_dtype(output_dtype);
+    }
+    let dims = x.dims();
+    let (b_sz, n_head, seq_len, n_embd) = x.dims4()?;
+    let x = x.reshape((b_sz, n_head, seq_len, n_embd / 2, 2))?;
+    let x0 = x.narrow(D::Minus1, 0, 1)?;
+    let x1 = x.narrow(D::Minus1, 1, 1)?;
+    let fr0 = freq_cis.get_on_dim(D::Minus1, 0)?;
+    let fr1 = freq_cis.get_on_dim(D::Minus1, 1)?;
+    (fr0.broadcast_mul(&x0)? + fr1.broadcast_mul(&x1)?)?
+        .reshape(dims.to_vec())?
+        .to_dtype(output_dtype)
+}
+
+pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, pe: &Tensor) -> Result<Tensor> {
+    let q = apply_rope(q, pe)?.contiguous()?;
+    let k = apply_rope(k, pe)?.contiguous()?;
+    let x = scaled_dot_product_attention(&q, &k, v)?;
+    x.transpose(1, 2)?.flatten_from(2)
+}
+
+pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
+    const TIME_FACTOR: f64 = 1000.;
+    const MAX_PERIOD: f64 = 10000.;
+    if dim % 2 == 1 {
+        candle_core::bail!("{dim} is odd")
+    }
+    let dev = t.device();
+    let half = dim / 2;
+    let t = (t * TIME_FACTOR)?;
+    let arange = Tensor::arange(0, half as u32, dev)?.to_dtype(DType::F32)?;
+    let freqs = (arange * (-MAX_PERIOD.ln() / half as f64))?.exp()?;
+    let args = t
+        .unsqueeze(1)?
+        .to_dtype(DType::F32)?
+        .broadcast_mul(&freqs.unsqueeze(0)?)?;
+    Tensor::cat(&[args.cos()?, args.sin()?], D::Minus1)?.to_dtype(dtype)
+}
+
+// ---------------------------------------------------------------------------
+// N-dimensional RoPE embedder
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct EmbedNd {
+    theta: usize,
+    axes_dim: Vec<usize>,
+}
+
+impl EmbedNd {
+    pub(crate) fn new(theta: usize, axes_dim: Vec<usize>) -> Self {
+        Self { theta, axes_dim }
+    }
+}
+
+impl candle_core::Module for EmbedNd {
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        let n_axes = ids.dim(D::Minus1)?;
+        let mut emb = Vec::with_capacity(n_axes);
+        for idx in 0..n_axes {
+            emb.push(rope(
+                &ids.get_on_dim(D::Minus1, idx)?,
+                self.axes_dim[idx],
+                self.theta,
+            )?)
+        }
+        Tensor::cat(&emb, 2)?.unsqueeze(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Building blocks
+// ---------------------------------------------------------------------------
+
+/// MLP embedder for timestep/guidance conditioning.
+#[derive(Debug, Clone)]
+struct MlpEmbedder {
+    in_layer: Flux2Linear,
+    out_layer: Flux2Linear,
+}
+
+impl MlpEmbedder {
+    fn new(in_sz: usize, h_sz: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        // Diffusers names: linear_1 / linear_2
+        let in_layer = flux2_linear_no_bias(in_sz, h_sz, widen, vb.pp("linear_1"))?;
+        let out_layer = flux2_linear_no_bias(h_sz, h_sz, widen, vb.pp("linear_2"))?;
+        Ok(Self {
+            in_layer,
+            out_layer,
+        })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            in_layer: self.in_layer.to_device(device)?,
+            out_layer: self.out_layer.to_device(device)?,
+        })
+    }
+}
+
+impl candle_core::Module for MlpEmbedder {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.apply(&self.in_layer)?.silu()?.apply(&self.out_layer)
+    }
+}
+
+struct ModulationOut {
+    shift: Tensor,
+    scale: Tensor,
+    gate: Tensor,
+}
+
+impl ModulationOut {
+    fn scale_shift(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.broadcast_mul(&(&self.scale + 1.)?)?
+            .broadcast_add(&self.shift)
+    }
+
+    fn gate(&self, xs: &Tensor) -> Result<Tensor> {
+        self.gate.broadcast_mul(xs)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Modulation1 {
+    lin: Flux2Linear,
+}
+
+impl Modulation1 {
+    fn new(dim: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let lin = flux2_linear_no_bias(dim, 3 * dim, widen, vb.pp("linear"))?;
+        Ok(Self { lin })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            lin: self.lin.to_device(device)?,
+        })
+    }
+
+    fn forward(&self, vec_: &Tensor) -> Result<ModulationOut> {
+        let ys = vec_
+            .silu()?
+            .apply(&self.lin)?
+            .unsqueeze(1)?
+            .chunk(3, D::Minus1)?;
+        if ys.len() != 3 {
+            candle_core::bail!("unexpected len from chunk {ys:?}")
+        }
+        Ok(ModulationOut {
+            shift: ys[0].clone(),
+            scale: ys[1].clone(),
+            gate: ys[2].clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Modulation2 {
+    lin: Flux2Linear,
+}
+
+impl Modulation2 {
+    fn new(dim: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let lin = flux2_linear_no_bias(dim, 6 * dim, widen, vb.pp("linear"))?;
+        Ok(Self { lin })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            lin: self.lin.to_device(device)?,
+        })
+    }
+
+    fn forward(&self, vec_: &Tensor) -> Result<(ModulationOut, ModulationOut)> {
+        let ys = vec_
+            .silu()?
+            .apply(&self.lin)?
+            .unsqueeze(1)?
+            .chunk(6, D::Minus1)?;
+        if ys.len() != 6 {
+            candle_core::bail!("unexpected len from chunk {ys:?}")
+        }
+        Ok((
+            ModulationOut {
+                shift: ys[0].clone(),
+                scale: ys[1].clone(),
+                gate: ys[2].clone(),
+            },
+            ModulationOut {
+                shift: ys[3].clone(),
+                scale: ys[4].clone(),
+                gate: ys[5].clone(),
+            },
+        ))
+    }
+}
+
+/// SwiGLU MLP (double-stream blocks).
+#[derive(Debug, Clone)]
+struct Mlp {
+    lin1: Flux2Linear,
+    lin2: Flux2Linear,
+    mlp_sz: usize,
+}
+
+impl Mlp {
+    fn new(in_sz: usize, mlp_sz: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let lin1 = flux2_linear_no_bias(in_sz, mlp_sz * 2, widen, vb.pp("linear_in"))?;
+        let lin2 = flux2_linear_no_bias(mlp_sz, in_sz, widen, vb.pp("linear_out"))?;
+        Ok(Self { lin1, lin2, mlp_sz })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            lin1: self.lin1.to_device(device)?,
+            lin2: self.lin2.to_device(device)?,
+            mlp_sz: self.mlp_sz,
+        })
+    }
+}
+
+fn mlp_bytes(mlp: &Mlp) -> usize {
+    flux2_linear_bytes(&mlp.lin1) + flux2_linear_bytes(&mlp.lin2)
+}
+
+impl candle_core::Module for Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let x = xs.apply(&self.lin1)?;
+        let gate = x.narrow(D::Minus1, 0, self.mlp_sz)?.silu()?;
+        let val = x.narrow(D::Minus1, self.mlp_sz, self.mlp_sz)?;
+        (gate * val)?.apply(&self.lin2)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DoubleStreamBlock — joint image+text attention (diffusers naming)
+// ---------------------------------------------------------------------------
+
+/// The double block's Q/K/V projections.
+///
+/// BFL ships ONE `[3*dim, dim]` GEMM per stream (`flux2/model.py:384`);
+/// diffusers splits it into `to_q` / `to_k` / `to_v`, which is the layout mold
+/// loads, and running the split form reads the activation three times and
+/// hands cuBLAS a third of the N it could have. The weights are concatenated
+/// at load where their arms allow it and the output is narrowed, which is what
+/// the GGUF path already does and what `fuse_qkv_projections()` does in
+/// diffusers.
+// One `DoubleAttention` per stream per block holds one of these, so the
+// unused tail of the smaller variant costs a few kilobytes across the whole
+// model. Boxing the larger one would buy that back with an allocation and a
+// pointer chase on every forward.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone)]
+enum QkvProjections {
+    /// One GEMM. `scales` carries each component's rank-0 output scale, which
+    /// rides the NARROWED slice — the same place the unfused FP8 arm applies
+    /// it, so fusing does not move it onto the weight.
+    Fused {
+        weight: Tensor,
+        scales: [Option<Tensor>; 3],
+        out_dim: usize,
+    },
+    /// Three separate projections, for every arm whose weights cannot be
+    /// concatenated: NVFP4 streaming (dequantized per forward from a packed
+    /// CPU source) and the per-forward FP8 arm (whose whole point is that the
+    /// slab stays packed).
+    Split {
+        to_q: Flux2Linear,
+        to_k: Flux2Linear,
+        to_v: Flux2Linear,
+    },
+}
+
+/// The `[out, in]` weight a linear can contribute to a fused projection, and
+/// the output scale its slice must carry.
+///
+/// `None` means "not fusable", which is a property of the arm rather than of
+/// the checkpoint. A bias would have to be concatenated too; FLUX.2's linears
+/// carry none, so a biased one is left split rather than handled.
+fn fusable_projection(linear: &Flux2Linear) -> Option<(&Tensor, Option<&Tensor>)> {
+    match linear {
+        Flux2Linear::Standard(inner) if inner.bias().is_none() => Some((inner.weight(), None)),
+        Flux2Linear::Fp8Widened {
+            weight,
+            scale,
+            bias: None,
+        } => Some((weight, scale.as_ref())),
+        _ => None,
+    }
+}
+
+impl QkvProjections {
+    /// Fuse when every arm allows it, else keep the three.
+    fn new(to_q: Flux2Linear, to_k: Flux2Linear, to_v: Flux2Linear) -> Result<Self> {
+        let parts = [
+            fusable_projection(&to_q),
+            fusable_projection(&to_k),
+            fusable_projection(&to_v),
+        ];
+        let (Some(q), Some(k), Some(v)) = (parts[0], parts[1], parts[2]) else {
+            return Ok(Self::Split { to_q, to_k, to_v });
+        };
+        let weights = [q.0, k.0, v.0];
+        let dtype = weights[0].dtype();
+        let out_dim = weights[0].dim(0)?;
+        let same_shape = weights
+            .iter()
+            .all(|w| w.dtype() == dtype && w.dim(0).map(|d| d == out_dim).unwrap_or(false));
+        if !same_shape {
+            return Ok(Self::Split { to_q, to_k, to_v });
+        }
+        let weight = Tensor::cat(&weights, 0)?;
+        let scales = [q.1.cloned(), k.1.cloned(), v.1.cloned()];
+        Ok(Self::Fused {
+            weight,
+            scales,
+            out_dim,
+        })
+    }
+
+    fn project(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        match self {
+            Self::Fused {
+                weight,
+                scales,
+                out_dim,
+            } => {
+                let dtype = xs.dtype();
+                let w = if weight.dtype() == dtype {
+                    weight.clone()
+                } else {
+                    weight.to_dtype(dtype)?
+                };
+                let out = flux2_matmul(xs, &w.t()?)?;
+                let mut parts = Vec::with_capacity(3);
+                for (index, scale) in scales.iter().enumerate() {
+                    // `narrow` on the last dim is a view; the caller reshapes
+                    // it into heads, so make it contiguous here — exactly the
+                    // bytes three separate GEMMs would have written.
+                    let part = out
+                        .narrow(D::Minus1, index * out_dim, *out_dim)?
+                        .contiguous()?;
+                    parts.push(match scale {
+                        Some(s) => part.broadcast_mul(&s.to_dtype(dtype)?)?,
+                        None => part,
+                    });
+                }
+                let mut parts = parts.into_iter();
+                let q = parts.next().expect("three parts");
+                let k = parts.next().expect("three parts");
+                let v = parts.next().expect("three parts");
+                Ok((q, k, v))
+            }
+            Self::Split { to_q, to_k, to_v } => {
+                Ok((xs.apply(to_q)?, xs.apply(to_k)?, xs.apply(to_v)?))
+            }
+        }
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        match self {
+            Self::Fused {
+                weight,
+                scales,
+                out_dim,
+            } => Ok(Self::Fused {
+                weight: weight.to_device(device)?,
+                scales: [
+                    scales[0]
+                        .as_ref()
+                        .map(|s| s.to_device(device))
+                        .transpose()?,
+                    scales[1]
+                        .as_ref()
+                        .map(|s| s.to_device(device))
+                        .transpose()?,
+                    scales[2]
+                        .as_ref()
+                        .map(|s| s.to_device(device))
+                        .transpose()?,
+                ],
+                out_dim: *out_dim,
+            }),
+            Self::Split { to_q, to_k, to_v } => Ok(Self::Split {
+                to_q: to_q.to_device(device)?,
+                to_k: to_k.to_device(device)?,
+                to_v: to_v.to_device(device)?,
+            }),
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Fused { weight, scales, .. } => {
+                tensor_bytes(weight)
+                    + scales
+                        .iter()
+                        .filter_map(|s| s.as_ref().map(tensor_bytes))
+                        .sum::<usize>()
+            }
+            Self::Split { to_q, to_k, to_v } => {
+                flux2_linear_bytes(to_q) + flux2_linear_bytes(to_k) + flux2_linear_bytes(to_v)
+            }
+        }
+    }
+}
+
+/// Separate Q/K/V attention for double-stream blocks (diffusers format).
+#[derive(Debug, Clone)]
+struct DoubleAttention {
+    qkv: QkvProjections,
+    to_out: Flux2Linear,
+    norm_q: RmsNorm,
+    norm_k: RmsNorm,
+    num_heads: usize,
+}
+
+impl DoubleAttention {
+    /// Load image-side attention from `attn.to_q/k/v`, `attn.to_out.0`, `attn.norm_q/k`.
+    fn new_img(dim: usize, num_heads: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let head_dim = dim / num_heads;
+        Ok(Self {
+            qkv: QkvProjections::new(
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("to_q"))?,
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("to_k"))?,
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("to_v"))?,
+            )?,
+            to_out: flux2_linear_no_bias(dim, dim, widen, vb.pp("to_out").pp("0"))?,
+            norm_q: RmsNorm::new(vb.get(head_dim, "norm_q.weight")?, 1e-6),
+            norm_k: RmsNorm::new(vb.get(head_dim, "norm_k.weight")?, 1e-6),
+            num_heads,
+        })
+    }
+
+    /// Load text-side attention from `attn.add_q_proj`, `attn.to_add_out`, `attn.norm_added_q/k`.
+    fn new_txt(dim: usize, num_heads: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let head_dim = dim / num_heads;
+        Ok(Self {
+            qkv: QkvProjections::new(
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("add_q_proj"))?,
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("add_k_proj"))?,
+                flux2_linear_no_bias(dim, dim, widen, vb.pp("add_v_proj"))?,
+            )?,
+            to_out: flux2_linear_no_bias(dim, dim, widen, vb.pp("to_add_out"))?,
+            norm_q: RmsNorm::new(vb.get(head_dim, "norm_added_q.weight")?, 1e-6),
+            norm_k: RmsNorm::new(vb.get(head_dim, "norm_added_k.weight")?, 1e-6),
+            num_heads,
+        })
+    }
+
+    fn qkv(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let (b, l, _) = xs.dims3()?;
+        let (q, k, v) = self.qkv.project(xs)?;
+        // Normalize BEFORE the transpose. The reshape of a projection output
+        // is contiguous, which is what candle's fused RMSNorm kernel requires
+        // (`candle-nn/src/layer_norm.rs:202-210`); the transposed view took
+        // the ~9-kernel strided fallback for every one of these. RMSNorm
+        // normalizes the LAST dim, `head_dim` in both layouts, so the
+        // arithmetic is BFL's own (`flux2/model.py:752-755`).
+        let q = q
+            .reshape((b, l, self.num_heads, ()))?
+            .apply(&self.norm_q)?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_heads, ()))?
+            .apply(&self.norm_k)?
+            .transpose(1, 2)?;
+        let v = v.reshape((b, l, self.num_heads, ()))?.transpose(1, 2)?;
+        Ok((q, k, v))
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            qkv: self.qkv.to_device(device)?,
+            to_out: self.to_out.to_device(device)?,
+            norm_q: rms_norm_to_device(&self.norm_q, device)?,
+            norm_k: rms_norm_to_device(&self.norm_k, device)?,
+            num_heads: self.num_heads,
+        })
+    }
+}
+
+fn double_attention_bytes(attention: &DoubleAttention) -> usize {
+    attention.qkv.bytes()
+        + flux2_linear_bytes(&attention.to_out)
+        + rms_norm_bytes(&attention.norm_q)
+        + rms_norm_bytes(&attention.norm_k)
+}
+
+#[derive(Debug, Clone)]
+struct DoubleStreamBlock {
+    img_norm1: LayerNorm,
+    img_attn: DoubleAttention,
+    img_norm2: LayerNorm,
+    img_mlp: Mlp,
+    txt_attn: DoubleAttention,
+    txt_norm1: LayerNorm,
+    txt_norm2: LayerNorm,
+    txt_mlp: Mlp,
+}
+
+impl DoubleStreamBlock {
+    fn new(cfg: &Flux2Config, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let h_sz = cfg.hidden_size;
+        let mlp_sz = (h_sz as f64 * cfg.mlp_ratio) as usize;
+        let attn_vb = vb.pp("attn");
+        Ok(Self {
+            img_norm1: layer_norm(h_sz, &vb)?,
+            img_attn: DoubleAttention::new_img(h_sz, cfg.num_heads, widen, attn_vb.clone())?,
+            img_norm2: layer_norm(h_sz, &vb)?,
+            img_mlp: Mlp::new(h_sz, mlp_sz, widen, vb.pp("ff"))?,
+            txt_attn: DoubleAttention::new_txt(h_sz, cfg.num_heads, widen, attn_vb)?,
+            txt_norm1: layer_norm(h_sz, &vb)?,
+            txt_norm2: layer_norm(h_sz, &vb)?,
+            txt_mlp: Mlp::new(h_sz, mlp_sz, widen, vb.pp("ff_context"))?,
+        })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            img_norm1: layer_norm_to_device(&self.img_norm1, device)?,
+            img_attn: self.img_attn.to_device(device)?,
+            img_norm2: layer_norm_to_device(&self.img_norm2, device)?,
+            img_mlp: self.img_mlp.to_device(device)?,
+            txt_attn: self.txt_attn.to_device(device)?,
+            txt_norm1: layer_norm_to_device(&self.txt_norm1, device)?,
+            txt_norm2: layer_norm_to_device(&self.txt_norm2, device)?,
+            txt_mlp: self.txt_mlp.to_device(device)?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward(
+        &self,
+        img: &Tensor,
+        txt: &Tensor,
+        img_mod1: &ModulationOut,
+        img_mod2: &ModulationOut,
+        txt_mod1: &ModulationOut,
+        txt_mod2: &ModulationOut,
+        pe: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let img_modulated = img_mod1.scale_shift(&img.apply(&self.img_norm1)?)?;
+        let (img_q, img_k, img_v) = self.img_attn.qkv(&img_modulated)?;
+
+        let txt_modulated = txt_mod1.scale_shift(&txt.apply(&self.txt_norm1)?)?;
+        let (txt_q, txt_k, txt_v) = self.txt_attn.qkv(&txt_modulated)?;
+
+        let q = Tensor::cat(&[txt_q, img_q], 2)?;
+        let k = Tensor::cat(&[txt_k, img_k], 2)?;
+        let v = Tensor::cat(&[txt_v, img_v], 2)?;
+
+        let attn = attention(&q, &k, &v, pe)?;
+        let txt_attn_out = attn.narrow(1, 0, txt.dim(1)?)?;
+        let img_attn_out = attn.narrow(1, txt.dim(1)?, attn.dim(1)? - txt.dim(1)?)?;
+
+        let img = (img + img_mod1.gate(&img_attn_out.apply(&self.img_attn.to_out)?))?;
+        let img = (&img
+            + img_mod2.gate(
+                &img_mod2
+                    .scale_shift(&img.apply(&self.img_norm2)?)?
+                    .apply(&self.img_mlp)?,
+            )?)?;
+
+        let txt = (txt + txt_mod1.gate(&txt_attn_out.apply(&self.txt_attn.to_out)?))?;
+        let txt = (&txt
+            + txt_mod2.gate(
+                &txt_mod2
+                    .scale_shift(&txt.apply(&self.txt_norm2)?)?
+                    .apply(&self.txt_mlp)?,
+            )?)?;
+
+        Ok((img, txt))
+    }
+}
+
+fn double_stream_block_bytes(block: &DoubleStreamBlock) -> usize {
+    layer_norm_bytes(&block.img_norm1)
+        + double_attention_bytes(&block.img_attn)
+        + layer_norm_bytes(&block.img_norm2)
+        + mlp_bytes(&block.img_mlp)
+        + double_attention_bytes(&block.txt_attn)
+        + layer_norm_bytes(&block.txt_norm1)
+        + layer_norm_bytes(&block.txt_norm2)
+        + mlp_bytes(&block.txt_mlp)
+}
+
+// ---------------------------------------------------------------------------
+// SingleStreamBlock (diffusers naming)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct SingleStreamBlock {
+    linear1: Flux2Linear,
+    linear2: Flux2Linear,
+    norm_q: RmsNorm,
+    norm_k: RmsNorm,
+    pre_norm: LayerNorm,
+    h_sz: usize,
+    mlp_sz: usize,
+    num_heads: usize,
+}
+
+impl SingleStreamBlock {
+    fn new(cfg: &Flux2Config, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        let h_sz = cfg.hidden_size;
+        let mlp_sz = (h_sz as f64 * cfg.mlp_ratio) as usize;
+        let head_dim = h_sz / cfg.num_heads;
+        let attn_vb = vb.pp("attn");
+        // Fused: QKV (3*h_sz) + SwiGLU (2*mlp_sz) → to_qkv_mlp_proj
+        let linear1 = flux2_linear_no_bias(
+            h_sz,
+            h_sz * 3 + mlp_sz * 2,
+            widen,
+            attn_vb.pp("to_qkv_mlp_proj"),
+        )?;
+        // Output: attn (h_sz) + mlp (mlp_sz) → to_out
+        let linear2 = flux2_linear_no_bias(h_sz + mlp_sz, h_sz, widen, attn_vb.pp("to_out"))?;
+        Ok(Self {
+            linear1,
+            linear2,
+            norm_q: RmsNorm::new(attn_vb.get(head_dim, "norm_q.weight")?, 1e-6),
+            norm_k: RmsNorm::new(attn_vb.get(head_dim, "norm_k.weight")?, 1e-6),
+            pre_norm: layer_norm(h_sz, &vb)?,
+            h_sz,
+            mlp_sz,
+            num_heads: cfg.num_heads,
+        })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            linear1: self.linear1.to_device(device)?,
+            linear2: self.linear2.to_device(device)?,
+            norm_q: rms_norm_to_device(&self.norm_q, device)?,
+            norm_k: rms_norm_to_device(&self.norm_k, device)?,
+            pre_norm: layer_norm_to_device(&self.pre_norm, device)?,
+            h_sz: self.h_sz,
+            mlp_sz: self.mlp_sz,
+            num_heads: self.num_heads,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor, mod_out: &ModulationOut, pe: &Tensor) -> Result<Tensor> {
+        let x_mod = mod_out.scale_shift(&xs.apply(&self.pre_norm)?)?;
+        let x_mod = x_mod.apply(&self.linear1)?;
+        let qkv = x_mod.narrow(D::Minus1, 0, 3 * self.h_sz)?;
+        let (b, l, _) = qkv.dims3()?;
+        let qkv = qkv.reshape((b, l, 3, self.num_heads, ()))?;
+        // Norm before transpose — see `DoubleAttention::qkv`. `i(.., .., n)`
+        // on the packed QKV is a narrow, so one `contiguous()` buys the fused
+        // kernel.
+        let q = qkv
+            .i((.., .., 0))?
+            .contiguous()?
+            .apply(&self.norm_q)?
+            .transpose(1, 2)?;
+        let k = qkv
+            .i((.., .., 1))?
+            .contiguous()?
+            .apply(&self.norm_k)?
+            .transpose(1, 2)?;
+        let v = qkv.i((.., .., 2))?.transpose(1, 2)?;
+        let mlp_portion = x_mod.narrow(D::Minus1, 3 * self.h_sz, self.mlp_sz * 2)?;
+        let attn = attention(&q, &k, &v, pe)?;
+        let mlp_gate = mlp_portion.narrow(D::Minus1, 0, self.mlp_sz)?.silu()?;
+        let mlp_val = mlp_portion.narrow(D::Minus1, self.mlp_sz, self.mlp_sz)?;
+        let mlp_out = (mlp_gate * mlp_val)?;
+        let output = Tensor::cat(&[attn, mlp_out], 2)?.apply(&self.linear2)?;
+        xs + mod_out.gate(&output)
+    }
+}
+
+fn single_stream_block_bytes(block: &SingleStreamBlock) -> usize {
+    flux2_linear_bytes(&block.linear1)
+        + flux2_linear_bytes(&block.linear2)
+        + rms_norm_bytes(&block.norm_q)
+        + rms_norm_bytes(&block.norm_k)
+        + layer_norm_bytes(&block.pre_norm)
+}
+
+// ---------------------------------------------------------------------------
+// LastLayer — final projection (diffusers: proj_out + norm_out)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct LastLayer {
+    norm_final: LayerNorm,
+    linear: Flux2Linear,
+    ada_ln_modulation: Flux2Linear,
+}
+
+impl LastLayer {
+    fn new(h_sz: usize, out_c: usize, widen: Flux2Fp8Widen, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            norm_final: layer_norm(h_sz, &vb)?,
+            linear: flux2_linear_no_bias(h_sz, out_c, widen, vb.pp("proj_out"))?,
+            ada_ln_modulation: flux2_linear_no_bias(
+                h_sz,
+                2 * h_sz,
+                widen,
+                vb.pp("norm_out").pp("linear"),
+            )?,
+        })
+    }
+
+    fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            norm_final: layer_norm_to_device(&self.norm_final, device)?,
+            linear: self.linear.to_device(device)?,
+            ada_ln_modulation: self.ada_ln_modulation.to_device(device)?,
+        })
+    }
+
+    fn forward(&self, xs: &Tensor, vec: &Tensor) -> Result<Tensor> {
+        let chunks = vec.silu()?.apply(&self.ada_ln_modulation)?.chunk(2, 1)?;
+        // Diffusers `AdaLayerNormContinuous` convention: scale first, shift second.
+        // Diffusers checkpoints store this ordering directly. BFL-native
+        // single-file checkpoints store (shift, scale) but `SingleFileBackend`
+        // applies `SwapHalves` when loading `norm_out.linear.weight` so the
+        // weight always arrives here in diffusers (scale, shift) order.
+        let (scale, shift) = (&chunks[0], &chunks[1]);
+        let xs = xs
+            .apply(&self.norm_final)?
+            .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
+            .broadcast_add(&shift.unsqueeze(1)?)?;
+        xs.apply(&self.linear)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flux2Transformer — full model (diffusers format)
+// ---------------------------------------------------------------------------
+
+/// Flux.2 transformer (BF16 safetensors, diffusers naming).
+///
+/// Key difference from FLUX.1: modulation is shared across all blocks.
+#[derive(Debug, Clone)]
+pub struct Flux2Transformer {
+    img_in: Flux2Linear,
+    txt_in: Flux2Linear,
+    time_in: MlpEmbedder,
+    vector_in: Option<MlpEmbedder>,
+    guidance_in: Option<MlpEmbedder>,
+    pe_embedder: EmbedNd,
+    // Shared modulation (NOT per-block)
+    double_mod_img: Modulation2,
+    double_mod_txt: Modulation2,
+    single_mod: Modulation1,
+    double_blocks: Vec<DoubleStreamBlock>,
+    single_blocks: Vec<SingleStreamBlock>,
+    final_layer: LastLayer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flux2StreamingBlock {
+    Double(usize),
+    Single(usize),
+}
+
+pub(crate) fn flux2_streaming_block_plan(cfg: &Flux2Config) -> Vec<Flux2StreamingBlock> {
+    let mut blocks = Vec::with_capacity(cfg.depth + cfg.depth_single_blocks);
+    blocks.extend((0..cfg.depth).map(Flux2StreamingBlock::Double));
+    blocks.extend((0..cfg.depth_single_blocks).map(Flux2StreamingBlock::Single));
+    blocks
+}
+
+enum DoubleBlockSlot {
+    Resident(DoubleStreamBlock),
+    Streamed(DoubleStreamBlock),
+}
+
+enum SingleBlockSlot {
+    Resident(SingleStreamBlock),
+    Streamed(SingleStreamBlock),
+}
+
+fn is_probable_cuda_oom(err: &candle_core::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("cuda_error_out_of_memory")
+        || msg.contains("out of memory")
+        || msg.contains("memory allocation")
+}
+
+fn materialize_flux2_block_slots(
+    double_blocks: &[DoubleStreamBlock],
+    single_blocks: &[SingleStreamBlock],
+    plan: &AdaptiveResidencyPlan,
+    device: &candle_core::Device,
+) -> Result<(Vec<DoubleBlockSlot>, Vec<SingleBlockSlot>)> {
+    let mut double_slots = Vec::with_capacity(double_blocks.len());
+    for (i, block) in double_blocks.iter().enumerate() {
+        if plan.resident.get(i).copied().unwrap_or(false) {
+            double_slots.push(DoubleBlockSlot::Resident(block.to_device(device)?));
+        } else {
+            double_slots.push(DoubleBlockSlot::Streamed(block.clone()));
+        }
+    }
+
+    let single_offset = double_blocks.len();
+    let mut single_slots = Vec::with_capacity(single_blocks.len());
+    for (i, block) in single_blocks.iter().enumerate() {
+        if plan
+            .resident
+            .get(single_offset + i)
+            .copied()
+            .unwrap_or(false)
+        {
+            single_slots.push(SingleBlockSlot::Resident(block.to_device(device)?));
+        } else {
+            single_slots.push(SingleBlockSlot::Streamed(block.clone()));
+        }
+    }
+
+    Ok((double_slots, single_slots))
+}
+
+pub(crate) struct OffloadedFlux2Transformer {
+    block_plan: Vec<Flux2StreamingBlock>,
+    img_in: Flux2Linear,
+    txt_in: Flux2Linear,
+    time_in: MlpEmbedder,
+    vector_in: Option<MlpEmbedder>,
+    guidance_in: Option<MlpEmbedder>,
+    pe_embedder: EmbedNd,
+    double_mod_img: Modulation2,
+    double_mod_txt: Modulation2,
+    single_mod: Modulation1,
+    double_blocks: Vec<DoubleBlockSlot>,
+    single_blocks: Vec<SingleBlockSlot>,
+    final_layer: LastLayer,
+    device: candle_core::Device,
+}
+
+impl OffloadedFlux2Transformer {
+    pub(crate) fn new(
+        cfg: &Flux2Config,
+        cpu_vb: VarBuilder,
+        device: &candle_core::Device,
+        gpu_ordinal: usize,
+        activation_budget: u64,
+        progress: &ProgressReporter,
+    ) -> Result<Self> {
+        let block_plan = flux2_streaming_block_plan(cfg);
+        let dense = Flux2Transformer::new(cfg, cpu_vb)?;
+        Self::from_dense(
+            dense,
+            block_plan,
+            device,
+            gpu_ordinal,
+            activation_budget,
+            progress,
+        )
+    }
+
+    fn from_dense(
+        dense: Flux2Transformer,
+        block_plan: Vec<Flux2StreamingBlock>,
+        device: &candle_core::Device,
+        gpu_ordinal: usize,
+        activation_budget: u64,
+        progress: &ProgressReporter,
+    ) -> Result<Self> {
+        let Flux2Transformer {
+            img_in,
+            txt_in,
+            time_in,
+            vector_in,
+            guidance_in,
+            pe_embedder,
+            double_mod_img,
+            double_mod_txt,
+            single_mod,
+            double_blocks,
+            single_blocks,
+            final_layer,
+        } = dense;
+
+        let img_in = img_in.to_device(device)?;
+        let txt_in = txt_in.to_device(device)?;
+        let time_in = time_in.to_device(device)?;
+        let vector_in = vector_in
+            .as_ref()
+            .map(|embedder| embedder.to_device(device))
+            .transpose()?;
+        let guidance_in = guidance_in
+            .as_ref()
+            .map(|embedder| embedder.to_device(device))
+            .transpose()?;
+        let double_mod_img = double_mod_img.to_device(device)?;
+        let double_mod_txt = double_mod_txt.to_device(device)?;
+        let single_mod = single_mod.to_device(device)?;
+        let final_layer = final_layer.to_device(device)?;
+
+        let mut block_sizes = Vec::with_capacity(double_blocks.len() + single_blocks.len());
+        block_sizes.extend(double_blocks.iter().map(double_stream_block_bytes));
+        block_sizes.extend(single_blocks.iter().map(single_stream_block_bytes));
+
+        let free_vram = crate::device::usable_free_vram_bytes(gpu_ordinal).unwrap_or(0);
+        let mut plan = plan_adaptive_residency(
+            &block_sizes,
+            free_vram,
+            // No weights outside the block set on this path.
+            0,
+            activation_budget,
+            ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM,
+        );
+
+        let (double_blocks, single_blocks, plan) = loop {
+            match materialize_flux2_block_slots(&double_blocks, &single_blocks, &plan, device) {
+                Ok((double_slots, single_slots)) => break (double_slots, single_slots, plan),
+                Err(err)
+                    if device.is_cuda()
+                        && plan.resident_count() > 0
+                        && is_probable_cuda_oom(&err) =>
+                {
+                    progress.info(&format!(
+                        "Flux.2 adaptive offload: resident allocation OOM at {} resident blocks; \
+                         retrying with fewer resident blocks",
+                        plan.resident_count()
+                    ));
+                    if let Err(sync_err) = device.synchronize() {
+                        tracing::warn!(
+                            "Flux.2 adaptive offload: synchronize after OOM failed: {sync_err}"
+                        );
+                    }
+                    if !plan.demote_largest_resident(&block_sizes) {
+                        return Err(err);
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        progress.info(&format!(
+            "Flux.2 adaptive offload: {} resident / {} streamed blocks \
+             (resident {:.2} GB, streamed {:.2} GB per denoise pass, reserve {:.2} GB)",
+            plan.resident_count(),
+            plan.streamed_count(),
+            plan.resident_bytes as f64 / 1_000_000_000.0,
+            plan.streamed_bytes as f64 / 1_000_000_000.0,
+            plan.reserved_bytes() as f64 / 1_000_000_000.0,
+        ));
+
+        Ok(Self {
+            block_plan,
+            img_in,
+            txt_in,
+            time_in,
+            vector_in,
+            guidance_in,
+            pe_embedder,
+            double_mod_img,
+            double_mod_txt,
+            single_mod,
+            double_blocks,
+            single_blocks,
+            final_layer,
+            device: device.clone(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if txt.rank() != 3 || img.rank() != 3 {
+            candle_core::bail!("expected rank 3, got txt={} img={}", txt.rank(), img.rank())
+        }
+        let device = &self.device;
+        let dtype = img.dtype();
+        let img = img.to_device(device)?;
+        let txt = txt.to_device(device)?;
+        let img_ids = img_ids.to_device(device)?;
+        let txt_ids = txt_ids.to_device(device)?;
+        let timesteps = timesteps.to_device(device)?;
+        let y = y.to_device(device)?;
+        let guidance = guidance.map(|g| g.to_device(device)).transpose()?;
+        let pe = {
+            let ids = Tensor::cat(&[&txt_ids, &img_ids], 1)?;
+            ids.apply(&self.pe_embedder)?
+        };
+        let mut txt = txt.apply(&self.txt_in)?;
+        let mut img = img.apply(&self.img_in)?;
+        let mut vec_ = timestep_embedding(&timesteps, 256, dtype)?.apply(&self.time_in)?;
+
+        if let (Some(g_in), Some(guidance)) = (self.guidance_in.as_ref(), guidance.as_ref()) {
+            vec_ = (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?;
+        }
+        if let Some(vec_in) = self.vector_in.as_ref() {
+            vec_ = (vec_ + y.apply(vec_in))?;
+        }
+
+        let (img_mod1, img_mod2) = self.double_mod_img.forward(&vec_)?;
+        let (txt_mod1, txt_mod2) = self.double_mod_txt.forward(&vec_)?;
+        debug_assert_eq!(
+            self.block_plan.len(),
+            self.double_blocks.len() + self.single_blocks.len()
+        );
+
+        for block in &self.double_blocks {
+            match block {
+                DoubleBlockSlot::Resident(block) => {
+                    (img, txt) = block
+                        .forward(&img, &txt, &img_mod1, &img_mod2, &txt_mod1, &txt_mod2, &pe)?;
+                }
+                DoubleBlockSlot::Streamed(block) => {
+                    let block = block.to_device(device)?;
+                    (img, txt) = block
+                        .forward(&img, &txt, &img_mod1, &img_mod2, &txt_mod1, &txt_mod2, &pe)?;
+                    device.synchronize()?;
+                    drop(block);
+                }
+            }
+        }
+
+        let single_mod = self.single_mod.forward(&vec_)?;
+        let mut img = Tensor::cat(&[&txt, &img], 1)?;
+        for block in &self.single_blocks {
+            match block {
+                SingleBlockSlot::Resident(block) => {
+                    img = block.forward(&img, &single_mod, &pe)?;
+                }
+                SingleBlockSlot::Streamed(block) => {
+                    let block = block.to_device(device)?;
+                    img = block.forward(&img, &single_mod, &pe)?;
+                    device.synchronize()?;
+                    drop(block);
+                }
+            }
+        }
+        let img = img.i((.., txt.dim(1)?..))?;
+        self.final_layer.forward(&img, &vec_)
+    }
+}
+
+impl Flux2Transformer {
+    /// See [`Flux2TransformerWrapper::resident_weight_dtype`]. The widen is
+    /// uniform across the network — one decision, taken once in `new` and
+    /// handed to every layer — so the first linear answers for all of them.
+    pub(crate) fn resident_weight_dtype(&self, loaded_dtype: DType) -> DType {
+        self.img_in.resident_weight_dtype(loaded_dtype)
+    }
+
+    pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+        // Resolved once, before the first weight lands, because the budget it
+        // reads is the card's free VRAM ahead of the load.
+        let widen = flux2_fp8_widen_for_load(cfg, vb.device());
+        let img_in =
+            flux2_linear_no_bias(cfg.in_channels, cfg.hidden_size, widen, vb.pp("x_embedder"))?;
+        let txt_in = flux2_linear_no_bias(
+            cfg.context_in_dim,
+            cfg.hidden_size,
+            widen,
+            vb.pp("context_embedder"),
+        )?;
+
+        let time_in = MlpEmbedder::new(
+            256,
+            cfg.hidden_size,
+            widen,
+            vb.pp("time_guidance_embed").pp("timestep_embedder"),
+        )?;
+
+        let vector_in = if cfg.vec_in_dim > 0 {
+            Some(MlpEmbedder::new(
+                cfg.vec_in_dim,
+                cfg.hidden_size,
+                widen,
+                vb.pp("vector_in"),
+            )?)
+        } else {
+            None
+        };
+
+        let guidance_in = if cfg.guidance_embed {
+            Some(MlpEmbedder::new(
+                256,
+                cfg.hidden_size,
+                widen,
+                vb.pp("time_guidance_embed").pp("guidance_embedder"),
+            )?)
+        } else {
+            None
+        };
+
+        // Shared modulation layers
+        let double_mod_img = Modulation2::new(
+            cfg.hidden_size,
+            widen,
+            vb.pp("double_stream_modulation_img"),
+        )?;
+        let double_mod_txt = Modulation2::new(
+            cfg.hidden_size,
+            widen,
+            vb.pp("double_stream_modulation_txt"),
+        )?;
+        let single_mod =
+            Modulation1::new(cfg.hidden_size, widen, vb.pp("single_stream_modulation"))?;
+
+        let mut double_blocks = Vec::with_capacity(cfg.depth);
+        let vb_d = vb.pp("transformer_blocks");
+        for idx in 0..cfg.depth {
+            double_blocks.push(DoubleStreamBlock::new(cfg, widen, vb_d.pp(idx))?);
+        }
+
+        let mut single_blocks = Vec::with_capacity(cfg.depth_single_blocks);
+        let vb_s = vb.pp("single_transformer_blocks");
+        for idx in 0..cfg.depth_single_blocks {
+            single_blocks.push(SingleStreamBlock::new(cfg, widen, vb_s.pp(idx))?);
+        }
+
+        let final_layer = LastLayer::new(cfg.hidden_size, cfg.in_channels, widen, vb.clone())?;
+        let pe_embedder = EmbedNd::new(cfg.theta, cfg.axes_dim.to_vec());
+
+        Ok(Self {
+            img_in,
+            txt_in,
+            time_in,
+            vector_in,
+            guidance_in,
+            pe_embedder,
+            double_mod_img,
+            double_mod_txt,
+            single_mod,
+            double_blocks,
+            single_blocks,
+            final_layer,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        if txt.rank() != 3 || img.rank() != 3 {
+            candle_core::bail!("expected rank 3, got txt={} img={}", txt.rank(), img.rank())
+        }
+        let dtype = img.dtype();
+        let pe = {
+            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+            ids.apply(&self.pe_embedder)?
+        };
+        let mut txt = txt.apply(&self.txt_in)?;
+        let mut img = img.apply(&self.img_in)?;
+        let mut vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
+
+        if let (Some(g_in), Some(guidance)) = (self.guidance_in.as_ref(), guidance) {
+            vec_ = (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?;
+        }
+        if let Some(vec_in) = self.vector_in.as_ref() {
+            vec_ = (vec_ + y.apply(vec_in))?;
+        }
+
+        // Shared modulation: compute once, reuse for all blocks
+        let (img_mod1, img_mod2) = self.double_mod_img.forward(&vec_)?;
+        let (txt_mod1, txt_mod2) = self.double_mod_txt.forward(&vec_)?;
+
+        for block in &self.double_blocks {
+            (img, txt) =
+                block.forward(&img, &txt, &img_mod1, &img_mod2, &txt_mod1, &txt_mod2, &pe)?;
+        }
+
+        let single_mod = self.single_mod.forward(&vec_)?;
+        let mut img = Tensor::cat(&[&txt, &img], 1)?;
+        for block in &self.single_blocks {
+            img = block.forward(&img, &single_mod, &pe)?;
+        }
+        let img = img.i((.., txt.dim(1)?..))?;
+        self.final_layer.forward(&img, &vec_)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wrapper enum for BF16 and GGUF quantized
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Flux2TransformerWrapper {
+    BF16(Flux2Transformer),
+    Offloaded(OffloadedFlux2Transformer),
+    Quantized(super::quantized_transformer::QuantizedFlux2Transformer),
+}
+
+// ---------------------------------------------------------------------------
+// Classifier-free guidance: one batched forward or two sequential ones
+// ---------------------------------------------------------------------------
+
+/// How a guided FLUX.2 [klein] base step issues its two predictions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flux2CfgBatching {
+    /// One forward at batch 2 — BFL's own shape (`flux2/sampling.py:375-406`).
+    /// Every weight is read once for both branches, which on a bandwidth-bound
+    /// tier is most of the step.
+    Batched,
+    /// Two batch-1 forwards. The historical path, and the fallback whenever
+    /// the card cannot hold the doubled activations — or, defensively, if the
+    /// two branches ever arrive at different lengths.
+    Sequential,
+}
+
+impl Flux2CfgBatching {
+    /// The sentence the progress stream publishes for this choice.
+    ///
+    /// `Sequential` no longer names a cause: since every Klein prompt is
+    /// padded to a fixed 512 rows, the length gate is unreachable in practice
+    /// and the only reason a real render takes two forwards is the VRAM
+    /// budget — which the line would have been reporting as "prompts differ in
+    /// length", a sentence that was never true again.
+    pub(crate) fn progress_note(self) -> &'static str {
+        match self {
+            Self::Batched => "one batched forward per step",
+            Self::Sequential => "two forwards per step",
+        }
+    }
+}
+
+/// Whether a batch-2 CFG forward fits the card.
+///
+/// Charged against the card's TOTAL VRAM rather than what happens to be free
+/// at this instant, so the server's plan and the engine reach the same answer
+/// for the same request — a decision that flipped between planning and
+/// execution would mis-price every queued job behind it.
+pub fn flux2_cfg_batching(
+    transformer_bytes: u64,
+    activation_bytes_batch2: u64,
+    device_total_bytes: u64,
+) -> Flux2CfgBatching {
+    let required = transformer_bytes
+        .checked_add(activation_bytes_batch2)
+        .and_then(|bytes| bytes.checked_add(ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM));
+    match required {
+        Some(required) if required <= device_total_bytes => Flux2CfgBatching::Batched,
+        _ => Flux2CfgBatching::Sequential,
+    }
+}
+
+/// The resolved batching for a guided render: the token-length gate, then the
+/// budget.
+///
+/// The length gate is not a budget question and cannot be folded into one: a
+/// negative prompt of a different length produces a different `txt` sequence
+/// and the two branches cannot be concatenated on the batch axis at all —
+/// upstream's `cat([txt_empty, txt_prompt])` (`flux2/sampling.py:368`) assumes
+/// a padded encoder.
+///
+/// mold now HAS that padded encoder: every Klein prompt is truncated and
+/// right-padded to `FLUX2_KLEIN_MAX_LENGTH` rows before it leaves
+/// `encoders::qwen3`, so both branches are 512 long and the gate passes for
+/// every real render. It stays as a structural guard rather than being
+/// deleted — the concatenation below is only valid when it holds, and a
+/// future conditioning path (a cached embedding from another contract, an
+/// encoder that declines to pad) must fall back rather than fail mid-step.
+pub fn flux2_cfg_batching_for(
+    positive_txt_tokens: usize,
+    negative_txt_tokens: usize,
+    transformer_bytes: u64,
+    activation_bytes_batch2: u64,
+    device_total_bytes: u64,
+) -> Flux2CfgBatching {
+    if positive_txt_tokens != negative_txt_tokens {
+        return Flux2CfgBatching::Sequential;
+    }
+    flux2_cfg_batching(
+        transformer_bytes,
+        activation_bytes_batch2,
+        device_total_bytes,
+    )
+}
+
+/// Peak activation bytes one FLUX.2 forward holds beyond the weights.
+///
+/// Counted per token over the tensors that are live at the same moment inside
+/// one single-stream block, which is the widest point in the model: the
+/// working hidden state, the fused `3*hidden + 2*mlp` projection, its SwiGLU
+/// product, and the attention output. Math attention additionally materializes
+/// a query-chunk-bounded score tile per head; flash materializes none, which is
+/// why the backend is an input rather than an assumption.
+pub fn flux2_activation_bytes_for(
+    cfg: &Flux2Config,
+    tokens: usize,
+    batch: usize,
+    dtype: DType,
+    backend: crate::attention::AttentionBackend,
+) -> u64 {
+    /// The query rows math attention keeps live at once; mirrors the chunk the
+    /// shared math path bounds itself to.
+    const MATH_SCORE_TILE_ROWS: u64 = 512;
+
+    let width = dtype.size_in_bytes() as u64;
+    let hidden = cfg.hidden_size as u64;
+    let mlp = (cfg.hidden_size as f64 * cfg.mlp_ratio) as u64;
+    let tokens = tokens as u64;
+    let batch = batch as u64;
+
+    let per_token = hidden + (3 * hidden + 2 * mlp) + mlp + hidden;
+    let stream = batch * tokens * per_token * width;
+    let scores = match backend {
+        crate::attention::AttentionBackend::Flash => 0,
+        crate::attention::AttentionBackend::Math => {
+            batch * cfg.num_heads as u64 * MATH_SCORE_TILE_ROWS * tokens * width
+        }
+    };
+    stream.saturating_add(scores)
+}
+
+/// The unconditional branch of a classifier-free-guided FLUX.2 render.
+///
+/// Only the undistilled [klein] base checkpoints use one: they carry no
+/// guidance embedding, so `guidance` can only reach the render as a real CFG
+/// scale over a second forward. `diffusers`'
+/// `pipeline_flux2_klein.py:747-753,862-875` is the contract — the negative
+/// prompt defaults to `""`, both branches see the identical latent and ids,
+/// and the combination is `neg + scale * (pos - neg)`.
+///
+/// "Identical latent and ids" now also covers REFERENCE tokens, and that is
+/// load-bearing rather than incidental: upstream builds `latent_model_input`
+/// once per step, with the references already concatenated, and passes the
+/// same tensor to both the conditional and the unconditional forward
+/// (`:862-873`). The two branches differ ONLY in text. Below, `model_img` /
+/// `model_img_ids` are likewise built once per step and both `forward_once`
+/// calls take them, so a Klein-base reference render guides between two
+/// predictions that saw the same references — never between one that saw them
+/// and one that did not, which would push the render away from the very
+/// images the user attached.
+pub(crate) struct Flux2CfgBranch<'a> {
+    /// `guidance_scale`; the branch is constructed only when it exceeds 1.
+    pub scale: f64,
+    /// The negative prompt's encoder hidden states.
+    pub txt: &'a Tensor,
+    pub txt_ids: &'a Tensor,
+    /// Resolved by the caller, which is the one place that knows the config,
+    /// the card and both prompts' lengths. The engine obeys it rather than
+    /// re-deciding, so the plan and the render cannot disagree.
+    pub batching: Flux2CfgBatching,
+}
+
+/// Whether the positional embedding these ids build can be shared across a
+/// doubled batch.
+///
+/// `apply_rope` broadcasts a batch-1 embedding over any batch, and nothing
+/// else: at any other leading dim the embedding's batch axis lines up against
+/// the head axis. The latent's own batch is one for every render that reaches
+/// the CFG path, so this is a guard rather than a restriction.
+fn batchable_positional_embedding(img_ids: &Tensor) -> bool {
+    img_ids.dim(0).map(|b| b == 1).unwrap_or(false)
+}
+
+impl Flux2TransformerWrapper {
+    /// The dtype this transformer's weights are actually HELD at.
+    ///
+    /// Everything but an FP8 tier that declined the widen holds its weights at
+    /// the working dtype it was loaded with, so the residency budget can be
+    /// derived from the checkpoint's parameter count. An FP8 slab that stayed
+    /// packed ([`Flux2Fp8Widen::PerForward`]) holds ONE byte per parameter and
+    /// casts per forward, which is the file's own figure — and the widen is
+    /// resolved once, from the card's free VRAM BEFORE the load, so it cannot
+    /// be re-derived afterwards against a card the weights are already on. The
+    /// loaded transformer is therefore the only honest authority, and this is
+    /// how it answers.
+    pub(crate) fn resident_weight_dtype(&self, loaded_dtype: DType) -> DType {
+        match self {
+            Self::BF16(transformer) => transformer.resident_weight_dtype(loaded_dtype),
+            // Quantized weights are charged at their file length, which never
+            // consults this. Streamed weights DO consult it — the held figure
+            // is then capped at the streaming working set by
+            // `device::resident_transformer_charge_bytes` — and settle at the
+            // dtype they were loaded at, so the loaded dtype is the answer.
+            Self::Offloaded(_) | Self::Quantized(_) => loaded_dtype,
+        }
+    }
+
+    /// The advice the non-finite bail may offer for THIS transformer, or
+    /// `None`.
+    ///
+    /// Only a GGUF tier actually running the MMQ fast path has a quantized
+    /// matmul to turn off. A BF16 tier, a streamed one, and an FP8 single-file
+    /// remap (`flux2-dev:fp8`, which the campaign UAT bailed on) carry none,
+    /// and telling their operator to set `MOLD_FLUX2_QMATMUL=0` sends them
+    /// after an arm that was never in the render.
+    fn nonfinite_hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Quantized(_) if super::quantized_transformer::flux2_qmatmul_enabled() => {
+                Some(crate::flux_debug::FLUX2_QMATMUL_HINT)
+            }
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn denoise(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        reference: Option<(&Tensor, &Tensor)>,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        vec_: &Tensor,
+        timesteps: &[f64],
+        guidance: f64,
+        progress: &crate::progress::ProgressReporter,
+        inpaint_ctx: Option<&crate::img_utils::InpaintContext>,
+        preview: Option<&crate::latent_preview::LatentPreviewer>,
+        cfg: Option<&Flux2CfgBranch<'_>>,
+    ) -> anyhow::Result<Tensor> {
+        use crate::progress::ProgressEvent;
+        use std::time::Instant;
+
+        let b_sz = img.dim(0)?;
+        let dev = img.device();
+        let guidance_tensor = Tensor::full(guidance as f32, b_sz, dev)?;
+        let mut img = img.clone();
+        let total_steps = timesteps.len().saturating_sub(1);
+
+        for (step, window) in timesteps.windows(2).enumerate() {
+            progress.checkpoint()?;
+            let step_start = Instant::now();
+            let (t_curr, t_prev) = match window {
+                [a, b] => (a, b),
+                _ => continue,
+            };
+            let t_vec = Tensor::full(*t_curr as f32, b_sz, dev)?;
+
+            let (model_img, model_img_ids) = if let Some((reference_img, reference_ids)) = reference
+            {
+                (
+                    Tensor::cat(&[&img, reference_img], 1)?,
+                    Tensor::cat(&[img_ids, reference_ids], 1)?,
+                )
+            } else {
+                (img.clone(), img_ids.clone())
+            };
+            // `None` takes exactly the call the single-forward path always
+            // made — the same conditioning, the same arguments — so a
+            // distilled render is byte-identical to one made before any of
+            // this existed.
+            let pred = match cfg {
+                Some(branch)
+                    if branch.batching == Flux2CfgBatching::Batched
+                        && batchable_positional_embedding(&model_img_ids) =>
+                {
+                    // BFL `flux2/sampling.py:375-406`: duplicate the latent,
+                    // concatenate the text with the UNCONDITIONAL branch
+                    // first, run ONE forward, and `pred.chunk(2)`. Every
+                    // weight is read once for both branches.
+                    //
+                    // The ids are NOT duplicated, unlike upstream's. The
+                    // rotary embedding is a function of position alone, so
+                    // both batch rows want the identical table, and mold's
+                    // `apply_rope` broadcasts a batch-shared one over any
+                    // batch — duplicating it would instead line the embedding's
+                    // batch axis up against the head axis and fail to
+                    // broadcast at all.
+                    let img = Tensor::cat(&[&model_img, &model_img], 0)?;
+                    let txt = Tensor::cat(&[branch.txt, txt], 0)?;
+                    let t_vec = Tensor::full(*t_curr as f32, b_sz * 2, dev)?;
+                    let guidance_tensor = Tensor::full(guidance as f32, b_sz * 2, dev)?;
+                    let vec_ = Tensor::cat(&[vec_, vec_], 0)?;
+                    let both = self.forward_once(
+                        &img,
+                        &model_img_ids,
+                        &txt,
+                        txt_ids,
+                        &t_vec,
+                        &vec_,
+                        &guidance_tensor,
+                    )?;
+                    let halves = both.chunk(2, 0)?;
+                    let [neg, pos] = halves.as_slice() else {
+                        anyhow::bail!(
+                            "a batched CFG forward must split into two predictions, got {}",
+                            halves.len()
+                        )
+                    };
+                    // `pipeline_flux2_klein.py:875` / `sampling.py:405`:
+                    // `noise_pred = neg + guidance_scale * (noise_pred - neg)`
+                    (neg + ((pos - neg)? * branch.scale)?)?
+                }
+                Some(branch) => {
+                    let pred = self.forward_once(
+                        &model_img,
+                        &model_img_ids,
+                        txt,
+                        txt_ids,
+                        &t_vec,
+                        vec_,
+                        &guidance_tensor,
+                    )?;
+                    let neg = self.forward_once(
+                        &model_img,
+                        &model_img_ids,
+                        branch.txt,
+                        branch.txt_ids,
+                        &t_vec,
+                        vec_,
+                        &guidance_tensor,
+                    )?;
+                    (&neg + ((&pred - &neg)? * branch.scale)?)?
+                }
+                None => self.forward_once(
+                    &model_img,
+                    &model_img_ids,
+                    txt,
+                    txt_ids,
+                    &t_vec,
+                    vec_,
+                    &guidance_tensor,
+                )?,
+            };
+            // Drop the reference tokens back off the prediction. The model
+            // was handed target + references as one sequence and returns a
+            // velocity for all of it; only the target's slice is integrated
+            // (`pipeline_flux2_klein.py:860`). This narrow is also what keeps
+            // the latent preview and the inpaint blend below on the TARGET
+            // grid — both index `img`'s shape, and a reference-extended `pred`
+            // would silently mis-shape them.
+            let pred = pred.narrow(1, 0, img.dim(1)?)?;
+            // Off by default and a boolean when off; see `crate::flux_debug`.
+            crate::flux_debug::check_step_is_finite(
+                &pred,
+                "prediction",
+                step,
+                self.nonfinite_hint(),
+            )?;
+            img = (img + &pred * (t_prev - t_curr))?;
+
+            // Inpainting: blend preserved regions back at current noise level
+            if let Some(ctx) = inpaint_ctx {
+                img = crate::img2img::apply_flow_match_inpaint(&img, ctx, *t_prev)?;
+            }
+
+            progress.emit(ProgressEvent::DenoiseStep {
+                step: step + 1,
+                total: total_steps,
+                elapsed: step_start.elapsed(),
+            });
+            if let Some(previewer) = preview {
+                if previewer.due(step + 1, total_steps) {
+                    // Preview the predicted clean image (flow matching:
+                    // x0 = x_t - t*v), not the still-noisy working latent —
+                    // composition is visible from the first step.
+                    match &img - &(&pred * *t_prev)? {
+                        Ok(x0_est) => {
+                            previewer.maybe_emit(progress, &x0_est, step + 1, total_steps)
+                        }
+                        Err(e) => tracing::warn!("skipping denoise preview: {e}"),
+                    }
+                }
+            }
+        }
+        progress.checkpoint()?;
+        Ok(img)
+    }
+
+    /// One transformer forward, routed to whichever of the three arms this is.
+    ///
+    /// Extracted so the conditional pass and the CFG unconditional pass are
+    /// the SAME call rather than two hand-kept copies of a three-arm match:
+    /// the two must differ only in their text conditioning.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_once(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        t_vec: &Tensor,
+        vec_: &Tensor,
+        guidance: &Tensor,
+    ) -> anyhow::Result<Tensor> {
+        let pred = match self {
+            Self::BF16(m) => m.forward(img, img_ids, txt, txt_ids, t_vec, vec_, Some(guidance))?,
+            Self::Offloaded(m) => {
+                m.forward(img, img_ids, txt, txt_ids, t_vec, vec_, Some(guidance))?
+            }
+            Self::Quantized(m) => {
+                m.forward(img, img_ids, txt, txt_ids, t_vec, vec_, Some(guidance))?
+            }
+        };
+        Ok(pred)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the card is HOLDING, per layer.
+    ///
+    /// The residency budget derives the transformer's device bytes from the
+    /// checkpoint's parameter count times the dtype its weights are held at,
+    /// and for an FP8 tier that dtype is the WIDEN's answer, not the working
+    /// dtype: a widened slab is two bytes per parameter where the file is one,
+    /// and a slab that declined the widen is still the file's own figure. The
+    /// widen is resolved from the card's free VRAM BEFORE the load, so it
+    /// cannot be re-derived afterwards — only the built layer knows.
+    #[test]
+    fn only_an_unwidened_fp8_layer_departs_from_the_working_dtype() {
+        let device = candle_core::Device::Cpu;
+        let weight = Tensor::zeros((2, 2), DType::F32, &device).unwrap();
+        let standard = Flux2Linear::Standard(candle_nn::Linear::new(weight.clone(), None));
+        assert_eq!(standard.resident_weight_dtype(DType::F32), DType::F32);
+        assert_eq!(standard.resident_weight_dtype(DType::BF16), DType::BF16);
+
+        let widened = Flux2Linear::Fp8Widened {
+            weight: weight.clone(),
+            scale: None,
+            bias: None,
+        };
+        assert_eq!(
+            widened.resident_weight_dtype(DType::BF16),
+            DType::BF16,
+            "a widened slab holds the working dtype — two bytes per parameter"
+        );
+
+        let packed = Flux2Linear::Fp8 {
+            weight,
+            scale: None,
+            bias: None,
+        };
+        assert_eq!(
+            packed.resident_weight_dtype(DType::BF16),
+            DType::F8E4M3,
+            "a slab that declined the widen is still one byte per parameter"
+        );
+    }
+
+    /// Denoise the tiny synthetic transformer for one step, optionally with an
+    /// unconditional branch. Returns the resulting latent as f32.
+    fn denoise_once(
+        wrapper: &Flux2TransformerWrapper,
+        guidance: f64,
+        cfg: Option<(&Tensor, &Tensor, f64)>,
+    ) -> Vec<f32> {
+        use crate::flux2::quantized_transformer::test_support::spread;
+        let device = candle_core::Device::Cpu;
+        let txt = spread((2, 6), 3.2).reshape((1, 2, 6)).unwrap();
+        let txt_ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+        denoise_once_with_text(wrapper, guidance, &txt, &txt_ids, cfg)
+    }
+
+    /// As `denoise_once`, with the positive conditioning supplied.
+    fn denoise_once_with_text(
+        wrapper: &Flux2TransformerWrapper,
+        guidance: f64,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        cfg: Option<(&Tensor, &Tensor, f64)>,
+    ) -> Vec<f32> {
+        denoise_once_with_reference(wrapper, guidance, txt, txt_ids, cfg, None)
+    }
+
+    /// A pair of reference tokens and their ids in the shape
+    /// `sampling::pack_reference_group` produces for this tiny config: two
+    /// tokens on time plane 10, `in_channels`-wide, ids rank 3.
+    fn tiny_reference() -> (Tensor, Tensor) {
+        use crate::flux2::quantized_transformer::test_support::spread;
+        let device = candle_core::Device::Cpu;
+        // Deliberately far from the target tokens' scale: the tiny synthetic
+        // transformer damps everything through 0.1-magnitude weights, so
+        // reference values in the target's own range would move the
+        // prediction by only ~1e-6 and leave the assertions below chasing
+        // f32 noise.
+        let tokens = (spread((2, 4), 7.7) * 40.0)
+            .unwrap()
+            .reshape((1, 2, 4))
+            .unwrap();
+        let ids = Tensor::from_vec(
+            vec![10.0f32, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0],
+            (1, 2, 4),
+            &device,
+        )
+        .unwrap();
+        (tokens, ids)
+    }
+
+    /// As `denoise_once_with_text`, optionally appending reference tokens.
+    fn denoise_once_with_reference(
+        wrapper: &Flux2TransformerWrapper,
+        guidance: f64,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        cfg: Option<(&Tensor, &Tensor, f64)>,
+        reference: Option<(&Tensor, &Tensor)>,
+    ) -> Vec<f32> {
+        denoise_once_batched(
+            wrapper,
+            guidance,
+            txt,
+            txt_ids,
+            cfg,
+            reference,
+            Flux2CfgBatching::Sequential,
+        )
+    }
+
+    /// As `denoise_once_with_reference`, with the CFG batching mode named.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise_once_batched(
+        wrapper: &Flux2TransformerWrapper,
+        guidance: f64,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        cfg: Option<(&Tensor, &Tensor, f64)>,
+        reference: Option<(&Tensor, &Tensor)>,
+        batching: Flux2CfgBatching,
+    ) -> Vec<f32> {
+        use crate::flux2::quantized_transformer::test_support::spread;
+        let device = candle_core::Device::Cpu;
+        let img = spread((3, 4), 3.1).reshape((1, 3, 4)).unwrap();
+        let img_ids = Tensor::zeros((1, 3, 4), DType::F32, &device).unwrap();
+        let vec_ = Tensor::zeros((1, 1), DType::F32, &device).unwrap();
+        let branch = cfg.map(|(txt, txt_ids, scale)| Flux2CfgBranch {
+            scale,
+            txt,
+            txt_ids,
+            batching,
+        });
+        let progress = crate::progress::ProgressReporter::default();
+        wrapper
+            .denoise(
+                &img,
+                &img_ids,
+                reference,
+                txt,
+                txt_ids,
+                &vec_,
+                &[1.0, 0.0],
+                guidance,
+                &progress,
+                None,
+                None,
+                branch.as_ref(),
+            )
+            .expect("denoise")
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+    }
+
+    /// A render that asks for no unconditional branch must take exactly the
+    /// path it took before the branch existed — same conditioning, same single
+    /// forward. Pinned by construction: `forward_once` is the only caller.
+    #[test]
+    fn a_render_without_a_cfg_branch_is_unchanged_by_a_scale_of_one() {
+        use crate::flux2::quantized_transformer::test_support::{
+            spread, tiny_cfg, tiny_transformer,
+        };
+        let cfg = tiny_cfg(false);
+        let wrapper = Flux2TransformerWrapper::Quantized(tiny_transformer(&cfg));
+        let device = candle_core::Device::Cpu;
+
+        let plain = denoise_once(&wrapper, 1.0, None);
+        // The SAME conditioning on both branches at scale 1.0:
+        // neg + 1.0 * (pos - neg) == pos.
+        let txt = spread((2, 6), 3.2).reshape((1, 2, 6)).unwrap();
+        let txt_ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+        let inert = denoise_once(&wrapper, 1.0, Some((&txt, &txt_ids, 1.0)));
+
+        assert_eq!(plain.len(), inert.len());
+        for (a, b) in plain.iter().zip(&inert) {
+            assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+        }
+    }
+
+    /// The combination is `neg + scale * (pos - neg)`
+    /// (`pipeline_flux2_klein.py:875`), and this pins it exactly rather than
+    /// settling for "the render changed". Over one step the update is
+    /// `img - pred`, so a conditional-only run, an unconditional-only run and
+    /// a guided run are related by that same lerp — with the sign inverted,
+    /// or the branches swapped, the identity fails.
+    #[test]
+    fn the_cfg_combination_is_the_upstream_lerp_between_the_two_branches() {
+        use crate::flux2::quantized_transformer::test_support::{
+            spread, tiny_cfg, tiny_transformer,
+        };
+        let cfg = tiny_cfg(false);
+        let wrapper = Flux2TransformerWrapper::Quantized(tiny_transformer(&cfg));
+        let device = candle_core::Device::Cpu;
+        // The positive conditioning `denoise_once` uses, and a different
+        // negative one.
+        let pos_txt = spread((2, 6), 3.2).reshape((1, 2, 6)).unwrap();
+        let neg_txt = spread((2, 6), 4.9).reshape((1, 2, 6)).unwrap();
+        let ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+
+        let scale = 3.0_f32;
+        // Conditional only, unconditional only, and the guided render.
+        let conditional = denoise_once(&wrapper, 1.0, None);
+        let unconditional = denoise_once_with_text(&wrapper, 1.0, &neg_txt, &ids, None);
+        let guided = denoise_once(&wrapper, 1.0, Some((&neg_txt, &ids, scale as f64)));
+
+        assert!(
+            conditional
+                .iter()
+                .zip(&unconditional)
+                .any(|(a, b)| (a - b).abs() > 1e-5),
+            "the two conditionings must actually differ, or the identity is vacuous"
+        );
+        for ((got, uncond), cond) in guided.iter().zip(&unconditional).zip(&conditional) {
+            let want = uncond + scale * (cond - uncond);
+            assert!(
+                (got - want).abs() < 1e-3,
+                "guided {got} != neg + {scale} * (pos - neg) = {want}",
+            );
+        }
+        // And the positive conditioning is the one that was guided toward,
+        // not the negative: this is what an accidental swap breaks.
+        assert!(pos_txt
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .zip(neg_txt.flatten_all().unwrap().to_vec1::<f32>().unwrap())
+            .any(|(a, b)| (a - b).abs() > 1e-6),);
+    }
+
+    /// References lengthen the sequence the transformer attends over, but the
+    /// latent that gets integrated is still only the TARGET's — the model's
+    /// prediction is narrowed back to `img.dim(1)` before the flow-matching
+    /// update (`pipeline_flux2_klein.py:860`). So the render must come back
+    /// the target's length, and it must actually have been conditioned:
+    /// a build that appended the tokens and then ignored them would return
+    /// the same numbers as a plain render.
+    #[test]
+    fn a_reference_extended_sequence_returns_a_target_length_prediction() {
+        use crate::flux2::quantized_transformer::test_support::{tiny_cfg, tiny_transformer};
+        let cfg = tiny_cfg(false);
+        let wrapper = Flux2TransformerWrapper::Quantized(tiny_transformer(&cfg));
+        let device = candle_core::Device::Cpu;
+        let txt = crate::flux2::quantized_transformer::test_support::spread((2, 6), 3.2)
+            .reshape((1, 2, 6))
+            .unwrap();
+        let txt_ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+
+        let plain = denoise_once_with_reference(&wrapper, 1.0, &txt, &txt_ids, None, None);
+        let (ref_tokens, ref_ids) = tiny_reference();
+        let referenced = denoise_once_with_reference(
+            &wrapper,
+            1.0,
+            &txt,
+            &txt_ids,
+            None,
+            Some((&ref_tokens, &ref_ids)),
+        );
+
+        assert_eq!(
+            plain.len(),
+            referenced.len(),
+            "a reference-extended sequence must still integrate only the target tokens"
+        );
+        assert!(
+            plain
+                .iter()
+                .zip(&referenced)
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "the references must reach the model — an ignored group renders identically"
+        );
+    }
+
+    /// A Klein-base render guides between two forwards that must see the SAME
+    /// reference tokens: upstream builds `latent_model_input` once with the
+    /// references already concatenated and hands it to both branches
+    /// (`pipeline_flux2_klein.py:862-873`). Over one step the update is
+    /// `img - pred`, so the same lerp identity that pins the plain CFG
+    /// combination pins this one — and it only holds if both branches were
+    /// conditioned on the references. Feed them to the positive branch alone
+    /// and the guided result stops being a lerp of the two.
+    #[test]
+    fn both_cfg_branches_see_the_same_reference_tokens() {
+        use crate::flux2::quantized_transformer::test_support::{
+            spread, tiny_cfg, tiny_transformer,
+        };
+        let cfg = tiny_cfg(false);
+        let wrapper = Flux2TransformerWrapper::Quantized(tiny_transformer(&cfg));
+        let device = candle_core::Device::Cpu;
+        let pos_txt = spread((2, 6), 3.2).reshape((1, 2, 6)).unwrap();
+        let neg_txt = spread((2, 6), 4.9).reshape((1, 2, 6)).unwrap();
+        let ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+        let (ref_tokens, ref_ids) = tiny_reference();
+        let reference = Some((&ref_tokens, &ref_ids));
+
+        let scale = 3.0_f32;
+        let conditional =
+            denoise_once_with_reference(&wrapper, 1.0, &pos_txt, &ids, None, reference);
+        let unconditional =
+            denoise_once_with_reference(&wrapper, 1.0, &neg_txt, &ids, None, reference);
+        let guided = denoise_once_with_reference(
+            &wrapper,
+            1.0,
+            &pos_txt,
+            &ids,
+            Some((&neg_txt, &ids, scale as f64)),
+            reference,
+        );
+
+        // The bug this guards against is feeding the references to the
+        // positive forward only. That render would combine a
+        // reference-conditioned positive with a reference-BLIND negative, so
+        // compare the guided result against both candidate lerps and require
+        // it to sit on the reference-conditioned one by a wide margin. Stated
+        // as a ratio rather than an absolute tolerance because the tiny
+        // synthetic transformer damps every conditioning term to ~1e-6.
+        let blind_unconditional =
+            denoise_once_with_reference(&wrapper, 1.0, &neg_txt, &ids, None, None);
+        let worst = |uncond: &[f32]| {
+            guided
+                .iter()
+                .zip(uncond)
+                .zip(&conditional)
+                .map(|((got, u), c)| (got - (u + scale * (c - u))).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let on_shared_references = worst(&unconditional);
+        let on_blind_negative = worst(&blind_unconditional);
+
+        assert!(
+            on_blind_references_is_distinguishable(on_blind_negative),
+            "the references must actually move the unconditional branch, or the check is vacuous"
+        );
+        assert!(
+            on_blind_negative > 10.0 * on_shared_references,
+            "guided render matches the reference-blind combination ({on_blind_negative:e}) as well \
+             as the shared-reference one ({on_shared_references:e}) — both branches must see the \
+             same reference tokens"
+        );
+    }
+
+    /// The reference-blind combination has to be far enough from zero that the
+    /// ratio above is measuring conditioning rather than f32 rounding.
+    fn on_blind_references_is_distinguishable(residual: f32) -> bool {
+        residual > 1e-7
+    }
+
+    /// The widen-at-load budget, over the tiers and the cards that matter.
+    ///
+    /// The pure function takes the checkpoint's FP8 bytes and the card's
+    /// usable free VRAM measured BEFORE the load, and requires three copies
+    /// (the F8 slab, plus two bytes per parameter for its working-dtype copy)
+    /// to fit beside the 2 GB runtime headroom. Every "already spoken for"
+    /// row is the same card with activations, the VAE and a text encoder
+    /// already resident, which is what makes the answer resolution-dependent.
+    #[test]
+    fn fp8_widen_policy_matrix() {
+        const GB: u64 = 1_000_000_000;
+        let klein_4b = flux2_fp8_checkpoint_bytes(&Flux2Config::klein());
+        let klein_9b = flux2_fp8_checkpoint_bytes(&Flux2Config::klein_9b());
+        let dev = flux2_fp8_checkpoint_bytes(&Flux2Config::dev());
+
+        // The estimate has to be the tier the name promises, or every row
+        // below is measuring the wrong number.
+        assert!(
+            (3 * GB..5 * GB).contains(&klein_4b),
+            "klein-4B fp8 estimated at {klein_4b} bytes"
+        );
+        assert!(
+            (8 * GB..10 * GB).contains(&klein_9b),
+            "klein-9B fp8 estimated at {klein_9b} bytes"
+        );
+        assert!(
+            (30 * GB..36 * GB).contains(&dev),
+            "dev fp8 estimated at {dev} bytes"
+        );
+
+        let rows: [(&str, u64, u64, Flux2Fp8Widen); 7] = [
+            (
+                "klein-4B on an idle 24 GB card",
+                klein_4b,
+                23 * GB,
+                Flux2Fp8Widen::AtLoad,
+            ),
+            (
+                "klein-4B on a 24 GB card with 13 GB already spoken for",
+                klein_4b,
+                10 * GB,
+                Flux2Fp8Widen::PerForward,
+            ),
+            (
+                "klein-9B on an idle 24 GB card — three copies never fit",
+                klein_9b,
+                23 * GB,
+                Flux2Fp8Widen::PerForward,
+            ),
+            (
+                "klein-9B on an idle 46 GB L40S at 1024 squared",
+                klein_9b,
+                43 * GB,
+                Flux2Fp8Widen::AtLoad,
+            ),
+            (
+                "klein-9B on the same card at 2048 squared, 18 GB spoken for",
+                klein_9b,
+                27 * GB,
+                Flux2Fp8Widen::PerForward,
+            ),
+            (
+                "dev on an idle 46 GB L40S — 32 GB of weights, three copies is 96",
+                dev,
+                45 * GB,
+                Flux2Fp8Widen::PerForward,
+            ),
+            ("dev on a 141 GB H200", dev, 139 * GB, Flux2Fp8Widen::AtLoad),
+        ];
+        for (what, fp8_bytes, free, want) in rows {
+            assert_eq!(
+                flux2_fp8_widen_policy(fp8_bytes, free),
+                want,
+                "{what}: {fp8_bytes} fp8 bytes against {free} free"
+            );
+        }
+
+        // The boundary itself, so the inequality cannot silently flip.
+        let exact = 3 * klein_4b + ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM;
+        assert_eq!(
+            flux2_fp8_widen_policy(klein_4b, exact),
+            Flux2Fp8Widen::AtLoad,
+            "exactly enough must widen"
+        );
+        assert_eq!(
+            flux2_fp8_widen_policy(klein_4b, exact - 1),
+            Flux2Fp8Widen::PerForward,
+            "one byte short must not"
+        );
+    }
+
+    /// `MOLD_FLUX2_FP8_CACHE` overrides the budget in both directions, and
+    /// anything else defers to it.
+    #[test]
+    fn flux2_fp8_cache_env_overrides_the_budget() {
+        for budget in [Flux2Fp8Widen::AtLoad, Flux2Fp8Widen::PerForward] {
+            assert_eq!(
+                resolve_flux2_fp8_widen(Some("1"), budget),
+                Flux2Fp8Widen::AtLoad
+            );
+            assert_eq!(
+                resolve_flux2_fp8_widen(Some("0"), budget),
+                Flux2Fp8Widen::PerForward
+            );
+            assert_eq!(
+                resolve_flux2_fp8_widen(Some(" 1 "), budget),
+                Flux2Fp8Widen::AtLoad
+            );
+            assert_eq!(resolve_flux2_fp8_widen(None, budget), budget);
+            assert_eq!(resolve_flux2_fp8_widen(Some("yes"), budget), budget);
+            assert_eq!(resolve_flux2_fp8_widen(Some(""), budget), budget);
+        }
+    }
+
+    /// The widened arm is the per-forward arm with its cast hoisted out of the
+    /// loop — same numbers, in the same order, for both scale shapes.
+    ///
+    /// A rank-0 scale rides the matmul OUTPUT in both arms (the Qwen-Image FP8
+    /// rule); a structured one is folded into the weight, which the widened
+    /// arm does once at load and the per-forward arm redoes every call. If
+    /// either moved sides the two would disagree here.
+    #[test]
+    fn widened_arm_matches_per_forward_arm_bitwise() {
+        let dev = candle_core::Device::Cpu;
+        let raw: Vec<f32> = (0..8).map(|i| (i as f32) - 3.5).collect();
+        let weight = Tensor::from_vec(raw, (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let bias = Tensor::from_vec(vec![0.125f32, -0.25], 2, &dev).unwrap();
+        let x = Tensor::from_vec(
+            vec![0.5f32, -1.5, 2.0, 0.75, 1.0, 1.0, -1.0, 0.25],
+            (1, 2, 4),
+            &dev,
+        )
+        .unwrap();
+
+        let scales = [
+            ("no scale", None),
+            ("rank-0 scale", Some(Tensor::new(0.25f32, &dev).unwrap())),
+            (
+                "per-output-row scale",
+                Some(Tensor::from_vec(vec![0.5f32, 2.0], (2, 1), &dev).unwrap()),
+            ),
+        ];
+        for (what, scale) in scales {
+            let per_forward = Flux2Linear::Fp8 {
+                weight: weight.clone(),
+                scale: scale.clone(),
+                bias: Some(bias.clone()),
+            };
+            let (widened_weight, widened_scale) =
+                widen_fp8_weight(&weight, scale.clone(), DType::F32).unwrap();
+            let widened = Flux2Linear::Fp8Widened {
+                weight: widened_weight,
+                scale: widened_scale,
+                bias: Some(bias.clone()),
+            };
+
+            let want: Vec<f32> = per_forward
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let got: Vec<f32> = widened
+                .forward(&x)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(got, want, "{what}: the widened arm changed the result");
+        }
+    }
+
+    /// A widened layer costs what it holds; an unwidened one is charged twice
+    /// its slab because `forward` materializes the working-dtype copy.
+    #[test]
+    fn a_widened_layer_is_charged_its_real_bytes() {
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![1.0f32; 8], (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let per_forward = Flux2Linear::Fp8 {
+            weight: weight.clone(),
+            scale: None,
+            bias: None,
+        };
+        let (widened_weight, widened_scale) = widen_fp8_weight(&weight, None, DType::BF16).unwrap();
+        let widened = Flux2Linear::Fp8Widened {
+            weight: widened_weight,
+            scale: widened_scale,
+            bias: None,
+        };
+        assert_eq!(
+            flux2_linear_bytes(&per_forward),
+            16,
+            "8 params charged at 2 B"
+        );
+        assert_eq!(
+            flux2_linear_bytes(&widened),
+            16,
+            "8 BF16 params, nothing transient"
+        );
+    }
+
+    /// ComfyUI clamps the activation into F8E4M3's finite range before casting
+    /// (`comfy/ops.py:872`). Without it the cast produces `inf`.
+    #[test]
+    fn fp8_activation_clamp_matches_comfyui_range() {
+        let dev = candle_core::Device::Cpu;
+        let x = Tensor::from_vec(
+            vec![-1000.0f32, -448.0, -1.5, 0.0, 1.5, 448.0, 1000.0],
+            7,
+            &dev,
+        )
+        .unwrap();
+        let got: Vec<f32> = clamp_activation_for_fp8(&x).unwrap().to_vec1().unwrap();
+        assert_eq!(got, vec![-448.0, -448.0, -1.5, 0.0, 1.5, 448.0, 448.0]);
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "a clamped activation casts to a finite F8E4M3"
+        );
+    }
+
+    /// One batch-2 forward must produce the same step as two batch-1 ones.
+    ///
+    /// BFL's `denoise_cfg` (`flux2/sampling.py:375-406`) duplicates the latent,
+    /// concatenates the text with the UNCONDITIONAL branch first, runs one
+    /// forward and chunks the prediction. The order matters: swapped, the lerp
+    /// would guide away from the prompt, which is why the two paths are
+    /// compared here rather than just the shapes.
+    #[test]
+    fn batched_cfg_matches_two_sequential_forwards() {
+        use crate::flux2::quantized_transformer::test_support::{
+            spread, tiny_cfg, tiny_transformer,
+        };
+        let cfg = tiny_cfg(false);
+        let wrapper = Flux2TransformerWrapper::Quantized(tiny_transformer(&cfg));
+        let device = candle_core::Device::Cpu;
+
+        let pos = spread((2, 6), 3.2).reshape((1, 2, 6)).unwrap();
+        let neg = spread((2, 6), 4.9).reshape((1, 2, 6)).unwrap();
+        let ids = Tensor::zeros((1, 2, 4), DType::F32, &device).unwrap();
+
+        let sequential = denoise_once_batched(
+            &wrapper,
+            1.0,
+            &pos,
+            &ids,
+            Some((&neg, &ids, 3.5)),
+            None,
+            Flux2CfgBatching::Sequential,
+        );
+        let batched = denoise_once_batched(
+            &wrapper,
+            1.0,
+            &pos,
+            &ids,
+            Some((&neg, &ids, 3.5)),
+            None,
+            Flux2CfgBatching::Batched,
+        );
+
+        assert_eq!(sequential.len(), batched.len());
+        let worst = sequential
+            .iter()
+            .zip(&batched)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-5,
+            "the batched forward moved the step by {worst} — check the uncond-first order"
+        );
+
+        // The guidance must actually be doing something, or the comparison
+        // above would pass on two identical unconditional renders.
+        let unguided = denoise_once_batched(
+            &wrapper,
+            1.0,
+            &pos,
+            &ids,
+            None,
+            None,
+            Flux2CfgBatching::Batched,
+        );
+        let moved = unguided
+            .iter()
+            .zip(&batched)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-6, "the guided and unguided steps are identical");
+    }
+
+    /// A negative prompt of a different length cannot be concatenated onto the
+    /// positive one, so the budget is never even asked.
+    #[test]
+    fn unequal_prompt_lengths_fall_back_to_two_forwards() {
+        const GB: u64 = 1_000_000_000;
+        assert_eq!(
+            flux2_cfg_batching_for(512, 300, GB, GB, 1_000 * GB),
+            Flux2CfgBatching::Sequential,
+            "a shorter negative prompt must not be batched, however much VRAM there is"
+        );
+        assert_eq!(
+            flux2_cfg_batching_for(512, 512, GB, GB, 1_000 * GB),
+            Flux2CfgBatching::Batched,
+            "equal lengths on an enormous card must batch"
+        );
+    }
+
+    /// The budget, over the cards the campaign cares about.
+    #[test]
+    fn cfg_batching_budget_matrix() {
+        const GB: u64 = 1_000_000_000;
+        let rows: [(&str, u64, u64, u64, Flux2CfgBatching); 5] = [
+            (
+                "klein-9B Q8 at 1024 squared on a 24 GB card",
+                10 * GB,
+                4 * GB,
+                24 * GB,
+                Flux2CfgBatching::Batched,
+            ),
+            (
+                "klein-9B Q8 at 2048 squared on the same 24 GB card",
+                10 * GB,
+                16 * GB,
+                24 * GB,
+                Flux2CfgBatching::Sequential,
+            ),
+            (
+                "klein-9B BF16 at 1024 squared on a 24 GB card",
+                19 * GB,
+                4 * GB,
+                24 * GB,
+                Flux2CfgBatching::Sequential,
+            ),
+            (
+                "klein-9B BF16 at 1024 squared on a 46 GB L40S",
+                19 * GB,
+                4 * GB,
+                46 * GB,
+                Flux2CfgBatching::Batched,
+            ),
+            (
+                "klein-4B Q8 at 1024 squared on a 24 GB card",
+                4 * GB,
+                3 * GB,
+                24 * GB,
+                Flux2CfgBatching::Batched,
+            ),
+        ];
+        for (what, transformer, activation, total, want) in rows {
+            assert_eq!(
+                flux2_cfg_batching(transformer, activation, total),
+                want,
+                "{what}"
+            );
+        }
+
+        // The boundary, so the inequality cannot silently flip.
+        let exact = 10 * GB + 4 * GB + ADAPTIVE_OFFLOAD_RUNTIME_HEADROOM;
+        assert_eq!(
+            flux2_cfg_batching(10 * GB, 4 * GB, exact),
+            Flux2CfgBatching::Batched
+        );
+        assert_eq!(
+            flux2_cfg_batching(10 * GB, 4 * GB, exact - 1),
+            Flux2CfgBatching::Sequential
+        );
+    }
+
+    /// Flash attention never materializes a score matrix; math does, and the
+    /// estimate has to say so or a math render batches into an OOM.
+    #[test]
+    fn the_activation_estimate_is_backend_aware() {
+        let cfg = Flux2Config::klein();
+        let flash = flux2_activation_bytes_for(
+            &cfg,
+            4_608,
+            2,
+            DType::BF16,
+            crate::attention::AttentionBackend::Flash,
+        );
+        let math = flux2_activation_bytes_for(
+            &cfg,
+            4_608,
+            2,
+            DType::BF16,
+            crate::attention::AttentionBackend::Math,
+        );
+        assert!(
+            math > flash,
+            "math must be charged its score tile ({math} vs {flash})"
+        );
+        let single = flux2_activation_bytes_for(
+            &cfg,
+            4_608,
+            1,
+            DType::BF16,
+            crate::attention::AttentionBackend::Flash,
+        );
+        assert_eq!(flash, 2 * single, "the estimate must scale with the batch");
+    }
+
+    /// The engine may only batch when the positional embedding is shared
+    /// across the batch — `apply_rope` broadcasts a batch-1 table and nothing
+    /// else.
+    #[test]
+    fn a_batched_step_requires_a_batch_shared_positional_embedding() {
+        let device = candle_core::Device::Cpu;
+        let shared = Tensor::zeros((1, 3, 4), DType::F32, &device).unwrap();
+        let per_row = Tensor::zeros((2, 3, 4), DType::F32, &device).unwrap();
+        assert!(batchable_positional_embedding(&shared));
+        assert!(!batchable_positional_embedding(&per_row));
+    }
+
+    /// One `[3*dim, dim]` GEMM narrowed into three must equal three GEMMs.
+    ///
+    /// BFL ships the fused form (`flux2/model.py:384`); mold loads the
+    /// diffusers split one and concatenates at load. A rank-0 FP8 output scale
+    /// has to stay on the NARROWED slice — if fusing quietly moved it onto the
+    /// concatenated weight, every component would get the first one's scale,
+    /// which is the failure this asserts against.
+    #[test]
+    fn fused_qkv_matches_three_projections() {
+        let dev = candle_core::Device::Cpu;
+        let (in_dim, out_dim) = (4usize, 6usize);
+        let weight = |salt: f64| {
+            Tensor::arange(0f32, (in_dim * out_dim) as f32, &dev)
+                .unwrap()
+                .affine(0.031, salt)
+                .unwrap()
+                .sin()
+                .unwrap()
+                .reshape((out_dim, in_dim))
+                .unwrap()
+        };
+        let xs = Tensor::arange(0f32, (2 * 3 * in_dim) as f32, &dev)
+            .unwrap()
+            .affine(0.017, -0.3)
+            .unwrap()
+            .reshape((2, 3, in_dim))
+            .unwrap();
+
+        // Plain BF16-shaped linears: fusing must be exact.
+        let split = [weight(0.1), weight(0.7), weight(1.3)]
+            .map(|w| Flux2Linear::Standard(candle_nn::Linear::new(w, None)));
+        let fused =
+            QkvProjections::new(split[0].clone(), split[1].clone(), split[2].clone()).unwrap();
+        assert!(
+            matches!(fused, QkvProjections::Fused { .. }),
+            "three bias-free standard linears must fuse"
+        );
+        let (q, k, v) = fused.project(&xs).unwrap();
+        for (got, linear) in [&q, &k, &v].into_iter().zip(&split) {
+            let want = xs.apply(linear).unwrap();
+            let diff = (got - &want)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .max(0)
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap();
+            assert!(diff < 1e-6, "the fused projection diverged by {diff}");
+        }
+
+        // Widened FP8 with a DIFFERENT scale per component.
+        let fp8 = |salt: f64, scale: f32| {
+            let w = weight(salt).to_dtype(DType::F8E4M3).unwrap();
+            let (weight, scale) =
+                widen_fp8_weight(&w, Some(Tensor::new(scale, &dev).unwrap()), DType::F32).unwrap();
+            Flux2Linear::Fp8Widened {
+                weight,
+                scale,
+                bias: None,
+            }
+        };
+        let scaled = [fp8(0.1, 0.25), fp8(0.7, 0.5), fp8(1.3, 2.0)];
+        let fused =
+            QkvProjections::new(scaled[0].clone(), scaled[1].clone(), scaled[2].clone()).unwrap();
+        assert!(
+            matches!(fused, QkvProjections::Fused { .. }),
+            "widened FP8 layers must fuse"
+        );
+        let (q, k, v) = fused.project(&xs).unwrap();
+        for (got, linear) in [&q, &k, &v].into_iter().zip(&scaled) {
+            let want: Vec<f32> = linear
+                .forward(&xs)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            let got: Vec<f32> = got.flatten_all().unwrap().to_vec1().unwrap();
+            assert_eq!(got, want, "a per-component scale must ride its own slice");
+        }
+    }
+
+    /// An arm whose weights cannot be concatenated stays split rather than
+    /// being fused wrongly — the per-forward FP8 slab must stay packed, and
+    /// NVFP4 lives on the CPU behind a lazy dequant.
+    #[test]
+    fn an_unfusable_projection_stays_split() {
+        let dev = candle_core::Device::Cpu;
+        let w = Tensor::from_vec(vec![1.0f32; 8], (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let packed = || Flux2Linear::Fp8 {
+            weight: w.clone(),
+            scale: None,
+            bias: None,
+        };
+        let projections = QkvProjections::new(packed(), packed(), packed()).unwrap();
+        assert!(
+            matches!(projections, QkvProjections::Split { .. }),
+            "a per-forward FP8 layer must not be fused"
+        );
+
+        // And a mismatched output width is left alone rather than silently
+        // producing a fused weight nobody can narrow correctly.
+        let wide = Flux2Linear::Standard(candle_nn::Linear::new(
+            Tensor::from_vec(vec![1.0f32; 12], (3, 4), &dev).unwrap(),
+            None,
+        ));
+        let narrow = || {
+            Flux2Linear::Standard(candle_nn::Linear::new(
+                Tensor::from_vec(vec![1.0f32; 8], (2, 4), &dev).unwrap(),
+                None,
+            ))
+        };
+        let projections = QkvProjections::new(narrow(), wide, narrow()).unwrap();
+        assert!(
+            matches!(projections, QkvProjections::Split { .. }),
+            "components of different widths must not be fused"
+        );
+    }
+
+    #[test]
+    fn klein_config_dimensions() {
+        let cfg = Flux2Config::klein();
+        assert_eq!(cfg.in_channels, 128);
+        assert_eq!(cfg.hidden_size, 3072);
+        assert_eq!(cfg.num_heads, 24);
+        assert_eq!(cfg.hidden_size / cfg.num_heads, 128); // head_dim
+        assert_eq!(cfg.depth, 5);
+        assert_eq!(cfg.depth_single_blocks, 20);
+        assert_eq!(cfg.axes_dim, vec![32, 32, 32, 32]);
+        assert_eq!(cfg.theta, 2000);
+        assert!(!cfg.guidance_embed); // distilled
+    }
+
+    #[test]
+    fn klein_mlp_sizes() {
+        let cfg = Flux2Config::klein();
+        let h_sz = cfg.hidden_size; // 3072
+        let mlp_sz = (h_sz as f64 * cfg.mlp_ratio) as usize; // 9216
+        assert_eq!(mlp_sz, 9216);
+        // Double-stream MLP: lin1 = (h_sz, 2*mlp_sz), lin2 = (mlp_sz, h_sz)
+        assert_eq!(h_sz * 3 + mlp_sz * 2, 27648); // single fused projection
+        assert_eq!(h_sz + mlp_sz, 12288); // single output projection
+    }
+
+    #[test]
+    fn klein_context_dim_matches_qwen3() {
+        let cfg = Flux2Config::klein();
+        // Qwen3 hidden_size=2560, stacked 3 layers = 7680
+        assert_eq!(cfg.context_in_dim, 7680);
+        assert_eq!(cfg.context_in_dim, 2560 * 3);
+    }
+
+    #[test]
+    fn klein_9b_config_dimensions() {
+        let cfg = Flux2Config::klein_9b();
+        assert_eq!(cfg.in_channels, 128);
+        assert_eq!(cfg.hidden_size, 4096);
+        assert_eq!(cfg.num_heads, 32);
+        assert_eq!(cfg.hidden_size / cfg.num_heads, 128); // head_dim
+        assert_eq!(cfg.depth, 8);
+        assert_eq!(cfg.depth_single_blocks, 24);
+        assert_eq!(cfg.context_in_dim, 12288);
+        assert_eq!(cfg.context_in_dim, 4096 * 3); // Qwen3 hidden_size=4096, stacked 3x
+        assert!(!cfg.guidance_embed); // distilled
+    }
+
+    #[test]
+    fn flux2_streaming_block_plan_preserves_reference_order() {
+        let mut cfg = Flux2Config::klein();
+        cfg.depth = 2;
+        cfg.depth_single_blocks = 3;
+
+        assert_eq!(
+            flux2_streaming_block_plan(&cfg),
+            vec![
+                Flux2StreamingBlock::Double(0),
+                Flux2StreamingBlock::Double(1),
+                Flux2StreamingBlock::Single(0),
+                Flux2StreamingBlock::Single(1),
+                Flux2StreamingBlock::Single(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn timestep_embedding_shape() {
+        let dev = candle_core::Device::Cpu;
+        let t = Tensor::full(0.5f32, 2, &dev).unwrap();
+        let emb = timestep_embedding(&t, 256, DType::F32).unwrap();
+        assert_eq!(emb.dims(), &[2, 256]);
+    }
+
+    #[test]
+    fn rope_4d_shape() {
+        let dev = candle_core::Device::Cpu;
+        let pos = Tensor::zeros((1, 16), DType::F32, &dev).unwrap();
+        let r = rope(&pos, 32, 2000).unwrap();
+        assert_eq!(r.dims(), &[1, 16, 16, 2, 2]);
+    }
+
+    #[test]
+    fn test_timestep_embedding_dtype_preserved() {
+        let dev = candle_core::Device::Cpu;
+        let t = Tensor::full(0.5f32, 2, &dev).unwrap();
+        let emb = timestep_embedding(&t, 128, DType::BF16).unwrap();
+        assert_eq!(emb.dtype(), DType::BF16);
+        assert_eq!(emb.dims(), &[2, 128]);
+    }
+
+    #[test]
+    fn test_timestep_embedding_values_bounded() {
+        let dev = candle_core::Device::Cpu;
+        let t = Tensor::full(0.7f32, 1, &dev).unwrap();
+        let emb = timestep_embedding(&t, 64, DType::F32).unwrap();
+        let flat = emb.flatten_all().unwrap();
+        let vals: Vec<f32> = flat.to_vec1().unwrap();
+        for v in &vals {
+            assert!(
+                *v >= -1.0 && *v <= 1.0,
+                "embedding value {v} outside [-1, 1] (sin/cos bounds)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_odd_dim_fails() {
+        let dev = candle_core::Device::Cpu;
+        let pos = Tensor::zeros((1, 4), DType::F32, &dev).unwrap();
+        let result = rope(&pos, 33, 2000);
+        assert!(result.is_err(), "rope with odd dim should fail");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("odd"),
+            "error should mention 'odd', got: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn flux2_linear_standard_bf16_forward() {
+        // Sanity: the BF16 (Standard) branch behaves like a stock Linear.
+        // weight = [[1.0, 2.0], [3.0, 4.0]]  → out = x @ weight.t()
+        // bias=None. Check via Module::forward.
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &dev).unwrap();
+        let lin = Flux2Linear::Standard(candle_nn::Linear::new(weight, None));
+        let x = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &dev).unwrap();
+        let out = lin.forward(&x).unwrap();
+        // x[0] * weight.t() col 0 = 1*1 + 0*2 = 1; col 1 = 1*3 + 0*4 = 3
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(v, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn flux2_linear_fp8_forward_matches_bf16_reference() {
+        // FP8 path: stored W is FP8(2.0). Input x = [[1, 1, 1, 1]].
+        // x @ W.t() with W = ones·2 (out=2, in=4) → [[8, 8]]. No sidecar
+        // scale — community FP8 conversions without an NVFP4 ancestor.
+        // Tests run F32 → F32 because candle CPU has no BF16 matmul.
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![2.0f32; 8], (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let lin = Flux2Linear::Fp8 {
+            weight,
+            scale: None,
+            bias: None,
+        };
+        let x = Tensor::from_vec(vec![1.0f32; 4], (1, 4), &dev).unwrap();
+        let out = lin.forward(&x).unwrap();
+        assert_eq!(
+            out.dtype(),
+            DType::F32,
+            "FP8 forward must preserve activation dtype",
+        );
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        for x in &v {
+            assert!((x - 8.0).abs() < 1e-3, "got {x}, want 8.0");
+        }
+    }
+
+    /// BFL's own FP8 conversions store `weight / weight_scale` and ship the
+    /// scale beside it. Ignoring it does not blur the render, it destroys it:
+    /// a scale of 0.002 makes every weight ~500x too large.
+    #[test]
+    fn flux2_linear_fp8_applies_a_scalar_dequantization_scale() {
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![2.0f32; 8], (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let scale = Tensor::new(0.25f32, &dev).unwrap();
+        assert_eq!(scale.rank(), 0, "per-tensor scale is a scalar");
+        let lin = Flux2Linear::Fp8 {
+            weight,
+            scale: Some(scale),
+            bias: None,
+        };
+        let x = Tensor::from_vec(vec![1.0f32; 4], (1, 4), &dev).unwrap();
+        let v: Vec<f32> = lin
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        // 4 inputs x (2.0 * 0.25) = 2.0 per output row.
+        for got in &v {
+            assert!((got - 2.0).abs() < 1e-3, "got {got}, want 2.0");
+        }
+    }
+
+    /// The scalar scale rides on the output for cost, so it must still agree
+    /// with the weight-side arithmetic a per-row scale takes.
+    #[test]
+    fn flux2_linear_fp8_scalar_and_per_row_scales_agree() {
+        let dev = candle_core::Device::Cpu;
+        let raw: Vec<f32> = (0..8).map(|i| (i as f32 + 1.0) * 0.5).collect();
+        let weight = Tensor::from_vec(raw, (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (1, 4), &dev).unwrap();
+
+        let scalar = Flux2Linear::Fp8 {
+            weight: weight.clone(),
+            scale: Some(Tensor::new(0.5f32, &dev).unwrap()),
+            bias: None,
+        };
+        // The same 0.5, expressed per output row — this takes the weight-side
+        // branch instead.
+        let per_row = Flux2Linear::Fp8 {
+            weight,
+            scale: Some(Tensor::from_vec(vec![0.5f32; 2], (2, 1), &dev).unwrap()),
+            bias: None,
+        };
+
+        let a: Vec<f32> = scalar
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let b: Vec<f32> = per_row
+            .forward(&x)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(a.len(), b.len());
+        for (got, want) in a.iter().zip(&b) {
+            assert!((got - want).abs() < 1e-3, "got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn flux2_linear_fp8_basic_matmul() {
+        // Simplest FP8 forward smoke test: weight [[3.0]], bias=None,
+        // x=[[2.0]]. Out = 2*3 = 6.
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![3.0f32], (1, 1), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let lin = Flux2Linear::Fp8 {
+            weight,
+            scale: None,
+            bias: None,
+        };
+        let x = Tensor::from_vec(vec![2.0f32], (1, 1), &dev).unwrap();
+        let out = lin.forward(&x).unwrap();
+        let v: f32 = out.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+        assert!((v - 6.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flux2_linear_fp8_applies_bias_after_matmul() {
+        // weight = [[1.0]], bias = [10.0], x = [[3]]. x@w.t()+bias = 13.
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![1.0f32], (1, 1), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let bias = Tensor::from_vec(vec![10.0f32], 1, &dev).unwrap();
+        let lin = Flux2Linear::Fp8 {
+            weight,
+            scale: None,
+            bias: Some(bias),
+        };
+        let x = Tensor::from_vec(vec![3.0f32], (1, 1), &dev).unwrap();
+        let out = lin.forward(&x).unwrap();
+        let v: f32 = out.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0];
+        assert!((v - 13.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn flux2_linear_fp8_applies_sidecar_scale_at_forward() {
+        // Verify the NVFP4 sidecar tensor_scale path: weight stored at FP8(2.0)
+        // pre-scale, scale_weight = [0.5] (1-D, length 1). Forward must
+        // broadcast-multiply every weight element by 0.5 → effective weight
+        // 1.0, so x @ W.t() with x=[1,1,1,1] and W=ones [2,4] yields [4,4].
+        let dev = candle_core::Device::Cpu;
+        let weight = Tensor::from_vec(vec![2.0f32; 8], (2, 4), &dev)
+            .unwrap()
+            .to_dtype(DType::F8E4M3)
+            .unwrap();
+        let scale = Tensor::from_vec(vec![0.5f32], 1, &dev).unwrap();
+        let lin = Flux2Linear::Fp8 {
+            weight,
+            scale: Some(scale),
+            bias: None,
+        };
+        let x = Tensor::from_vec(vec![1.0f32; 4], (1, 4), &dev).unwrap();
+        let out = lin.forward(&x).unwrap();
+        let v: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        for x in &v {
+            assert!(
+                (x - 4.0).abs() < 1e-3,
+                "got {x}, want 4.0 (sidecar scale 0.5 applied to FP8(2.0))",
+            );
+        }
+    }
+
+    /// Build the canonical 1-block NVFP4 fixture used by the streaming tests:
+    /// N rows × 16 columns of weight = +1.0 (E2M1 nibble 0b0010), one block
+    /// scale per row at E4M3 = 1.0 (byte 0x38), per-tensor scale applied at
+    /// forward time. block_scales are stored in cuBLAS SWIZZLE_32_4_4 tiled
+    /// layout to match what ComfyUI's NVFP4 converter writes: padded to
+    /// (roundup(N, 128), roundup(1, 4)) = (128, 4).
+    /// Returns (packed U8 [N, 8], block_scales F8E4M3 [128, 4]).
+    fn nvfp4_unit_fixture(n_rows: usize) -> (Tensor, Tensor) {
+        use crate::nvfp4::swizzle_block_scales;
+        use candle_core::Device;
+        let dev = Device::Cpu;
+        let packed_bytes = vec![0x22u8; n_rows * 8];
+        let packed = Tensor::from_vec(packed_bytes, (n_rows, 8), &dev).unwrap();
+        // Natural block-scale layout: [n_rows, 1], all 1.0.
+        let natural_scales: Vec<f32> = vec![1.0f32; n_rows];
+        let swizzled = swizzle_block_scales(&natural_scales, n_rows, 1).unwrap();
+        let padded_rows = n_rows.div_ceil(128) * 128;
+        let padded_cols = 4;
+        let scales_f32 = Tensor::from_vec(swizzled, (padded_rows, padded_cols), &dev).unwrap();
+        let block_scales = scales_f32.to_dtype(DType::F8E4M3).unwrap();
+        (packed, block_scales)
+    }
+
+    #[test]
+    fn flux2_linear_nvfp4_streaming_round_trip_matches_standard() {
+        // Streaming path must produce the same output as a Standard linear
+        // built from the dequanted weight. Tolerance is BF16-level (~1e-3).
+        // 4 output rows × 16 input columns. Each weight element = +1.0
+        // (FP4 1.0 × block_scale 1.0). Per-tensor scale = 0.25 → effective
+        // weight = 0.25. Input = ones. Out = sum(weights row) = 16 * 0.25 = 4.
+        let dev = candle_core::Device::Cpu;
+        let n_full = 4;
+        let k = 16;
+        let tensor_scale = 0.25f32;
+        let (packed, block_scales) = nvfp4_unit_fixture(n_full);
+
+        let streaming = Flux2Linear::Nvfp4Streaming {
+            packed: packed.clone(),
+            block_scales: block_scales.clone(),
+            tensor_scale,
+            out_dim: n_full,
+            in_dim: k,
+            slice: None,
+            bias: None,
+            cache: Arc::new(OnceLock::new()),
+        };
+
+        // Reference: full BF16 dequanted weight (all 0.25), as a Standard
+        // candle Linear.
+        let ref_w = Tensor::from_vec(vec![tensor_scale; n_full * k], (n_full, k), &dev).unwrap();
+        let ref_lin = Flux2Linear::Standard(candle_nn::Linear::new(ref_w, None));
+
+        let x = Tensor::from_vec(vec![1.0f32; k], (1, k), &dev).unwrap();
+        let out_streaming = streaming.forward(&x).unwrap();
+        let out_ref = ref_lin.forward(&x).unwrap();
+
+        let s: Vec<f32> = out_streaming
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let r: Vec<f32> = out_ref
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(s.len(), r.len());
+        for (i, (a, b)) in s.iter().zip(r.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-2,
+                "streaming[{i}]={a}, reference={b} — diverged beyond BF16 tolerance",
+            );
+            assert!(
+                (a - 4.0).abs() < 1e-2,
+                "streaming[{i}]={a}, want 4.0 (sum of 16 × 0.25)",
+            );
+        }
+    }
+
+    #[test]
+    fn flux2_linear_nvfp4_streaming_caches_bf16() {
+        // After one forward, the OnceLock cache must be populated. This
+        // ensures the second forward bypasses the f32 dequant pass.
+        let dev = candle_core::Device::Cpu;
+        let n_full = 2;
+        let k = 16;
+        let (packed, block_scales) = nvfp4_unit_fixture(n_full);
+        let cache = Arc::new(OnceLock::new());
+        let streaming = Flux2Linear::Nvfp4Streaming {
+            packed,
+            block_scales,
+            tensor_scale: 1.0,
+            out_dim: n_full,
+            in_dim: k,
+            slice: None,
+            bias: None,
+            cache: cache.clone(),
+        };
+        assert!(cache.get().is_none(), "cache empty before first forward");
+
+        let x = Tensor::from_vec(vec![1.0f32; k], (1, k), &dev).unwrap();
+        let _ = streaming.forward(&x).unwrap();
+        assert!(
+            cache.get().is_some(),
+            "cache must be populated after first forward",
+        );
+        let cached = cache.get().unwrap();
+        assert_eq!(cached.dtype(), DType::BF16);
+        assert_eq!(cached.dims(), &[n_full, k]);
+    }
+
+    #[test]
+    fn flux2_linear_nvfp4_streaming_slice_q_k_v_share_cache() {
+        // Three sliced linears (`to_q`/`to_k`/`to_v`) sharing one
+        // `Arc<OnceLock<Tensor>>` populate the cache exactly once and each
+        // produces output matching an independently-built reference Linear
+        // sliced from the same dequanted weight.
+        //
+        // Build a 3*N=6 row fused weight (Q/K/V each contribute 2 rows of
+        // 16 columns). Q rows = 0.25 (all FP4 1.0, scale 1.0, t_scale 0.25).
+        // The reference Linear is sliced from a manually-constructed BF16
+        // weight matching what dequant produces.
+        let dev = candle_core::Device::Cpu;
+        let out_dim = 2;
+        let n_full = out_dim * 3; // 6 rows for fused QKV
+        let k = 16;
+        let tensor_scale = 0.25f32;
+        let (packed, block_scales) = nvfp4_unit_fixture(n_full);
+
+        let shared_cache = Arc::new(OnceLock::new());
+        let mut linears = Vec::with_capacity(3);
+        for component in 0..3 {
+            linears.push(Flux2Linear::Nvfp4Streaming {
+                packed: packed.clone(),
+                block_scales: block_scales.clone(),
+                tensor_scale,
+                out_dim,
+                in_dim: k,
+                slice: Some((0, component, 3)),
+                bias: None,
+                cache: shared_cache.clone(),
+            });
+        }
+        assert!(
+            shared_cache.get().is_none(),
+            "shared cache empty before any forward",
+        );
+
+        let x = Tensor::from_vec(vec![1.0f32; k], (1, k), &dev).unwrap();
+        // Forward Q. After this, the shared cache is populated; K and V both
+        // hit the warm cache.
+        let out_q = linears[0].forward(&x).unwrap();
+        assert!(
+            shared_cache.get().is_some(),
+            "Q-forward must populate cache"
+        );
+        let cached_after_q = shared_cache.get().unwrap().clone();
+        let _out_k = linears[1].forward(&x).unwrap();
+        let cached_after_k = shared_cache.get().unwrap().clone();
+        // The cached pointer is identical (OnceLock::set is no-op once set).
+        // Compare via F32 round-trip to avoid pulling in the half crate.
+        let after_q_data: Vec<f32> = cached_after_q
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        let after_k_data: Vec<f32> = cached_after_k
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(
+            after_q_data, after_k_data,
+            "shared cache must be unchanged after subsequent forwards",
+        );
+
+        // Per-component reference: each component is identical here (all
+        // weights = 0.25), so each Q/K/V forward must yield 16 × 0.25 = 4.0.
+        for (component, lin) in linears.iter().enumerate() {
+            let out = lin.forward(&x).unwrap();
+            let v: Vec<f32> = out
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1()
+                .unwrap();
+            assert_eq!(v.len(), out_dim);
+            for (i, &x) in v.iter().enumerate() {
+                assert!(
+                    (x - 4.0).abs() < 1e-2,
+                    "component {component} out[{i}] = {x}, want 4.0",
+                );
+            }
+        }
+        // Sanity: Q output values match expectations.
+        let q_v: Vec<f32> = out_q
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        for (i, &x) in q_v.iter().enumerate() {
+            assert!((x - 4.0).abs() < 1e-2, "Q[{i}]={x}");
+        }
+    }
+
+    #[test]
+    fn test_klein_config_vec_in_dim_zero() {
+        let cfg = Flux2Config::klein();
+        // Klein uses timestep-only conditioning (no pooled text embeddings),
+        // so vec_in_dim must be 0 to skip the vector_in MLP embedder.
+        assert_eq!(
+            cfg.vec_in_dim, 0,
+            "Klein vec_in_dim must be 0 (no pooled text vector)"
+        );
+        // Confirm the constructor logic: vec_in_dim == 0 means vector_in is None.
+        // This is the architectural invariant enforced in Flux2Transformer::new().
+        assert!(
+            cfg.vec_in_dim == 0,
+            "vec_in_dim > 0 would create an unused MlpEmbedder for Klein"
+        );
+        // Also verify that guidance_embed is false (distilled model, no CFG).
+        assert!(
+            !cfg.guidance_embed,
+            "Klein is a distilled model; guidance_embed must be false"
+        );
+    }
+
+    /// Regression test for the LastLayer shift/scale ordering bug (commit c0c2b80).
+    ///
+    /// `AdaLayerNormContinuous` — the diffusers norm — outputs (scale, shift):
+    /// `x = norm(x) * (1 + scale) + shift`.
+    ///
+    /// `LastLayer::forward` must use chunks[0]=scale, chunks[1]=shift.
+    ///
+    /// Strategy: use xs=zeros so `norm(xs)=0` and the output reduces to
+    /// `shift` only. If chunks were swapped, the output would be `scale`
+    /// instead, which is distinct from `shift` in our fixture.
+    ///
+    /// `ada_ln_modulation` weight (2·h_sz × h_sz): constructed so that
+    /// - rows 0..h_sz (scale half) produce `scale_val` per element
+    /// - rows h_sz..2·h_sz (shift half) produce `shift_val` per element
+    ///
+    /// For a vec of all-ones and weight `w` per row, `silu(vec)·w.T` gives
+    /// `h_sz * silu(1) * w_row` per output.  Set `w_row = target / (h_sz * silu(1))`.
+    #[test]
+    fn last_layer_forward_uses_diffusers_scale_then_shift_ordering() {
+        use candle_core::Device;
+        use candle_nn::VarBuilder;
+        use std::collections::HashMap;
+
+        let dev = Device::Cpu;
+        let h_sz = 2usize;
+        let out_c = 2usize; // proj_out: h_sz → h_sz (square for identity weight)
+
+        let scale_val = 3.0f32;
+        let shift_val = 0.5f32;
+
+        // silu(1.0) ≈ 0.7311.  With vec = ones (h_sz=2 elements), the ada_ln
+        // output for row i is: h_sz * silu(1) * w_per_element.
+        // So w_per_element = target / (h_sz * silu(1)).
+        let silu_one = 0.731_058_6f32; // silu(1) = 1 / (1 + e^-1)
+        let dot_factor = h_sz as f32 * silu_one;
+        let w_scale = scale_val / dot_factor;
+        let w_shift = shift_val / dot_factor;
+
+        // ada_ln weight: (2·h_sz, h_sz) = (4, 2).
+        // Rows 0..1 are the SCALE half (diffusers first half → chunks[0]).
+        // Rows 2..3 are the SHIFT half (diffusers second half → chunks[1]).
+        let ada_weight: Vec<f32> = vec![
+            w_scale, w_scale, // row 0 → scale[0]
+            w_scale, w_scale, // row 1 → scale[1]
+            w_shift, w_shift, // row 2 → shift[0]
+            w_shift, w_shift, // row 3 → shift[1]
+        ];
+
+        // proj_out (out_c × h_sz): identity so output = xs_mod unchanged.
+        let proj_weight = vec![1.0f32, 0.0, 0.0, 1.0];
+
+        let mut map: HashMap<String, candle_core::Tensor> = HashMap::new();
+        map.insert(
+            "norm_out.linear.weight".to_string(),
+            Tensor::from_vec(ada_weight, (2 * h_sz, h_sz), &dev).unwrap(),
+        );
+        map.insert(
+            "proj_out.weight".to_string(),
+            Tensor::from_vec(proj_weight, (out_c, h_sz), &dev).unwrap(),
+        );
+        let vb = VarBuilder::from_tensors(map, DType::F32, &dev);
+        let layer = LastLayer::new(h_sz, out_c, Flux2Fp8Widen::PerForward, vb).unwrap();
+
+        // xs: all-zeros → norm(xs)=0 → output = 0*(1+scale) + shift = shift.
+        let xs = Tensor::zeros((1, 1, h_sz), DType::F32, &dev).unwrap();
+        // vec: all-ones → silu → matmul → scale_val in scale half, shift_val in shift half.
+        let vec_ = Tensor::ones((1, h_sz), DType::F32, &dev).unwrap();
+
+        let out = layer.forward(&xs, &vec_).unwrap();
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        assert_eq!(vals.len(), out_c);
+
+        // Correct ordering (scale, shift) → output = norm(0)*(1+scale_val) + shift_val = shift_val.
+        // Wrong ordering (shift, scale) → output = norm(0)*(1+shift_val) + scale_val = scale_val.
+        // These differ (0.5 vs 3.0) so the assertion unambiguously catches the regression.
+        let tol = 0.08; // BF16 + silu rounding headroom
+        assert!(
+            (vals[0] - shift_val).abs() < tol,
+            "LastLayer output[0]={:.4}: expected shift={shift_val:.4} \
+             (diffusers scale-then-shift ordering). \
+             Got scale={scale_val:.4} instead? The c0c2b80 regression is present.",
+            vals[0],
+        );
+        assert!(
+            (vals[1] - shift_val).abs() < tol,
+            "LastLayer output[1]={:.4}: expected shift={shift_val:.4}",
+            vals[1],
+        );
+    }
+}
