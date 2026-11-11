@@ -8,8 +8,17 @@
   - part 2, Chat Completions' `web_search_options`;
   - part 4, `agentrun --tools`: the header through Claude Code's `ANTHROPIC_CUSTOM_HEADERS`, Codex's `http_headers` and OpenCode's `headers`.
 - **Tested:** `a_client_key_gets_its_profiles_tools_without_flags`, `anthropic_web_search_is_answered_by_the_server`, `anthropic_web_search_needs_a_profile_with_web` and `responses_web_search_gives_a_web_search_call_item`.
+- **Hosted tools built (2026-11-11):**
+  - **Responses `image_generation`:** for a key whose profile has "image", the model's `generate_image` runs here.
+    The image is made after the answer gives up the GPU and returned as an `image_generation_call` item (base64
+    PNG, `revised_prompt`) before `response.completed`, with a keep-alive every 10 s meanwhile.
+  - **Responses `mcp`:** a `server_label` naming one of this server's MCP servers that the key's profile allows
+    (`mcp:<name>`, or `mcp:*` for address servers). Its calls show as `mcp_call` items with the arguments and the
+    output or error. A label the key may not use, or a `server_url` of the request's own, is refused: the server
+    never connects to an address a request names.
+  - **Gemini `google_search`:** answered by the server's web search (built earlier).
+  - Tested: `responses_image_generation_gives_an_image_generation_call_item`, `responses_hosted_mcp_gives_mcp_call_items`.
 - **Next:**
-  - the Responses `image_generation` and `mcp` hosted tools, and Gemini's `google_search`;
   - part 3, media inside the turn: **speech on the CPU is built** (2026-11-11: a `speak` call with Chatterbox,
     beside the text model, finishes inside the answer, waited for up to 3 minutes); image and video `swap` still
     to do (they stay `defer`: queued, shown after the answer);

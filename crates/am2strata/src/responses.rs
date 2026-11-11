@@ -469,6 +469,12 @@ pub struct Assembler {
     called: bool,
     /// the server's web searches shown as items: the tool loop's call id -> the item's index in output
     searches: std::collections::HashMap<String, usize>,
+    /// the hosted image_generation: each generate_image call's item (call id -> output index), and the jobs to wait for
+    image_calls: std::collections::HashMap<String, usize>,
+    pub images: Vec<(usize, String)>,
+    /// the hosted mcp tool: the server labels asked for, and each call's item (call id -> output index)
+    pub mcp_labels: Vec<String>,
+    mcp_calls: std::collections::HashMap<String, usize>,
 }
 
 impl Assembler {
@@ -491,7 +497,8 @@ impl Assembler {
             "metadata": req.get("metadata").filter(|t| !t.is_null()).cloned().unwrap_or(json!({})),
         });
         Assembler { names, encrypted, prompt_tokens, seq: 0, open: None, response, validator: None, json_text: String::new(), called: false,
-                    searches: std::collections::HashMap::new() }
+                    searches: std::collections::HashMap::new(), image_calls: std::collections::HashMap::new(), images: Vec::new(),
+                    mcp_labels: Vec::new(), mcp_calls: std::collections::HashMap::new() }
     }
 
     fn event(&mut self, kind: &str, data: Value) -> Value {
@@ -555,6 +562,91 @@ impl Assembler {
             out.push(self.event("response.web_search_call.completed", json!({"output_index": at, "item_id": item_id})));
             out.push(self.event("response.output_item.done", json!({"output_index": at, "item": item})));
         }
+        out
+    }
+
+    /// A call to one of the MCP servers the request named in a hosted `mcp` tool?
+    pub fn is_mcp_call(&self, v: &Value) -> bool {
+        match v["event"].as_str() {
+            Some("call") => v["server"].as_str().is_some_and(|sv| self.mcp_labels.iter().any(|l| l == sv)),
+            Some("result") => v["id"].as_str().is_some_and(|id| self.mcp_calls.contains_key(id)),
+            _ => false,
+        }
+    }
+
+    /// An `mcp_call` item: added at the call, its output (or error) at the result.
+    pub fn mcp_call(&mut self, v: &Value) -> Vec<Value> {
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        let mut out = Vec::new();
+        if v["event"] == "call" {
+            out.extend(self.close("completed"));
+            let item = json!({"type": "mcp_call", "id": new_id("mcp"), "server_label": v["server"], "name": v["tool"],
+                              "arguments": v["arguments"].to_string(), "output": null, "error": null, "status": "in_progress"});
+            self.output().push(item.clone());
+            let at = self.response["output"].as_array().unwrap().len() - 1;
+            self.mcp_calls.insert(id, at);
+            out.push(self.event("response.output_item.added", json!({"output_index": at, "item": item.clone()})));
+            out.push(self.event("response.mcp_call.in_progress", json!({"output_index": at, "item_id": item["id"]})));
+            out.push(self.event("response.mcp_call_arguments.done", json!({"output_index": at, "item_id": item["id"], "arguments": item["arguments"]})));
+        } else if let Some(at) = self.mcp_calls.get(&id).copied() {
+            let ok = v["ok"] == true;
+            let item = &mut self.response["output"][at];
+            item["status"] = json!(if ok { "completed" } else { "failed" });
+            if ok { item["output"] = v["text"].clone() } else { item["error"] = v["text"].clone() }
+            let (item, item_id) = (item.clone(), item["id"].clone());
+            out.push(self.event(if ok { "response.mcp_call.completed" } else { "response.mcp_call.failed" }, json!({"output_index": at, "item_id": item_id})));
+            out.push(self.event("response.output_item.done", json!({"output_index": at, "item": item})));
+        }
+        out
+    }
+
+    /// The server's generate_image (the tool loop's call or result event) for the hosted `image_generation` tool?
+    pub fn is_image_call(&self, v: &Value) -> bool {
+        match v["event"].as_str() {
+            Some("call") => v["name"] == "generate_image",
+            Some("result") => v["id"].as_str().is_some_and(|id| self.image_calls.contains_key(id)),
+            _ => false,
+        }
+    }
+
+    /// An `image_generation_call` item: added at the call; at the result its job is waited for after the answer
+    /// (the job needs the GPU the answer holds), or the item fails.
+    pub fn image_call(&mut self, v: &Value) -> Vec<Value> {
+        let id = v["id"].as_str().unwrap_or("").to_string();
+        let mut out = Vec::new();
+        if v["event"] == "call" {
+            out.extend(self.close("completed"));
+            let item = json!({"type": "image_generation_call", "id": new_id("ig"), "status": "in_progress", "result": null,
+                              "revised_prompt": v["arguments"]["prompt"]});
+            self.output().push(item.clone());
+            let at = self.response["output"].as_array().unwrap().len() - 1;
+            self.image_calls.insert(id, at);
+            out.push(self.event("response.output_item.added", json!({"output_index": at, "item": item.clone()})));
+            out.push(self.event("response.image_generation_call.in_progress", json!({"output_index": at, "item_id": item["id"]})));
+        } else if let Some(at) = self.image_calls.get(&id).copied() {
+            match v["job"]["id"].as_str().filter(|_| v["ok"] == true) {
+                Some(job) => {
+                    self.images.push((at, job.to_string()));
+                    let item_id = self.response["output"][at]["id"].clone();
+                    out.push(self.event("response.image_generation_call.generating", json!({"output_index": at, "item_id": item_id})));
+                }
+                None => out.extend(self.image_done(at, None)),
+            }
+        }
+        out
+    }
+
+    /// The image of item `at` (base64 PNG), or None: failed.
+    pub fn image_done(&mut self, at: usize, b64: Option<String>) -> Vec<Value> {
+        let item = &mut self.response["output"][at];
+        item["status"] = json!(if b64.is_some() { "completed" } else { "failed" });
+        item["result"] = json!(b64);
+        let (item, item_id) = (item.clone(), item["id"].clone());
+        let mut out = Vec::new();
+        if item["status"] == "completed" {
+            out.push(self.event("response.image_generation_call.completed", json!({"output_index": at, "item_id": item_id})));
+        }
+        out.push(self.event("response.output_item.done", json!({"output_index": at, "item": item})));
         out
     }
 
@@ -855,6 +947,26 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     if web_items {
         req["strata_web"] = json!(true);
     }
+    // the hosted image_generation: this server's generate_image, for a key whose client profile has "image"; the image
+    // is made after the answer (it needs the GPU) and returned as an image_generation_call item before the response ends
+    // the hosted mcp tool: {"type": "mcp", "server_label": ...} names one of this server's MCP servers that the key's
+    // profile allows; its calls show as mcp_call items. A server_url of the request's own is never connected to.
+    let mut mcp_labels: Vec<String> = Vec::new();
+    for t in req["tools"].as_array().into_iter().flatten().filter(|t| t["type"] == "mcp") {
+        let label = t["server_label"].as_str().unwrap_or("").to_string();
+        let profile = crate::api_access(&s, &headers).flatten();
+        let (names, all) = profile.as_ref().map(|p| p.mcp()).unwrap_or_default();
+        let server = s.mcp.as_ref().and_then(|h| h.servers().into_iter().find(|sv| sv.name == label));
+        let allowed = server.as_ref().is_some_and(|sv| names.contains(&label) || (all && !sv.is_command()));
+        if !allowed {
+            return RespError::new(format!("tools: mcp server_label {label:?} is not one of this server's MCP servers that this key may use \
+                                           (Settings › Tools adds servers; the run config's \"clients\" gives a key mcp:<name> or mcp:*). \
+                                           A server_url sent in the request is not connected to"), "tools".to_string()).into_response();
+        }
+        mcp_labels.push(label);
+    }
+    let image_items = req["tools"].as_array().into_iter().flatten().any(|t| t["type"] == "image_generation")
+        && s.media.available() && crate::api_access(&s, &headers).flatten().is_some_and(|p| p.has("image"));
     if let Err(e) = media::expand_videos(&mut chat).await {
         return RespError::new(e.to_string(), None).into_response();
     }
@@ -905,7 +1017,10 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         .is_some_and(|a| a.iter().any(|x| x.as_str() == Some("reasoning.encrypted_content")));
     let mut asm = Assembler::new(&req, &started.model, started.prompt_tokens as u64, names, encrypted);
     asm.validator = validator;
+    asm.mcp_labels = mcp_labels;
+    let mcp_items = !asm.mcp_labels.is_empty();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(256);
+    let jobs_state = s.clone();
     let mut events = started.events;
     tokio::spawn(async move {
         for e in asm.start() {
@@ -914,9 +1029,31 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         while let Some(ev) = events.recv().await {
             let out = match ev {
                 RunEvent::Mcp(v) if web_items && asm.is_web_search(&v) => asm.web_search(&v),
+                RunEvent::Mcp(v) if image_items && asm.is_image_call(&v) => asm.image_call(&v),
+                RunEvent::Mcp(v) if mcp_items && asm.is_mcp_call(&v) => asm.mcp_call(&v),
                 RunEvent::Ping | RunEvent::Mcp(_) => vec![asm.in_progress()],
                 RunEvent::Event(e) => asm.feed(e),
                 RunEvent::Done(sum) => {
+                    // the images the answer queued, made now that it gave up the GPU (a keep-alive every 10 s)
+                    for (at, job) in std::mem::take(&mut asm.images) {
+                        let wait = jobs_state.media_jobs.wait_done(&job, std::time::Duration::from_secs(15 * 60));
+                        tokio::pin!(wait);
+                        let done = loop {
+                            tokio::select! {
+                                d = &mut wait => break d,
+                                _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                                    if tx.send(asm.in_progress()).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        };
+                        let b64 = done.filter(|d| d["state"] == "done").and_then(|_| jobs_state.media_jobs.bytes(&job))
+                            .map(|b| base64::engine::general_purpose::STANDARD.encode(b));
+                        for e in asm.image_done(at, b64) {
+                            let _ = tx.send(e).await;
+                        }
+                    }
                     for e in asm.finish(&sum) {
                         let _ = tx.send(e).await;
                     }

@@ -548,6 +548,14 @@ impl Jobs {
         }
     }
 
+    /// A finished job's file (in memory, or on disk after a restart).
+    pub fn bytes(&self, id: &str) -> Option<Vec<u8>> {
+        let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
+        let jobs = self.jobs.lock().unwrap();
+        let j = jobs.get(&n)?;
+        j.data.clone().or_else(|| j.file.as_ref().and_then(|f| std::fs::read(f).ok()))
+    }
+
     /// Wait for job `id` to finish (done or error), at most `max`: its status, or None if it is still going.
     pub async fn wait_done(&self, id: &str, max: Duration) -> Option<Value> {
         let t0 = Instant::now();

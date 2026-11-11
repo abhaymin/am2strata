@@ -2171,6 +2171,56 @@ fn responses_web_search_gives_a_web_search_call_item() {
     assert_eq!(msg["content"][0]["text"], "It is in Jeddah.");
 }
 
+/// The hosted image_generation tool: the model's generate_image runs here, and the image comes back in an
+/// image_generation_call item (made after the answer gives up the GPU) before the response completes.
+#[test]
+fn responses_image_generation_gives_an_image_generation_call_item() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"clients": {"default": {"tools": ["image"]}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Draw.\n</think>{call}")), ids("Ok.\n</think>\n\nHere it is.")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"model": "mock-a", "input": "Draw a lighthouse.", "tools": [{"type": "image_generation"}]}));
+    assert_eq!(c, 200, "{r}");
+    let out = r["output"].as_array().unwrap();
+    let img = out.iter().find(|i| i["type"] == "image_generation_call").expect("an image_generation_call item");
+    assert_eq!(img["status"], "completed", "{img}");
+    let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, img["result"].as_str().unwrap()).unwrap();
+    assert_eq!(&png[1..4], b"PNG", "the image itself");
+    assert_eq!(img["revised_prompt"], "a lighthouse at dusk");
+    assert!(out.iter().any(|i| i["type"] == "message" && i["content"][0]["text"] == "Here it is."), "{r}");
+    assert!(!r["output"].to_string().contains("function_call"), "the server's own call is not the client's: {r}");
+    // without "image" in the key's profile the hosted tool is left out, as the API does for a tool it does not offer
+    let s = Server::start(&[Model::default()], &[ids("Ok.\n</think>\n\nNo tools.")], json!({}));
+    let (c, r) = s.post("/v1/responses", &json!({"model": "mock-a", "input": "Draw.", "tools": [{"type": "image_generation"}]}));
+    assert_eq!(c, 200, "{r}");
+    assert!(!r["output"].to_string().contains("image_generation_call"));
+}
+
+/// The hosted mcp tool: a server_label that names one of this server's MCP servers the key may use; its calls show
+/// as mcp_call items. A label the key may not use (or a server_url of the request's own) is refused.
+#[test]
+fn responses_hosted_mcp_gives_mcp_call_items() {
+    let m = Model { extra: json!({"mcp_servers": {"calc": {"command": env!("CARGO_BIN_EXE_strata-mock-mcp")}},
+                                  "clients": {"default": {"tools": ["mcp:calc"]}}}), ..Model::default() };
+    let call = "\n\n<tool_call>\n<function=calc__add>\n<parameter=a>\n2\n</parameter>\n<parameter=b>\n3\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[m], &[ids(&format!("Use the tool.\n</think>{call}")), ids("Adding.\n</think>\n\nThe sum is 5.")], json!({}));
+    let t0 = Instant::now();
+    while s.get("/mcp", true).1["tools"] != 1 && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (c, r) = s.post("/v1/responses", &json!({"model": "mock-a", "input": "2+3?", "tools": [{"type": "mcp", "server_label": "calc"}]}));
+    assert_eq!(c, 200, "{r}");
+    let out = r["output"].as_array().unwrap();
+    let mc = out.iter().find(|i| i["type"] == "mcp_call").expect("an mcp_call item");
+    assert_eq!((mc["server_label"].as_str(), mc["status"].as_str(), mc["output"].as_str()), (Some("calc"), Some("completed"), Some("5")), "{mc}");
+    assert!(mc["name"].as_str().unwrap().contains("add"), "{mc}");
+    assert_eq!(serde_json::from_str::<Value>(mc["arguments"].as_str().unwrap()).unwrap()["a"], 2);
+    assert!(out.iter().any(|i| i["type"] == "message" && i["content"][0]["text"] == "The sum is 5."), "{r}");
+    let (c, r) = s.post("/v1/responses", &json!({"model": "mock-a", "input": "x",
+        "tools": [{"type": "mcp", "server_label": "remote", "server_url": "https://mcp.example/sse"}]}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("not connected to"), "{r}");
+}
+
 #[test]
 fn fetch_url_keeps_out_of_the_private_network_by_default() {
     let port = fake_web();
