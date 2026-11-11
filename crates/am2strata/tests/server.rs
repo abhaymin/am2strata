@@ -2631,3 +2631,41 @@ fn a_client_profiles_size_length_and_search_limits_hold() {
     let last = prompt_text(s.gen_lines().last().unwrap());
     assert!(last.contains("may run 1 web searches an answer"), "{last}");
 }
+
+/// A song part with "continue": true continues the song before it (ACE-Step's repaint past the source's end): the
+/// engine gets that song's last seconds as continue_from, and the two are merged into one entry with a chapter each.
+#[test]
+fn a_production_song_can_continue_the_song_before() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let plan = json!({"name": "Long song", "parts": [
+        {"song": {"lyrics": "[verse]\nLights on the river", "genre": "festive", "duration": 30}},
+        {"song": {"lyrics": "[chorus]\nAnd on it goes", "genre": "festive", "duration": 30, "continue": true, "context_seconds": 1}},
+        {"music": {"genre": "ambient", "duration": 20}}], "crossfade_s": 0.5, "captions": false});
+    let (c, j) = s.post("/v1/media/productions", &plan);
+    assert_eq!(c, 200, "{j}");
+    let id = j["id"].as_str().unwrap().to_string();
+    let t0 = std::time::Instant::now();
+    let done = loop {
+        let (_, v) = s.get(&format!("/api/jobs/{id}"), true);
+        if v["state"] == "done" || v["state"] == "error" { break v; }
+        assert!(t0.elapsed().as_secs() < 30, "{v}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(done["state"], "done", "{done}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let songs: Vec<Value> = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == "song").collect();
+    // song parts make two takes each (the lyrics check), the music one
+    assert_eq!(songs.len(), 5, "{} song ops", songs.len());
+    let cont: Vec<bool> = songs.iter().map(|v| v["continue_from"].is_string()).collect();
+    assert_eq!(cont, [false, false, true, true, false], "both takes of the second part continue the first");
+    let tail = songs[2]["continue_from"].as_str().unwrap();
+    let wav = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, tail).unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(wav.len(), 44 + 96_000 * 4, "the last context_seconds of the song before (at least 2 s): {}", wav.len());
+    let ch = done["meta"]["chapters"].as_array().unwrap();
+    assert_eq!(ch.len(), 3, "{ch:?}");
+    // the continuation starts where the first song is cut (2 s - 0.48 s + the 20 ms crossfade), inside its entry
+    let at = ch[1]["start_s"].as_f64().unwrap();
+    assert!((at - 1.5).abs() < 0.11, "the continuation's chapter at {at} s");
+    assert!(ch[2]["start_s"].as_f64().unwrap() > at);
+}

@@ -420,6 +420,9 @@ fn list(st: &mut State) -> Value {
 
 /// A song (ACE-Step 1.5 in Rust): {"op":"song","caption","lyrics","language","duration","seed","bpm","key","time_signature",
 /// "steps","device","planner" (default true),"planner_temperature","planner_cfg","planner_top_p"} -> {"event":"step",...}... then {"event":"song","format":"wav","data":<base64>,"seconds",...}.
+/// {"op": "song", caption, lyrics, duration, ..., "continue_from"?: base64 WAV of the song before (its end),
+/// "context_seconds"?: 10, "timbre_from_source"?: true} -> {"event": "song", ..., "continued", "replaces_s"}: with
+/// continue_from, only the continuation's audio, starting replaces_s before the source's end.
 fn song(st: &mut State, cmd: &Value) -> Result<Value> {
     let dir = acestep::local().ok_or_else(|| anyhow!("{} is not downloaded (pull it first)", acestep::NAME))?;
     if st.song.is_none() {
@@ -454,8 +457,32 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
             seed: cmd["seed"].as_u64().unwrap_or(0),
         }),
     };
-    let planned = s.plan.is_some() && st.song.as_ref().unwrap().has_planner();
     let t0 = std::time::Instant::now();
+    // a continuation of the song before: "continue_from" is a WAV (base64) of its end, of which the last
+    // "context_seconds" (default 10) are kept and continued (ACE-Step's repaint past the source's end)
+    if let Some(b64) = cmd["continue_from"].as_str().filter(|b| !b.is_empty()) {
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.split_once(";base64,").map(|(_, b)| b).unwrap_or(b64))
+            .context("continue_from: not base64")?;
+        let source = stereo_48k(&bytes)?;
+        let ctx = cmd["context_seconds"].as_f64().unwrap_or(10.0).clamp(2.0, 60.0);
+        let n = source.dim(1)?;
+        let take = ((ctx * 48_000.0) as usize).min(n);
+        let source = source.narrow(1, n - take, take)?;
+        let mut s = s;
+        s.plan = None; // the planner's codes would replace the source (a cover); a repaint keeps it
+        let song = st.song.as_mut().unwrap();
+        let audio = song.continuation(&s, &source, cmd["timbre_from_source"].as_bool() != Some(false),
+                                      &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
+        let replaces = acestep::pipeline::CROSSFADE as f64 * acestep::oobleck::HOP as f64 / 48_000.0;
+        let wav = acestep::pipeline::wav(&audio)?;
+        return Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE,
+                         "seconds": audio.dim(1)? as f64 / 48_000.0, "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME,
+                         "seed": s.seed, "planner": false, "continued": true, "context_seconds": take as f64 / 48_000.0,
+                         // the audio starts this many seconds before the previous song's end: those are replaced
+                         "replaces_s": replaces,
+                         "data": base64::engine::general_purpose::STANDARD.encode(wav)}));
+    }
+    let planned = s.plan.is_some() && st.song.as_ref().unwrap().has_planner();
     let audio = st.song.as_mut().unwrap().song(&s, &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
     let wav = acestep::pipeline::wav(&audio)?;
     Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE, "seconds": duration,
@@ -464,6 +491,52 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
               "planned": st.song.as_ref().unwrap().last_thought().map(|t| json!({"bpm": t.bpm, "key": t.key_scale,
                                                                                  "time_signature": t.time_signature})),
               "data": base64::engine::general_purpose::STANDARD.encode(wav)}))
+}
+
+/// A WAV (PCM 16-bit or float 32-bit, mono or stereo, any rate) as stereo 48 kHz [2, samples] (linear resampling).
+fn stereo_48k(b: &[u8]) -> Result<candle_core::Tensor> {
+    if b.len() < 12 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        bail!("continue_from: not a WAV file");
+    }
+    let (mut fmt, mut data) = (None, None);
+    let mut o = 12;
+    while o + 8 <= b.len() {
+        let len = u32::from_le_bytes(b[o + 4..o + 8].try_into()?) as usize;
+        let body = &b[o + 8..(o + 8 + len).min(b.len())];
+        match &b[o..o + 4] {
+            b"fmt " => fmt = Some(body),
+            b"data" => data = Some(body),
+            _ => {}
+        }
+        o += 8 + len + (len & 1);
+    }
+    let (fmt, data) = (fmt.ok_or_else(|| anyhow!("continue_from: no fmt chunk"))?, data.ok_or_else(|| anyhow!("continue_from: no data"))?);
+    let (format, ch, rate, bits) = (u16::from_le_bytes([fmt[0], fmt[1]]), u16::from_le_bytes([fmt[2], fmt[3]]) as usize,
+                                    u32::from_le_bytes(fmt[4..8].try_into()?), u16::from_le_bytes([fmt[14], fmt[15]]));
+    let samples: Vec<f32> = match (format, bits) {
+        (1, 16) => data.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect(),
+        (3, 32) | (0xFFFE, 32) => data.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
+        _ => bail!("continue_from: a {bits}-bit WAV (format {format}) is not read; send 16-bit PCM or 32-bit float"),
+    };
+    if ch == 0 {
+        bail!("continue_from: no channels");
+    }
+    let frames = samples.len() / ch;
+    let chan = |c: usize| -> Vec<f32> { (0..frames).map(|i| samples[i * ch + c.min(ch - 1)]).collect() };
+    let (l, r) = (chan(0), chan(1));
+    let resample = |x: Vec<f32>| -> Vec<f32> {
+        if rate == 48_000 { return x; }
+        let n = (x.len() as f64 * 48_000.0 / rate as f64) as usize;
+        (0..n).map(|i| {
+            let p = i as f64 * rate as f64 / 48_000.0;
+            let (a, f) = (p.floor() as usize, (p - p.floor()) as f32);
+            let (u, v) = (x[a.min(x.len() - 1)], x[(a + 1).min(x.len() - 1)]);
+            u + (v - u) * f
+        }).collect()
+    };
+    let (l, r) = (resample(l), resample(r));
+    let n = l.len();
+    Ok(candle_core::Tensor::from_vec([l, r].concat(), (2, n), &candle_core::Device::Cpu)?)
 }
 
 fn load(st: &mut State, model: &str) -> Result<()> {

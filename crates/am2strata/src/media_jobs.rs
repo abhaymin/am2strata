@@ -678,18 +678,35 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
     let id = format!("mj-{n}");
     let mut audio: Vec<Vec<f32>> = Vec::new();
     let mut chapters = Vec::new();
+    // the song before, as made (not yet evened), for a song part that continues it ("continue": true); and the
+    // chapters inside an entry (a continuation merged into its song): (entry, offset s, title)
+    let mut prev_song: Option<Vec<f32>> = None;
+    let mut inner: Vec<(usize, f64, String)> = Vec::new();
     for (i, (kind, body)) in parts.iter().enumerate() {
+        let continues = *kind != "speak" && body["continue"] == true && prev_song.is_some();
         s.media_jobs.set_meta(n, json!({"part": i + 1, "parts": total, "now": kind}));
         let kept = dir.as_ref().map(|d| d.join(format!("{id}.part-{}.wav", i + 1)));
+        let kept_rep = dir.as_ref().map(|d| d.join(format!("{id}.part-{}.replaces", i + 1)));
+        let mut replaces = kept_rep.as_ref().and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| t.trim().parse::<f64>().ok()).unwrap_or(0.0);
         let bytes = match kept.as_ref().and_then(|f| std::fs::read(f).ok()) {
             Some(b) => b,
             None => {
                 let mut b = body.clone();
                 b["strata_label"] = json!(id);
+                if let (true, Some(prev)) = (continues, prev_song.as_ref()) {
+                    // the last context_seconds (default 10) of the song before
+                    let ctx = body["context_seconds"].as_f64().unwrap_or(10.0).clamp(2.0, 60.0);
+                    let take = ((ctx * crate::production::RATE as f64) as usize * 2).min(prev.len());
+                    b["continue_from"] = json!(base64::engine::general_purpose::STANDARD.encode(crate::production::wav(&prev[prev.len() - take..])));
+                }
                 let r = match *kind {
                     "speak" => crate::audio_api::speech(State(s.clone()), own_key(s), Json(b)).await,
                     _ => crate::music::music(State(s.clone()), own_key(s), Json(b)).await,
                 };
+                replaces = r.headers().get("x-strata-replaces-s").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                if let Some(f) = &kept_rep {
+                    let _ = std::fs::write(f, replaces.to_string());
+                }
                 let ok = r.status().is_success();
                 let body_bytes = axum::body::to_bytes(r.into_body(), 1 << 30).await.map(|b| b.to_vec()).unwrap_or_default();
                 if !ok {
@@ -704,7 +721,23 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
             }
         };
         let (rate, ch, samples) = crate::production::read_wav(&bytes).map_err(|e| format!("part {}: {e}", i + 1))?;
-        let mut st = crate::production::to_stereo_48k(rate, ch, &samples);
+        let st = crate::production::to_stereo_48k(rate, ch, &samples);
+        if continues {
+            // merged into the song before: that song cut where the continuation starts (it re-makes the last
+            // replaces s), a 20 ms crossfade over the encoder's round trip, loudness evened over the whole
+            let prev = prev_song.take().unwrap();
+            let cut = ((replaces - 0.02).max(0.0) * crate::production::RATE as f64) as usize * 2;
+            let (merged, at) = crate::production::join(&[prev[..prev.len() - cut.min(prev.len())].to_vec(), st], 0.02);
+            let entry = audio.len() - 1;
+            inner.push((entry, at[1], crate::production::title(kind, body, i)));
+            let mut evened = merged.clone();
+            crate::production::even_loudness(&mut evened);
+            audio[entry] = evened;
+            prev_song = Some(merged);
+            continue;
+        }
+        prev_song = (*kind != "speak").then(|| st.clone());
+        let mut st = st;
         crate::production::even_loudness(&mut st);
         audio.push(st);
         chapters.push(crate::production::title(kind, body, i));
@@ -712,11 +745,18 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
     let cross = plan["crossfade_s"].as_f64().unwrap_or(1.0).clamp(0.0, 8.0);
     let (joined, starts) = crate::production::join(&audio, cross);
     let secs = (joined.len() / 2) as f64 / crate::production::RATE as f64;
+    let mut timed: Vec<(String, f64)> = chapters.iter().cloned().zip(starts.iter().copied()).collect();
+    for (entry, off, title) in &inner {
+        timed.push((title.clone(), starts[*entry] + off));
+    }
+    timed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let (chapters, starts): (Vec<String>, Vec<f64>) = timed.into_iter().unzip();
     let marks: Vec<Value> = chapters.iter().zip(&starts).map(|(t, at)| json!({"title": t, "start_s": (at * 10.0).round() / 10.0})).collect();
     // the parts' files are no longer needed once the whole is kept
     if let Some(d) = &dir {
         for i in 1..=total {
             let _ = std::fs::remove_file(d.join(format!("{id}.part-{i}.wav")));
+            let _ = std::fs::remove_file(d.join(format!("{id}.part-{i}.replaces")));
         }
     }
     // ready for YouTube: the chapters in the description's form, and captions from the finished audio (Whisper,

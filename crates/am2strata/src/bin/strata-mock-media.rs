@@ -66,9 +66,28 @@ fn main() {
                 for s in 1..=8u64 {
                     emit(serde_json::json!({"event": "step", "step": s, "total": 8}));
                 }
-                // a valid 1-sample stereo WAV at 48 kHz
-                emit(serde_json::json!({"event": "song", "format": "wav", "sample_rate": 48000, "seconds": cmd["duration"],
-                    "data": "UklGRigAAABXQVZFZm10IBAAAAABAAIAgLsAAADuAgAEABAAZGF0YQQAAAAAAAAA"}));
+                // a 2 s stereo WAV at 48 kHz (a quiet tone); a continuation ("continue_from") answers as the engine
+                // does: its audio starts replaces_s before the source's end
+                let n = 96_000usize;
+                let mut w: Vec<u8> = Vec::with_capacity(44 + n * 4);
+                w.extend_from_slice(b"RIFF");
+                w.extend_from_slice(&(36 + n as u32 * 4).to_le_bytes());
+                w.extend_from_slice(b"WAVEfmt ");
+                w.extend_from_slice(&[16, 0, 0, 0, 1, 0, 2, 0]);
+                w.extend_from_slice(&48000u32.to_le_bytes());
+                w.extend_from_slice(&(48000u32 * 4).to_le_bytes());
+                w.extend_from_slice(&[4, 0, 16, 0]);
+                w.extend_from_slice(b"data");
+                w.extend_from_slice(&(n as u32 * 4).to_le_bytes());
+                for i in 0..n {
+                    let v = ((i as f32 * 0.05).sin() * 3000.0) as i16;
+                    w.extend_from_slice(&v.to_le_bytes());
+                    w.extend_from_slice(&v.to_le_bytes());
+                }
+                let continued = cmd["continue_from"].as_str().is_some_and(|c| !c.is_empty());
+                emit(serde_json::json!({"event": "song", "format": "wav", "sample_rate": 48000, "seconds": 2.0,
+                    "continued": continued, "replaces_s": if continued { 0.48 } else { 0.0 },
+                    "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &w)}));
             }
             "speak" => {
                 emit(serde_json::json!({"event": "part", "done": 1, "total": 1}));
