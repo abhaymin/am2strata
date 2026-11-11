@@ -2359,6 +2359,7 @@ async function loadCluster() {
     }
     html += (j.workers || []).map((w) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(w.name)}</strong>` +
       `<span class="st-badge ${w.ready ? "st-badge--generating" : ""}">${w.ready ? "Answering" : "Not answering"}</span>` +
+      `<span class="st-badge" title="${esc(w.transport || "")}">${w.encrypted ? "Encrypted" : "Plain HTTP: use a VPN"}</span>` +
       `<span class="muted small">${esc(w.url)} · ${w.loaded ? `${esc(w.loaded)} loaded` : "no model loaded"} · ${fmt(w.waiting || 0)} waiting` +
       ` · ${fmt(w.requests_routed || 0)} requests taken${w.seen_s_ago != null ? ` · seen ${fmt(w.seen_s_ago)} s ago` : ""}</span>` +
       `<button class="st-btn st-btn--danger" data-unpair="${esc(w.name)}">Remove</button></div>` +

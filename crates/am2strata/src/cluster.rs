@@ -18,8 +18,11 @@
 //!   (`DELETE /api/cluster/workers/{name}`) also tells the worker to forget that master.
 //! - Workers can also be given in the run config:
 //!   `"cluster": {"workers": {"pc2": {"url": "http://192.168.8.50:8000", "key": "env:PC2_KEY"}}}`.
-//! - Traffic is plain HTTP with the key for now: across a network you do not trust, connect the machines through your
-//!   own VPN (Tailscale, WireGuard). Encryption with the paired keys is the next step.
+//! - **Encrypted** (cluster_tls.rs): pairing swaps the nodes' certificate pins, and a paired worker is then reached
+//!   only over its TLS 1.3 listener (`"tls_port"`, default the API port + 443), each side checking the other's pinned
+//!   certificate; a master's key works only with that master's own certificate, and no longer over plain HTTP unless
+//!   the worker's `"cluster": {"allow_plain": true}`. Workers given in the run config (url and key) stay plain HTTP,
+//!   shown as such: use a VPN for those.
 //! - Each worker is asked every 5 s for its models and queue. One that has not answered for 15 s gets no new work;
 //!   a request it fails to take is answered here when this PC has the model, else refused plainly.
 //! - `AM2STRATA_NO_MDNS=1` turns mDNS off (tests, or a network where it is not wanted).
@@ -59,6 +62,11 @@ pub struct Worker {
     pub name: String,
     pub url: String,
     key: String,
+    /// paired with TLS: the worker's listener (https://host:tls_port) and its certificate's pin
+    pub tls_url: Option<String>,
+    pub pin: Option<String>,
+    /// the HTTP client for it: pinned mutual TLS, or plain HTTP for a run-config worker
+    client: reqwest::Client,
     /// the worker's node id, when it was paired (not for run-config workers)
     pub node_id: Option<String>,
     /// paired from the app (kept in cluster-workers.json), not from the run config
@@ -69,7 +77,28 @@ pub struct Worker {
 
 impl Worker {
     fn new(name: String, url: String, key: String, node_id: Option<String>, paired: bool) -> Arc<Worker> {
-        Arc::new(Worker { name, url, key, node_id, paired, seen: Mutex::new(Seen::default()), stop: AtomicBool::new(false) })
+        Self::with_tls(name, url, key, node_id, paired, None, None)
+    }
+
+    /// `tls`: (the worker's TLS url, its pin), and this node's identity to show it.
+    fn with_tls(name: String, url: String, key: String, node_id: Option<String>, paired: bool, tls: Option<(String, String)>,
+                me: Option<&crate::cluster_tls::Identity>) -> Arc<Worker> {
+        let (client, error) = match (&tls, me) {
+            (Some((_, pin)), Some(me)) => match crate::cluster_tls::client(me, pin) {
+                Ok(c) => (c, None),
+                // never a silent fall back to plain HTTP: requests to the https url then fail, and say why
+                Err(e) => (reqwest::Client::new(), Some(format!("its TLS client could not be made: {e}"))),
+            },
+            _ => (reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build().unwrap_or_default(), None),
+        };
+        let (tls_url, pin) = tls.map(|(u, p)| (Some(u), Some(p))).unwrap_or((None, None));
+        let seen = Seen { error, ..Seen::default() };
+        Arc::new(Worker { name, url, key, tls_url, pin, client, node_id, paired, seen: Mutex::new(seen), stop: AtomicBool::new(false) })
+    }
+
+    /// Where its requests go: the TLS listener when paired with one, else its url.
+    fn base(&self) -> &str {
+        self.tls_url.as_deref().unwrap_or(&self.url)
     }
 
     fn ready(&self) -> bool {
@@ -83,6 +112,8 @@ impl Worker {
     fn view(&self) -> Value {
         let s = self.seen.lock().unwrap().clone();
         json!({"name": self.name, "url": self.url, "node_id": self.node_id, "paired": self.paired, "ready": self.ready(),
+               "encrypted": self.tls_url.is_some(), "tls_url": self.tls_url,
+               "transport": if self.tls_url.is_some() { "TLS 1.3, pinned certificates" } else { "plain HTTP: use a VPN" },
                "models": s.models, "loaded": s.current, "waiting": s.waiting, "running": s.running,
                "seen_s_ago": s.at.map(|t| t.elapsed().as_secs()), "error": s.error, "requests_routed": s.routed})
     }
@@ -115,6 +146,14 @@ pub struct Cluster {
     pub role: Role,
     pub node: Node,
     data_dir: Option<PathBuf>,
+    /// this node's TLS certificate (cluster_tls.rs), made with the node's data
+    pub identity: Option<crate::cluster_tls::Identity>,
+    /// a worker's TLS port for its masters (None: the API port + 443)
+    tls_port: Option<u16>,
+    /// a worker still takes a TLS-paired master's key over plain HTTP
+    allow_plain: bool,
+    /// the API's port (set at start), for the default TLS port
+    api_port: std::sync::atomic::AtomicU16,
     workers: RwLock<Vec<Arc<Worker>>>,
     // worker side
     code: Mutex<(String, Instant)>,
@@ -152,7 +191,7 @@ fn new_code() -> String {
 }
 
 /// Write `v` to `path` readable by its owner only.
-fn write_private(path: &Path, v: &Value) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, v: &Value) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(v).unwrap_or_default();
     #[cfg(unix)]
     {
@@ -203,7 +242,8 @@ fn host_name() -> String {
 impl Cluster {
     /// A cluster with no workers (tests).
     pub fn empty() -> Cluster {
-        Cluster { role: Role::Master, node: Node { id: String::new(), name: String::new() }, data_dir: None,
+        Cluster { role: Role::Master, node: Node { id: String::new(), name: String::new() }, data_dir: None, identity: None,
+                  tls_port: None, allow_plain: false, api_port: std::sync::atomic::AtomicU16::new(0),
                   workers: RwLock::new(Vec::new()), code: Mutex::new((new_code(), Instant::now())), fails: Mutex::new((0, None)),
                   masters: RwLock::new(Vec::new()), found: Mutex::new(HashMap::new()), polling: AtomicBool::new(false) }
     }
@@ -221,7 +261,13 @@ impl Cluster {
         if let Some(d) = data_dir {
             let _ = std::fs::create_dir_all(d);
             c.node = Node { id: node_identity(d), name: cfg["name"].as_str().map(str::to_string).unwrap_or_else(host_name) };
+            match crate::cluster_tls::Identity::load_or_make(d, &c.node.name) {
+                Ok(i) => c.identity = Some(i),
+                Err(e) => tracing::warn!("cluster: no TLS certificate ({e}); cluster traffic stays plain HTTP"),
+            }
         }
+        c.tls_port = cfg["tls_port"].as_u64().and_then(|p| u16::try_from(p).ok());
+        c.allow_plain = cfg["allow_plain"] == true;
         let mut list = Vec::new();
         if let Some(w) = cfg.get("workers") {
             let obj = w.as_object().ok_or("config cluster.workers: expected {\"name\": {\"url\": ..., \"key\": ...}}")?;
@@ -243,7 +289,9 @@ impl Cluster {
             for w in saved["workers"].as_array().into_iter().flatten() {
                 let (Some(name), Some(url), Some(key)) = (w["name"].as_str(), w["url"].as_str(), w["key"].as_str()) else { continue };
                 if !list.iter().any(|x: &Arc<Worker>| x.name == name) {
-                    list.push(Worker::new(name.into(), url.into(), key.into(), w["node_id"].as_str().map(str::to_string), true));
+                    let tls = w["tls_url"].as_str().zip(w["pin"].as_str()).map(|(u, p)| (u.to_string(), p.to_string()));
+                    list.push(Worker::with_tls(name.into(), url.into(), key.into(), w["node_id"].as_str().map(str::to_string), true, tls,
+                                               c.identity.as_ref()));
                 }
             }
             let masters: Value = std::fs::read_to_string(d.join("cluster-masters.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
@@ -263,6 +311,7 @@ impl Cluster {
 
     /// Start: poll the workers; announce (a worker) or browse (a master) by mDNS; a worker logs its pairing code.
     pub fn start(self: &Arc<Self>, port: u16) {
+        self.api_port.store(port, Ordering::Relaxed);
         self.polling.store(true, Ordering::Relaxed);
         for w in self.workers() {
             spawn_poller(w);
@@ -317,13 +366,42 @@ impl Cluster {
         c.0.clone()
     }
 
-    /// A master's key, given to this worker: true when it is one this worker minted.
-    pub fn is_master_key(&self, key: &str) -> bool {
+    /// A master's key, given to this worker: true when it is one this worker minted, and it came the way that master
+    /// paired: over the TLS listener with that master's own certificate (`peer`: the pin of the certificate the
+    /// request's connection showed), or, for a master paired without TLS (or with `allow_plain`), over plain HTTP too.
+    pub fn is_master_key(&self, key: &str, peer: Option<&str>) -> bool {
         if self.role != Role::Worker {
             return false;
         }
         let h = sha_hex(key);
-        self.masters.read().unwrap().iter().any(|m| m["key_sha256"].as_str().is_some_and(|k| same(k, &h)))
+        self.masters.read().unwrap().iter().any(|m| {
+            m["key_sha256"].as_str().is_some_and(|k| same(k, &h)) && match (m["cert_sha256"].as_str(), peer) {
+                (Some(pin), Some(p)) => same(pin, p),
+                (Some(_), None) => self.allow_plain,
+                (None, _) => true,
+            }
+        })
+    }
+
+    /// The pins of the masters this worker paired with TLS (its listener lets only these in).
+    pub fn master_pins(&self) -> Vec<String> {
+        self.masters.read().unwrap().iter().filter_map(|m| m["cert_sha256"].as_str().map(str::to_string)).collect()
+    }
+
+    /// A worker's TLS port for its masters (`api_port`: the API's).
+    pub fn tls_port(&self, api_port: u16) -> Option<u16> {
+        self.tls_port.or_else(|| api_port.checked_add(443))
+    }
+
+    /// A worker: its encrypted listener for paired masters, serving `app`.
+    pub fn serve_tls(self: &Arc<Self>, app: axum::Router, host: String, api_port: u16) {
+        let (Some(me), Some(port), Role::Worker) = (self.identity.clone(), self.tls_port(api_port), &self.role) else { return };
+        let c = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::cluster_tls::serve(me, Box::new(move || c.master_pins()), app, host, port).await {
+                tracing::warn!("cluster: the encrypted listener did not start ({e}); masters paired with TLS cannot reach this worker");
+            }
+        });
     }
 
     fn save_masters(&self) {
@@ -335,13 +413,13 @@ impl Cluster {
     fn save_workers(&self) {
         if let Some(d) = &self.data_dir {
             let list: Vec<Value> = self.workers().iter().filter(|w| w.paired)
-                .map(|w| json!({"name": w.name, "url": w.url, "node_id": w.node_id, "key": w.key})).collect();
+                .map(|w| json!({"name": w.name, "url": w.url, "node_id": w.node_id, "key": w.key, "tls_url": w.tls_url, "pin": w.pin})).collect();
             let _ = write_private(&d.join("cluster-workers.json"), &json!({"workers": list}));
         }
     }
 
     /// A worker's answer to a master's join: Ok(the key minted for it) or Err((status, why)).
-    pub fn join(&self, code: &str, master_id: &str, master_name: &str) -> Result<String, (StatusCode, String)> {
+    pub fn join(&self, code: &str, master_id: &str, master_name: &str, master_pin: Option<&str>) -> Result<String, (StatusCode, String)> {
         if self.role != Role::Worker {
             return Err((StatusCode::NOT_FOUND, "this server is not a worker (its run config's \"cluster\": {\"role\": \"worker\"})".into()));
         }
@@ -369,7 +447,8 @@ impl Cluster {
         {
             let mut m = self.masters.write().unwrap();
             m.retain(|x| x["id"] != id.as_str());
-            m.push(json!({"id": id, "name": name, "key_sha256": sha_hex(&key), "paired_at": crate::now()}));
+            m.push(json!({"id": id, "name": name, "key_sha256": sha_hex(&key), "paired_at": crate::now(),
+                          "cert_sha256": master_pin.filter(|p| crate::cluster_tls::valid_pin(p)).map(|p| p.to_ascii_lowercase())}));
         }
         self.save_masters();
         // a used code is not used again
@@ -467,9 +546,8 @@ fn found_of(info: &mdns_sd::ServiceInfo) -> Option<(String, Found)> {
 /// Ask a worker for its models and queue every 5 s, until it is removed.
 fn spawn_poller(w: Arc<Worker>) {
     tokio::spawn(async move {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(4)).build().expect("http client");
         while !w.stop.load(Ordering::Relaxed) {
-            let get = |p: &str| http.get(format!("{}{p}", w.url)).bearer_auth(&w.key).send();
+            let get = |p: &str| w.client.get(format!("{}{p}", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(4)).send();
             let r = async {
                 let m: Value = get("/api/models").await?.error_for_status()?.json().await?;
                 let q: Value = get("/api/queue").await?.error_for_status()?.json().await?;
@@ -487,7 +565,7 @@ fn spawn_poller(w: Arc<Worker>) {
                         s.at = Some(Instant::now());
                         s.error = None;
                     }
-                    Err(e) => s.error = Some(e.to_string()),
+                    Err(e) => s.error = Some(error_chain(&e)),
                 }
             }
             tokio::time::sleep(POLL).await;
@@ -497,16 +575,27 @@ fn spawn_poller(w: Arc<Worker>) {
 
 /// The request sent on to `w`, its answer streamed back. Err: the worker could not be reached (the caller answers
 /// here when it can).
+/// An error with its causes (a TLS refusal says why: "not the one paired").
+fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(c) = src {
+        s.push_str(": ");
+        s.push_str(&c.to_string());
+        src = c.source();
+    }
+    s
+}
+
 pub async fn forward(w: &Worker, path_and_query: &str, headers: &HeaderMap, body: axum::body::Bytes) -> Result<Response, String> {
-    let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(5)).build().map_err(|e| e.to_string())?;
-    let mut rq = http.post(format!("{}{path_and_query}", w.url)).bearer_auth(&w.key).body(body);
+    let mut rq = w.client.post(format!("{}{path_and_query}", w.base())).bearer_auth(&w.key).body(body);
     // what shapes the answer; never the client's own key
     for h in ["content-type", "accept", "anthropic-version", "anthropic-beta", "openai-beta", "x-strata-priority"] {
         if let Some(v) = headers.get(h) {
             rq = rq.header(h, v.as_bytes());
         }
     }
-    let r = rq.send().await.map_err(|e| e.to_string())?;
+    let r = rq.send().await.map_err(|e| error_chain(&e))?;
     w.seen.lock().unwrap().routed += 1;
     let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let ctype = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/json").to_string();
@@ -596,7 +685,8 @@ pub async fn pair(axum::extract::State(s): axum::extract::State<crate::AppState>
         Err(e) => return crate::error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     };
     let r = http.post(format!("{url}/api/cluster/join"))
-        .json(&json!({"code": code, "master_id": s.cluster.node.id, "master_name": s.cluster.node.name})).send().await;
+        .json(&json!({"code": code, "master_id": s.cluster.node.id, "master_name": s.cluster.node.name,
+                      "master_cert_sha256": s.cluster.identity.as_ref().map(|i| i.pin.clone())})).send().await;
     let r = match r {
         Ok(r) => r,
         Err(e) => return crate::error(StatusCode::BAD_GATEWAY, "worker_unreachable", format!("{url} did not answer: {e}")),
@@ -618,9 +708,19 @@ pub async fn pair(axum::extract::State(s): axum::extract::State<crate::AppState>
     if s.cluster.workers().iter().any(|w| w.name == name && w.node_id.as_deref() != Some(node_id)) {
         name = format!("{name}-{}", &node_id[..6.min(node_id.len())]);
     }
-    s.cluster.add_worker(Worker::new(name.clone(), url.clone(), key.to_string(), Some(node_id.to_string()), true));
-    tracing::info!("cluster: paired with worker {name} ({url})");
-    axum::Json(json!({"paired": name, "url": url, "node_id": node_id})).into_response()
+    // the worker's encrypted listener: the same host, its TLS port, its certificate pinned
+    let tls = match (v["tls_port"].as_u64(), v["cert_sha256"].as_str().filter(|p| crate::cluster_tls::valid_pin(p)), s.cluster.identity.as_ref()) {
+        (Some(port), Some(pin), Some(_)) => reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(|h| {
+            let h = if h.contains(':') && !h.starts_with('[') { format!("[{h}]") } else { h.to_string() };
+            (format!("https://{h}:{port}"), pin.to_ascii_lowercase())
+        })),
+        _ => None,
+    };
+    let encrypted = tls.is_some();
+    s.cluster.add_worker(Worker::with_tls(name.clone(), url.clone(), key.to_string(), Some(node_id.to_string()), true, tls,
+                                          s.cluster.identity.as_ref()));
+    tracing::info!("cluster: paired with worker {name} ({url}{})", if encrypted { ", encrypted" } else { ", plain HTTP" });
+    axum::Json(json!({"paired": name, "url": url, "node_id": node_id, "encrypted": encrypted})).into_response()
 }
 
 /// POST /api/cluster/join {"code", "master_id", "master_name"} (a worker; the code is the only proof): for the right
@@ -630,8 +730,14 @@ pub async fn join(axum::extract::State(s): axum::extract::State<crate::AppState>
     if id.is_empty() {
         return crate::error(StatusCode::BAD_REQUEST, "invalid_request_error", "send \"master_id\"");
     }
-    match s.cluster.join(code, id, name) {
-        Ok(key) => axum::Json(json!({"key": key, "node_id": s.cluster.node.id, "name": s.cluster.node.name})).into_response(),
+    match s.cluster.join(code, id, name, req["master_cert_sha256"].as_str()) {
+        Ok(key) => {
+            // the encrypted listener's port and this worker's pin, for a master that sent its own pin
+            let tls = req["master_cert_sha256"].as_str().is_some_and(crate::cluster_tls::valid_pin) && s.cluster.identity.is_some();
+            axum::Json(json!({"key": key, "node_id": s.cluster.node.id, "name": s.cluster.node.name,
+                              "tls_port": if tls { s.cluster.tls_port(s.cluster.api_port.load(Ordering::Relaxed)) } else { None },
+                              "cert_sha256": if tls { s.cluster.identity.as_ref().map(|i| i.pin.clone()) } else { None }})).into_response()
+        }
         Err((status, why)) => crate::error(status, "pairing_refused", why),
     }
 }
@@ -661,11 +767,8 @@ pub async fn remove(axum::extract::State(s): axum::extract::State<crate::AppStat
         return crate::error(StatusCode::NOT_FOUND, "not_found", format!("no worker is named {name:?}"));
     };
     let told = if w.paired {
-        let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build();
-        match http {
-            Ok(h) => h.post(format!("{}/api/cluster/forget", w.url)).bearer_auth(&w.key).send().await.is_ok_and(|r| r.status().is_success()),
-            Err(_) => false,
-        }
+        w.client.post(format!("{}/api/cluster/forget", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(5)).send().await
+            .is_ok_and(|r| r.status().is_success())
     } else {
         false
     };
@@ -737,15 +840,30 @@ mod tests {
         c.role = Role::Worker;
         let code = c.code();
         let wrong = if code == "000000" { "000001" } else { "000000" };
-        assert_eq!(c.join(wrong, "m1", "master").unwrap_err().0, StatusCode::FORBIDDEN);
-        let key = c.join(&code, "m1", "master").unwrap();
-        assert!(c.is_master_key(&key) && !c.is_master_key("am2w-other"));
+        assert_eq!(c.join(wrong, "m1", "master", None).unwrap_err().0, StatusCode::FORBIDDEN);
+        let key = c.join(&code, "m1", "master", None).unwrap();
+        assert!(c.is_master_key(&key, None) && !c.is_master_key("am2w-other", None));
         assert_ne!(c.code(), code, "a used code is not used again");
         for _ in 0..LOCK_AFTER {
-            let _ = c.join(wrong, "m2", "x");
+            let _ = c.join(wrong, "m2", "x", None);
         }
-        assert_eq!(c.join(&c.code(), "m2", "x").unwrap_err().0, StatusCode::TOO_MANY_REQUESTS, "locked, even for the right code");
-        assert!(c.forget(&key) && !c.is_master_key(&key));
+        assert_eq!(c.join(&c.code(), "m2", "x", None).unwrap_err().0, StatusCode::TOO_MANY_REQUESTS, "locked, even for the right code");
+        assert!(c.forget(&key) && !c.is_master_key(&key, None));
+    }
+
+    #[test]
+    fn a_tls_paired_masters_key_needs_its_own_certificate() {
+        let mut c = Cluster::empty();
+        c.role = Role::Worker;
+        let (pin, other) = ("a".repeat(64), "b".repeat(64));
+        let key = c.join(&c.code(), "m1", "master", Some(&pin)).unwrap();
+        assert!(c.is_master_key(&key, Some(&pin)), "over TLS with its certificate");
+        assert!(!c.is_master_key(&key, Some(&other)), "another master's certificate");
+        assert!(!c.is_master_key(&key, None), "plain HTTP");
+        c.allow_plain = true;
+        assert!(c.is_master_key(&key, None), "plain HTTP when the worker allows it");
+        assert_eq!(c.master_pins(), vec![pin.clone()]);
+        assert_eq!(c.tls_port(8000), Some(8443));
     }
 
     #[test]

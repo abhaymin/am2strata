@@ -4,8 +4,8 @@ Owner's request (2026-11-10): machines on the same network, or remote ones the u
 work together. A model's layers are shared across them, for quicker requests and longer context, as exo and other
 cluster tools do, old phones included.
 
-**State: phase 1 (request routing) and part 1 (nodes and joining) built and tested on one machine (2026-11-11);
-encryption with the paired keys, and measurements on a second machine, are next.** This page is the design and the
+**State: phase 1 (request routing), part 1 (nodes and joining) and encryption with the paired keys built and tested
+on one machine (2026-11-11); measurements on a second machine are next.** This page is the design and the
 order of the work. Each step is measured on real machines before the next starts.
 
 ### Part 1 as built: nodes and joining (`crates/am2strata/src/cluster.rs`)
@@ -174,6 +174,33 @@ The cluster has one **master** and any number of **workers**:
 
 ## Security
 
+- **Encryption with the paired keys (built 2026-11-11, `crates/am2strata/src/cluster_tls.rs`):** mutual TLS 1.3.
+  - Every node has a self-signed certificate in `<data>/node-tls.json` (0600). Its SHA-256 is its pin.
+  - Pairing swaps the pins over the same request the 6-digit code proves: the master sends its pin, and the worker
+    answers with its own and its TLS port. Each side keeps the other's pin (`cluster-workers.json` /
+    `cluster-masters.json`, 0600).
+  - A worker serves a second listener for its masters (`"cluster": {"role": "worker", "tls_port": N}`, default the
+    API port + 443): TLS 1.3 only, a client certificate required, and only a paired master's certificate is let in.
+  - A master's key works only on a connection showing that same master's certificate. Plain HTTP with it is refused
+    unless the worker sets `"allow_plain": true` (masters paired before TLS keep working over plain HTTP).
+  - The master reaches the worker only over that listener, checking the worker's certificate against its pin (no
+    certificate authority: the pin is the trust), and shows its own certificate.
+  - Why TLS and not Noise: rustls is already in the build (reqwest), audited and fast, and HTTP and streaming run over
+    it unchanged.
+  - Tested: `a_paired_worker_is_reached_only_over_pinned_tls` (two servers on one machine), plus a unit test with real
+    handshakes (`only_pinned_certificates_talk`):
+    - the master's key over plain HTTP: 401;
+    - the TLS listener without a client certificate: refused at the handshake, as is an unpaired certificate;
+    - a worker showing another certificate is refused by the master, which reports "the worker's certificate is not
+      the one paired";
+    - chats, streamed too, go through.
+  - Measured on this PC (mock engines, 40 short chats each): the median chat through the master took 1.0 ms over
+    plain HTTP and 1.0-1.1 ms over TLS. Connections are reused, so TLS adds about 0.1 ms.
+  - **Limits:**
+    - the pairing request itself is plain HTTP, so pair on a network you trust or through a VPN (someone in the middle
+      of that one request could swap the pins);
+    - workers listed in the run config by url and key stay plain HTTP, shown as "Plain HTTP: use a VPN";
+    - hole punching across the internet is not built.
 - **Joining:** only machines the user accepted or paired, never by being on the network alone.
 - **Keys:** a node's keys never leave it. The main machine's API keys and client profiles stay on the main machine.
 - **Prompts and answers:** they leave the main machine only to the nodes doing the work, encrypted. The node list

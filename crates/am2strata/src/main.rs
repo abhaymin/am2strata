@@ -7,6 +7,7 @@
 
 mod agents;
 mod cluster;
+mod cluster_tls;
 mod machine;
 mod optimizer;
 mod clients;
@@ -222,7 +223,7 @@ pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<client
     }
     let k = clients::given_key(headers)?;
     // a key this worker minted for its master (cluster.rs): the model APIs, no tools of a profile
-    if state.cluster.is_master_key(k) {
+    if state.cluster.is_master_key(k, cluster_tls::peer_of(headers)) {
         return Some(None);
     }
     state.clients.by_key(k).map(|p| Some(p.clone()))
@@ -230,7 +231,7 @@ pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<client
 
 /// The main key, or (on a worker) a key it gave its master: what the master polls, the model list and the queue.
 pub fn authorized_or_master(state: &AppState, headers: &HeaderMap) -> bool {
-    authorized(state, headers) || clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k))
+    authorized(state, headers) || clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k, cluster_tls::peer_of(headers)))
 }
 
 pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -577,7 +578,11 @@ async fn main() -> Result<()> {
         // a handler that panics is answered with a JSON error, never a dropped connection
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))
         .layer(axum::middleware::from_fn_with_state(hosts, check_host))
+        // a TLS peer's pin (cluster_tls.rs): set only for the cluster listener's requests, removed from all others
+        .layer(axum::middleware::from_fn(cluster_tls::peer_header))
         .with_state(state);
+    // a worker: the encrypted listener for its paired masters (the same app)
+    cluster.serve_tls(app.clone(), host.clone(), port);
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;
     tracing::info!("listening on http://{host}:{port}/ (web app from {}), API at /v1", web_dir.display());
     // each request's address is known (adding a command MCP server is allowed only from this PC)

@@ -2682,7 +2682,10 @@ fn a_production_song_can_continue_the_song_before() {
 /// master then routes a chat for the worker's model to it; removing it forgets the master on both sides.
 #[test]
 fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
-    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker"}}), ..Model::default() }],
+    // plain HTTP still allowed for a TLS-paired master here (allow_plain), so the key's reach can be checked directly;
+    // the encrypted path is a_paired_worker_is_reached_only_over_pinned_tls
+    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker", "allow_plain": true, "tls_port": free_port()}}),
+                                         ..Model::default() }],
                                &[ids("Ok.\n</think>\n\nFrom the paired worker.")], json!({}));
     let master = Server::start(&[Model::default()], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
     let (_, w) = worker.get("/api/cluster", true);
@@ -2737,4 +2740,109 @@ fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
     let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
     let (c, e) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code}));
     assert_eq!(c, 429, "{e}");
+}
+
+
+/// Clusters, encrypted (CLUSTER-PLAN security): after pairing, the master reaches the worker only over the worker's
+/// TLS listener, each side checking the other's pinned certificate. The master's key is refused over plain HTTP and
+/// without the master's certificate; a worker showing another certificate is refused by the master, which says why;
+/// chats, streamed too, go through.
+#[test]
+fn a_paired_worker_is_reached_only_over_pinned_tls() {
+    let tp = free_port();
+    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker", "tls_port": tp}}), ..Model::default() }],
+                               &[ids("Ok.\n</think>\n\nFrom the worker, encrypted.")], json!({}));
+    let mut master = Server::start(&[Model::default()], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
+    let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
+    let (c, p) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code}));
+    assert_eq!((c, p["encrypted"].as_bool()), (200, Some(true)), "{p}");
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(master.dir.join("cluster-workers.json")).unwrap()).unwrap();
+    let w0 = &saved["workers"][0];
+    assert_eq!(w0["tls_url"], format!("https://127.0.0.1:{tp}"));
+    let key = w0["key"].as_str().unwrap().to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in [master.dir.join("node-tls.json"), worker.dir.join("node-tls.json"), worker.dir.join("cluster-masters.json"),
+                  master.dir.join("cluster-workers.json")] {
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
+        }
+    }
+    // the master's key over plain HTTP: refused
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/models", worker.base)).bearer_auth(&key).send().unwrap();
+    assert_eq!(r.status().as_u16(), 401, "plain HTTP is refused for a TLS-paired master");
+    // the TLS listener without the master's certificate (the key alone): refused at the handshake
+    let bare = reqwest::blocking::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
+    assert!(bare.get(format!("https://127.0.0.1:{tp}/v1/models")).bearer_auth(&key).send().is_err(), "no client certificate");
+    // the master, over TLS: ready, and a chat (and a stream) for the worker's model goes through
+    let t0 = Instant::now();
+    loop {
+        let (_, cl) = master.get("/api/cluster", true);
+        if cl["workers"][0]["ready"] == true {
+            assert_eq!(cl["workers"][0]["encrypted"], true);
+            assert_eq!(cl["workers"][0]["transport"], "TLS 1.3, pinned certificates");
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(15), "{cl}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
+    assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the worker, encrypted.")), "{v}");
+    let ev = master.stream("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "stream": true}));
+    let text: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
+    assert_eq!(text, "From the worker, encrypted.");
+    // a worker that shows another certificate (its pin changed on the master's side): refused, and said why
+    let mut saved = saved.clone();
+    saved["workers"][0]["pin"] = json!("0".repeat(64));
+    std::fs::write(master.dir.join("cluster-workers.json"), serde_json::to_vec(&saved).unwrap()).unwrap();
+    master.restart();
+    let t0 = Instant::now();
+    let err = loop {
+        let (_, cl) = master.get("/api/cluster", true);
+        if let Some(e) = cl["workers"][0]["error"].as_str() {
+            break e.to_string();
+        }
+        assert!(t0.elapsed() < Duration::from_secs(15), "{cl}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(err.contains("not the one paired"), "{err}");
+    assert_eq!(master.get("/api/cluster", true).1["workers"][0]["ready"], false);
+}
+
+/// The added time of TLS on one short chat through a master (mock engines; run by hand:
+/// cargo test --release -p am2strata --test server cluster_tls_latency -- --ignored --nocapture).
+#[test]
+#[ignore = "a measurement, not a check"]
+fn cluster_tls_latency() {
+    let tp = free_port();
+    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker", "tls_port": tp, "allow_plain": true}}), ..Model::default() }],
+                               &[ids("Ok.\n</think>\n\nHi.")], json!({}));
+    let tls_master = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
+    assert_eq!(tls_master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code})).0, 200);
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(tls_master.dir.join("cluster-workers.json")).unwrap()).unwrap();
+    let key = saved["workers"][0]["key"].as_str().unwrap().to_string();
+    let plain_master = Server::start(&[Model { extra: json!({"cluster": {"workers": {"pc": {"url": worker.base, "key": key}}}}), ..Model::default() }],
+                                     &[ids("x")], json!({}));
+    for m in [&tls_master, &plain_master] {
+        let t0 = Instant::now();
+        while m.get("/api/cluster", true).1["workers"][0]["ready"] != true {
+            assert!(t0.elapsed() < Duration::from_secs(15));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let time = |m: &Server| {
+        let mut v: Vec<f64> = (0..40).map(|_| {
+            let t0 = Instant::now();
+            let (c, _) = m.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
+            assert_eq!(c, 200);
+            t0.elapsed().as_secs_f64() * 1000.0
+        }).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[v.len() / 2], v[v.len() * 9 / 10])
+    };
+    let _ = (time(&plain_master), time(&tls_master)); // warm up both
+    let (p50, p90) = time(&plain_master);
+    let (t50, t90) = time(&tls_master);
+    eprintln!("one short chat through the master: plain HTTP median {p50:.1} ms (p90 {p90:.1}); TLS median {t50:.1} ms (p90 {t90:.1})");
 }

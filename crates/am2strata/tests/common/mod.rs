@@ -63,7 +63,7 @@ impl Default for Model<'_> {
 
 /// A port no other test of this run is given (asking the OS for port 0 and letting it go raced between parallel tests:
 /// two servers could get the same one, and a test talked to another test's server).
-fn free_port() -> u16 {
+pub fn free_port() -> u16 {
     static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
     let _ = NEXT.compare_exchange(0, 20000 + (std::process::id() % 20000) as u16, std::sync::atomic::Ordering::SeqCst,
                                   std::sync::atomic::Ordering::SeqCst);

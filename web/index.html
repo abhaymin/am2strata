@@ -624,8 +624,10 @@
 }}</code></pre>
             <p class="muted small">Workers can also be listed in the run config (used from the next start); the key is then the
               worker's own API key (or env:NAME). Pairing in the app gives each master a key of its own instead, and the worker's
-              main key never leaves it. Traffic is plain HTTP with the key: across a network you do not trust, connect the
-              machines through your own VPN (Tailscale, WireGuard).</p></div>
+              main key never leaves it. A worker paired in the app is reached over TLS 1.3, each machine checking the other's
+              certificate as it was paired (the worker's port "tls_port", default its API port + 443, must be reachable from
+              the master). Workers listed in the run config are plain HTTP with the key: across a network you do not trust,
+              connect those machines through your own VPN (Tailscale, WireGuard).</p></div>
         </section>
 
         <section class="set-panel" id="sec-clients" aria-labelledby="h-clients" hidden>
