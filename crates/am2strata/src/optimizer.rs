@@ -34,6 +34,15 @@ pub fn prompts() -> Vec<(String, u32)> {
 pub struct Knob {
     pub flag: String,
     pub values: Vec<String>,
+    /// the engine's own value when the run config does not pass the flag (Strata's engines' flags, added only then)
+    pub default: Option<String>,
+}
+
+impl Knob {
+    /// The value it has in `args`, or the engine's default.
+    pub fn current(&self, args: &[String]) -> Option<String> {
+        arg(args, &self.flag).or_else(|| self.default.clone())
+    }
 }
 
 /// The value `flag` has in `args`.
@@ -41,29 +50,35 @@ pub fn arg(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
 }
 
-/// `args` with `flag` set to `value` (the flag must be there already).
+/// `args` with `flag` set to `value` (added at the end when it is not there).
 pub fn with_arg(args: &[String], flag: &str, value: &str) -> Vec<String> {
     let mut a = args.to_vec();
-    if let Some(i) = a.iter().position(|x| x == flag) {
-        if i + 1 < a.len() {
-            a[i + 1] = value.to_string();
-        }
+    match a.iter().position(|x| x == flag) {
+        Some(i) if i + 1 < a.len() => a[i + 1] = value.to_string(),
+        _ => a.extend([flag.to_string(), value.to_string()]),
     }
     a
 }
 
-/// The settings to tune, from the flags the run config passes and the machine's facts.
-pub fn knobs(args: &[String], facts: &Value) -> Vec<Knob> {
-    let mut k = Vec::new();
+/// The settings to tune, from the flags the run config passes and the machine's facts. For Strata's own engines
+/// (`strata`, `strata-poly`), their speed flags that leave the answers as they are, with the engine's defaults, even
+/// when the run config does not pass them: `--threads`, `--window` (the tokens that go through at once, guesses
+/// counted only when right), `--prompt-batch` and `--expert-swaps`. Never the ones that move the answers
+/// (`--tail-skip`, `--skip-weight`, `--kv`).
+pub fn knobs(exe: &Path, args: &[String], facts: &Value) -> Vec<Knob> {
+    let mut k: Vec<Knob> = Vec::new();
     let cores = facts["cpu"]["cores"].as_u64().unwrap_or(0);
     let threads = facts["cpu"]["threads"].as_u64().unwrap_or(0);
+    let list = |vals: Vec<u64>, cur: u64| -> Vec<String> {
+        let mut v: Vec<u64> = vals.into_iter().chain([cur]).filter(|x| *x > 0).collect();
+        v.sort_unstable();
+        v.dedup();
+        v.into_iter().map(|x| x.to_string()).collect()
+    };
     let mut add = |flags: &[&str], vals: Vec<u64>| {
         for f in flags {
             if let Some(cur) = arg(args, f).and_then(|v| v.parse::<u64>().ok()) {
-                let mut v: Vec<u64> = vals.iter().copied().chain([cur]).filter(|x| *x > 0).collect();
-                v.sort_unstable();
-                v.dedup();
-                k.push(Knob { flag: f.to_string(), values: v.into_iter().map(|x| x.to_string()).collect() });
+                k.push(Knob { flag: f.to_string(), values: list(vals, cur), default: None });
                 return;
             }
         }
@@ -75,6 +90,24 @@ pub fn knobs(args: &[String], facts: &Value) -> Vec<Knob> {
     add(&["-b", "--batch-size"], vec![512, 1024, 2048]);
     if let Some(n) = arg(args, "--resident-experts").and_then(|v| v.parse::<u64>().ok()) {
         add(&["--resident-experts"], vec![n / 2, n * 3 / 4, n * 5 / 4, n * 3 / 2]);
+    }
+    let strata = exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == "strata" || n.starts_with("strata-poly"));
+    if strata {
+        let own: [(&str, Vec<u64>, u64); 4] = [
+            ("--threads", vec![cores * 3 / 4, cores, threads * 3 / 4], threads),
+            ("--window", vec![1, 4, 8, 12], 8),
+            ("--prompt-batch", vec![512, 1024, 2048], 1024),
+            ("--expert-swaps", vec![0, 32, 64, 128], 64),
+        ];
+        for (flag, vals, default) in own {
+            if k.iter().any(|x| x.flag == flag) || (flag == "--threads" && threads == 0) {
+                continue;
+            }
+            match arg(args, flag).and_then(|v| v.parse::<u64>().ok()) {
+                Some(cur) => k.push(Knob { flag: flag.into(), values: list(vals, cur), default: None }),
+                None => k.push(Knob { flag: flag.into(), values: list(vals, default), default: Some(default.to_string()) }),
+            }
+        }
     }
     k
 }
@@ -139,7 +172,7 @@ where
     'rounds: for _ in 0..3 {
         let mut gained = false;
         for k in knobs {
-            let cur = arg(&args, &k.flag);
+            let cur = k.current(&args);
             let mut pick: Option<(Vec<String>, Score)> = None;
             for v in &k.values {
                 if Some(v) == cur.as_ref() {
@@ -219,9 +252,10 @@ pub async fn run(mgr: std::sync::Arc<crate::manager::Manager>, id: String, objec
         let entry = mgr.entry(&id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
         let models_dir = entry.path.parent().map(Path::to_path_buf).unwrap_or_default();
         let facts = crate::machine::facts(&models_dir);
-        let k = knobs(&entry.cfg.args, &facts);
+        let k = knobs(&entry.cfg.exe, &entry.cfg.args, &facts);
         if k.is_empty() {
-            return Err(anyhow!("its run config passes none of the settings the optimizer tunes (-t, -ub, -b, --resident-experts)"));
+            return Err(anyhow!("its run config passes none of the settings the optimizer tunes (-t, -ub, -b, --resident-experts; \
+                                 for Strata's engines also --threads, --window, --prompt-batch, --expert-swaps)"));
         }
         set(|j| { j["state"] = json!("running"); j["settings"] = json!(k.iter().map(|k| &k.flag).collect::<Vec<_>>()); });
         let prompts = prompts();
@@ -296,11 +330,24 @@ mod tests {
     #[test]
     fn only_the_flags_the_config_passes_are_tuned() {
         let facts = json!({"cpu": {"cores": 16, "threads": 32}});
-        let k = knobs(&a("-m x.gguf -t 12 -ub 256 -ctk q8_0"), &facts);
+        let k = knobs(Path::new("/x/llama-server"), &a("-m x.gguf -t 12 -ub 256 -ctk q8_0"), &facts);
         assert_eq!(k.iter().map(|k| k.flag.as_str()).collect::<Vec<_>>(), vec!["-t", "-ub"]);
         assert_eq!(k[0].values, vec!["8", "12", "16", "32"]);
         assert!(k.iter().all(|k| !k.flag.starts_with("-ct")), "the KV types are never changed");
         assert_eq!(with_arg(&a("-t 12 -ub 256"), "-ub", "512"), a("-t 12 -ub 512"));
+        assert_eq!(with_arg(&a("-t 12"), "--window", "4"), a("-t 12 --window 4"), "a flag the config lacks is added");
+    }
+
+    #[test]
+    fn strata_engines_get_their_own_flags_with_their_defaults() {
+        let facts = json!({"cpu": {"cores": 8, "threads": 16}});
+        let k = knobs(Path::new("/p/engine-poly/strata-poly"), &a("--model m.gguf --kv q8_0 --window 4"), &facts);
+        let flags: Vec<&str> = k.iter().map(|k| k.flag.as_str()).collect();
+        assert_eq!(flags, vec!["--threads", "--window", "--prompt-batch", "--expert-swaps"]);
+        assert_eq!(k[0].default.as_deref(), Some("16"), "all usable threads, as strata-poly does");
+        assert_eq!(k[0].values, vec!["6", "8", "12", "16"]);
+        assert_eq!((k[1].default.as_deref(), k[1].current(&a("--window 4")).as_deref()), (None, Some("4")), "passed: its value");
+        assert!(!flags.iter().any(|f| f.contains("skip") || *f == "--kv"), "never the flags that move the answers");
     }
 
     /// The mock of the plan's tests: speed and fit per setting from a table.
@@ -320,7 +367,7 @@ mod tests {
     async fn the_search_finds_the_tables_best_and_drops_what_fails() {
         let facts = json!({"cpu": {"cores": 16, "threads": 32}});
         let start = a("-m x.gguf -t 16 -ub 256");
-        let k = knobs(&start, &facts);
+        let k = knobs(Path::new("llama-server"), &start, &facts);
         let mut calls = 0;
         let out = search(start, &k, "decode", Duration::from_secs(60), |args| { calls += 1; async move { table(args) } }).await.unwrap();
         assert_eq!(arg(&out.args, "-t").as_deref(), Some("12"));
@@ -335,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_stops_the_search_with_the_best_so_far() {
-        let out = search(a("-t 16 -ub 256"), &knobs(&a("-t 16 -ub 256"), &json!({"cpu": {"cores": 16, "threads": 32}})),
+        let out = search(a("-t 16 -ub 256"), &knobs(Path::new("llama-server"), &a("-t 16 -ub 256"), &json!({"cpu": {"cores": 16, "threads": 32}})),
                          "decode", Duration::ZERO, |args| async move { table(args) }).await.unwrap();
         assert!(out.stopped_by_budget);
         assert_eq!(out.args, a("-t 16 -ub 256"));

@@ -41,10 +41,12 @@ fn parse_gpus(text: &str) -> Value {
     Value::Array(text.lines().filter(|l| !l.trim().is_empty()).map(|l| {
         let f: Vec<&str> = l.split(',').map(str::trim).collect();
         let g = |i: usize| f.get(i).copied().unwrap_or("");
-        let (gen, width) = (num(g(4)), num(g(5)));
-        json!({"index": num(g(0)), "name": g(1), "vram_gb": num(g(2)).map(|m| (m / 1024.0 * 10.0).round() / 10.0),
+        // the link: the card's best generation (an idle card drops its current one to save power) at the width it
+        // has now (the slot's, or a USB4 / OCuLink dock's, which does not change when idle)
+        let (gen, width) = (num(g(4)), num(g(7)).or(num(g(5))));
+        json!({"index": g(0).trim().parse::<u64>().ok(), "name": g(1), "vram_gb": num(g(2)).map(|m| (m / 1024.0 * 10.0).round() / 10.0),
                "pci": g(3), "pcie_gen_max": gen, "pcie_width_max": width, "pcie_gen": num(g(6)), "pcie_width": num(g(7)),
-               // GB/s one way at the link's best: about 0.985 GB/s a lane at gen 3, doubling each generation
+               // GB/s one way: about 0.985 GB/s a lane at gen 3, doubling each generation
                "link_gb_s": gen.zip(width).map(|(g, w)| ((0.985 * 2f64.powf(g - 3.0) * w) * 10.0).round() / 10.0)})
     }).collect())
 }
@@ -147,7 +149,8 @@ mod tests {
         let g = parse_gpus("0, NVIDIA GeForce RTX 5060 Ti, 16311, 00000000:01:00.0, 5, 8, 1, 4\n1, NVIDIA GeForce RTX 5060 Ti, 16311, 00000000:08:00.0, 4, 4, 1, 4\n");
         assert_eq!(g.as_array().unwrap().len(), 2);
         assert_eq!(g[0]["vram_gb"], 15.9);
-        assert_eq!(g[0]["link_gb_s"], 31.5, "gen 5 x8");
+        assert_eq!(g[0]["index"], 0);
+        assert_eq!(g[0]["link_gb_s"], 15.8, "a gen 5 card at x4 now");
         assert_eq!(g[1]["link_gb_s"], 7.9, "gen 4 x4 (the USB4 dock)");
         assert_eq!(g[1]["pci"], "00000000:08:00.0");
     }
