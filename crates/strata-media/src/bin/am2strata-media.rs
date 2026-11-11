@@ -464,20 +464,28 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64.split_once(";base64,").map(|(_, b)| b).unwrap_or(b64))
             .context("continue_from: not base64")?;
         let source = stereo_48k(&bytes)?;
+        // a song that ends in silence is continued from its last sound (measured: from a 6 s silent tail the
+        // continuation's lyrics were not heard); the silence is replaced too
+        let full = source.dim(1)?;
+        let n = sounding_end(&source)?;
+        let silent_tail = (full - n) as f64 / 48_000.0;
         let ctx = cmd["context_seconds"].as_f64().unwrap_or(10.0).clamp(2.0, 60.0);
-        let n = source.dim(1)?;
         let take = ((ctx * 48_000.0) as usize).min(n);
+        if take < 48_000 {
+            bail!("continue_from: less than a second of sound to continue");
+        }
         let source = source.narrow(1, n - take, take)?;
         let mut s = s;
         s.plan = None; // the planner's codes would replace the source (a cover); a repaint keeps it
         let song = st.song.as_mut().unwrap();
         let audio = song.continuation(&s, &source, cmd["timbre_from_source"].as_bool() != Some(false),
                                       &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
-        let replaces = acestep::pipeline::CROSSFADE as f64 * acestep::oobleck::HOP as f64 / 48_000.0;
+        let replaces = acestep::pipeline::CROSSFADE as f64 * acestep::oobleck::HOP as f64 / 48_000.0 + silent_tail;
         let wav = acestep::pipeline::wav(&audio)?;
         return Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE,
                          "seconds": audio.dim(1)? as f64 / 48_000.0, "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME,
                          "seed": s.seed, "planner": false, "continued": true, "context_seconds": take as f64 / 48_000.0,
+                         "silent_tail_s": silent_tail,
                          // the audio starts this many seconds before the previous song's end: those are replaced
                          "replaces_s": replaces,
                          "data": base64::engine::general_purpose::STANDARD.encode(wav)}));
@@ -491,6 +499,21 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
               "planned": st.song.as_ref().unwrap().last_thought().map(|t| json!({"bpm": t.bpm, "key": t.key_scale,
                                                                                  "time_signature": t.time_signature})),
               "data": base64::engine::general_purpose::STANDARD.encode(wav)}))
+}
+
+/// Where `audio` [2, samples] last sounds: the end of its last quarter second louder than -40 dBFS (RMS).
+fn sounding_end(audio: &candle_core::Tensor) -> Result<usize> {
+    let v = audio.mean(0)?.to_vec1::<f32>()?;
+    let w = 12_000;
+    let mut end = v.len();
+    while end >= w {
+        let rms = (v[end - w..end].iter().map(|x| x * x).sum::<f32>() / w as f32).sqrt();
+        if rms > 0.01 {
+            break;
+        }
+        end -= w;
+    }
+    Ok(end)
 }
 
 /// A WAV (PCM 16-bit or float 32-bit, mono or stereo, any rate) as stereo 48 kHz [2, samples] (linear resampling).
@@ -855,5 +878,39 @@ fn main() {
         if let Err(e) = r {
             emit(json!({"event": "error", "message": format!("{e:#}")}));
         }
+    }
+}
+
+#[cfg(test)]
+mod continue_tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_tail_is_found_and_a_wav_is_read() {
+        // 2 s of a tone then 1.5 s of silence, as a 16-bit stereo WAV at 44.1 kHz
+        let rate = 44_100usize;
+        let mut pcm: Vec<i16> = Vec::new();
+        for i in 0..rate * 7 / 2 {
+            let v = if i < rate * 2 { ((i as f32 * 0.05).sin() * 8000.0) as i16 } else { 0 };
+            pcm.extend([v, v]);
+        }
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + pcm.len() as u32 * 2).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&[16, 0, 0, 0, 1, 0, 2, 0]);
+        w.extend_from_slice(&(rate as u32).to_le_bytes());
+        w.extend_from_slice(&(rate as u32 * 4).to_le_bytes());
+        w.extend_from_slice(&[4, 0, 16, 0]);
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(pcm.len() as u32 * 2).to_le_bytes());
+        for v in pcm {
+            w.extend_from_slice(&v.to_le_bytes());
+        }
+        let a = stereo_48k(&w).unwrap();
+        assert_eq!(a.dim(0).unwrap(), 2);
+        assert!((a.dim(1).unwrap() as f64 / 48_000.0 - 3.5).abs() < 0.01, "resampled to 48 kHz");
+        let end = sounding_end(&a).unwrap() as f64 / 48_000.0;
+        assert!((end - 2.0).abs() <= 0.25, "sound ends at {end} s");
     }
 }

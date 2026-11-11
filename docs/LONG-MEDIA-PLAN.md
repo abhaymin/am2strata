@@ -22,9 +22,20 @@ plan of speak, song and music parts.
 - **The result:** one WAV, with a chapter per part in the job's meta. The web app shows "part 3 of 9" while it is
   made, then the player and the chapters.
 - **Tested:** `a_production_makes_its_parts_in_order_and_joins_them` and the join's unit test.
+- **Songs continued from the one before: built (2026-11-11).**
+  - It is ACE-Step's **repaint** task run past the end of its source (outpainting), not "complete": that task adds
+    instrument tracks to a track.
+  - A song part with `"continue": true` sends the last `context_seconds` (default 10) of the song part before. A
+    silent tail is left out, so the continuation starts from the last sound.
+  - The engine encodes that tail (the Oobleck encoder) and makes the frames after it, with the tail kept as context.
+  - The two are merged into one entry: cut where the continuation starts, a 20 ms crossfade, loudness evened over the
+    whole, a chapter for each part.
+  - Measured live: a 30 s continuation took 7 s (no planner pass) to 40 s.
+    - The join: a sample step of 0.030 to 0.048, below the song's 99.9th-percentile step (about 0.2), so no click.
+    - Whisper base heard part of the new lyrics ("…harmony The world can sing as one").
+    - From a source that ended in 6 s of silence, before the trim, no lyrics were heard.
+  - Tested: `a_production_song_can_continue_the_song_before`.
 - **Not yet:**
-  - songs continued from the one before (ACE-Step's "complete" task needs the Oobleck encoder ported): a long song
-    is joined with a crossfade today;
   - video productions;
   - MP3 output;
   - chapters in the file's own metadata.
@@ -47,7 +58,7 @@ one finished file, made by am2Strata from start to end, with nobody stitching pa
   still images held as video), queued and retried as any job, with the same checks (Whisper for words, the take rule).
 - **The parts are joined in the engine, in Rust:**
   - audio: resampled to one rate (48 kHz stereo), joined with short crossfades (a song continued from the one before
-    uses ACE-Step's "complete" task from its last seconds, so the music flows on rather than restarting), loudness
+    uses ACE-Step's repaint past the end of its last seconds, so the music flows on rather than restarting), loudness
     evened out;
   - video: segments joined (each next segment started from the frame before, as above), images shown for their
     seconds, the audio track (the joined audio, or music made for it) laid under the video, then one MP4;
@@ -190,6 +201,6 @@ refused plainly when it named the text-only model.
 ## Songs: one pass, up to 10 minutes
 
 - `duration` 10 to 600 s (480 s with the planner on a 16 GB card, as ACE-Step's own tiers say); longer than that,
-  ACE-Step's "complete" task continues a song from its end (stage after the Rust port).
+  a song continues from its end: ACE-Step's repaint past the end of the source (built 2026-11-11, see Productions).
 - The lyric check (Whisper hears the vocals, retakes for missing words) runs per minute of song.
 - The Songs tab under Media Generation takes the duration in minutes and seconds.

@@ -40,9 +40,24 @@ So the first milestone leaves it out.
      (ACE-Step sings 50+; the picker lists them by name), duration, seed;
    - the player, Save, and "make another take";
    - a note that songs are AI-made.
-5b. **Longer than 10 minutes:** a song continues from the last seconds of the one before (ACE-Step's "complete" task:
-   the earlier audio's latents as the source with the chunk mask open after it), joined in one file. Part of the
-   productions in `docs/LONG-MEDIA-PLAN.md`.
+5b. **Longer than 10 minutes: built (2026-11-11).** A song continues from the last seconds of the one before, joined
+   in one file. It is ACE-Step's repaint task run past the end of its source (outpainting), not "complete" (which adds
+   instrument tracks). What the reference does, and the port does the same:
+   - **The source:** the previous song's tail, encoded by the Oobleck encoder (`oobleck::Encoder`, SNR 110 dB
+     against diffusers), then silence for the frames to make.
+   - **The instruction:** "Repaint the mask area based on the given conditions:".
+   - **The context:** the source, then a chunk mask in "explicit" mode, ACE-Step's Gradio mode for repaint (0 for
+     kept frames, 1 for made ones), repeated over the 64 channels (128 channels in all).
+   - **The timbre:** silence, as ACE-Step without a reference audio. The port uses the source's latent by default
+     (`timbre_from_source`).
+   - **The steps:** for the first half of the steps (`repaint_injection_ratio` 0.5), the kept frames are set back to
+     t_next·noise + (1 − t_next)·source, with the same initial noise.
+   - **The end:** the result is blended with the source through a soft mask: linear ramps of 12 frames on each side
+     of the region (`_repaint_boundary_blend`).
+   - **The output:** only the continuation, starting 12 frames (0.48 s) before the source's end; it replaces that
+     much of the previous song, plus any silent tail.
+   - **Gate** (`the_golden_repaint_is_made_again_from_its_noise`, golden `~/Development/ref/acestep-golden-repaint.py`
+     on the CPU, 8 steps): final latent cosine 0.99992, the new part 0.99986, the kept frames equal to the source.
 6. **The planner (Qwen3 1.7B):** audio codes at 5 Hz for song structure, and "write the lyrics for me" from a
    description. Gate: the same codes as Python for greedy sampling.
 7. **Measured and documented:** time and VRAM on the RTX 5060 Ti against the Python numbers (about 12 s and 9.85 GB
@@ -59,6 +74,7 @@ Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.
 | 2. Caption encoder, lyric embeddings, prompts | done | same token ids; cosine 0.9992+ per token; lyrics exact |
 | 3. Condition encoder, DiT, sampler, DCW | done | DiT against ACE-Step in f32: cosine 1.000000; the 8 bf16 steps 0.9926 to 0.9999; final latent 0.996 |
 | Pipeline (`acestep/pipeline.rs`) | done | the golden song made again in Rust from its noise: final latent 0.995, and Whisper hears its lyrics as in Python's |
+| 5b. Continuation (repaint past the end) | done (2026-11-11) | the Oobleck encoder SNR 110.2 dB; the golden repaint's final latent cosine 0.99992 (new part 0.99986), kept frames exact; live: the join has no click, Whisper hears part of the new lyrics |
 | 6. The planner (codes) | done (2026-11-10) | `planner.rs`, `dit::Detokenizer`; prompts and token ids the same as ACE-Step's; FSQ output cosine 0.99997, hints (detokenizer) 0.99999; teacher-forced on ACE-Step's greedy codes, its code is in Rust's top 5 at 47 of 50 steps, never more than 0.3 logits from the best (Python bf16 on a GPU, Rust f32 on the CPU: near ties in a flat 64,000-way choice) |
 | 6b. The planner's reasoning | built and measured (2026-11-11): live, 60 s English songs asked without a tempo or key, 1 take each, 4 seeds: 83%, 86%, 11%, 94% of the lyrics heard (mean 69%; before it, 53% and 64% with 2 takes); the planner wrote 94-167 bpm and keys such as E major and D minor | a song asked without a tempo, key or time signature: the planner writes them first (ACE-Step's phase 1, text tokens only, until `</think>`; values checked: 30-300 bpm, "<note> major/minor", 2/3/4/6 beats), and both the planner and the DiT use them; `/v1/audio/music` returns them in `x-strata-planned`. To measure: lyrics heard without a tempo and key, with and without it, on a free GPU |
 | 6c. "Write the lyrics for me" | next | the planner writing lyrics from a description |
