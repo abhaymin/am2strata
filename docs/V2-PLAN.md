@@ -247,3 +247,19 @@ Engine on its own (`am2strata-media`, the text model stopped), then the live ser
 **Still for you to check**
 - The microphone (getUserMedia) at http://localhost:8000.
 - A listening test of Parler at 0.7.
+
+
+## Fixes found while recording the documentary (2026-11-11)
+
+- **Browser:** each step has a time limit (`"browser": {"step_timeout_s"}`, default 45). Past it the page's loading
+  is stopped, and a tab that still does not answer is closed and a fresh one opened. The model is told what
+  happened and the address it was on. Seen on a train-times page that hung on "Please wait".
+- **Image edit at 1024x1024:** measured: 35 steps, then `CUDA_ERROR_OUT_OF_MEMORY` in the VAE decode, which shares
+  card 1 with Qwen3-VL.
+  - A Qwen Image picture above 0.8 megapixels now decodes on the CPU.
+  - A smaller one that still runs out of graphics memory is made again with the decode on the CPU, and the answer's
+    `strata.notes` says so.
+  - Errors are logged. An engine that dies is reported with its exit code or signal and the likely cause.
+- **Video from an image:** `/v1/videos/generations` takes `image`, `input_reference` or `image_url` (base64 or a
+  data URL; web addresses are refused). A text-only model is refused when named and swapped when not. In a chain,
+  only the first clip takes the image.
