@@ -1988,6 +1988,9 @@ fn fake_web() -> u16 {
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             let (ct, body) = if req.starts_with("GET /login") {
                 ("text/html", "<html><head><title>Sign in</title></head><body><form action=\"/done\"><input id=\"user\"><input id=\"pw\" type=\"password\"><button type=\"submit\">Sign in</button></form></body></html>".to_string())
+            } else if req.starts_with("GET /hang") {
+                // a page whose own script never ends once it has loaded (the tab stops answering)
+                ("text/html", "<html><head><title>Hang</title></head><body><p>Loading trains...</p><script>while (true) {}</script></body></html>".to_string())
             } else if req.starts_with("GET /search?") && req.contains("format=json") {
                 ("application/json", format!(r#"{{"results": [{{"title": "Lighthouse facts", "url": "http://127.0.0.1:{port}/page", "content": "All about lighthouses."}}]}}"#))
             } else {
@@ -2347,6 +2350,29 @@ fn the_browser_opens_a_page_and_keeps_out_of_the_private_network_by_default() {
     assert_eq!(c, 200);
     let p = prompt_text(s.gen_lines().last().unwrap());
     assert!(p.contains("not a public web address") && !p.contains("Jeddah"), "{p}");
+}
+
+/// A page that stops answering (its script never ends) does not take the browser down with it: past the step
+/// timeout the tab is closed and a fresh one opened, the model is told with the address, and the next step works.
+#[test]
+fn a_hung_page_is_left_and_the_next_step_works() {
+    let Some(exe) = chrome() else { eprintln!("no chrome-headless-shell: skipped"); return };
+    let port = fake_web();
+    let open = |path: &str| format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/{path}\n</parameter>\n</function>\n</tool_call>");
+    let read = "\n\n<tool_call>\n<function=browser_read>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"browser": {"exe": exe, "step_timeout_s": 4}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{}", open("hang"))), ids(&format!("Again.\n</think>{}", open("page"))),
+                                  ids("Ok.\n</think>\n\nIt says Jeddah.")], json!({}));
+    let _ = read;
+    let t0 = Instant::now();
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("find the trains")], "strata_browser": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "It says Jeddah.", "{r}");
+    let all: Vec<String> = s.gen_lines().iter().map(|l| prompt_text(l)).collect();
+    let last = all.last().unwrap();
+    assert!(last.contains("stopped answering") && last.contains("/hang"), "the model was told, with the address: {last}");
+    assert!(last.contains("The tallest lighthouse is in Jeddah."), "the next step worked in a fresh tab: {last}");
+    assert!(t0.elapsed() < Duration::from_secs(50), "bounded by the step timeout: {:?}", t0.elapsed());
 }
 
 #[test]

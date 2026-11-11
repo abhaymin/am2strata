@@ -46,6 +46,9 @@ pub struct Settings {
     pub connect: Option<String>,
     pub auto_approve: bool,
     pub private_urls: bool,
+    /// the most one step may take (`"browser": {"step_timeout_s": N}`, default 45): past it the page's loading is
+    /// stopped, and a tab that still does not answer is closed and a fresh one opened
+    pub step_timeout: Duration,
 }
 
 /// Chrome for Testing's folder and file for this system's chrome-headless-shell (what the installers fetch).
@@ -98,7 +101,8 @@ impl Settings {
         let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| find_chrome(data_dir));
         Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
                    auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
-                   private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false) }
+                   private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false),
+                   step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)) }
     }
 
     /// Whether a started or attached browser carries the user's own logins (so the tool descriptions, and the risk
@@ -370,7 +374,7 @@ impl Browsers {
                     return ""; }})()"#)
             }
         };
-        let v = page.evaluate(js).await.ok()?.into_value::<String>().ok()?;
+        let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.ok()?.ok()?.into_value::<String>().ok()?;
         if v.is_empty() {
             return None;
         }
@@ -378,8 +382,43 @@ impl Browsers {
         Some(format!("{v} on {url}"))
     }
 
-    /// One step. `vision`: the screenshot is wanted (the model reads pictures, or the client shows it).
+    /// One step, within the step timeout. A page that hangs (a script that never ends, a load that never finishes:
+    /// seen on a train-times site) is stopped; if the tab still does not answer it is closed and a fresh one opened,
+    /// and the model is told, with the address it was on, so the next step works.
     pub async fn call(&self, conv: &str, name: &str, args: &Value) -> Result<Step, String> {
+        let limit = self.settings.step_timeout;
+        match tokio::time::timeout(limit, self.step(conv, name, args)).await {
+            Ok(r) => r,
+            Err(_) => {
+                let page = self.page(conv).await?;
+                let url = tokio::time::timeout(Duration::from_secs(3), page.url()).await.ok().and_then(|u| u.ok().flatten())
+                    .unwrap_or_else(|| "an unknown address".into());
+                // first, stop the load; a page whose own scripts are stuck does not answer even then
+                let _ = tokio::time::timeout(Duration::from_secs(5),
+                    page.execute(chromiumoxide::cdp::browser_protocol::page::StopLoadingParams::default())).await;
+                let alive = tokio::time::timeout(Duration::from_secs(5), page.evaluate("1+1")).await.is_ok_and(|r| r.is_ok());
+                if alive {
+                    tracing::warn!(%url, "browser: a step took over {} s; the page's loading was stopped", limit.as_secs());
+                    return Err(format!("{name} took over {} s on {url}, so the page's loading was stopped. The page is still open \
+                                        and may be partly loaded: browser_read shows what it has, or try another way", limit.as_secs()));
+                }
+                self.drop_tab(conv).await;
+                tracing::warn!(%url, "browser: the tab stopped answering; it was closed and a fresh one opened");
+                Err(format!("{name} took over {} s and the page on {url} stopped answering, so its tab was closed and a fresh, \
+                             empty one opened. Open a page again (perhaps a lighter one, or another site) to go on", limit.as_secs()))
+            }
+        }
+    }
+
+    /// Close conversation `conv`'s tab without waiting on a page that does not answer.
+    async fn drop_tab(&self, conv: &str) {
+        let mut guard = self.run.lock().await;
+        if let Some(t) = guard.as_mut().and_then(|r| r.tabs.remove(conv)) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+        }
+    }
+
+    async fn step(&self, conv: &str, name: &str, args: &Value) -> Result<Step, String> {
         let page = self.page(conv).await?;
         let settle = || async { tokio::time::sleep(Duration::from_millis(600)).await };
         match name {
