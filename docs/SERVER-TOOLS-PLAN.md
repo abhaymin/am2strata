@@ -19,9 +19,15 @@
   - **Gemini `google_search`:** answered by the server's web search (built earlier).
   - Tested: `responses_image_generation_gives_an_image_generation_call_item`, `responses_hosted_mcp_gives_mcp_call_items`.
 - **Next:**
-  - part 3, media inside the turn: **speech on the CPU is built** (2026-11-11: a `speak` call with Chatterbox,
-    beside the text model, finishes inside the answer, waited for up to 3 minutes); image and video `swap` still
-    to do (they stay `defer`: queued, shown after the answer);
+  - part 3, media inside the turn: **built** (2026-11-11).
+    - Speech on the CPU: a `speak` call with Chatterbox runs beside the text model and finishes inside the answer
+      (waited for up to 3 minutes).
+    - Image and video `swap`: set by a profile's `"media_in_turn": "swap"` or a request's
+      `"strata_media_in_turn": "swap"`. The answer waits for the job (up to 30 minutes): the round gives up its
+      turn, the job takes the GPU, and the next round loads the model again and goes on with the result.
+    - `defer` stays the default.
+    - Tested: `swap_makes_the_image_inside_the_answer`.
+    - Still to do: an image or video on a second card while the text model stays on the first;
   - the per-profile limits beyond media jobs an hour (`"limits": {"media_jobs_per_hour": N}`, built 2026-11-11);
   - Settings › Clients is built (2026-11-11, read only: profiles with masked keys, from GET /api/clients); Settings › Connect saying which built-in tools am2Strata answers is still to do.
 

@@ -103,6 +103,10 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
         let extra: Vec<Value> = crate::media_jobs::Jobs::tools(&caps).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
         if !extra.is_empty() {
             add(prep, &mut offered, extra);
+            // defer (the default) or swap: the request's own strata_media_in_turn, else the key's profile's
+            let mode = req.get("strata_media_in_turn").and_then(Value::as_str)
+                .or(profile.as_ref().and_then(|p| p.media_in_turn.as_deref())).unwrap_or("defer");
+            caps["in_turn"] = serde_json::json!(if mode == "swap" { "swap" } else { "defer" });
             opts.media = Some(caps);
         }
     }

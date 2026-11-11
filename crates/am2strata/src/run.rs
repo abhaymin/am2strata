@@ -885,6 +885,30 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                                     r["text"] = json!(text);
                                 }
                             }
+                            // "swap": an image or video is waited for inside the answer. This round gave up its turn,
+                            // so the job takes the GPU (the text model stops), and the next round loads the model again
+                            let swap = caps["in_turn"] == "swap" && matches!(c.name.as_str(), "generate_image" | "generate_video");
+                            if let (true, true, Some(id)) = (swap, r["ok"] == true, r["job"]["id"].as_str().map(str::to_string)) {
+                                let _ = tx.send(RunEvent::Mcp(json!({"event": "swap", "id": c.id, "job": id}))).await;
+                                let done = tokio::select! {
+                                    d = j.wait_done(&id, std::time::Duration::from_secs(30 * 60)) => d,
+                                    _ = tx.closed() => return,
+                                };
+                                if let Some(d) = done {
+                                    let what = if c.name == "generate_image" { "image" } else { "video" };
+                                    let text = if d["state"] == "done" {
+                                        format!("{what} job {id} is done: it shows in the chat now (/v1/media/jobs/{id}/content); tell the user it is ready")
+                                    } else {
+                                        format!("error: {what} job {id} failed: {}", d["error"].as_str().unwrap_or("unknown"))
+                                    };
+                                    r["ok"] = json!(d["state"] == "done");
+                                    r["chars"] = json!(text.len());
+                                    r["text"] = json!(text);
+                                    if let Some(job) = r.get_mut("job") {
+                                        job["state"] = d["state"].clone();
+                                    }
+                                }
+                            }
                             r
                         }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),

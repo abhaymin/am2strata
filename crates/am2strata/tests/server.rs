@@ -1613,6 +1613,28 @@ fn a_chat_queues_an_image_with_its_media_tool_and_the_job_runs_after_the_answer(
     assert_eq!(s.get("/api/jobs/mj-9", true).0, 404);
 }
 
+/// Media in the turn, "swap" (SERVER-TOOLS-PLAN part 3): the answer waits for its image (the job takes the GPU, the
+/// model loads again) and goes on with the result; "defer" (the default) ends the answer with the job queued.
+#[test]
+fn swap_makes_the_image_inside_the_answer() {
+    let call = "\n\n<tool_call>\n<function=generate_image>\n<parameter=prompt>\na lighthouse at dusk\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"clients": {"default": {"tools": ["image"], "media_in_turn": "swap"}}}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Draw it.\n</think>{call}")), ids("Done.\n</think>\n\nHere it is.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("Draw a lighthouse.")]}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "Here it is.");
+    // the job was finished when the model went on: its result is in the second round's prompt
+    let second = prompt_text(s.gen_lines().last().unwrap());
+    assert!(second.contains("image job mj-1 is done"), "{second}");
+    assert_eq!(s.get("/api/jobs/mj-1", true).1["state"], "done", "made before the answer ended");
+    // a request may ask for defer itself
+    let s = Server::start(&[Model { extra: json!({"clients": {"default": {"tools": ["image"], "media_in_turn": "swap"}}}), ..Model::default() }],
+                          &[ids(&format!("Draw it.\n</think>{call}")), ids("Queued.\n</think>\n\nOn its way.")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("Draw.")], "strata_media_in_turn": "defer"}));
+    assert_eq!(c, 200);
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("is done"), "deferred: queued, not waited for");
+}
+
 /// Production, step 6: a media job survives a restart (its record and file are kept on disk), ids go on from the
 /// highest kept, and a gone job's tool call can be made again (POST /api/jobs).
 #[test]

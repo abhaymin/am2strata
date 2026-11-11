@@ -32,6 +32,9 @@ pub struct Profile {
     pub memory: Option<String>,
     /// "limits": {"media_jobs_per_hour": N}: media jobs this key's chats may queue in an hour
     pub media_jobs_per_hour: Option<u32>,
+    /// "media_in_turn": "defer" (default: an image or video is made after the answer) or "swap" (the answer waits
+    /// for it: the text model stops, the job runs, the model loads again and the answer goes on with the result)
+    pub media_in_turn: Option<String>,
 }
 
 impl Profile {
@@ -103,7 +106,12 @@ impl Clients {
                 .filter(|m| !m.is_empty());
             let key = o.get("key").and_then(Value::as_str).map(str::trim).filter(|k| !k.is_empty()).map(str::to_owned);
             let media_jobs_per_hour = o.get("limits").and_then(|l| l.get("media_jobs_per_hour")).and_then(Value::as_u64).map(|n| n as u32);
-            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory, media_jobs_per_hour };
+            let media_in_turn = match o.get("media_in_turn").and_then(Value::as_str) {
+                None => None,
+                Some(m @ ("defer" | "swap")) => Some(m.to_string()),
+                Some(m) => return Err(format!("config clients.{name}.media_in_turn: {m:?} is not \"defer\" or \"swap\"")),
+            };
+            let profile = Profile { name: name.clone(), key: key.clone(), tools, memory, media_jobs_per_hour, media_in_turn };
             if name == "default" {
                 if key.is_some() {
                     return Err("config clients.default: the default profile is the main key's; it has no key of its own".into());
@@ -139,7 +147,7 @@ impl Clients {
     /// Settings › Clients: each profile without its key (the key's last 4 characters only).
     pub fn view(&self) -> Value {
         let show = |p: &Profile| serde_json::json!({"name": p.name, "tools": p.tools, "memory": p.memory_space(),
-            "media_jobs_per_hour": p.media_jobs_per_hour,
+            "media_jobs_per_hour": p.media_jobs_per_hour, "media_in_turn": p.media_in_turn,
             "key": p.key.as_deref().map(|k| format!("••••{}", &k[k.len().saturating_sub(4)..]))});
         serde_json::json!({"profiles": self.profiles.iter().map(show).collect::<Vec<_>>(),
                            "default": self.default.as_ref().map(show)})
@@ -195,7 +203,7 @@ mod tests {
 
     #[test]
     fn the_header_narrows_and_never_widens() {
-        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None, media_jobs_per_hour: None };
+        let p = Profile { name: "a".into(), key: None, tools: ["web", "image", "mcp:*", "mcp:files"].iter().map(|s| s.to_string()).collect(), memory: None, media_jobs_per_hour: None, media_in_turn: None };
         let n = p.narrowed("web, MCP:search").unwrap();
         assert_eq!(n.tools, ["mcp:search", "web"].iter().map(|s| s.to_string()).collect());
         assert!(p.narrowed("video").is_err());
