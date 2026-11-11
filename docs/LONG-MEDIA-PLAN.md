@@ -146,8 +146,17 @@ refused plainly when it named the text-only model.
 
 1. **A cleaner start frame by the model itself:** redraw the carried frame at low strength (image to image) before
    it starts the next clip. Shrinking it and blowing it back up was tried and did not help.
-2. **The model's own size, 1280×704:** measure one clip's time there (expected several times the 640×352 time). At
-   640×352 the model is outside what it was trained on, which makes the artefacts.
+2. **The model's own size, 1280×704: measured (2026-11-11).**
+   - One 121-frame clip (5 s), 20 steps, seed 7: **2,612 s (43.5 min)**, about 10× the 640×352 time. About 105 s
+     a denoising step, then 7 min of tiled VAE decode.
+   - **The picture is much cleaner:** a sharp lighthouse, natural water, no blocks.
+   - The first try failed at the end with "device mismatch in add, lhs: Cpu, rhs: Cuda". The full VAE decode needs
+     more than 16 GB at this size, and mold's tiled retry (`WanVideoVae::decode_tiled`) adds GPU tiles to its CPU
+     totals. It's fixed by moving each tile and its mask to the CPU (two lines).
+   - **That fix is not in the repository yet:** it was built here against a local copy of mold. Ship it by vendoring
+     mold, a fork, or upstream: the owner's choice.
+   - A 30 s video at this size is about 6-7 clips, so about 5 hours. That is for a finished piece rendered overnight,
+     not for a quick request.
 3. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
    inpaint takes two anchors (`WanImageAnchors`); otherwise a storyboard of independent clips with crossfades.
 4. **The last clip:** find out why it drifts most even at full length.
