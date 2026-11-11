@@ -190,9 +190,10 @@ fn voice_clip(st: &mut State, voice: &str, rate: u32, language: Option<&str>) ->
                                audio::VOICES.iter().map(|v| v.0).collect::<Vec<_>>().join(", ")))?;
     let path = audio::voices_dir().join(format!("{voice}.wav"));
     if !path.exists() {
-        let parler = audio::entry("parler-tts-mini-v1").unwrap();
+        let maker = audio::VOICE_MAKERS.iter().find(|m| m.0 == voice).map(|m| m.1).unwrap_or("parler-tts-mini-v1");
+        let parler = audio::entry(maker).unwrap();
         if !audio::downloaded(parler) {
-            bail!("the voice {voice:?} is made with Parler-TTS mini v1 the first time: download it, or give a clip of the voice (voice_audio)");
+            bail!("the voice {voice:?} is made with {maker} the first time: download it, or give a clip of the voice (voice_audio)");
         }
         if st.parler.as_ref().is_none_or(|p| p.name != parler.name) {
             st.parler = None;

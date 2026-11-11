@@ -83,7 +83,11 @@ pub fn language_name(code: &str) -> String {
 
 /// Each named voice's gender: in another language than English it is spoken by the native voice of that gender.
 pub const VOICE_GENDER: &[(&str, &str)] = &[("laura", "female"), ("lea", "female"), ("female", "female"),
-                                            ("jon", "male"), ("gary", "male"), ("male", "male")];
+                                            ("jon", "male"), ("gary", "male"), ("male", "male"), ("gautham", "male")];
+
+/// The model that makes a named voice's reference clip, when it is not Parler-TTS mini v1: Gautham is Indic Parler's
+/// English male speaker (Thoma), a warm Indian-English voice.
+pub const VOICE_MAKERS: &[(&str, &str)] = &[("gautham", "indic-parler-tts")];
 
 /// The native voices' descriptions (for a multilingual Parler model; synthetic voices, no person's recording)
 pub const NATIVE_VOICES: &[(&str, &str)] = &[
@@ -116,6 +120,7 @@ pub const VOICES: &[(&str, &str)] = &[
     ("jon", "Jon's voice is warm and steady, speaking at a moderate pace with a slightly low pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("lea", "Lea speaks in a bright, expressive and animated way, slightly fast, with a higher pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
     ("gary", "Gary speaks slowly and deliberately with a deep voice, in a quiet room. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
+    ("gautham", "Thoma's voice is calm and warm, speaking at a moderate pace with a natural pitch. The recording is of very high quality, with the speaker's voice sounding clear and very close up, with almost no background noise."),
 ];
 
 /// Indic Parler's recommended speakers by language, (female, male), from its model card (ai4bharat/indic-parler-tts).
@@ -1061,6 +1066,16 @@ mod tests {
         assert_eq!(number_words(0), "zero");
         assert_eq!(number_words(100_000_000_105), "one hundred billion one hundred five");
         assert_eq!(spoken("GPT4 and H100 stay"), "GPT4 and H100 stay");
+    }
+
+    #[test]
+    fn gautham_is_a_male_voice_made_by_indic_parler() {
+        assert_eq!(VOICE_GENDER.iter().find(|v| v.0 == "gautham").map(|v| v.1), Some("male"));
+        assert_eq!(VOICE_MAKERS.iter().find(|v| v.0 == "gautham").map(|v| v.1), Some("indic-parler-tts"));
+        assert!(VOICES.iter().find(|v| v.0 == "gautham").unwrap().1.starts_with("Thoma's voice"), "Indic Parler's English male speaker");
+        assert!(entry("indic-parler-tts").is_some());
+        // in an Indian language Gautham speaks as that language's male speaker
+        assert!(indic_description("gautham", "ml").unwrap().starts_with("Harish's"));
     }
 
     #[test]
