@@ -255,20 +255,45 @@ impl AceStep {
         let lyrics = self.text.lyrics(&text::lyric_prompt(&s.lyrics, &s.language))?.to_dtype(self.dtype)?;
         let timbre = if timbre_from_source { kept.clone() } else { self.silence.narrow(1, 0, 750)? };
         let cond = self.cond.forward(&caption, &lyrics, &timbre)?;
-        let (latent, _) = self.repaint(&kept, new, &cond, s.seed, s.steps, s.shift, on_step)?;
+        // with the planner (not in ACE-Step's reference, which skips it for repaint and keeps codes out of a repaint
+        // range): its codes for the new part's lyrics and length, detokenized, as the context where frames are made
+        let new_secs = new / FRAMES_PER_SECOND;
+        let hints = match s.plan.clone().filter(|_| self.has_planner()) {
+            Some(sampling) => {
+                let mut part = s.clone();
+                part.metas.duration_s = new_secs as u32;
+                let n_codes = new_secs * planner::CODES_PER_SECOND;
+                let codes = self.plan(&part, &sampling, new_secs, &mut |i, _| on_step(i, n_codes + s.steps))?;
+                Some(self.detok.hints(&codes, self.dtype, &self.device)?.narrow(1, 0, new)?)
+            }
+            None => None,
+        };
+        let (latent, _) = self.repaint_with(&kept, new, hints.as_ref(), &cond, s.seed, s.steps, s.shift, on_step)?;
         Ok((latent, k))
     }
 
     /// The repaint itself, from conditions already made: `kept` [1, k, 64] then `new` frames made.
     pub fn repaint(&self, kept: &Tensor, new: usize, cond: &Tensor, seed: u64, steps: usize, shift: f32,
                    on_step: &mut dyn FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
+        self.repaint_with(kept, new, None, cond, seed, steps, shift, on_step)
+    }
+
+    /// `repaint` with `hints` [1, new, 64] (the planner's detokenized codes) as the context of the frames made
+    /// instead of silence; the source frames and the injection are as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn repaint_with(&self, kept: &Tensor, new: usize, hints: Option<&Tensor>, cond: &Tensor, seed: u64, steps: usize,
+                        shift: f32, on_step: &mut dyn FnMut(usize, usize)) -> Result<(Tensor, Tensor)> {
         let k = kept.dim(1)?;
         let total = k + new;
         // the source, then silence where frames are made (ACE-Step's src_latents and clean_src_latents agree here)
         let clean = Tensor::cat(&[kept, &self.silence.narrow(1, k, new)?], 1)?;
+        let src = match hints {
+            Some(h) => Tensor::cat(&[kept, &h.to_dtype(self.dtype)?], 1)?,
+            None => clean.clone(),
+        };
         let m: Vec<f32> = (0..total).map(|i| if i >= k { 1.0 } else { 0.0 }).collect();
         let mask = Tensor::from_vec(m, (1, total, 1), &self.device)?.to_dtype(self.dtype)?;
-        let context = Tensor::cat(&[&clean, &mask.broadcast_as((1, total, 64))?.contiguous()?], 2)?;
+        let context = Tensor::cat(&[&src, &mask.broadcast_as((1, total, 64))?.contiguous()?], 2)?;
         let x = noise(seed, total, &self.device)?.to_dtype(self.dtype)?;
         let rp = dit::Repaint { mask: &mask, clean: &clean, injection_ratio: 0.5, crossfade: CROSSFADE };
         let latent = dit::sample_repaint(&self.dit, &x, &context, cond, &dit::schedule(steps, shift), Some(&rp), on_step)?;

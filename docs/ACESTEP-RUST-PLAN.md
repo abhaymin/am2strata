@@ -58,6 +58,28 @@ So the first milestone leaves it out.
      much of the previous song, plus any silent tail.
    - **Gate** (`the_golden_repaint_is_made_again_from_its_noise`, golden `~/Development/ref/acestep-golden-repaint.py`
      on the CPU, 8 steps): final latent cosine 0.99992, the new part 0.99986, the kept frames equal to the source.
+   - **The planner's codes for the new part (default, beyond the reference).** ACE-Step skips the planner for repaint
+     (`DIRECT_CONDITIONING_TASKS`), and a repaint range keeps codes out of the context (`is_covers` False). Here the
+     planner runs for the new part's lyrics and length, and its detokenized hints are the context where frames are
+     made, instead of silence. The source frames and the injection are unchanged. `"continue_planner": false` gives
+     the reference's way.
+   - **Measured** (2026-11-11, one RTX 5060 Ti):
+     - The same 30 s song (it ends in 6 s of silence, so the continuation starts from its last sound), a 30 s
+       continuation, 10 s of context, seeds 11, 23 and 37.
+     - The share of the new part's lyric words that Whisper base hears in order:
+
+       | | Seed 11 | Seed 23 | Seed 37 | Mean | Time |
+       |---|---|---|---|---|---|
+       | Without planner codes | 32% | 14% | 23% | 23% | 7 s (39 s with the first load) |
+       | With planner codes | 91% | 73% | 55% | 73% | 25-27 s |
+       | With planner codes, 2 takes (best kept) | 91% | 73% | 73% | 79% | 28-41 s |
+
+     - The join is the same in every case: a sample step of 0.030 to 0.032, against a 99.9th percentile of 0.17
+       to 0.23, so no click.
+     - For comparison, a fresh 30 s song from the same request had its lyrics heard almost word for word.
+     - 2 takes cost about 15 s more for each second take; a take heard at 75% or more is kept without making
+       another.
+     - Productions already make song parts with 2 takes; `/v1/audio/music` with `"takes": 2`.
 6. **The planner (Qwen3 1.7B):** audio codes at 5 Hz for song structure, and "write the lyrics for me" from a
    description. Gate: the same codes as Python for greedy sampling.
 7. **Measured and documented:** time and VRAM on the RTX 5060 Ti against the Python numbers (about 12 s and 9.85 GB
@@ -74,7 +96,7 @@ Reference numbers (Python, phase 0): see `docs/MUSIC-PLAN.md`.
 | 2. Caption encoder, lyric embeddings, prompts | done | same token ids; cosine 0.9992+ per token; lyrics exact |
 | 3. Condition encoder, DiT, sampler, DCW | done | DiT against ACE-Step in f32: cosine 1.000000; the 8 bf16 steps 0.9926 to 0.9999; final latent 0.996 |
 | Pipeline (`acestep/pipeline.rs`) | done | the golden song made again in Rust from its noise: final latent 0.995, and Whisper hears its lyrics as in Python's |
-| 5b. Continuation (repaint past the end) | done (2026-11-11) | the Oobleck encoder SNR 110.2 dB; the golden repaint's final latent cosine 0.99992 (new part 0.99986), kept frames exact; live: the join has no click, Whisper hears part of the new lyrics |
+| 5b. Continuation (repaint past the end) | done (2026-11-11) | the Oobleck encoder SNR 110.2 dB; the golden repaint's final latent cosine 0.99992 (new part 0.99986), kept frames exact; live: no click at the join; the new part's lyrics heard 73% with the planner's codes (default) against 23% without, 79% with 2 takes |
 | 6. The planner (codes) | done (2026-11-10) | `planner.rs`, `dit::Detokenizer`; prompts and token ids the same as ACE-Step's; FSQ output cosine 0.99997, hints (detokenizer) 0.99999; teacher-forced on ACE-Step's greedy codes, its code is in Rust's top 5 at 47 of 50 steps, never more than 0.3 logits from the best (Python bf16 on a GPU, Rust f32 on the CPU: near ties in a flat 64,000-way choice) |
 | 6b. The planner's reasoning | built and measured (2026-11-11): live, 60 s English songs asked without a tempo or key, 1 take each, 4 seeds: 83%, 86%, 11%, 94% of the lyrics heard (mean 69%; before it, 53% and 64% with 2 takes); the planner wrote 94-167 bpm and keys such as E major and D minor | a song asked without a tempo, key or time signature: the planner writes them first (ACE-Step's phase 1, text tokens only, until `</think>`; values checked: 30-300 bpm, "<note> major/minor", 2/3/4/6 beats), and both the planner and the DiT use them; `/v1/audio/music` returns them in `x-strata-planned`. To measure: lyrics heard without a tempo and key, with and without it, on a free GPU |
 | 6c. "Write the lyrics for me" | next | the planner writing lyrics from a description |

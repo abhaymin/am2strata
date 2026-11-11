@@ -151,7 +151,7 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     // a continuation of the song before (LONG-MEDIA-PLAN: ACE-Step's repaint past the source's end): "continue_from"
     // is a WAV (base64) of that song's end; the answer starts x-strata-replaces-s seconds before that end
     for k in ["bpm", "key", "time_signature", "planner", "planner_temperature", "planner_cfg", "planner_top_p",
-              "continue_from", "context_seconds", "timbre_from_source"] {
+              "continue_from", "context_seconds", "timbre_from_source", "continue_planner"] {
         if !req[k].is_null() {
             cmd[k] = req[k].clone();
         }

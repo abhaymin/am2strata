@@ -30,6 +30,8 @@ plan of speak, song and music parts.
   - The engine encodes that tail (the Oobleck encoder) and makes the frames after it, with the tail kept as context.
   - The two are merged into one entry: cut where the continuation starts, a 20 ms crossfade, loudness evened over the
     whole, a chapter for each part.
+  - The planner's codes for the new part are its context by default: 73% of the new lyrics heard against 23%
+    without (3 seeds), 79% with 2 takes (ACESTEP-RUST-PLAN stage 5b).
   - Measured live: a 30 s continuation took 7 s (no planner pass) to 40 s.
     - The join: a sample step of 0.030 to 0.048, below the song's 99.9th-percentile step (about 0.2), so no click.
     - Whisper base heard part of the new lyrics ("…harmony The world can sing as one").

@@ -476,7 +476,14 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         }
         let source = source.narrow(1, n - take, take)?;
         let mut s = s;
-        s.plan = None; // the planner's codes would replace the source (a cover); a repaint keeps it
+        // the planner's codes for the new part, as its context where frames are made (ACE-Step's reference skips the
+        // planner for a repaint). On by default: measured on one song, 3 seeds, Whisper base, the new part's lyrics
+        // heard 91/73/55% with them against 32/14/23% without, the join the same; "continue_planner": false for
+        // the reference's way. "planner": false turns it off too.
+        if cmd["continue_planner"].as_bool() == Some(false) {
+            s.plan = None;
+        }
+        let planned = s.plan.is_some() && st.song.as_ref().unwrap().has_planner();
         let song = st.song.as_mut().unwrap();
         let audio = song.continuation(&s, &source, cmd["timbre_from_source"].as_bool() != Some(false),
                                       &mut |step, total| emit(json!({"event": "step", "step": step, "total": total})))?;
@@ -484,7 +491,7 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         let wav = acestep::pipeline::wav(&audio)?;
         return Ok(json!({"event": "song", "format": "wav", "sample_rate": acestep::oobleck::SAMPLE_RATE,
                          "seconds": audio.dim(1)? as f64 / 48_000.0, "ms": t0.elapsed().as_millis() as u64, "model": acestep::NAME,
-                         "seed": s.seed, "planner": false, "continued": true, "context_seconds": take as f64 / 48_000.0,
+                         "seed": s.seed, "planner": planned, "continued": true, "context_seconds": take as f64 / 48_000.0,
                          "silent_tail_s": silent_tail,
                          // the audio starts this many seconds before the previous song's end: those are replaced
                          "replaces_s": replaces,
