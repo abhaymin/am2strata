@@ -167,10 +167,30 @@ A third run (09:13, the same request) added two things:
 clip each time. A long video moves to a downloaded model that can continue when the request named none, and is
 refused plainly when it named the text-only model.
 
+### The start frame redrawn by an image model (2026-11-11, built, measured, on by default)
+
+- **Redraw:** before the carried frame starts the next clip, Z-Image Turbo (Q8) redraws it image to image at
+  strength 0.4, with the chain's prompt. The image model is loaded for each redraw and unloaded after (about 10 s a
+  clip), so the GPU is the video model's again. `"redraw_start": 0` turns it off, and `"redraw_model"` picks
+  another model.
+- **Opening frames held too:** a continued clip's opening frames came out bluer (blue up about 20 for about 20
+  frames). One colour table for the whole clip left them as they were, which is why the last, truncated clip
+  measured the most drift. The first 24 frames now get their own table, eased into the whole clip's over 48 frames.
+- **Strength test**, 10 s / 3 clips, the same prompt and seed:
+  - joins: 15 / 19 with no redraw, 21 / 17 at 0.25, **15 / 12 at 0.4**;
+  - the final frame: blocky sky and a smeared sea with no redraw, better at 0.25, **clean at 0.4**.
+- **30 s at 0.4** (7 clips, 1,955 s):
+  - joins 11-16, against 17-21 with the hold alone;
+  - colour drift from clip 1: 0.7-2.4 for clips 2-6 (5.8 in the truncated last clip, which is only its opening);
+  - **the picture stays coherent to the last clip:** lighthouse, rocks and sea keep their detail, where before
+    the sky broke into blocks and the rocks were posterised from clip 4 on;
+  - left: faint purple streaks in the sky in clips 5-6 and some flattening of the rocks in clip 6.
+- The frames: `am2strata-promo/rec/chain/redraw30-vs-before.png` (top: the hold alone; bottom: with the redraw).
+
 ### Next, before long video is offered
 
-1. **A cleaner start frame by the model itself:** redraw the carried frame at low strength (image to image) before
-   it starts the next clip. Shrinking it and blowing it back up was tried and did not help.
+1. **A cleaner start frame by the model itself:** done (above). Shrinking the frame and blowing it back up did not
+   help; the image model's redraw at 0.4 did.
 2. **The model's own size, 1280×704: measured (2026-11-11).**
    - One 121-frame clip (5 s), 20 steps, seed 7: **2,612 s (43.5 min)**, about 10× the 640×352 time. About 105 s
      a denoising step, then 7 min of tiled VAE decode.
@@ -185,7 +205,7 @@ refused plainly when it named the text-only model.
      not for a quick request.
 3. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
    inpaint takes two anchors (`WanImageAnchors`); otherwise a storyboard of independent clips with crossfades.
-4. **The last clip:** find out why it drifts most even at full length.
+4. **The last clip:** explained and fixed (each clip's opening frames held on their own).
 5. Measure again on the same prompt and seed (`docs/` keeps these numbers).
 
 - The model: Wan 2.2 TI2V 5B (text and image to video, 1280×704 or 704×1280 at 24 fps, about 5 s a segment) in mold.

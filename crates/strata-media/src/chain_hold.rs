@@ -4,6 +4,9 @@
 //!   brightness and saturation drift that each clip otherwise passes on, compounding.
 //! - **overlapped crossfades:** the next clip starts from the frame `overlap` frames before this clip's end, so the
 //!   two clips cover the same `overlap` frames of time; the stitch crossfades them instead of cutting.
+//! - **a redrawn start frame** (on by default at 0.4, "redraw_start"): an image model redraws the carried frame
+//!   image to image, so the artefacts a clip passes on are drawn over (measured 2026-11-11: the 30 s chain stays
+//!   clean to its last clip).
 //! - **a smoothed start frame:** the carried frame is taken to half size and back, so its blocky artefacts are not
 //!   passed on ("smooth_start", off by default: measured, it did not stop the drift).
 //!

@@ -723,7 +723,9 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
     // "redraw_start": strength (0.1-0.6): an image model redraws the carried frame (image to image) before it starts
     // the next clip, so the artefacts a clip passes on are drawn over; loaded for each redraw and unloaded after, so
     // the GPU is the video model's again ("redraw_model", default z-image-turbo:q8)
-    let redraw_strength = req["redraw_start"].as_f64().filter(|s| wan && *s > 0.0).map(|s| s.clamp(0.1, 0.6));
+    // on by default at 0.4 (measured: the 30 s chain stays clean to its last clip; 0 turns it off); a redraw that
+    // fails (the image model not downloaded) leaves the frame as it was
+    let redraw_strength = req["redraw_start"].as_f64().or(Some(0.4)).filter(|s| wan && *s > 0.0).map(|s| s.clamp(0.1, 0.6));
     let redraw_model = req["redraw_model"].as_str().unwrap_or("z-image-turbo:q8").to_string();
     let redraw_cfg = st.config.clone();
     let prompt = request.stages.first().map(|s| s.prompt.clone()).unwrap_or_default();
