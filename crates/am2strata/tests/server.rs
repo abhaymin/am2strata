@@ -1988,6 +1988,9 @@ fn fake_web() -> u16 {
             let req = String::from_utf8_lossy(&buf[..n]).to_string();
             let (ct, body) = if req.starts_with("GET /login") {
                 ("text/html", "<html><head><title>Sign in</title></head><body><form action=\"/done\"><input id=\"user\"><input id=\"pw\" type=\"password\"><button type=\"submit\">Sign in</button></form></body></html>".to_string())
+            } else if req.starts_with("GET /form") {
+                // a search box that already holds text (as a site's box keeps the last search)
+                ("text/html", "<html><head><title>Search</title></head><body><input id=\"q\" value=\"old search\"></body></html>".to_string())
             } else if req.starts_with("GET /hang") {
                 // a page whose own script never ends once it has loaded (the tab stops answering)
                 ("text/html", "<html><head><title>Hang</title></head><body><p>Loading trains...</p><script>while (true) {}</script></body></html>".to_string())
@@ -2373,6 +2376,33 @@ fn a_hung_page_is_left_and_the_next_step_works() {
     assert!(last.contains("stopped answering") && last.contains("/hang"), "the model was told, with the address: {last}");
     assert!(last.contains("The tallest lighthouse is in Jeddah."), "the next step worked in a fresh tab: {last}");
     assert!(t0.elapsed() < Duration::from_secs(50), "bounded by the step timeout: {:?}", t0.elapsed());
+}
+
+/// Typing replaces a field's text (a filled search box grew "…stationKodaikanal Road railway station…" when the
+/// model typed into it again), "append" adds to it, and the same step a third time on an unchanged page is not run:
+/// the model is told it repeats itself and what the field holds.
+#[test]
+fn typing_replaces_the_field_and_repeats_are_stopped() {
+    let Some(exe) = chrome() else { eprintln!("no chrome-headless-shell: skipped"); return };
+    let port = fake_web();
+    let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/form\n</parameter>\n</function>\n</tool_call>");
+    let typ = |extra: &str| format!("\n\n<tool_call>\n<function=browser_type>\n<parameter=selector>\n#q\n</parameter>\n<parameter=text>\nKodaikanal Road\n</parameter>\n{extra}</function>\n</tool_call>");
+    let m = Model { extra: json!({"browser": {"exe": exe}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids(&format!("Type.\n</think>{}", typ(""))),
+                                  ids(&format!("Again.\n</think>{}", typ(""))), ids(&format!("Again.\n</think>{}", typ(""))),
+                                  ids(&format!("Add.\n</think>{}", typ("<parameter=append>\ntrue\n</parameter>\n"))),
+                                  ids("Ok.\n</think>\n\nDone.")], json!({}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("search")], "strata_browser": true}));
+    assert_eq!(c, 200, "{r}");
+    let all: Vec<String> = s.gen_lines().iter().map(|l| prompt_text(l)).collect();
+    // after the first type: the old text is gone
+    assert!(all[2].contains("The field now contains: \"Kodaikanal Road\""), "replaced: {}", all[2]);
+    assert!(!all[2].contains("old searchKodaikanal"), "{}", all[2]);
+    // the third identical type on the unchanged page is not run, and says so
+    assert!(all[4].contains("3 times in a row") && all[4].contains("\"Kodaikanal Road\""), "the guard: {}", all[4]);
+    // append adds to the text
+    let tail: String = all[5].chars().rev().take(700).collect::<String>().chars().rev().collect();
+    assert!(all[5].contains("The field now contains: \"Kodaikanal RoadKodaikanal Road\""), "appended: {tail}");
 }
 
 #[test]

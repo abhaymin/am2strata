@@ -254,6 +254,11 @@ Engine on its own (`am2strata-media`, the text model stopped), then the live ser
 - **Browser:** each step has a time limit (`"browser": {"step_timeout_s"}`, default 45). Past it the page's loading
   is stopped, and a tab that still does not answer is closed and a fresh one opened. The model is told what
   happened and the address it was on. Seen on a train-times page that hung on "Please wait".
+- **Browser typing** (2026-11-11): `browser_type` replaces the field's text (a filled search box grew
+  "…stationKodaikanal Road railway station…" when a model typed into it again); `"append": true` adds at the end.
+  After typing, the result says what the field now contains. The same step a third time in a row on a page it did
+  not change is not run: the model is told it is repeating itself and what the field holds (a model retyped one
+  search for 16 minutes). Tested: `typing_replaces_the_field_and_repeats_are_stopped`.
 - **Image edit at 1024x1024:** measured: 35 steps, then `CUDA_ERROR_OUT_OF_MEMORY` in the VAE decode, which shares
   card 1 with Qwen3-VL.
   - A Qwen Image picture above 0.8 megapixels now decodes on the CPU.
