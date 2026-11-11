@@ -158,6 +158,34 @@ pub struct Outcome {
 
 const GAIN: f64 = 1.03;
 
+fn prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The quality floor: per prompt, a candidate's answer must agree with the run config's (the same tokens from the
+/// start) as far as the run config agrees with itself: all of it when the engine is exact from run to run, else at
+/// least half as far as its own second run did.
+struct Floor {
+    base: Vec<Vec<u32>>,
+    self_agree: Vec<usize>,
+}
+
+impl Floor {
+    fn new(a: &Score, b: &Score) -> Floor {
+        Floor { base: a.tokens.clone(), self_agree: a.tokens.iter().zip(&b.tokens).map(|(x, y)| prefix(x, y)).collect() }
+    }
+
+    fn agree(&self, s: &Score) -> Vec<usize> {
+        self.base.iter().zip(&s.tokens).map(|(x, y)| prefix(x, y)).collect()
+    }
+
+    fn passes(&self, s: &Score) -> bool {
+        s.tokens.len() == self.base.len() && self.base.iter().zip(&s.tokens).zip(&self.self_agree).all(|((b, c), &me)| {
+            if me >= b.len() { c == b } else { prefix(b, c) * 2 >= me }
+        })
+    }
+}
+
 /// The search. `trial(args)` starts the model with those settings and runs the prompt set.
 pub async fn search<F, Fut>(start: Vec<String>, knobs: &[Knob], objective: &str, budget: Duration, mut trial: F) -> Result<Outcome>
 where
@@ -166,8 +194,13 @@ where
 {
     let t0 = Instant::now();
     let baseline = trial(start.clone()).await.map_err(|e| anyhow!("the run config as it is did not run: {e:#}"))?;
+    // the run config twice: how far its greedy answers agree with themselves (an engine whose sums are not
+    // bit-exact from run to run, as an expert cache that moves, parts at some token), the yardstick for the others
+    let again = trial(start.clone()).await.map_err(|e| anyhow!("the run config as it is did not run again: {e:#}"))?;
+    let floor = Floor::new(&baseline, &again);
     let (mut args, mut best) = (start, baseline.clone());
-    let mut trials = vec![json!({"setting": "the run config", "score": baseline.view()})];
+    let mut trials = vec![json!({"setting": "the run config", "score": baseline.view()}),
+                          json!({"setting": "the run config, again", "score": again.view(), "agrees_to": floor.self_agree})];
     let mut stopped = false;
     'rounds: for _ in 0..3 {
         let mut gained = false;
@@ -188,7 +221,8 @@ where
                 }
                 let row = match trial(cand.clone()).await {
                     Err(e) => json!({"dropped": format!("{e:#}")}),
-                    Ok(s) if s.tokens != baseline.tokens => json!({"dropped": "other tokens than the run config at temperature 0", "score": s.view()}),
+                    Ok(s) if !floor.passes(&s) => json!({"dropped": "its answers part from the run config's sooner than the run config's \
+                                                                       own do at temperature 0", "score": s.view(), "agrees_to": floor.agree(&s)}),
                     Ok(s) => {
                         let row = json!({"score": s.view()});
                         let to_beat = pick.as_ref().map(|p| p.1.value(objective)).unwrap_or(best.value(objective) * GAIN);
@@ -378,6 +412,18 @@ mod tests {
         assert!(dropped.iter().any(|t| t["value"] == "1024"), "the one that does not fit");
         assert!(dropped.iter().any(|t| t["value"] == "128"), "the one under the quality floor");
         assert!(calls < 20, "bounded: {calls} trials");
+    }
+
+    #[test]
+    fn an_engine_that_is_not_exact_is_judged_by_its_own_agreement() {
+        let sc = |t: Vec<u32>| Score { decode_tok_s: 1.0, prefill_tok_s: 1.0, first_token_ms: 1.0, tokens: vec![t] };
+        // the run config twice: they part at token 6
+        let f = Floor::new(&sc(vec![1, 2, 3, 4, 5, 6, 7, 8]), &sc(vec![1, 2, 3, 4, 5, 6, 9, 9]));
+        assert!(f.passes(&sc(vec![1, 2, 3, 4, 0, 0, 0, 0])), "parts at 4: within half of 6");
+        assert!(!f.passes(&sc(vec![1, 2, 0, 0, 0, 0, 0, 0])), "parts at 2: too soon");
+        // an exact engine: every token
+        let exact = Floor::new(&sc(vec![1, 2, 3]), &sc(vec![1, 2, 3]));
+        assert!(!exact.passes(&sc(vec![1, 2, 4])));
     }
 
     #[tokio::test]

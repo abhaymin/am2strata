@@ -342,7 +342,14 @@ pub async fn machine_measure(State(s): State<AppState>, headers: HeaderMap) -> R
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let (d, m) = (s.data_dir.clone(), s.models_dir.clone());
-    match tokio::task::spawn_blocking(move || crate::machine::measure(&d, &m)).await {
+    // the models' files are where their run configs' --model says, often not beside the configs
+    let mut weights: Vec<std::path::PathBuf> = s.mgr.models().iter()
+        .filter_map(|e| crate::optimizer::arg(&e.cfg.args, "--model"))
+        .filter_map(|p| std::path::Path::new(&p).parent().and_then(|d| d.parent()).map(|d| d.to_path_buf()))
+        .collect();
+    weights.sort();
+    weights.dedup();
+    match tokio::task::spawn_blocking(move || crate::machine::measure(&d, &m, &weights)).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     }

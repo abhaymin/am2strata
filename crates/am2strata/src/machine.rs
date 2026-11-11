@@ -79,16 +79,18 @@ pub fn fingerprint(f: &Value) -> String {
     h.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-/// The disk's sequential read speed in MB/s, from the largest model file (up to 1 GiB, past the page cache).
-pub fn measure_read(models_dir: &Path) -> Option<(f64, String)> {
+/// The disk's sequential read speed in MB/s, from the largest model file (.gguf or .safetensors; up to 1 GiB, past
+/// the page cache) in `dirs`.
+pub fn measure_read(dirs: &[std::path::PathBuf]) -> Option<(f64, String)> {
     let mut best: Option<(u64, std::path::PathBuf)> = None;
-    let mut stack = vec![models_dir.to_path_buf()];
+    let mut stack = dirs.to_vec();
     while let Some(d) = stack.pop() {
         for e in std::fs::read_dir(&d).ok()?.flatten() {
             let Ok(m) = e.metadata() else { continue };
             if m.is_dir() && stack.len() < 64 {
                 stack.push(e.path());
-            } else if m.is_file() && best.as_ref().is_none_or(|(n, _)| m.len() > *n) {
+            } else if m.is_file() && e.path().extension().is_some_and(|x| x == "gguf" || x == "safetensors")
+                && best.as_ref().is_none_or(|(n, _)| m.len() > *n) {
                 best = Some((m.len(), e.path()));
             }
         }
@@ -131,9 +133,12 @@ pub fn view(data_dir: &Path, models_dir: &Path) -> Value {
     v
 }
 
-pub fn measure(data_dir: &Path, models_dir: &Path) -> Value {
+/// `weights`: the folders the models' files are in (from the run configs' --model), besides the configs' folder.
+pub fn measure(data_dir: &Path, models_dir: &Path, weights: &[std::path::PathBuf]) -> Value {
     let mut v = view(data_dir, models_dir);
-    let m = measure_read(models_dir);
+    let mut dirs = weights.to_vec();
+    dirs.push(models_dir.to_path_buf());
+    let m = measure_read(&dirs);
     v["measured"] = json!({"at": crate::now(), "disk_read_mb_s": m.as_ref().map(|x| x.0), "read_from": m.map(|x| x.1)});
     v["hardware_changed"] = json!(false);
     let _ = std::fs::write(data_dir.join("machine.json"), serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -170,8 +175,9 @@ mod tests {
         let d = std::env::temp_dir().join(format!("machine-test-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("m.gguf"), vec![1u8; 4 << 20]).unwrap();
-        let (mb_s, from) = measure_read(&d).unwrap();
-        assert!(mb_s > 0.0 && from.ends_with("m.gguf"));
+        std::fs::write(d.join("engine-binary"), vec![1u8; 8 << 20]).unwrap();
+        let (mb_s, from) = measure_read(&[d.clone()]).unwrap();
+        assert!(mb_s > 0.0 && from.ends_with("m.gguf"), "a model file, not the larger program beside it: {from}");
         std::fs::remove_dir_all(&d).unwrap();
     }
 }
