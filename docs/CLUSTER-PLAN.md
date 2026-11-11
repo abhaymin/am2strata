@@ -4,9 +4,52 @@ Owner's request (2026-11-10): machines on the same network, or remote ones the u
 work together. A model's layers are shared across them, for quicker requests and longer context, as exo and other
 cluster tools do, old phones included.
 
-**State: phase 1 (request routing) built and tested on one machine (2026-11-11); its measurement on a second
-machine, and the paired keys, are next.** This page is the design and the order of the work. Each step is measured
-on real machines before the next starts.
+**State: phase 1 (request routing) and part 1 (nodes and joining) built and tested on one machine (2026-11-11);
+encryption with the paired keys, and measurements on a second machine, are next.** This page is the design and the
+order of the work. Each step is measured on real machines before the next starts.
+
+### Part 1 as built: nodes and joining (`crates/am2strata/src/cluster.rs`)
+
+- **A worker:** `"cluster": {"role": "worker"}` in its run config (and optionally `"name"`).
+  - It has an ed25519 identity in `<data>/node-key` (0600, made on first start). Its node id is the first 16 bytes
+    of the SHA-256 of the public key.
+  - It announces itself on the LAN by mDNS as `_am2strata._tcp` (TXT: name, version, node_id), using the
+    `mdns-sd` crate (Apache-2.0 OR MIT).
+  - It shows a 6-digit pairing code that changes every 10 minutes and after each use. The code appears in its log
+    and its own Settings › Cluster, and only to its own main key.
+- **The master:**
+  - It browses for `_am2strata._tcp`. `GET /api/cluster` lists the servers found and not paired as "found";
+    Settings › Cluster shows them as "wants to join", with a code field and a Pair button. A worker reached through
+    a VPN can be paired by its address.
+  - The address used is a private LAN address first, then a VPN's, then IPv6.
+- **Pairing:**
+  1. The master's `POST /api/cluster/pair {"url" or "node_id", "code"}` (main key, own page) sends the code to the
+     worker's `POST /api/cluster/join`.
+  2. The worker compares the code in constant time. Five wrong codes lock pairing for 10 minutes, even for the
+     right code.
+  3. For the right code it mints a random key for that master alone, keeps only the key's SHA-256 in
+     `<data>/cluster-masters.json` (0600), and answers the key once.
+  4. The master keeps the worker and its key in `<data>/cluster-workers.json` (0600), merged with any run-config
+     workers at start, and polls it at once (no restart).
+- **What a master's key opens on the worker:** the model APIs, plus the model list and queue the master polls.
+  Never the worker's settings or its own pairing code. The worker's main key never leaves it.
+- **Removing:** `DELETE /api/cluster/workers/{name}` on the master stops using the worker, and tells it to forget
+  that master (`POST /api/cluster/forget` with the master's key). After that the key is refused.
+- `AM2STRATA_NO_MDNS=1` turns mDNS off (the tests set it).
+- **Tested:**
+  - `a_worker_pairs_by_its_code_and_is_removed_cleanly`, on two servers on one machine: a wrong code is refused;
+    the right code pairs; the key files are 0600; the worker keeps only the hash; the minted key opens
+    `/v1/models`, `/api/models` and `/api/queue` but not `/api/cluster` or `/api/system`; a chat for the worker's
+    model is answered by it through the master; removal makes the key refused; five wrong codes lock pairing.
+  - Unit tests: the node identity, the code and the lock, the address preference.
+  - `security_every_route_needs_the_key` names `/api/cluster/join` as the one route proven by a code (refused on a
+    server that is not a worker).
+- **Checked by hand on this PC (2026-11-11):** a worker and a master as two processes, mDNS on. The master found the
+  worker (name, node id, version) with no configuration. It took the worker's Tailscale address, the first IPv4 the
+  worker announced, which is why private LAN addresses now go first.
+- **Security:** pairing needs physical or remote access to the worker's code. Each master has its own revocable
+  key. Traffic is still plain HTTP with that key, so across a network you don't trust, use your own VPN.
+  **Encryption with the paired keys (Noise or TLS pinned to the node ids) is the next step.**
 
 ### Phase 1 as built (`crates/am2strata/src/cluster.rs`)
 

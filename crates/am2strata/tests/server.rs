@@ -1779,6 +1779,13 @@ fn security_every_route_needs_the_key() {
         if matches!(path.as_str(), "/health" | "/api/health" | "/preview/mj-1") {
             continue;
         }
+        // a worker's join is proven by its pairing code, not a key (a_worker_pairs_by_its_code_and_is_removed_cleanly);
+        // on a server that is not a worker it is refused
+        if path == "/api/cluster/join" {
+            let code = c.post(format!("{}{path}", s.base)).json(&serde_json::json!({"code": "123456", "master_id": "m"})).send().unwrap().status().as_u16();
+            assert_eq!(code, 404, "join on a server that is not a worker");
+            continue;
+        }
         for (m, method) in [("get(", reqwest::Method::GET), ("post(", reqwest::Method::POST), ("delete(", reqwest::Method::DELETE)] {
             if !cap[2].contains(m) {
                 continue;
@@ -2668,4 +2675,66 @@ fn a_production_song_can_continue_the_song_before() {
     let at = ch[1]["start_s"].as_f64().unwrap();
     assert!((at - 1.5).abs() < 0.11, "the continuation's chapter at {at} s");
     assert!(ch[2]["start_s"].as_f64().unwrap() > at);
+}
+
+/// Clusters, joining (CLUSTER-PLAN part 1): a worker pairs with a master only by its code; five wrong codes lock it;
+/// the key it mints opens its model APIs (and the model list and queue the master polls) but not its settings; the
+/// master then routes a chat for the worker's model to it; removing it forgets the master on both sides.
+#[test]
+fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
+    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker"}}), ..Model::default() }],
+                               &[ids("Ok.\n</think>\n\nFrom the paired worker.")], json!({}));
+    let master = Server::start(&[Model::default()], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
+    let (_, w) = worker.get("/api/cluster", true);
+    assert_eq!(w["role"], "worker", "{w}");
+    let code = w["pairing_code"].as_str().unwrap().to_string();
+    assert_eq!(code.len(), 6);
+    // the code is never shown without the worker's own key
+    assert_eq!(worker.get("/api/cluster", false).0, 401);
+    // a wrong code is refused
+    let wrong = if code == "000000" { "000001" } else { "000000" };
+    let (c, e) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": wrong}));
+    assert_eq!(c, 403, "{e}");
+    // the right code pairs
+    let (c, p) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code}));
+    assert_eq!(c, 200, "{p}");
+    let name = p["paired"].as_str().unwrap().to_string();
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(master.dir.join("cluster-workers.json")).unwrap()).unwrap();
+    let key = saved["workers"][0]["key"].as_str().unwrap().to_string();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in [master.dir.join("cluster-workers.json"), worker.dir.join("cluster-masters.json"), worker.dir.join("node-key")] {
+            assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
+        }
+    }
+    assert!(!std::fs::read_to_string(worker.dir.join("cluster-masters.json")).unwrap().contains(&key), "the worker keeps only the key's hash");
+    // the minted key: the model APIs, the model list and the queue; never the settings
+    let get = |path: &str, k: &str| reqwest::blocking::Client::new().get(format!("{}{path}", worker.base)).bearer_auth(k).send().unwrap().status().as_u16();
+    assert_eq!(get("/v1/models", &key), 200);
+    assert_eq!(get("/api/models", &key), 200);
+    assert_eq!(get("/api/queue", &key), 200);
+    assert_eq!(get("/api/cluster", &key), 401, "not the worker's settings");
+    assert_eq!(get("/api/system", &key), 401);
+    // the master uses it at once (no restart)
+    let t0 = Instant::now();
+    while master.get("/api/cluster", true).1["workers"][0]["ready"] != true {
+        assert!(t0.elapsed() < Duration::from_secs(15), "{}", master.get("/api/cluster", true).1);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
+    assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the paired worker.")), "{v}");
+    // removed: the master stops using it and the worker forgets the master
+    let r = reqwest::blocking::Client::new().delete(format!("{}/api/cluster/workers/{name}", master.base)).bearer_auth(KEY).send().unwrap();
+    let v: Value = r.json().unwrap();
+    assert_eq!(v["worker_told"], true, "{v}");
+    assert_eq!(get("/v1/models", &key), 401, "the worker forgot the key");
+    assert!(master.get("/api/cluster", true).1["workers"].as_array().unwrap().is_empty());
+    // five wrong codes lock pairing, even for the right code
+    for _ in 0..5 {
+        master.post("/api/cluster/pair", &json!({"url": worker.base, "code": wrong}));
+    }
+    let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
+    let (c, e) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code}));
+    assert_eq!(c, 429, "{e}");
 }

@@ -220,7 +220,17 @@ pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<client
     if authorized(state, headers) {
         return Some(state.clients.default.clone());
     }
-    clients::given_key(headers).and_then(|k| state.clients.by_key(k)).map(|p| Some(p.clone()))
+    let k = clients::given_key(headers)?;
+    // a key this worker minted for its master (cluster.rs): the model APIs, no tools of a profile
+    if state.cluster.is_master_key(k) {
+        return Some(None);
+    }
+    state.clients.by_key(k).map(|p| Some(p.clone()))
+}
+
+/// The main key, or (on a worker) a key it gave its master: what the master polls, the model list and the queue.
+pub fn authorized_or_master(state: &AppState, headers: &HeaderMap) -> bool {
+    authorized(state, headers) || clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k))
 }
 
 pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -418,7 +428,7 @@ async fn main() -> Result<()> {
             }
         });
     }
-    let cluster = Arc::new(match cluster::Cluster::from_config(&first.cfg.rest) {
+    let cluster = Arc::new(match cluster::Cluster::from_config(&first.cfg.rest, Some(&expand(&args.data_dir))) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("am2strata: {e}");
@@ -426,9 +436,9 @@ async fn main() -> Result<()> {
         }
     });
     if !cluster.is_empty() {
-        tracing::info!("cluster: master of {}", cluster.workers.iter().map(|w| format!("{} ({})", w.name, w.url)).collect::<Vec<_>>().join(", "));
-        cluster.start_polling();
+        tracing::info!("cluster: master of {}", cluster.workers().iter().map(|w| format!("{} ({})", w.name, w.url)).collect::<Vec<_>>().join(", "));
     }
+    cluster.start(port);
     let clients = Arc::new(clients);
     let _ = mgr.clients.set(clients.clone());
     let state = AppState { mgr: mgr.clone(), api_key, clients: clients.clone(), mcp: Some(hub.clone()), trusted_origins,
@@ -474,6 +484,10 @@ async fn main() -> Result<()> {
         .route("/api/gpus", get(web::gpus))
         .route("/api/machine", get(web::machine))
         .route("/api/cluster", get(cluster::status))
+        .route("/api/cluster/pair", post(cluster::pair))
+        .route("/api/cluster/join", post(cluster::join))
+        .route("/api/cluster/forget", post(cluster::forget))
+        .route("/api/cluster/workers/{name}", axum::routing::delete(cluster::remove))
         .route("/api/machine/measure", post(web::machine_measure))
         .route("/api/optimise", get(web::optimise_status))
         .route("/api/models/{id}/optimise", post(web::optimise))

@@ -26,7 +26,7 @@ pub async fn health(State(s): State<AppState>) -> Json<Value> {
 }
 
 pub async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::authorized_or_master(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     Json(s.mgr.list().await).into_response()
@@ -267,7 +267,7 @@ pub async fn agents(State(s): State<AppState>, headers: HeaderMap, Query(q): Que
 
 /// GET /api/queue: the job that has the GPU's turn and the ones waiting, in the order they will run.
 pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::authorized_or_master(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     Json(s.mgr.queue.snapshot()).into_response()

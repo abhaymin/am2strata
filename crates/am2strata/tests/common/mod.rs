@@ -205,6 +205,7 @@ fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Ch
             .env("AM2_JOB_IDS_FROM", "1")
             .env("MOCK_RECORD", record)
             .env("RUST_LOG", "warn")
+            .env("AM2STRATA_NO_MDNS", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

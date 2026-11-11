@@ -612,17 +612,20 @@
         <section class="set-panel" id="sec-cluster" aria-labelledby="h-cluster" hidden>
           <h2 id="h-cluster">Cluster</h2>
           <div class="st-card"><span class="card-title">Workers</span>
-            <p class="muted small">This server is the master: people and apps talk to it, and it keeps the keys, memory and queue. A
-              worker is another am2Strata that runs models for it. A chat goes to a worker when only the worker has its model, or
-              when this PC is busy and a worker has the same model loaded and idle; the answer comes back through here.</p>
+            <p class="muted small">A master is the am2Strata people and apps talk to; it keeps the keys, memory and queue. A
+              worker is another am2Strata that runs models for it: set <code>"cluster": {"role": "worker"}</code> in its run
+              config. Workers on this network show here as "wants to join"; type the 6-digit code the worker shows to pair it.
+              Nothing joins by itself. A chat goes to a worker when only the worker has its model, or when this PC is busy and
+              a worker has the same model loaded and idle; the answer comes back through here.</p>
             <div class="mcp-list" id="cluster-list"></div></div>
           <div class="st-card"><span class="card-title">Add one in the run config</span>
             <pre class="snippet"><code>"cluster": {"workers": {
   "pc2": {"url": "http://192.168.8.50:8000", "key": "env:PC2_KEY"}
 }}</code></pre>
-            <p class="muted small">The key is the worker's own API key (or env:NAME to read it from the environment); give each
-              worker a key of its own. Traffic is plain HTTP with that key: across a network you do not trust, connect the
-              machines through your own VPN (Tailscale, WireGuard). Used from the next start.</p></div>
+            <p class="muted small">Workers can also be listed in the run config (used from the next start); the key is then the
+              worker's own API key (or env:NAME). Pairing in the app gives each master a key of its own instead, and the worker's
+              main key never leaves it. Traffic is plain HTTP with the key: across a network you do not trust, connect the
+              machines through your own VPN (Tailscale, WireGuard).</p></div>
         </section>
 
         <section class="set-panel" id="sec-clients" aria-labelledby="h-clients" hidden>

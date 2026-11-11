@@ -2340,7 +2340,8 @@ async function loadClients() {
   } catch (e) { $("clients-list").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
 }
 
-// Settings › Cluster: the workers (GET api/cluster), seen every few seconds while the section is open
+// Settings › Cluster (GET api/cluster): on a master, its workers (Remove), and the machines found on the network that
+// want to join (Pair, with the code the worker shows); on a worker, its pairing code and its masters
 let clusterTimer = null;
 async function loadCluster() {
   clearTimeout(clusterTimer);
@@ -2348,16 +2349,60 @@ async function loadCluster() {
     const r = await fetch("api/cluster", {headers: headers()});
     if (!r.ok) throw new Error(r.status === 401 ? "An API key is needed (Settings › Server and access › API key)." : `HTTP ${r.status}`);
     const j = await r.json();
-    $("cluster-list").innerHTML = (j.workers || []).map((w) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(w.name)}</strong>` +
+    let html = "";
+    if (j.role === "worker") {
+      html += `<div class="mcp-server"><div class="mcp-server__head"><strong>This PC is a worker</strong>` +
+        `<span class="muted small">${esc(j.node.name)} · node ${esc(j.node.id.slice(0, 12))}</span></div>` +
+        `<p>Pairing code: <b class="mono" style="font-size:1.4em;letter-spacing:.15em">${esc(j.pairing_code)}</b> ` +
+        `<span class="muted small">(type it on the master; it changes every 10 minutes and after each use)</span></p>` +
+        `<div class="mcp-server__tools">${(j.masters || []).map((m) => `<span class="chip">master: ${esc(m.name)}</span>`).join("") || '<span class="muted small">no master yet</span>'}</div></div>`;
+    }
+    html += (j.workers || []).map((w) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(w.name)}</strong>` +
       `<span class="st-badge ${w.ready ? "st-badge--generating" : ""}">${w.ready ? "Answering" : "Not answering"}</span>` +
       `<span class="muted small">${esc(w.url)} · ${w.loaded ? `${esc(w.loaded)} loaded` : "no model loaded"} · ${fmt(w.waiting || 0)} waiting` +
-      ` · ${fmt(w.requests_routed || 0)} requests taken${w.seen_s_ago != null ? ` · seen ${fmt(w.seen_s_ago)} s ago` : ""}</span></div>` +
+      ` · ${fmt(w.requests_routed || 0)} requests taken${w.seen_s_ago != null ? ` · seen ${fmt(w.seen_s_ago)} s ago` : ""}</span>` +
+      `<button class="st-btn st-btn--danger" data-unpair="${esc(w.name)}">Remove</button></div>` +
       (w.error ? `<div class="msg-error">${esc(w.error)}</div>` : "") +
-      `<div class="mcp-server__tools">${(w.models || []).map((m) => `<span class="chip">${esc(m)}</span>`).join("") || '<span class="muted small">no models</span>'}</div></div>`).join("")
-      || '<p class="muted">No workers: this is a single machine. Add one in the run config (below).</p>';
-    if (!$("sec-cluster").hidden && (j.workers || []).length) clusterTimer = setTimeout(loadCluster, 5000);
+      `<div class="mcp-server__tools">${(w.models || []).map((m) => `<span class="chip">${esc(m)}</span>`).join("") || '<span class="muted small">no models</span>'}</div></div>`).join("");
+    html += (j.found || []).map((f) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(f.name)}</strong>` +
+      `<span class="st-badge st-badge--reading">Wants to join</span><span class="muted small">${esc(f.url)} · am2Strata ${esc(f.version)} · node ${esc(f.node_id.slice(0, 12))}</span></div>` +
+      `<p><input class="st-input" inputmode="numeric" maxlength="6" placeholder="Its 6-digit code" data-code-for="${esc(f.node_id)}" style="width:10em"> ` +
+      `<button class="st-btn st-btn--primary" data-pair="${esc(f.node_id)}">Pair</button></p></div>`).join("");
+    if (j.role !== "worker") {
+      html += `<div class="mcp-server"><div class="mcp-server__head"><strong>Pair a worker by its address</strong>` +
+        `<span class="muted small">for one on another network (through your VPN)</span></div>` +
+        `<p><input class="st-input" id="pair-url" placeholder="http://100.64.0.2:8000" style="width:16em"> ` +
+        `<input class="st-input" id="pair-code" inputmode="numeric" maxlength="6" placeholder="6-digit code" style="width:9em"> ` +
+        `<button class="st-btn st-btn--secondary" data-pair-url>Pair</button></p></div>`;
+    }
+    $("cluster-list").innerHTML = html || '<p class="muted">No workers: this is a single machine.</p>';
+    if (!$("sec-cluster").hidden) clusterTimer = setTimeout(loadCluster, 5000);
   } catch (e) { $("cluster-list").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
 }
+$("cluster-list").addEventListener("click", async (e) => {
+  const pair = e.target.closest("[data-pair]"), byUrl = e.target.closest("[data-pair-url]"), unpair = e.target.closest("[data-unpair]");
+  if (pair || byUrl) {
+    const body = pair ? {node_id: pair.dataset.pair, code: (document.querySelector(`[data-code-for="${CSS.escape(pair.dataset.pair)}"]`) || {}).value}
+                      : {url: $("pair-url").value.trim(), code: $("pair-code").value.trim()};
+    try {
+      const r = await fetch("api/cluster/pair", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error || {}).message || `HTTP ${r.status}`);
+      toast("success", `Paired with ${j.paired}`, "Its models are used from now on.");
+    } catch (err) { toast("error", "Not paired", String(err.message || err), 8000); }
+    loadCluster();
+  }
+  if (unpair) {
+    if (!confirm(`Remove the worker ${unpair.dataset.unpair}? It forgets this master too, and must be paired again with a new code.`)) return;
+    try {
+      const r = await fetch(`api/cluster/workers/${encodeURIComponent(unpair.dataset.unpair)}`, {method: "DELETE", headers: headers(true)});
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error || {}).message || `HTTP ${r.status}`);
+      toast("info", "Worker removed", j.note || (j.worker_told ? "It forgot this master." : "It could not be told (not reachable)."));
+    } catch (err) { toast("error", "Not removed", String(err.message || err), 8000); }
+    loadCluster();
+  }
+});
 
 // Settings › Chat defaults: the same settings as the drawer (this browser), optionally shared with other apps
 function loadDefaults() {

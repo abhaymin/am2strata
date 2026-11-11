@@ -28,6 +28,10 @@ uuid.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking", "json", "stream"] }
 base64 = "0.22"
 sha2 = "0.10"
+# clusters: the node's ed25519 identity, random pairing codes and keys, LAN discovery (cluster.rs)
+ed25519-dalek = "2"
+rand = "0.8"
+mdns-sd = "0.13"
 jsonschema = { version = "0.30", default-features = false }
 tower-http = { version = "0.6", features = ["fs", "set-header", "catch-panic"] }
 # web_search / fetch_url: DuckDuckGo's HTML results and the text of a page (pure Rust, html5ever)
