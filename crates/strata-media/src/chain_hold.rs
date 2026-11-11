@@ -80,12 +80,13 @@ pub struct Held<'a, R: ChainStageRenderer + ?Sized> {
     hold_colour: bool,
     overlap: usize,
     smooth: bool,
+    stages_done: usize,
     redraw: Option<Redraw<'a>>,
 }
 
 impl<'a, R: ChainStageRenderer + ?Sized> Held<'a, R> {
     pub fn new(inner: &'a mut R, hold_colour: bool, overlap: usize, smooth: bool, redraw: Option<Redraw<'a>>) -> Self {
-        Held { inner, reference: None, hold_colour, overlap, smooth, redraw }
+        Held { inner, reference: None, hold_colour, overlap, smooth, redraw, stages_done: 0 }
     }
 }
 
@@ -120,7 +121,17 @@ impl<R: ChainStageRenderer + ?Sized> ChainStageRenderer for Held<'_, R> {
     fn render_stage(&mut self, stage_req: &mold_core::GenerateRequest, carry: Option<&ChainTail>, motion_tail_pixel_frames: u32,
                     hdr_sidecar: Option<&StageSidecar>, stage_progress: Option<&mut dyn FnMut(StageProgressEvent)>)
                     -> Result<StageOutcome> {
-        let mut out = self.inner.render_stage(stage_req, carry, motion_tail_pixel_frames, hdr_sidecar, stage_progress)?;
+        // a starting image (the request's) begins the first clip only: mold copies it to every stage, and a later
+        // clip that has it skips its carried frame, so it would not continue from the clip before
+        let stage_req = if self.stages_done > 0 && stage_req.source_image.is_some() {
+            let mut r = stage_req.clone();
+            r.source_image = None;
+            std::borrow::Cow::Owned(r)
+        } else {
+            std::borrow::Cow::Borrowed(stage_req)
+        };
+        self.stages_done += 1;
+        let mut out = self.inner.render_stage(&stage_req, carry, motion_tail_pixel_frames, hdr_sidecar, stage_progress)?;
         if self.hold_colour {
             match &self.reference {
                 None => self.reference = Some(hist(&out.frames)),

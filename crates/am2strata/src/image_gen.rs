@@ -209,8 +209,15 @@ impl Media {
         p.writing = false;
         loop {
             let Some(line) = p.lines.next_line().await? else {
+                // why it stopped, said plainly and logged (a bare "stopped" left a 1024x1024 edit unexplained)
+                let why = match tokio::time::timeout(std::time::Duration::from_secs(5), p.child.wait()).await {
+                    Ok(Ok(st)) => exit_reason(&st),
+                    _ => "it closed its output".to_string(),
+                };
+                let op = cmd["op"].as_str().unwrap_or("a command").to_string();
                 *guard = None;
-                anyhow::bail!("the media engine stopped unexpectedly");
+                tracing::error!("the media engine stopped during {op}: {why}");
+                anyhow::bail!("the media engine stopped during {op}: {why}. It starts again with the next request");
             };
             let v: Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
@@ -227,6 +234,27 @@ impl Media {
             }
             return Ok(v);
         }
+    }
+}
+
+/// How a media engine process ended, in words.
+fn exit_reason(st: &std::process::ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = st.signal() {
+            return match sig {
+                9 => "it was killed (signal 9): most likely the PC ran out of memory (RAM), so the kernel ended it; a smaller size, or more free RAM, avoids it".into(),
+                6 => "it aborted (signal 6): most likely the graphics card ran out of memory; a smaller size avoids it".into(),
+                11 => "it crashed (signal 11)".into(),
+                s => format!("it ended on signal {s}"),
+            };
+        }
+    }
+    match st.code() {
+        Some(0) => "it exited".into(),
+        Some(c) => format!("it exited with code {c}"),
+        None => "it ended".into(),
     }
 }
 
@@ -400,9 +428,11 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let mut data = Vec::new();
     let mut failure = None;
     let mut ran = steps.unwrap_or(0);
+    let mut vae_on_cpu = false;
+    let mut notes: Vec<String> = Vec::new();
     for i in 0..n {
         let mut r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "seed": seed + i, "batch_size": 1});
-        if let Some(p) = placement(&s, &model) {
+        if let Some(p) = placement(&s, &model, w as u64 * h as u64, vae_on_cpu) {
             r["placement"] = p;
         }
         if let Some(st) = steps {
@@ -418,7 +448,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
             r["edit_images"] = json!(edit_images);
         }
         let mut png = None;
-        let res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
+        let mut res = s.media.call(json!({"op": "generate", "request": r.clone()}), |ev| {
             if ev["event"] == "image" && png.is_none() {
                 png = ev["png"].as_str().map(str::to_owned);
             }
@@ -428,6 +458,22 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
                 mon.media_step(job, ev["step"].as_u64().unwrap_or(0) + i * total, total * n);
             }
         }).await;
+        // out of graphics memory on a Qwen Image picture: made once more with its VAE decode on the CPU, and said so
+        if let (Err(e), true) = (&res, model.contains("qwen-image") && !vae_on_cpu) {
+            if out_of_memory(&format!("{e:#}")) {
+                tracing::warn!("{model} {w}x{h}: out of graphics memory ({e:#}); made again with the VAE decode on the CPU");
+                vae_on_cpu = true;
+                notes.push(format!("{w}x{h} ran out of graphics memory, so it was made again with its last step on the CPU"));
+                if let Some(p) = placement(&s, &model, w as u64 * h as u64, true) {
+                    r["placement"] = p;
+                }
+                res = s.media.call(json!({"op": "generate", "request": r}), |ev| {
+                    if ev["event"] == "image" && png.is_none() {
+                        png = ev["png"].as_str().map(str::to_owned);
+                    }
+                }).await;
+            }
+        }
         match (res, png) {
             (Ok(_), Some(b64)) => data.push(json!({"b64_json": b64, "seed": seed + i, "revised_prompt": prompt})),
             (Ok(_), None) => {
@@ -445,7 +491,11 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
         tracing::warn!("the media engine did not unload: {e:#}");
     }
     if let Some(f) = failure {
+        tracing::warn!("{model} {w}x{h}: {f}");
         mon.media_end(job, "error", &f);
+        let f = if out_of_memory(&f) {
+            format!("{f}: the graphics card ran out of memory at {w}x{h}; a smaller size (768x768 fits on a 16 GB card) avoids it")
+        } else { f };
         return error(StatusCode::BAD_GATEWAY, "image_error", f);
     }
     for d in &data {
@@ -457,7 +507,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
     Json(json!({"created": crate::now(), "data": data, "size": format!("{w}x{h}"),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": ran, "model": model,
-                           "edit_images": edit_images.len(),
+                           "edit_images": edit_images.len(), "notes": notes,
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
 }
 
@@ -465,13 +515,27 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
 /// on GPU 0, its text encoder and VAE on GPU 1 (devices in sequence). Measured 2026-11-09: Qwen-Image 2.1 (Q8,
 /// 1024x768) on GPU 0 alone peaked at 15.2 of 16.3 GB in the VAE decode while GPU 1 stayed empty, and the same job
 /// failed with CUDA_ERROR_OUT_OF_MEMORY. For the families checked so far (Qwen-Image); others keep mold's own choice.
-fn placement(s: &AppState, model: &str) -> Option<Value> {
+fn placement(s: &AppState, model: &str, pixels: u64, vae_cpu: bool) -> Option<Value> {
     let qwen_image = model.contains("qwen-image");
-    if !qwen_image || s.mgr.hw.gpus.len() < 2 || s.media.keep_text_model {
+    if !qwen_image {
         return None;
     }
     let gpu = |n: usize| json!({"kind": "gpu", "ordinal": n});
-    Some(json!({"text_encoders": gpu(1), "advanced": {"transformer": gpu(0), "vae": gpu(1), "qwen": gpu(1)}}))
+    // Qwen Image 2.1's VAE decode beside its Qwen3-VL on a 16 GB card runs out of memory from about a megapixel
+    // (measured: a 1024x1024 edit, CUDA_ERROR_OUT_OF_MEMORY in the final decode); there it decodes on the CPU
+    let vae = if vae_cpu || pixels > BIG_DECODE_PIXELS { json!({"kind": "cpu"}) } else { gpu(1) };
+    if s.mgr.hw.gpus.len() < 2 || s.media.keep_text_model {
+        return (vae_cpu || pixels > BIG_DECODE_PIXELS).then(|| json!({"advanced": {"vae": {"kind": "cpu"}}}));
+    }
+    Some(json!({"text_encoders": gpu(1), "advanced": {"transformer": gpu(0), "vae": vae, "qwen": gpu(1)}}))
+}
+
+/// Above this many pixels a Qwen Image picture is decoded on the CPU (768x768 fits on the card, 1024x1024 did not).
+const BIG_DECODE_PIXELS: u64 = 800_000;
+
+/// A media engine error that is the graphics card running out of memory.
+fn out_of_memory(e: &str) -> bool {
+    e.contains("OUT_OF_MEMORY") || e.to_lowercase().contains("out of memory")
 }
 
 /// GET /api/media/models: the media engine's catalog (image, video, 3D) with what is downloaded, the image model in
@@ -661,8 +725,37 @@ fn chrono_now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// The video's starting image from the request: `image`, `input_reference` (a string or {"image_url": ...}) or
+/// `image_url` (a string or {"url": ...}), as base64 or a data URL. A web address is refused: send the image itself.
+/// -> its base64 (PNG or JPEG), checked.
+fn starting_image(req: &Value) -> Result<Option<String>, String> {
+    let pick = |v: &Value| -> Option<String> {
+        v.as_str().map(str::to_string)
+            .or_else(|| v["url"].as_str().map(str::to_string))
+            .or_else(|| v["image_url"].as_str().map(str::to_string))
+            .or_else(|| v["image_url"]["url"].as_str().map(str::to_string))
+    };
+    let Some(raw) = ["image", "input_reference", "image_url"].iter().find_map(|k| pick(&req[*k])) else { return Ok(None) };
+    let raw = raw.trim();
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Err("image: send the image itself (base64 or a data: URL); the server does not fetch web addresses".into());
+    }
+    let b64 = raw.split_once(";base64,").map(|(_, b)| b).unwrap_or(raw);
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|_| "image: not valid base64".to_string())?;
+    if bytes.len() > 20 << 20 {
+        return Err("image: at most 20 MB".into());
+    }
+    let png = bytes.starts_with(&[0x89, b'P', b'N', b'G']);
+    let jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    if !png && !jpeg {
+        return Err("image: a PNG or JPEG".into());
+    }
+    Ok(Some(base64::engine::general_purpose::STANDARD.encode(&bytes)))
+}
+
 /// POST /v1/videos/generations {"prompt", "model"?, "size"?: "WxH", "frames"?, "fps"?, "steps"?, "seed"?, "format"?,
-/// "seconds"? / "total_frames"?}: one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an
+/// "seconds"? / "total_frames"?, "image"?}: one clip, drawn by the media engine's video models (Wan, LTX), as one GPU job like an
 /// image. Longer than one clip ("seconds" or "total_frames" past `frames`): a chain of clips (mold's chain, each
 /// continuing from the one before on a model that takes a source image), stitched into one video. The answer is the clip
 /// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
@@ -692,6 +785,25 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
         .is_some_and(|t| t > req["frames"].as_u64().or(m["defaults"]["frames"].as_u64()).unwrap_or(33));
     // a long video is a chain, and a chain needs a model that continues from a frame: a text-only model would draw
     // the same clip again and again. Not named: the first downloaded one that can; named: refused plainly.
+    // a starting image ("image", "input_reference" or "image_url": base64 or a data URL): the clip (or a chain's first
+    // clip) starts from it, on a model that takes a source image
+    let start = match starting_image(&req) {
+        Ok(x) => x,
+        Err(e) => return bad(e),
+    };
+    let takes_image = |x: &Value| x["continues"] != false && !x["family"].as_str().unwrap_or("").starts_with("ltx-video");
+    if start.is_some() && m["kind"] == "video" && !takes_image(&m) {
+        let other = list["models"].as_array().and_then(|a| a.iter()
+            .find(|x| x["kind"] == "video" && takes_image(x) && x["downloaded"] == true).cloned());
+        match (req["model"].as_str().is_some_and(|n| n.contains(':')), other) {
+            (false, Some(o)) => {
+                model = o["name"].as_str().unwrap_or_default().to_string();
+                m = o;
+            }
+            _ => return bad(format!("{model} cannot start a video from an image: use a model that takes one (Wan 2.2 TI2V 5B), \
+                                     or leave the image out")),
+        }
+    }
     if long && m["kind"] == "video" && m["continues"] == false {
         let other = list["models"].as_array().and_then(|a| a.iter()
             .find(|x| x["kind"] == "video" && x["continues"] != false && x["downloaded"] == true).cloned());
@@ -753,6 +865,10 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance, "seed": seed,
                    "batch_size": 1, "frames": frames, "fps": fps, "output_format": format});
+    let mut r = r;
+    if let Some(b) = &start {
+        r["source_image"] = json!(b);
+    }
     // longer than one clip: a chain of clips. The carry between clips is the family's: Wan continues from the last
     // frame alone (mold's WAN_HANDOFF_DUPLICATED_FRAMES), LTX from a 17-frame motion tail
     let tail = if m["family"].as_str().unwrap_or("").starts_with("wan") { 1 } else { 17 };
@@ -763,6 +879,9 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             let mut c = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
                                "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
                                "motion_tail_frames": tail});
+            if let Some(b) = &start {
+                c["source_image"] = json!(b);
+            }
             // Wan chains: "overlap_frames" (crossfaded frames at each join, default 8) and "hold_colour" (default on)
             if let Some(o) = req["overlap_frames"].as_u64() {
                 c["overlap_frames"] = json!(o.min(32));

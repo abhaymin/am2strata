@@ -42,6 +42,11 @@ fn main() {
                     emit(serde_json::json!({"event": "error", "message": "mock failure"}));
                     continue;
                 }
+                // "OOM" in the prompt: the graphics card runs out of memory unless the VAE decodes on the CPU
+                if r["prompt"].as_str().unwrap_or("").contains("OOM") && r["placement"]["advanced"]["vae"]["kind"] != "cpu" {
+                    emit(serde_json::json!({"event": "error", "message": "DriverError(CUDA_ERROR_OUT_OF_MEMORY)"}));
+                    continue;
+                }
                 let steps = r["steps"].as_u64().unwrap_or(8);
                 for s in 1..=steps {
                     emit(serde_json::json!({"event": "step", "step": s, "total": steps}));

@@ -2872,3 +2872,65 @@ fn cluster_tls_latency() {
     let (t50, t90) = time(&tls_master);
     eprintln!("one short chat through the master: plain HTTP median {p50:.1} ms (p90 {p90:.1}); TLS median {t50:.1} ms (p90 {t90:.1})");
 }
+
+/// A video can start from an image ("image", "input_reference" or "image_url", base64 or a data URL): the clip, or a
+/// chain's first clip, gets it as its source image; a text-only model is refused when named, or swapped when not; a
+/// web address is refused (the server does not fetch it).
+#[test]
+fn a_video_starts_from_an_image() {
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD.encode([0x89u8, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 0]);
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 33, "image": format!("data:image/png;base64,{png}")}));
+    assert_eq!(c, 200, "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let last = |op: &str| rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == op).last().unwrap();
+    assert_eq!(last("generate")["request"]["source_image"], png, "the clip starts from it");
+    // a chain's first clip; OpenAI's shape too
+    let (c, _) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 81, "seconds": 10,
+                                                          "input_reference": {"image_url": format!("data:image/png;base64,{png}")}}));
+    assert_eq!(c, 200);
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == "chain").last().unwrap();
+    assert_eq!(chain["request"]["source_image"], png);
+    // without an image, no source image is sent
+    let (c, _) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 33}));
+    assert_eq!(c, 200);
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let g = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == "generate").last().unwrap();
+    assert!(g["request"].get("source_image").is_none(), "{g}");
+    // a text-only model, named: refused plainly
+    let (c, e) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 33, "model": "wan21-t2v-1.3b:turbo", "image": png}));
+    assert_eq!(c, 400, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("cannot start a video from an image"), "{e}");
+    // a web address, or something that is not an image
+    let (c, e) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "image_url": "https://example.com/a.png"}));
+    assert_eq!(c, 400);
+    assert!(e["error"]["message"].as_str().unwrap().contains("does not fetch"), "{e}");
+    let (c, _) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "image": "aGVsbG8="}));
+    assert_eq!(c, 400);
+}
+
+/// Qwen Image's VAE decode runs out of graphics memory from about a megapixel on a 16 GB card: a big picture decodes on
+/// the CPU from the start, and a smaller one that still runs out is made again with the decode on the CPU, said so in
+/// the answer; an error is logged and told plainly.
+#[test]
+fn a_big_qwen_image_decodes_on_the_cpu() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let rec = |s: &Server| std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap().lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok()).filter(|v| v["op"] == "generate").collect::<Vec<_>>();
+    let m = "chatr-omni-qwen-image-2.1:q8";
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "1024x1024", "model": m}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(rec(&s).last().unwrap()["request"]["placement"]["advanced"]["vae"]["kind"], "cpu", "a megapixel decodes on the CPU");
+    let (c, _) = s.post("/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "model": m}));
+    assert_eq!(c, 200);
+    assert_ne!(rec(&s).last().unwrap()["request"]["placement"]["advanced"]["vae"]["kind"], "cpu", "a small one stays on the card");
+    // out of graphics memory below the threshold: made again with the decode on the CPU, and said so
+    let (c, r) = s.post("/v1/images/generations", &json!({"prompt": "OOM lighthouse", "size": "768x768", "model": m}));
+    assert_eq!(c, 200, "{r}");
+    assert!(r["strata"]["notes"][0].as_str().unwrap().contains("ran out of graphics memory"), "{r}");
+    let g = rec(&s);
+    assert_eq!(g[g.len() - 1]["request"]["placement"]["advanced"]["vae"]["kind"], "cpu");
+    assert_ne!(g[g.len() - 2]["request"]["placement"]["advanced"]["vae"]["kind"], "cpu");
+}
