@@ -4,6 +4,8 @@
 //!   brightness and saturation drift that each clip otherwise passes on, compounding.
 //! - **overlapped crossfades:** the next clip starts from the frame `overlap` frames before this clip's end, so the
 //!   two clips cover the same `overlap` frames of time; the stitch crossfades them instead of cutting.
+//! - **a smoothed start frame:** the carried frame is taken to half size and back, so its blocky artefacts are not
+//!   passed on ("smooth_start", default on).
 //!
 //! Only for chains whose clips continue one scene (one prompt): a storyboard's clips may change light on purpose.
 
@@ -71,11 +73,12 @@ pub struct Held<'a, R: ChainStageRenderer + ?Sized> {
     reference: Option<Hist>,
     hold_colour: bool,
     overlap: usize,
+    smooth: bool,
 }
 
 impl<'a, R: ChainStageRenderer + ?Sized> Held<'a, R> {
-    pub fn new(inner: &'a mut R, hold_colour: bool, overlap: usize) -> Self {
-        Held { inner, reference: None, hold_colour, overlap }
+    pub fn new(inner: &'a mut R, hold_colour: bool, overlap: usize, smooth: bool) -> Self {
+        Held { inner, reference: None, hold_colour, overlap, smooth }
     }
 }
 
@@ -98,10 +101,22 @@ impl<R: ChainStageRenderer + ?Sized> ChainStageRenderer for Held<'_, R> {
         // the frame the next clip starts from: `overlap` frames before the end (the last frame when no overlap)
         let n = out.frames.len();
         let k = self.overlap.min(n.saturating_sub(2));
-        let seed = out.frames[n - 1 - k].clone();
+        let mut seed = out.frames[n - 1 - k].clone();
+        if self.smooth {
+            seed = smoothed(&seed);
+        }
         out.tail = ChainTail { frames: 1, tail_rgb_frames: vec![seed] };
         Ok(out)
     }
+}
+
+/// The start frame, smoothed: down to half size and back (a Catmull-Rom filter), which takes off the blocky
+/// high-frequency artefacts a clip passes on and leaves the shapes and colours; the next clip draws the detail again.
+pub fn smoothed(f: &RgbImage) -> RgbImage {
+    use image::imageops::{resize, FilterType};
+    let (w, h) = f.dimensions();
+    let half = resize(f, (w / 2).max(1), (h / 2).max(1), FilterType::Triangle);
+    resize(&half, w, h, FilterType::CatmullRom)
 }
 
 /// The clips as one video: each later clip's first frame (the carried one) is dropped, and its next `overlap` frames
@@ -154,6 +169,17 @@ mod tests {
         let lut = match_lut(&hist(&b), &hist(&a));
         apply(&mut b, &lut);
         assert!((mean(&b) - mean(&a)).abs() < 1.0, "{} vs {}", mean(&b), mean(&a));
+    }
+
+    #[test]
+    fn the_start_frame_keeps_its_size_and_colour_and_loses_its_blocks() {
+        // a 2-pixel checkerboard (a stand-in for block artefacts) on mid grey
+        let f = RgbImage::from_fn(64, 32, |x, y| { let v = if (x / 2 + y / 2) % 2 == 0 { 150 } else { 100 }; image::Rgb([v, v, v]) });
+        let g = smoothed(&f);
+        assert_eq!(g.dimensions(), (64, 32));
+        assert!((mean(&[g.clone()]) - mean(&[f])).abs() < 3.0);
+        let spread = g.pixels().map(|p| (p.0[0] as i32 - 125).abs()).max().unwrap();
+        assert!(spread < 25, "the checkerboard is smoothed: {spread}");
     }
 
     #[test]

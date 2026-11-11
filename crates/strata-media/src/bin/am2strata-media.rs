@@ -399,6 +399,8 @@ fn list(st: &mut State) -> Value {
                    "loaded": st.model.as_deref() == Some(m.name.as_str()),
                    // takes edit images: the first is edited, the rest are references
                    "edits": m.family == "qwen-image21" || m.family.contains("edit") || m.name.contains("edit"),
+                   // a video model that continues from a frame (image to video), so it can make a long video as a chain
+                   "continues": kind == "video" && !(m.family.starts_with("wan") && m.name.contains("t2v") && !m.name.contains("ti2v")),
                    "defaults": {"steps": m.defaults.steps, "guidance": m.defaults.guidance, "width": m.defaults.width,
                                 "height": m.defaults.height, "frames": m.defaults.frames, "fps": m.defaults.fps,
                                 "negative_prompt": m.defaults.negative_prompt}});
@@ -599,6 +601,20 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
             }
         }
     }
+    // a short last clip comes out broken (measured): the last clip is made whole, and the video cut to length after
+    if let (Some(total), true) = (wanted, wan && request.stages.len() > 1) {
+        let (full, last) = (request.stages[0].frames, request.stages.last().map(|s| s.frames).unwrap_or(0));
+        if last < full {
+            let extra = (request.stages.len().saturating_sub(1) * overlap) as u32 + (full - last);
+            let mut r2 = r.clone();
+            r2["total_frames"] = json!(total + extra);
+            let next = parse(&r2)?;
+            if next.stages.len() == request.stages.len() {
+                request = next;
+            }
+        }
+    }
+    let smooth = wan && req["smooth_start"].as_bool().unwrap_or(true);
     load_placed(st, &model, None)?;
     let engine = st.engine.as_mut().unwrap();
     let t0 = std::time::Instant::now();
@@ -621,10 +637,11 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
         }
     };
     if wan {
-        eprintln!("[media] chain: {stages} clips, colour held: {hold}, overlap: {overlap} frames");
+        eprintln!("[media] chain: {stages} clips ({:?} frames), colour held: {hold}, overlap: {overlap} frames, smoothed start: {smooth}",
+                  request.stages.iter().map(|s| s.frames).collect::<Vec<_>>());
     }
     let out = if wan {
-        let mut held = chain_hold::Held::new(renderer, hold, overlap);
+        let mut held = chain_hold::Held::new(renderer, hold, overlap, smooth);
         mold_inference::chain::ChainOrchestrator::new(&mut held).run(&request, Some(&mut progress))
     } else {
         mold_inference::chain::ChainOrchestrator::new(renderer).run(&request, Some(&mut progress))

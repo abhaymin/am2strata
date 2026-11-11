@@ -680,9 +680,27 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
     };
-    let Some(m) = list["models"].as_array().and_then(|a| a.iter().find(|x| x["name"] == model.as_str()).cloned()) else {
+    let Some(mut m) = list["models"].as_array().and_then(|a| a.iter().find(|x| x["name"] == model.as_str()).cloned()) else {
         return bad(format!("{model} is not in the media catalog"));
     };
+    let mut model = model;
+    let fps0 = req["fps"].as_u64().or(m["defaults"]["fps"].as_u64()).unwrap_or(16).max(1);
+    let long = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps0 as f64).round() as u64))
+        .is_some_and(|t| t > req["frames"].as_u64().or(m["defaults"]["frames"].as_u64()).unwrap_or(33));
+    // a long video is a chain, and a chain needs a model that continues from a frame: a text-only model would draw
+    // the same clip again and again. Not named: the first downloaded one that can; named: refused plainly.
+    if long && m["kind"] == "video" && m["continues"] == false {
+        let other = list["models"].as_array().and_then(|a| a.iter()
+            .find(|x| x["kind"] == "video" && x["continues"] != false && x["downloaded"] == true).cloned());
+        match (req["model"].as_str().is_some_and(|n| n.contains(':')), other) {
+            (false, Some(o)) => {
+                model = o["name"].as_str().unwrap_or_default().to_string();
+                m = o;
+            }
+            _ => return bad(format!("{model} makes video from text only, so it cannot continue a clip into a long video: \
+                                     use a text-and-image-to-video model (Wan 2.2 TI2V 5B, LTX) or one clip")),
+        }
+    }
     if m["kind"] != "video" {
         return bad(format!("{model} is not a video model"));
     }
@@ -739,8 +757,10 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             if let Some(o) = req["overlap_frames"].as_u64() {
                 c["overlap_frames"] = json!(o.min(32));
             }
-            if let Some(h) = req["hold_colour"].as_bool() {
-                c["hold_colour"] = json!(h);
+            for k in ["hold_colour", "smooth_start"] {
+                if let Some(b) = req[k].as_bool() {
+                    c[k] = json!(b);
+                }
             }
             ("chain", c)
         }

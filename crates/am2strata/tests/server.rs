@@ -1495,6 +1495,24 @@ fn speech_models_leave_the_ram_when_it_is_short_and_stay_warm_when_not() {
     }
 }
 
+/// A long video needs a model that continues from a frame: a text-only one is swapped when the request named none,
+/// and refused when it named it; one clip on it is fine.
+#[test]
+fn a_long_video_is_not_made_on_a_text_only_model() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let (c, _) = s.post("/api/media/models/default", &json!({"model": "wan21-t2v-1.3b:turbo"}));
+    assert_eq!(c, 200);
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "seconds": 10}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["strata"]["model"], "wan22-ti2v-5b:q8", "the downloaded model that continues: {r}");
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "seconds": 10, "model": "wan21-t2v-1.3b:turbo"}));
+    assert_eq!(c, 400);
+    assert!(r["error"]["message"].as_str().unwrap().contains("text only"), "{r}");
+    let (c, r) = s.post("/v1/videos/generations", &json!({"prompt": "waves", "frames": 33}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["strata"]["model"], "wan21-t2v-1.3b:turbo");
+}
+
 /// Long video (LONG-MEDIA-PLAN.md): a request longer than one clip is a chain in the engine (mold's chain: clips
 /// continued from the one before, stitched into one video); one clip stays one generate.
 #[test]
