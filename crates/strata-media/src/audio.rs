@@ -118,6 +118,25 @@ pub const VOICES: &[(&str, &str)] = &[
     ("gary", "Gary speaks slowly and deliberately with a deep voice, in a quiet room. The recording is of very high quality, with the speaker's voice sounding clear and very close up."),
 ];
 
+/// Indic Parler's recommended speakers by language, (female, male), from its model card (ai4bharat/indic-parler-tts).
+/// A language with one recommended voice of one gender has None for the other.
+pub const INDIC_SPEAKERS: &[(&str, Option<&str>, Option<&str>)] = &[
+    ("as", Some("Sita"), Some("Amit")), ("bn", Some("Aditi"), Some("Arjun")), ("gu", Some("Neha"), Some("Yash")),
+    ("hi", Some("Divya"), Some("Rohit")), ("kn", Some("Anu"), Some("Suresh")), ("ml", Some("Anjali"), Some("Harish")),
+    ("mr", Some("Sunita"), Some("Sanjay")), ("ne", Some("Amrita"), None), ("or", Some("Debjani"), Some("Manas")),
+    ("ta", Some("Jaya"), None), ("te", Some("Lalitha"), Some("Prakash")), ("en", Some("Mary"), Some("Thoma")),
+];
+
+/// For Indic Parler: a named voice (laura, jon, female, male, ...) becomes the language's recommended speaker of that
+/// voice's gender, in the card's way of describing a speaker. None: keep the voice's own description.
+pub fn indic_description(voice: &str, language: &str) -> Option<String> {
+    let gender = VOICE_GENDER.iter().find(|g| g.0 == voice.to_lowercase())?.1;
+    let row = INDIC_SPEAKERS.iter().find(|r| r.0 == language)?;
+    let name = if gender == "female" { row.1 } else { row.2 }?;
+    Some(format!("{name}'s voice is calm and clear, speaking at a moderate pace with a natural pitch. The recording is of very high \
+                  quality, with the speaker's voice sounding clear and very close up, with almost no background noise."))
+}
+
 /// Chatterbox Multilingual's languages whose text preparation this engine has: its 23 less Chinese (Cangjie codes with
 /// a word segmenter), Japanese (kana from kanji) and Hebrew (vowel points), which need models of their own first.
 pub const CHATTERBOX_LANGUAGES: &[(&str, &str)] = &[
@@ -1042,6 +1061,15 @@ mod tests {
         assert_eq!(number_words(0), "zero");
         assert_eq!(number_words(100_000_000_105), "one hundred billion one hundred five");
         assert_eq!(spoken("GPT4 and H100 stay"), "GPT4 and H100 stay");
+    }
+
+    #[test]
+    fn indic_parler_gets_the_languages_own_speaker() {
+        assert!(indic_description("laura", "ml").unwrap().starts_with("Anjali's voice"));
+        assert!(indic_description("jon", "ml").unwrap().starts_with("Harish's voice"));
+        assert!(indic_description("male", "hi").unwrap().starts_with("Rohit's"));
+        assert!(indic_description("gary", "ta").is_none(), "Tamil has no recommended male voice: the description stays");
+        assert!(indic_description("A deep voice", "ml").is_none(), "a description of one's own is kept");
     }
 
     #[test]

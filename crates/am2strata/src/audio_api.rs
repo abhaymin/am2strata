@@ -387,6 +387,9 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         }
     } else if req["voice_audio"].is_string() {
         return bad(format!("voice_audio: {model} does not clone a voice; Chatterbox does"));
+    } else if m["languages"].is_array() {
+        // a multilingual Parler (Indic Parler: its named speaker for the language and the voice's gender)
+        cmd["language"] = json!(language);
     }
     let (r, device, row) = match job(&s, "text-to-speech", &model, m["size_gb"].as_f64().unwrap_or(3.5), cmd, |_| {}).await {
         Ok(x) => x,

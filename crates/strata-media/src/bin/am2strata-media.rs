@@ -145,7 +145,8 @@ fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
     }
     let text = cmd["text"].as_str().filter(|t| !t.trim().is_empty()).ok_or_else(|| anyhow!("no text to speak"))?;
     let voice = cmd["voice"].as_str().unwrap_or("laura");
-    let description = audio::VOICES.iter().find(|v| v.0 == voice.to_lowercase()).map(|v| v.1.to_string())
+    let indic = name.contains("indic").then(|| audio::indic_description(voice, cmd["language"].as_str().unwrap_or("hi"))).flatten();
+    let description = indic.or_else(|| audio::VOICES.iter().find(|v| v.0 == voice.to_lowercase()).map(|v| v.1.to_string()))
         .unwrap_or_else(|| voice.to_string());
     let t0 = std::time::Instant::now();
     let (pcm, rate) = st.parler.as_mut().unwrap().speak(text, &description, cmd["seed"].as_u64().unwrap_or(0),
