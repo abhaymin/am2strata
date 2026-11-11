@@ -2307,7 +2307,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ Settings: sections
 let section = store.get("settings-section", "models");
 function showSection(name) {
-  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients"].includes(name) ? name : "models";
+  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients", "cluster"].includes(name) ? name : "models";
   store.set("settings-section", section);
   for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
   for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
@@ -2319,6 +2319,7 @@ function showSection(name) {
   if (section === "server") loadSystem();
   if (section === "connect") { renderAppSetup(); renderAgents(); }
   if (section === "clients") loadClients();
+  if (section === "cluster") loadCluster();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
@@ -2337,6 +2338,25 @@ async function loadClients() {
     if (j.default) rows.unshift(row(j.default, true));
     $("clients-list").innerHTML = rows.join("") || '<p class="muted">No client profiles yet: add one in the run config (below).</p>';
   } catch (e) { $("clients-list").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
+}
+
+// Settings › Cluster: the workers (GET api/cluster), seen every few seconds while the section is open
+let clusterTimer = null;
+async function loadCluster() {
+  clearTimeout(clusterTimer);
+  try {
+    const r = await fetch("api/cluster", {headers: headers()});
+    if (!r.ok) throw new Error(r.status === 401 ? "An API key is needed (Settings › Server and access › API key)." : `HTTP ${r.status}`);
+    const j = await r.json();
+    $("cluster-list").innerHTML = (j.workers || []).map((w) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(w.name)}</strong>` +
+      `<span class="st-badge ${w.ready ? "st-badge--generating" : ""}">${w.ready ? "Answering" : "Not answering"}</span>` +
+      `<span class="muted small">${esc(w.url)} · ${w.loaded ? `${esc(w.loaded)} loaded` : "no model loaded"} · ${fmt(w.waiting || 0)} waiting` +
+      ` · ${fmt(w.requests_routed || 0)} requests taken${w.seen_s_ago != null ? ` · seen ${fmt(w.seen_s_ago)} s ago` : ""}</span></div>` +
+      (w.error ? `<div class="msg-error">${esc(w.error)}</div>` : "") +
+      `<div class="mcp-server__tools">${(w.models || []).map((m) => `<span class="chip">${esc(m)}</span>`).join("") || '<span class="muted small">no models</span>'}</div></div>`).join("")
+      || '<p class="muted">No workers: this is a single machine. Add one in the run config (below).</p>';
+    if (!$("sec-cluster").hidden && (j.workers || []).length) clusterTimer = setTimeout(loadCluster, 5000);
+  } catch (e) { $("cluster-list").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
 }
 
 // Settings › Chat defaults: the same settings as the drawer (this browser), optionally shared with other apps
