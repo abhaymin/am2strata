@@ -489,6 +489,7 @@ async fn main() -> Result<()> {
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))
+        .route("/v1/media/jobs/{id}/captions.srt", get(media_jobs::captions))
         .route("/api/models/updates", get(hub_api::updates))
         .route("/api/models/update", post(hub_api::update))
         .route("/api/requests", get(api_monitor::requests))

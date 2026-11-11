@@ -713,7 +713,58 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
             let _ = std::fs::remove_file(d.join(format!("{id}.part-{i}.wav")));
         }
     }
-    Ok(("audio/wav".into(), crate::production::wav(&joined), json!({"chapters": marks, "parts": total, "seconds_of_audio": secs})))
+    // ready for YouTube: the chapters in the description's form, and captions from the finished audio (Whisper,
+    // "captions": false to skip), so the video is found by its words (SEO-PLAN)
+    let mut meta = json!({"chapters": marks, "parts": total, "seconds_of_audio": secs});
+    let pairs: Vec<(String, f64)> = chapters.iter().cloned().zip(starts.iter().copied()).collect();
+    match crate::production::youtube_chapters(&pairs, secs) {
+        Ok(t) => meta["youtube_chapters"] = json!(t),
+        Err(why) => meta["youtube_chapters_note"] = json!(why),
+    }
+    if plan["captions"] != false {
+        s.media_jobs.set_meta(n, json!({"part": total, "parts": total, "now": "captions"}));
+        let wav = crate::production::mono_16k_wav(&joined);
+        // the chosen speech-to-text model, or another one that is downloaded
+        let chosen = s.media.stt_model();
+        let stt = match s.media.list().await {
+            Ok(l) => {
+                let all: Vec<Value> = l["models"].as_array().cloned().unwrap_or_default().into_iter()
+                    .filter(|m| m["task"] == "stt" && m["downloaded"] == true).collect();
+                all.iter().find(|m| m["name"] == chosen.as_str()).or(all.first()).and_then(|m| m["name"].as_str().map(str::to_string))
+            }
+            Err(_) => None,
+        }.unwrap_or(chosen);
+        let body = json!({"file": format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(&wav)),
+                          "response_format": "srt", "model": stt, "language": plan["language"].as_str().filter(|l| *l != "auto")});
+        let mut req = axum::http::Request::builder().method("POST").uri("/v1/audio/transcriptions")
+            .header(header::CONTENT_TYPE, "application/json");
+        for (k, v) in own_key(s).iter() {
+            req = req.header(k, v);
+        }
+        let r = crate::audio_api::transcriptions(State(s.clone()), own_key(s), req.body(Body::from(body.to_string())).unwrap()).await;
+        let ok = r.status().is_success();
+        let text = axum::body::to_bytes(r.into_body(), 64 << 20).await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        if ok {
+            meta["captions_srt"] = json!(text);
+            meta["captions_url"] = json!(format!("/v1/media/jobs/{id}/captions.srt"));
+        } else {
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            meta["captions_note"] = json!(format!("no captions: {}", v["error"]["message"].as_str().unwrap_or(&text)));
+        }
+    }
+    Ok(("audio/wav".into(), crate::production::wav(&joined), meta))
+}
+
+/// GET /v1/media/jobs/{id}/captions.srt: a finished production's captions, to upload beside its video.
+pub async fn captions(State(s): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+    if !crate::api_authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let id = id.trim_end_matches(".srt").to_string();
+    match s.media_jobs.status(&id).and_then(|v| v["meta"]["captions_srt"].as_str().map(str::to_string)) {
+        Some(t) => ([(header::CONTENT_TYPE, "application/x-subrip"), (header::CONTENT_DISPOSITION, "attachment")], t).into_response(),
+        None => error(StatusCode::NOT_FOUND, "not_found", format!("media job {id} has no captions")),
+    }
 }
 
 /// POST /v1/media/productions {"name", "parts": [...], "crossfade_s"}: one job for the whole piece (GET /api/jobs/{id}

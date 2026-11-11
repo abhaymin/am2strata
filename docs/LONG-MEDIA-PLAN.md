@@ -83,6 +83,18 @@ not yet good enough to promise.**
   checkpoint chains as independent clips. The longest is 10 minutes at 24 fps.
 - **Tested:** `a_long_video_is_made_as_a_chain_of_clips` on the mock, and `a_video_is_refused_when_the_pc_lacks_its_memory`.
 
+### Ready for YouTube (2026-11-11)
+
+A finished production's meta now also has:
+- **`youtube_chapters`:** the chapters as YouTube reads them from a description ("0:00 Intro" lines), or
+  `youtube_chapters_note` saying why YouTube would not show them. YouTube needs at least 3 chapters, the first at
+  0:00, each 10 s or longer.
+- **`captions_srt`:** captions transcribed from the finished audio by Whisper. It uses the chosen speech-to-text
+  model, or another downloaded one. Set `"captions": false` to skip them, and `"language"` to fix the language.
+  The captions are also at `GET /v1/media/jobs/{id}/captions.srt`, ready to upload beside the video. Uploaded
+  captions make a video findable by its words.
+- Tested in `a_production_makes_its_parts_in_order_and_joins_them`.
+
 ### Measured (2026-11-11, Wan 2.2 TI2V 5B Q8, one RTX 5060 Ti 16 GB, through the live API)
 
 | Run | Result |

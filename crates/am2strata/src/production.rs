@@ -181,6 +181,51 @@ pub fn wav(s: &[f32]) -> Vec<u8> {
     o
 }
 
+/// The chapters as YouTube reads them from a description: "0:00 Title" lines. YouTube shows them only when the first
+/// is at 0:00, there are at least 3, and each lasts 10 s or more; None (with why) otherwise.
+pub fn youtube_chapters(marks: &[(String, f64)], total_s: f64) -> Result<String, String> {
+    if marks.len() < 3 {
+        return Err(format!("{} parts: YouTube shows chapters from 3", marks.len()));
+    }
+    let stamp = |t: f64| {
+        let t = t.max(0.0).floor() as u64;
+        if t >= 3600 { format!("{}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60) } else { format!("{}:{:02}", t / 60, t % 60) }
+    };
+    let mut out = Vec::new();
+    for (i, (title, at)) in marks.iter().enumerate() {
+        let at = if i == 0 { 0.0 } else { *at };
+        let end = marks.get(i + 1).map(|m| m.1).unwrap_or(total_s);
+        if end - at < 10.0 {
+            return Err(format!("chapter {} (\"{title}\") lasts {:.0} s: YouTube needs 10 s or more each", i + 1, end - at));
+        }
+        out.push(format!("{} {title}", stamp(at)));
+    }
+    Ok(out.join("\n"))
+}
+
+/// The joined 48 kHz stereo audio as a 16 kHz mono WAV, for Whisper (a third of the samples, averaged).
+pub fn mono_16k_wav(stereo_48k: &[f32]) -> Vec<u8> {
+    let mono: Vec<f32> = stereo_48k.chunks(6).map(|c| c.iter().sum::<f32>() / c.len() as f32).collect();
+    let mut b = Vec::with_capacity(44 + mono.len() * 2);
+    let data = (mono.len() * 2) as u32;
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    b.extend_from_slice(&16u32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&16000u32.to_le_bytes());
+    b.extend_from_slice(&32000u32.to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&data.to_le_bytes());
+    for x in mono {
+        b.extend_from_slice(&((x.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes());
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +253,19 @@ mod tests {
             w.extend_from_slice(&((x * 32767.0) as i16).to_le_bytes());
         }
         w
+    }
+
+    #[test]
+    fn chapters_are_written_as_youtube_reads_them() {
+        let m = |v: &[(&str, f64)]| v.iter().map(|(t, a)| (t.to_string(), *a)).collect::<Vec<_>>();
+        assert_eq!(youtube_chapters(&m(&[("Intro", 0.4), ("The song", 62.0), ("Outro", 3700.0)]), 3800.0).unwrap(),
+                   "0:00 Intro\n1:02 The song\n1:01:40 Outro");
+        assert!(youtube_chapters(&m(&[("a", 0.0), ("b", 20.0)]), 60.0).is_err(), "fewer than 3");
+        assert!(youtube_chapters(&m(&[("a", 0.0), ("b", 20.0), ("c", 25.0)]), 60.0).unwrap_err().contains("10 s"));
+        // the mono copy for Whisper: a third of the frames, a valid WAV
+        let w = mono_16k_wav(&vec![0.5f32; 48000 * 2]);
+        let (rate, ch, samples) = read_wav(&w).unwrap();
+        assert_eq!((rate, ch, samples.len()), (16000, 1, 16000));
     }
 
     #[test]

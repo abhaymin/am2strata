@@ -1697,6 +1697,12 @@ fn a_production_makes_its_parts_in_order_and_joins_them() {
     let ch = done["meta"]["chapters"].as_array().unwrap();
     assert_eq!(ch.len(), 3);
     assert!(ch[0]["title"].as_str().unwrap().contains("Welcome") && ch[1]["title"].as_str().unwrap().contains("Song: Lights"), "{ch:?}");
+    // ready for YouTube: the chapters in the description's form (or why not), and captions from the finished audio
+    assert!(done["meta"]["youtube_chapters"].is_string() || done["meta"]["youtube_chapters_note"].is_string(), "{done}");
+    assert!(done["meta"]["captions_srt"].as_str().is_some_and(|t| t.contains("-->")), "{done}");
+    let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/{id}/captions.srt", s.base)).bearer_auth(KEY).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert!(r.text().unwrap().starts_with("1\n"));
     let r = reqwest::blocking::Client::new().get(format!("{}/v1/media/jobs/{id}/content", s.base)).bearer_auth(KEY).send().unwrap();
     let b = r.bytes().unwrap();
     assert_eq!(&b[0..4], b"RIFF");
