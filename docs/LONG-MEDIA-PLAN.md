@@ -104,17 +104,43 @@ UMT5 on the CPU (F32, about 22.7 GB), the service reached 34.9 GB, and the kerne
 video job needs 24 GB free or is refused plainly; mold's own messages (UMT5 on GPU or CPU, stage times) are in the
 service log; the Wan carry is one frame, not LTX's 17.
 
+### Colour hold and crossfaded joins (2026-11-11, built and measured)
+
+`crates/strata-media/src/chain_hold.rs` wraps mold's Wan stage renderer:
+- **The colour hold:** each later clip's histogram is matched to clip 1's (one lookup table a clip) before its frame
+  starts the next clip. It is on when every clip has the same prompt (`"hold_colour"` turns it off or on).
+- **The overlap:** the next clip starts `overlap_frames` (default 8) before the end of the one before, so both clips
+  draw those frames, and the stitch crossfades them instead of cutting. mold is asked for enough more frames that the
+  video keeps its length.
+- **Monitor:** Wan's stage renderer does not pass on its denoise steps, so the chain takes them from the engine's own
+  events, and Monitor shows "step N of M" for a chain.
+
+The same 30 s request (Wan 2.2 5B Q8, 640×352, 20 steps, 24 fps, seed 7; frame difference on the full grey frame), before
+and after:
+
+| | Before | Colour hold + 8-frame crossfades |
+|---|---|---|
+| Time | 1,654 s, 6 clips, 721 frames | 1,717 s, 7 clips, 720 frames |
+| The joins (largest difference around each, against just before) | 30, 25, 38, 47, 54 (11-20 before) | 15, 16, 13, 17, 21, 22 (8-11 before) |
+| Colour drift from clip 1 (mean of R, G, B), clips 2 to 6 | 6.0, 8.0, 10.5, 13.3, 15.3 | 1.7, 1.6, 1.4, 1.5, 2.0 (5.6 in the short last clip) |
+| Saturation change by clip 6 | -26.6 | -2.6 |
+
+**What the numbers do not show:** the colour now holds and the jumps are halved, but **the detail still degrades from
+clip to clip.** From clip 3 the sky breaks into horizontal blocks and the rocks are posterised, and the last clip is
+broken. A crossfade between two clips that moved apart also shows both at once (a see-through lighthouse) for its 8
+frames. The carried frame passes the artefacts on, and a histogram cannot remove them. **Long video is still not
+offered as good.**
+
 ### Next, before long video is offered
 
-1. **Colour and brightness held to the first clip:** match each clip's histogram to clip 1 before it is used as the
-   next clip's start frame and before the stitch. Cheap, on the CPU, and it attacks the drift where it starts.
-2. **Crossfaded seams:** a fade of a few frames at each seam (mold's `TransitionMode` and `fade_frames`), instead of
-   a cut.
-3. **The model's own size, 1280×704:** measure one clip's time there (expected several times the 640×352 time).
-4. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
+1. **A cleaner start frame:** re-draw the carried frame lightly (image to image at low strength, or upscale and
+   downscale) before it starts the next clip, so the artefacts are not passed on.
+2. **The model's own size, 1280×704:** measure one clip's time there (expected several times the 640×352 time). At
+   640×352 the model is outside what it was trained on, which makes the artefacts.
+3. **An anchor:** clips k > 1 conditioned on the first clip's opening frame as well as the last frame, if mold's Wan
    inpaint takes two anchors (`WanImageAnchors`); otherwise a storyboard of independent clips with crossfades.
-5. Measure again on the same prompt and seed: the seam numbers, and the drift (the difference of each clip's mean
-   colour from clip 1's).
+4. **A short last clip:** fold the remainder into the clip before it, so no clip is only a few frames long.
+5. Measure again on the same prompt and seed (`docs/` keeps these numbers).
 
 - The model: Wan 2.2 TI2V 5B (text and image to video, 1280×704 or 704×1280 at 24 fps, about 5 s a segment) in mold.
   Wan 2.1 1.3B makes text-to-video only, so it can make the first segment but not continue one.
