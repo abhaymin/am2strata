@@ -11,6 +11,9 @@
 //!   `"browser": {"auto_approve": true}`.
 //! - **What the model sees:** after each step the page's address, title and the start of its text, and a screenshot
 //!   when the model reads pictures.
+//! - **Upload a file:** `browser_upload` gives a page's `<input type=file>` a file from one folder set in
+//!   `"browser": {"upload_dir": <a folder>}` (off by default, so the tool stays hidden until then); only an existing
+//!   file inside that folder is given — symlinks and ".." are resolved, and anything outside it is refused.
 
 use base64::Engine as _;
 use chromiumoxide::cdp::browser_protocol::fetch;
@@ -22,11 +25,11 @@ use chromiumoxide::{Browser, Page};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-pub const TOOL_NAMES: [&str; 6] = ["browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back", "browser_read"];
+pub const TOOL_NAMES: [&str; 7] = ["browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back", "browser_read", "browser_upload"];
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
@@ -46,6 +49,10 @@ pub struct Settings {
     pub connect: Option<String>,
     pub auto_approve: bool,
     pub private_urls: bool,
+    /// the one folder `browser_upload` takes files from (`"browser": {"upload_dir": <a folder>}`, no default): until it
+    /// is set the tool stays hidden and a call is refused; only an existing file inside it (symlinks and ".." resolved)
+    /// is given, so the model can point at a path without reaching into the rest of this PC
+    pub upload_dir: Option<PathBuf>,
     /// the most one step may take (`"browser": {"step_timeout_s": N}`, default 45): past it the page's loading is
     /// stopped, and a tab that still does not answer is closed and a fresh one opened
     pub step_timeout: Duration,
@@ -101,8 +108,9 @@ impl Settings {
         let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| find_chrome(data_dir));
         Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
                    auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
-                   private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false),
-                   step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)) }
+                    private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false),
+                    upload_dir: c["upload_dir"].as_str().map(PathBuf::from),
+                    step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)) }
     }
 
     /// Whether a started or attached browser carries the user's own logins (so the tool descriptions, and the risk
@@ -110,6 +118,26 @@ impl Settings {
     fn user_session(&self) -> bool {
         self.connect.is_some()
     }
+}
+
+/// The CSS selector of the file input, from `args["selector"]`, else the first `<input type=file>` on the page.
+fn raw_selector(args: &Value) -> Result<&str, String> {
+    Ok(args["selector"].as_str().unwrap_or("input[type=file]"))
+}
+
+/// Is `path` an existing regular file inside `upload_dir`, after resolving symlinks and ".." ? Ok(path): the file that
+/// gets given to the input; Err(message): refused (so the upload only takes a file of the operator's own folder, not
+/// anything on this PC reached through a symlink or a path that walks out).
+fn upload_file_ok(path: &Path, upload_dir: &Path) -> Result<PathBuf, String> {
+    let canon_path = std::fs::canonicalize(path).map_err(|_| format!("{} does not exist", path.display()))?;
+    let canon_dir = std::fs::canonicalize(upload_dir).map_err(|_| format!("the upload folder {} is not here", upload_dir.display()))?;
+    if !canon_path.starts_with(&canon_dir) {
+        return Err(format!("{} is outside the upload folder {}", canon_path.display(), upload_dir.display()));
+    }
+    if !canon_path.is_file() {
+        return Err(format!("{} is not a file (the upload takes one file)", canon_path.display()));
+    }
+    Ok(canon_path)
 }
 
 struct Tab {
@@ -209,10 +237,10 @@ impl Browsers {
     }
 
     /// `user_session`: the browser carries the user's logins (the `connect` mode), so say so instead of "no logins".
-    pub fn tools(vision: bool, user_session: bool) -> Vec<Value> {
+    pub fn tools(vision: bool, user_session: bool, upload: bool) -> Vec<Value> {
         let shot = if vision { " You get a screenshot of the page after each step." } else { "" };
         let whose = if user_session { "the user's own browser, with their logins" } else { "a browser on the server (no logins of the user's)" };
-        vec![
+        let mut tools = vec![
             json!({"name": "browser_open", "description": format!("Open a web page in {whose}. Returns its title, address and the start of its text.{shot}"),
                    "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}),
             json!({"name": "browser_click", "description": format!("Click on the page: at x, y (pixels of the {WIDTH}x{HEIGHT} screenshot) or on the link or button whose visible text is `text`."),
@@ -227,7 +255,14 @@ impl Browsers {
             json!({"name": "browser_back", "description": "Go back to the previous page.", "parameters": {"type": "object", "properties": {}}}),
             json!({"name": "browser_read", "description": "The whole readable text of the page that is open (up to 20,000 characters), without menus and scripts.",
                    "parameters": {"type": "object", "properties": {}}}),
-        ]
+        ];
+        if upload {
+            // only when an upload folder is set: hidden until then, and a call is refused with the setting named
+            tools.push(json!({"name": "browser_upload",
+                               "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
+                               "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "selector": {"type": "string"}}, "required": ["path"]}}));
+        }
+        tools
     }
 
     async fn ensure(&self) -> Result<(), String> {
@@ -546,6 +581,25 @@ impl Browsers {
                 let _ = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
             }
             "browser_read" => {}
+            "browser_upload" => {
+                let raw = args["path"].as_str().ok_or("give the file path")?;
+                // only a file inside the upload folder: refused (naming the setting) until it is set in the config
+                let dir = self.settings.upload_dir.as_deref().ok_or_else(|| {
+                    "no upload folder is set: put \"browser\": {{\"upload_dir\": <a folder>}} in the config to attach a file".to_string()
+                })?;
+                let path = upload_file_ok(Path::new(raw), dir).map_err(|e| format!("{e}"))?;
+                // set the file on the input through the DevTools protocol, so the page receives it as if chosen (hidden inputs too)
+                let root = page.execute(chromiumoxide::cdp::browser_protocol::dom::GetDocumentParams::default())
+                    .await.map_err(|e| format!("reading the page: {e}"))?;
+                let ids = page.execute(chromiumoxide::cdp::browser_protocol::dom::QuerySelectorAllParams::new(root.result.root.node_id, raw_selector(args)?))
+                    .await.map_err(|e| format!("finding a file input on the page: {e}"))?;
+                let node_id = ids.result.node_ids.into_iter().next()
+                    .ok_or_else(|| "there is no file input here: give its selector with `selector`".to_string())?;
+                // carry only the files and which input (by node id); chromium fills in the fake path itself
+                let mut files = chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams::new(vec![path.to_string_lossy().to_string()]);
+                files.node_id = Some(node_id);
+                page.execute(files).await.map_err(|e| format!("setting the file on the input: {e}"))?;
+            }
             _ => return Err(format!("there is no tool named {name}")),
         }
         let url = page.url().await.ok().flatten().unwrap_or_default();
@@ -622,5 +676,138 @@ pub async fn approve(axum::extract::State(s): axum::extract::State<crate::AppSta
             axum::Json(json!({"id": id, "ok": req["ok"]})).into_response()
         }
         None => crate::error(axum::http::StatusCode::NOT_FOUND, "not_found", "no step waits for this answer (it timed out or ended)"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    /// a unique folder under the system temp dir, so parallel tests do not step on each other
+    fn fresh(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("am2-upload-test-{tag}-{}-{}", std::process::id(), n))
+    }
+
+    fn make_file(p: &Path, contents: &str) {
+        std::fs::write(p, contents).unwrap();
+    }
+
+    fn clean(p: &Path) {
+        let _ = std::fs::remove_dir_all(p);
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// a file inside the folder can be uploaded
+    #[test]
+    fn upload_inside_is_accepted() {
+        let dir = fresh("inside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("clip.mp4");
+        make_file(&f, "video data");
+        assert!(upload_file_ok(&f, &dir).is_ok());
+        clean(&dir);
+    }
+
+    /// a file next to the folder, not inside it, cannot be uploaded
+    #[test]
+    fn upload_outside_is_refused() {
+        let dir = fresh("outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let other = dir.parent().unwrap().join(format!("other-{}", std::process::id()));
+        make_file(&other, "nope");
+        assert!(upload_file_ok(&other, &dir).is_err());
+        clean(&other);
+        clean(&dir);
+    }
+
+    /// reaching a file just above the folder through ".." still walks out of it
+    #[test]
+    fn upload_dotdot_escape_is_refused() {
+        let dir = fresh("dotdot");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let up = dir.parent().unwrap();
+        let name = format!("escape-{}", std::process::id());
+        make_file(&up.join(&name), "x");
+        // the same file, given via sub/../.. : it canonicalizes to above the folder, so it is refused
+        assert!(upload_file_ok(&dir.join("sub/../..").join(&name), &dir).is_err());
+        clean(up);
+        clean(&dir);
+    }
+
+    /// a ".." that stays inside is still accepted (the positive control for the escape above)
+    #[test]
+    fn upload_dotted_inside_is_accepted() {
+        let dir = fresh("dotted");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let f = dir.join("a.mp4");
+        make_file(&f, "x");
+        assert!(upload_file_ok(&dir.join("sub/../a.mp4"), &dir).is_ok());
+        clean(&dir);
+    }
+
+    /// a symlink inside the folder that points at a file outside cannot bring that file in
+    #[cfg(unix)]
+    #[test]
+    fn upload_symlink_outside_is_refused() {
+        let dir = fresh("symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.parent().unwrap().join(format!("secret-{}", std::process::id()));
+        make_file(&outside, "secret");
+        let link = dir.join("link.mp4");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(upload_file_ok(&link, &dir).is_err());
+        clean(&outside);
+        clean(&dir);
+    }
+
+    /// the folder itself (a directory) is not a file, and a file that is not there is refused
+    #[test]
+    fn upload_directory_and_missing_are_refused() {
+        let dir = fresh("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(upload_file_ok(&dir, &dir).is_err(), "a directory is refused");
+        assert!(upload_file_ok(&dir.join("nope.mp4"), &dir).is_err(), "a missing file is refused");
+        clean(&dir);
+    }
+
+    /// with no upload folder set (here: a folder that does not exist), even an existing file is refused
+    #[test]
+    fn upload_without_folder_is_refused() {
+        let dir = fresh("nofolder");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("a.mp4");
+        make_file(&f, "x");
+        // an empty (non-existent) folder stands in for "upload_dir: None": canonicalize fails, so it is refused
+        let empty = fresh("nofolder-empty");
+        assert!(upload_file_ok(&f, &empty).is_err());
+        clean(&dir);
+        clean(&empty);
+    }
+
+    /// the setting parses when present, and is absent otherwise (so the tool stays hidden)
+    #[test]
+    fn settings_upload_folder_parses() {
+        let mut with = BTreeMap::new();
+        with.insert("browser".into(), json!({"upload_dir": "/tmp/uploads"}));
+        assert_eq!(Settings::from_config(&with, std::path::Path::new("/tmp")).upload_dir.as_deref().map(|p| p.to_string_lossy()), Some("/tmp/uploads".into()));
+
+        let mut without = BTreeMap::new();
+        without.insert("browser".into(), json!({"auto_approve": true}));
+        assert!(Settings::from_config(&without, std::path::Path::new("/tmp")).upload_dir.is_none());
+    }
+
+    /// the tool is listed only when an upload folder is set
+    #[test]
+    fn tools_list_upload_only_with_folder() {
+        let with = Browsers::tools(false, false, true);
+        assert!(with.iter().any(|t| t["name"] == "browser_upload"), "offered when a folder is set");
+
+        let without = Browsers::tools(false, false, false);
+        assert!(!without.iter().any(|t| t["name"] == "browser_upload"), "hidden without a folder");
     }
 }

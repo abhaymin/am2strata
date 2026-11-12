@@ -115,7 +115,7 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
         if let Some(b) = s.mgr.browser.get().filter(|b| b.available()) {
             let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
             let own = own_names(prep);
-            let extra: Vec<Value> = crate::browser::Browsers::tools(vision, b.user_session()).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+            let extra: Vec<Value> = crate::browser::Browsers::tools(vision, b.user_session(), b.settings.upload_dir.is_some()).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
             if !extra.is_empty() {
                 add(prep, &mut offered, extra);
             }
