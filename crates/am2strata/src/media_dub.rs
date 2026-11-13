@@ -132,7 +132,7 @@ pub fn trim_silence(x: &[f32]) -> Vec<f32> {
     if x.is_empty() { return Vec::new(); }
     let hop = (SR / 100) as usize;
     let y = &x[..x.len() / hop * hop];
-    let peak = x.iter().cloned().fold(0f32, f32::max).abs();
+    let peak = x.iter().cloned().fold(0f32, |m, s| m.max(s.abs()));
     let thr = if peak > 1e-4 { peak * 10f32.powf(-40.0 / 20.0) } else { 1e-4 };
     let rms: Vec<f32> = y.chunks(hop).map(|c| (c.iter().map(|&s| s * s).sum::<f32>() / c.len() as f32).sqrt()).collect();
     if rms.is_empty() || rms.iter().all(|&r| r <= thr) { return x.to_vec(); }
@@ -619,5 +619,19 @@ mod tests {
         let data = write_wav(&x);
         let p = interior_pause_s(&data).expect("the WAV is read");
         assert!((p - 2.0).abs() < 0.1, "a 2 s interior pause measures ~2 s (got {p})");
+    }
+
+    #[test]
+    fn trim_silence_peaks_on_the_absolute_value_even_when_negative() {
+        // input: near-silence (-0.005) for the first ~8/10 s, then a loud NEGATIVE spike (-1.0). Its true peak magnitude is
+        // 1.0 (the most-negative sample), so the -40 dB threshold clears the early quiet and only the spike survives: if the
+        // peak were the raw max value instead of its absolute value it would be ~-0.005 and that quiet would wrongly remain.
+        let mut x = Vec::new();
+        for _ in 0..8 { x.extend(std::iter::repeat(-0.005f32).take(480)); }   // 7/10 s of near-silence (frames)
+        for _ in 0..2 { x.extend(std::iter::repeat(-1.0f32).take(480)); }      // 2/10 s loud negative peak
+        let kept = trim_silence(&x);
+        assert!(!kept.is_empty(), "keeps the loud end");
+        assert!(kept.iter().map(|&s| s.abs()).fold(0f32, f32::max) > 0.9, "the largest-magnitude (negative) sample survives");
+        assert!(kept.len() < x.len() / 2, "only the loud end remains ({}/{} frames: early quiet is cleared)", kept.len(), x.len());
     }
 }

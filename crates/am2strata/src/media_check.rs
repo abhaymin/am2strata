@@ -25,6 +25,7 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 
 pub const TOOL_NAMES: [&str; 1] = ["check_media"];
@@ -317,6 +318,21 @@ pub fn near_static_run(deltas: &[f64], fps: f64) -> (usize, f64) {
     (frames, frames as f64 / fps.max(0.0001))
 }
 
+/// Parse an ffprobe `r_frame_rate` string (e.g. "30000/1001") into frames-per-second. It is a fraction, so divide the
+/// numerator by the denominator (29.97), never read just the top number; a bare rate like "25" passes through. A
+/// degenerate 0/0 returns None so the caller keeps its own fps instead of dividing by zero.
+pub fn rate_from_r_frame_rate(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Some((num, den)) = s.split_once('/') {
+        let n = num.trim().parse::<f64>().ok()?;
+        let d = den.trim().parse::<f64>().ok()?;
+        if d != 0.0 { Some(n / d) } else { None }
+    } else {
+        let v = s.parse::<f64>().ok()?;
+        if v > 0.0 { Some(v) } else { None }
+    }
+}
+
 /// Decode a video's frames to 160x90 grey raw bytes with ffmpeg; returns the frames and their fps.
 pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<Vec<u8>>, f64), String> {
     if !crate::media::ffmpeg_available() { return Err("this server cannot read video: install ffmpeg (sudo apt install ffmpeg)".into()); }
@@ -328,9 +344,10 @@ pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<
     let mut fps = fps_override.unwrap_or(24.0);
     if let Ok(p) = std::process::Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=r_frame_rate"]).arg(&in_file).output() {
-        if let Some(s) = String::from_utf8_lossy(&p.stdout).trim().to_string().split('/').next() {
-            if let Ok(d) = s.trim().parse::<f64>() { if d > 0.0 { fps = d; } }
-        }
+        // r_frame_rate is a fraction like 30000/1001 (29.97): divide it, not just take the top number. A degenerate
+        // 0/0 refuses here so the caller keeps its override/fallback instead of dividing by zero.
+        let s = String::from_utf8_lossy(&p.stdout).trim().to_string();
+        if let Some(rate) = rate_from_r_frame_rate(s.split('=').last().unwrap_or(&s)) { fps = rate; }
     }
     let cmd = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&in_file)
         .args(["-vf", &format!("format=gray,scale={}:{}", VIDEO_W, VIDEO_H), "-f", "rawvideo", "-"])
@@ -405,17 +422,19 @@ pub fn check(audio: Option<&[u8]>, gray: Option<&[Vec<u8>]>, expected: &str, hea
 
 // --------------------------------------------------------------------------------------------- resolve + HTTP + tool
 
-/// Decode a request's `audio` (base64/data URL, an http(s) URL or a local file) into bytes, when given.
+/// Decode a request's `audio` (base64/data URL, an http(s) URL or a local file) into bytes, when given. An http(s) URL or
+/// a local path goes through the shared loader (local paths only inside the server's allowed folders), exactly like the
+/// other media inputs; anything left is base64 or a data: URL.
 async fn load_audio(req: &Value) -> Result<Option<Vec<u8>>, String> {
-    if let Some(b64) = req["audio"].as_str().filter(|s| !s.is_empty()) {
-        let raw = b64.split_once(";base64,").map(|(_, b)| b).unwrap_or(b64);
-        return Ok(Some(base64::engine::general_purpose::STANDARD.decode(raw.trim()).map_err(|_| "\"audio\": base64 or a data: URL".to_string())?));
+    let Some(src) = req["audio"].as_str().filter(|s| !s.is_empty()) else { return Ok(None) };
+    // an http(s) URL, a file:// URL or a local path (inside the allowed folders) goes through the shared loader like the
+    // other media inputs; a data: URL is handled there too, and anything else is raw base64 decoded below
+    if src.starts_with("http://") || src.starts_with("https://") || src.starts_with('/')
+        || src.starts_with("file://") || Path::new(src).is_file() {
+        return Ok(Some(crate::media::load_source(src).await.map_err(|e| format!("{e:#}"))?));
     }
-    if let Some(src) = req.get("url").or_else(|| req.get("path")).and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        Ok(Some(crate::media::load_source(src).await.map_err(|e| format!("{e:#}"))?))
-    } else {
-        Ok(None)
-    }
+    let raw = src.split_once(";base64,").map(|(_, b)| b).unwrap_or(src);
+    Ok(Some(base64::engine::general_purpose::STANDARD.decode(raw.trim()).map_err(|_| "\"audio\": base64 or a data: URL".to_string())?))
 }
 
 async fn video_source(req: &Value) -> Option<Result<Vec<u8>, String>> {
@@ -662,6 +681,41 @@ mod tests {
         let wav = wav_flat(rate, 1, 16, &tone(220.0, 1.0, rate, 0.8));
         let v = check(Some(&wav), None, "hello world", "", "en", &Opts::default());
         assert!(v["audio"]["words_heard"]["rate"].is_null(), "no transcript -> words_heard null");
+    }
+
+    /// The ffprobe r_frame_rate is a fraction (30000/1001 == 29.97), so it is divided, not just the numerator taken; a bare
+    /// rate passes through and a degenerate 0/0 refuses (None) rather than dividing by zero.
+    #[test]
+    fn r_frame_rate_is_divided_not_truncated_to_the_numerator() {
+        let v = rate_from_r_frame_rate("30000/1001").unwrap();
+        assert!((v - 30000.0 / 1001.0).abs() < 1e-6, "30000/1001 is 29.97 fps, not 30000: {v}");
+        assert_eq!(rate_from_r_frame_rate("25/1"), Some(25.0), "25/1 is a flat 25 fps");
+        assert_eq!(rate_from_r_frame_rate("24"), Some(24.0), "a bare rate passes through");
+        assert_eq!(rate_from_r_frame_rate("0/0"), None, "0/0 is degenerate -> refuse (keep the caller's default)");
+    }
+
+    /// A request's `audio` accepts a raw base64 payload and a data: URL as before, and now also an http(s) URL or a local
+    /// file path — the latter through the shared loader, so local files load only when the server allows them.
+    #[tokio::test]
+    async fn audio_reads_base64_a_data_url_and_an_allowed_local_path() {
+        // raw base64 and a data: URL decode exactly as before
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello");
+        assert_eq!(load_audio(&json!({"audio": b64})).await.unwrap().unwrap(), b"hello", "raw base64 decodes");
+        let data_url = format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(b"world"));
+        assert_eq!(load_audio(&json!({"audio": data_url})).await.unwrap().unwrap(), b"world", "a data: URL decodes");
+
+        // a local file path loads when the server allows local files (the shared loader's policy), like other media inputs;
+        // with the default policy (no allow_local_files) the same path is refused, and without permission it is not misread
+        // as base64 either
+        let dir = std::env::temp_dir().join(format!("strata-load-audio-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("take.wav");
+        std::fs::write(&f, b"on-disk-wav").unwrap();
+        assert!(load_audio(&json!({"audio": f.display().to_string()})).await.is_err(),
+                "a local path outside the allowed folders is refused by the shared loader, not base64-decoded");
+        let _ = crate::media::POLICY.set(crate::media::SourcePolicy { local_files: true, private_urls: false }).ok();
+        assert_eq!(load_audio(&json!({"audio": f.display().to_string()})).await.unwrap().unwrap(), b"on-disk-wav", "the path loads once allowed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
