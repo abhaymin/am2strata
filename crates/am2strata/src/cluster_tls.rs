@@ -278,8 +278,9 @@ mod tests {
         // no certificate at all: refused
         let bare = reqwest::Client::builder().danger_accept_invalid_certs(true).build().unwrap();
         assert!(bare.get(&url).send().await.is_err());
+        // cleanup only: on macOS a folder can already be gone here, which is not what this test is about
         for d in [dw, dm, dx] {
-            std::fs::remove_dir_all(d).unwrap();
+            let _ = std::fs::remove_dir_all(d);
         }
     }
 }
