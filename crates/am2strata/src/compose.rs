@@ -89,6 +89,13 @@ pub fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 // --------------------------------------------------------------------------------------------------------------- ASS
 
+/// A caption or card's text for one ASS line: its lines joined with ASS's own line break (\\N), and braces (which
+/// would start an override block) and backslashes made literal.
+fn ass_text(t: &str) -> String {
+    t.lines().map(str::trim).collect::<Vec<_>>().join("\n")
+        .replace('\\', "\u{29F5}").replace('{', "(").replace('}', ")").replace('\n', "\\N")
+}
+
 /// An Ass time like "0:01:23.45".
 fn ass_time(t: f64) -> String {
     let t = t.max(0.0);
@@ -100,7 +107,7 @@ fn ass_time(t: f64) -> String {
 /// The captions and the title/end cards as an ASS script burned in with libass: the captions centred low (each fading
 /// in and out over a quarter second, like song_video.py), the title at the start and the end card at the end. Empty when
 /// there is nothing to show.
-pub fn ass_script(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<&str>, end: Option<&str>) -> String {
+pub fn ass_script(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<&str>, end: Option<&str>, total: f64) -> String {
     let mut out = format!(
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {}\nPlayResY: {}\n\n[V4+ Styles]\nFormat: Name, Fontname, \
          Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, \
@@ -115,16 +122,14 @@ pub fn ass_script(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<
             continue;
         }
         // each caption fades in and out over a quarter second so it does not snap on its change
-        let t = format!("{{\\fad(250,250)}}{}", text.replace('&', "\\&"));
-        out.push_str(&format!("Dialogue: 0={},{},Cap,,0,0,120,,{}\n", ass_time(*a), ass_time(*b), t));
+        let t = format!("{{\\fad(250,250)}}{}", ass_text(text));
+        out.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,120,,{}\n", ass_time(*a), ass_time(*b), t));
     }
     if let Some(t) = open {
-        let t = t.lines().map(str::trim).collect::<Vec<_>>().join("\n");
-        out.push_str(&format!("Dialogue: 0=0,0:00:09.00,Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", t.replace('&', "\\&")));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time(0.5), ass_time(9.0_f64.min(total)), ass_text(t)));
     }
     if let Some(t) = end {
-        let t = t.lines().map(str::trim).collect::<Vec<_>>().join("\n");
-        out.push_str(&format!("Dialogue: 0=0:00:01.00,9:59:59.00,Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", t.replace('&', "\\&")));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time((total - 10.0).max(0.0)), ass_time(total), ass_text(t)));
     }
     out
 }
@@ -261,12 +266,11 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
             if text.is_empty() || b <= a { None } else { Some((a, b, text)) }
         }).collect::<Vec<_>>()
     }).unwrap_or_default();
-    let ass = ass_script(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str());
-    let subs = dir.join("subs.ass");
-    std::fs::write(&subs, &ass).map_err(|e| format!("could not write the captions: {e}"))?;
-
     // the shots' lengths: their own when given, else spread over the audio (with crossfades)
     let total_s = duration_of(&dir, "audio.wav", &audio).await?;
+    let ass = ass_script(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s);
+    let subs = dir.join("subs.ass");
+    std::fs::write(&subs, &ass).map_err(|e| format!("could not write the captions: {e}"))?;
     let per_shot: Vec<Option<f64>> = shots.iter().map(|sh| sh["seconds"].as_f64()).collect();
     let durations = if per_shot.iter().all(|d| d.is_some()) {
         per_shot.iter().map(|d| d.unwrap_or(5.0)).collect()
@@ -430,13 +434,13 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
         let y = base_y - (row as i32) * 150;
         let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
         // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture
-        draws.push(format!("drawtext=fontfile='{}':text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x99_180A06@0.7:shadowx=3:shadowy=3", drawtext_escape(&font), drawtext_escape(&text)));
+        draws.push(format!("drawtext=fontfile='{}':text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x180A06@0.6:shadowx=3:shadowy=3", drawtext_escape(&font), drawtext_escape(&text)));
     }
     // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
     let _ = run_ffmpeg(&[
         "-y", "-i", image_.display().to_string().as_str(),
         "-vf", &format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},eq=brightness=-0.15,{}", draws.join(",")).as_str(),
-        "-vframes", "1", "-c:v", "mjpeg", "-q:v", "92", out.display().to_string().as_str(),
+        "-vframes", "1", "-c:v", "mjpeg", "-q:v", "3", out.display().to_string().as_str(),
     ]).await?;
 
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the thumbnail: {e}"))?;
@@ -491,7 +495,13 @@ mod tests {
     #[test]
     fn the_captions_are_written_as_ass_for_libass() {
         let captions = vec![(0.5, 2.5, "Hello world".to_string()), (3.0, 5.0, "made by am2Strata".to_string())];
-        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"));
+        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 60.0);
+        // ASS's own line format: "Dialogue: Layer,Start,End,Style,...", so libass shows them (a "0=" was skipped)
+        assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:02.50,Cap,"), "{ass}");
+        assert!(ass.contains("Dialogue: 0,0:00:50.00,0:01:00.00,Ttl,"), "the end card is the last 10 s: {ass}");
+        assert!(!ass.contains("Dialogue: 0="), "{ass}");
+        let two = ass_script(1280, 720, &[(0.0, 1.0, "line one\nline {two}".to_string())], None, None, 5.0);
+        assert!(two.contains("line one\\Nline (two)"), "newlines become \\N and braces cannot start an override: {two}");
         assert!(ass.starts_with("[Script Info]"), "a valid ASS starts with the script header");
         assert!(ass.contains("Style: Cap,DejaVu Sans,"), "the caption style is centred low");
         assert!(ass.contains("0:00:00.50") && ass.contains("0:00:02.50"), "each caption carries its start and end");
