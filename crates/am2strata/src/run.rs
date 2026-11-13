@@ -918,25 +918,36 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                 } else if let (true, None, Some(b)) = (crate::browser::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.browser.get()) {
                     let t0 = std::time::Instant::now();
                     let page_of = conv.clone().unwrap_or_else(|| "chat".to_string());
-                    // a risky step (a password, a form sent) waits for the user's yes in the web app
+                    // a risky step (a password, a form sent, a publishing click, an upload) waits for the user's yes
                     let mut allowed = true;
-                    if let Some(what) = b.risk(&page_of, &c.name, &args).await {
-                        allowed = b.settings.auto_approve;
+                    let mut approved_note = String::new(); // "approved" or "approved (job)", kept in the step result
+                    if let Some(r) = b.risk(&page_of, &c.name, &args).await {
+                        let job = b.settings.approve == crate::browser::ApproveMode::Job;
+                        allowed = b.settings.auto_approve || (job && b.job_allowed(&page_of, &r.site));
                         if !allowed {
+                            let what_prompt = match (job, r.publishing) {
+                                (true, true) => format!("Allow this job to publish on {}?", r.site),
+                                _ => format!("{} on {}", r.what, r.url),
+                            };
                             let (atx, arx) = tokio::sync::oneshot::channel();
                             crate::browser::approvals().lock().unwrap().insert(c.id.clone(), atx);
-                            let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": c.id, "name": c.name, "what": what}))).await;
+                            let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": c.id, "name": c.name, "what": what_prompt}))).await;
                             allowed = tokio::select! {
                                 a = tokio::time::timeout(std::time::Duration::from_secs(180), arx) => matches!(a, Ok(Ok(true))),
                                 _ = tx.closed() => return,
                             };
                             crate::browser::approvals().lock().unwrap().remove(&c.id);
+                            if allowed { b.job_remember(&page_of, &r.site); }
+                        }
+                        if allowed && !b.settings.auto_approve {
+                            approved_note = if job { "approved (job)".into() } else { "approved".into() };
                         }
                         if !allowed {
-                            tracing::info!("browser step refused: {what}");
+                            tracing::info!("browser step refused: {}", r.what);
                         }
                     }
                     let ms = |t0: std::time::Instant| t0.elapsed().as_millis() as u64;
+                    let note = if approved_note.is_empty() { String::new() } else { format!("\n\n({})", approved_note) };
                     if !allowed {
                         json!({"ok": false, "text": "error: the user did not allow this step (or no one answered); ask them, or do something else",
                                "chars": 0, "truncated": false, "ms": ms(t0)})
@@ -950,7 +961,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                                 if let Some(img) = &st.screenshot {
                                     shots.push((c.name.clone(), img.clone()));
                                 }
-                                json!({"ok": true, "chars": st.text.chars().count(), "text": st.text, "truncated": false, "ms": ms(t0),
+                                json!({"ok": true, "chars": (st.text.chars().count() + note.chars().count()),
+                                       "text": format!("{}{}", st.text, note), "truncated": false, "ms": ms(t0),
                                        "image": st.screenshot})
                             }
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
