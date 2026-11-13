@@ -24,8 +24,8 @@
 //!   other tools act on, or closes one (the last one cannot be closed, the job would lose its browser).
 //! - **Select a choice:** `browser_select {selector, value}` sets a page's `<select>` to an option and fires input.
 //! - **Wait:** `browser_wait {for: "text"}` waits until the text is on the page (up to 30 s) before it returns.
-//! - **Downloads:** a page's download goes into one folder set in `"computer": {"download_dir": <a folder>}` (the
-//!   run config's `<data>/browser-downloads`), with the file name sanitised; when `"computer": {"download_ask": true}`
+//! - **Downloads:** refused until you set a folder — `"computer": {"download_dir": <a folder>}`, which no longer defaults to the
+//!   run config's `<data>/browser-downloads` (with nothing set, nothing is saved) — with the file name sanitised; when `"computer": {"download_ask": true}`
 //!   (Strict) each asks first. **Allow/block lists:** `"computer": {"site_allow"/"site_block": [...]}` refuse a page or
 //!   request whose host is in the list (block wins) before it reaches the browser.
 
@@ -241,8 +241,8 @@ pub struct Settings {
     /// is set the tool stays hidden and a call is refused; only an existing file inside it (symlinks and ".." resolved)
     /// is given, so the model can point at a path without reaching into the rest of this PC
     pub upload_dir: Option<PathBuf>,
-    /// where a page's downloads are written (`"computer": {"download_dir": <a folder>}`, the run config's `<data>/browser-downloads`);
-    /// without it a page's download is denied as before — the file name is sanitised and the download asked for (Strict) first
+    /// where a page's downloads go (`"computer": {"download_dir": <a folder>}`); with nothing set, none is saved and a page's download is
+    /// denied as before — the file name is sanitised and the download asked for (Strict) first
     pub download_dir: Option<PathBuf>,
     /// downloads to this folder ask (`true`, Strict's default, when `download_ask` is unset) vs auto-accepted (`false`)
     pub download_ask: bool,
