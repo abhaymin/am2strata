@@ -7,8 +7,14 @@
 //!   addresses only (plus data:, blob:, about:), so not file://, this PC's services or the LAN, unless
 //!   "allow_private_urls".
 //! - **Risky steps wait for you:** typing into a password field, submitting a form (Enter in it, or clicking its
-//!   submit button) ask first; the web app shows Allow / Deny, an API client is refused unless the run config says
-//!   `"browser": {"auto_approve": true}`.
+//!   submit button), and publishing clicks (a link or button whose text or aria-label is publish, post, send, submit,
+//!   upload, save, delete, remove, share, public, schedule, confirm, buy, pay — only whole words on a control) ask
+//!   first; `browser_upload` asks too; the web app shows Allow / Deny, an API client is refused unless the run config
+//!   says `"browser": {"auto_approve": true}`.
+//! - **Allow once per job:** with `"browser": {"approve": "job"}`, the publishing click's first risk of a conversation
+//!   (the job) shows "Allow this job to publish on <site>?", and then later risks on the same site run without asking
+//!   for 30 minutes; `"each"` (the default) asks each time. Each step that ran notes whether it was "approved" or
+//!   "approved (job)".
 //! - **What the model sees:** after each step the page's address, title and the start of its text, and a screenshot
 //!   when the model reads pictures.
 //! - **Upload a file:** `browser_upload` gives a page's `<input type=file>` a file from one folder set in
@@ -39,6 +45,100 @@ const PAGE_CHARS: usize = 20_000;
 /// Pages kept at once (one per conversation); the least recently used closes first, and any after IDLE.
 const PAGES: usize = 3;
 const IDLE: Duration = Duration::from_secs(600);
+/// How long a "job" approval stays good for the same site (the one-time "Allow this job to publish on <site>?").
+const JOB_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// Whether every risky step asks (`"approve": "each"`, the default) or the first one of a conversation allows the rest
+/// of that job on the same site (`"job"`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ApproveMode { Each, Job }
+
+impl ApproveMode {
+    fn parse(s: &str) -> ApproveMode { if s == "job" { ApproveMode::Job } else { ApproveMode::Each } }
+}
+
+/// Words that make a click risky on purpose: it publishes or changes something (the studio's Publish, Send, Save…).
+/// Matched against an element's visible text or aria-label, case-insensitively and only as whole words, so the heading
+/// "Published 3 days ago" does not match "publish" — only a control whose own label is the word is publishing.
+pub fn publisher_keyword(text: &str) -> bool {
+    const KEYS: [&str; 15] = ["publish", "post", "send", "submit", "upload", "save", "delete", "remove",
+                               "share", "public", "make public", "schedule", "confirm", "buy", "pay"];
+    let h = text.to_lowercase();
+    KEYS.iter().any(|k| word_at(&h, k))
+}
+
+/// Does `needle` sit inside `haystack` as a whole word (bounded by the ends or by non-alphanumerics)? For "make public"
+/// the space between is not alnum, so it still anchors on both sides.
+fn word_at(haystack: &str, needle: &str) -> bool {
+    if haystack.len() < needle.len() { return false; }
+    let mut from = 0usize;
+    loop {
+        match haystack[from..].find(needle) {
+            None => return false,
+            Some(rel) => {
+                let i = from + rel;
+                let before = i == 0 || !haystack[i - 1..].chars().next().unwrap().is_ascii_alphanumeric();
+                let end = i + needle.len();
+                let after = end >= haystack.len() || !haystack[end..].chars().next().unwrap().is_ascii_alphanumeric();
+                if before && after { return true; }
+                from = i + 1;
+            }
+        }
+    }
+}
+
+/// The host of a URL (studio.youtube.com), for the "once per job" memory and the prompt.
+pub fn site_of(url: &str) -> String {
+    reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default()
+}
+
+/// The answer to a risky-step check: what it would do, whether it publishes, and the page's site.
+pub struct Risk {
+    /// short description of what it would do ("type into a password field", "submit a form (Sign in)", "click 'Publish'")
+    pub what: String,
+    /// it publishes or changes the site's state (a publishing click or an upload), so a "job" approval covers it
+    pub publishing: bool,
+    /// the host of the page, for the prompt and the once-per-job memory
+    pub site: String,
+    /// the page's full address, for the "… on <url>" of each-step prompts
+    pub url: String,
+}
+
+/// What a `browser_type` step would do (a password field, or Enter in a form) — nothing else is risky. Returns it so
+/// risk() can build the prompt; None means an ordinary step.
+async fn type_risk(page: &Page, sel: &str, enter: bool) -> Option<Risk> {
+    let js = format!(r#"(() => {{ const e = {sel} ? document.querySelector({sel}) : document.activeElement;
+        if (!e) return "";
+        if ((e.type || "").toLowerCase() === "password") return "type into a password field";
+        if ({enter} && e.form) return "press Enter in a form (it may submit it)";
+        return ""; }})()"#, sel = serde_json::to_string(sel).unwrap(), enter = enter);
+    let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.ok()?.ok()?.into_value::<String>().ok()?;
+    if v.is_empty() { None } else { Some(Risk { what: v, publishing: false, site: String::new(), url: String::new() }) }
+}
+
+/// The control a `browser_click` would hit (the element itself when it is a link/button/control, else its nearest one),
+/// returning its button text or aria-label and whether it submits a form. A heading or plain element gives back empty, so
+/// only real controls are inspected — never a piece of text in the middle of the page.
+async fn click_parts(page: &Page, args: &Value) -> Option<(String /*label*/, String /*aria*/, bool /*submit*/)> {
+    let at = match (args["x"].as_f64(), args["y"].as_f64()) {
+        (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
+        _ => format!("[...document.querySelectorAll('a,button,input[type=submit],[role=button]')].find(e => (e.innerText || e.value || '').trim() === {})",
+                     serde_json::to_string(args["text"].as_str().unwrap_or("")).unwrap()),
+    };
+    let js = format!(r#"(() => {{ const e = {at}; if (!e) return JSON.stringify({{}});
+        // the clickable control: this element if it is one, else its nearest button/link/[role=button]
+        const b = (e.matches('a,button,input[type=submit],[role=button],input')) ? e : e.closest('a,button,input[type=submit],[role=button]');
+        if (!b) return JSON.stringify({{}});
+        const label = ((b.innerText || '') + (b.value != null ? b.value : '')).trim().slice(0, 60);
+        const aria = (b.getAttribute('aria-label') || '').trim();
+        const t = (b.getAttribute('type') || (b.tagName === 'A' ? '' : b.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();
+        return JSON.stringify({{ label: label, aria: aria, submit: !!b.form && t === 'submit' }}); }})()"#, at = at);
+    let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.ok()?.ok()?.into_value::<Value>().ok()?;
+    let label = v["label"].as_str().unwrap_or("").to_string();
+    let aria = v["aria"].as_str().unwrap_or("").to_string();
+    let submit = v["submit"].as_bool().unwrap_or(false);
+    Some((label, aria, submit))
+}
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -48,6 +148,8 @@ pub struct Settings {
     /// nor closes it. The user launches it themselves: `chrome --remote-debugging-port=9222 --user-data-dir=<a folder>`.
     pub connect: Option<String>,
     pub auto_approve: bool,
+    /// every risky step asks (`Each`, the default) or the first risk of a conversation allows the rest on the same site (`Job`)
+    pub approve: ApproveMode,
     pub private_urls: bool,
     /// the one folder `browser_upload` takes files from (`"browser": {"upload_dir": <a folder>}`, no default): until it
     /// is set the tool stays hidden and a call is refused; only an existing file inside it (symlinks and ".." resolved)
@@ -108,6 +210,7 @@ impl Settings {
         let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| find_chrome(data_dir));
         Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
                    auto_approve: c["auto_approve"].as_bool().unwrap_or(false),
+                   approve: c["approve"].as_str().map(str::to_lowercase).map(|s| ApproveMode::parse(&s)).unwrap_or(ApproveMode::Each),
                     private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false),
                     upload_dir: c["upload_dir"].as_str().map(PathBuf::from),
                     step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)) }
@@ -143,6 +246,30 @@ fn upload_file_ok(path: &Path, upload_dir: &Path) -> Result<PathBuf, String> {
 struct Tab {
     page: Page,
     used: Instant,
+}
+
+/// Risky steps allowed once per conversation (the "job"): which (conversation, site) are allowed and until when.
+#[derive(Default)]
+struct JobMemory {
+    // key is "conv\u{1}host"; the value is when this approval stops being good (30 minutes after it was given)
+    grants: HashMap<String, Instant>,
+}
+
+impl JobMemory {
+    fn key(conv: &str, host: &str) -> String { format!("{conv}\u{1}{host}") }
+
+    /// Was this conversation+site allowed already and still within the window? `now` is passed in so it stays a pure
+    /// check (and testable without waiting).
+    fn allowed(&self, conv: &str, host: &str, now: Instant) -> bool {
+        self.grants.get(&Self::key(conv, host)).map_or(false, |until| now < *until)
+    }
+
+    /// Remember an approval of this conversation+site, good for the window (unless it was already still active).
+    fn remember(&mut self, conv: &str, host: &str, now: Instant, window: Duration) {
+        if !self.allowed(conv, host, now) {
+            self.grants.insert(Self::key(conv, host), now + window);
+        }
+    }
 }
 
 /// Chrome is started from this one thread, which lives as long as the server: a child's parent-death signal fires
@@ -186,6 +313,8 @@ pub struct Browsers {
     /// per conversation: the last step (its name and arguments), the page it left, and how many times in a row it
     /// was asked on that same page (the repeat guard)
     last: std::sync::Mutex<HashMap<String, (String, u64, usize)>>,
+    /// per conversation+site: one-time "allow this job to publish" grants (the job memory)
+    jobs: std::sync::Mutex<JobMemory>,
 }
 
 /// The same step asked this many times in a row on a page it did not change is not run again.
@@ -224,7 +353,17 @@ fn allowed_host(url: &str, private: bool) -> futures::future::BoxFuture<'static,
 
 impl Browsers {
     pub fn new(settings: Settings) -> Browsers {
-        Browsers { settings, run: Mutex::new(None), last: std::sync::Mutex::new(HashMap::new()) }
+        Browsers { settings, run: Mutex::new(None), last: std::sync::Mutex::new(HashMap::new()), jobs: std::sync::Mutex::new(JobMemory::default()) }
+    }
+
+    /// This conversation+site is allowed to keep going (the one-time "allow this job to publish").
+    pub fn job_allowed(&self, conv: &str, host: &str) -> bool {
+        self.jobs.lock().unwrap().allowed(conv, host, Instant::now())
+    }
+
+    /// Record that this conversation+site is allowed for the window.
+    pub fn job_remember(&self, conv: &str, host: &str) {
+        self.jobs.lock().unwrap().remember(conv, host, Instant::now(), JOB_WINDOW);
     }
 
     pub fn available(&self) -> bool {
@@ -388,40 +527,38 @@ impl Browsers {
         Ok(page)
     }
 
-    /// A step that needs the user's yes first, with what it would do; None for an ordinary step.
-    pub async fn risk(&self, conv: &str, name: &str, args: &Value) -> Option<String> {
-        if !matches!(name, "browser_type" | "browser_click") {
-            return None;
-        }
+    /// A risky step (password, form sent, publishing click, upload) with what it would do; None for an ordinary step.
+    pub async fn risk(&self, conv: &str, name: &str, args: &Value) -> Option<Risk> {
         let page = self.page(conv).await.ok()?;
-        let js = match name {
+        let (what, publishing) = match name {
             "browser_type" => {
-                let sel = args["selector"].as_str().map(|s| serde_json::to_string(s).unwrap()).unwrap_or("null".into());
-                format!(r#"(() => {{ const e = {sel} ? document.querySelector({sel}) : document.activeElement;
-                    if (!e) return "";
-                    if ((e.type || "").toLowerCase() === "password") return "type into a password field";
-                    if ({enter} && e.form) return "press Enter in a form (it may submit it)";
-                    return ""; }})()"#, enter = args["enter"].as_bool().unwrap_or(false))
+                let sel = args["selector"].as_str().unwrap_or("");
+                let r = type_risk(&page, sel, args["enter"].as_bool().unwrap_or(false)).await?;
+                (r.what, r.publishing)
             }
-            _ => {
-                let at = match (args["x"].as_f64(), args["y"].as_f64()) {
-                    (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
-                    _ => format!("[...document.querySelectorAll('a,button,input[type=submit],[role=button]')].find(e => (e.innerText || e.value || '').trim() === {})",
-                                 serde_json::to_string(args["text"].as_str().unwrap_or("")).unwrap()),
+            "browser_click" => {
+                let (label, aria, submit) = click_parts(&page, args).await?;
+                if label.is_empty() && aria.is_empty() && !submit {
+                    return None;
+                }
+                let publishing = publisher_keyword(&label) || publisher_keyword(&aria);
+                let what = if submit {
+                    format!("submit a form ({})", if label.is_empty() { "its button".into() } else { label })
+                } else if publishing {
+                    format!("click '{}'", if !label.is_empty() { label } else { aria })
+                } else {
+                    return None;
                 };
-                format!(r#"(() => {{ const e = {at}; if (!e) return "";
-                    const b = e.closest('button,input');
-                    const t = b ? (b.getAttribute('type') || (b.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase() : '';
-                    if (b && b.form && t === 'submit') return "submit a form (" + ((b.innerText || b.value || '').trim().slice(0, 40) || 'its button') + ")";
-                    return ""; }})()"#)
+                (what, publishing)
             }
+            "browser_upload" => {
+                // attaching a file is always risky: it can be sent with an Upload button
+                ("upload a file".to_string(), true)
+            }
+            _ => return None,
         };
-        let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.ok()?.ok()?.into_value::<String>().ok()?;
-        if v.is_empty() {
-            return None;
-        }
         let url = page.url().await.ok().flatten().unwrap_or_default();
-        Some(format!("{v} on {url}"))
+        Some(Risk { what, publishing, site: site_of(&url), url })
     }
 
     /// One step, within the step timeout. A page that hangs (a script that never ends, a load that never finishes:
@@ -809,5 +946,74 @@ mod tests {
 
         let without = Browsers::tools(false, false, false);
         assert!(!without.iter().any(|t| t["name"] == "browser_upload"), "hidden without a folder");
+    }
+
+    /// a publishing click matches whole words: Publish, the phrase "make public", an aria-label "Upload"...
+    #[test]
+    fn publisher_keywords_match_their_words() {
+        assert!(publisher_keyword("Publish"));
+        assert!(publisher_keyword("Make public"));
+        assert!(publisher_keyword("Upload"), "matched from an aria-label too");
+        assert!(publisher_keyword("Post to feed"));
+        assert!(publisher_keyword("Send email"));
+        assert!(publisher_keyword("Save the day now"), "save is a keyword even mid-sentence");
+    }
+
+    /// ...only as whole words, never a substring: "Published 3 days ago" (a heading, never a control) does not match,
+    /// nor "republished", "publicity" or "unsent".
+    #[test]
+    fn publisher_keyword_ignores_substrings() {
+        assert!(!publisher_keyword("Published 3 days ago"));
+        assert!(!publisher_keyword("Republished yesterday"));
+        assert!(!publisher_keyword("Publicity desk"));
+        assert!(!publisher_keyword("unsent mail"));
+        assert!(!publisher_keyword("The dashboard"));
+    }
+
+    /// allowed once for the same conversation+site, but not a different site, and not after the 30-minute window
+    #[test]
+    fn job_memory_allows_once_per_site() {
+        let mut m = JobMemory::default();
+        let now = Instant::now();
+        assert!(!m.allowed("job1", "studio.youtube.com", now), "asks the first time");
+        m.remember("job1", "studio.youtube.com", now, JOB_WINDOW);
+        assert!(m.allowed("job1", "studio.youtube.com", now + Duration::from_secs(60)), "the same site keeps going");
+        // a different site on the same job still asks
+        assert!(!m.allowed("job1", "docs.google.com", now + Duration::from_secs(60)));
+        // past the window it asks again
+        assert!(!m.allowed("job1", "studio.youtube.com", now + JOB_WINDOW + Duration::from_secs(1)));
+    }
+
+    /// one job's yes does not cover a different conversation
+    #[test]
+    fn job_memory_is_per_conversation() {
+        let mut m = JobMemory::default();
+        let now = Instant::now();
+        m.remember("job-a", "studio.youtube.com", now, JOB_WINDOW);
+        assert!(!m.allowed("job-b", "studio.youtube.com", now), "a different job does not get the same yes");
+    }
+
+    /// the "approve" setting is "each" by default and parses "job"; anything else (including an old spelling) falls back to "each"
+    #[test]
+    fn settings_approve_mode_parses() {
+        let mut each = BTreeMap::new();
+        each.insert("browser".into(), json!({}));
+        assert_eq!(Settings::from_config(&each, std::path::Path::new("/tmp")).approve, ApproveMode::Each);
+
+        let mut job = BTreeMap::new();
+        job.insert("browser".into(), json!({"approve": "job"}));
+        assert_eq!(Settings::from_config(&job, std::path::Path::new("/tmp")).approve, ApproveMode::Job);
+
+        let mut other = BTreeMap::new();
+        other.insert("browser".into(), json!({"approve": "sometimes"}));
+        assert_eq!(Settings::from_config(&other, std::path::Path::new("/tmp")).approve, ApproveMode::Each);
+    }
+
+    /// the host of a URL, for the prompt and the once-per-job memory
+    #[test]
+    fn site_of_takes_the_host() {
+        assert_eq!(site_of("https://studio.youtube.com/upload?x=1"), "studio.youtube.com");
+        assert_eq!(site_of("http://127.0.0.1:8080/x"), "127.0.0.1");
+        assert_eq!(site_of(""), "");
     }
 }
