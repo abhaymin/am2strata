@@ -402,6 +402,7 @@
         <button type="button" data-sec="connect"><b>Connect</b><span>Base URLs for your apps</span></button>
         <button type="button" data-sec="clients"><b>Clients</b><span>Keys with their own tools</span></button>
         <button type="button" data-sec="cluster"><b>Cluster</b><span>Other machines that answer for this one</span></button>
+        <button type="button" data-sec="computer"><b>Computer and browser use</b><span>Preset, mode, allowed apps and sites</span></button>
       </nav>
       <div class="set-body">
 
@@ -675,12 +676,63 @@
             </div>
             <div class="agents-list" id="agents-list"><p class="muted">Loading&hellip;</p></div>
           </div>
-          <p class="muted small">am2Strata, a new edition of <a href="https://github.com/VecSzn/PolyStrata" target="_blank" rel="noopener noreferrer">PolyStrata</a>
-            (MIT, <a href="/web/LICENSE-PolyStrata.txt" target="_blank">license</a>).</p>
-        </section>
+            <p class="muted small">am2Strata, a new edition of <a href="https://github.com/VecSzn/PolyStrata" target="_blank" rel="noopener noreferrer">PolyStrata</a>
+              (MIT, <a href="/web/LICENSE-PolyStrata.txt" target="_blank">license</a>).</p>
+          </section>
+
+          <section class="set-panel" id="sec-computer" aria-labelledby="h-computer" hidden>
+            <h2 id="h-computer">Computer and browser use</h2>
+            <div class="st-card toggle-row"><span>Use a browser<br><span class="muted small">the model may open pages in a
+              browser on the server and click and type there; passwords and sending forms ask you first</span></span>
+              <button class="st-toggle" id="cu-browser" role="switch" aria-checked="false" aria-label="Use a browser"></button></div>
+            <div class="st-card toggle-row"><span>Use the computer<br><span class="muted small">the model may drive this PC's
+              desktop - open apps, click and type, take screenshots</span></span>
+              <button class="st-toggle" id="cu-computer" role="switch" aria-checked="false" aria-label="Use the computer"></button></div>
+
+            <div class="st-card">
+              <span class="card-title">Rule preset</span>
+              <div class="theme-cards" id="cu-preset" role="radiogroup" aria-label="Rule preset">
+                <button type="button" role="radio" data-v="strict" aria-checked="true"><b>Strict</b><span class="muted small">only the apps it opens; clicking, typing and asking you are refused until it asks</span></button>
+                <button type="button" role="radio" data-v="creator"><b>Creator</b><span class="muted small">open and move what is around, but not your password manager or a bank site</span></button>
+                <button type="button" role="radio" data-v="custom"><b>Custom</b><span class="muted small">your own rule toggles below</span></button>
+              </div>
+              <div id="cu-custom-rules" hidden>
+                <div class="st-card toggle-row"><span>Don't touch password fields<br><span class="muted small">refuse to fill or clear a login field</span></span>
+                  <button class="st-toggle" id="cu-no-password" role="switch" aria-checked="true" aria-label="Don't touch password fields"></button></div>
+                <div class="st-card toggle-row"><span>Don't touch payment fields<br><span class="muted small">refuse to fill a card or amount, or submit a payment</span></span>
+                  <button class="st-toggle" id="cu-no-payment" role="switch" aria-checked="true" aria-label="Don't touch payment fields"></button></div>
+                <div class="st-card toggle-row"><span>Ask before signing in<br><span class="muted small">refuse actions that log into an account unless it asks first</span></span>
+                  <button class="st-toggle" id="cu-no-signin" role="switch" aria-checked="true" aria-label="Ask before signing in"></button></div>
+                <div class="st-card toggle-row"><span>Ask before send, delete, install, buy or publish<br><span class="muted small">refuse those until it asks first</span></span>
+                  <button class="st-toggle" id="cu-ask-risky" role="switch" aria-checked="true" aria-label="Ask before risky actions"></button></div>
+              </div>
+            </div>
+
+            <div class="st-card" id="cu-desktop" hidden>
+              <span class="card-title">Desktop</span>
+              <div class="st-field">
+                <label class="st-label">Mode <span class="muted small">how the model acts in the desktop</span></label>
+                <div class="seg seg--4" id="cu-mode" role="radiogroup" aria-label="Desktop mode">
+                  <button type="button" role="radio" data-v="sandbox" aria-checked="true">Sandbox</button><button type="button" role="radio" data-v="watch-only">Watch only</button>
+                  <button type="button" role="radio" data-v="assist">Assist <span class="muted small">(ask)</span></button><button type="button" role="radio" data-v="trusted-job">Trusted job</button></div></div>
+              <div class="st-field"><label class="st-label">Allowed apps<br><span class="muted small">the sandbox desktop may open, one per line or comma-separated</span></label>
+                <textarea class="st-input mono" id="cu-apps" rows="2" placeholder="firefox&#10;LibreOffice"></textarea></div>
+              <div class="st-field"><label class="st-label">Allowed sites<br><span class="muted small">sites the sandbox may visit, one per line or comma-separated</span></label>
+                <textarea class="st-input mono" id="cu-site-allow" rows="2" placeholder="youtube.com"></textarea></div>
+              <div class="st-field"><label class="st-label">Blocked sites<br><span class="muted small">sites the sandbox must not visit</span></label>
+                <textarea class="st-input mono" id="cu-site-block" rows="2" placeholder="ads.example"></textarea></div>
+              <p class="muted small"><span>The download folder</span><br>
+                Downloads are written to this PC's <code>browser-downloads</code> folder. Set <code>computer.download_dir</code> in the run config to change it.<br>
+                <label class="st-field" style="display:flex;justify-content:space-between;align-items:center;margin-top:.4rem"><span>Ask before each download reaches this PC</span>
+                  <button class="st-toggle" id="cu-download-ask" role="switch" aria-checked="false" aria-label="Ask before each download"></button></label></p>
+            </div>
+
+            <div class="row-actions"><button class="st-btn st-btn--primary" id="cu-save" type="button">Save</button>
+              <span class="muted small" id="cu-msg" role="status"></span></div>
+          </section>
+        </div>
       </div>
-    </div>
-  </section>
+    </section>
 
   <!-- ============================ API calls ============================ -->
   <section class="view view--calls" id="view-calls" role="tabpanel" aria-labelledby="tab-btn-calls" hidden>
@@ -780,6 +832,12 @@
 </aside>
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
+
+  <!-- ============================ Now using the computer / browser ============================ -->
+  <div class="use-pill" id="use-pill" role="status" aria-live="polite" hidden>
+    <span class="use-pill__dot"></span><span id="use-pill-label">Using the computer</span>
+    <button type="button" class="st-btn st-btn--secondary use-pill__stop" id="use-pill-stop">Stop</button>
+  </div>
   <!-- ============================ Media viewer ============================ -->
   <div class="viewer" id="viewer" role="dialog" aria-modal="true" aria-label="Media viewer" hidden>
     <div class="viewer__stage" id="viewer-stage"></div>
