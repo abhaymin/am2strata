@@ -101,10 +101,13 @@ pub fn measure_read(dirs: &[std::path::PathBuf]) -> Option<(f64, String)> {
 
 fn read_speed(path: &Path, bytes: u64) -> Option<f64> {
     use std::io::Read;
-    use std::os::unix::io::AsRawFd;
     let mut f = std::fs::File::open(path).ok()?;
-    // drop the file's cached pages, so the disk is read and not memory
-    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, bytes as i64, libc::POSIX_FADV_DONTNEED) };
+    // drop the file's cached pages, so the disk is read and not memory (Linux; elsewhere the cache may flatter it)
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, bytes as i64, libc::POSIX_FADV_DONTNEED) };
+    }
     let mut buf = vec![0u8; 8 << 20];
     let (t0, mut got) = (std::time::Instant::now(), 0u64);
     while got < bytes {
@@ -115,7 +118,12 @@ fn read_speed(path: &Path, bytes: u64) -> Option<f64> {
         got += n as u64;
     }
     let s = t0.elapsed().as_secs_f64();
-    unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, bytes as i64, libc::POSIX_FADV_DONTNEED) };
+    // and drop them again, so the measurement leaves no cached copy behind (Linux)
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, bytes as i64, libc::POSIX_FADV_DONTNEED) };
+    }
     (got > 0 && s > 0.0).then(|| (got as f64 / 1e6 / s).round())
 }
 
