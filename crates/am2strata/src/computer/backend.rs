@@ -92,6 +92,7 @@ pub trait Backend {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
 
     impl Backend for LinuxBackend {
         fn screenshot(&self) -> Result<Buffer, String> {
@@ -246,13 +247,104 @@ mod linux {
 
     impl Default for Size { fn default() -> Self { Size::DEFAULT } }
 
-    /// A free X display number to run the sandbox's virtual screen on: try :99, then the next free one checked via its `/tmp/.X11-unix/X<n>`
-    /// socket. Chosen from the filesystem, never read from the environment's DISPLAY, so a sandbox desktop can't drive the real one.
-    pub fn pick_free_display() -> String {
-        for n in 99..=1000 {
-            if !std::path::PathBuf::from(format!("/tmp/.X11-unix/X{n}")).exists() { return format!(":{n}"); }
+    /// Start `Xvfb` privately for the sandbox (`item 1`). It picks its own free display via `-displayfd`, which reports that
+    /// display number back on a pipe, so there is no window between choosing a number and starting Xvfb for another server to
+    /// take it (and we never talk to a display we did not start). Returns the running child and the display name it wrote
+    /// (`:NN`); `-nolisten tcp` keeps it off TCP, and if Xvfb exits early or writes nothing within 5 s this returns an error.
+    fn start_sandbox_xvfb(size: Size) -> Result<(std::process::Child, String), String> {
+        unsafe {
+            // a pipe so Xvfb can write its chosen display number back on `-displayfd`; the read end is parsed below.
+            let mut fds = [0i32; 2];
+            if libc::pipe(fds.as_mut_ptr()) != 0 { return Err("making the pipe for Xvfb's display number failed".into()); }
+            // wrap both ends in a File so each closes exactly once, when this scope leaves.
+            let read_end = std::fs::File::from_raw_fd(fds[0]);
+            let write_end = std::fs::File::from_raw_fd(fds[1]);
+
+            let mut cmd = std::process::Command::new("Xvfb");
+            cmd.arg("-displayfd").arg(write_end.as_raw_fd().to_string())
+               .arg("-nolisten").arg("tcp")
+               .arg("-screen").arg("0").arg(format!("{}x{}x{}", size.width, size.height, size.depth))
+               .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY")
+               .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+
+            let mut child = cmd.spawn().map_err(|e| format!("starting Xvfb: the sandbox needs `Xvfb` (install xvfb) to run its virtual display: {e}"))?;
+            // close our copy of the write end after spawning; Xvfb keeps its own so it can still report the number.
+            drop(write_end);
+
+            // read Xvfb's reported display number in a thread until it ends its line (non-blocking reads on the pipe).
+            let (dtx, drx) = std::sync::mpsc::channel();
+            {
+                let rd = read_end.try_clone().map_err(|e| e.to_string())?;
+                std::thread::spawn(move || report_display_number(rd, &dtx));
+            }
+
+            const DISPLAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            let started = std::time::Instant::now();
+            loop {
+                if let Ok(read) = drx.try_recv() {
+                    return match parse_display_number(&read) {
+                        Some(d) => Ok((child, d)),
+                        None => { let _ = child.kill(); Err(format!("Xvfb started but reported an unreadable display number: {read:?}").into()) }
+                    };
+                }
+                match child.try_wait().map_err(|e| e.to_string())? {
+                    Some(_) => {
+                        // Xvfb may write the display then close its end; take one final look before giving up.
+                        if let Ok(read) = drx.try_recv() {
+                            return match parse_display_number(&read) {
+                                Some(d) => Ok((child, d)),
+                                None => { let _ = child.kill(); Err(format!("Xvfb started but reported an unreadable display number: {read:?}").into()) }
+                            };
+                        }
+                        let _ = child.kill();
+                        return Err("Xvfb exited before it could report a display number".into());
+                    }
+                    None if started.elapsed() >= DISPLAY_TIMEOUT => {
+                        let _ = child.kill();
+                        return Err("Xvfb did not report a display number within 5 seconds".into());
+                    }
+                    _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+                }
+            }
         }
-        ":(1001)".to_string()  // nothing free in range: report the next number anyway so a step fails clearly, not silently
+    }
+
+    /// Xvfb writes its chosen display (`:NN`) on `-displayfd` followed by a newline. Read that number back from the pipe
+    /// without blocking forever (non-blocking reads until the line ends, or a short cap), then hand it to the channel.
+    fn report_display_number(read_end: std::fs::File, dtx: &std::sync::mpsc::Sender<String>) {
+        let fd = read_end.as_raw_fd();
+        let mut data: Vec<u8> = Vec::new();
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFL);
+            if flags >= 0 { let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK); }
+            let mut buf = [0u8; 64];
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) {
+                    n if n > 0 => {
+                        data.extend_from_slice(&buf[..n as usize]);
+                        if data.iter().any(|&b| b == b'\n') { break; }  // full line read: the display number Xvfb chose
+                    }
+                    0 => break,                                       // EOF: Xvfb closed its end (it exited)
+                    _ => {
+                        let e = std::io::Error::last_os_error();
+                        if e.kind() != std::io::ErrorKind::WouldBlock && e.kind() != std::io::ErrorKind::Interrupted { break; }
+                        if std::time::Instant::now() >= deadline { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+        let _ = dtx.send(String::from_utf8_lossy(&data).into_owned());
+    }
+
+    /// The display number Xvfb reported on `-displayfd` (`:NN`, or just `NN`; possibly with trailing whitespace/newline), or
+    /// None when it is not a usable ":N". Pure, so the read-back can be unit-tested without starting Xvfb (item 1).
+    pub(super) fn parse_display_number(read: &str) -> Option<String> {
+        let s = read.trim();
+        let body = s.strip_prefix(':').unwrap_or(s);
+        if body.is_empty() || !body.chars().all(|c| c.is_ascii_digit()) { return None; }
+        Some(format!(":{body}"))
     }
 
     /// The sandbox's private virtual desktop. It owns an `Xvfb` started lazily on the first computer step and killed when the last
@@ -287,9 +379,8 @@ mod linux {
         pub fn ensure(&self) -> Result<String, String> {
             let mut state = self.inner.lock().unwrap();
             if !matches!(*state, State::Running(..)) {
-                let disp = pick_free_display();
-                match start_xvfb(self.size, &disp) {
-                    Ok(child) => *state = State::Running(child, disp.clone(), std::time::Instant::now()),
+                match start_sandbox_xvfb(self.size) {
+                    Ok((child, disp)) => *state = State::Running(child, disp, std::time::Instant::now()),
                     Err(e) => return Err(e),
                 }
             }
@@ -316,16 +407,6 @@ mod linux {
 
     /// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped.
     const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
-
-    /// Start `Xvfb` on `display` at `size`, ignoring the host's DISPLAY / WAYLAND_DISPLAY so it can never drive the real screen.
-    fn start_xvfb(size: Size, display: &str) -> Result<std::process::Child, String> {
-        std::process::Command::new("Xvfb")
-            .arg(display).arg("-screen").arg("0").arg(format!("{}x{}x{}", size.width, size.height, size.depth))
-            .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY")
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("starting Xvfb {display}: the sandbox needs `Xvfb` (install xvfb) to run its virtual display: {e}"))
-    }
 
     impl std::ops::Drop for SandboxDesktop {
         fn drop(&mut self) { self.stop(); }
@@ -657,5 +738,34 @@ mod tests {
         assert_eq!(Size::parse(None), Size::DEFAULT);
         assert_eq!(Size::parse(Some("garbage")), Size::DEFAULT);
         assert_eq!(Size::parse(Some("1024x768x24")), Size { width: 1024, height: 768, depth: 24 });
+    }
+
+    /// Xvfb reports its chosen display on `-displayfd`; parse that number back (item 1). Pure, no Xvfb needed. Accepts a
+    /// leading colon or just the digits, since different Xvfb builds write one form or the other.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xvfb_display_number_is_parsed_from_the_pipe() {
+        assert_eq!(linux::parse_display_number(":99\n"), Some(":99".into()));
+        assert_eq!(linux::parse_display_number("2\n"), Some(":2".into()), "some builds write the number without a colon");
+        assert_eq!(linux::parse_display_number(" :123 "), Some(":123".into()));
+        assert_eq!(linux::parse_display_number(""), None);
+        assert_eq!(linux::parse_display_number("garbage"), None);
+        assert_eq!(linux::parse_display_number(":-1"), None);
+    }
+
+    /// The sandbox's private Xvfb picks a free display via `-displayfd` and reports it back over the pipe (item 1). Ignored by
+    /// default — this box has no Xvfb on a running session; run with `cargo test -- --ignored`. Bails when Xvfb is absent.
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs Xvfb on a running session"]
+    #[test]
+    fn the_sandbox_xvfb_reports_a_display_number_that_is_usable() -> Result<(), String> {
+        if !linux::tool_available("Xvfb") { return Ok(()); }
+        // a desktop at 640x480; Xvfb runs privately, reports its display over the pipe, stays up so it can be driven.
+        let d = SandboxDesktop::new(Size { width: 640, height: 480, depth: 24 });
+        let disp = d.ensure()?;
+        assert!(disp.starts_with(':'), "Xvfb writes back a usable display number: {disp}");
+        // it is the number Xvfb itself chose (not ours): :99 or whatever -displayfd handed out, never the server's DISPLAY.
+        let _ = d.stop();
+        Ok(())
     }
 }
