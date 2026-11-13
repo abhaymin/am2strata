@@ -182,31 +182,39 @@ enum Kind {
     Arg(&'static str),
 }
 
-const EDITABLE: [(&str, Kind, &str); 18] = [
+const EDITABLE: [(&str, Kind, &str); 24] = [
     ("sampling.temperature", Kind::Sampling("num>=0"),
-     "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
+      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
     ("sampling.top_p", Kind::Sampling("0<x<=1"), "Default top_p for requests that send none"),
     ("sampling.top_k", Kind::Sampling("1..64"), "Default top_k for requests that send none (1-64)"),
     ("sampling.min_p", Kind::Sampling("0<=x<=1"), "Default min_p for requests that send none"),
     ("reasoning_budget_tokens", Kind::IntGe0, "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
     ("fit_max_tokens", Kind::Bool, "Shorten a max_tokens that does not fit the context instead of answering 400"),
     ("drop_oldest", Kind::Bool, "Leave out a conversation's oldest turns when it no longer fits the context, instead of \
-                                 answering 400 (the system prompt and the last turn stay)"),
+                                  answering 400 (the system prompt and the last turn stay)"),
     ("preserve_thinking", Kind::Bool, "Keep the thinking of earlier turns in the prompt (templates that support it: \
                                        Qwen3.6, Ornith, Tiel Coder)"),
     ("anthropic_thinking", Kind::Enum(&["model", "on_request"]),
-     "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
+      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
     ("effort_position", Kind::Enum(&["start", "end"]),
-     "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
     ("aliases", Kind::Names, "Other model names the server lists and answers to (comma-separated)"),
     ("idle_unload_s", Kind::NumGe0, "Unload the model after this many seconds without requests (0 or empty: never)"),
     ("lazy_load", Kind::Bool, "Start without loading the model; the first request loads it (text only)"),
     ("engine_silence_s", Kind::NumGe0, "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
     ("api_monitor", Kind::Bool, "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("switch_on_request", Kind::Bool, "List every installed model in /v1/models and load the one a request names, the \
-                                       loaded one stopped first (#38; read from the config the server starts with)"),
+                                        loaded one stopped first (#38; read from the config the server starts with)"),
     ("open_browser", Kind::Bool, "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", Kind::Arg("--vram-reserve-mib"), "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+    // computer use / browser use / rule presets: a nested block under these dotted keys, all off/empty by default
+    ("browser.use", Kind::Bool, "Offer the existing headless-Chrome computer-use tools (off; switch on to drive a browser)"),
+    ("computer.use", Kind::Bool, "Turn on desktop computer use (off by default: no access to this PC's desktop)"),
+    ("computer.mode", Kind::Enum(&["sandbox", "watch-only", "assist", "trusted-job"]),
+      "The desktop the tools run in when computer use is on (the sandbox virtual display is the default)"),
+    ("computer.download_ask", Kind::Bool, "Ask before a download reaches this PC instead of writing it to the download folder"),
+    ("computer.apps", Kind::Names, "Apps the sandbox desktop may open (comma-separated; Strict requires a list)"),
+    ("rules.preset", Kind::Enum(&["strict", "creator", "custom"]), "The rule preset enforced on every computer step (strict is the default)"),
 ];
 
 fn kind_of(key: &str) -> Option<Kind> {
@@ -229,7 +237,11 @@ fn value_of(cfg: &Value, key: &str) -> Value {
     match kind_of(key) {
         Some(Kind::Sampling(_)) => cfg.get("sampling").and_then(|s| s.get(&key[9..])).cloned().unwrap_or(Value::Null),
         Some(Kind::Arg(flag)) => arg_value(cfg, flag),
-        _ => cfg.get(key).cloned().unwrap_or(Value::Null),
+        // a nested key (browser.use / computer.mode / rules.preset ...) reads into that block; a bare key stays top-level
+        _ => match key.split_once('.') {
+            Some((sec, sub)) => cfg.get(sec).and_then(Value::as_object).and_then(|o| o.get(sub)).cloned().unwrap_or(Value::Null),
+            None => cfg.get(key).cloned().unwrap_or(Value::Null),
+        },
     }
 }
 
@@ -361,12 +373,17 @@ pub fn apply(cfg: &Value, changes: Option<&Value>) -> Result<(Value, Vec<String>
                 }
                 obj.insert("args".into(), Value::Array(a));
             }
-            _ if v.is_null() => {
-                obj.remove(&key);
-            }
-            _ => {
-                obj.insert(key.clone(), v);
-            }
+            _ => match key.split_once('.') {
+                // a nested key is written into its block (removing it leaves an empty block, like the sampling rule does)
+                Some((sec, sub)) => {
+                    let sec_obj = obj.entry(sec.to_string()).or_insert_with(|| Value::Object(Map::new()))
+                        .as_object_mut().ok_or("the run config is not a JSON object")?;
+                    if v.is_null() { sec_obj.remove(sub); } else { sec_obj.insert(sub.to_string(), v); }
+                }
+                None => {
+                    if v.is_null() { obj.remove(&key); } else { obj.insert(key.clone(), v); }
+                }
+            },
         }
         changed.push(key);
     }
@@ -425,5 +442,21 @@ mod tests {
         let v = view(&new, Path::new("/x/strata-m.json"));
         assert_eq!(v["file"], "strata-m.json");
         assert_eq!(v["keys"][0]["value"], 0.6);
+    }
+
+    #[test]
+    fn nested_computer_keys_write_into_their_block() {
+        let cfg = json!({"api_key": "k", "sampling": {"top_p": 0.9}});
+        let (new, changed) = apply(&cfg, Some(&json!({"computer.use": true, "rules.preset": "creator", "computer.mode": "watch-only"}))).unwrap();
+        assert_eq!(changed.len(), 3);
+        assert_eq!(new["computer"], json!({"use": true, "mode": "watch-only"}));
+        assert_eq!(new["rules"], json!({"preset": "creator"}));
+        // GET /config now reports the value back to the Settings page (the web app reads these keys)
+        let v = view(&new, Path::new("/x/strata-m.json"));
+        let found = v["keys"].as_array().unwrap().iter().find(|k| k["key"] == "computer.use").unwrap();
+        assert_eq!(found["value"], json!(true));
+        // turning a key off with null removes just that key, leaving the block and other keys intact
+        let (back, _) = apply(&new, Some(&json!({"computer.use": null}))).unwrap();
+        assert_eq!(back["computer"], json!({"mode": "watch-only"}), "the key is removed, its block kept");
     }
 }
