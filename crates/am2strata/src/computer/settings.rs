@@ -38,6 +38,8 @@ impl Mode {
 /// The maximum steps one job (conversation) runs before a step is refused (`"computer": {"max_steps": N}`, default 200);
 /// at the limit the step is refused naming the limit, and the next approval starts a new count (item 2).
 pub const DEFAULT_MAX_STEPS: u32 = 200;
+/// The largest `max_steps` a config can set without being clamped (item 7): larger values would otherwise silently truncate.
+pub const MAX_MAX_STEPS: u32 = 10_000;
 
 /// The desktop control: switched on (`use_`), the mode it runs in, the apps the sandbox may open, whether downloads ask.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,7 +127,7 @@ impl Config {
                  site_allow: names_array(c.get("site_allow")),
                  site_block: names_array(c.get("site_block")),
                  display_size: c.get("display_size").and_then(Value::as_str).map(str::to_string),
-                 max_steps: c.get("max_steps").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(DEFAULT_MAX_STEPS),
+                  max_steps: c.get("max_steps").and_then(Value::as_u64).map(|v| v.min(MAX_MAX_STEPS as u64) as u32).unwrap_or(DEFAULT_MAX_STEPS),
              },
             None => ComputerUse { mode: Mode::DEFAULT, ..Default::default() },
         };
@@ -279,5 +281,17 @@ mod tests {
         cfg.computer.use_ = true;
         cfg.computer.max_steps = 7;
         assert_eq!(Config::from_config(&rest(cfg.to_value()), Path::new("/tmp")).computer.max_steps, 7);
+    }
+
+    /// A max_steps above u32 truncates silently if cast directly (item 7), so any value over the sane cap is clamped to it while a
+    /// normal set value passes through unchanged.
+    #[test]
+    fn max_steps_is_clamped_not_truncated() {
+        // a value above u32::MAX clamps to the sane cap instead of wrapping around when cast to u32
+        let c = Config::from_config(&rest(json!({"computer": {"use": true, "max_steps": 5_000_000_000u64}})), Path::new("/tmp"));
+        assert_eq!(c.computer.max_steps, MAX_MAX_STEPS, "a max_steps over the cap is clamped");
+        // a value within range is not touched
+        let ok = Config::from_config(&rest(json!({"computer": {"use": true, "max_steps": 100}})), Path::new("/tmp"));
+        assert_eq!(ok.computer.max_steps, 100);
     }
 }
