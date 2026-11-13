@@ -85,6 +85,12 @@ pub struct Jobs {
     recent: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
 }
 
+/// The error text when a key has hit its media-jobs-per-hour limit: one clear sentence naming the cap and telling it to
+/// try again later (no stray fragment).
+fn hourly_cap_message(limit: u32) -> String {
+    format!("error: this key already queued its {limit} media jobs for this hour; try again later")
+}
+
 impl Jobs {
     pub fn new() -> Jobs {
         Jobs { app: OnceLock::new(), jobs: Mutex::new(BTreeMap::new()), next: Mutex::new(1), caps: Mutex::new(None),
@@ -434,18 +440,9 @@ impl Jobs {
             return fail(format!("error: {} cannot be made here: {}", kind, k["note"].as_str().unwrap_or("not available")));
         }
         let model = k["model"].as_str().unwrap_or("").to_string();
-        // a client profile's limit: media jobs an hour
-        let client = crate::queue::current_client();
-        if let Some(limit) = self.app.get().and_then(|a| a.clients.by_name(&client)).and_then(|p| p.media_jobs_per_hour) {
-            let mut recent = self.recent.lock().unwrap();
-            let q = recent.entry(client.clone()).or_default();
-            while q.front().is_some_and(|t| t.elapsed() > Duration::from_secs(3600)) {
-                q.pop_front();
-            }
-            if q.len() >= limit as usize {
-                return fail(format!("error: this key may queue {limit} media jobs an hour, and has; try again later"));
-            }
-            q.push_back(Instant::now());
+        // a client profile's limit: media jobs an hour (also enforced in submit_compose and submit_thumbnail)
+        if let Some(e) = self.enforce_hourly() {
+            return fail(e);
         }
         let mut req = match kind {
             "image" => {
@@ -608,6 +605,27 @@ impl Jobs {
         Ok(json!({"id": id, "kind": "production", "model": "production", "parts": parts.len(), "url": format!("/api/jobs/{id}")}))
     }
 
+    /// A client profile's limit: how many media jobs its key may queue in an hour (the `media_jobs_per_hour` config).
+    /// Drop entries older than an hour; if the key is already at its limit return that as a message without recording it,
+    /// otherwise record now and succeed. Shared by submit(), submit_compose() and submit_thumbnail() so limited keys queue
+    /// compose and thumbnail jobs no more freely than the other media jobs. Returns None when the key has no such limit.
+    fn enforce_hourly(&self) -> Option<String> {
+        let client = crate::queue::current_client();
+        let Some(limit) = self.app.get().and_then(|a| a.clients.by_name(&client)).and_then(|p| p.media_jobs_per_hour) else {
+            return None;
+        };
+        let mut recent = self.recent.lock().unwrap();
+        let q = recent.entry(client.clone()).or_default();
+        while q.front().is_some_and(|t| t.elapsed() > Duration::from_secs(3600)) {
+            q.pop_front();
+        }
+        if q.len() >= limit as usize {
+            return Some(hourly_cap_message(limit));
+        }
+        q.push_back(Instant::now());
+        None
+    }
+
     /// A compose job: pictures, clips, audio and captions joined into one MP4 by ffmpeg. The shots are laid out over the
     /// audio's length (their own when given), crossfaded between, with the captions and cards burned in. Queued like a
     /// production; its file is the video at /v1/media/jobs/{id}/content, its meta the size, length and shot count.
@@ -620,6 +638,14 @@ impl Jobs {
             if sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
                 return Err(format!("shots[{i}]: give an \"image\" or a \"clip\""));
             }
+        }
+        // without audio there is nothing to compose to; refuse it up front rather than queue a job that will fail later
+        if req.get("audio").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
+            return Err("audio: send the audio file (or an mj-N id) to compose to".into());
+        }
+        // this counts against the key's media_jobs_per_hour, like every other media job (enforce before queueing it)
+        if let Some(e) = self.enforce_hourly() {
+            return Err(e);
         }
         let n = {
             let mut g = self.next.lock().unwrap();
@@ -645,8 +671,17 @@ impl Jobs {
     /// A thumbnail job: one big-worded JPEG on a dark gradient (compose.rs), from an image and the lines to show. Queued
     /// like a production; its file is the JPEG at /v1/media/jobs/{id}/content.
     pub fn submit_thumbnail(&self, req: &Value) -> Result<Value, String> {
-        if req["image"].is_null() {
+        // reject what make() would otherwise reject late, so a bad request is refused up front instead of queued and later failed.
+        // an empty or missing image (not just null), or no usable words to show, cannot make a thumbnail
+        if req.get("image").and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
             return Err("image: send the picture to turn into a thumbnail".into());
+        }
+        if !req["lines"].as_array().is_some_and(|a| a.iter().any(|l| l.get(0).and_then(Value::as_str).map_or(false, |t| !t.trim().is_empty()))) {
+            return Err("lines: give the words to show, as [[text, \"white\"|\"gold\"]]".into());
+        }
+        // count this against the key's media_jobs_per_hour, like every other media job (enforce before queueing it)
+        if let Some(e) = self.enforce_hourly() {
+            return Err(e);
         }
         let n = {
             let mut g = self.next.lock().unwrap();
@@ -657,7 +692,8 @@ impl Jobs {
             *g - 1
         };
         let id = format!("mj-{n}");
-        let prompt = req["lines"].as_array().and_then(|a| a.first()).and_then(|l| l.get(0).and_then(Value::as_str)).unwrap_or("thumbnail").chars().take(48).collect();
+        let prompt = req["lines"].as_array().and_then(|a| a.iter().find(|l| l.get(0).and_then(Value::as_str).map_or(false, |t| !t.trim().is_empty())))
+            .and_then(|l| l.get(0).and_then(Value::as_str)).unwrap_or("thumbnail").trim().chars().take(48).collect();
         let job = Job { id: id.clone(), kind: "thumbnail", model: "thumbnail".into(), prompt, created: crate::now(), state: "queued",
                         error: None, mime: None, data: None, meta: json!({"part": 0, "parts": 1, "now": "thumbnail"}), seconds: None,
                         req: req.clone(), file: None };
@@ -1074,4 +1110,18 @@ pub async fn expand_audio(s: &AppState, req: &mut Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hourly_cap_is_one_clear_sentence() {
+        // the reviewer's fix: read as a single clear sentence that names the cap and tells the key to retry later, no stray fragment
+        assert_eq!(hourly_cap_message(3), "error: this key already queued its 3 media jobs for this hour; try again later");
+        assert!(!hourly_cap_message(1).contains("and has"), "one clean sentence, not a broken clause: {}", hourly_cap_message(1));
+    }
 }

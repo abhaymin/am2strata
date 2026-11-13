@@ -2147,7 +2147,7 @@ fn a_client_gets_code_memory_and_its_limits_through_the_api() {
     assert_eq!(post_as(&s, LAPTOP, "/api/jobs", &job, &[]).0, 200);
     let (c, r) = post_as(&s, LAPTOP, "/api/jobs", &job, &[]);
     assert_eq!(c, 400, "{r}");
-    assert!(r.to_string().contains("1 media jobs an hour"), "{r}");
+    assert!(r.to_string().contains("1 media jobs for this hour"), "{r}");
 }
 
 /// Claude Code's WebSearch: a request with Anthropic's web_search server tool gets server_tool_use and

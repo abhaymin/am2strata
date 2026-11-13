@@ -433,8 +433,10 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     for (row, (text, colour)) in rows {
         let y = base_y - (row as i32) * 150;
         let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
-        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture
-        draws.push(format!("drawtext=fontfile='{}':text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x180A06@0.6:shadowx=3:shadowy=3", drawtext_escape(&font), drawtext_escape(&text)));
+        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture. The
+        // options are built as a list and joined with ':' so an absent fontfile leaves no empty field (drawtext=text=...,
+        // not drawtext=:text=...); a found Outfit font only leads with its fontfile
+        draws.push(thumbnail_drawtext(&text, &font, color, y));
     }
     // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
     let _ = run_ffmpeg(&[
@@ -457,6 +459,24 @@ fn outfit_font() -> String {
         std::env::current_dir().ok().map(|d| d.join("web/fonts/outfit-latin-wght.woff2")),
     ];
     candidates.iter().flatten().find(|p| p.is_file()).map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// One thumbnail row's drawtext filter, built as a list of options joined with ':' so an absent fontfile leaves no empty
+/// field (the filter starts `drawtext=text=`, not `drawtext=:text=`). A found Outfit font only leads with its fontfile.
+fn thumbnail_drawtext(text: &str, font: &str, color: &str, y: i32) -> String {
+    let mut opts = Vec::new();
+    if !font.is_empty() { opts.push(format!("fontfile='{}'", drawtext_escape(font))); }
+    opts.push(format!("text='{}'", drawtext_escape(text)));
+    opts.extend([
+        format!("fontsize=120"),
+        format!("fontcolor={color}"),
+        "x=(w-text_w)/2".to_string(),
+        format!("y={y}"),
+        "shadowcolor=0x180A06@0.6".to_string(),
+        "shadowx=3".to_string(),
+        "shadowy=3".to_string(),
+    ]);
+    format!("drawtext={}", opts.join(":"))
 }
 
 // ----------------------------------------------------------------------------------------------------------- tests
@@ -594,6 +614,17 @@ mod tests {
         // these render as plain caption text: ffmpeg never treats them as filter options or escapes inside the quotes
         assert_eq!(drawtext_escape("a:b"), "a:b");
         assert_eq!(drawtext_escape("%{pts}"), "%{pts}");
+    }
+
+    #[test]
+    fn drawtext_leaves_no_empty_field_when_the_font_is_absent() {
+        // no usable Outfit font: the first option is text, so the filter starts drawtext=text= (no leading colon after =)
+        assert!(thumbnail_drawtext("Hi", "", "ffffff", 100).starts_with("drawtext=text="),
+                "absent font -> the filter starts drawtext=text=: {}", thumbnail_drawtext("Hi", "", "ffffff", 100));
+        // a found Outfit font leads with its (escaped, quoted) fontfile then text; backslashes/paths stay valid inside quotes
+        let f = thumbnail_drawtext("Hi", "C:\\a b\\outfit.woff2", "ffd65a", 100);
+        assert!(f.starts_with("drawtext=fontfile='C:\\\\a b\\\\outfit.woff2':text='Hi'"),
+                "found font -> drawtext=fontfile=...:text=: {f}");
     }
 
     #[test]
