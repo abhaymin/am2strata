@@ -990,7 +990,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                                         let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": format!("dl {}", c.id), "name": c.name, "what": what}))).await;
                                         allowed = tokio::select! {
                                             a = tokio::time::timeout(std::time::Duration::from_secs(180), arx) => matches!(a, Ok(Ok(true))),
-                                            _ = tx.closed() => return,
+                                            _ = tx.closed() => { crate::browser::approvals().lock().unwrap().remove(&format!("dl {}", c.id)); return; }
                                         };
                                         crate::browser::approvals().lock().unwrap().remove(&format!("dl {}", c.id));
                                     }
