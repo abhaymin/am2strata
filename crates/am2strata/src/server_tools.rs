@@ -10,7 +10,7 @@ use crate::run::{self, Refusal, RunOpts, Started};
 use crate::{error, AppState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +108,27 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
                 .or(profile.as_ref().and_then(|p| p.media_in_turn.as_deref())).unwrap_or("defer");
             caps["in_turn"] = serde_json::json!(if mode == "swap" { "swap" } else { "defer" });
             opts.media = Some(caps);
+        }
+    }
+    // check_media: review a take's pauses and words heard, and a film's frame jumps; offered like the media tools
+    if req.get("strata_media") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+        let own = own_names(prep);
+        let extra: Vec<Value> = vec![json!({"name": "check_media", "description":
+            "Quality-check one of this PC's takes and films the way the reviewer does: audio — the longest pause between \
+             words, whether it is clipped or ends mid-voice, and the share of the expected words the speech model heard; \
+             video — single-frame jumps (a broken crossfade), frozen holds and length. Returns each measure with an ok/\
+             not and the thresholds used.",
+            "parameters": {"type": "object", "properties": {
+                "audio": {"type": "string", "description": "the take to review, as a WAV (base64/data URL or an http(s) URL / file path)"},
+                "expected_text": {"type": "string", "description": "the words that should be spoken, in the language below, for the words-heard check"},
+                "language": {"type": "string", "description": "a language code: hi, en, fr, es, ml, ta, kn, te ... (Hindi is Unicode-aware)"},
+                "heard_text": {"type": "string", "description": "optional pre-transcribed text; left out and, when the media engine is built, Whisper transcribes the audio"},
+                "video": {"type": "string", "description": "optional a video (base64/data URL or file path) to scan for single-frame jumps"},
+                "max_s": {"type": "number", "description": "longest interior pause allowed in seconds (default 0.25)"},
+                "words_ok": {"type": "number", "description": "share of expected words heard to pass the word check (default 0.6)"}}}})]
+            .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+        if !extra.is_empty() {
+            add(prep, &mut offered, extra);
         }
     }
     // the browser (computer use): only for a request that asks, never for another web page

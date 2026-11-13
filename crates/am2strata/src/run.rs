@@ -987,6 +987,14 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                         r = crate::code_run::call(code, &args) => r,
                         _ = tx.closed() => return,
                     }
+                } else if let (true, None, Some(mc)) = (crate::media_check::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.media_check.get()) {
+                    tokio::select! {
+                        r = mc.call(&args) => match r {
+                            Ok(v) => json!({"ok": true, "chars": v.to_string().chars().count(), "text": v.to_string(), "truncated": false, "ms": 0}),
+                            Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": 0}),
+                        },
+                        _ = tx.closed() => return,
+                    }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
                     if c.name == "web_search" {
                         web_queries += 1;
