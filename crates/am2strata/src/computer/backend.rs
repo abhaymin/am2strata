@@ -87,7 +87,7 @@ impl Size {
         match s.and_then(|v| v.split_once('x')) {
             Some((w, rest)) => match (w.trim().parse::<u32>(), rest.split_once('x')) {
                 (Ok(w), Some((h, d))) => match (h.trim().parse::<u32>(), d.trim().parse::<u32>()) {
-                    (Ok(h), Ok(d)) if h > 0 && d > 0 => Size { width: w, height: h, depth: d },
+                    (Ok(h), Ok(d)) if w > 0 && h > 0 && d > 0 => Size { width: w, height: h, depth: d },
                     _ => Size::DEFAULT,
                 },
                 _ => Size::DEFAULT,
@@ -778,6 +778,7 @@ mod tests {
         assert_eq!(Size::parse(None), Size::DEFAULT);
         assert_eq!(Size::parse(Some("garbage")), Size::DEFAULT);
         assert_eq!(Size::parse(Some("1024x768x24")), Size { width: 1024, height: 768, depth: 24 });
+        assert_eq!(Size::parse(Some("0x768x24")), Size::DEFAULT, "a zero width falls back to the default");
     }
 
     /// Xvfb reports its chosen display on `-displayfd`; parse that number back (item 1). Pure, no Xvfb needed. Accepts a
