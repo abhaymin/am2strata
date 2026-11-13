@@ -3,8 +3,8 @@
 //! - [`quantizer_error_under_bound`]: fixed-seed random f32 blocks quantized then `quants::dequantize`d; per-block
 //!   relative RMS error must stay under each encoding's known ggml bound (a proxy for "round-trips faithfully").
 //! - [`save_quant_input_fixture`] writes the shared fixed-seed F32 GGUF that `llama-quantize` is quantized from.
-//! - [`quantized_bytes_match_llama_quantize`] compares our bytes with llama-quantize's, byte for byte; it is ignored
-//!   until the reviewer generates `fixtures/quant-<TYPE>.gguf` (see fixtures/NEEDED.md) and commits them.
+//! - [`quantized_bytes_match_llama_quantize`] compares our bytes with llama-quantize's, byte for byte on the committed
+//!   `fixtures/quant-<TYPE>.gguf` (see fixtures/NEEDED.md), skipping any type whose reference file is absent.
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -72,12 +72,15 @@ fn quantizer_error_under_bound() {
 
 #[test]
 fn save_quant_input_fixture() {
-    // a fixed-seed F32 GGUF with one [256, 64] tensor: the shared input `llama-quantize` is run against.
+    // a fixed-seed F32 GGUF with one tensor whose numpy shape is [64, 256], i.e. ggml ne = [256, 64]: the shared input
+    // `llama-quantize` is run against. TensorSpec.shape is in numpy order (outermost first); the writer reverses it into
+    // the file's ggml dimension order, so [64, 256] -> ne = [256, 64]. A K-quant needs the last dim a multiple of 8;
+    // ne[1] = 64 is (ne[0] = 256 would not be).
     ensure_dir();
-    let input = quantize_input(256 * 64);
+    let input = quantize_input(64 * 256);
     let raw: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
 
-    let specs = vec![TensorSpec { name: "weight".into(), shape: vec![256, 64], ggml_type: 0 /* F32 */, nbytes: raw.len() as u64 }];
+    let specs = vec![TensorSpec { name: "weight".into(), shape: vec![64, 256], ggml_type: 0 /* F32 */, nbytes: raw.len() as u64 }];
     let kv = [("general.architecture", "quantize-fixture".to_string())];
     let path = fixtures().join("quant-input-f32.gguf");
     let mut w = Writer::create(&path, &kv, specs).unwrap();
@@ -121,8 +124,9 @@ fn reference_tensor_bytes(path: &Path) -> (u32, Vec<u8>) {
     (t.ggml_type, b)
 }
 
+// Byte-for-byte against llama-quantize's output on the committed fixtures (`tests/NEEDED.md` says how they were made).
+// Runs by default now that the type ids are right; each type is skipped only when its reference file is absent.
 #[test]
-#[ignore = "run `llama-quantize quant-input-f32.gguf quant-<TYPE>.gguf <TYPE>` for Q8_0 Q4_0 Q4_K Q5_K Q6_K in crates/strata-pack/tests/fixtures, commit the outputs, then rerun to compare our bytes to theirs byte for byte"]
 fn quantized_bytes_match_llama_quantize() {
     ensure_dir();
     let input = input_f32();
@@ -142,7 +146,8 @@ fn quantized_bytes_match_llama_quantize() {
     }
 }
 
-// ggml type ids (GGML_TYPE_*), which the reference GGUFs carry for each tensor
+// ggml type ids (GGML_TYPE_*), which the reference GGUFs carry for each tensor. The K formats are the dense-encoding
+// ids (12/13/14), not the 36/37/38 GGML_TYPE_Q{4,5,6}_K_2 "extra block" ids used only by some llama.cpp internals.
 fn block_type_id(t: &str) -> u32 {
-    match t { "Q8_0" => 8, "Q4_0" => 2, "Q4_K" => 36, "Q5_K" => 37, "Q6_K" => 38, _ => unreachable!() }
+    match t { "Q8_0" => 8, "Q4_0" => 2, "Q4_K" => 12, "Q5_K" => 13, "Q6_K" => 14, _ => unreachable!() }
 }
