@@ -975,8 +975,41 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                                 if let Some(img) = &st.screenshot {
                                     shots.push((c.name.clone(), img.clone()));
                                 }
-                                json!({"ok": true, "chars": (st.text.chars().count() + note.chars().count()),
-                                       "text": format!("{}{}", st.text, note), "truncated": false, "ms": ms(t0),
+                                // a download this step triggered is placed (or denied) here, asking first when the preset asks
+                                let mut dl_note = String::new();
+                                let downloads = b.consume_downloads();
+                                if !downloads.is_empty() {
+                                    let mut allowed = b.settings.download_ask; // Strict asks (each), config may auto-accept
+                                    if allowed {
+                                        // ask once, listing the files; approved back through the same /api/tools/approve route
+                                        let what = format!("Save {} downloaded file(s) to the download folder: {}", downloads.len(),
+                                            downloads.iter().map(|d| format!("{} ({}, {} bytes)", d.name, d.url, d.bytes))
+                                                .collect::<Vec<_>>().join("; "));
+                                        let (atx, arx) = tokio::sync::oneshot::channel();
+                                        crate::browser::approvals().lock().unwrap().insert(format!("dl {}", c.id), atx);
+                                        let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": format!("dl {}", c.id), "name": c.name, "what": what}))).await;
+                                        allowed = tokio::select! {
+                                            a = tokio::time::timeout(std::time::Duration::from_secs(180), arx) => matches!(a, Ok(Ok(true))),
+                                            _ = tx.closed() => return,
+                                        };
+                                        crate::browser::approvals().lock().unwrap().remove(&format!("dl {}", c.id));
+                                    }
+                                    if allowed {
+                                        match b.place_downloads(&downloads).await {
+                                            Ok(_) => dl_note = format!("\n\nSaved {} file(s) to the download folder: {}", downloads.len(),
+                                                downloads.iter().map(|d| d.name.clone()).collect::<Vec<_>>().join(", ")),
+                                            Err(e) => dl_note = format!("\n\n{}", e),
+                                        }
+                                    } else {
+                                        // deny it: resolve each file's path, then remove what Chrome wrote
+                                        if let Ok(paths) = b.place_downloads(&downloads).await {
+                                            for p in paths { let _ = std::fs::remove_file(p); }
+                                        }
+                                        dl_note = format!("\n\n(The user did not allow {} download(s); they were removed)", downloads.len());
+                                    }
+                                }
+                                json!({"ok": true, "chars": (st.text.chars().count() + note.chars().count() + dl_note.chars().count()),
+                                       "text": format!("{}{}{}", st.text, note, dl_note), "truncated": false, "ms": ms(t0),
                                        "image": st.screenshot})
                             }
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
