@@ -130,8 +130,9 @@ fn error_result(text: String, ms: u64) -> Value {
         backend: Option<Box<dyn Backend + Send + Sync>>,
         /// the sandbox's private Xvfb display, shared with the backend so it can be stopped after 10 minutes idle; `None` otherwise
         desktop: Option<Arc<SandboxDesktop>>,
-        /// the one-shot idle watcher (stopped the display after 10 min with no step), armed on the first step of a sandbox server
-        watchdog: std::sync::OnceLock<std::thread::JoinHandle<()>>,
+        /// the idle watcher for the sandbox desktop: it stops the display after 10 min quiet, then frees this slot on exit so a
+        /// restarted display gets a fresh one; `None` means none is alive (at most one at a time), and the Arc lets it clear the slot itself.
+        watchdog: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
     }
 
     impl Computers {
@@ -141,7 +142,7 @@ fn error_result(text: String, ms: u64) -> Value {
             let mode = config.computer.mode;
             let size = Size::parse(config.computer.display_size.as_deref());
             let (backend, desktop) = select_backend(mode, size);
-            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), steps: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: std::sync::OnceLock::new() }
+            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), steps: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: Arc::new(std::sync::Mutex::new(None)) }
         }
 
     /// Whether desktop use is on AND this computer has a backend (so the tools can be offered). Off by default. On a sandbox
@@ -178,12 +179,11 @@ fn error_result(text: String, ms: u64) -> Value {
     fn computer_apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
     fn computer_mode(&self) -> Mode { self.config.computer.mode }
 
-    /// Arm the idle watcher once (item 1): after 10 minutes with no computer step the sandbox display is stopped. Idempotent via `OnceLock`.
+    /// Arm the idle watcher (item 1): after 10 minutes with no computer step the sandbox display is stopped. Called on every step, so a
+    /// display that restarted after an idle stop (which cleared `stopped`, backend.rs) gets a fresh watcher — at most one alive at a time.
     fn arm_watchdog(&self) {
         if let Some(desktop) = &self.desktop {
-            // move an owned clone into the thread so the handle does not borrow `self` out of this method
-            let desktop = desktop.clone();
-            let _ = self.watchdog.get_or_init(move || std::thread::spawn(move || idle_watcher(desktop, IDLE_TIMEOUT)));
+            start_watchdog(desktop.clone(), IDLE_TIMEOUT, self.watchdog.clone());
         }
     }
 }
@@ -191,15 +191,28 @@ fn error_result(text: String, ms: u64) -> Value {
 /// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped (item 1).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Watches a sandbox desktop once and stops it when it has been quiet for `period`, or as soon as it is already stopping. The
-/// period is a parameter so tests can drive this in milliseconds (item 1): the original bug was that idle only broke the loop,
-/// leaving Xvfb running forever.
-fn idle_watcher(desktop: Arc<SandboxDesktop>, period: Duration) {
+/// Start a fresh idle watcher into `slot` only when none is already running, keeping at most one alive at a time (item 1): the previous
+/// watcher frees this slot on exit, so a restarted display (whose `stopped` was cleared) can arm a new one. Returns false when one is live.
+fn start_watchdog(desktop: Arc<SandboxDesktop>, period: Duration, slot: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>) -> bool {
+    // lock a clone so the closure can move `slot` (same underlying mutex), not the one the guard borrows.
+    let shared = slot.clone();
+    let mut w = shared.lock().unwrap();
+    if w.is_some() { return false; }   // a watcher is already alive; don't start a second one (at most one at a time)
+    *w = Some(std::thread::spawn(move || idle_watcher(desktop, period, slot)));
+    true
+}
+
+/// Watches a sandbox desktop until it has been quiet for `period`, then stops it — and as soon as it is already stopping. The watcher frees
+/// `slot` on exit so a restarted display can arm a fresh one (item 1); `period` is a parameter so tests drive this in milliseconds, and the
+/// original bug was that idle only broke the loop, leaving Xvfb running forever with no watcher after a restart.
+fn idle_watcher(desktop: Arc<SandboxDesktop>, period: Duration, slot: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>) {
     loop {
         std::thread::sleep(period);
         if desktop.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; }       // already stopping, nothing to do
         if desktop.is_idle(period) { desktop.stop(); break; }                         // idle the whole period → stop the display
     }
+    // this watcher has exited: free the slot so the next (re)start arms a fresh one instead of leaving the display with no watcher (item 1).
+    *slot.lock().unwrap() = None;
 }
 
 /// The desktop for `mode` on this OS: the sandbox builds a private Xvfb-backed display (never the real desktop), the others use
@@ -491,13 +504,40 @@ mod tests {
 
     /// A quiet sandbox display is stopped by the idle watcher within its period — not just left running once it breaks out of the
     /// loop (item 1). A short period is passed so the test runs in milliseconds and needs no Xvfb (`new` marks it last-used now, so
-    /// it reads idle once the quiet period elapses; watch `stopped` flip).
+    /// it reads idle once the quiet period elapses; watch `stopped` flip). The watcher clears its slot on exit, so the same slot can arm
+    /// a fresh one for a restarted display (see the next test).
     #[test]
     fn the_idle_watcher_stops_a_quiet_sandbox() {
         let desktop = Arc::new(SandboxDesktop::new(DEFAULT_DISPLAY));
         let check = desktop.clone();
-        std::thread::spawn(move || idle_watcher(desktop, Duration::from_millis(10)));
+        let slot: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(start_watchdog(desktop.clone(), Duration::from_millis(10), slot.clone()));
         for _ in 0..200 { if check.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_millis(10)); }
         assert!(check.stopped.load(std::sync::atomic::Ordering::Relaxed), "the idle watcher stopped the quiet sandbox display");
+    }
+
+    /// At most one idle watcher is alive at a time (item 1): while a watcher runs, arming again does not start a second one, even if it
+    /// has just stopped the display; and once it exits the slot frees so a restarted display can arm a fresh watcher that stops it again.
+    #[test]
+    fn the_watcher_stops_itself_at_most_once_then_rearms() {
+        // a single desktop with one watcher: arming while it is alive starts only that one (the second call returns false).
+        let d1 = Arc::new(SandboxDesktop::new(DEFAULT_DISPLAY));
+        let s1: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(start_watchdog(d1.clone(), Duration::from_millis(10), s1.clone()));
+        assert!(!start_watchdog(d1.clone(), Duration::from_millis(10), s1.clone()), "a watcher already running blocks a second one");
+        assert!(s1.lock().unwrap().is_some(), "exactly one watcher handle is tracked");
+
+        // once it has stopped and exited, the slot frees; a restarted display (stopped cleared) arms a fresh watcher that stops it again.
+        let d2 = Arc::new(SandboxDesktop::new(DEFAULT_DISPLAY));
+        let s2: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+        assert!(start_watchdog(d2.clone(), Duration::from_millis(10), s2.clone()));
+        for _ in 0..200 { if d2.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_millis(10)); }
+        assert!(d2.stopped.load(std::sync::atomic::Ordering::Relaxed), "the first watcher stopped the display");
+        // wait for it to exit and free the slot, so re-arming arms a genuinely fresh watcher.
+        for _ in 0..200 { if s2.lock().unwrap().is_none() { break; } std::thread::sleep(Duration::from_millis(10)); }
+        d2.stopped.store(false, std::sync::atomic::Ordering::Relaxed);   // a step restarted the display (ensure clears `stopped`, backend.rs)
+        assert!(start_watchdog(d2.clone(), Duration::from_millis(10), s2.clone()), "a fresh watcher arms after the old one freed its slot");
+        for _ in 0..200 { if d2.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_millis(10)); }
+        assert!(d2.stopped.load(std::sync::atomic::Ordering::Relaxed), "the fresh watcher stops the restarted display again");
     }
 }

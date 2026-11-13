@@ -383,6 +383,8 @@ mod linux {
             *self.last_used.lock().unwrap() = std::time::Instant::now();   // a step ran, so the idle watcher should count from now regardless of Xvfb state
             let mut state = self.inner.lock().unwrap();
             if !matches!(*state, State::Running(..)) {
+                // the display is (re)starting after an idle stop: clear `stopped` so a fresh idle watcher can run again (item 1).
+                self.stopped.store(false, std::sync::atomic::Ordering::Relaxed);
                 match start_sandbox_xvfb(self.size) {
                     Ok((child, disp)) => *state = State::Running(child, disp),
                     Err(e) => return Err(e),
@@ -770,6 +772,22 @@ mod tests {
         let disp = d.ensure()?;
         assert!(disp.starts_with(':'), "Xvfb writes back a usable display number: {disp}");
         // it is the number Xvfb itself chose (not ours): :99 or whatever -displayfd handed out, never the server's DISPLAY.
+        let _ = d.stop();
+        Ok(())
+    }
+
+    /// After an idle stop the display is `stopped`; when a step restarts it, `ensure` clears that flag so a fresh idle watcher can run
+    /// again (item 1). Ignored by default like the sibling Xvfb test — bail when Xvfb is absent.
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs Xvfb on a running session"]
+    #[test]
+    fn ensure_clears_stopped_when_the_display_restarts() -> Result<(), String> {
+        if !linux::tool_available("Xvfb") { return Ok(()); }
+        let d = SandboxDesktop::new(Size { width: 320, height: 240, depth: 24 });
+        let _ = d.stop();                                       // an idle watcher stopped the display
+        assert!(d.stopped.load(std::sync::atomic::Ordering::Relaxed), "it is stopped");
+        d.ensure()?;                                            // a step restarts the display
+        assert!(!d.stopped.load(std::sync::atomic::Ordering::Relaxed), "the restart cleared `stopped` so a fresh watcher can run (item 1)");
         let _ = d.stop();
         Ok(())
     }
