@@ -39,8 +39,8 @@ fn sends_input(name: &str) -> bool {
 /// holds the conversation's once-per-job approval so a later ask of the same job runs without asking again; `tx` sends
 /// the "approve" event when a step waits. Kept generic over the backend so tests drive a mock.
 pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mode: Mode, conv: &str, name: &str, args: &Value,
-                     id: &str, grants: &mut HashMap<String, Instant>, started_at: Instant, now: Instant,
-                     tx: &mpsc::Sender<RunEvent>) -> Value {
+                      id: &str, grants: &mut HashMap<String, Instant>, step_counts: &mut HashMap<String, usize>, max_steps: u32,
+                      started_at: Instant, now: Instant, tx: &mpsc::Sender<RunEvent>) -> Value {
     let t0 = Instant::now();
     let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
     // 1. A call with a missing or wrong argument is refused up front, the step never runs (like browser.rs refuses a
@@ -57,7 +57,8 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
     // 3. Classify into an Intent and check it against the active preset. A refusal is never executed and names the rule;
     //    an "ask" waits for approval through the browser's own path.
     let intent = rules::classify(name, args).unwrap_or(Intent::Screenshot);
-    match rules.check(&intent, &Ctx::default(), started_at, now) {
+    let decision = rules.check(&intent, &Ctx::default(), started_at, now);
+    match &decision {
         Decision::Refused(rule) => return error_result(format!("error: the step was not run, by rule {rule}"), ms(t0)),
         Decision::Approval(prompt) => {
             let granted = grants.get(conv).is_some_and(|until| now < *until);
@@ -67,13 +68,19 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "approve", "id": id, "name": name, "what": prompt}))).await;
                 let allowed = matches!(tokio::time::timeout(APPROVE_TIMEOUT, arx).await, Ok(Ok(true)));
                 browser::approvals().lock().unwrap().remove(id);
-                if allowed { grants.insert(conv.to_string(), now + JOB_WINDOW); }
+                if allowed { grants.insert(conv.to_string(), now + JOB_WINDOW); step_counts.insert(conv.to_string(), 0); /* next approval starts a new job count (item 2) */ }
                 if !allowed { return error_result("error: the user did not allow this step (or no one answered); ask them, or do something else".into(), ms(t0)); }
             }
         }
         Decision::Allowed => {}
     }
-    // 4. The rules let it through: run it over the desktop.
+    // 4. The rules let it through: run it over the desktop. One job (conversation) is capped at `max_steps` steps (item 2):
+    //    an ask is how you pass the limit ("the next approval starts a new job count"), so only freely-allowed steps hit this
+    //    hard cap; once there, refuse with a message naming the limit until an approval resets it.
+    if matches!(decision, Decision::Allowed) && step_counts.get(conv).copied().unwrap_or(0) >= max_steps as usize {
+        return error_result(format!("error: this job reached its limit of {max_steps} steps; approve it again to start a new job"), ms(t0));
+    }
+    *step_counts.entry(conv.to_string()).or_insert(0) += 1;
     let err = match name {
         "computer_screenshot" | "computer_wait" => Ok(()),
         "computer_click" => backend.click(step.x.unwrap_or(0), step.y.unwrap_or(0), step.button),
@@ -108,6 +115,8 @@ fn error_result(text: String, ms: u64) -> Value {
         started_at: Instant,
         /// per conversation: the once-per-job approval already given (until when), for the reuse of the browser path
         grants: tokio::sync::Mutex<HashMap<String, Instant>>,
+        /// per conversation: how many steps this job has run, capped at `computer.max_steps` (item 2); a fresh approval resets it
+        steps: tokio::sync::Mutex<HashMap<String, usize>>,
         backend: Option<Box<dyn Backend + Send + Sync>>,
         /// the sandbox's private Xvfb display, shared with the backend so it can be stopped after 10 minutes idle; `None` otherwise
         desktop: Option<Arc<SandboxDesktop>>,
@@ -122,7 +131,7 @@ fn error_result(text: String, ms: u64) -> Value {
             let mode = config.computer.mode;
             let size = Size::parse(config.computer.display_size.as_deref());
             let (backend, desktop) = select_backend(mode, size);
-            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: std::sync::OnceLock::new() }
+            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), steps: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: std::sync::OnceLock::new() }
         }
 
     /// Whether desktop use is on AND this computer has a backend (so the tools can be offered). Off by default. On a sandbox
@@ -149,8 +158,10 @@ fn error_result(text: String, ms: u64) -> Value {
         };
         let started_at = self.started_at;
         let now = Instant::now();
+        let max_steps = self.config.computer.max_steps;
         let mut grants = self.grants.lock().await;
-        run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, started_at, now, tx).await
+        let mut step_counts = self.steps.lock().await;
+        run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, started_at, now, tx).await
     }
 
     fn computer_apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
@@ -239,15 +250,18 @@ mod tests {
     fn ruleset() -> RuleSet { let mut r = RuleSet::strict(); r.allowed_apps = vec!["firefox".into()]; r }
     /// A fresh run loop channel; the receiver is kept alive so the "approve" event has somewhere to go.
     fn channel() -> (mpsc::Sender<RunEvent>, mpsc::Receiver<RunEvent>) { mpsc::channel(16) }
+    /// The per-job step cap used by the existing tests: large enough that only the dedicated limit tests hit it (item 2).
+    const LIMIT: u32 = crate::computer::settings::DEFAULT_MAX_STEPS;
 
     #[tokio::test]
     async fn a_refused_step_is_not_run_and_names_the_rule() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // Strict never types into a password field: classify the step, check it against the preset, decline without running.
         let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_type",
-                        &json!({"selector": "input[type=password]", "text": "x"}), "id1", &mut grants, Instant::now(), Instant::now(), &tx).await;
+                        &json!({"selector": "input[type=password]", "text": "x"}), "id1", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(r["text"].as_str().unwrap().contains("no_password_fields"), "the message names the rule: {}", r["text"]);
         assert!(mock.typed.borrow().is_empty(), "the refused step was not run");
@@ -257,9 +271,10 @@ mod tests {
     async fn a_wrong_argument_is_refused_before_it_runs() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // A click without x and y is refused up front; the step never reaches the backend.
-        let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click", &json!({"x": 5.0}), "id2", &mut grants, Instant::now(), Instant::now(), &tx).await;
+        let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click", &json!({"x": 5.0}), "id2", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(r["text"].as_str().unwrap().contains("x and y"));
         assert!(mock.clicks.borrow().is_empty());
@@ -269,14 +284,15 @@ mod tests {
     async fn an_approved_job_runs_its_steps_without_asking_again() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // A risky click ("Publish") asks once; approve it for the conversation, and a later risky click of the same job runs.
         seed_approval("idA", true).await;
         let r1 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
-                         &json!({"x": 3.0, "y": 4.0, "text": "Publish"}), "idA", &mut grants, Instant::now(), Instant::now(), &tx).await;
+                         &json!({"x": 3.0, "y": 4.0, "text": "Publish"}), "idA", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r1["ok"], true, "the approved risky click ran: {}", r1["text"]);
         let r2 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
-                         &json!({"x": 5.0, "y": 6.0, "text": "Publish"}), "idB", &mut grants, Instant::now(), Instant::now(), &tx).await;
+                         &json!({"x": 5.0, "y": 6.0, "text": "Publish"}), "idB", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r2["ok"], true, "a later risky click of the same job runs without asking again");
         assert_eq!(mock.clicks.borrow().len(), 2, "both approved clicks ran");
     }
@@ -285,10 +301,11 @@ mod tests {
     async fn a_denied_step_is_not_run() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         seed_approval("idD", false).await;
         let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click",
-                        &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idD", &mut grants, Instant::now(), Instant::now(), &tx).await;
+                        &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idD", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(mock.clicks.borrow().is_empty(), "a denied step was not run");
     }
@@ -297,13 +314,14 @@ mod tests {
     async fn watch_only_never_sends_input_but_reads() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // In watch-only a click is declined without asking and the desktop never receives it...
-        let click = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_click", &json!({"x": 3.0, "y": 4.0}), "idW", &mut grants, Instant::now(), Instant::now(), &tx).await;
+        let click = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_click", &json!({"x": 3.0, "y": 4.0}), "idW", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(click["ok"], false);
         assert!(mock.clicks.borrow().is_empty(), "watch-only sent no input");
         // ...but a screenshot (a read) still runs.
-        let shot = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_screenshot", &json!({}), "idR", &mut grants, Instant::now(), Instant::now(), &tx).await;
+        let shot = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_screenshot", &json!({}), "idR", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(shot["ok"], true);
     }
 
@@ -311,12 +329,13 @@ mod tests {
     async fn the_allowed_apps_open_and_refuse() {
         let mock = MockBackend::new();
         let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // Firefox is allowed to open; an unknown app is refused by the allowed_apps rule without running.
-        let opened = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "firefox"}), "idO", &mut grants, Instant::now(), Instant::now(), &tx).await;
+        let opened = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "firefox"}), "idO", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(opened["ok"], true);
         assert_eq!(*mock.opened.borrow(), vec!["firefox".to_string()]);
-        let refused = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "code"}), "idC", &mut grants, Instant::now(), Instant::now(), &tx).await;
+        let refused = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "code"}), "idC", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(refused["ok"], false);
         assert!(refused["text"].as_str().unwrap().contains("allowed_apps"));
     }
@@ -385,5 +404,48 @@ mod tests {
             assert!(shot.get("image").is_some(), "the screenshot carries a base64 JPEG for the model");
         }
         Ok(())
+    }
+
+    /// One job is capped at its configured step count (item 2): freely-allowed steps run until the limit, then are refused
+    /// with a message naming it; they stay refused until an approval resets the count.
+    #[tokio::test]
+    async fn one_job_is_capped_at_its_step_limit() {
+        let mock = MockBackend::new();
+        let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
+        let (tx, _rx) = channel();
+        // ordinary clicks are Allowed by the strict preset; run them up to and past a limit of 2.
+        for i in 0..3 {
+            let r = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
+                            &json!({"x": 1.0 + i as f64, "y": 2.0}), "idC", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+            if i < 2 { assert_eq!(r["ok"], true, "the first {} allowed steps run", i); }
+            else { assert_eq!(r["ok"], false, "a step at the limit is refused"); assert!(r["text"].as_str().unwrap().contains("limit of 2"), "{}", r["text"]); }
+        }
+        assert_eq!(mock.clicks.borrow().len(), 2, "only the two steps under the cap actually ran");
+    }
+
+    /// A user approval resets the job's count ("the next approval starts a new job count", item 2): after freely-allowed steps
+    /// reach the plain cap of 2, approving one risky click resets it and lets more allowed steps run again.
+    #[tokio::test]
+    async fn an_approved_reset_allows_more_steps_than_the_plain_cap() {
+        let mock = MockBackend::new();
+        let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
+        let (tx, _rx) = channel();
+        seed_approval("idReset", true).await;  // approve the risky click so its approval resets the count
+        let r1 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id1", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r1["ok"], true);
+        let r2 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id2", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r2["ok"], true);
+        // a risky click ("Publish") asks; approving it resets the count to start a new job.
+        let r3 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idReset", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r3["ok"], true, "the approved risky click ran and reset the count: {}", r3["text"]);
+        // two more allowed steps run past the plain cap before the cap bites again.
+        let r4 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id4", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        let r5 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id5", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r4["ok"], true, "after a reset an allowed step runs again");
+        assert_eq!(r5["ok"], false, "the cap bites once the count reaches it again");
+        assert!(r5["text"].as_str().unwrap().contains("limit of 2"), "{}", r5["text"]);
+        assert_eq!(mock.clicks.borrow().len(), 4, "reset let the job run past its plain cap of 2");
     }
 }

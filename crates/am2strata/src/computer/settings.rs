@@ -35,8 +35,12 @@ impl Mode {
     pub const DEFAULT: Mode = Mode::Sandbox;
 }
 
+/// The maximum steps one job (conversation) runs before a step is refused (`"computer": {"max_steps": N}`, default 200);
+/// at the limit the step is refused naming the limit, and the next approval starts a new count (item 2).
+pub const DEFAULT_MAX_STEPS: u32 = 200;
+
 /// The desktop control: switched on (`use_`), the mode it runs in, the apps the sandbox may open, whether downloads ask.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComputerUse {
     pub use_: bool,
     pub mode: Mode,
@@ -49,6 +53,15 @@ pub struct ComputerUse {
     pub site_block: Vec<String>,
     /// the sandbox virtual display as "WxHxD" (e.g. "1280x800x24"); `None` uses the default 1280x800x24
     pub display_size: Option<String>,
+    /// the maximum steps one job runs before it is refused; see `DEFAULT_MAX_STEPS`. Absent in config uses that default.
+    pub max_steps: u32,
+}
+
+impl Default for ComputerUse {
+    fn default() -> Self {
+        ComputerUse { use_: false, mode: Mode::DEFAULT, apps: Vec::new(), download_ask: None, site_allow: Vec::new(),
+                      site_block: Vec::new(), display_size: None, max_steps: DEFAULT_MAX_STEPS }
+    }
 }
 
 /// Whether the existing headless-Chrome tools are offered again (`"browser": {"use": true}`), off by default.
@@ -109,10 +122,11 @@ impl Config {
                 mode: if let Some(m) = c.get("mode").and_then(Value::as_str) { Mode::parse(m) } else { Mode::DEFAULT },
                 apps: names_array(c.get("apps")),
                 download_ask: c.get("download_ask").and_then(Value::as_bool),
-                site_allow: names_array(c.get("site_allow")),
-                site_block: names_array(c.get("site_block")),
-                display_size: c.get("display_size").and_then(Value::as_str).map(str::to_string),
-            },
+                 site_allow: names_array(c.get("site_allow")),
+                 site_block: names_array(c.get("site_block")),
+                 display_size: c.get("display_size").and_then(Value::as_str).map(str::to_string),
+                 max_steps: c.get("max_steps").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(DEFAULT_MAX_STEPS),
+             },
             None => ComputerUse { mode: Mode::DEFAULT, ..Default::default() },
         };
         let browser_use = rest.get("browser").and_then(Value::as_object).and_then(|b| b.get("use")).and_then(Value::as_bool).unwrap_or(false);
@@ -148,6 +162,9 @@ impl Config {
         }
         if let Some(d) = &self.computer.display_size {
             computer["display_size"] = json!(d);
+        }
+        if self.computer.max_steps != DEFAULT_MAX_STEPS {
+            computer["max_steps"] = json!(self.computer.max_steps);
         }
         let mut browser = json!({"use": self.browser.use_});
         json!({"computer": computer, "browser": browser, "rules": self.rules.to_value()})
@@ -249,5 +266,18 @@ mod tests {
         assert_eq!(Mode::parse("trusted job"), Mode::TrustedJob);
         assert_eq!(Mode::parse("weird"), Mode::Sandbox, "unknown falls back to the sandbox default");
         assert_eq!(Mode::Sandbox.as_str(), "sandbox");
+    }
+
+    /// The per-job step limit defaults to `DEFAULT_MAX_STEPS` and reads back a set value, round-tripping through the config.
+    #[test]
+    fn max_steps_defaults_and_round_trips() {
+        assert_eq!(Config::from_config(&rest(json!({"computer": {"use": true}})), Path::new("/tmp")).computer.max_steps, DEFAULT_MAX_STEPS);
+        let c = Config::from_config(&rest(json!({"computer": {"use": true, "max_steps": 50}})), Path::new("/tmp"));
+        assert_eq!(c.computer.max_steps, 50);
+        // a hand-written small limit still round-trips (written back, read again)
+        let mut cfg = Config::default();
+        cfg.computer.use_ = true;
+        cfg.computer.max_steps = 7;
+        assert_eq!(Config::from_config(&rest(cfg.to_value()), Path::new("/tmp")).computer.max_steps, 7);
     }
 }
