@@ -466,6 +466,8 @@ async fn main() -> Result<()> {
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
+    // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
+    let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,

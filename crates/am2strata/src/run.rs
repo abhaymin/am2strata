@@ -982,6 +982,12 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
                         }
                     }
+                } else if let (true, None, Some(comp)) = (crate::computer::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.computer.get()) {
+                    // classify the step and check it against the active preset before it runs: a refused step is not executed
+                    // and its result names the rule; an "ask" waits for approval through the browser's own path. The desktop
+                    // is this machine's (sandbox / watch-only ...); in watch-only no input is sent.
+                    let conv_of = conv.clone().unwrap_or_else(|| "chat".to_string());
+                    comp.step(&conv_of, &c.name, &args, &c.id, &tx).await
                 } else if let (true, None, Some(code)) = (crate::code_run::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.code.get()) {
                     tokio::select! {
                         r = crate::code_run::call(code, &args) => r,
