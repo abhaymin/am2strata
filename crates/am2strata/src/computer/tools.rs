@@ -21,7 +21,7 @@ pub fn tools(vision: bool) -> Vec<Value> {
                "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"},
                                  "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}},
                               "required": ["x", "y"]}}),
-        json!({"name": "computer_type", "description": "Type text into the focused element, replacing its current text (focus it first, with a click).",
+        json!({"name": "computer_type", "description": "Type text at the cursor in the focused element (it appends, it does not replace — click the field first to focus it).",
                "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "computer_key", "description": "Press a key or key combination on the desktop (e.g. \"Enter\", or [\"Ctrl\", \"a\"] / \"Ctrl+a\").",
                "parameters": {"type": "object", "properties": {
