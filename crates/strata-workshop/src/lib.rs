@@ -9,5 +9,6 @@
 //! quantizer, LoRA train, merge, convert, quantize, ONNX, GGUF→safetensors, strata-ready, dataset, API. See
 //! `docs/MODEL-WORKSHOP-PLAN.md`.
 
+pub mod lora;
 pub mod safetensors_io;
 pub mod testmodel;
