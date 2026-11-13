@@ -10,7 +10,7 @@ use crate::run::{self, Refusal, RunOpts, Started};
 use crate::{error, AppState};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,7 +110,38 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             opts.media = Some(caps);
         }
     }
-    // the browser (computer use): only for a request that asks, never for another web page
+    // check_media: review a take's pauses and words heard, and a film's frame jumps; offered like the media tools
+    if req.get("strata_media") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+        let own = own_names(prep);
+        let extra: Vec<Value> = vec![json!({"name": "check_media", "description":
+            "Quality-check one of this PC's takes and films the way the reviewer does: audio — the longest pause between \
+             words, whether it is clipped or ends mid-voice, and the share of the expected words the speech model heard; \
+             video — single-frame jumps (a broken crossfade), frozen holds and length. Returns each measure with an ok/\
+             not and the thresholds used.",
+            "parameters": {"type": "object", "properties": {
+                "audio": {"type": "string", "description": "the take to review, as a WAV (base64/data URL or an http(s) URL / file path)"},
+                "expected_text": {"type": "string", "description": "the words that should be spoken, in the language below, for the words-heard check"},
+                "language": {"type": "string", "description": "a language code: hi, en, fr, es, ml, ta, kn, te ... (Hindi is Unicode-aware)"},
+                "heard_text": {"type": "string", "description": "optional pre-transcribed text; left out and, when the media engine is built, Whisper transcribes the audio"},
+                "video": {"type": "string", "description": "optional a video (base64/data URL or file path) to scan for single-frame jumps"},
+                "max_s": {"type": "number", "description": "longest interior pause allowed in seconds (default 0.25)"},
+                "words_ok": {"type": "number", "description": "share of expected words heard to pass the word check (default 0.6)"}}}})]
+             .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+         if !extra.is_empty() {
+             add(prep, &mut offered, extra);
+         }
+     }
+     // dub_narration: dub a narration into another language over the same stems and beat times (with the seed retry, the
+     // inner pause cap and cut-with-report); offered like the media tools, it needs check_media's words-heard check too
+     if req.get("strata_media") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+         let own = own_names(prep);
+          let extra: Vec<Value> = vec![dub_narration_tool()]
+              .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+         if !extra.is_empty() {
+             add(prep, &mut offered, extra);
+         }
+     }
+     // the browser (computer use): only for a request that asks, never for another web page
     if (req.get("strata_browser") == Some(&Value::Bool(true)) || has("browser")) && !structured && !forced && !crate::foreign_origin(s, headers) {
         if let Some(b) = s.mgr.browser.get().filter(|b| b.available()) {
             let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
@@ -147,11 +178,57 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
     Ok(offered)
 }
 
+/// The dub_narration tool schema (offered when strata_media opts in): narration lines, takes, stems and language. Each line
+/// is an OBJECT that types `speaker`/`text`/`t0`/`dur` and requires the first two, so `items.required` is well-formed.
+fn dub_narration_tool() -> Value {
+    json!({"name": "dub_narration", "description":
+        "Dub a spoken narration into another language on this PC, re-laid over the same music and stems at the SAME beat \
+         times so the picture does not move. Give it the narration lines with their beat times ({\"speaker\",\"text\",\"t0\",\"dur\"} per line), \
+         the recorded takes to lay over them (as WAV data URLs), the other audio stems (which set the film's length) and a target language; \
+         optionally show the translation first by passing source_lines. Returns a full-length soundtrack WAV of the original length as a data URL \
+         and a report naming every line that was sped up to fit, cut or kept silent with only the stems.",
+        "parameters": {"type": "object", "properties": {
+             "lines": {"type": "array", "description": "the narration lines in order, each {\"speaker\",\"text\",\"t0\",\"dur\"} (t0/dur seconds)", "items": {"type": "object", "properties": {"speaker": {"type": "string"}, "text": {"type": "string"}, "t0": {"type": "number"}, "dur": {"type": "number"}}, "required": ["speaker", "text"]}},
+            "takes": {"type": "array", "items": {"type": "string"}, "description": "a WAV per line to lay over the narration (base64/data URL); a missing take keeps that line silent"},
+            "stems": {"type": "string", "description": "the other audio stems — the music and listening clips — as a WAV (data URL/file path), setting the full length of the soundtrack"},
+            "heard": {"type": "array", "items": {"type": "string"}, "description": "optional per-line transcripts, filled into words_heard with check_media"},
+            "language": {"type": "string", "description": "target language as a code: de, fr, es, hi, ml, ta, kn, te ..."}}}})
+}
+
 /// Start the request: with the server's tools, in the tool loop; else as it is.
 pub async fn start(mgr: Arc<crate::manager::Manager>, loaded: Arc<crate::manager::Loaded>, prep: Prepared, req: Value, opts: RunOpts,
                    offered: Offered) -> Result<Started, Refusal> {
     match offered {
         Some((hub, names)) => run::start_mcp(mgr, loaded, prep, req, opts, hub, names).await,
         None => run::start(mgr, loaded, prep, req, opts).await,
+    }
+}
+
+// ----------------------------------------------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The dub_narration tool's `lines` is an array whose `items` is an OBJECT schema that types each field and requires
+    /// `speaker` and `text` — so the schema is well-formed (items.required present) instead of putting `required` on the
+    /// array itself.
+    #[test]
+    fn dub_narration_lines_items_is_a_typed_object_schema_with_required() {
+        let tool = dub_narration_tool();
+        assert_eq!(tool["name"].as_str(), Some("dub_narration"));
+        let lines = &tool["parameters"]["properties"]["lines"];
+        assert_eq!(lines["type"].as_str(), Some("array"), "lines is an array");
+        let items = &lines["items"];
+        assert_eq!(items["type"].as_str(), Some("object"), "each line's items is an object");
+        // per-field types, so a caller can tell which entries are strings and which are times
+        assert_eq!(items["properties"]["speaker"]["type"].as_str(), Some("string"));
+        assert_eq!(items["properties"]["text"]["type"].as_str(), Some("string"));
+        assert_eq!(items["properties"]["t0"]["type"].as_str(), Some("number"));
+        assert_eq!(items["properties"]["dur"]["type"].as_str(), Some("number"));
+        // the required fields are listed on the items object, not on the array
+        let required: Vec<&str> = items["required"].as_array().unwrap()
+            .iter().filter_map(Value::as_str).collect();
+        assert!(required.contains(&"speaker") && required.contains(&"text"), "items requires speaker and text: {required:?}");
     }
 }

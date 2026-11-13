@@ -159,6 +159,10 @@ pub struct Manager {
     pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
     /// the sandbox for run_python (code_run.rs; set at start)
     pub code: std::sync::OnceLock<Arc<crate::code_run::CodeRun>>,
+    /// check_media, the media quality checks chat tool (media_check.rs; set at start)
+    pub media_check: std::sync::OnceLock<Arc<crate::media_check::Checker>>,
+    /// dub_narration, the dub a narration into another language tool (media_dub.rs; set at start)
+    pub media_dub: std::sync::OnceLock<Arc<crate::media_dub::Dubbing>>,
     /// what each model took from free memory when it loaded (mem.rs), under <data>/model-memory.json
     pub needs: crate::mem::Needs,
     /// how long each model takes to load (seconds), under <data>/model-load-s.json: the queue's switch costs
@@ -305,6 +309,8 @@ impl Manager {
             clients: std::sync::OnceLock::new(),
             browser: std::sync::OnceLock::new(),
             code: std::sync::OnceLock::new(),
+            media_check: std::sync::OnceLock::new(),
+            media_dub: std::sync::OnceLock::new(),
             needs: crate::mem::Needs::open(&memory_dir),
             load_s: crate::mem::Needs::open_file(memory_dir.join("model-load-s.json")),
             warmed: Default::default(),
