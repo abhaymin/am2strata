@@ -1305,9 +1305,7 @@ async function saveConfig() {
 }
 
 // ------------------------------------------------------------------ Computer and browser use (dedicated Settings section)
-// The keys below are owned by this section; they round-trip through the same GET/POST /config the Model config uses.
-const COMPUTE_KEYS = new Set(["browser.use", "computer.use", "rules.preset", "computer.mode",
-                              "computer.apps", "computer.site_allow", "computer.site_block", "computer.download_ask"]);
+// The keys above (COMPUTE_KEYS) are owned by this section; they round-trip through the same GET/POST /config the Model config uses.
 const CU_TOGGLES = [["cu-no-password", "no_password_fields"], ["cu-no-payment", "no_payment_fields"],
                     ["cu-no-signin", "no_sign_in"], ["cu-ask-risky", "ask_send_delete_install_buy_publish"]];
 let cuBase = {};   // the values as loaded, so Save sends only what changed
