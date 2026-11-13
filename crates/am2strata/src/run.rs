@@ -772,6 +772,18 @@ pub fn compact_tool_results(messages: &mut [Value], context: usize) -> usize {
     cut
 }
 
+/// In `"approve": "job"` mode whether an allowed risky step runs again without asking. The one-time job grant covers only
+/// publishing risks (`r.publishing`); a non-publishing risk (a password field, a form submit) always asks, even after a
+/// publishing grant on the same site is remembered — so it cannot silently get Publish/Delete/Upload for free.
+fn publishing_job_allows(publishing: bool, auto_approve: bool, job_mode: bool, site_granted: bool) -> bool {
+    auto_approve || (job_mode && publishing && site_granted)
+}
+
+/// Whether to record the once-per-job grant after an allowed risky step: only for a publishing risk, never an ordinary one.
+fn remember_publishing(publishing: bool, allowed: bool) -> bool {
+    allowed && publishing
+}
+
 /// `start` with the MCP tools run here: the model writes a call to an MCP tool, the server runs it, adds the call
 /// and its result to the conversation and lets the model continue, up to `max_rounds` times. `names`: the MCP tools
 /// this request offered; any other call is the request's own and ends the turn as always (the client answers it),
@@ -923,7 +935,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                     let mut approved_note = String::new(); // "approved" or "approved (job)", kept in the step result
                     if let Some(r) = b.risk(&page_of, &c.name, &args).await {
                         let job = b.settings.approve == crate::browser::ApproveMode::Job;
-                        allowed = b.settings.auto_approve || (job && b.job_allowed(&page_of, &r.site));
+                        // the one-time job grant covers only publishing risks: a password field or form submit always asks.
+                        allowed = publishing_job_allows(r.publishing, b.settings.auto_approve, job, b.job_allowed(&page_of, &r.site));
                         if !allowed {
                             let what_prompt = match (job, r.publishing) {
                                 (true, true) => format!("Allow this job to publish on {}?", r.site),
@@ -937,7 +950,8 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                                 _ = tx.closed() => return,
                             };
                             crate::browser::approvals().lock().unwrap().remove(&c.id);
-                            if allowed { b.job_remember(&page_of, &r.site); }
+                            // record a publishing job grant only for a publishing risk (never a password or form submit).
+                            if remember_publishing(r.publishing, allowed) { b.job_remember(&page_of, &r.site); }
                         }
                         if allowed && !b.settings.auto_approve {
                             approved_note = if job { "approved (job)".into() } else { "approved".into() };
@@ -1070,6 +1084,25 @@ mod tests {
         // the context had only 416 tokens left (issue 16): the answer still gets its room
         assert_eq!(thinking_budget(None, 416, true, true), Some(208));
         assert_eq!(thinking_budget(None, 416, true, false), None, "a small cap the client chose is left as it is");
+    }
+
+    /// in "job" mode the grant covers only publishing risks: an ordinary risk (password field, form submit) keeps asking even with a
+    /// remembered publishing grant on the site, and no grant opens a first publishing click. Auto-approve lets everything through.
+    #[test]
+    fn publishing_job_grant_covers_only_publishing() {
+        assert!(!publishing_job_allows(false, false, true, true), "a password field keeps asking under an existing publishing grant");
+        assert!(!publishing_job_allows(false, false, true, false));
+        assert!(publishing_job_allows(true, false, true, true), "the remembered publishing grant lets a publish through without asking");
+        assert!(!publishing_job_allows(true, false, true, false), "no grant yet: the first publish still asks");
+        assert!(publishing_job_allows(false, true, true, false), "auto-approve allows an ordinary risk too");
+    }
+
+    /// a job grant is recorded only for a publishing risk that was allowed — not after an ordinary risk
+    #[test]
+    fn job_grant_recorded_only_for_publishing() {
+        assert!(remember_publishing(true, true));
+        assert!(!remember_publishing(false, true), "an ordinary risk never opens Publish/Delete/Upload for free");
+        assert!(!remember_publishing(true, false));
     }
 }
 
