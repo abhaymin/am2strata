@@ -126,12 +126,33 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
                 "video": {"type": "string", "description": "optional a video (base64/data URL or file path) to scan for single-frame jumps"},
                 "max_s": {"type": "number", "description": "longest interior pause allowed in seconds (default 0.25)"},
                 "words_ok": {"type": "number", "description": "share of expected words heard to pass the word check (default 0.6)"}}}})]
-            .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
-        if !extra.is_empty() {
-            add(prep, &mut offered, extra);
-        }
-    }
-    // the browser (computer use): only for a request that asks, never for another web page
+             .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+         if !extra.is_empty() {
+             add(prep, &mut offered, extra);
+         }
+     }
+     // dub_narration: dub a narration into another language over the same stems and beat times (with the seed retry, the
+     // inner pause cap and cut-with-report); offered like the media tools, it needs check_media's words-heard check too
+     if req.get("strata_media") == Some(&Value::Bool(true)) && !structured && !forced && !crate::foreign_origin(s, headers) {
+         let own = own_names(prep);
+         let extra: Vec<Value> = vec![json!({"name": "dub_narration", "description":
+             "Dub a spoken narration into another language on this PC, re-laid over the same music and stems at the SAME beat \
+              times so the picture does not move. Give it the narration lines with their beat times ({\"speaker\",\"text\",\"t0\",\"dur\"} per line), \
+              the recorded takes to lay over them (as WAV data URLs), the other audio stems (which set the film's length) and a target language; \
+              optionally show the translation first by passing source_lines. Returns a full-length soundtrack WAV of the original length as a data URL \
+              and a report naming every line that was sped up to fit, cut or kept silent with only the stems.",
+             "parameters": {"type": "object", "properties": {
+                 "lines": {"type": "array", "description": "the narration lines in order, each {\"speaker\",\"text\",\"t0\",\"dur\"} (t0/dur seconds)", "required": ["speaker","text"]},
+                 "takes": {"type": "array", "items": {"type": "string"}, "description": "a WAV per line to lay over the narration (base64/data URL); a missing take keeps that line silent"},
+                 "stems": {"type": "string", "description": "the other audio stems — the music and listening clips — as a WAV (data URL/file path), setting the full length of the soundtrack"},
+                 "heard": {"type": "array", "items": {"type": "string"}, "description": "optional per-line transcripts, filled into words_heard with check_media"},
+                 "language": {"type": "string", "description": "target language as a code: de, fr, es, hi, ml, ta, kn, te ..."}}}})]
+             .into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+         if !extra.is_empty() {
+             add(prep, &mut offered, extra);
+         }
+     }
+     // the browser (computer use): only for a request that asks, never for another web page
     if (req.get("strata_browser") == Some(&Value::Bool(true)) || has("browser")) && !structured && !forced && !crate::foreign_origin(s, headers) {
         if let Some(b) = s.mgr.browser.get().filter(|b| b.available()) {
             let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };

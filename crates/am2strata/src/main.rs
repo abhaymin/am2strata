@@ -32,6 +32,7 @@ mod memory;
 mod media;
 mod compose;
 mod media_check;
+mod media_dub;
 mod media_jobs;
 mod model_remove;
 mod monitor;
@@ -459,6 +460,7 @@ async fn main() -> Result<()> {
     state.media_jobs.bind(state.clone());
     let _ = mgr.code.set(state.code_run.clone());
     let _ = mgr.media_check.set(Arc::new(media_check::Checker::new(Arc::new(state.clone()))));
+    let _ = mgr.media_dub.set(Arc::new(media_dub::Dubbing::new(Arc::new(state.clone()))));
     state.media_jobs.resume(unfinished);
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
@@ -509,6 +511,7 @@ async fn main() -> Result<()> {
         .route("/v1/media/videos/compose", post(compose::compose_videos))
         .route("/v1/media/thumbnails", post(compose::thumbnails))
         .route("/v1/media/check", post(media_check::check_endpoint))
+        .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

@@ -995,6 +995,15 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                         },
                         _ = tx.closed() => return,
                     }
+                } else if let (true, None, Some(dub)) = (crate::media_dub::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.media_dub.get()) {
+                    tokio::select! {
+                        r = dub.call(&args) => match r {
+                            Ok(v) => json!({"ok": true, "chars": v.to_string().chars().count() as i64,
+                                "text": v["text"].as_str().unwrap_or(""), "truncated": false, "ms": 0}),
+                            Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": 0}),
+                        },
+                        _ = tx.closed() => return,
+                    }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
                     if c.name == "web_search" {
                         web_queries += 1;

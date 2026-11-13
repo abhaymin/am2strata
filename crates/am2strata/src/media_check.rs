@@ -30,7 +30,7 @@ use std::sync::Arc;
 pub const TOOL_NAMES: [&str; 1] = ["check_media"];
 
 /// A frame is "loud" when it is more than this many dB under the loudest frame (capgaps.py's GAP_DB).
-const GAP_DB: f32 = 30.0;
+pub const GAP_DB: f32 = 30.0;
 /// The analysis frame length: a 10 ms window (capgaps.py's FS), used for pause and near-static seconds.
 const FRAME_S: f64 = 0.01;
 /// The longest interior pause allowed, in seconds (dub.py caps pauses inside a take at this).
