@@ -352,14 +352,17 @@ mod linux {
     pub struct SandboxDesktop {
         size: Size,
         inner: std::sync::Mutex<State>,
+        /// when the display was last driven, so the idle watcher can tell it has been quiet (item 1); set on `new`, refreshed each step.
+        /// A mutex keeps this interior-mutable (driven through `&self`) and Send + Sync like the rest of the desktop.
+        last_used: std::sync::Mutex<std::time::Instant>,
         /// whether the display has been told to stop (set on drop and by the idle watcher), so the watcher can exit promptly
         pub stopped: std::sync::atomic::AtomicBool,
     }
 
-    /// Whether Xvfb is running yet (`Idle`), on screen (`Running(child, display, last_used)`) or stopped.
+    /// Whether Xvfb is running yet (`Idle`), on screen (`Running(child, display)`) or stopped.
     enum State {
         Idle,
-        Running(std::process::Child, String, std::time::Instant),
+        Running(std::process::Child, String),
     }
 
     impl std::fmt::Debug for SandboxDesktop {
@@ -372,41 +375,38 @@ mod linux {
     impl SandboxDesktop {
         /// Construct a sandbox desktop at `size`, not yet started (Xvfb runs on the first `ensure`).
         pub fn new(size: Size) -> SandboxDesktop {
-            SandboxDesktop { size, inner: std::sync::Mutex::new(State::Idle), stopped: std::sync::atomic::AtomicBool::new(false) }
+            SandboxDesktop { size, inner: std::sync::Mutex::new(State::Idle), last_used: std::sync::Mutex::new(std::time::Instant::now()), stopped: std::sync::atomic::AtomicBool::new(false) }
         }
 
         /// The display a step drives, starting Xvfb lazily the first time (item 1) and refreshing the last-used clock.
         pub fn ensure(&self) -> Result<String, String> {
+            *self.last_used.lock().unwrap() = std::time::Instant::now();   // a step ran, so the idle watcher should count from now regardless of Xvfb state
             let mut state = self.inner.lock().unwrap();
             if !matches!(*state, State::Running(..)) {
                 match start_sandbox_xvfb(self.size) {
-                    Ok((child, disp)) => *state = State::Running(child, disp, std::time::Instant::now()),
+                    Ok((child, disp)) => *state = State::Running(child, disp),
                     Err(e) => return Err(e),
                 }
             }
-            if let State::Running(_, _, last) = &mut *state { *last = std::time::Instant::now(); }
             match &*state {
-                State::Running(_, d, _) => Ok(d.clone()),
+                State::Running(_, d) => Ok(d.clone()),
                 State::Idle => Err("the sandbox display is not running".into()),
             }
         }
 
-        /// Stop the virtual display (kill Xvfb); called on drop and by the 10-minute idle watcher.
+        /// Stop the virtual display (kill Xvfb); called on drop and by the idle watcher.
         pub fn stop(&self) {
             self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut state = self.inner.lock().unwrap();
-            if let State::Running(child, _, _) = &mut *state { let _ = child.kill(); let _ = child.wait(); }
+            if let State::Running(child, _) = &mut *state { let _ = child.kill(); let _ = child.wait(); }
             *state = State::Idle;
         }
 
-        /// True when the display has been quiet for 10 minutes, so the idle watcher can stop it.
-        pub fn is_idle(&self) -> bool {
-            matches!(*self.inner.lock().unwrap(), State::Running(_, _, last) if std::time::Instant::now().duration_since(last) > IDLE_TIMEOUT)
+        /// True when it has been quiet at least `within` (the idle watcher's period), so the watcher can stop it.
+        pub fn is_idle(&self, within: std::time::Duration) -> bool {
+            std::time::Instant::now().duration_since(*self.last_used.lock().unwrap()) > within
         }
     }
-
-    /// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
     impl std::ops::Drop for SandboxDesktop {
         fn drop(&mut self) { self.stop(); }

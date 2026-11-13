@@ -183,7 +183,7 @@ fn error_result(text: String, ms: u64) -> Value {
         if let Some(desktop) = &self.desktop {
             // move an owned clone into the thread so the handle does not borrow `self` out of this method
             let desktop = desktop.clone();
-            let _ = self.watchdog.get_or_init(move || std::thread::spawn(move || idle_watcher(desktop)));
+            let _ = self.watchdog.get_or_init(move || std::thread::spawn(move || idle_watcher(desktop, IDLE_TIMEOUT)));
         }
     }
 }
@@ -191,11 +191,14 @@ fn error_result(text: String, ms: u64) -> Value {
 /// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped (item 1).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Stops the sandbox display once it has been quiet for a full idle period, or as soon as it is already stopping.
-fn idle_watcher(desktop: Arc<SandboxDesktop>) {
+/// Watches a sandbox desktop once and stops it when it has been quiet for `period`, or as soon as it is already stopping. The
+/// period is a parameter so tests can drive this in milliseconds (item 1): the original bug was that idle only broke the loop,
+/// leaving Xvfb running forever.
+fn idle_watcher(desktop: Arc<SandboxDesktop>, period: Duration) {
     loop {
-        std::thread::sleep(IDLE_TIMEOUT);
-        if desktop.is_idle() || desktop.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; }
+        std::thread::sleep(period);
+        if desktop.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; }       // already stopping, nothing to do
+        if desktop.is_idle(period) { desktop.stop(); break; }                         // idle the whole period → stop the display
     }
 }
 
@@ -484,5 +487,17 @@ mod tests {
         }
         // only the one in-bounds click reached the backend: out-of-bounds clicks never send anything.
         assert_eq!(mock.clicks.borrow().len(), 1, "only the in-bounds click ran");
+    }
+
+    /// A quiet sandbox display is stopped by the idle watcher within its period — not just left running once it breaks out of the
+    /// loop (item 1). A short period is passed so the test runs in milliseconds and needs no Xvfb (`new` marks it last-used now, so
+    /// it reads idle once the quiet period elapses; watch `stopped` flip).
+    #[test]
+    fn the_idle_watcher_stops_a_quiet_sandbox() {
+        let desktop = Arc::new(SandboxDesktop::new(DEFAULT_DISPLAY));
+        let check = desktop.clone();
+        std::thread::spawn(move || idle_watcher(desktop, Duration::from_millis(10)));
+        for _ in 0..200 { if check.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_millis(10)); }
+        assert!(check.stopped.load(std::sync::atomic::Ordering::Relaxed), "the idle watcher stopped the quiet sandbox display");
     }
 }
