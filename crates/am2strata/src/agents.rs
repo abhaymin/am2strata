@@ -583,9 +583,9 @@ mod tests {
 
     #[test]
     fn setup_backs_up_and_reset_restores() {
-        // CI runs this setup/apply/reset from several processes (the lib build and the am2strata bin, both include the
-        // agents tests) at once; a PID can be reused by another process mid-run, so the folder adds nanos to stay
-        // unique or two runs would share it and lose each other's restored .claude/settings.json.
+        // A home folder of its own for each run (pid + nanos, as memory.rs does): a folder named by pid alone can be
+        // left behind by an earlier run on a reused CI runner, or shared by any other test that picks the same name.
+        // The exact cause of the old flaky NotFound at the reset check below was not proven; this keeps the run isolated.
         let home = std::env::temp_dir().join(format!("am2-agents-{}-{}", std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
         let _ = std::fs::remove_dir_all(&home);
