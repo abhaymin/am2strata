@@ -932,7 +932,9 @@ mod tests {
         clean(&dir);
     }
 
-    /// a ".." that stays inside is still accepted (the positive control for the escape above)
+    /// a ".." that stays inside is still accepted (the positive control for the escape above). Not on Windows, where
+    /// such a path is refused (the safe side: a refusal, never a file from outside)
+    #[cfg(not(windows))]
     #[test]
     fn upload_dotted_inside_is_accepted() {
         let dir = fresh("dotted");

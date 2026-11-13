@@ -598,14 +598,10 @@ mod tests {
         assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), "{\"theme\": \"dark\", \"env\": {\"FOO\": \"1\"}}");
         reset("pi", &home).unwrap();
         assert!(!home.join(".pi/agent/models.json").exists());
-        // JSONC is left alone (not checked on Windows, where the runner refused this scratch file just after making its
-        // folder; the JSONC rule itself is the same code on every system)
-        #[cfg(not(windows))]
-        {
-            std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
-            std::fs::write(home.join(".config/opencode/opencode.json"), "{ // mine\n}").unwrap();
-            assert!(setup("opencode", &t(true), &home).unwrap_err().contains("not plain JSON"));
-        }
+        // JSONC is left alone
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        std::fs::write(home.join(".config/opencode/opencode.json"), "{ // mine\n}").unwrap();
+        assert!(setup("opencode", &t(true), &home).unwrap_err().contains("not plain JSON"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
