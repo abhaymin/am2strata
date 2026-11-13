@@ -157,6 +157,8 @@ pub struct Manager {
     pub clients: std::sync::OnceLock<Arc<crate::clients::Clients>>,
     /// browser computer use (browser.rs; set from the run config at start)
     pub browser: std::sync::OnceLock<Arc<crate::browser::Browsers>>,
+    /// desktop computer use (computer::engine; set from the run config at start)
+    pub computer: std::sync::OnceLock<Arc<crate::computer::Computers>>,
     /// the sandbox for run_python (code_run.rs; set at start)
     pub code: std::sync::OnceLock<Arc<crate::code_run::CodeRun>>,
     /// check_media, the media quality checks chat tool (media_check.rs; set at start)
@@ -308,6 +310,7 @@ impl Manager {
             web: std::sync::OnceLock::new(),
             clients: std::sync::OnceLock::new(),
             browser: std::sync::OnceLock::new(),
+            computer: std::sync::OnceLock::new(),
             code: std::sync::OnceLock::new(),
             media_check: std::sync::OnceLock::new(),
             media_dub: std::sync::OnceLock::new(),

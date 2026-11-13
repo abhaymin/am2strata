@@ -152,6 +152,18 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             }
         }
     }
+    // the desktop computer use: only when the run config turned it on (off by default: nothing offered otherwise), never
+    // for another web page. The mode's rules are enforced in run.rs before every step.
+    if !structured && !forced && !crate::foreign_origin(s, headers) {
+        if let Some(c) = s.mgr.computer.get().filter(|c| c.enabled()) {
+            let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
+            let own = own_names(prep);
+            let extra: Vec<Value> = c.offered_tools(vision).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+            if !extra.is_empty() {
+                add(prep, &mut offered, extra);
+            }
+        }
+    }
     // run_python in the sandbox: only for a profile with "code" (a person on the page runs code with its Run button)
     if has("code") && !structured && !forced && s.code_run.enabled && !crate::foreign_origin(s, headers) {
         let own = own_names(prep);

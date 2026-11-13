@@ -1227,7 +1227,10 @@ $("mcp-import-btn").onclick = async () => {
 let cfgKeys = [];
 // the run config's keys, in groups
 const CFG_GROUPS = [["sampling", "Sampling defaults"], ["thinking", "Thinking"], ["context", "Context and long chats"],
-                    ["memory", "Loading and memory"], ["server", "Server"], ["other", "Other"]];
+                     ["memory", "Loading and memory"], ["server", "Server"], ["other", "Other"]];
+// keys the dedicated "Computer and browser use" section owns, so the Model config list does not show them too
+const COMPUTE_KEYS = new Set(["browser.use", "computer.use", "rules.preset", "computer.mode",
+                              "computer.apps", "computer.site_allow", "computer.site_block", "computer.download_ask"]);
 function cfgGroup(key) {
   if (key.startsWith("sampling.")) return "sampling";
   if (/reasoning|thinking|effort/.test(key)) return "thinking";
@@ -1256,8 +1259,9 @@ async function loadConfig() {
       input = `<input class="st-input" id="${id}" ${k.kind === "number" ? 'type="number" step="any" min="0"' : 'type="text"'} ` +
         `value="${esc(text)}" placeholder="default" autocomplete="off">`;
     }
+    if (COMPUTE_KEYS.has(k.key)) return {group: k.group || "other", html: null};
     return {group: cfgGroup(k.key), html: `<div class="cfg-row"><label for="${id}"><span>${esc(k.help)}</span><code>${esc(k.key)}</code></label>${input}</div>`};
-  }).reduce((acc, x) => { (acc[x.group] = acc[x.group] || []).push(x.html); return acc; }, {});
+  }).filter((r) => r.html !== null).reduce((acc, x) => { (acc[x.group] = acc[x.group] || []).push(x.html); return acc; }, {});
   $("cfg-form").innerHTML = CFG_GROUPS.filter(([g]) => rows[g]).map(([g, title]) =>
     `<fieldset class="cfg-group"><legend>${title}</legend>${rows[g].join("")}</fieldset>`).join("");
   $("cfg-card").hidden = false;
@@ -1280,6 +1284,7 @@ async function saveConfig() {
   delete $("cfg-msg").dataset.failed;
   const set = {};
   cfgKeys.forEach((k, i) => {
+    if (COMPUTE_KEYS.has(k.key)) return;   // owned by the dedicated "Computer and browser use" section instead
     const v = configValue(k, $(`cfg-${i}`));
     const old = Array.isArray(k.value) ? k.value.join(", ") : k.value;
     if (JSON.stringify(v) !== JSON.stringify(old ?? null)) set[k.key] = v;
@@ -1298,6 +1303,87 @@ async function saveConfig() {
     toast("error", "Not saved", String(e.message || e), 6000);
   }
 }
+
+// ------------------------------------------------------------------ Computer and browser use (dedicated Settings section)
+// The keys above (COMPUTE_KEYS) are owned by this section; they round-trip through the same GET/POST /config the Model config uses.
+const CU_TOGGLES = [["cu-no-password", "no_password_fields"], ["cu-no-payment", "no_payment_fields"],
+                    ["cu-no-signin", "no_sign_in"], ["cu-ask-risky", "ask_send_delete_install_buy_publish"]];
+let cuBase = {};   // the values as loaded, so Save sends only what changed
+
+function setChecked(el, on) { el.setAttribute("aria-checked", String(!!on)); }
+function setRadio(id, value) { for (const b of $(id).children) b.setAttribute("aria-checked", String(b.dataset.v === value)); }
+function setList(id, k) { if (k && Array.isArray(k.value)) $(id).value = k.value.join("\n"); else $(id).value = ""; }
+function norm(v) { return v === undefined ? "null" : JSON.stringify(v); }
+
+// the section's current state as the /config {"set": {...}} payload it would send (null = unset/default)
+function cuValues() {
+  const preset = ($("cu-preset").querySelector('[aria-checked="true"]') || {}).dataset.v || "strict";
+  const out = {};
+  out["browser.use"] = $("cu-browser").getAttribute("aria-checked") === "true" ? true : null;
+  out["computer.use"] = $("cu-computer").getAttribute("aria-checked") === "true" ? true : null;
+  out["rules.preset"] = preset !== "strict" ? preset : null;
+  if (preset === "custom") {
+    for (const [id, key] of CU_TOGGLES) out["rules.custom." + key] = $(id).getAttribute("aria-checked") === "true" ? true : null;
+  }
+  out["computer.mode"] = ($("cu-mode").querySelector('[aria-checked="true"]') || {}).dataset.v || "sandbox";
+  const list = (id) => [...$(id).value.split(/[,\n]/).map((s) => s.trim()).filter(Boolean)];
+  out["computer.apps"] = list("cu-apps").length ? list("cu-apps") : null;
+  out["computer.site_allow"] = list("cu-site-allow").length ? list("cu-site-allow") : null;
+  out["computer.site_block"] = list("cu-site-block").length ? list("cu-site-block") : null;
+  out["computer.download_ask"] = $("cu-download-ask").getAttribute("aria-checked") === "true" ? true : null;
+  return out;
+}
+
+async function loadComputerUse() {
+  await loadConfig();   // populates cfgKeys first (this also renders the Model config list, harmlessly)
+  const find = (key) => cfgKeys.find((k) => k.key === key);
+
+  setChecked($("cu-browser"), !!(find("browser.use") && find("browser.use").value === true));
+  setChecked($("cu-computer"), !!(find("computer.use") && find("computer.use").value === true));
+
+  const preset = (find("rules.preset") && find("rules.preset").value) || "strict";
+  setRadio("cu-preset", preset);
+  $("cu-custom-rules").hidden = preset !== "custom";
+  for (const [id, key] of CU_TOGGLES) setChecked($(id), !!(find(`rules.custom.${key}`) && find(`rules.custom.${key}`).value === true));
+
+  setRadio("cu-mode", (find("computer.mode") && find("computer.mode").value) || "sandbox");
+  setList("cu-apps", find("computer.apps"));
+  setList("cu-site-allow", find("computer.site_allow"));
+  setList("cu-site-block", find("computer.site_block"));
+  setChecked($("cu-download-ask"), !!(find("computer.download_ask") && find("computer.download_ask").value === true));
+
+  // the desktop controls only apply to driving a computer (a browser needs none of them)
+  $("cu-desktop").hidden = !(find("computer.use") && find("computer.use").value === true);
+
+  cuBase = cuValues();
+  $("cu-msg").textContent = "";
+}
+
+// reveal/hide the custom toggles and the desktop card live; Save only sends what actually changed against cuBase
+for (const b of $("cu-preset").children) b.onclick = () => { setRadio("cu-preset", b.dataset.v); $("cu-custom-rules").hidden = b.dataset.v !== "custom"; };
+$("cu-computer").onclick = () => { $("cu-desktop").hidden = $("cu-computer").getAttribute("aria-checked") !== "true"; };
+for (const [id] of CU_TOGGLES) {
+  const el = $(id);
+  el.onclick = () => el.setAttribute("aria-checked", String(el.getAttribute("aria-checked") !== "true"));
+}
+$("cu-save").addEventListener("click", async () => {
+  delete $("cu-msg").dataset.failed;
+  const now = cuValues();
+  const set = {};
+  for (const key in now) if (norm(cuBase[key]) !== norm(now[key])) set[key] = now[key];
+  if (!Object.keys(set).length) { $("cu-msg").textContent = "Nothing changed."; return; }
+  try {
+    const r = await fetch("config", {method: "POST", headers: headers(true), body: JSON.stringify({set})});
+    const b = await r.json();
+    if (!r.ok) throw new Error((b.error || {}).message || `HTTP ${r.status}`);
+    cuBase = now;   // the saved state becomes the baseline for the next change
+    $("cu-msg").textContent = b.changed.length
+      ? `Saved (${b.changed.join(", ")}); the earlier file is ${b.file}.bak. Start the model again to use it.` : "Nothing changed.";
+  } catch (e) {
+    $("cu-msg").dataset.failed = "1";
+    toast("error", "Not saved", String(e.message || e), 6000);
+  }
+});
 
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {
@@ -1401,6 +1487,22 @@ if (!chats.some((c) => c.id === current)) current = chats[0] ? chats[0].id : nul
 let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
 let busy = null;                      // {controller, msg, cutoff?}
+// a chat is actively driving the computer or browser; the floating pill offers to stop it (reuses busy's controller)
+let usingComputer = false, usingBrowser = false;
+function updateUsePill() {
+  const kind = usingComputer ? "computer" : usingBrowser ? "browser" : null;
+  if (!kind) { $("use-pill").hidden = true; return; }
+  $("use-pill-label").textContent = `Using the ${kind}`;
+  $("use-pill").hidden = false;
+}
+function clearUsing() { usingComputer = usingBrowser = false; updateUsePill(); }
+// a browser_ or computer_ tool has just run in this answer - the pill shows which one it is doing
+function trackUsing(name) {
+  if (!name) return;
+  if (name.startsWith("computer_")) usingComputer = true;
+  else if (name.startsWith("browser_")) usingBrowser = true;
+  if (usingComputer || usingBrowser) updateUsePill();
+}
 
 // the browser's screenshots are not kept with the chat (each is ~100 KB; the page's storage holds a few MB)
 const noShots = (tools) => tools && tools.map((t) => (t.image ? {...t, image: undefined} : t));
@@ -1668,9 +1770,10 @@ function onTool(m, x) {
   m.tools = m.tools || [];
   let t = m.tools.find((y) => y.id === x.id);
   if (!t) { t = {id: x.id, name: x.name, at: m.text.length, rat: m.reasoning.length, state: "writing"}; m.tools.push(t); }
-  if (x.event === "approve") { t.approve = {what: x.what, answered: null}; t.state = "running"; return; }
+  if (x.event === "approve") { t.approve = {what: x.what, answered: null}; t.state = "running"; trackUsing(t.name); return; }
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
+    trackUsing(x.name);
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
@@ -1849,19 +1952,21 @@ async function send() {
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
   renderChat();
-  const el = $("chat").lastElementChild;
-  const controller = new AbortController();
-  busy = {controller, msg: m};
-  setBusy(true);
+   const el = $("chat").lastElementChild;
+   const controller = new AbortController();
+   clearUsing();   // a fresh answer starts with no computer/browser in use
+   busy = {controller, msg: m};
+   setBusy(true);
 
-  try {
-    await streamInto(m, el, controller.signal);
-  } catch (e) {
-    m.error = e.message || String(e);
-    toast("error", "The request failed", m.error, 6000);
-  }
-  busy = null;
-  setBusy(false);
+   try {
+     await streamInto(m, el, controller.signal);
+   } catch (e) {
+     m.error = e.message || String(e);
+     toast("error", "The request failed", m.error, 6000);
+   }
+   busy = null;
+   setBusy(false);
+   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
@@ -1909,8 +2014,9 @@ async function regenerateMessage(i) {
   m.swipes.length = m.swipeIndex + 1;
   const keep = swipeSnapshot(m);
   Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null});
-  const controller = new AbortController();
-  busy = {controller, msg: m, cutoff: i};
+   const controller = new AbortController();
+   clearUsing();   // regenerating starts a fresh answer with no computer/browser in use
+   busy = {controller, msg: m, cutoff: i};
   if (i < messages.length - 1) {
     toast("info", "Regenerating an earlier answer",
           `${messages.length - i - 1} later message(s) stay in the chat; this request sees the chat up to here.`, 7000);
@@ -1926,10 +2032,11 @@ async function regenerateMessage(i) {
     Object.assign(m, keep, {error: null});
     m.swipes[m.swipeIndex] = keep;
   }
-  busy = null;
-  setBusy(false);
-  updateAssistant(el, m, false);
-  saveChat();
+   busy = null;
+   setBusy(false);
+   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
+   updateAssistant(el, m, false);
+   saveChat();
 }
 
 // The request and its stream into answer `m` (shared by send and regenerate). A Stop returns normally with m.stopped
@@ -2026,7 +2133,10 @@ async function streamInto(m, el, signal) {
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
-$("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+// stop a running answer (reuses the same AbortController) and hide the "using the computer/browser" pill
+function stopChat() { if (busy) busy.controller.abort(); clearUsing(); }
+$("stop-btn").onclick = stopChat;
+$("use-pill-stop").onclick = stopChat;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
@@ -2307,12 +2417,13 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ Settings: sections
 let section = store.get("settings-section", "models");
 function showSection(name) {
-  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients", "cluster"].includes(name) ? name : "models";
+  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients", "cluster", "computer"].includes(name) ? name : "models";
   store.set("settings-section", section);
   for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
   for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
   if (section === "models") { loadModels(); hubStatus(); }
   if (section === "config") loadConfig();
+  if (section === "computer") loadComputerUse();
   if (section === "defaults") { loadShared().then(loadDefaults); }
   if (section === "tools") loadMcp();
   if (section === "memory") loadMemory();

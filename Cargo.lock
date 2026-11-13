@@ -50,6 +50,7 @@ dependencies = [
  "mdns-sd",
  "rand 0.8.8",
  "rcgen",
+ "regex",
  "reqwest",
  "rustls",
  "scraper",

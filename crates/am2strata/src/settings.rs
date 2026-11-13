@@ -182,31 +182,46 @@ enum Kind {
     Arg(&'static str),
 }
 
-const EDITABLE: [(&str, Kind, &str); 18] = [
+const EDITABLE: [(&str, Kind, &str); 30] = [
     ("sampling.temperature", Kind::Sampling("num>=0"),
-     "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
+      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
     ("sampling.top_p", Kind::Sampling("0<x<=1"), "Default top_p for requests that send none"),
     ("sampling.top_k", Kind::Sampling("1..64"), "Default top_k for requests that send none (1-64)"),
     ("sampling.min_p", Kind::Sampling("0<=x<=1"), "Default min_p for requests that send none"),
     ("reasoning_budget_tokens", Kind::IntGe0, "Cap the thinking of every request at this many tokens (0 or empty: no cap)"),
     ("fit_max_tokens", Kind::Bool, "Shorten a max_tokens that does not fit the context instead of answering 400"),
     ("drop_oldest", Kind::Bool, "Leave out a conversation's oldest turns when it no longer fits the context, instead of \
-                                 answering 400 (the system prompt and the last turn stay)"),
+                                  answering 400 (the system prompt and the last turn stay)"),
     ("preserve_thinking", Kind::Bool, "Keep the thinking of earlier turns in the prompt (templates that support it: \
                                        Qwen3.6, Ornith, Tiel Coder)"),
     ("anthropic_thinking", Kind::Enum(&["model", "on_request"]),
-     "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
+      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
     ("effort_position", Kind::Enum(&["start", "end"]),
-     "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
+      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
     ("aliases", Kind::Names, "Other model names the server lists and answers to (comma-separated)"),
     ("idle_unload_s", Kind::NumGe0, "Unload the model after this many seconds without requests (0 or empty: never)"),
     ("lazy_load", Kind::Bool, "Start without loading the model; the first request loads it (text only)"),
     ("engine_silence_s", Kind::NumGe0, "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
     ("api_monitor", Kind::Bool, "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("switch_on_request", Kind::Bool, "List every installed model in /v1/models and load the one a request names, the \
-                                       loaded one stopped first (#38; read from the config the server starts with)"),
+                                        loaded one stopped first (#38; read from the config the server starts with)"),
     ("open_browser", Kind::Bool, "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", Kind::Arg("--vram-reserve-mib"), "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+    // computer use / browser use / rule presets: a nested block under these dotted keys, all off/empty by default
+    ("browser.use", Kind::Bool, "Offer the existing headless-Chrome computer-use tools (off; switch on to drive a browser)"),
+    ("computer.use", Kind::Bool, "Turn on desktop computer use (off by default: no access to this PC's desktop)"),
+    ("computer.mode", Kind::Enum(&["sandbox", "watch-only", "assist", "trusted-job"]),
+      "The desktop the tools run in when computer use is on (the sandbox virtual display is the default)"),
+    ("computer.download_ask", Kind::Bool, "Ask before a download reaches this PC instead of writing it to the download folder"),
+    ("computer.apps", Kind::Names, "Apps the sandbox desktop may open (comma-separated; Strict requires a list)"),
+    ("computer.site_allow", Kind::Names, "Sites the sandbox desktop may visit (comma-separated)"),
+    ("computer.site_block", Kind::Names, "Sites the sandbox desktop must not visit (comma-separated)"),
+    ("rules.preset", Kind::Enum(&["strict", "creator", "custom"]), "The rule preset enforced on every computer step (strict is the default)"),
+    // custom toggles (only used when the preset is Custom), nested under rules.custom, all on by default so they keep Strict's caution
+    ("rules.custom.no_password_fields", Kind::Bool, "When the preset is Custom: refuse to fill or clear a password field"),
+    ("rules.custom.no_payment_fields", Kind::Bool, "When the preset is Custom: refuse to fill a card or submit a payment"),
+    ("rules.custom.no_sign_in", Kind::Bool, "When the preset is Custom: refuse an action that signs into an account unless it asks first"),
+    ("rules.custom.ask_send_delete_install_buy_publish", Kind::Bool, "When the preset is Custom: refuse to send/delete/install/buy/publish until it asks first"),
 ];
 
 fn kind_of(key: &str) -> Option<Kind> {
@@ -229,8 +244,22 @@ fn value_of(cfg: &Value, key: &str) -> Value {
     match kind_of(key) {
         Some(Kind::Sampling(_)) => cfg.get("sampling").and_then(|s| s.get(&key[9..])).cloned().unwrap_or(Value::Null),
         Some(Kind::Arg(flag)) => arg_value(cfg, flag),
-        _ => cfg.get(key).cloned().unwrap_or(Value::Null),
+        // nested by every dot (browser.use -> browser.use; rules.custom.no_password_fields into its block); a bare key stays top-level
+        _ => { let parts: Vec<&str> = key.split('.').collect(); nested_get(cfg, &parts) }
     }
+}
+
+/// The value at a dotted path (["rules","custom","no_sign_in"]), or null when any segment is missing. A single-segment
+/// path reads the top level, so every existing one-level key still resolves the same way.
+fn nested_get(cfg: &Value, parts: &[&str]) -> Value {
+    let mut cur = cfg;
+    for p in parts {
+        match cur.as_object().and_then(|o| o.get(*p)) {
+            Some(v) => cur = v,
+            None => return Value::Null,
+        }
+    }
+    (*cur).clone()
 }
 
 /// GET /config: the editable keys with their values (null: not set, the default applies).
@@ -361,11 +390,18 @@ pub fn apply(cfg: &Value, changes: Option<&Value>) -> Result<(Value, Vec<String>
                 }
                 obj.insert("args".into(), Value::Array(a));
             }
-            _ if v.is_null() => {
-                obj.remove(&key);
-            }
             _ => {
-                obj.insert(key.clone(), v);
+                // a nested key is written by its dotted path (computer.use -> computer.use; rules.custom.no_sign_in into
+                // rules.custom); creating each intermediate object and setting the leaf, so one-level keys still work too.
+                let parts: Vec<&str> = key.split('.').collect();
+                let mut cur = obj;
+                for p in &parts[..parts.len() - 1] {
+                    let entry = cur.entry(p.to_string()).or_insert_with(|| Value::Object(Map::new()));
+                    if !entry.is_object() { *entry = Value::Object(Map::new()); }
+                    cur = entry.as_object_mut().ok_or("the run config is not a JSON object")?;
+                }
+                let leaf = parts[parts.len() - 1];
+                if v.is_null() { cur.remove(leaf); } else { cur.insert(leaf.to_string(), v); }
             }
         }
         changed.push(key);
@@ -425,5 +461,81 @@ mod tests {
         let v = view(&new, Path::new("/x/strata-m.json"));
         assert_eq!(v["file"], "strata-m.json");
         assert_eq!(v["keys"][0]["value"], 0.6);
+    }
+
+    #[test]
+    fn nested_computer_keys_write_into_their_block() {
+        let cfg = json!({"api_key": "k", "sampling": {"top_p": 0.9}});
+        let (new, changed) = apply(&cfg, Some(&json!({"computer.use": true, "rules.preset": "creator", "computer.mode": "watch-only"}))).unwrap();
+        assert_eq!(changed.len(), 3);
+        assert_eq!(new["computer"], json!({"use": true, "mode": "watch-only"}));
+        assert_eq!(new["rules"], json!({"preset": "creator"}));
+        // GET /config now reports the value back to the Settings page (the web app reads these keys)
+        let v = view(&new, Path::new("/x/strata-m.json"));
+        let found = v["keys"].as_array().unwrap().iter().find(|k| k["key"] == "computer.use").unwrap();
+        assert_eq!(found["value"], json!(true));
+        // turning a key off with null removes just that key, leaving the block and other keys intact
+        let (back, _) = apply(&new, Some(&json!({"computer.use": null}))).unwrap();
+        assert_eq!(back["computer"], json!({"mode": "watch-only"}), "the key is removed, its block kept");
+    }
+
+    // the keys the web app's "Computer and browser use" settings section owns; GET /config lists them, POST /config changes them
+    const PAGE_KEYS: [&str; 8] = ["browser.use", "computer.use", "rules.preset", "computer.mode",
+        "computer.apps", "computer.site_allow", "computer.site_block", "computer.download_ask"];
+
+    #[test]
+    fn page_computer_browser_keys_are_off_by_default() {
+        // every one of the section's keys reads back null (its default: off / empty) with nothing set
+        let v = view(&json!({"api_key": "k"}), Path::new("/x/m.json"));
+        for k in PAGE_KEYS {
+            let found = v["keys"].as_array().unwrap().iter().find(|kk| kk["key"] == *k).unwrap();
+            assert!(found["value"].is_null(), "{k} should be off by default, not {}", found["value"]);
+        }
+    }
+
+    #[test]
+    fn page_computer_browser_keys_round_trip_through_config() {
+        // the exact set a filled-in section would POST back: {"set": {...}} -> apply() -> view() is GET /config after POST /config
+        let changes = json!({"browser.use": true, "computer.use": true, "rules.preset": "custom",
+            "computer.mode": "watch-only", "computer.apps": ["firefox"], "computer.site_allow": ["youtube.com"],
+            "computer.site_block": ["ads.example"], "computer.download_ask": true,
+            "rules.custom.no_password_fields": false, "rules.custom.no_payment_fields": false,
+            "rules.custom.no_sign_in": true, "rules.custom.ask_send_delete_install_buy_publish": false});
+        let cfg = json!({"api_key": "k", "sampling": {"top_p": 0.9}});
+        // a checked apply changes only the keys given, and leaves the rest of the file alone
+        let (new, changed) = apply(&cfg, Some(&changes)).unwrap();
+        assert_eq!(changed.len(), changes.as_object().unwrap().len());
+        assert_eq!(new["sampling"], json!({"top_p": 0.9}), "the sampling block is untouched");
+
+        // GET /config now reports each key back exactly (the section re-reads these), including the nested custom toggles
+        let v = view(&new, Path::new("/x/m.json"));
+        let keys = v["keys"].as_array().unwrap();
+        for k in PAGE_KEYS {
+            let found = keys.iter().find(|kk| kk["key"] == *k).unwrap();
+            assert_eq!(found["value"], changes[k], "{k} should round-trip through /config");
+        }
+
+        // and the computer feature reads the same values from the written config, so they actually persist (not just shown)
+        let mut rest = std::collections::BTreeMap::new();
+        for (kk, vv) in new.as_object().unwrap() { rest.insert(kk.clone(), vv.clone()); }
+        let cs = crate::computer::settings::Config::from_config(&rest, Path::new("/tmp"));
+        assert!(cs.computer.use_);
+        assert!(cs.browser.use_);
+        assert_eq!(cs.computer.mode, crate::computer::settings::Mode::WatchOnly);
+        assert_eq!(cs.computer.apps, vec!["firefox".to_string()]);
+        assert_eq!(cs.computer.site_allow, vec!["youtube.com".to_string()]);
+        assert_eq!(cs.computer.site_block, vec!["ads.example".to_string()]);
+        assert_eq!(cs.computer.download_ask, Some(true));
+        assert_eq!(cs.rules.preset, crate::computer::rules::Preset::Custom);
+        assert_eq!(cs.rules.custom.no_password_fields, false);
+        assert_eq!(cs.rules.custom.no_payment_fields, false);
+        assert_eq!(cs.rules.custom.no_sign_in, true);
+        assert_eq!(cs.rules.custom.ask_send_delete_install_buy_publish, false);
+
+        // setting computer use off with null removes just that key; the rest of the block and the nested custom toggles stay
+        let (back, _) = apply(&new, Some(&json!({"computer.use": null}))).unwrap();
+        assert_eq!(back["computer"]["mode"], json!("watch-only"));
+        assert_eq!(back["computer"]["apps"], json!(["firefox"]));
+        assert_eq!(back["rules"]["custom"]["no_sign_in"], json!(true), "nested custom toggle kept");
     }
 }

@@ -54,3 +54,5 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 jsonschema = { version = "0.30", default-features = false }
+# web_assets: check the client JS this box serves, since it has no node to parse it (no duplicate top-level declarations)
+regex = "1"
