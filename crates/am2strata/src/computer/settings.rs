@@ -47,6 +47,8 @@ pub struct ComputerUse {
     /// browser/site allow + block lists; empty means none configured (off by default)
     pub site_allow: Vec<String>,
     pub site_block: Vec<String>,
+    /// the sandbox virtual display as "WxHxD" (e.g. "1280x800x24"); `None` uses the default 1280x800x24
+    pub display_size: Option<String>,
 }
 
 /// Whether the existing headless-Chrome tools are offered again (`"browser": {"use": true}`), off by default.
@@ -109,6 +111,7 @@ impl Config {
                 download_ask: c.get("download_ask").and_then(Value::as_bool),
                 site_allow: names_array(c.get("site_allow")),
                 site_block: names_array(c.get("site_block")),
+                display_size: c.get("display_size").and_then(Value::as_str).map(str::to_string),
             },
             None => ComputerUse { mode: Mode::DEFAULT, ..Default::default() },
         };
@@ -142,6 +145,9 @@ impl Config {
         }
         if !self.computer.site_block.is_empty() {
             computer["site_block"] = json!(self.computer.site_block.clone());
+        }
+        if let Some(d) = &self.computer.display_size {
+            computer["display_size"] = json!(d);
         }
         let mut browser = json!({"use": self.browser.use_});
         json!({"computer": computer, "browser": browser, "rules": self.rules.to_value()})

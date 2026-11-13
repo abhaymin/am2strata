@@ -11,12 +11,13 @@
 //! - **Modes gate input.** In `watch-only` no input is sent (only a screenshot or a wait).
 
 use crate::browser;
-use crate::computer::backend::Backend;
+use crate::computer::backend::{Backend, LinuxBackend, SandboxDesktop, Size};
 use crate::computer::rules::{self, Ctx, Decision, Intent, RuleSet};
 use crate::computer::settings::{Config, Mode};
 use crate::computer::step::classify_step;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -108,6 +109,10 @@ fn error_result(text: String, ms: u64) -> Value {
         /// per conversation: the once-per-job approval already given (until when), for the reuse of the browser path
         grants: tokio::sync::Mutex<HashMap<String, Instant>>,
         backend: Option<Box<dyn Backend + Send + Sync>>,
+        /// the sandbox's private Xvfb display, shared with the backend so it can be stopped after 10 minutes idle; `None` otherwise
+        desktop: Option<Arc<SandboxDesktop>>,
+        /// the one-shot idle watcher (stopped the display after 10 min with no step), armed on the first step of a sandbox server
+        watchdog: std::sync::OnceLock<std::thread::JoinHandle<()>>,
     }
 
     impl Computers {
@@ -115,10 +120,13 @@ fn error_result(text: String, ms: u64) -> Value {
         /// now; macOS/Windows stubs have none, so it offers nothing until the plan's §6).
         pub fn new(config: Config) -> Computers {
             let mode = config.computer.mode;
-            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), backend: select_backend(mode) }
+            let size = Size::parse(config.computer.display_size.as_deref());
+            let (backend, desktop) = select_backend(mode, size);
+            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: std::sync::OnceLock::new() }
         }
 
-    /// Whether desktop use is on AND this computer has a backend (so the tools can be offered). Off by default.
+    /// Whether desktop use is on AND this computer has a backend (so the tools can be offered). Off by default. On a sandbox
+    /// short of Xvfb or xdotool the backend is `None`, so nothing is offered (`server_tools.rs`; item 2) instead of panicking.
     pub fn enabled(&self) -> bool { self.config.computer.use_ && self.backend.is_some() }
 
     /// The computer-use tool schemas, or none when the desktop use is off or this platform has no backend — so the chat
@@ -132,6 +140,8 @@ fn error_result(text: String, ms: u64) -> Value {
     /// `conv` is the conversation (its once-per-job grant). The job's clock is this store's start and now, for the
     /// preset's time limit. Each step also returns a screenshot, like the browser's.
     pub async fn step(&self, conv: &str, name: &str, args: &Value, id: &str, tx: &mpsc::Sender<RunEvent>) -> Value {
+        // arm the idle watcher so a sandbox display is stopped after 10 minutes with no step (item 1); a non-sandbox server has none
+        self.arm_watchdog();
         let rules = self.config.rules.rule_set(self.computer_apps());
         let backend: &(dyn Backend + Send + Sync) = match self.backend.as_ref() {
             Some(b) => b.as_ref(),
@@ -145,15 +155,47 @@ fn error_result(text: String, ms: u64) -> Value {
 
     fn computer_apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
     fn computer_mode(&self) -> Mode { self.config.computer.mode }
+
+    /// Arm the idle watcher once (item 1): after 10 minutes with no computer step the sandbox display is stopped. Idempotent via `OnceLock`.
+    fn arm_watchdog(&self) {
+        if let Some(desktop) = &self.desktop {
+            // move an owned clone into the thread so the handle does not borrow `self` out of this method
+            let desktop = desktop.clone();
+            let _ = self.watchdog.get_or_init(move || std::thread::spawn(move || idle_watcher(desktop)));
+        }
+    }
 }
 
-/// The desktop for `mode` on this OS: Linux builds one Xvfb-backed display (the sandbox's virtual screen, never the real
-/// desktop); the others have no backend yet and return none.
-fn select_backend(_mode: Mode) -> Option<Box<dyn Backend + Send + Sync>> {
+/// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped (item 1).
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Stops the sandbox display once it has been quiet for a full idle period, or as soon as it is already stopping.
+fn idle_watcher(desktop: Arc<SandboxDesktop>) {
+    loop {
+        std::thread::sleep(IDLE_TIMEOUT);
+        if desktop.is_idle() || desktop.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; }
+    }
+}
+
+/// The desktop for `mode` on this OS: the sandbox builds a private Xvfb-backed display (never the real desktop), the others use
+/// a fixed one (`XTEST_DISPLAY`); when the sandbox is short of Xvfb or xdotool it has no backend, so the tools are not offered
+/// (`server_tools.rs`, item 2). Returns the backend and its Arc so the engine can stop the display after idle.
+fn select_backend(mode: Mode, size: Size) -> (Option<Box<dyn Backend + Send + Sync>>, Option<Arc<SandboxDesktop>>) {
     #[cfg(target_os = "linux")]
-    { let b: Box<dyn Backend + Send + Sync> = Box::new(crate::computer::backend::LinuxBackend::new(std::env::var("XTEST_DISPLAY").ok().as_deref())); Some(b) }
+    {
+        if mode == Mode::Sandbox && !(crate::computer::backend::tool_available("Xvfb") && crate::computer::backend::tool_available("xdotool")) {
+            return (None, None);  // the sandbox needs both Xvfb and xdotool; without them the desktop tools are not offered
+        }
+        let desktop = if mode == Mode::Sandbox { Some(Arc::new(SandboxDesktop::new(size))) } else { None };
+        let backend: Box<dyn Backend + Send + Sync> = if mode == Mode::Sandbox {
+            Box::new(LinuxBackend::new_sandbox(size))
+        } else {
+            Box::new(LinuxBackend::new(std::env::var("XTEST_DISPLAY").ok().as_deref()))
+        };
+        (Some(backend), desktop)
+    }
     #[cfg(not(target_os = "linux"))]
-    { None }
+    { (None, None) }
 }
 
 // ------------------------------------------------------------------------------------------------------------- tests
@@ -286,10 +328,17 @@ mod tests {
         assert!(!off.enabled(), "off by default");
         assert!(off.offered_tools(true).is_empty(), "no computer tools when the run config has it off");
 
-        // A config with computer use on but no backend here still does not enable the tools.
+        // A config with computer use on but no backend here still does not enable the tools: in the sandbox, whether the tools
+        // are offered depends on Xvfb + xdotool being installed (item 2) — assert it either way so this stays honest on any box.
         let mut cfg = Config::default();
         cfg.computer.use_ = true;
         assert_eq!(cfg.computer.mode, Mode::Sandbox);
+        let c = Computers::new(cfg);
+        if crate::computer::backend::tool_available("Xvfb") && crate::computer::backend::tool_available("xdotool") {
+            assert!(c.enabled(), "the sandbox offers tools when Xvfb and xdotool are installed");
+        } else {
+            assert!(!c.enabled(), "the sandbox offers nothing when Xvfb/xdotool are missing (item 2)");
+        }
     }
 
     /// Put an approval (yes or no) on the browser's shared approvals map for `id`, answered on its sender, concurrently
@@ -307,5 +356,34 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         });
+    }
+
+    /// End-to-end through the engine on a real (sandbox) desktop: start the private Xvfb via `Computers.step`, click an area and take
+    /// a screenshot over the backend — the whole point of starting a display. Ignored by default (this box has no Xvfb); bails early
+    /// when Xvfb/xdotool are absent, like the ignored backend test. Run with `cargo test -- --ignored`.
+    #[cfg(target_os = "linux")]
+    #[ignore = "needs Xvfb + xdotool on a running session"]
+    #[tokio::test]
+    async fn sandbox_engine_starts_a_display_clicks_and_screenshots() -> Result<(), String> {
+        // build the server's desktop from a sandbox config; if its tools are absent there is no backend to drive.
+        let mut cfg = Config::default();
+        cfg.computer.use_ = true;
+        cfg.computer.mode = Mode::Sandbox;
+        cfg.computer.apps = vec!["xterm".into()];
+        let computers = Computers::new(cfg);
+        if !computers.enabled() { return Ok(()); }  // no Xvfb/xdotool on this box: there is nothing to start
+        let (tx, _rx) = channel();
+
+        // a plain click is Allowed by the preset (not risky), so it runs without an approval wait and starts the private display
+        let click = computers.step("job", "computer_click", &json!({"x": 3.0, "y": 4.0}), "idE", &tx).await;
+        assert_eq!(click["ok"], true, "a sandbox click runs through the engine and starts Xvfb: {}", click["text"]);
+
+        // a screenshot returns the frame from the virtual display; its presence depends on a screenshot tool being installed
+        let shot = computers.step("job", "computer_screenshot", &json!({}), "idS", &tx).await;
+        assert_eq!(shot["ok"], true, "a sandbox screenshot reads the virtual display: {}", shot["text"]);
+        if crate::computer::backend::tool_available("convert") || crate::computer::backend::tool_available("import") || crate::computer::backend::tool_available("scrot") {
+            assert!(shot.get("image").is_some(), "the screenshot carries a base64 JPEG for the model");
+        }
+        Ok(())
     }
 }

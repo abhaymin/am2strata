@@ -954,6 +954,10 @@ mod tests {
         let outside = dir.parent().unwrap().join(format!("secret-{}", std::process::id()));
         make_file(&outside, "secret");
         let link = dir.join("link.mp4");
+        // remove any link left by an earlier run (ignore NotFound) so this does not fail on symlink(); recreate the parent too,
+        // in case a prior or parallel run already cleaned the folder out from under us (this is what made it flaky)
+        if std::fs::symlink_metadata(&link).is_ok() { let _ = std::fs::remove_file(&link); }
+        let _ = std::fs::create_dir_all(&dir);
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(upload_file_ok(&link, &dir).is_err());
         clean(&outside);

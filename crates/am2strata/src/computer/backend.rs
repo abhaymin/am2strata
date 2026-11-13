@@ -95,7 +95,8 @@ mod linux {
 
     impl Backend for LinuxBackend {
         fn screenshot(&self) -> Result<Buffer, String> {
-            let bytes = self.capture_screen()?;
+            let disp = self.disp()?;
+            let bytes = self.capture_screen(&disp)?;
             let img = image::load_from_memory(&bytes).map_err(|e| format!("decoding the screenshot: {e}"))?;
             Ok(Buffer { width: img.width(), height: img.height(), rgba: img.to_rgba8().into_raw() })
         }
@@ -104,50 +105,55 @@ mod linux {
             if !tool_available("xwininfo") {
                 return Err("`xwininfo` is not on this system; the window list needs it (install x11-utils)".into());
             }
-            let disp = self.display.as_str();
-            let out = run_cmd(&["xwininfo", "-root", "-tree", "-display", disp])?;
+            let disp = self.disp()?;
+            let out = run_cmd(&["xwininfo", "-root", "-tree", "-display", &disp])?;
             Ok(parse_wininfo(&String::from_utf8_lossy(&out)))
         }
 
         fn focus(&self, id: WindowId) -> Result<(), String> {
+            let disp = self.disp()?;
             let win = format!("0x{id:x}");
             let mut c = dotool("windowactivate --sync")?;
-            c.arg(&win).arg("-d").arg(&self.display);
+            c.arg(&win).arg("-d").arg(&disp);
             c.status_checked()
         }
 
         fn click(&self, x: i32, y: i32, button: Button) -> Result<(), String> {
+            let disp = self.disp()?;
             let mut m = dotool("mousemove --sync")?;
-            m.arg(x.to_string()).arg(y.to_string()).arg("-d").arg(&self.display);
+            m.arg(x.to_string()).arg(y.to_string()).arg("-d").arg(&disp);
             m.status_checked()?;
             // xdotool click codes: 1 left, 2 middle, 3 right
             let code = match button { Button::Left => "1", Button::Middle => "2", Button::Right => "3" };
             let mut c = dotool("click")?;
-            c.arg(code).arg("-d").arg(&self.display);
+            c.arg(code).arg("-d").arg(&disp);
             c.status_checked()
         }
 
         fn type_text(&self, text: &str) -> Result<(), String> {
             // --clearmodifiers drops any stuck modifier keys; xdotool types the rest literally
+            let disp = self.disp()?;
             let mut c = dotool("type --clearmodifiers --delay 3")?;
-            c.arg(text).arg("-d").arg(&self.display);
+            c.arg(text).arg("-d").arg(&disp);
             c.status_checked()
         }
 
         fn press_keys(&self, keys: &[Key]) -> Result<(), String> {
             let seq = keys_to_xdotool(keys);
             if seq.is_empty() { return Ok(()); }
+            let disp = self.disp()?;
             let mut c = dotool("key --clearmodifiers")?;
-            c.arg(seq).arg("-d").arg(&self.display);
+            c.arg(seq).arg("-d").arg(&disp);
             c.status_checked()
         }
 
         fn scroll(&self, dx: i32, dy: i32) -> Result<(), String> {
             let (h, v) = (scroll_part(dx), scroll_part(dy));
             if h.is_none() && v.is_none() { return Ok(()); } // nothing to do
+            let disp = self.disp()?;
             // xdotool scrolls lines from the current pointer (0,0); sign carries the direction.
             let mut c = dotool("scroll")?;
-            c.arg("-d").arg(&self.display).arg("0").arg("0");
+            c.arg("-d").arg(&disp).arg("0").arg("0");
             if let Some((dir, n)) = v { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
             else if let Some((dir, n)) = h { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
             c.status_checked()
@@ -155,8 +161,9 @@ mod linux {
 
         fn open_app(&self, name: &str) -> Result<(), String> {
             // run on this display; an app not installed (NotFound) is a clear "is it in the allow list?" message
+            let disp = self.disp()?;
             let mut cmd = std::process::Command::new(name);
-            cmd.env("DISPLAY", &self.display).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            cmd.env("DISPLAY", &disp).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
             match cmd.spawn() {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
@@ -166,24 +173,39 @@ mod linux {
         }
     }
 
-    /// This PC's desktop. For the sandbox it is a virtual display (Xvfb :99, or `weston --backend=headless`/`cage` if a
-    /// headless compositor is set up); input is issued there with xdotool and its XTest, and the screenshot comes from
-    /// ImageMagick on that display. The display defaults to :99, overridable with `XTEST_DISPLAY` (how the sandbox sets it).
+    /// This PC's desktop. For the sandbox it is a private Xvfb virtual display started lazily on the first step (`SandboxDesktop`),
+    /// for the watch-only / assist / trusted-job modes a fixed one; input is issued there with xdotool and its XTest, and the
+    /// screenshot comes from ImageMagick on that display. The sandbox's display is never the environment's DISPLAY (item 3).
     #[derive(Debug)]
-    pub struct LinuxBackend { display: String }
+    pub struct LinuxBackend {
+        sandbox: bool,
+        /// a set display for the non-sandbox / test case (`XTEST_DISPLAY`, else :99) — never the environment's DISPLAY
+        fixed_display: Option<String>,
+        /// the private Xvfb-backed virtual desktop the sandbox starts lazily; owns the child that is killed on drop
+        desktop: Option<std::sync::Arc<SandboxDesktop>>,
+    }
 
     impl LinuxBackend {
+        /// A fixed display (`XTEST_DISPLAY`, else :99), used by the watch-only / assist / trusted-job modes and tests.
         pub fn new(display: Option<&str>) -> LinuxBackend {
-            let display = display.map(str::to_string)
-                .or_else(|| std::env::var("XTEST_DISPLAY").ok())
-                .unwrap_or_else(|| ":99".to_string());
-            LinuxBackend { display }
+            LinuxBackend { sandbox: false, fixed_display: display.map(str::to_string).or_else(|| std::env::var("XTEST_DISPLAY").ok()), desktop: None }
         }
 
-        /// Try a screenshot tool and return its image bytes (JPEG/PNG). The first that works wins.
-        fn capture_screen(&self) -> Result<Vec<u8>, String> {
-            let disp = self.display.as_str();
-            // ImageMagick's `convert -window root` reads the whole display as one frame; `import -window root` is another entry point.
+        /// A private sandbox desktop: a virtual Xvfb display started lazily on the first step (item 1) at `size`, never driving
+        /// the real DISPLAY, killed when dropped and after 10 minutes with no computer step. A `None` config size uses the default geometry.
+        pub fn new_sandbox(size: Size) -> LinuxBackend {
+            LinuxBackend { sandbox: true, fixed_display: None, desktop: Some(std::sync::Arc::new(SandboxDesktop::new(size))) }
+        }
+
+        /// The display a step drives. For the sandbox it starts a private Xvfb on a free number the first time (item 1), so it
+        /// never falls back to the environment's DISPLAY / WAYLAND_DISPLAY; for the fixed case it is just that number.
+        fn disp(&self) -> Result<String, String> {
+            if self.sandbox { self.desktop.as_ref().unwrap().ensure() }
+            else { Ok(self.fixed_display.clone().unwrap_or_else(|| ":99".into())) }
+        }
+
+        /// Try a screenshot tool and return its image bytes (JPEG/PNG). The first that works wins; needs a running display.
+        fn capture_screen(&self, disp: &str) -> Result<Vec<u8>, String> {
             if tool_available("convert") || tool_available("import") {
                 let tool = if tool_available("convert") { "convert" } else { "import" };
                 let b = run_cmd(&[tool, "-window", "root", "-display", disp, "jpg:-"])?;
@@ -198,8 +220,118 @@ mod linux {
         }
     }
 
-    /// The tools a real session needs, so a backend on a box without them fails cleanly instead of panicking.
-    pub(super) fn tool_available(name: &str) -> bool {
+    /// The virtual display geometry (`WxHxD`), defaulting to 1280x800x24 when the config gives none.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Size { pub width: u32, pub height: u32, pub depth: u32 }
+
+    impl Size {
+        /// The default sandbox display geometry (1280x800x24).
+        pub const DEFAULT: Size = Size { width: 1280, height: 800, depth: 24 };
+        /// Parse "WxHxD" (e.g. "1280x800x24"); unknown or empty falls back to the default.
+        pub fn parse(s: Option<&str>) -> Size {
+            match s.and_then(|v| v.split_once('x')) {
+                Some((w, rest)) => match (w.trim().parse::<u32>(), rest.split_once('x')) {
+                    (Ok(w), Some((h, d))) => match (h.trim().parse::<u32>(), d.trim().parse::<u32>()) {
+                        (Ok(h), Ok(d)) if h > 0 && d > 0 => Size { width: w, height: h, depth: d },
+                        _ => Size::DEFAULT,
+                    },
+                    _ => Size::DEFAULT,
+                },
+                None => Size::DEFAULT,
+            }
+        }
+    }
+
+    impl Default for Size { fn default() -> Self { Size::DEFAULT } }
+
+    /// A free X display number to run the sandbox's virtual screen on: try :99, then the next free one checked via its `/tmp/.X11-unix/X<n>`
+    /// socket. Chosen from the filesystem, never read from the environment's DISPLAY, so a sandbox desktop can't drive the real one.
+    pub fn pick_free_display() -> String {
+        for n in 99..=1000 {
+            if !std::path::PathBuf::from(format!("/tmp/.X11-unix/X{n}")).exists() { return format!(":{n}"); }
+        }
+        ":(1001)".to_string()  // nothing free in range: report the next number anyway so a step fails clearly, not silently
+    }
+
+    /// The sandbox's private virtual desktop. It owns an `Xvfb` started lazily on the first computer step and killed when the last
+    /// reference drops (the server stops), shared by the backend that drives it and the engine that stops it after 10 minutes idle.
+    pub struct SandboxDesktop {
+        size: Size,
+        inner: std::sync::Mutex<State>,
+        /// whether the display has been told to stop (set on drop and by the idle watcher), so the watcher can exit promptly
+        pub stopped: std::sync::atomic::AtomicBool,
+    }
+
+    /// Whether Xvfb is running yet (`Idle`), on screen (`Running(child, display, last_used)`) or stopped.
+    enum State {
+        Idle,
+        Running(std::process::Child, String, std::time::Instant),
+    }
+
+    impl std::fmt::Debug for SandboxDesktop {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let running = matches!(*self.inner.lock().unwrap(), State::Running(..));
+            f.debug_struct("SandboxDesktop").field("size", &self.size).field("running", &running).finish()
+        }
+    }
+
+    impl SandboxDesktop {
+        /// Construct a sandbox desktop at `size`, not yet started (Xvfb runs on the first `ensure`).
+        pub fn new(size: Size) -> SandboxDesktop {
+            SandboxDesktop { size, inner: std::sync::Mutex::new(State::Idle), stopped: std::sync::atomic::AtomicBool::new(false) }
+        }
+
+        /// The display a step drives, starting Xvfb lazily the first time (item 1) and refreshing the last-used clock.
+        pub fn ensure(&self) -> Result<String, String> {
+            let mut state = self.inner.lock().unwrap();
+            if !matches!(*state, State::Running(..)) {
+                let disp = pick_free_display();
+                match start_xvfb(self.size, &disp) {
+                    Ok(child) => *state = State::Running(child, disp.clone(), std::time::Instant::now()),
+                    Err(e) => return Err(e),
+                }
+            }
+            if let State::Running(_, _, last) = &mut *state { *last = std::time::Instant::now(); }
+            match &*state {
+                State::Running(_, d, _) => Ok(d.clone()),
+                State::Idle => Err("the sandbox display is not running".into()),
+            }
+        }
+
+        /// Stop the virtual display (kill Xvfb); called on drop and by the 10-minute idle watcher.
+        pub fn stop(&self) {
+            self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut state = self.inner.lock().unwrap();
+            if let State::Running(child, _, _) = &mut *state { let _ = child.kill(); let _ = child.wait(); }
+            *state = State::Idle;
+        }
+
+        /// True when the display has been quiet for 10 minutes, so the idle watcher can stop it.
+        pub fn is_idle(&self) -> bool {
+            matches!(*self.inner.lock().unwrap(), State::Running(_, _, last) if std::time::Instant::now().duration_since(last) > IDLE_TIMEOUT)
+        }
+    }
+
+    /// The idle watcher's quiet period: after 10 minutes with no computer step, the sandbox display is stopped.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+    /// Start `Xvfb` on `display` at `size`, ignoring the host's DISPLAY / WAYLAND_DISPLAY so it can never drive the real screen.
+    fn start_xvfb(size: Size, display: &str) -> Result<std::process::Child, String> {
+        std::process::Command::new("Xvfb")
+            .arg(display).arg("-screen").arg("0").arg(format!("{}x{}x{}", size.width, size.height, size.depth))
+            .env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("starting Xvfb {display}: the sandbox needs `Xvfb` (install xvfb) to run its virtual display: {e}"))
+    }
+
+    impl std::ops::Drop for SandboxDesktop {
+        fn drop(&mut self) { self.stop(); }
+    }
+
+    /// The tools a real session needs, so a backend on a box without them fails cleanly instead of panicking. Visible crate-wide
+    /// (re-exported below) so the engine can gate the sandbox's tools on their presence (`server_tools.rs`, item 2).
+    pub fn tool_available(name: &str) -> bool {
         if let Some(path) = std::env::var_os("PATH") {
             for dir in std::env::split_paths(&path) {
                 if dir.join(name).is_file() { return true; }
@@ -277,7 +409,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::LinuxBackend;
+pub use linux::{LinuxBackend, SandboxDesktop, Size, tool_available};
 
 // -------------------------------------------------------------------------------------------------------- Non-Linux stub
 
@@ -430,5 +562,28 @@ mod tests {
         let b = LinuxBackend::new(Some(":98"));
         let _ = b.screenshot();
         let _ = b.open_app("am2strata-no-such-app-xyz");
+    }
+
+    /// A sandbox backend's display is chosen from the filesystem, never the environment's DISPLAY (`/computer/backend.rs`, item 3).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sandbox_backend_never_uses_the_environment_display() {
+        let forced = ":7777";
+        let original = std::env::var("DISPLAY").ok();
+        std::env::set_var("DISPLAY", forced);  // even if the host points DISPLAY here, the sandbox ignores it
+        assert_ne!(linux::pick_free_display(), forced, "the free display is chosen from /tmp, never the environment's DISPLAY");
+        // a sandbox backend constructs without touching the environment's DISPLAY (it picks its own on first need)
+        let _b = LinuxBackend::new_sandbox(Size::default());
+        match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
+    }
+
+    /// The default geometry is used when the config gives none or an unparseable value.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn size_falls_back_to_the_default_geometry() {
+        assert_eq!(Size::default(), Size::DEFAULT);
+        assert_eq!(Size::parse(None), Size::DEFAULT);
+        assert_eq!(Size::parse(Some("garbage")), Size::DEFAULT);
+        assert_eq!(Size::parse(Some("1024x768x24")), Size { width: 1024, height: 768, depth: 24 });
     }
 }
