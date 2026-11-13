@@ -14,6 +14,7 @@ mod clients;
 mod gemini;
 mod anthropic;
 mod browser;
+mod computer;
 mod api_monitor;
 mod audio_api;
 mod langdetect;
