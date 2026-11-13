@@ -158,7 +158,7 @@ fall; merge → convert GGUF → quantize → load with `strata-gguf` → run th
 10. **Dataset generation + quality filters** (`dataset.rs`). Chunker, dedupe (MinHash/n-gram), too-short/long/refusal/off-language filters, judging pass,
     `dataset.jsonl` + `dataset.card.md`. Gate: pure-Rust unit tests; generation tested with the mock engine.
 11. **API/UI.** `/v1/workshop/*` routes in `am2strata`, jobs in the existing queue (GPU stop/reload like media), recipe job, VRAM up-front refusal for our two
-    16 GB GPUs, remote-Ursloth forwarding, HF download with size+approval, "Workshop" tab. Gate: job state-transition tests; refused/accept flows.
+    16 GB GPUs, remote-Unsloth forwarding, HF download with size+approval, "Workshop" tab. Gate: job state-transition tests; refused/accept flows.
 
 Each step commits on `agent/model-workshop` with the tests that gate it before the next begins.
 

@@ -1,0 +1,17 @@
+[package]
+name = "strata-workshop"
+description = "Train, convert, quantize, and make models Strata-ready — all in Rust (no Python); the Workshop."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+candle-core.workspace = true
+candle-nn.workspace = true
+safetensors.workspace = true
+memmap2.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
