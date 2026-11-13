@@ -40,7 +40,7 @@ fn sends_input(name: &str) -> bool {
 /// the "approve" event when a step waits. Kept generic over the backend so tests drive a mock.
 pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mode: Mode, conv: &str, name: &str, args: &Value,
                       id: &str, grants: &mut HashMap<String, Instant>, step_counts: &mut HashMap<String, usize>, max_steps: u32,
-                      started_at: Instant, now: Instant, tx: &mpsc::Sender<RunEvent>) -> Value {
+                      display_size: Size, started_at: Instant, now: Instant, tx: &mpsc::Sender<RunEvent>) -> Value {
     let t0 = Instant::now();
     let ms = |t0: Instant| t0.elapsed().as_millis() as u64;
     // 1. A call with a missing or wrong argument is refused up front, the step never runs (like browser.rs refuses a
@@ -49,6 +49,16 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
         Ok(s) => s,
         Err(e) => return error_result(format!("error: the step was not run: {e}"), ms(t0)),
     };
+    // 1b. Refuse a click whose coordinates fall outside the sandbox display (item 3), before anything is sent; a click by
+    //    window title (no x, y) has no pixel to bounds-check against.
+    if name == "computer_click" {
+        if let (Some(x), Some(y)) = (step.x, step.y) {
+            if x < 0 || y < 0 || x >= display_size.width as i32 || y >= display_size.height as i32 {
+                return error_result(format!("error: the click at ({x}, {y}) is outside the {}x{} sandbox display; choose coordinates within it",
+                                             display_size.width, display_size.height), ms(t0));
+            }
+        }
+    }
     // 2. In watch-only no input is sent: a click / type / key / scroll / open_app is declined without asking; only a
     //    screenshot (a read) or a wait go on.
     if mode == Mode::WatchOnly && sends_input(name) {
@@ -159,9 +169,10 @@ fn error_result(text: String, ms: u64) -> Value {
         let started_at = self.started_at;
         let now = Instant::now();
         let max_steps = self.config.computer.max_steps;
+        let disp_size = Size::parse(self.config.computer.display_size.as_deref());
         let mut grants = self.grants.lock().await;
         let mut step_counts = self.steps.lock().await;
-        run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, started_at, now, tx).await
+        run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, disp_size, started_at, now, tx).await
     }
 
     fn computer_apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
@@ -252,6 +263,8 @@ mod tests {
     fn channel() -> (mpsc::Sender<RunEvent>, mpsc::Receiver<RunEvent>) { mpsc::channel(16) }
     /// The per-job step cap used by the existing tests: large enough that only the dedicated limit tests hit it (item 2).
     const LIMIT: u32 = crate::computer::settings::DEFAULT_MAX_STEPS;
+    /// A comfortably-large sandbox display so the existing small-coordinate clicks are always in bounds (item 3).
+    const DEFAULT_DISPLAY: Size = Size::DEFAULT;
 
     #[tokio::test]
     async fn a_refused_step_is_not_run_and_names_the_rule() {
@@ -261,7 +274,7 @@ mod tests {
         let (tx, _rx) = channel();
         // Strict never types into a password field: classify the step, check it against the preset, decline without running.
         let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_type",
-                        &json!({"selector": "input[type=password]", "text": "x"}), "id1", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+                        &json!({"selector": "input[type=password]", "text": "x"}), "id1", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(r["text"].as_str().unwrap().contains("no_password_fields"), "the message names the rule: {}", r["text"]);
         assert!(mock.typed.borrow().is_empty(), "the refused step was not run");
@@ -274,7 +287,7 @@ mod tests {
         let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // A click without x and y is refused up front; the step never reaches the backend.
-        let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click", &json!({"x": 5.0}), "id2", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+        let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click", &json!({"x": 5.0}), "id2", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(r["text"].as_str().unwrap().contains("x and y"));
         assert!(mock.clicks.borrow().is_empty());
@@ -289,10 +302,10 @@ mod tests {
         // A risky click ("Publish") asks once; approve it for the conversation, and a later risky click of the same job runs.
         seed_approval("idA", true).await;
         let r1 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
-                         &json!({"x": 3.0, "y": 4.0, "text": "Publish"}), "idA", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+                         &json!({"x": 3.0, "y": 4.0, "text": "Publish"}), "idA", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r1["ok"], true, "the approved risky click ran: {}", r1["text"]);
         let r2 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
-                         &json!({"x": 5.0, "y": 6.0, "text": "Publish"}), "idB", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+                         &json!({"x": 5.0, "y": 6.0, "text": "Publish"}), "idB", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r2["ok"], true, "a later risky click of the same job runs without asking again");
         assert_eq!(mock.clicks.borrow().len(), 2, "both approved clicks ran");
     }
@@ -305,7 +318,7 @@ mod tests {
         let (tx, _rx) = channel();
         seed_approval("idD", false).await;
         let r = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_click",
-                        &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idD", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+                        &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idD", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r["ok"], false);
         assert!(mock.clicks.borrow().is_empty(), "a denied step was not run");
     }
@@ -317,11 +330,11 @@ mod tests {
         let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // In watch-only a click is declined without asking and the desktop never receives it...
-        let click = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_click", &json!({"x": 3.0, "y": 4.0}), "idW", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+        let click = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_click", &json!({"x": 3.0, "y": 4.0}), "idW", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(click["ok"], false);
         assert!(mock.clicks.borrow().is_empty(), "watch-only sent no input");
         // ...but a screenshot (a read) still runs.
-        let shot = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_screenshot", &json!({}), "idR", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+        let shot = run_one(&mock, &ruleset(), Mode::WatchOnly, "conv", "computer_screenshot", &json!({}), "idR", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(shot["ok"], true);
     }
 
@@ -332,10 +345,10 @@ mod tests {
         let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         // Firefox is allowed to open; an unknown app is refused by the allowed_apps rule without running.
-        let opened = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "firefox"}), "idO", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+        let opened = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "firefox"}), "idO", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(opened["ok"], true);
         assert_eq!(*mock.opened.borrow(), vec!["firefox".to_string()]);
-        let refused = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "code"}), "idC", &mut grants, &mut steps, LIMIT, Instant::now(), Instant::now(), &tx).await;
+        let refused = run_one(&mock, &ruleset(), Mode::Sandbox, "conv", "computer_open_app", &json!({"name": "code"}), "idC", &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(refused["ok"], false);
         assert!(refused["text"].as_str().unwrap().contains("allowed_apps"));
     }
@@ -417,7 +430,7 @@ mod tests {
         // ordinary clicks are Allowed by the strict preset; run them up to and past a limit of 2.
         for i in 0..3 {
             let r = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
-                            &json!({"x": 1.0 + i as f64, "y": 2.0}), "idC", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+                            &json!({"x": 1.0 + i as f64, "y": 2.0}), "idC", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
             if i < 2 { assert_eq!(r["ok"], true, "the first {} allowed steps run", i); }
             else { assert_eq!(r["ok"], false, "a step at the limit is refused"); assert!(r["text"].as_str().unwrap().contains("limit of 2"), "{}", r["text"]); }
         }
@@ -433,19 +446,43 @@ mod tests {
         let mut steps = HashMap::new();
         let (tx, _rx) = channel();
         seed_approval("idReset", true).await;  // approve the risky click so its approval resets the count
-        let r1 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id1", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        let r1 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id1", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r1["ok"], true);
-        let r2 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id2", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        let r2 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id2", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r2["ok"], true);
         // a risky click ("Publish") asks; approving it resets the count to start a new job.
-        let r3 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idReset", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        let r3 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0, "text": "Publish"}), "idReset", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r3["ok"], true, "the approved risky click ran and reset the count: {}", r3["text"]);
         // two more allowed steps run past the plain cap before the cap bites again.
-        let r4 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id4", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
-        let r5 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id5", &mut grants, &mut steps, 2, Instant::now(), Instant::now(), &tx).await;
+        let r4 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id4", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        let r5 = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click", &json!({"x": 1.0, "y": 2.0}), "id5", &mut grants, &mut steps, 2, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
         assert_eq!(r4["ok"], true, "after a reset an allowed step runs again");
         assert_eq!(r5["ok"], false, "the cap bites once the count reaches it again");
         assert!(r5["text"].as_str().unwrap().contains("limit of 2"), "{}", r5["text"]);
         assert_eq!(mock.clicks.borrow().len(), 4, "reset let the job run past its plain cap of 2");
+    }
+
+    /// A click whose coordinates fall outside the sandbox display's size is refused with a message naming the size, before
+    /// anything is sent to the backend (item 3). Within bounds an ordinary click runs.
+    #[tokio::test]
+    async fn a_click_outside_the_sandbox_display_is_refused_before_it_runs() {
+        let mock = MockBackend::new();
+        let mut grants = HashMap::new();
+        let mut steps = HashMap::new();
+        let (tx, _rx) = channel();
+        let small = Size { width: 100, height: 100, depth: 24 };
+        // inside the bounds, an ordinary click runs.
+        let ok = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
+                         &json!({"x": 50.0, "y": 60.0}), "ok1", &mut grants, &mut steps, LIMIT, small, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(ok["ok"], true, "{}", ok["text"]);
+        // outside on either axis, or negative, is refused before anything is sent, naming the display size.
+        for (tag, x, y) in [("x-axis", 200.0, 50.0), ("y-axis", 50.0, 300.0), ("negative", -1.0, 5.0)] {
+            let r = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
+                            &json!({"x": x, "y": y}), "oob1", &mut grants, &mut steps, LIMIT, small, Instant::now(), Instant::now(), &tx).await;
+            assert_eq!(r["ok"], false, "{tag}: an out-of-bounds click is refused");
+            assert!(r["text"].as_str().unwrap().contains("outside the 100x100 sandbox display"), "{tag}: {}", r["text"]);
+        }
+        // only the one in-bounds click reached the backend: out-of-bounds clicks never send anything.
+        assert_eq!(mock.clicks.borrow().len(), 1, "only the in-bounds click ran");
     }
 }
