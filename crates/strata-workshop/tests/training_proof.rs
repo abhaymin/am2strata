@@ -1,5 +1,5 @@
 //! Step 0 gate: prove the mold candle fork can actually train on CPU — a 2-weight linear regression trained with a
-//! `Var`, `backward()`, and `candy_nn::AdamW`, whose loss falls. If this fails, autograd is missing and training waits.
+//! `Var`, `backward()`, and `candle_nn::AdamW`, whose loss falls. If this fails, autograd is missing and training waits.
 
 use candle_core::{Device, Tensor, Var};
 use candle_nn::{AdamW, Optimizer, ParamsAdamW};
