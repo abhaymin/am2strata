@@ -433,8 +433,9 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     for (row, (text, colour)) in rows {
         let y = base_y - (row as i32) * 150;
         let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
-        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture
-        draws.push(format!("drawtext=fontfile='{}':text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x180A06@0.6:shadowx=3:shadowy=3", drawtext_escape(&font), drawtext_escape(&text)));
+        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture; only set fontfile when a usable Outfit font was found (else ffmpeg keeps its default system font instead of drawing an empty fontfile='')
+        draws.push(format!("drawtext={}:text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x180A06@0.6:shadowx=3:shadowy=3",
+                            drawtext_font_option(&font), drawtext_escape(&text)));
     }
     // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
     let _ = run_ffmpeg(&[
@@ -457,6 +458,12 @@ fn outfit_font() -> String {
         std::env::current_dir().ok().map(|d| d.join("web/fonts/outfit-latin-wght.woff2")),
     ];
     candidates.iter().flatten().find(|p| p.is_file()).map(|p| p.display().to_string()).unwrap_or_default()
+}
+
+/// The drawtext option prefix for the font: `fontfile='...'` when a usable Outfit font path was found, else empty so
+/// ffmpeg keeps its default system font instead of drawing an empty `fontfile=''`.
+fn drawtext_font_option(font: &str) -> String {
+    if font.is_empty() { String::new() } else { format!("fontfile='{}':", drawtext_escape(font)) }
 }
 
 // ----------------------------------------------------------------------------------------------------------- tests
@@ -594,6 +601,15 @@ mod tests {
         // these render as plain caption text: ffmpeg never treats them as filter options or escapes inside the quotes
         assert_eq!(drawtext_escape("a:b"), "a:b");
         assert_eq!(drawtext_escape("%{pts}"), "%{pts}");
+    }
+
+    #[test]
+    fn an_absent_font_leaves_drawtext_without_a_fontfile() {
+        // a usable font path is quoted and escaped like every other drawtext option, so a backslash in it stays valid
+        assert_eq!(drawtext_font_option("a b"), "fontfile='a b':", "a found font keeps its own quoting");
+        assert_eq!(drawtext_font_option("C:\\path"), "fontfile='C:\\\\path':", "a backslash in a path is not left as an escape");
+        // no usable Outfit font: omit fontfile entirely so ffmpeg falls back to its default system font (not fontfile='')
+        assert!(drawtext_font_option("").is_empty(), "an empty font path omits fontfile");
     }
 
     #[test]
