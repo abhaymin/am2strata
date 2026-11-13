@@ -30,6 +30,7 @@ mod mem;
 mod mcp;
 mod memory;
 mod media;
+mod compose;
 mod media_jobs;
 mod model_remove;
 mod monitor;
@@ -503,6 +504,8 @@ async fn main() -> Result<()> {
         .route("/api/media/genres", get(music::genres))
         .route("/api/jobs", post(media_jobs::again))
         .route("/v1/media/productions", post(media_jobs::productions))
+        .route("/v1/media/videos/compose", post(compose::compose_videos))
+        .route("/v1/media/thumbnails", post(compose::thumbnails))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

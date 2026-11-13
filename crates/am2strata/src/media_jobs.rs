@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub const TOOL_NAMES: [&str; 6] = ["generate_image", "generate_video", "speak", "make_song", "compose_music", "produce"];
+pub const TOOL_NAMES: [&str; 8] = ["generate_image", "generate_video", "speak", "make_song", "compose_music", "produce", "compose_video", "make_thumbnail"];
 
 /// The most media jobs one answer may queue.
 pub const PER_ANSWER: usize = 3;
@@ -62,12 +62,13 @@ impl Job {
 }
 
 fn kind_of(k: &str) -> &'static str {
-    match k { "image" => "image", "video" => "video", "song" => "song", "music" => "music", "production" => "production", _ => "tts" }
+    match k { "image" => "image", "compose" | "video" => "video", "song" => "song", "music" => "music", "thumbnail" => "image",
+              "production" => "production", _ => "tts" }
 }
 
 fn ext_of(mime: &str) -> &'static str {
-    match mime { "image/png" | "image/apng" => "png", "video/mp4" => "mp4", "image/gif" => "gif", "image/webp" => "webp",
-                 m if m.starts_with("audio/") => "wav", _ => "bin" }
+    match mime { "image/png" | "image/apng" => "png", "image/jpeg" | "image/jpg" => "jpeg", "video/mp4" => "mp4",
+                 "image/gif" => "gif", "image/webp" => "webp", m if m.starts_with("audio/") => "wav", _ => "bin" }
 }
 
 pub struct Jobs {
@@ -244,8 +245,53 @@ impl Jobs {
                  reads; to sing, use make_song.",
                 "parameters": {"type": "object", "properties": {
                     "text": {"type": "string", "description": "what to say, at most 20,000 characters (about 20 minutes)"},
-                    "voice": {"type": "string", "description": "female, male, or a voice name (laura, jon, lea, gary)"}},
-                    "required": ["text"]}}));
+                     "voice": {"type": "string", "description": "female, male, or a voice name (laura, jon, lea, gary)"}},
+                     "required": ["text"]}}));
+        }
+        // compose_video needs pictures and audio to join; make_thumbnail only needs one picture
+        if ok("image") && (ok("music") || ok("tts")) {
+            t.push(json!({
+                "name": "compose_video",
+                "description": format!(
+                    "Compose a finished video on this PC from shots you already have: pictures (a generated image or clip), \
+                     short clips, an audio track (a song, instrumental music, or spoken speech) and optional captions. The \
+                     shots are laid out over the audio's length, joined with soft fades, burned in with any captions, and \
+                     exported as one MP4; a vertical 1080x1920 Short is an option. It is queued and appears in the chat after \
+                     your answer: say that it is on its way."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "audio": {"type": "string", "description": "a media job id (mj-… ) or file that sets the video's length and sound"},
+                        "shots": {"type": "array", "description": "the shots in order, each of {\"image\": <job id or file>}, {\"clip\": <job id or file>}, or with a \"seconds\" length for that shot",
+                                  "items": {"type": "object"}},
+                        "captions": {"type": "array", "description": "optional [[start_s, end_s, text], ...] to show on screen"},
+                        "title_card": {"type": "string", "description": "text shown at the start"},
+                        "end_card": {"type": "string", "description": "text shown at the end"},
+                        "size": {"type": "string", "description": "\"1920x1080\" (default) or \"1080x1920\" for a vertical Short"},
+                        "crossfade_s": {"type": "number", "description": "the fade between shots in seconds, default 0.8"}
+                    },
+                    "required": ["audio", "shots"]
+                }
+            }));
+        }
+        if ok("image") {
+            t.push(json!({
+                "name": "make_thumbnail",
+                "description": format!(
+                    "Make a YouTube thumbnail on this PC: one 1280x720 picture, big words on a dark gradient, from a single image. \
+                     Use at most four short words, heavy type with strong contrast. It is queued and appears in the chat after your \
+                     answer: say that it is on its way."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "image": {"type": "string", "description": "a media job id (mj-… ) or file to use as the picture"},
+                        "lines": {"type": "array", "description": "the words, as [[text, \"white\"|\"gold\"], ...] — at most four short lines",
+                                  "items": {"type": "object"}},
+                        "tag": {"type": "string", "description": "small text shown beneath the lines"}
+                    },
+                    "required": ["image", "lines"]
+                }
+            }));
         }
         t
     }
@@ -338,7 +384,33 @@ impl Jobs {
             return match self.submit_production(args, caps) {
                 Ok(job) => {
                     let text = format!("production job {} queued ({} parts). It is made part by part after this answer and \
-                                        appears in the chat as one file; tell the user it is on its way.", job["id"].as_str().unwrap_or(""), job["parts"]);
+                                         appears in the chat as one file; tell the user it is on its way.", job["id"].as_str().unwrap_or(""), job["parts"]);
+                    json!({"ok": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0, "job": job})
+                }
+                Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": e.len() + 7, "truncated": false, "ms": 0}),
+            };
+        }
+        if name == "compose_video" {
+            // it needs to gather shots and audio: a picture or a video model must fit this PC
+            let can = caps["kinds"]["image"]["usable"] == true || caps["kinds"]["video"]["usable"] == true;
+            if !can {
+                return json!({"ok": false, "text": "error: compose_video needs a picture or video model on this PC to gather the shots", "chars": 0, "truncated": false, "ms": 0});
+            }
+            return match self.submit_compose(args) {
+                Ok(job) => {
+                    let shots = job["shots"].as_u64().unwrap_or(0);
+                    let text = format!("compose job {} queued ({} shots). It joins the pictures, clips, audio and captions into \
+                                one MP4 after this answer and appears in the chat as a video; tell the user it is on its way.", job["id"].as_str().unwrap_or(""), shots);
+                    json!({"ok": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0, "job": job})
+                }
+                Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": e.len() + 7, "truncated": false, "ms": 0}),
+            };
+        }
+        if name == "make_thumbnail" {
+            return match self.submit_thumbnail(args) {
+                Ok(job) => {
+                    let text = format!("thumbnail job {} queued. It is made after this answer and appears in the chat as an image; \
+                                tell the user it is on its way.", job["id"].as_str().unwrap_or(""));
                     json!({"ok": true, "text": text, "chars": text.len(), "truncated": false, "ms": 0, "job": job})
                 }
                 Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": e.len() + 7, "truncated": false, "ms": 0}),
@@ -536,7 +608,70 @@ impl Jobs {
         Ok(json!({"id": id, "kind": "production", "model": "production", "parts": parts.len(), "url": format!("/api/jobs/{id}")}))
     }
 
-    fn set_meta(&self, n: u64, meta: Value) {
+    /// A compose job: pictures, clips, audio and captions joined into one MP4 by ffmpeg. The shots are laid out over the
+    /// audio's length (their own when given), crossfaded between, with the captions and cards burned in. Queued like a
+    /// production; its file is the video at /v1/media/jobs/{id}/content, its meta the size, length and shot count.
+    pub fn submit_compose(&self, req: &Value) -> Result<Value, String> {
+        let shots = req["shots"].as_array().ok_or("shots: a list of {\"image\"|\"clip\": ...}, each an image or clip file")?;
+        if shots.is_empty() {
+            return Err("shots: at least one shot is needed".into());
+        }
+        for (i, sh) in shots.iter().enumerate() {
+            if sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).is_none_or(|s| s.trim().is_empty()) {
+                return Err(format!("shots[{i}]: give an \"image\" or a \"clip\""));
+            }
+        }
+        let n = {
+            let mut g = self.next.lock().unwrap();
+            *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
+            *g - 1
+        };
+        let id = format!("mj-{n}");
+        let job = Job { id: id.clone(), kind: "compose", model: "compose".into(), prompt: format!("{} shots", shots.len()), created: crate::now(),
+                        state: "queued", error: None, mime: None, data: None, meta: json!({"part": 0, "parts": shots.len(), "now": "compose"}),
+                        seconds: None, req: req.clone(), file: None };
+        self.save(&job);
+        self.jobs.lock().unwrap().insert(n, job);
+        let s = self.app().clone();
+        let req = req.clone(); // own it so the spawned future does not borrow the request's lifetime
+        tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
+                         crate::queue::CLIENT.scope("media".to_string(), async move { run(s, n, "compose", req).await })));
+        Ok(json!({"id": id, "kind": "video", "model": "compose", "shots": shots.len(), "url": format!("/api/jobs/{id}")}))
+    }
+
+    /// A thumbnail job: one big-worded JPEG on a dark gradient (compose.rs), from an image and the lines to show. Queued
+    /// like a production; its file is the JPEG at /v1/media/jobs/{id}/content.
+    pub fn submit_thumbnail(&self, req: &Value) -> Result<Value, String> {
+        if req["image"].is_null() {
+            return Err("image: send the picture to turn into a thumbnail".into());
+        }
+        let n = {
+            let mut g = self.next.lock().unwrap();
+            *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
+            *g - 1
+        };
+        let id = format!("mj-{n}");
+        let prompt = req["lines"].as_array().and_then(|a| a.first()).and_then(|l| l.get(0).and_then(Value::as_str)).unwrap_or("thumbnail").chars().take(48).collect();
+        let job = Job { id: id.clone(), kind: "thumbnail", model: "thumbnail".into(), prompt, created: crate::now(), state: "queued",
+                        error: None, mime: None, data: None, meta: json!({"part": 0, "parts": 1, "now": "thumbnail"}), seconds: None,
+                        req: req.clone(), file: None };
+        self.save(&job);
+        self.jobs.lock().unwrap().insert(n, job);
+        let s = self.app().clone();
+        let req = req.clone(); // own it so the spawned future does not borrow the request's lifetime
+        tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
+                         crate::queue::CLIENT.scope("media".to_string(), async move { run(s, n, "thumbnail", req).await })));
+        Ok(json!({"id": id, "kind": "image", "model": "thumbnail", "url": format!("/api/jobs/{id}")}))
+    }
+
+    /// Update a job's meta (a compose's progress, or a production's current part).
+    pub fn set_meta(&self, n: u64, meta: Value) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(j) = jobs.get_mut(&n) {
             j.meta = meta;
@@ -613,6 +748,17 @@ fn human(s: f64) -> String {
 async fn run(s: AppState, n: u64, kind: &'static str, req: Value) {
     if kind == "production" {
         let out = run_production(&s, n, &req).await;
+        s.media_jobs.finish(n, out);
+        return;
+    }
+    // compose and thumbnail are not an endpoint's request: they run ffmpeg here (compose.rs), the media engine.
+    if kind == "compose" {
+        let out = crate::compose::make(&s, n, &req).await;
+        s.media_jobs.finish(n, out);
+        return;
+    }
+    if kind == "thumbnail" {
+        let out = crate::compose::make_thumbnail(&s, &req).await;
         s.media_jobs.finish(n, out);
         return;
     }
@@ -846,8 +992,15 @@ pub async fn again(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     if !TOOL_NAMES.contains(&tool) {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("tool: one of {}", TOOL_NAMES.join(", ")));
     }
+    // each standard tool needs its own kind's profile; compose_video and make_thumbnail gather pictures and audio, so any
+    // media kind is enough for them
     let set = match tool { "generate_image" => "image", "generate_video" => "video", "speak" => "speech", _ => "music" };
-    if profile.as_ref().is_some_and(|p| p.name != "default" && !p.has(set)) {
+    let allowed = if matches!(tool, "compose_video" | "make_thumbnail") {
+        profile.as_ref().is_none_or(|p| p.name == "default" || p.has("image") || p.has("video") || p.has("music") || p.has("speech"))
+    } else {
+        profile.as_ref().is_none_or(|p| p.name == "default" || p.has(set))
+    };
+    if !allowed {
         return error(StatusCode::FORBIDDEN, "permission_error", format!("this key's profile has no \"{set}\""));
     }
     let caps = s.media_jobs.capabilities().await;

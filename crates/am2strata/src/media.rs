@@ -170,7 +170,7 @@ async fn frames(video: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
-fn tempdir() -> Result<PathBuf> {
+pub fn tempdir() -> Result<PathBuf> {
     let d = std::env::temp_dir().join(format!("strata-video-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&d)?;
     Ok(d)
