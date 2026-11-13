@@ -524,10 +524,10 @@ pub use linux::{LinuxBackend, SandboxDesktop};
 /// real Xvfb-backed one in `mod linux` — both are named `SandboxDesktop` at this path, which is why the engine needs no OS check.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[cfg(not(target_os = "linux"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct SandboxDesktop {
     /// whether it has been told to stop (the idle watcher / engine read this), mirroring the Linux sandbox's flag.
-    stopped: std::sync::atomic::AtomicBool,
+    pub stopped: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(not(target_os = "linux"))]
