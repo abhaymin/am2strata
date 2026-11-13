@@ -149,15 +149,15 @@ mod linux {
         }
 
         fn scroll(&self, dx: i32, dy: i32) -> Result<(), String> {
-            let (h, v) = (scroll_part(dx), scroll_part(dy));
-            if h.is_none() && v.is_none() { return Ok(()); } // nothing to do
+            // xdotool scrolls one direction at a time, so emit a scroll per non-zero axis: both dx and dy run when both are given.
             let disp = self.disp()?;
-            // xdotool scrolls lines from the current pointer (0,0); sign carries the direction.
-            let mut c = dotool("scroll", &disp)?;
-            c.arg("0").arg("0");
-            if let Some((dir, n)) = v { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
-            else if let Some((dir, n)) = h { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
-            c.status_checked()
+            for (dir, n) in scroll_parts(dx, dy) {
+                let mut c = dotool("scroll", &disp)?;
+                c.arg("0").arg("0");
+                c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]);
+                c.status_checked()?;
+            }
+            Ok(())
         }
 
         fn open_app(&self, name: &str) -> Result<(), String> {
@@ -486,10 +486,13 @@ mod linux {
         seq.join("+")
     }
 
-    /// The scroll part for one axis: (direction, line count) or None when the delta is zero.
-    pub(super) fn scroll_part(d: i32) -> Option<(&'static str, u32)> {
-        if d == 0 { return None; }
-        Some((if d < 0 { "down" } else { "up" }, d.unsigned_abs()))
+    /// The scroll actions for both axes: one (direction, line count) per non-zero delta, so a diagonal scrolls in both directions.
+    /// Per the tool schema positive dx scrolls right and positive dy scrolls down; xdotool takes up/down/left/right directions.
+    pub(super) fn scroll_parts(dx: i32, dy: i32) -> Vec<(&'static str, u32)> {
+        let mut out = Vec::new();
+        if dy != 0 { out.push((if dy > 0 { "down" } else { "up" }, dy.unsigned_abs())); }
+        if dx != 0 { out.push((if dx > 0 { "right" } else { "left" }, dx.unsigned_abs())); }
+        out
     }
 
     /// Run a finished command, turning failure into a readable error (the tool's name + the failing status).
@@ -606,8 +609,10 @@ mod tests {
     fn key_and_scroll_helpers_render_for_xdotool() {
         assert_eq!(linux::keys_to_xdotool(&[Key::new("Ctrl"), Key::new("a")]), "ctrl+a");
         assert_eq!(linux::keys_to_xdotool(&[Key::new("Enter")]), "enter");
-        assert_eq!(linux::scroll_part(-2), Some(("down", 2)));
-        assert_eq!(linux::scroll_part(0), None);
+        // positive dy scrolls down, negative dx scrolls left, and both axes come back (dy then dx) when both deltas are given.
+        assert!(linux::scroll_parts(0, 0).is_empty(), "a zero scroll does nothing");
+        assert_eq!(linux::scroll_parts(0, 2), vec![("down", 2)]);
+        assert_eq!(linux::scroll_parts(-3, 4), vec![("down", 4), ("left", 3)], "both axes run when both are given");
     }
 
     /// End-to-end on a real (sandbox) desktop: start Xvfb :99, open an allowed app through LinuxBackend, list its windows,
