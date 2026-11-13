@@ -583,7 +583,11 @@ mod tests {
 
     #[test]
     fn setup_backs_up_and_reset_restores() {
-        let home = std::env::temp_dir().join(format!("am2-agents-{}", std::process::id()));
+        // CI runs this setup/apply/reset from several processes (the lib build and the am2strata bin, both include the
+        // agents tests) at once; a PID can be reused by another process mid-run, so the folder adds nanos to stay
+        // unique or two runs would share it and lose each other's restored .claude/settings.json.
+        let home = std::env::temp_dir().join(format!("am2-agents-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::write(home.join(".claude/settings.json"), "{\"theme\": \"dark\", \"env\": {\"FOO\": \"1\"}}").unwrap();
@@ -603,6 +607,31 @@ mod tests {
         std::fs::write(home.join(".config/opencode/opencode.json"), "{ // mine\n}").unwrap();
         assert!(setup("opencode", &t(true), &home).unwrap_err().contains("not plain JSON"));
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // regression for setup_backs_up_and_reset_restores: CI runs it from several processes at once, so each concurrent
+    // run still gets its own uniquely named home and restores its file; none may lose its settings.json to another.
+    #[test]
+    fn setup_apply_reset_run_on_separate_concurrent_homes() {
+        let mut hs = Vec::new();
+        for s in 0..4 {
+            hs.push(std::thread::spawn(move || {
+                let home = std::env::temp_dir().join(format!("am2-agents-{}-{}-{}", std::process::id(), s,
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()));
+                let _ = std::fs::remove_dir_all(&home);
+                std::fs::create_dir_all(home.join(".claude")).unwrap();
+                std::fs::write(home.join(".claude/settings.json"), "{\"theme\": \"dark\", \"env\": {\"FOO\": \"1\"}}").unwrap();
+                apply(&setup("claude", &t(true), &home).unwrap()).unwrap();
+                apply(&setup("pi", &t(false), &home).unwrap()).unwrap();
+                assert_eq!(reset("claude", &home).unwrap().len(), 1);
+                // a file that was not there goes again, both restored and removed by their resets
+                assert_eq!(std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(), "{\"theme\": \"dark\", \"env\": {\"FOO\": \"1\"}}");
+                reset("pi", &home).unwrap();
+                assert!(!home.join(".pi/agent/models.json").exists());
+                let _ = std::fs::remove_dir_all(&home);
+            }));
+        }
+        for h in hs { h.join().unwrap(); }
     }
 
     #[test]
