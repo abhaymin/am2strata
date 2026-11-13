@@ -106,35 +106,35 @@ mod linux {
                 return Err("`xwininfo` is not on this system; the window list needs it (install x11-utils)".into());
             }
             let disp = self.disp()?;
-            let out = run_cmd(&["xwininfo", "-root", "-tree", "-display", &disp])?;
+            let out = run_cmd(&["xwininfo", "-root", "-tree", "-display", &disp], &disp)?;
             Ok(parse_wininfo(&String::from_utf8_lossy(&out)))
         }
 
         fn focus(&self, id: WindowId) -> Result<(), String> {
             let disp = self.disp()?;
             let win = format!("0x{id:x}");
-            let mut c = dotool("windowactivate --sync")?;
-            c.arg(&win).arg("-d").arg(&disp);
+            let mut c = dotool("windowactivate --sync", &disp)?;
+            c.arg(&win);
             c.status_checked()
         }
 
         fn click(&self, x: i32, y: i32, button: Button) -> Result<(), String> {
             let disp = self.disp()?;
-            let mut m = dotool("mousemove --sync")?;
-            m.arg(x.to_string()).arg(y.to_string()).arg("-d").arg(&disp);
+            let mut m = dotool("mousemove --sync", &disp)?;
+            m.arg(x.to_string()).arg(y.to_string());
             m.status_checked()?;
             // xdotool click codes: 1 left, 2 middle, 3 right
             let code = match button { Button::Left => "1", Button::Middle => "2", Button::Right => "3" };
-            let mut c = dotool("click")?;
-            c.arg(code).arg("-d").arg(&disp);
+            let mut c = dotool("click", &disp)?;
+            c.arg(code);
             c.status_checked()
         }
 
         fn type_text(&self, text: &str) -> Result<(), String> {
             // --clearmodifiers drops any stuck modifier keys; xdotool types the rest literally
             let disp = self.disp()?;
-            let mut c = dotool("type --clearmodifiers --delay 3")?;
-            c.arg(text).arg("-d").arg(&disp);
+            let mut c = dotool("type --clearmodifiers --delay 3", &disp)?;
+            c.arg(text);
             c.status_checked()
         }
 
@@ -142,8 +142,8 @@ mod linux {
             let seq = keys_to_xdotool(keys);
             if seq.is_empty() { return Ok(()); }
             let disp = self.disp()?;
-            let mut c = dotool("key --clearmodifiers")?;
-            c.arg(seq).arg("-d").arg(&disp);
+            let mut c = dotool("key --clearmodifiers", &disp)?;
+            c.arg(seq);
             c.status_checked()
         }
 
@@ -152,18 +152,20 @@ mod linux {
             if h.is_none() && v.is_none() { return Ok(()); } // nothing to do
             let disp = self.disp()?;
             // xdotool scrolls lines from the current pointer (0,0); sign carries the direction.
-            let mut c = dotool("scroll")?;
-            c.arg("-d").arg(&disp).arg("0").arg("0");
+            let mut c = dotool("scroll", &disp)?;
+            c.arg("0").arg("0");
             if let Some((dir, n)) = v { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
             else if let Some((dir, n)) = h { c.args(&["--direction".into(), dir.into(), "--lines".into(), n.to_string()]); }
             c.status_checked()
         }
 
         fn open_app(&self, name: &str) -> Result<(), String> {
-            // run on this display; an app not installed (NotFound) is a clear "is it in the allow list?" message
+            // run on this display; an app not installed (NotFound) is a clear "is it in the allow list?" message. Pin DISPLAY and
+            // drop WAYLAND_DISPLAY so a Wayland-capable app cannot open on the real desktop instead of the sandbox.
             let disp = self.disp()?;
             let mut cmd = std::process::Command::new(name);
-            cmd.env("DISPLAY", &disp).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+            let mut cmd = use_sandbox_display(cmd, &disp);
             match cmd.spawn() {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
@@ -208,12 +210,12 @@ mod linux {
         fn capture_screen(&self, disp: &str) -> Result<Vec<u8>, String> {
             if tool_available("convert") || tool_available("import") {
                 let tool = if tool_available("convert") { "convert" } else { "import" };
-                let b = run_cmd(&[tool, "-window", "root", "-display", disp, "jpg:-"])?;
+                let b = run_cmd(&[tool, "-window", "root", "-display", disp, "jpg:-"], disp)?;
                 if !b.is_empty() { return Ok(b); }
             }
             // scrot writes a PNG to `-` (its own piping), else we read the file it leaves behind.
             if tool_available("scrot") {
-                let b = run_cmd(&["scrot", "-o", "-", "-display", disp])?;
+                let b = run_cmd(&["scrot", "-o", "-", "-display", disp], disp)?;
                 if !b.is_empty() { return Ok(b); }
             }
             Err(format!("no screenshot tool (convert/import/scrot) is on this system for display {disp}"))
@@ -340,19 +342,33 @@ mod linux {
         false
     }
 
-    /// xdotool invocation with a shared flag set, or an error naming the missing tool.
-    pub(super) fn dotool(action: &str) -> Result<std::process::Command, String> {
+    /// A child X tool must run against the sandbox display with nothing inherited from the server's environment (the am2strata
+    /// service runs with `DISPLAY=:0` / `WAYLAND_DISPLAY=wayland-0`, so a leaked DISPLAY would drive the owner's real screen),
+    /// yet keep PATH so the binary resolves. Applies this pinned environment to any Command; xdotool reads its display only from
+    /// DISPLAY, so no `-d` argument is needed or allowed anymore.
+    fn use_sandbox_display(mut cmd: std::process::Command, disp: &str) -> std::process::Command {
+        // capture PATH before clearing (env_clear drops all inherited vars); DISPLAY is pinned to the sandbox display below.
+        let path = std::env::var_os("PATH");
+        cmd.env_clear();
+        if let Some(path) = path { cmd.env("PATH", path); }
+        cmd.env("DISPLAY", disp);
+        cmd
+    }
+
+    /// xdotool invocation pinned to the sandbox display (`disp`), or an error naming the missing tool. Callers pass the action and
+    /// its arguments; the sandbox DISPLAY is set on the environment (never inherited), so `-d` is dropped at every call site.
+    pub(super) fn dotool(action: &str, disp: &str) -> Result<std::process::Command, String> {
         if !tool_available("xdotool") { return Err("`xdotool` is not on this system; computer use input needs it (install xdotool)".into()); }
         let mut c = std::process::Command::new("xdotool");
         c.args(action.split_whitespace()).stdin(std::process::Stdio::null());
-        Ok(c)
+        Ok(use_sandbox_display(c, disp))
     }
 
-    /// Run a command, capture its stdout, and fail with stderr if it did not exit successfully.
-    pub(super) fn run_cmd(args: &[&str]) -> Result<Vec<u8>, String> {
-        let child = std::process::Command::new(&args[0]).args(&args[1..])
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
-            .spawn().map_err(|e| format!("running {}: {e}", args[0]))?;
+    /// Run a command against the sandbox display (`disp`), capture its stdout, and fail with stderr if it did not exit successfully.
+    pub(super) fn run_cmd(args: &[&str], disp: &str) -> Result<Vec<u8>, String> {
+        let mut child_cmd = std::process::Command::new(&args[0]);
+        child_cmd.args(&args[1..]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        let child = use_sandbox_display(child_cmd, disp).spawn().map_err(|e| format!("running {}: {e}", args[0]))?;
         let out = child.wait_with_output().map_err(|e| e.to_string())?;
         if out.status.success() { Ok(out.stdout) } else { Err("the screenshot command failed".into()) }
     }
@@ -529,7 +545,7 @@ mod tests {
 
         // wait (briefly) for the display to come up, or bail if it never does
         let mut waited = 0u32;
-        while linux::run_cmd(&["xwininfo", "-root", "-display", ":99"]).is_err() && waited < 50 {
+        while linux::run_cmd(&["xwininfo", "-root", "-display", ":99"], ":99").is_err() && waited < 50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             waited += 1;
         }
@@ -564,17 +580,73 @@ mod tests {
         let _ = b.open_app("am2strata-no-such-app-xyz");
     }
 
-    /// A sandbox backend's display is chosen from the filesystem, never the environment's DISPLAY (`/computer/backend.rs`, item 3).
+    /// The sandbox display is handed to child X tools on their environment, never inherited from the server's DISPLAY (`/computer/backend.rs`, item 3).
+    /// Unlike the old check (which only compared the stored string), this sets `DISPLAY=:0` in the process — like the real service would — and asserts what each
+    /// built Command actually passes the child: DISPLAY is the sandbox display, there is no WAYLAND_DISPLAY leaked in, PATH is kept, and `-d` is no longer an xdotool
+    /// argument (for click, type, key, scroll and focus). Without the fix the inherited `DISPLAY=:0` would hit the owner's real desktop.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_sandbox_backend_never_uses_the_environment_display() {
-        let forced = ":7777";
         let original = std::env::var("DISPLAY").ok();
-        std::env::set_var("DISPLAY", forced);  // even if the host points DISPLAY here, the sandbox ignores it
-        assert_ne!(linux::pick_free_display(), forced, "the free display is chosen from /tmp, never the environment's DISPLAY");
-        // a sandbox backend constructs without touching the environment's DISPLAY (it picks its own on first need)
-        let _b = LinuxBackend::new_sandbox(Size::default());
+        std::env::set_var("DISPLAY", ":0");  // the server's real display; a leaked one would drive the owner's desktop
+
+        // Inspecting the built Command needs no running display, but building an xdotool command goes through the availability
+        // guard — so on a box without xdotool (this CI box) there is nothing to build; the assertions below run wherever the
+        // sandbox actually runs, which requires `xdotool` (`computer/engine.rs`, item 2).
+        if !linux::tool_available("xdotool") {
+            match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
+            return;
+        }
+
+        const SANDBOX: &str = ":99";
+
+        // focus: xdotool windowactivate --sync <win>
+        let mut c = linux::dotool("windowactivate --sync", SANDBOX).unwrap(); c.arg("0x1f");
+        assert_sandbox_env(&c, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+
+        // click: xdotool mousemove --sync <x> <y>, then xdotool click <code>
+        let mut m = linux::dotool("mousemove --sync", SANDBOX).unwrap(); m.arg("10").arg("20");
+        assert_sandbox_env(&m, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+        let mut k = linux::dotool("click", SANDBOX).unwrap(); k.arg("1");
+        assert_sandbox_env(&k, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+
+        // type: xdotool type --clearmodifiers --delay 3 <text>
+        let mut t = linux::dotool("type --clearmodifiers --delay 3", SANDBOX).unwrap(); t.arg("hello");
+        assert_sandbox_env(&t, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+
+        // key: xdotool key --clearmodifiers <seq>
+        let mut kp = linux::dotool("key --clearmodifiers", SANDBOX).unwrap(); kp.arg("enter");
+        assert_sandbox_env(&kp, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+
+        // scroll: xdotool scroll 0 0 [direction]
+        let mut s = linux::dotool("scroll", SANDBOX).unwrap(); s.arg("0").arg("0");
+        assert_sandbox_env(&s, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
+
         match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
+    }
+
+    /// What every built child X command must receive: DISPLAY pinned to the sandbox display, no WAYLAND_DISPLAY leaked in, PATH kept so
+    /// the binary resolves, and no `-d` argument (xdotool reads its display only from the environment). Mirrors exactly what each backend
+    /// method pushes onto its Command. `CommandEnvs` is an iterator over the env overrides, so it is scanned here rather than indexed.
+    #[cfg(target_os = "linux")]
+    fn assert_sandbox_env(c: &std::process::Command, disp_key: &str, wl_key: &str, path_key: &str, sandbox: &str) {
+        assert!(!c.get_args().any(|a| a.to_string_lossy() == "-d"), "xdotool must not get a -d argument; it reads DISPLAY from the environment");
+        let mut disp_value: Option<String> = None;
+        let mut has_wl = false;
+        let mut has_path = false;
+        for (k, v) in c.get_envs() {
+            let ks = k.to_string_lossy();
+            if ks == disp_key {
+                disp_value = Some(v.as_ref().and_then(|o| o.to_str()).unwrap_or("").to_string());
+            } else if ks == wl_key {
+                has_wl = true;
+            } else if ks == path_key {
+                has_path = true;
+            }
+        }
+        assert_eq!(disp_value, Some(sandbox.to_string()), "child must get the sandbox DISPLAY, not an inherited one");
+        assert!(!has_wl, "WAYLAND_DISPLAY must not reach the child");
+        assert!(has_path, "PATH must be kept so the binary resolves");
     }
 
     /// The default geometry is used when the config gives none or an unparseable value.
