@@ -150,7 +150,12 @@ fn click_selector_js(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> Stri
         (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
         _ => {
             let t = serde_json::to_string(text.unwrap_or("")).unwrap();
-            format!("[...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase() === {t}.toLowerCase())\n                     || [...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase().includes({t}.toLowerCase()))", SEL = SEL, t = t)
+            if text.map(|s| s.trim().is_empty()).unwrap_or(true) {
+                // no usable text: resolve to nothing, so the "includes" fall-back cannot grab the first control on an empty text
+                format!("[...document.querySelectorAll('{SEL}')].find(() => false)", SEL = SEL)
+            } else {
+                format!("[...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase() === {t}.toLowerCase())\n                     || [...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase().includes({t}.toLowerCase()))", SEL = SEL, t = t)
+            }
         }
     }
 }
@@ -161,7 +166,8 @@ fn click_selector_js(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> Stri
 #[allow(dead_code)]
 fn control_text_matches(control: &str, needle: &str) -> bool {
     let c = control.trim().to_lowercase();
-    let n = needle.to_lowercase();
+    let n = needle.trim().to_lowercase();
+    if n.is_empty() { return false; }
     c == n || c.contains(&n)
 }
 
@@ -701,6 +707,9 @@ impl Browsers {
                 // ONE lookup resolves this control (same list, lowercasing, includes fallback as the risk check above).
                 let ctrl = click_control(&page, args, true).await.map_err(|e| e.to_string())?;
                 match (args["x"].as_f64(), args["y"].as_f64(), args["text"].as_str()) {
+                    (Some(_), Some(_), _) => {}, // a point on the page resolves the control by itself
+                    (_, _, Some(t)) if t.trim().is_empty() => return Err("give x and y, or the text of a link or button".into()),
+                    (None, None, None) => return Err("give x and y, or the text of a link or button".into()),
                     (_, _, Some(t)) if !ctrl.found => return Err(format!("no link or button with the text {t:?} on this page")),
                     _ => {}
                 }
@@ -1041,6 +1050,17 @@ mod tests {
         assert!(control_text_matches("Publish", "publish"), "exact, case-insensitive");
         assert!(control_text_matches("Publish", "ublish"), "the includes fall-back the reviewer flagged");
         assert!(!control_text_matches("The Dashboard", "publish"), "text without the clicked text is not matched");
+        assert!(!control_text_matches("Publish", ""), "an empty needle never matches, so no control is clicked on a blank text");
+    }
+
+    /// a click needs a target again: no text at all, or a text that is blank after trimming, resolves to nothing (matches no
+    /// control) so the shared lookup can't fall through and grab the first one; a real word still resolves by exact-then-includes.
+    #[test]
+    fn empty_click_text_resolves_to_nothing() {
+        assert!(click_selector_js(None, None, None).contains("find(() => false)"), "no text at all resolves to nothing");
+        assert!(click_selector_js(None, None, Some("")).contains("find(() => false)"), "empty text resolves to nothing");
+        assert!(click_selector_js(None, None, Some("   ")).contains("find(() => false)"), "blank text resolves to nothing");
+        assert!(!click_selector_js(None, None, Some("Publish")).contains("find(() => false)"), "a real word still resolves normally");
     }
 
     /// allowed once for the same conversation+site, but not a different site, and not after the 30-minute window
