@@ -144,6 +144,18 @@ fn click_control_js(x: Option<f64>, y: Option<f64>, text: Option<&str>, click: b
 /// The JS that resolves a `browser_click` argument (a point on the page, or a link/button's text) to the candidate element.
 /// One resolution: by point, else an exact case-insensitive match first and a case-insensitive "includes" fall-back over the
 /// SAME control list — so the risk check and the click agree on which control was hit.
+/// A `browser_click` has a target only by a full point (both x and y) or by non-empty text; an empty argument, or a partial
+/// coordinate with only x or only y, is refused by the caller — so it cannot fall through `_ => {}`, resolve to nothing, and
+/// click the wrong control. Kept pure next to `click_selector_js` for one shared rule and one test.
+fn click_has_target(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> bool {
+    match (x, y) {
+        // a point needs both coordinates; any partial coordinate — only x or only y — is refused, even when text is also given
+        (Some(_), Some(_)) => true,
+        (None, None) => !text.map_or(true, |t| t.is_empty()),
+        _ => false,
+    }
+}
+
 fn click_selector_js(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> String {
     const SEL: &str = "a,button,input[type=submit],[role=button],[onclick]";
     match (x, y) {
@@ -704,12 +716,16 @@ impl Browsers {
                 page.goto(url.as_str()).await.map_err(|e| format!("opening {url}: {e}"))?;
             }
             "browser_click" => {
+                // a click needs a target by point (both coordinates) or by a link/button's text; an empty argument or a
+                // partial coordinate (only x or only y) is refused up front, so it cannot fall through and click nothing
+                let (x, y, text) = (args["x"].as_f64(), args["y"].as_f64(), args["text"].as_str());
+                if !click_has_target(x, y, text) {
+                    return Err("give x and y, or the text of a link or button".into());
+                }
                 // ONE lookup resolves this control (same list, lowercasing, includes fallback as the risk check above).
                 let ctrl = click_control(&page, args, true).await.map_err(|e| e.to_string())?;
-                match (args["x"].as_f64(), args["y"].as_f64(), args["text"].as_str()) {
+                match (x, y, text) {
                     (Some(_), Some(_), _) => {}, // a point on the page resolves the control by itself
-                    (_, _, Some(t)) if t.trim().is_empty() => return Err("give x and y, or the text of a link or button".into()),
-                    (None, None, None) => return Err("give x and y, or the text of a link or button".into()),
                     (_, _, Some(t)) if !ctrl.found => return Err(format!("no link or button with the text {t:?} on this page")),
                     _ => {}
                 }
@@ -1061,6 +1077,17 @@ mod tests {
         assert!(click_selector_js(None, None, Some("")).contains("find(() => false)"), "empty text resolves to nothing");
         assert!(click_selector_js(None, None, Some("   ")).contains("find(() => false)"), "blank text resolves to nothing");
         assert!(!click_selector_js(None, None, Some("Publish")).contains("find(() => false)"), "a real word still resolves normally");
+    }
+
+    /// the reviewer's partial coordinate is refused: only x, or only y (even with text), has no usable target and must be rejected,
+    /// while a full point or a plain word still counts as a click target.
+    #[test]
+    fn a_partial_coordinate_is_refused() {
+        assert!(!click_has_target(Some(10.0), None, None), "only x is not a target");
+        assert!(!click_has_target(None, Some(20.0), None), "only y is not a target");
+        assert!(!click_has_target(Some(10.0), None, Some("publish")), "x without y refuses even with text");
+        assert!(click_has_target(Some(10.0), Some(20.0), None), "both coordinates are a point");
+        assert!(click_has_target(None, None, Some("publish")), "text alone is a target");
     }
 
     /// allowed once for the same conversation+site, but not a different site, and not after the 30-minute window
