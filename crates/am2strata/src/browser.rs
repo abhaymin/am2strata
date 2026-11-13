@@ -56,6 +56,8 @@ const PAGES: usize = 3;
 const IDLE: Duration = Duration::from_secs(600);
 /// How long a "job" approval stays good for the same site (the one-time "Allow this job to publish on <site>?").
 const JOB_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// Max time browser_wait waits for text to appear before it gives up.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether every risky step asks (`"approve": "each"`, the default) or the first one of a conversation allows the rest
 /// of that job on the same site (`"job"`).
@@ -191,6 +193,27 @@ fn control_text_matches(control: &str, needle: &str) -> bool {
     let n = needle.trim().to_lowercase();
     if n.is_empty() { return false; }
     c == n || c.contains(&n)
+}
+
+/// The script `browser_select` runs: it finds the `<select>` at `selector`, refuses when there is none (or no such option,
+/// naming the available ones), else sets the option and fires input + change so the page sees the selection.
+fn select_js(selector: &str, value: &str) -> String {
+    let sel_s = serde_json::to_string(selector).unwrap();
+    let val_s = serde_json::to_string(value).unwrap();
+    format!("(function() {{ const e = {sel_s} ? document.querySelector({sel_s}) : null; \
+        if (!e || e.tagName !== 'SELECT') return JSON.stringify({{ok:false,msg:'no <select> at this selector'}}); \
+        const opts = Array.prototype.map.call(e.options, o => o.value); \
+        if (opts.indexOf({val_s}) === -1) return JSON.stringify({{ok:false,msg:'no such option in this select (available: ' + opts.join(', ') + ')'}}); \
+        e.value = {val_s}; e.dispatchEvent(new Event('input',{{bubbles:true}})); e.dispatchEvent(new Event('change',{{bubbles:true}})); \
+        return JSON.stringify({{ok:true,value:{val_s}}}); }})()")
+}
+
+/// The script `browser_wait` runs: it polls the page's text until the given text appears (true) or 30 s pass (false), so a
+/// step can block on content that loads late.
+fn wait_js(text: &str) -> String {
+    let txt_s = serde_json::to_string(text).unwrap();
+    format!("(function() {{ return new Promise(function(resolve) {{ const t = setInterval(function() {{ if ((document.body && document.body.innerText || '').indexOf({txt_s}) !== -1) {{ clearInterval(t); resolve(true); }} }}, 150); \
+        setTimeout(function() {{ clearInterval(t); resolve(false); }}, 30000); }}); }})()")
 }
 
 const CONTROL_LOOKUP: &str = r#"(() => { const e = AT; if (!e) return JSON.stringify({found:false,label:'',aria:'',submit:false});
@@ -565,6 +588,17 @@ impl Browsers {
                                "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
                                "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "selector": {"type": "string"}}, "required": ["path"]}}));
         }
+        tools.extend([
+            json!({"name": "browser_tabs", "description": format!("Manage the tabs open in this job.{shot}"),
+                   "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["list","switch","close"],
+                       "description": "list the tabs, switch this job to one (index), or close one (index)"},
+                       "index": {"type": "number", "description": "which tab, as browser_tabs lists them (0 is the oldest)"}}}}),
+            json!({"name": "browser_select", "description": format!("Set a page's <select> dropdown to a value and fire input+change.{shot}"),
+                   "parameters": {"type": "object", "properties": {"selector": {"type": "string", "description": "a CSS selector of the <select>"},
+                       "value": {"type": "string", "description": "the option's value or visible text to set"}}}}),
+            json!({"name": "browser_wait", "description": format!("Wait until a piece of text is on the page (up to 30 s) before returning.{shot}"),
+                   "parameters": {"type": "object", "properties": {                        "for": {"type": "string", "description": "the text to wait for"}}}}),
+        ]);
         tools
     }
 
@@ -1010,6 +1044,83 @@ impl Browsers {
                 files.node_id = Some(node_id);
                 page.execute(files).await.map_err(|e| format!("setting the file on the input: {e}"))?;
             }
+            "browser_tabs" => {
+                let action = args["action"].as_str().ok_or("give the action: list, switch or close")?.to_lowercase();
+                let idx = args["index"].as_u64().unwrap_or(0) as usize;
+                match action.as_str() {
+                    "list" => {
+                        // which tabs are open and which one this job acts on (its number is the current one's, marked below)
+                        let tabs = self.list_tabs().await;
+                        if tabs.is_empty() {
+                            return Err("there are no tabs open: open a page (browser_open) first".into());
+                        }
+                        let mut text = format!("{} tab(s) open:", tabs.len());
+                        for t in &tabs { text.push_str(&format!("\n  {} {}", t.index, t.label())); }
+                        if let Some(page) = self.current(conv).await { return Ok(render_page(&page, &text).await); }
+                        return Err(text);
+                    }
+                    "switch" => {
+                        // point this job at another tab: the other tools act on it from here on
+                        let tabs = self.list_tabs().await;
+                        let Some(target) = tabs.iter().find(|t| t.index == idx) else {
+                            return Err(format!("there is no tab numbered {idx}: browser_tabs lists them, or give a smaller number"));
+                        };
+                        if let Some(mut run) = self.run.lock().await.as_mut() {
+                            if let Some(pos) = (0..run.tabs.len()).find(|&i| *run.tabs[i].0 == target.id) { run.tabs[pos].1.used = Instant::now(); }
+                            run.active.insert(conv.to_string(), target.id.clone());
+                        }
+                        return Ok(render_page(&self.page(conv).await?, &format!("Switched to tab {}: {}", idx, target.label())).await);
+                    }
+                    "close" => {
+                        // the last tab cannot be closed: the job would lose its browser
+                        let tabs = self.list_tabs().await;
+                        let Some(target) = tabs.iter().find(|t| t.index == idx) else {
+                            return Err(format!("there is no tab numbered {idx}: browser_tabs lists them, or give a smaller number"));
+                        };
+                        if tabs.len() == 1 {
+                            return Err("closing the only tab would lose this job's browser: switch to another one first".into());
+                        }
+                        let mut guard = self.run.lock().await;
+                        if let Some(run) = guard.as_mut() {
+                            let i = (0..run.tabs.len()).find(|&i| run.tabs[i].0 == target.id);
+                            if let Some(i) = i {
+                                let (_, t) = run.tabs.remove(i);
+                                run.active.retain(|_, v| *v != target.id);
+                                let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+                            }
+                        }
+                        if let Some(page) = self.current(conv).await.or_else(|| guard.as_ref().and_then(|r| r.tabs.first().map(|(_, t)| t.page.clone()))) {
+                            return Ok(render_page(&page, &format!("Closed tab {}: {}", idx, target.label())).await);
+                        }
+                        return Err(format!("Closed tab {}: {}", idx, target.label()));
+                    }
+                    _ => return Err("the action is list, switch or close".into()),
+                }
+            }
+            "browser_select" => {
+                // set a <select> to an option (an exact match, else the available ones are named) and fire input + change
+                let sel = args["selector"].as_str().unwrap_or("");
+                let value = args["value"].as_str().ok_or("give the value to select")?;
+                let js = select_js(sel, value);
+                let r = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.map_err(|_| "the page did not answer the select")?
+                    .map_err(|e| e.to_string())?.into_value::<Value>().map_err(|e| e.to_string())?;
+                if !r["ok"].as_bool().unwrap_or(false) {
+                    return Err(format!("{} on this select", r["msg"].as_str().unwrap_or("cannot select that")));
+                }
+                return Ok(render_page(&page, &format!("The select now holds: {:?}.\n", value)).await);
+            }
+            "browser_wait" => {
+                // wait until the text is on the page (a 30 s cap) — resolves false when it never arrives
+                let text = args["for"].as_str().ok_or("give the text to wait for")?;
+                let js = wait_js(text);
+                let found = tokio::time::timeout(WAIT_TIMEOUT + Duration::from_secs(2), page.evaluate(js)).await
+                    .map_err(|_| "the page did not answer the wait")?.map_err(|e| e.to_string())?
+                    .into_value::<bool>().map_err(|e| e.to_string())?;
+                if !found {
+                    return Err(format!("waited but the text {text:?} was not on the page within 30 s"));
+                }
+                return Ok(render_page(&page, &format!("The text {text:?} is now on the page.\n")).await);
+            }
             _ => return Err(format!("there is no tool named {name}")),
         }
         let url = page.url().await.ok().flatten().unwrap_or_default();
@@ -1368,5 +1479,100 @@ mod tests {
         assert_eq!(site_of("https://studio.youtube.com/upload?x=1"), "studio.youtube.com");
         assert_eq!(site_of("http://127.0.0.1:8080/x"), "127.0.0.1");
         assert_eq!(site_of(""), "");
+    }
+
+    /// the allow/block lists match a host exactly or as a subdomain, ignoring a leading www and trailing dot; an unrelated host does not
+    #[test]
+    fn site_match_is_exact_or_subdomain() {
+        assert!(host_matches("studio.youtube.com", "youtube.com"), "a subdomain matches its registered domain");
+        assert!(host_matches("youtube.com", "youtube.com"), "the exact host matches");
+        assert!(host_matches("www.studio.youtube.com", "youtube.com"), "a leading www is ignored on both sides");
+        assert!(!host_matches("notyoutube.com", "youtube.com"), "a similar but different domain does not match");
+        assert!(!host_matches("studio.youtube.com", ""), "an empty list entry never matches");
+    }
+
+    /// the block list refuses a host and wins over the allow list; only a non-empty allow list refuses the rest, an empty one permits all
+    #[test]
+    fn block_list_wins_over_allow() {
+        let allow = vec!["youtube.com".to_string()];
+        let block = vec!["ads.example.com".to_string()];
+        assert_eq!(download_verdict("ads.example.com", &allow, &block).as_deref(), Some("the block list"));
+        assert_eq!(download_verdict("studio.youtube.com", &allow, &block), None, "allowed and not blocked goes through");
+        assert_eq!(download_verdict("docs.github.com", &allow, &block), Some("the allow list"), "outside an allow list is refused");
+        assert_eq!(download_verdict("anything.com", &[], &[]), None, "with neither list every host goes through");
+        assert_eq!(download_verdict("ads.example.com", &[], &["ads.example.com".to_string()]), Some("the block list"), "the block alone refuses a host");
+    }
+
+    /// the site lists parse from a JSON array or a comma-separated string, and nothing comes of anything else
+    #[test]
+    fn site_lists_parse_from_array_or_csv() {
+        assert_eq!(names_array(Some(&json!(["a.com", "b.com"]))), vec!["a.com".to_string(), "b.com".to_string()]);
+        assert_eq!(names_array(Some(&json!("a.com,  b.com ,c.com"))), vec!["a.com".to_string(), "b.com".to_string(), "c.com".to_string()]);
+        assert_eq!(names_array(None), Vec::<String>::new());
+        assert_eq!(names_array(Some(&json!("   "))), Vec::<String>::new(), "blank whitespace is ignored");
+    }
+
+    /// a download file name is made safe: path separators become underscores so nothing escapes the folder; a leading dot is refused
+    #[test]
+    fn sanitize_download_name_is_safe() {
+        assert_eq!(sanitize_download_name("report.pdf").unwrap(), "report.pdf", "a plain name passes");
+        assert_eq!(sanitize_download_name("sub dir/file.txt").unwrap(), "sub dir_file.txt", "separators become underscores, not a path out");
+        assert!(sanitize_download_name(".hidden").is_err(), "a name starting with a dot is refused, so one never hides in the folder");
+        assert!(sanitize_download_name("").is_err(), "an empty name is refused");
+    }
+
+    /// the download/website settings parse from the computer block: a default download folder, asking first (Strict), and the lists
+    #[test]
+    fn download_and_site_settings_parse() {
+        let mut with = BTreeMap::new();
+        with.insert("computer".into(), json!({"download_dir": "/tmp/dl", "download_ask": false,
+                                             "site_allow": ["y.com"], "site_block": ["bad.com"]}));
+        let s = Settings::from_config(&with, std::path::Path::new("/data"));
+        assert_eq!(s.download_dir.as_deref().map(|p| p.to_string_lossy()), Some("/tmp/dl".into()));
+        assert!(!s.download_ask, "config can auto-accept downloads");
+        assert_eq!(s.site_allow, vec!["y.com".to_string()]);
+        assert_eq!(s.site_block, vec!["bad.com".to_string()]);
+
+        // defaults when the computer block is absent: ask first (Strict), and a default folder under the data dir
+        let mut none = BTreeMap::new();
+        let s2 = Settings::from_config(&none, std::path::Path::new("/data"));
+        assert!(s2.download_ask, "asking is the default");
+        assert_eq!(s2.download_dir.as_deref().map(|p| p.to_string_lossy()), Some("/data/browser-downloads".into()));
+    }
+
+    /// the tabs/select/wait tools are always offered when a browser is on, so the model can manage them
+    #[test]
+    fn tabs_select_wait_tools_are_offered() {
+        let tools = Browsers::tools(false, false, true);
+        assert!(tools.iter().any(|t| t["name"] == "browser_tabs"));
+        assert!(tools.iter().any(|t| t["name"] == "browser_select"));
+        assert!(tools.iter().any(|t| t["name"] == "browser_wait"));
+    }
+
+    /// browser_select builds a script that refuses a non-select and a missing option, then fires input+change to set it
+    #[test]
+    fn select_js_checks_the_control_and_option() {
+        let js = select_js("select[name=country]", "us");
+        assert!(js.contains("tagName !== 'SELECT'"), "refuses when there is no <select> at the selector");
+        assert!(js.contains("no such option"), "names a missing option instead of silently setting one");
+        assert!(js.contains("dispatchEvent") && js.contains("'input'") && js.contains("'change'"), "fires input then change so the page sees it");
+    }
+
+    /// browser_wait polls until the text is present, else gives up after 30 s, resolving a boolean either way
+    #[test]
+    fn wait_js_polls_for_text_then_times_out() {
+        let js = wait_js("Saved!");
+        assert!(js.contains("setInterval"), "it polls the page");
+        assert!(js.contains("Saved!"), "for the given text");
+        assert!(js.contains("resolve(false)"), "times out so it never hangs");
+    }
+
+    /// a tab's label shows its title when there is one, else just its address — for browser_tabs listings
+    #[test]
+    fn tab_view_shows_title_or_url() {
+        let with_title = TabView { id: "t".into(), index: 0, url: "https://a.com/".into(), title: "Home".into() };
+        assert_eq!(with_title.label(), "https://a.com/ - Home");
+        let plain = TabView { id: "t".into(), index: 1, url: "https://b.com/".into(), title: String::new() };
+        assert_eq!(plain.label(), "https://b.com/");
     }
 }
