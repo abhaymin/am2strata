@@ -74,13 +74,13 @@ fn a_limited_key_queues_one_then_hits_the_hourly_cap() {
     assert_eq!(c1, 200, "the first compose is queued: {r1}");
     let (c2, r2) = post_as(&s.base, "limit-key-0123456789abcd", "/v1/media/videos/compose", &compose);
     assert_eq!(c2, 400, "the second is refused by the limit: {r2}");
-    assert!(r2["error"]["message"].as_str().unwrap_or("").contains("media jobs an hour"), "about the hourly cap: {r2}");
+    assert!(r2["error"]["message"].as_str().unwrap_or("").contains("this hour"), "about the hourly cap: {r2}");
 
     // a thumbnail from the same exhausted key is refused the same way
     let thumb = json!({"image": "x", "lines": [["Hi", "white"]]});
     let (c3, r3) = post_as(&s.base, "limit-key-0123456789abcd", "/v1/media/thumbnails", &thumb);
     assert_eq!(c3, 400, "the thumbnail is also refused by the limit: {r3}");
-    assert!(r3["error"]["message"].as_str().unwrap_or("").contains("media jobs an hour"), "{r3}");
+    assert!(r3["error"]["message"].as_str().unwrap_or("").contains("this hour"), "{r3}");
 
     // a different key has no such limit and queues freely (no cross-talk between keys)
     let (c4, r4) = post_as(&s.base, KEY, "/v1/media/videos/compose", &compose);

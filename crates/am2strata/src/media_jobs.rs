@@ -85,6 +85,12 @@ pub struct Jobs {
     recent: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
 }
 
+/// The error text when a key has hit its media-jobs-per-hour limit: one clear sentence naming the cap and telling it to
+/// try again later (no stray fragment).
+fn hourly_cap_message(limit: u32) -> String {
+    format!("error: this key already queued its {limit} media jobs for this hour; try again later")
+}
+
 impl Jobs {
     pub fn new() -> Jobs {
         Jobs { app: OnceLock::new(), jobs: Mutex::new(BTreeMap::new()), next: Mutex::new(1), caps: Mutex::new(None),
@@ -614,7 +620,7 @@ impl Jobs {
             q.pop_front();
         }
         if q.len() >= limit as usize {
-            return Some(format!("error: this key may queue {limit} media jobs an hour, and has; try again later"));
+            return Some(hourly_cap_message(limit));
         }
         q.push_back(Instant::now());
         None
@@ -1104,4 +1110,18 @@ pub async fn expand_audio(s: &AppState, req: &mut Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------------------------------------------------- tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hourly_cap_is_one_clear_sentence() {
+        // the reviewer's fix: read as a single clear sentence that names the cap and tells the key to retry later, no stray fragment
+        assert_eq!(hourly_cap_message(3), "error: this key already queued its 3 media jobs for this hour; try again later");
+        assert!(!hourly_cap_message(1).contains("and has"), "one clean sentence, not a broken clause: {}", hourly_cap_message(1));
+    }
 }

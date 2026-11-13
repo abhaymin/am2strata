@@ -433,9 +433,10 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     for (row, (text, colour)) in rows {
         let y = base_y - (row as i32) * 150;
         let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
-        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture; only set fontfile when a usable Outfit font was found (else ffmpeg keeps its default system font instead of drawing an empty fontfile='')
-        draws.push(format!("drawtext={}:text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x180A06@0.6:shadowx=3:shadowy=3",
-                            drawtext_font_option(&font), drawtext_escape(&text)));
+        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture. The
+        // options are built as a list and joined with ':' so an absent fontfile leaves no empty field (drawtext=text=...,
+        // not drawtext=:text=...); a found Outfit font only leads with its fontfile
+        draws.push(thumbnail_drawtext(&text, &font, color, y));
     }
     // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
     let _ = run_ffmpeg(&[
@@ -460,10 +461,22 @@ fn outfit_font() -> String {
     candidates.iter().flatten().find(|p| p.is_file()).map(|p| p.display().to_string()).unwrap_or_default()
 }
 
-/// The drawtext option prefix for the font: `fontfile='...'` when a usable Outfit font path was found, else empty so
-/// ffmpeg keeps its default system font instead of drawing an empty `fontfile=''`.
-fn drawtext_font_option(font: &str) -> String {
-    if font.is_empty() { String::new() } else { format!("fontfile='{}':", drawtext_escape(font)) }
+/// One thumbnail row's drawtext filter, built as a list of options joined with ':' so an absent fontfile leaves no empty
+/// field (the filter starts `drawtext=text=`, not `drawtext=:text=`). A found Outfit font only leads with its fontfile.
+fn thumbnail_drawtext(text: &str, font: &str, color: &str, y: i32) -> String {
+    let mut opts = Vec::new();
+    if !font.is_empty() { opts.push(format!("fontfile='{}'", drawtext_escape(font))); }
+    opts.push(format!("text='{}'", drawtext_escape(text)));
+    opts.extend([
+        format!("fontsize=120"),
+        format!("fontcolor={color}"),
+        "x=(w-text_w)/2".to_string(),
+        format!("y={y}"),
+        "shadowcolor=0x180A06@0.6".to_string(),
+        "shadowx=3".to_string(),
+        "shadowy=3".to_string(),
+    ]);
+    format!("drawtext={}", opts.join(":"))
 }
 
 // ----------------------------------------------------------------------------------------------------------- tests
@@ -604,12 +617,14 @@ mod tests {
     }
 
     #[test]
-    fn an_absent_font_leaves_drawtext_without_a_fontfile() {
-        // a usable font path is quoted and escaped like every other drawtext option, so a backslash in it stays valid
-        assert_eq!(drawtext_font_option("a b"), "fontfile='a b':", "a found font keeps its own quoting");
-        assert_eq!(drawtext_font_option("C:\\path"), "fontfile='C:\\\\path':", "a backslash in a path is not left as an escape");
-        // no usable Outfit font: omit fontfile entirely so ffmpeg falls back to its default system font (not fontfile='')
-        assert!(drawtext_font_option("").is_empty(), "an empty font path omits fontfile");
+    fn drawtext_leaves_no_empty_field_when_the_font_is_absent() {
+        // no usable Outfit font: the first option is text, so the filter starts drawtext=text= (no leading colon after =)
+        assert!(thumbnail_drawtext("Hi", "", "ffffff", 100).starts_with("drawtext=text="),
+                "absent font -> the filter starts drawtext=text=: {}", thumbnail_drawtext("Hi", "", "ffffff", 100));
+        // a found Outfit font leads with its (escaped, quoted) fontfile then text; backslashes/paths stay valid inside quotes
+        let f = thumbnail_drawtext("Hi", "C:\\a b\\outfit.woff2", "ffd65a", 100);
+        assert!(f.starts_with("drawtext=fontfile='C:\\\\a b\\\\outfit.woff2':text='Hi'"),
+                "found font -> drawtext=fontfile=...:text=: {f}");
     }
 
     #[test]
