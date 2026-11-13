@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "am2strata"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -2534,7 +2534,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "strata-engine"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "image",
  "serde",
@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "strata-frontend"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde_json",
  "strata-template",
@@ -2558,7 +2558,7 @@ dependencies = [
 
 [[package]]
 name = "strata-gguf"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "strata-hub"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "reqwest",
  "serde",
@@ -2580,7 +2580,7 @@ dependencies = [
 
 [[package]]
 name = "strata-pack"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "reqwest",
@@ -2591,14 +2591,14 @@ dependencies = [
 
 [[package]]
 name = "strata-protocol"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "strata-template"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -2610,7 +2610,7 @@ dependencies = [
 
 [[package]]
 name = "strata-tokenizer"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aho-corasick",
  "fancy-regex",
