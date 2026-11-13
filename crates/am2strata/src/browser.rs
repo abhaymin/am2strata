@@ -302,8 +302,8 @@ fn find_chrome(data_dir: &std::path::Path) -> Option<PathBuf> {
 impl Settings {
     pub fn from_config(rest: &std::collections::BTreeMap<String, Value>, data_dir: &std::path::Path) -> Settings {
         let c = rest.get("browser").cloned().unwrap_or(Value::Null);
-        // the download folder and the site lists live in the computer block (reused here, as upload_dir is); the default
-        // download folder is `<data>/browser-downloads`, so a page's downloads are always caught somewhere on this PC
+        // the download folder and the site lists live in the computer block (reused here, as upload_dir is); downloads are denied
+        // unless a folder is set ("computer": {"download_dir": <a folder>}), so nothing is saved by default (item 3)
         let comp = rest.get("computer").cloned().unwrap_or(Value::Null);
         let exe = c["exe"].as_str().map(PathBuf::from).or_else(|| find_chrome(data_dir));
         Settings { exe, connect: c["connect"].as_str().map(|s| s.trim_end_matches('/').to_string()),
@@ -311,8 +311,7 @@ impl Settings {
                     approve: c["approve"].as_str().map(str::to_lowercase).map(|s| ApproveMode::parse(&s)).unwrap_or(ApproveMode::Each),
                      private_urls: rest.get("allow_private_urls").and_then(Value::as_bool).unwrap_or(false),
                      upload_dir: c["upload_dir"].as_str().map(PathBuf::from),
-                     download_dir: comp["download_dir"].as_str().map(PathBuf::from)
-                                 .or_else(|| (!rest.contains_key("computer")).then(|| data_dir.join("browser-downloads"))),
+                     download_dir: comp["download_dir"].as_str().map(PathBuf::from),   // None = downloads denied until one is set (item 3)
                      download_ask: comp["download_ask"].as_bool().unwrap_or(true),
                      site_allow: names_array(comp.get("site_allow")),
                      site_block: names_array(comp.get("site_block")),
@@ -1533,11 +1532,20 @@ mod tests {
         assert_eq!(s.site_allow, vec!["y.com".to_string()]);
         assert_eq!(s.site_block, vec!["bad.com".to_string()]);
 
-        // defaults when the computer block is absent: ask first (Strict), and a default folder under the data dir
+        // defaults when the computer block is absent: ask first (Strict), and downloads denied — no download folder is set, so a
+        // page's download is refused until one is given ("computer": {"download_dir": <a folder>}) (item 3)
         let mut none = BTreeMap::new();
         let s2 = Settings::from_config(&none, std::path::Path::new("/data"));
         assert!(s2.download_ask, "asking is the default");
-        assert_eq!(s2.download_dir.as_deref().map(|p| p.to_string_lossy()), Some("/data/browser-downloads".into()));
+        assert!(s2.download_dir.is_none(), "with no config, downloads are denied (no download folder set)");
+    }
+
+    /// With no download folder configured, a page's download is refused before Chrome writes anything, since `download_dir` is the
+    /// only thing that enables saving downloads (item 3).
+    #[test]
+    fn downloads_are_denied_without_a_configured_folder() {
+        let s = Settings::from_config(&BTreeMap::new(), std::path::Path::new("/data"));
+        assert!(s.download_dir.is_none(), "no computer block means no download folder, so nothing is saved");
     }
 
     /// the tabs/select/wait tools are always offered when a browser is on, so the model can manage them
