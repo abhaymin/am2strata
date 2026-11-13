@@ -25,7 +25,6 @@ use base64::Engine as _;
 use chromiumoxide::cdp::browser_protocol::fetch;
 use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
 use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
-use chromiumoxide::layout::Point;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide::{Browser, Page};
 use futures::StreamExt;
@@ -77,7 +76,9 @@ fn word_at(haystack: &str, needle: &str) -> bool {
             None => return false,
             Some(rel) => {
                 let i = from + rel;
-                let before = i == 0 || !haystack[i - 1..].chars().next().unwrap().is_ascii_alphanumeric();
+                // char-aware boundaries: a multi-byte character next to the needle (a "📤Upload" or a "保存Send") is
+                // still bounded right there, where slicing at the byte `i - 1` would panic on the half of a code point.
+                let before = i == 0 || !haystack[..i].chars().next_back().unwrap().is_ascii_alphanumeric();
                 let end = i + needle.len();
                 let after = end >= haystack.len() || !haystack[end..].chars().next().unwrap().is_ascii_alphanumeric();
                 if before && after { return true; }
@@ -116,29 +117,63 @@ async fn type_risk(page: &Page, sel: &str, enter: bool) -> Option<Risk> {
     if v.is_empty() { None } else { Some(Risk { what: v, publishing: false, site: String::new(), url: String::new() }) }
 }
 
-/// The control a `browser_click` would hit (the element itself when it is a link/button/control, else its nearest one),
-/// returning its button text or aria-label and whether it submits a form. A heading or plain element gives back empty, so
-/// only real controls are inspected — never a piece of text in the middle of the page.
-async fn click_parts(page: &Page, args: &Value) -> Option<(String /*label*/, String /*aria*/, bool /*submit*/)> {
-    let at = match (args["x"].as_f64(), args["y"].as_f64()) {
-        (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
-        _ => format!("[...document.querySelectorAll('a,button,input[type=submit],[role=button]')].find(e => (e.innerText || e.value || '').trim() === {})",
-                     serde_json::to_string(args["text"].as_str().unwrap_or("")).unwrap()),
-    };
-    let js = format!(r#"(() => {{ const e = {at}; if (!e) return JSON.stringify({{}});
-        // the clickable control: this element if it is one, else its nearest button/link/[role=button]
-        const b = (e.matches('a,button,input[type=submit],[role=button],input')) ? e : e.closest('a,button,input[type=submit],[role=button]');
-        if (!b) return JSON.stringify({{}});
-        const label = ((b.innerText || '') + (b.value != null ? b.value : '')).trim().slice(0, 60);
-        const aria = (b.getAttribute('aria-label') || '').trim();
-        const t = (b.getAttribute('type') || (b.tagName === 'A' ? '' : b.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();
-        return JSON.stringify({{ label: label, aria: aria, submit: !!b.form && t === 'submit' }}); }})()"#, at = at);
-    let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.ok()?.ok()?.into_value::<Value>().ok()?;
-    let label = v["label"].as_str().unwrap_or("").to_string();
-    let aria = v["aria"].as_str().unwrap_or("").to_string();
-    let submit = v["submit"].as_bool().unwrap_or(false);
-    Some((label, aria, submit))
+/// What one control resolved from a `browser_click` argument is: its button text or aria-label, whether it submits a form,
+/// and whether any control was found at all (a heading or plain element gives back empty). The lookup itself is built by
+/// `click_control_js`, shared with the click — so the risk check and the click can never pick different controls.
+async fn click_control(page: &Page, args: &Value, click: bool) -> Result<Control, String> {
+    let (x, y, text) = (args["x"].as_f64(), args["y"].as_f64(), args["text"].as_str());
+    let js = click_control_js(x, y, text, click);
+    let v = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js))
+        .await.map_err(|_| "the page did not answer the click lookup")?
+        .map_err(|e| e.to_string())?
+        .into_value::<Value>()
+        .map_err(|e| e.to_string())?;
+    Ok(Control { label: v["label"].as_str().unwrap_or("").to_string(), aria: v["aria"].as_str().unwrap_or("").to_string(), submit: v["submit"].as_bool().unwrap_or(false), found: v["found"].as_bool().unwrap_or(false) })
 }
+
+/// The control a `browser_click` hits (the element itself when it is a link/button/control, else its nearest one).
+struct Control { label: String, aria: String, submit: bool, found: bool }
+
+/// ONE click lookup, used by both the risk check (`click_control(..., false)`, no side effect) and the click itself
+/// (`true`), differing only in the optional scroll-and-click — same selector list, lower-casing and includes fall-back.
+fn click_control_js(x: Option<f64>, y: Option<f64>, text: Option<&str>, click: bool) -> String {
+    let at = click_selector_js(x, y, text);
+    CONTROL_LOOKUP.replace("AT", &at).replace("CLICK", &click.to_string())
+}
+
+/// The JS that resolves a `browser_click` argument (a point on the page, or a link/button's text) to the candidate element.
+/// One resolution: by point, else an exact case-insensitive match first and a case-insensitive "includes" fall-back over the
+/// SAME control list — so the risk check and the click agree on which control was hit.
+fn click_selector_js(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> String {
+    const SEL: &str = "a,button,input[type=submit],[role=button],[onclick]";
+    match (x, y) {
+        (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
+        _ => {
+            let t = serde_json::to_string(text.unwrap_or("")).unwrap();
+            format!("[...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase() === {t}.toLowerCase())\n                     || [...document.querySelectorAll('{SEL}')].find(e => (e.innerText || e.value || '').trim().toLowerCase().includes({t}.toLowerCase()))", SEL = SEL, t = t)
+        }
+    }
+}
+
+/// How the shared click lookup matches a candidate control's text to what was clicked: a case-insensitive exact match on the
+/// trimmed text first, then a case-insensitive "includes" fall-back — mirroring `click_selector_js`, so one test keeps both in step.
+/// Never used at run time (the browser does the matching); kept only so the shared rule has a pure-Rust check.
+#[allow(dead_code)]
+fn control_text_matches(control: &str, needle: &str) -> bool {
+    let c = control.trim().to_lowercase();
+    let n = needle.to_lowercase();
+    c == n || c.contains(&n)
+}
+
+const CONTROL_LOOKUP: &str = r#"(() => { const e = AT; if (!e) return JSON.stringify({found:false,label:'',aria:'',submit:false});
+    // the clickable control: this element if it is one, else its nearest button/link/[role=button]
+    const b = (e.matches('a,button,input[type=submit],[role=button],input')) ? e : e.closest('a,button,input[type=submit],[role=button]');
+    if (!b) return JSON.stringify({found:false,label:'',aria:'',submit:false});
+    const label = ((b.innerText || '') + (b.value != null ? b.value : '')).trim().slice(0, 60);
+    const aria = (b.getAttribute('aria-label') || '').trim();
+    const t = (b.getAttribute('type') || (b.tagName === 'A' ? '' : b.tagName === 'BUTTON' ? 'submit' : '')).toLowerCase();
+    if (CLICK) { e.scrollIntoView({block: 'center'}); e.click(); }
+    return JSON.stringify({found:true, label: label, aria: aria, submit: !!b.form && t === 'submit'}); })()"#;
 
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -260,13 +295,17 @@ impl JobMemory {
 
     /// Was this conversation+site allowed already and still within the window? `now` is passed in so it stays a pure
     /// check (and testable without waiting).
+    /// A host-less page (`about:blank`, `data:`) keeps no grant — the same "publish on ?" would otherwise share one grant and
+    /// only ask once, so it always asks there again.
     fn allowed(&self, conv: &str, host: &str, now: Instant) -> bool {
+        if host.is_empty() { return false; }
         self.grants.get(&Self::key(conv, host)).map_or(false, |until| now < *until)
     }
 
-    /// Remember an approval of this conversation+site, good for the window (unless it was already still active).
+    /// Remember an approval of this conversation+site, good for the window (unless it was already still active). A host-less
+    /// page (empty host, e.g. `about:blank`) records nothing, so it always asks again.
     fn remember(&mut self, conv: &str, host: &str, now: Instant, window: Duration) {
-        if !self.allowed(conv, host, now) {
+        if host.is_empty() || !self.allowed(conv, host, now) {
             self.grants.insert(Self::key(conv, host), now + window);
         }
     }
@@ -537,7 +576,10 @@ impl Browsers {
                 (r.what, r.publishing)
             }
             "browser_click" => {
-                let (label, aria, submit) = click_parts(&page, args).await?;
+                // the shared lookup: couldn't resolve it (a hang) reads as an ordinary step, no control read means no risk.
+                let Some(ctrl) = click_control(&page, args, false).await.ok() else { return None; };
+                if !ctrl.found { return None; }
+                let (label, aria, submit) = (ctrl.label, ctrl.aria, ctrl.submit);
                 if label.is_empty() && aria.is_empty() && !submit {
                     return None;
                 }
@@ -656,22 +698,11 @@ impl Browsers {
                 page.goto(url.as_str()).await.map_err(|e| format!("opening {url}: {e}"))?;
             }
             "browser_click" => {
+                // ONE lookup resolves this control (same list, lowercasing, includes fallback as the risk check above).
+                let ctrl = click_control(&page, args, true).await.map_err(|e| e.to_string())?;
                 match (args["x"].as_f64(), args["y"].as_f64(), args["text"].as_str()) {
-                    (Some(x), Some(y), _) => {
-                        page.click(Point { x, y }).await.map_err(|e| e.to_string())?;
-                    }
-                    (_, _, Some(t)) => {
-                        let js = format!("(() => {{ const e = [...document.querySelectorAll('a,button,input[type=submit],[role=button],[onclick]')]
-                            .find(e => (e.innerText || e.value || '').trim().toLowerCase() === {0}.toLowerCase())
-                            || [...document.querySelectorAll('a,button')].find(e => (e.innerText || '').toLowerCase().includes({0}.toLowerCase()));
-                            if (!e) return false; e.scrollIntoView({{block: 'center'}}); e.click(); return true; }})()",
-                            serde_json::to_string(t).unwrap());
-                        let hit = page.evaluate(js).await.map_err(|e| e.to_string())?.into_value::<bool>().unwrap_or(false);
-                        if !hit {
-                            return Err(format!("no link or button with the text {t:?} on this page"));
-                        }
-                    }
-                    _ => return Err("give x and y, or the text of a link or button".into()),
+                    (_, _, Some(t)) if !ctrl.found => return Err(format!("no link or button with the text {t:?} on this page")),
+                    _ => {}
                 }
                 settle().await;
                 let _ = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
@@ -970,6 +1001,48 @@ mod tests {
         assert!(!publisher_keyword("The dashboard"));
     }
 
+    /// a multi-byte character right next to a keyword does not get sliced mid code point (where `i - 1` used to panic)
+    #[test]
+    fn word_at_is_char_safe_next_to_multibyte() {
+        assert!(word_at("📤upload", "upload"), "emoji straight before the word");
+        assert!(word_at("保存 send", "send"), "CJK straight before the word");
+        assert!(word_at("publish 🌐", "publish"), "emoji straight after the word");
+        assert!(!word_at("📤uploading", "upload"), "still a whole word, not a substring across the multibyte");
+    }
+
+    /// one shared control lookup: one selector list in both branches, exact-then-"includes", always case-insensitive — so the risk
+    /// check and the click build the same resolution and can never pick different controls.
+    #[test]
+    fn click_lookup_is_one_shared_resolution() {
+        let by_text = click_selector_js(None, None, Some("publish"));
+        assert_eq!(by_text.matches("querySelectorAll('a,button,input[type=submit],[role=button],[onclick]')").count(), 2, "one list in both branches");
+        assert!(by_text.contains(".toLowerCase() ==="), "the exact compare is case-insensitive");
+        assert!(by_text.contains(".includes("), "and there is a case-insensitive includes fall-back");
+
+        let by_point = click_selector_js(Some(10.0), Some(20.0), None);
+        assert_eq!(by_point, "document.elementFromPoint(10, 20)");
+    }
+
+    /// the risk check (no side effect) and the click itself build identical resolution — only the `if(false)`/`if(true)` guard of
+    /// the scroll-and-click side effect differs, so they can never pick different controls.
+    #[test]
+    fn risk_and_click_share_the_resolution() {
+        let risk = click_control_js(None, None, Some("publish"), false);
+        let clicked = click_control_js(None, None, Some("publish"), true);
+        assert!(risk.contains("if (false)"));
+        assert!(clicked.contains("if (true)"));
+        assert_eq!(risk.replace("if (false) {", ""), clicked.replace("if (true) {", ""));
+    }
+
+    /// the shared text match is case-insensitive, exact first then an includes fall-back ("publish"/"ublish" both hit "Publish"):
+    /// same rule the click uses, so a control it clicks can never slip past the risk check.
+    #[test]
+    fn control_text_match_is_case_insensitive_and_includes() {
+        assert!(control_text_matches("Publish", "publish"), "exact, case-insensitive");
+        assert!(control_text_matches("Publish", "ublish"), "the includes fall-back the reviewer flagged");
+        assert!(!control_text_matches("The Dashboard", "publish"), "text without the clicked text is not matched");
+    }
+
     /// allowed once for the same conversation+site, but not a different site, and not after the 30-minute window
     #[test]
     fn job_memory_allows_once_per_site() {
@@ -991,6 +1064,16 @@ mod tests {
         let now = Instant::now();
         m.remember("job-a", "studio.youtube.com", now, JOB_WINDOW);
         assert!(!m.allowed("job-b", "studio.youtube.com", now), "a different job does not get the same yes");
+    }
+
+    /// a host-less page (`about:blank`, `data:`) keeps no grant and two empty hosts do not share one — it always asks there again
+    #[test]
+    fn job_memory_empty_host_never_grants() {
+        let mut m = JobMemory::default();
+        let now = Instant::now();
+        m.remember("job-blank", "", now, JOB_WINDOW);
+        assert!(!m.allowed("job-blank", "", now + Duration::from_secs(1)), "a host-less page keeps asking");
+        assert!(!m.allowed("other conversation", "", now + Duration::from_secs(1)), "empty hosts are not one shared grant");
     }
 
     /// the "approve" setting is "each" by default and parses "job"; anything else (including an old spelling) falls back to "each"
