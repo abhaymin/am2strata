@@ -17,13 +17,12 @@ pub fn tools(vision: bool) -> Vec<Value> {
     vec![
         json!({"name": "computer_screenshot", "description": format!("Take a screenshot of the desktop.{} What is on screen is shown.", shot),
                "parameters": {"type": "object", "properties": {}}}),
-        json!({"name": "computer_click", "description": format!("Click on the desktop, at x and y (pixels of the {W}x{H} screenshot) or on a window whose title is `title`."),
+        json!({"name": "computer_click", "description": format!("Click the desktop at x and y (pixels of the {W}x{H} screenshot). Both coordinates are required."),
                "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"},
-                                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
-                                 "title": {"type": "string", "description": "the visible title of a window to click on"}}}}),
-        json!({"name": "computer_type", "description": "Type text into the focused element (focus it first, with a click). The current text is replaced unless `append` is true.",
-               "parameters": {"type": "object", "properties": {"text": {"type": "string"},
-                                 "append": {"type": "boolean", "description": "add to the current text instead of replacing it"}}}, "required": ["text"]}),
+                                 "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}},
+                              "required": ["x", "y"]}}),
+        json!({"name": "computer_type", "description": "Type text into the focused element, replacing its current text (focus it first, with a click).",
+               "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
         json!({"name": "computer_key", "description": "Press a key or key combination on the desktop (e.g. \"Enter\", or [\"Ctrl\", \"a\"] / \"Ctrl+a\").",
                "parameters": {"type": "object", "properties": {
                    "keys": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],

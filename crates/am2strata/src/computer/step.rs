@@ -52,7 +52,7 @@ pub fn classify_step(tool: &str, args: &Value) -> Result<ComputerStep, String> {
         "computer_click" => {
             match (number(args.get("x")), number(args.get("y"))) {
                 (Some(x), Some(y)) => Ok(ComputerStep { x: Some(x as i32), y: Some(y as i32), button: parse_button(args.get("button")), ..s }),
-                _ => return Err("give x and y, or a window title to click".into()),
+                _ => return Err("give x and y to click on".into()),
             }
         }
         "computer_type" => {
@@ -119,7 +119,9 @@ mod tests {
     fn click_requires_coordinates() {
         assert_eq!(classify_step("computer_click", &json!({"x": 10.0, "y": 20.0})).unwrap(),
                    ComputerStep { tool: "computer_click".into(), x: Some(10), y: Some(20), button: Button::Left, ..ComputerStep::new("computer_click") });
-        assert_eq!(classify_step("computer_click", &json!({"x": 5.5})).unwrap_err(), "give x and y, or a window title to click");
+        // either coordinate missing is refused naming both as required (matches the tool schema in tools.rs)
+        assert_eq!(classify_step("computer_click", &json!({"x": 5.5})).unwrap_err(), "give x and y to click on");
+        assert_eq!(classify_step("computer_click", &json!({"y": 5.5})).unwrap_err(), "give x and y to click on");
         // an explicit right button is kept
         assert_eq!(classify_step("computer_click", &json!({"x": 1, "y": 2, "button": "right"})).unwrap().button, Button::Right);
     }
