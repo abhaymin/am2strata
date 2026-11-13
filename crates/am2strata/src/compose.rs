@@ -191,6 +191,9 @@ fn kind_of_bytes(bytes: &[u8]) -> &'static str {
     if bytes.starts_with(b"\xef\xbb\xbfID3") || (bytes.len() >= 3 && &bytes[0..3] == b"ID3") {
         return "audio"; // an MP3 with an ID3 tag
     }
+    if bytes.len() >= 4 && bytes[0] == 0xFF && (bytes[1] & 0xF0) == 0xF0 {
+        return "audio"; // a raw MP3 frame stream (no ID3 tag): an MPEG-1 audio frame sync, whose FF F8–FF start JPEG's SOI FF D8 avoids
+    }
     if bytes.len() >= 8 && (&bytes[4..8] == b"ftyp" || &bytes[0..4] == b"\x1a\x45\xda\xa3" || &bytes[0..4] == b"OggS") {
         return "clip"; // an mp4, a webm/matroska or an ogg video
     }
@@ -336,9 +339,9 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let fc = format!("[0:v]subtitles='{}'[v];[1:a]atrim=0:setpts=N/SR/TB,afade=t=out:st={}:d=4[a]", subsp, played.max(4.0) - 4.0);
     run_ffmpeg(&["-i", picp.as_str(), "-i", audiop.as_str(), "-filter_complex", fc.as_str(), "-map", "[v]", "-map", "[a]", "-t", played.to_string().as_str(), "-r", FPS.to_string().as_str(), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.display().to_string().as_str()]).await?;
 
-    // free the temporary clips, keep only the finished video (a restart keeps it)
-    let _ = std::fs::remove_dir_all(&dir);
+    // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
+    let _ = std::fs::remove_dir_all(&dir);
     Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": played.round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
 }
 
@@ -367,6 +370,22 @@ pub fn xfade_chain(durations: &[f64], crossfade: f64) -> String {
         last = out;
     }
     if parts.is_empty() { String::from("[0:v]") } else { parts.join("") }
+}
+
+/// ffmpeg reads a drawtext option between its quotes (e.g. `text='…'`), where inside those quotes a backslash still opens an
+/// escape and a single quote closes the value: unescaped, request text could end the quotes and append another option such as
+/// `textfile=/etc/passwd`. Escape just those two characters (double the backslash, quote the apostrophe) so the whole value
+/// stays inside its own quotes and round-trips to exactly the caption requested — a colon or `%{pts}` passes through as text.
+fn drawtext_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Make the thumbnail: one 1280×720 JPEG, the image with a left-dark gradient and big Outfit words drawn over it by
@@ -411,7 +430,7 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
         let y = base_y - (row as i32) * 150;
         let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
         // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture
-        draws.push(format!("drawtext=fontfile='{font}':text='{text}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x99_180A06@0.7:shadowx=3:shadowy=3"));
+        draws.push(format!("drawtext=fontfile='{}':text='{}':fontsize=120:fontcolor={color}:x=(w-text_w)/2:y={y}:shadowcolor=0x99_180A06@0.7:shadowx=3:shadowy=3", drawtext_escape(&font), drawtext_escape(&text)));
     }
     // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
     let _ = run_ffmpeg(&[
@@ -553,5 +572,26 @@ mod tests {
             .arg(&out).output().await.unwrap();
         let len: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
         assert!((len - 3.0).abs() < 0.25, "the video plays for about three seconds: {len}");
+    }
+
+    #[test]
+    fn request_text_that_broke_the_filter_now_stays_inside_it() {
+        // the reviewer's test vectors round-trip with only the two ffmpeg-special characters escaped, so an apostrophe can't
+        // close the quoted value and a backslash can't escape it, which is how `textfile=/etc/passwd` injection worked before
+        assert_eq!(drawtext_escape("It's"), "It\\'s", "an apostrophe is quoted");
+        assert_eq!(drawtext_escape("\\"), "\\\\", "a backslash is doubled so it cannot open a new escape");
+        assert_eq!(drawtext_escape("\\'"), "\\\\\\'", "a backslash then an apostrophe keeps its shape without breaking out");
+        // these render as plain caption text: ffmpeg never treats them as filter options or escapes inside the quotes
+        assert_eq!(drawtext_escape("a:b"), "a:b");
+        assert_eq!(drawtext_escape("%{pts}"), "%{pts}");
+    }
+
+    #[test]
+    fn an_untagged_raw_mp3_stream_is_audio() {
+        // a raw MPEG audio frame stream is recognised by its sync: FF followed by a header byte in 0xF0-0xFF (LAME's VBR tag
+        // starts FF FB; a CBR MPEG-1 Layer III frame starts FF F3). JPEG's SOI, FF D8, keeps top nibble 0xD and stays an image.
+        assert_eq!(kind_of_bytes(&[0xFF, 0xFB, 0x90, 0x00]), "audio");
+        assert_eq!(kind_of_bytes(&[0xFF, 0xF3, 0xFF, 0x90]), "audio");
+        assert_eq!(kind_of_bytes(&[0xFF, 0xD8, 0xFF, 0xE0]), "image", "a JPEG starts FF D8, not an MP3");
     }
 }
