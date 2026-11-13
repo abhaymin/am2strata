@@ -2121,7 +2121,10 @@ fn a_client_gets_code_memory_and_its_limits_through_the_api() {
     let (_, info) = s.get("/api/run", true);
     let (c, r) = post_as(&s, LAPTOP, "/v1/chat/completions", &json!({"messages": [user("What is 6 times 7? Use Python.")]}), &[]);
     assert_eq!(c, 200, "{r}");
-    assert!(prompt_text(&s.gen_lines()[0]).contains("run_python"), "offered to the code profile");
+    // offered only where the sandbox can run it (bubblewrap and python3): the release runners (Ubuntu 22.04, macOS,
+    // Windows) have no bubblewrap, so there it is rightly left out
+    assert_eq!(prompt_text(&s.gen_lines()[0]).contains("run_python"), info["enabled"] == true,
+               "offered to the code profile exactly when the sandbox is there");
     if info["enabled"] == true {
         assert!(prompt_text(&s.gen_lines()[1]).contains("42"), "the sandbox ran it: {}", prompt_text(&s.gen_lines()[1]));
     }
