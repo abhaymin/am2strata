@@ -623,9 +623,9 @@
             <div class="st-field">
               <label class="st-label" for="tls-http">Plain HTTP (the API port) then</label>
               <select class="st-input" id="tls-http">
+                <option value="keep">keeps answering everyone: http:// and ws:// work beside https:// and wss://</option>
                 <option value="local-only">answers this PC only; other devices are sent to HTTPS</option>
-                <option value="redirect">sends everyone to HTTPS</option>
-                <option value="keep">keeps answering everyone (not recommended)</option>
+                <option value="redirect">sends everyone to HTTPS (and turns on HSTS)</option>
               </select>
             </div>
             <div class="tls-actions">

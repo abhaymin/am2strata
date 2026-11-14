@@ -2455,7 +2455,7 @@ function renderTls(j) {
   if (j.on) {
     html += `<dl class="facts">` +
       `<dt>Open</dt><dd>${(j.urls || []).map((u) => `<a href="${esc(u)}" class="mono">${esc(u)}</a>`).join("<br>")}</dd>` +
-      `<dt>Plain HTTP</dt><dd>${esc({"local-only": "this PC only; other devices go to HTTPS", redirect: "everyone goes to HTTPS", keep: "still answers everyone"}[j.http] || j.http)}</dd>` +
+      `<dt>Plain HTTP</dt><dd>${esc({"local-only": "this PC only; other devices go to HTTPS", redirect: "everyone goes to HTTPS", keep: "still answers everyone (http:// and ws://)"}[j.http] || j.http)}</dd>` +
       `<dt>HSTS</dt><dd class="mono">${esc(j.hsts || "")}</dd>` +
       `<dt>Certificate</dt><dd>${esc(c.subject || "")}${c.self_signed ? " (self-signed)" : ` · issued by ${esc(c.issuer || "")}`}</dd>` +
       `<dt>Names</dt><dd class="mono small">${(c.names || []).map(esc).join(", ")}</dd>` +

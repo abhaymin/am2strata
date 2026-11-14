@@ -278,17 +278,20 @@ Three ways to get a certificate:
 `tls renew` gets a fresh certificate; `tls off` turns HTTPS off. `--port` and `--http` set the port and what plain
 HTTP does.
 
-**Plain HTTP once HTTPS is on** (`"http"`): `local-only` (the default) keeps answering this PC's own tools on
-127.0.0.1 and sends every other device to HTTPS (a 308 redirect, so the method and body are kept); `redirect` sends
-everyone except `/health`; `keep` changes nothing (not recommended).
+**Plain HTTP once HTTPS is on** (`"http"`): `keep` (the default) changes nothing: the site and the API answer on
+`http://` and `ws://` (port 8000) and on `https://` and `wss://` (port 8001) alike. `local-only` keeps answering this
+PC's own tools on 127.0.0.1 and sends every other device to HTTPS (a 308 redirect, so the method and body are kept);
+`redirect` sends everyone except `/health`.
 
-**HSTS** (`Strict-Transport-Security: max-age=31536000`) is sent on HTTPS responses only. Browsers apply it to a
-trusted name (the Tailscale one), not to bare IP addresses or certificates they do not trust.
+**HSTS** is on only with `redirect` (or `"hsts": true`): it then sends `Strict-Transport-Security: max-age=31536000`
+on HTTPS responses. A browser applies HSTS to the whole name, every port, so while plain HTTP is kept, HTTPS sends
+`max-age=0` instead; that also clears a pin a browser was given before, so `http://` works in it again. Browsers
+apply HSTS only to a trusted name (the Tailscale one), not to bare IP addresses or certificates they do not trust.
 
 The run config block, if you prefer to write it:
 
 ```json
-"tls": { "mode": "tailscale", "https_port": 8001, "http": "local-only" }
+"tls": { "mode": "tailscale", "https_port": 8001, "http": "keep" }
 ```
 
 `mode` is `self-signed`, `tailscale` or `files` (with `"cert"` and `"key"` paths); a mistake in this block stops
