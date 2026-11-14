@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>am2Strata · a local AI server in Rust</title>
+<meta name="description" content="am2Strata is a free, open-source AI server you run on your own PC: OpenAI, Anthropic and Gemini-compatible APIs, a web app for chat, a Workshop for making models and training data, and computer use in its own sandbox VM.">
+<meta property="og:title" content="am2Strata · a local AI server in Rust">
+<meta property="og:description" content="Run AI models on your own PC: compatible APIs, a web app, a model Workshop, computer use in a sandbox VM. Free and open source (MIT).">
+<meta property="og:image" content="https://am2strata.am2.ai/assets/social.png">
+<meta property="og:url" content="https://am2strata.am2.ai/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="theme-color" content="#0a1020">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+@font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+:root {
+  --bg: #0a1020; --bg2: #0f1830; --card: #121d38; --line: #23314f; --ink: #eef3f8; --muted: #a7b6c8; --accent: #5eead4;
+  --accent-ink: #062a26; --shadow: 0 18px 50px rgba(0, 0, 0, .35);
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f6f8fb; --bg2: #ffffff; --card: #ffffff; --line: #dde4ee; --ink: #0d1726; --muted: #4a5a70; --accent: #0f9f8f;
+          --accent-ink: #ffffff; --shadow: 0 14px 40px rgba(16, 32, 64, .10); }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+img { max-width: 100%; display: block; }
+code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+
+/* nav */
+nav { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(10px); background: color-mix(in srgb, var(--bg) 82%, transparent);
+      border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; gap: 22px; height: 60px; }
+.brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; }
+.brand svg { width: 26px; height: 26px; }
+nav .links { margin-left: auto; display: flex; gap: 20px; font-size: 15px; }
+nav .links a { color: var(--muted); }
+nav .links a:hover { color: var(--ink); text-decoration: none; }
+@media (max-width: 640px) { nav .links a.hide-sm { display: none; } }
+
+/* hero */
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); }
+.hero::before { content: ""; position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .55; }
+.hero::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, var(--bg) 25%, color-mix(in srgb, var(--bg) 45%, transparent) 75%, transparent); }
+.hero .wrap { position: relative; z-index: 1; padding: 96px 20px 88px; }
+.hero h1 { font-size: clamp(44px, 8vw, 84px); line-height: 1; margin: 0 0 18px; letter-spacing: -.02em; }
+.hero p.lead { font-size: clamp(19px, 2.4vw, 24px); color: var(--muted); max-width: 640px; margin: 0 0 30px; }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 600; border: 1px solid var(--line);
+       color: var(--ink); background: var(--card); }
+.btn:hover { text-decoration: none; border-color: var(--accent); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.badges { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 8px; }
+.badge { font-size: 13px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted);
+         background: color-mix(in srgb, var(--card) 70%, transparent); }
+
+section { padding: 84px 0; }
+section.alt { background: var(--bg2); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+h2 { font-size: clamp(30px, 4vw, 42px); margin: 0 0 12px; letter-spacing: -.01em; }
+.sub { color: var(--muted); max-width: 720px; margin: 0 0 40px; }
+
+/* features */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 24px; box-shadow: var(--shadow); }
+.card h3 { margin: 0 0 6px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.card .tag { font-size: 12px; font-weight: 600; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+             border-radius: 99px; padding: 2px 9px; white-space: nowrap; }
+.card p { margin: 0; color: var(--muted); font-size: 16px; }
+
+/* screens */
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+figure { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; box-shadow: var(--shadow); }
+figure img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; }
+figcaption { padding: 12px 16px; font-size: 15px; color: var(--muted); }
+figcaption b { color: var(--ink); font-weight: 600; }
+.note { font-size: 14px; color: var(--muted); margin-top: 18px; }
+
+/* install */
+.tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+.tab { padding: 8px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font: inherit; font-size: 15px; }
+.tab[aria-selected="true"] { color: var(--ink); border-color: var(--accent); }
+.code { position: relative; background: #070c18; color: #d8e6f3; border: 1px solid var(--line); border-radius: 14px; padding: 18px 56px 18px 18px;
+        overflow-x: auto; white-space: pre; }
+.copy { position: absolute; top: 10px; right: 10px; font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2b3a58;
+        background: #111a2e; color: #d8e6f3; cursor: pointer; }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 28px; }
+.steps .card p code { color: var(--ink); }
+
+/* platforms */
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 16px; background: var(--card); }
+table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 15px; }
+th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: 0; }
+.yes { color: var(--accent); font-weight: 600; }
+
+/* principles */
+.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.pillar { padding: 22px; border-left: 3px solid var(--accent); background: var(--card); border-radius: 0 14px 14px 0; }
+.pillar b { display: block; font-size: 19px; margin-bottom: 4px; }
+.pillar span { color: var(--muted); font-size: 16px; }
+
+footer { padding: 48px 0 60px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); }
+footer .cols { display: flex; flex-wrap: wrap; gap: 30px; justify-content: space-between; }
+footer p { margin: 6px 0; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="am2Strata home">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0f1830"/><path d="M7 10h18M7 16h13M7 22h18" stroke="#5eead4" stroke-width="3" stroke-linecap="round"/></svg>
+      am2Strata
+    </a>
+    <div class="links">
+      <a href="#features">Features</a>
+      <a class="hide-sm" href="#screens">Screens</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/abhaymin/am2strata">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <h1>am2Strata</h1>
+    <p class="lead">An AI server you run on your own PC. Chat with local models, plug in the apps you already use, make your own
+      models, and let an agent work in a sandbox computer of its own.</p>
+    <div class="cta">
+      <a class="btn primary" href="#install">Install in one line</a>
+      <a class="btn" href="https://github.com/abhaymin/am2strata">View on GitHub</a>
+      <a class="btn" href="https://github.com/abhaymin/am2strata/releases/latest">Downloads</a>
+    </div>
+    <div class="badges">
+      <span class="badge">Free and open source · MIT</span>
+      <span class="badge">Written in Rust</span>
+      <span class="badge">Linux · macOS · Windows · x64 and Arm</span>
+    </div>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <h2>What it does</h2>
+    <p class="sub">One server on your machine, one address for every app. Your models, your data and your keys stay with you.</p>
+    <div class="grid">
+      <div class="card"><h3>Compatible APIs <span class="tag">any OS</span></h3>
+        <p>OpenAI, Anthropic, Responses and Gemini-compatible endpoints, streaming and tools included, so existing apps and
+          coding agents connect with just a base URL and a key.</p></div>
+      <div class="card"><h3>Web app <span class="tag">any OS</span></h3>
+        <p>Chat with a live canvas for HTML, diagrams and Python in a sandbox; a Monitor for speed, GPUs and the queue;
+          settings for everything else.</p></div>
+      <div class="card"><h3>Workshop <span class="tag">any OS</span></h3>
+        <p>Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result. Fine-tune with
+          LoRA, sized to the machine you have.</p></div>
+      <div class="card"><h3>Training data <span class="tag">any OS</span></h3>
+        <p>Turn your documents into a chat dataset written by the model you have loaded, with near-duplicates dropped, an
+          optional judge pass and a dataset card. Review and edit it record by record.</p></div>
+      <div class="card"><h3>Sandbox VM <span class="tag">Linux · KVM</span></h3>
+        <p>Computer use in its own small Debian virtual machine: the agent installs and runs what it needs inside, and your
+          PC is untouched. It pauses when idle and resumes in about a second.</p></div>
+      <div class="card"><h3>Computer tab <span class="tag">Linux</span></h3>
+        <p>Watch the agent's desktop live, take control with your own mouse and keyboard, and copy and paste across. Rules
+          you choose decide what it may do.</p></div>
+      <div class="card"><h3>Secure by default <span class="tag">any OS</span></h3>
+        <p>HTTPS and secure WebSockets with a self-signed, your own or a Tailscale certificate. API keys with limits and
+          expiry, and usage per key and per model.</p></div>
+      <div class="card"><h3>One live connection <span class="tag">any OS</span></h3>
+        <p>The web app talks to the server over one WebSocket: answers stream over it, and status, the queue and jobs are
+          pushed the moment they change.</p></div>
+      <div class="card"><h3>Media <span class="tag">build from source</span></h3>
+        <p>Songs that sing their lyrics in 50+ languages, voices, images, video and speech to text, all running on your own
+          GPU.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="screens">
+  <div class="wrap">
+    <h2>See it</h2>
+    <p class="sub">Real screenshots of the web app, running on one PC.</p>
+    <div class="shots">
+      <figure><img src="assets/chat.webp" alt="A question and its answer, streamed at 68 tokens per second" loading="lazy" width="1200" height="675">
+        <figcaption><b>Chat.</b> Answers stream as they are written, with the model's thinking alongside.</figcaption></figure>
+      <figure><img src="assets/canvas.webp" alt="A digital clock the model wrote, running in the canvas" loading="lazy" width="1200" height="675">
+        <figcaption><b>Canvas.</b> An HTML page the model wrote, running live beside the chat.</figcaption></figure>
+      <figure><img src="assets/python.webp" alt="Python from the chat run in a sandbox with no network" loading="lazy" width="1200" height="675">
+        <figcaption><b>Python, sandboxed.</b> Code from the chat runs with no network and your home folder hidden.</figcaption></figure>
+      <figure><img src="assets/whiteboard.webp" alt="A Mermaid flow and shapes drawn on the whiteboard" loading="lazy" width="1200" height="675">
+        <figcaption><b>Flows and whiteboard.</b> Diagrams open by themselves when an answer has one.</figcaption></figure>
+      <figure><img src="assets/monitor.webp" alt="The Monitor's request history" loading="lazy" width="1200" height="675">
+        <figcaption><b>Monitor.</b> Every request, with speed, GPU, memory and what came back.</figcaption></figure>
+      <figure><img src="assets/agents.webp" alt="Settings, Connect: the coding agents and what each supports" loading="lazy" width="1200" height="675">
+        <figcaption><b>Coding agents.</b> Connect the agents you use to your own models in one command.</figcaption></figure>
+    </div>
+    <p class="note">The Workshop and Computer tabs are newer than these screenshots.</p>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install in one line</h2>
+    <p class="sub">The installer picks the right download for your system and processor, checks its SHA-256, needs no admin
+      rights, and keeps your models and settings when you update.</p>
+    <div class="tabs" role="tablist">
+      <button class="tab" role="tab" aria-selected="true" data-os="unix">Linux and macOS</button>
+      <button class="tab" role="tab" aria-selected="false" data-os="win">Windows</button>
+    </div>
+    <div class="code" id="cmd-unix">curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh<button class="copy" type="button">Copy</button></div>
+    <div class="code" id="cmd-win" hidden>irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex<button class="copy" type="button">Copy</button></div>
+    <div class="steps">
+      <div class="card"><h3>1 · Get a model</h3><p>Pull a small one to start:<br><code>am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M</code></p></div>
+      <div class="card"><h3>2 · Start it</h3><p>Run <code>am2strata</code> and open <code>http://127.0.0.1:8000</code> in your browser.</p></div>
+      <div class="card"><h3>3 · Check your PC</h3><p><code>am2strata-run doctor</code> lists each optional feature and exactly what this machine still needs for it.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="platforms">
+  <div class="wrap">
+    <h2>Where it runs</h2>
+    <p class="sub">Six downloads. The server, the web app, the APIs and the Workshop work on all of them.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Linux x64</th><th>Linux Arm</th><th>macOS Apple silicon</th><th>macOS Intel</th><th>Windows x64</th><th>Windows Arm</th></tr></thead>
+        <tbody>
+          <tr><td>Server, web app, APIs, Workshop</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+          <tr><td>Rust engine</td><td>CPU or GPU</td><td>CPU</td><td>CPU or GPU</td><td>CPU</td><td>CPU or GPU</td><td>CPU</td></tr>
+          <tr><td>Computer tab</td><td class="yes">yes</td><td class="yes">yes</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>Sandbox VM</td><td class="yes">yes (KVM)</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
+          <tr><td>Start at sign-in</td><td>systemd</td><td>systemd</td><td>launchd</td><td>launchd</td><td>Startup</td><td>Startup</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Built to stay yours</h2>
+    <div class="pillars">
+      <div class="pillar"><b>Local first</b><span>Models run on your hardware. Nothing leaves your PC unless you send it.</span></div>
+      <div class="pillar"><b>Light on the machine</b><span>Jobs queue for the GPU one at a time; the sandbox VM only gets CPU nothing else is using.</span></div>
+      <div class="pillar"><b>Open</b><span>MIT licensed and written in Rust, with a regression suite that checks every route on every change.</span></div>
+      <div class="pillar"><b>Your rules</b><span>An agent on your desktop asks before anything that sends, deletes, installs, buys or publishes.</span></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap cols">
+    <div>
+      <p><b>am2Strata</b> · free and open source (MIT)</p>
+      <p><a href="https://github.com/abhaymin/am2strata">GitHub</a> · <a href="https://github.com/abhaymin/am2strata/releases/latest">Downloads</a>
+        · <a href="https://github.com/abhaymin/am2strata/issues">Report an issue</a> · <a href="https://github.com/sponsors/abhaymin">Sponsor</a></p>
+    </div>
+    <div>
+      <p>Includes code derived from <a href="https://github.com/Niko1221/Strata">Strata</a> and
+        <a href="https://github.com/VecSzn/PolyStrata">PolyStrata</a> (MIT).</p>
+      <p>The background image was made with am2Strata's media engine.</p>
+    </div>
+  </div>
+</footer>
+
+<script>
+  for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => {
+    for (const o of document.querySelectorAll(".tab")) o.setAttribute("aria-selected", String(o === t));
+    document.getElementById("cmd-unix").hidden = t.dataset.os !== "unix";
+    document.getElementById("cmd-win").hidden = t.dataset.os !== "win";
+  });
+  if (/Windows/i.test(navigator.userAgent)) document.querySelector('.tab[data-os="win"]').click();
+  for (const b of document.querySelectorAll(".copy")) b.addEventListener("click", async () => {
+    const text = b.parentElement.firstChild.textContent.trim();
+    try { await navigator.clipboard.writeText(text); b.textContent = "Copied"; }
+    catch (e) { b.textContent = "Select and copy"; }
+    setTimeout(() => (b.textContent = "Copy"), 1600);
+  });
+</script>
+</body>
+</html>
