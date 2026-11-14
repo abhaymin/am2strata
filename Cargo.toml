@@ -68,3 +68,9 @@ prost = "0.13"
 lto = false
 codegen-units = 16
 incremental = true
+
+[patch.crates-io]
+# zip 9.2.2 (labelled 8.99.0) for CVE-2026-115905 (critical) and CVE-2026-115906 to 115909: the candle fork the Workshop
+# uses pins zip ^8.6, and every 8.x is affected. The same vendored copy the media crate uses (its AM2STRATA.md says
+# what differs and when to remove it).
+zip = { path = "crates/strata-media/vendor/zip" }
