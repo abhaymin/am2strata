@@ -187,7 +187,7 @@ enum Cmd {
         /// the HTTPS (and wss) port (default 8001)
         #[arg(long)]
         port: Option<u16>,
-        /// what plain HTTP does then: local-only (default), redirect or keep
+        /// what plain HTTP does then: keep (default: http:// and ws:// keep working), local-only or redirect
         #[arg(long)]
         http: Option<String>,
         /// the server (default: this PC's, from its run configs; or AM2STRATA_URL)

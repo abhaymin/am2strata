@@ -39,11 +39,11 @@ fn https_from_the_run_config_with_hsts_only_over_tls() {
     let s = Server::start(&[Model { extra: json!({"tls": {"https_port": port}}), ..Model::default() }], &[ids("hi")], json!({}));
     let c = wait_https(&s.dir, port);
     let r = c.get(format!("https://localhost:{port}/health")).send().unwrap();
-    assert_eq!(r.headers()["strict-transport-security"], "max-age=31536000", "HSTS over HTTPS");
+    assert_eq!(r.headers()["strict-transport-security"], "max-age=0", "plain HTTP is kept, so no HSTS pin (and an old one is cleared)");
     // the API answers over HTTPS with the key, like over HTTP
     let r = c.get(format!("https://localhost:{port}/v1/models")).bearer_auth(KEY).send().unwrap();
     assert_eq!(r.status(), 200);
-    // plain HTTP from this PC keeps answering (local-only), and never carries HSTS
+    // plain HTTP keeps answering (the default "keep"), and never carries HSTS
     let r = reqwest::blocking::get(format!("{}/health", s.base)).unwrap();
     assert_eq!(r.status(), 200);
     assert!(r.headers().get("strict-transport-security").is_none(), "no HSTS over plain HTTP");

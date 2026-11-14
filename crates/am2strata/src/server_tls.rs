@@ -5,7 +5,8 @@
 //! ```json
 //! "tls": {"mode": "self-signed" | "tailscale" | "files", "https_port": 8001,
 //!         "cert": "/path/cert.pem", "key": "/path/key.pem",          // "files" only
-//!         "http": "local-only" | "keep" | "redirect",                 // what the plain-HTTP port does
+//!         "http": "keep" | "local-only" | "redirect",                 // what the plain-HTTP port does
+//!         "hsts": true | false,                                        // default: only with "redirect"
 //!         "hsts_max_age": 31536000, "hsts_include_subdomains": false}
 //! ```
 //!
@@ -35,7 +36,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde_json::Value;
 
-/// What the plain-HTTP port does once HTTPS is on.
+/// What the plain-HTTP port does once HTTPS is on. The default is `Keep`: `http://` and `ws://` keep working for
+/// everything, next to `https://` and `wss://`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMode {
     /// this PC's own requests answered as before; every other request redirected to HTTPS
@@ -60,6 +62,9 @@ pub struct Config {
     pub http: HttpMode,
     pub hsts_max_age: u64,
     pub hsts_include_subdomains: bool,
+    /// HSTS on: browsers then refuse plain HTTP for this name on every port, so it is on by default only when plain
+    /// HTTP redirects anyway
+    pub hsts: bool,
 }
 
 /// HTTPS and wss next to the API's default 8000 (and clear of the cluster's TLS port, the API port + 443).
@@ -82,7 +87,7 @@ impl Config {
             },
             other => return Err(format!("\"tls\": unknown mode {other:?} (self-signed, tailscale or files)")),
         };
-        let http = match t["http"].as_str().unwrap_or("local-only") {
+        let http = match t["http"].as_str().unwrap_or("keep") {
             "local-only" | "local" => HttpMode::LocalOnly,
             "redirect" => HttpMode::Redirect,
             "keep" => HttpMode::Keep,
@@ -96,11 +101,19 @@ impl Config {
             mode, https_port, http,
             hsts_max_age: t["hsts_max_age"].as_u64().unwrap_or(31_536_000),
             hsts_include_subdomains: t["hsts_include_subdomains"].as_bool().unwrap_or(false),
+            hsts: match t.get("hsts") {
+                None | Some(Value::Null) => http == HttpMode::Redirect,
+                Some(v) => v.as_bool().ok_or("\"tls\": \"hsts\" is true or false")?,
+            },
         }))
     }
 
+    /// The Strict-Transport-Security header sent over HTTPS. With HSTS off it is `max-age=0`, which also makes a
+    /// browser forget a pin it was given before, so `http://` to this PC works there again.
     pub fn hsts_value(&self) -> String {
-        if self.hsts_include_subdomains {
+        if !self.hsts {
+            "max-age=0".to_string()
+        } else if self.hsts_include_subdomains {
             format!("max-age={}; includeSubDomains", self.hsts_max_age)
         } else {
             format!("max-age={}", self.hsts_max_age)
@@ -671,7 +684,7 @@ mod tests {
         assert!(cfg(serde_json::json!({})).unwrap().is_none());
         assert!(cfg(serde_json::json!({"tls": false})).unwrap().is_none());
         let c = cfg(serde_json::json!({"tls": {}})).unwrap().unwrap();
-        assert_eq!((c.mode, c.https_port, c.http), (Mode::SelfSigned, DEFAULT_HTTPS_PORT, HttpMode::LocalOnly));
+        assert_eq!((c.mode, c.https_port, c.http), (Mode::SelfSigned, DEFAULT_HTTPS_PORT, HttpMode::Keep), "plain HTTP keeps working");
         assert!(cfg(serde_json::json!({"tls": {"mode": "selfsigned-typo"}})).unwrap_err().contains("unknown mode"));
         assert!(cfg(serde_json::json!({"tls": {"mode": "files"}})).unwrap_err().contains("needs \"cert\""));
         assert!(cfg(serde_json::json!({"tls": {"http": "nope"}})).unwrap_err().contains("unknown \"http\""));
@@ -680,10 +693,19 @@ mod tests {
 
     #[test]
     fn hsts_value() {
-        let mut c = cfg(serde_json::json!({"tls": {}})).unwrap().unwrap();
+        // plain HTTP kept (the default): no HSTS pin, and max-age=0 clears one a browser had
+        let c = cfg(serde_json::json!({"tls": {}})).unwrap().unwrap();
+        assert_eq!(c.hsts_value(), "max-age=0");
+        assert_eq!(cfg(serde_json::json!({"tls": {"http": "local-only"}})).unwrap().unwrap().hsts_value(), "max-age=0");
+        // everything redirected to HTTPS: HSTS on
+        let mut c = cfg(serde_json::json!({"tls": {"http": "redirect"}})).unwrap().unwrap();
         assert_eq!(c.hsts_value(), "max-age=31536000");
         c.hsts_include_subdomains = true;
         assert_eq!(c.hsts_value(), "max-age=31536000; includeSubDomains");
+        // or by hand
+        assert_eq!(cfg(serde_json::json!({"tls": {"hsts": true}})).unwrap().unwrap().hsts_value(), "max-age=31536000");
+        assert_eq!(cfg(serde_json::json!({"tls": {"http": "redirect", "hsts": false}})).unwrap().unwrap().hsts_value(), "max-age=0");
+        assert!(cfg(serde_json::json!({"tls": {"hsts": "yes"}})).is_err());
     }
 
     #[test]

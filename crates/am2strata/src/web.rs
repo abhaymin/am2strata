@@ -480,7 +480,7 @@ pub async fn tls_post(State(s): State<AppState>, headers: HeaderMap, Json(req): 
     };
     let current = cfg.get("tls").cloned().filter(|t| t.is_object()).unwrap_or_else(|| json!({}));
     let mut block = current.clone();
-    for k in ["https_port", "http", "hsts_max_age", "hsts_include_subdomains"] {
+    for k in ["https_port", "http", "hsts", "hsts_max_age", "hsts_include_subdomains"] {
         if let Some(v) = req.get(k) {
             block[k] = v.clone();
         }
