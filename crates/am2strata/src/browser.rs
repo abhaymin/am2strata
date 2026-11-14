@@ -620,7 +620,7 @@ impl Browsers {
         if upload {
             // only when an upload folder is set: hidden until then, and a call is refused with the setting named
             tools.push(json!({"name": "browser_upload",
-                               "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
+                               "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. Open the page's upload dialog first (YouTube Studio: .../videos/upload?d=ud opens it); never click a \"Select files\" button, which opens a system file picker the tools cannot see. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
                                "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "selector": {"type": "string"}}, "required": ["path"]}}));
         }
         tools.extend([
@@ -1083,7 +1083,10 @@ impl Browsers {
                 let ids = page.execute(chromiumoxide::cdp::browser_protocol::dom::QuerySelectorAllParams::new(root.result.root.node_id, raw_selector(args)?))
                     .await.map_err(|e| format!("finding a file input on the page: {e}"))?;
                 let node_id = ids.result.node_ids.into_iter().next()
-                    .ok_or_else(|| "there is no file input here: give its selector with `selector`".to_string())?;
+                    .ok_or_else(|| "there is no file input on this page yet: open the page's upload dialog first (a page usually adds its \
+                                   <input type=file> only then; on YouTube Studio open https://studio.youtube.com/channel/<id>/videos/upload?d=ud, \
+                                   which shows it), or give its selector with `selector`. Do not click \"Select files\": that opens the \
+                                   system's file picker, which these tools cannot use".to_string())?;
                 // carry only the files and which input (by node id); chromium fills in the fake path itself
                 let mut files = chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams::new(vec![path.to_string_lossy().to_string()]);
                 files.node_id = Some(node_id);
