@@ -62,6 +62,18 @@ fn read_exact(s: &mut impl Read, n: usize) -> std::io::Result<Vec<u8>> {
 fn be16(b: &[u8]) -> u16 { u16::from_be_bytes([b[0], b[1]]) }
 fn be32(b: &[u8]) -> u32 { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
 
+/// The largest screen accepted. The guest is not trusted (the agent is root in it), so sizes it sends are bounded
+/// before anything is allocated.
+const MAX_W: usize = 4096;
+const MAX_H: usize = 4096;
+
+fn check_size(w: usize, h: usize) -> Result<(), String> {
+    if w == 0 || h == 0 || w > MAX_W || h > MAX_H {
+        return Err(format!("VNC: a screen of {w}x{h} is refused (at most {MAX_W}x{MAX_H})"));
+    }
+    Ok(())
+}
+
 /// Raw encoding, the DesktopSize pseudo-encoding.
 const ENC_RAW: i32 = 0;
 const ENC_DESKTOP_SIZE: i32 = -223;
@@ -94,6 +106,7 @@ impl Rfb {
         s.write_all(&[1]).map_err(|x| e("init", x))?; // shared: other viewers stay connected
         let init = read_exact(&mut s, 24).map_err(|x| e("init", x))?;
         let (w, h) = (be16(&init[0..2]), be16(&init[2..4]));
+        check_size(w as usize, h as usize)?;
         let name_len = be32(&init[20..24]) as usize;
         read_exact(&mut s, name_len.min(1 << 16)).map_err(|x| e("init", x))?;
         // SetPixelFormat: 32 bpp, depth 24, little-endian, true colour, max 255, red 16, green 8, blue 0 (BGRX bytes)
@@ -150,16 +163,21 @@ impl Rfb {
                         let enc = i32::from_be_bytes([r[8], r[9], r[10], r[11]]);
                         match enc {
                             ENC_RAW => {
+                                // inside the screen, checked before its pixels are read
+                                let (fw, fh) = { let f = self.shared.frame.lock().unwrap(); (f.width as usize, f.height as usize) };
+                                if x + w > fw || y + h > fh {
+                                    return Err(format!("VNC: a rectangle {w}x{h} at {x},{y} is outside the {fw}x{fh} screen"));
+                                }
                                 let px = read_exact(&mut s, w * h * 4).map_err(io)?;
                                 let mut f = self.shared.frame.lock().unwrap();
-                                let fw = f.width as usize;
+                                if (f.width as usize, f.height as usize) != (fw, fh) { continue; }
                                 for row in 0..h {
-                                    let (yy, dst) = (y + row, (y + row) * fw * 4 + x * 4);
-                                    if yy >= f.height as usize || x + w > fw { continue; }
+                                    let dst = (y + row) * fw * 4 + x * 4;
                                     f.bgrx[dst..dst + w * 4].copy_from_slice(&px[row * w * 4..(row + 1) * w * 4]);
                                 }
                             }
                             ENC_DESKTOP_SIZE => {
+                                check_size(w, h)?;
                                 let mut f = self.shared.frame.lock().unwrap();
                                 *f = Frame { width: w as u16, height: h as u16, bgrx: vec![0; w * h * 4] };
                             }
@@ -209,6 +227,9 @@ impl Rfb {
         }
         if !self.alive() {
             return Err(format!("the VM's screen is closed: {}", self.error().unwrap_or_default()));
+        }
+        if self.version() == 0 {
+            return Err("the VM's screen has sent no picture yet".into());
         }
         Ok(f(&self.shared.frame.lock().unwrap()))
     }
@@ -299,6 +320,13 @@ mod tests {
             assert!(incremental || read_exact(&mut c, 10).unwrap()[0..2] == [3, 1], "the client asks for the next update");
             got
         })
+    }
+
+    #[test]
+    fn sizes_from_the_guest_are_bounded() {
+        assert!(check_size(1280, 800).is_ok());
+        assert!(check_size(65535, 65535).is_err(), "no 17 GB frame");
+        assert!(check_size(0, 800).is_err());
     }
 
     #[test]

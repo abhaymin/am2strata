@@ -663,7 +663,9 @@ async fn main() -> Result<()> {
     // the sandbox VM is saved, so it comes back as it was at the next start
     #[cfg(target_os = "linux")]
     if let Some(vm) = computer::vm::get() {
-        let _ = tokio::task::spawn_blocking(move || vm.shutdown_for_exit()).await;
+        if let Err(e) = tokio::task::spawn_blocking(move || vm.shutdown_for_exit()).await {
+            tracing::warn!("sandbox VM: saving it at exit failed: {e}");
+        }
     }
     if let Some(b) = mgr.browser.get() {
         b.close().await;
