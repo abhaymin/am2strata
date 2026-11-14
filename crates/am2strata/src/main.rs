@@ -192,6 +192,28 @@ async fn overload_headers(axum::extract::State(s): axum::extract::State<AppState
     r
 }
 
+/// A body axum could not read (broken JSON, a wrong content type, too large) is refused by axum before the handler
+/// runs, in plain text. Two things are put right here, for every route at once:
+/// - a caller without a valid key gets the 401 the handler would have given: the key comes before the body, so a
+///   stranger learns nothing from a route (not even that it reads JSON);
+/// - everyone else gets the refusal in the APIs' JSON error shape, like every other refusal.
+/// Not for the two places whose proof is not a key header: a worker's pairing code and Gemini's `?key=`.
+async fn body_rejections(axum::extract::State(s): axum::extract::State<AppState>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let stranger = !api_authorized(&s, req.headers());
+    let own_proof = { let p = req.uri().path(); p == "/api/cluster/join" || p.starts_with("/v1beta/") };
+    let r = next.run(req).await;
+    let st = r.status();
+    let plain = r.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("text/plain"));
+    if !plain || !matches!(st, StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE | StatusCode::UNPROCESSABLE_ENTITY) {
+        return r;
+    }
+    if stranger && !own_proof {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let why = axum::body::to_bytes(r.into_body(), 4096).await.map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    error(st, "invalid_request_error", if why.is_empty() { "the request body could not be read".to_string() } else { why })
+}
+
 /// A panic in a handler, as a 500 in the APIs' error shape (the panic itself is logged).
 fn panic_answer(err: Box<dyn std::any::Any + Send + 'static>) -> axum::http::Response<axum::body::Body> {
     let what = err.downcast_ref::<String>().cloned().or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
@@ -603,6 +625,8 @@ async fn main() -> Result<()> {
             axum::http::header::X_CONTENT_TYPE_OPTIONS, axum::http::HeaderValue::from_static("nosniff")))
         .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
             axum::http::header::REFERRER_POLICY, axum::http::HeaderValue::from_static("no-referrer")))
+        // a body axum refused: 401 first for a caller without a key, and the APIs' JSON error shape for the rest
+        .layer(axum::middleware::from_fn_with_state(state.clone(), body_rejections))
         // a chat whose model a worker should answer goes there (cluster.rs); inside the records, so they show it
         .layer(axum::middleware::from_fn_with_state(state.clone(), cluster::route))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))

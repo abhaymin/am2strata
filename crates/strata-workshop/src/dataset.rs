@@ -97,7 +97,9 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
         let mut j = first;
         let mut last_boundary: Option<usize> = None;
         while j < tokens.len() {
-            let space = if j == first { 0 } else { 1 };
+            // the whitespace really between the two words (a blank line is two characters or more, not one): the
+            // chunk's text keeps it, so it counts towards the limit
+            let space = if j == first { 0 } else { tokens[j].start - tokens[j - 1].end };
             let add = (tokens[j].end - tokens[j].start) + space;
             if len + add > max_chars {
                 break;
@@ -548,5 +550,112 @@ mod tests {
             assert!(!cs.is_empty() && cs.len() < 400, "overlap {overlap}: {} chunks", cs.len());
             assert!(cs.windows(2).all(|w| w[1].start > w[0].start), "every chunk moves forward");
         }
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Regressions (docs/REGRESSION.md): bugs fixed in review of PR #13
+    // (https://github.com/abhaymin/am2strata/pull/13). Every bug fix adds its test here.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// `chunk` on its own thread with a deadline: a chunker that loops forever fails the test in two seconds instead
+    /// of hanging the whole run.
+    fn chunk_within(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = text.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(chunk(&t, max_chars, overlap));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap_or_else(|_| panic!("chunk({text:?}, {max_chars}, {overlap}) did not finish: it loops"))
+    }
+
+    /// PR #13 (Kilo, commits 34a12e2 and e3263cc): `chunk` looped forever when the overlap was as long as a chunk, and
+    /// again when a sentence boundary in the first chunk left the next start where the last one was. Every tiny
+    /// input, every limit and every overlap (0, under, equal to and far over `max_chars`) must finish, move forward,
+    /// stay inside the text and cover every word.
+    #[test]
+    fn regress_pr13_chunk_never_loops_whatever_the_overlap() {
+        let texts = [
+            "a", "a b", "a. b", "Hi. one two three", "A. bbbb cccc dddd", "a.\n\nb c d e f", "one two three four five six",
+            "x. y. z. w. v.", "aaaaaaaaaaaaaaaaaaaa b", "b aaaaaaaaaaaaaaaaaaaa", "  lead and trail  ", "é ü 漢字 x. y",
+            "Hi.\nThere. You.\n\nNew para here. End", "a b c d e f g h i j k l m n o p",
+        ];
+        for text in texts {
+            let chars: Vec<char> = text.chars().collect();
+            let words = text.split_whitespace().count();
+            for max_chars in 1..=12usize {
+                for overlap in [0, 1, 2, max_chars / 2, max_chars.saturating_sub(1), max_chars, max_chars + 1, 2 * max_chars, 1000, usize::MAX] {
+                    let what = format!("chunk({text:?}, {max_chars}, {overlap})");
+                    let cs = chunk_within(text, max_chars, overlap);
+                    assert!(!cs.is_empty(), "{what}: no chunks for a text with words");
+                    assert!(cs.len() <= words, "{what}: {} chunks for {words} words (each chunk starts on a new word)", cs.len());
+                    assert!(cs.windows(2).all(|w| w[1].start > w[0].start), "{what}: a chunk did not move forward");
+                    // (>=, not >: with an overlap, a chunk that is only the tail of the one before it is still made)
+                    assert!(cs.windows(2).all(|w| w[1].end >= w[0].end), "{what}: a chunk ended before the last one did");
+                    for c in &cs {
+                        assert!(c.start < c.end && c.end <= chars.len(), "{what}: offsets {}..{}", c.start, c.end);
+                        assert_eq!(c.text, chars[c.start..c.end].iter().collect::<String>(), "{what}: text is the input at its offsets");
+                        let one_word = !c.text.chars().any(char::is_whitespace);
+                        assert!(c.text.chars().count() <= max_chars || one_word, "{what}: {:?} is over the limit and not one word", c.text);
+                    }
+                    // nothing is skipped: every word of the text is inside some chunk
+                    assert_eq!(cs[0].start, chars.iter().position(|c| !c.is_whitespace()).unwrap(), "{what}: starts at the first word");
+                    assert_eq!(cs.last().unwrap().end, text.trim_end().chars().count(), "{what}: ends at the last word");
+                    assert!(cs.windows(2).all(|w| chars[w[0].end..w[1].start.max(w[0].end)].iter().all(|c| c.is_whitespace())),
+                            "{what}: words were skipped between two chunks");
+                }
+            }
+        }
+        // degenerate limits end at once
+        assert!(chunk_within("a b c", 0, 5).is_empty());
+        assert!(chunk_within("", 5, 5).is_empty());
+    }
+
+    /// Found by this suite: the space between two words was counted as one character whatever it was, so a chunk
+    /// holding a blank line or an indented line came out longer than `max_chars`.
+    #[test]
+    fn regress_chunk_counts_the_whitespace_it_keeps() {
+        let cs = chunk("a.\n\nb c d e f", 12, 0);
+        assert!(cs.iter().all(|c| c.text.chars().count() <= 12), "{cs:?}");
+        let text = "First line.\n\n\n\n    indented second line here.\n\n\n\tthird   with   wide   gaps.";
+        for max in [8, 16, 24, 40] {
+            for c in chunk(text, max, 0) {
+                assert!(c.text.chars().count() <= max || !c.text.chars().any(char::is_whitespace), "max {max}: {:?}", c.text);
+            }
+        }
+    }
+
+    /// The exact shape of the second loop (e3263cc): a boundary inside the first chunk ("Hi.") ends it early, and an
+    /// overlap longer than that chunk put the next start back at the same word.
+    #[test]
+    fn regress_pr13_chunk_moves_on_after_a_boundary_in_the_first_chunk() {
+        let cs = chunk_within("Hi. one two three four", 10, 9);
+        assert_eq!(cs[0].text, "Hi.");
+        assert!(cs.len() >= 2 && cs[1].start > cs[0].start, "{cs:?}");
+        assert_eq!(cs.last().unwrap().text.split_whitespace().last(), Some("four"));
+    }
+
+    /// PR #13 (Kilo, commit 34a12e2): MinHash signatures are compared for exact equality, slot by slot. Identical
+    /// texts are duplicates at threshold 1.0 itself; texts with nothing in common share no slot at any threshold
+    /// above zero; a text with no words is never a duplicate of one with words; the first of a group is kept.
+    #[test]
+    fn regress_pr13_near_duplicates_compare_hashes_exactly() {
+        let t = |s: &str| s.to_string();
+        let a = "the model workshop converts merges and quantizes models on this machine";
+        assert_eq!(near_duplicates(&[t(a), t(a)], 1.0), vec![1], "identical texts match in every slot");
+        assert_eq!(near_duplicates(&[t(a), t("  The MODEL workshop, converts; merges and quantizes models on this machine! ")], 1.0), vec![1],
+                   "case, punctuation and spacing are not words");
+        assert!(near_duplicates(&[t(a), t(""), t("  \n ")], 0.01).is_empty() || near_duplicates(&[t(a), t(""), t("  \n ")], 0.01) == vec![2],
+                "a text with no words is never a duplicate of one with words");
+        let b = "seven purple elephants juggle flaming torches beside a frozen northern lake";
+        assert!(near_duplicates(&[t(a), t(b)], 0.01).is_empty(), "unrelated texts share no minimum hash");
+        assert_eq!(jaccard_estimate(&min_hash_signature(a), &min_hash_signature(b)), 0.0);
+        assert_eq!(jaccard_estimate(&min_hash_signature(a), &min_hash_signature(a)), 1.0);
+        // short texts (under one shingle) are whole-text shingles: equal ones match, different ones do not
+        assert_eq!(near_duplicates(&[t("yes please"), t("yes please"), t("no thanks")], 0.9), vec![1]);
+        // order decides who is kept: the first of each group, whatever follows
+        assert_eq!(near_duplicates(&[t(b), t(a), t(b), t(a)], 0.9), vec![2, 3]);
+        assert!(near_duplicates(&[], 0.5).is_empty());
+        assert!(near_duplicates(&[t(a)], 0.0).is_empty(), "one text has nothing to duplicate");
     }
 }

@@ -45,6 +45,9 @@ pub async fn load_model(State(s): State<AppState>, headers: HeaderMap, Json(req)
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("a model can be loaded");
+    }
     let Some(name) = req.get("model").and_then(Value::as_str) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "send {\"model\": \"<name>\"}");
     };
@@ -341,6 +344,9 @@ pub async fn machine_measure(State(s): State<AppState>, headers: HeaderMap) -> R
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the disk can be measured");
+    }
     let (d, m) = (s.data_dir.clone(), s.models_dir.clone());
     // the models' files are where their run configs' --model says, often not beside the configs
     let mut weights: Vec<std::path::PathBuf> = s.mgr.models().iter()
@@ -361,6 +367,9 @@ pub async fn optimise(State(s): State<AppState>, headers: HeaderMap, axum::extra
                       body: Option<Json<Value>>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("a model can be tuned");
     }
     if s.mgr.entry(&id).is_none() {
         return error(StatusCode::NOT_FOUND, "not_found", format!("no installed model is named {id:?}"));
@@ -392,6 +401,9 @@ pub async fn set_tuned(State(s): State<AppState>, headers: HeaderMap, axum::extr
                        Json(b): Json<Value>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("tuned settings can be switched");
     }
     let Some(e) = s.mgr.entry(&id) else {
         return error(StatusCode::NOT_FOUND, "not_found", format!("no installed model is named {id:?}"));

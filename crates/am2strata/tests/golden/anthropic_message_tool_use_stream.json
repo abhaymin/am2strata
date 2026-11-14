@@ -1,0 +1,84 @@
+{
+  "content_block_delta": [
+    {
+      "delta": {
+        "partial_json": "string",
+        "type": "=input_json_delta"
+      },
+      "index": "int",
+      "type": "=content_block_delta"
+    },
+    {
+      "delta": {
+        "thinking": "string",
+        "type": "=thinking_delta"
+      },
+      "index": "int",
+      "type": "=content_block_delta"
+    }
+  ],
+  "content_block_start": [
+    {
+      "content_block": {
+        "id": "string",
+        "input": {},
+        "name": "string",
+        "type": "=tool_use"
+      },
+      "index": "int",
+      "type": "=content_block_start"
+    },
+    {
+      "content_block": {
+        "signature": "string",
+        "thinking": "string",
+        "type": "=thinking"
+      },
+      "index": "int",
+      "type": "=content_block_start"
+    }
+  ],
+  "content_block_stop": [
+    {
+      "index": "int",
+      "type": "=content_block_stop"
+    }
+  ],
+  "message_delta": [
+    {
+      "delta": {
+        "stop_reason": "=tool_use",
+        "stop_sequence": "null"
+      },
+      "type": "=message_delta",
+      "usage": {
+        "cache_read_input_tokens": "int",
+        "input_tokens": "int",
+        "output_tokens": "int"
+      }
+    }
+  ],
+  "message_start": [
+    {
+      "message": {
+        "content": [],
+        "id": "string",
+        "model": "string",
+        "role": "=assistant",
+        "stop_reason": "null",
+        "stop_sequence": "null",
+        "type": "=message",
+        "usage": {
+          "input_tokens": "int",
+          "output_tokens": "int"
+        }
+      },
+      "type": "=message_start"
+    }
+  ],
+  "message_stop": [
+    {
+      "type": "=message_stop"
+    }
+  ]
+}
