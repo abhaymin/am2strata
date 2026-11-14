@@ -74,11 +74,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "tungstenite 0.28.0",
+ "tungstenite 0.29.0",
  "uuid",
+ "webpki-roots",
  "x11rb",
  "x509-parser",
 ]
@@ -4006,23 +4008,6 @@ dependencies = [
  "rand 0.8.8",
  "sha1",
  "thiserror 1.0.69",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8628dcc84e5a09eb3d8423d6cb682965dea9133204e8fb3efee74c2a0c259442"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "sha1",
- "thiserror 2.0.21",
  "utf-8",
 ]
 

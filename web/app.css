@@ -34,6 +34,15 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .model-select { height: 36px; max-width: 320px; padding: 0 var(--st-s-2); border-radius: 8px; border: 1px solid var(--st-line);
                 background: var(--st-surface); color: var(--st-ink); font: inherit; font-size: var(--st-fs-sm); }
 .model-select:disabled { opacity: .6; }
+/* the live channel's state beside the status pill: connected (pushed updates), reconnecting, or refused */
+.live-ind { display: inline-flex; align-items: center; gap: 6px; font-size: var(--st-fs-xs, 12px); color: var(--st-ink-muted); white-space: nowrap; cursor: default; }
+.live-ind__dot { width: 7px; height: 7px; border-radius: 50%; background: var(--st-ink-muted); }
+.live-ind[data-state="on"] .live-ind__dot { background: var(--st-accent); }
+.live-ind[data-state="wait"] .live-ind__dot { background: var(--st-warn); animation: live-wait 1.2s ease-in-out infinite; }
+.live-ind[data-state="off"] .live-ind__dot { background: var(--st-warn); }
+@keyframes live-wait { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .live-ind[data-state="wait"] .live-ind__dot { animation: none; } }
+@media (max-width: 1100px) { .live-ind #live-text { display: none; } }
 .narrow-only { display: none; }
 
 /* ---------------------------------------------------------------- chat */

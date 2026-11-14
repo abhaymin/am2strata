@@ -241,6 +241,24 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    /// the live channel from a terminal (ws:// or wss://): what the server pushes, one JSON per line, until Ctrl+C
+    Live {
+        /// the topics to follow: status, queue, jobs, workshop, metrics
+        #[arg(long, default_value = "status,queue")]
+        topics: String,
+        /// wss://: a certificate to trust besides the public ones (the server's self-signed one, e.g.
+        /// <data-dir>/server-tls/cert.pem)
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// the server: http://, https://, ws:// or wss:// (default: this PC's, from its run configs; or AM2STRATA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// its API key (default: from the run configs; or AM2STRATA_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// what upstream (PolyStrata, Strata) changed since am2Strata's ports: tools/upstream.json against GitHub, read-only
     UpstreamCheck {
         /// the manifest (default: tools/upstream.json in this checkout)
@@ -738,6 +756,7 @@ fn main() -> ExitCode {
                                                      "limits": {"requests_per_day": requests_per_day, "tokens_per_day": tokens_per_day}}),
                      days, key, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
+        Cmd::Live { topics, cert, url, api_key, models_dir } => live_cmd(&topics, cert, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
@@ -1102,6 +1121,98 @@ fn computer_cmd(action: &str, arg: Option<String>, url: Option<String>, api_key:
         Err(e) => { eprintln!("computer: {e}"); ExitCode::from(1) }
     }
 }
+
+/// `am2strata-run live [--topics status,queue]`: the live channel (GET /v1/live), for scripts and cluster nodes. Each
+/// pushed update is printed as one line of JSON on stdout; what the server says about the connection goes to stderr.
+fn live_cmd(topics: &str, cert: Option<PathBuf>, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let result = (|| -> Result<(), String> {
+        use tungstenite::client::IntoClientRequest;
+        let (secure, rest) = match url.split_once("://") {
+            Some(("https" | "wss", r)) => (true, r),
+            Some(("http" | "ws", r)) => (false, r),
+            _ => return Err(format!("{url:?} is not an http://, https://, ws:// or wss:// address")),
+        };
+        let authority = rest.split('/').next().unwrap_or(rest);
+        let ws_url = format!("{}://{authority}/v1/live", if secure { "wss" } else { "ws" });
+        let parsed = reqwest::Url::parse(&ws_url).map_err(|e| format!("{url}: {e}"))?;
+        let host = parsed.host_str().ok_or_else(|| format!("{url}: no host in it"))?.trim_start_matches('[').trim_end_matches(']').to_string();
+        let port = parsed.port().unwrap_or(if secure { 443 } else { 80 });
+        let mut req = ws_url.as_str().into_client_request().map_err(|e| e.to_string())?;
+        // a program can send the key as a header (a browser cannot, and sends it as the first message)
+        if let Some(k) = &key {
+            req.headers_mut().insert("authorization", format!("Bearer {k}").parse().map_err(|_| "the API key has characters a header cannot carry")?);
+        }
+        let tcp = std::net::TcpStream::connect((host.as_str(), port)).map_err(|e| format!("{host}:{port} does not answer ({e}); is the server running?"))?;
+        let stream: Box<dyn ReadWrite> = if secure {
+            use rustls::pki_types::pem::PemObject;
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            if let Some(c) = &cert {
+                for der in rustls::pki_types::CertificateDer::pem_file_iter(c).map_err(|e| format!("{}: {e}", c.display()))? {
+                    roots.add(der.map_err(|e| format!("{}: {e}", c.display()))?).map_err(|e| format!("{}: {e}", c.display()))?;
+                }
+            }
+            let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions().map_err(|e| e.to_string())?
+                .with_root_certificates(roots).with_no_client_auth();
+            let name = rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| format!("{host}: {e}"))?;
+            let conn = rustls::ClientConnection::new(std::sync::Arc::new(cfg), name).map_err(|e| e.to_string())?;
+            Box::new(rustls::StreamOwned::new(conn, tcp))
+        } else {
+            Box::new(tcp)
+        };
+        let (mut ws, _) = tungstenite::client(req, stream).map_err(|e| match e {
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) if r.status() == 403 =>
+                "refused (403): the server took this for another site's page".to_string(),
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Io(e)) if secure =>
+                format!("{ws_url}: {e} (a self-signed certificate is trusted with --cert <its cert.pem>)"),
+            tungstenite::HandshakeError::Failure(e) => format!("{ws_url}: {e}"),
+            tungstenite::HandshakeError::Interrupted(_) => format!("{ws_url}: the handshake was interrupted"),
+        })?;
+        let list: Vec<&str> = topics.split(',').map(str::trim).filter(|t| !t.is_empty()).collect();
+        ws.send(tungstenite::Message::Text(serde_json::json!({"type": "subscribe", "topics": list}).to_string().into())).map_err(|e| e.to_string())?;
+        let mut refused = None;
+        loop {
+            // (pings from the server are answered by the socket as it reads)
+            let text = match ws.read() {
+                Ok(tungstenite::Message::Text(t)) => t,
+                Ok(tungstenite::Message::Close(_)) | Err(tungstenite::Error::ConnectionClosed) =>
+                    return Err(refused.unwrap_or_else(|| "the server closed the connection".to_string())),
+                Ok(_) => continue,
+                Err(e) => return Err(format!("the connection broke: {e}")),
+            };
+            let m: serde_json::Value = serde_json::from_str(text.as_str()).unwrap_or_default();
+            match m["type"].as_str() {
+                Some("update") => {
+                    let mut out = std::io::stdout().lock();
+                    // a closed pipe (`| head -1`) ends it quietly
+                    if writeln!(out, "{}", text.as_str()).and_then(|_| out.flush()).is_err() {
+                        return Ok(());
+                    }
+                }
+                Some("error") => {
+                    let what = m["message"].as_str().unwrap_or("error").to_string();
+                    eprintln!("live: {what}");
+                    refused = Some(what);
+                }
+                Some("ready") => eprintln!("live: connected to {ws_url} as {}{}", m["role"].as_str().unwrap_or("?"),
+                                           m["client"].as_str().map(|c| format!(" ({c})")).unwrap_or_default()),
+                Some("subscribed") => eprintln!("live: following {} (Ctrl+C stops)", m["topics"].as_array().map(|a| a.iter().filter_map(|t| t.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+                _ => {}
+            }
+        }
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("live: {e}"); ExitCode::from(1) }
+    }
+}
+
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 /// `am2strata-run tls ...`: the same /api/tls the web app's Settings › Secure connection uses.
 #[allow(clippy::too_many_arguments)]
