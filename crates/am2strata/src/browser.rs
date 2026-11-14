@@ -408,6 +408,38 @@ fn upload_file_ok(path: &Path, upload_dir: &Path) -> Result<PathBuf, String> {
 struct Tab {
     page: Page,
     used: Instant,
+    /// a tab the user already had open (the `connect` mode): the job works in it and never closes it
+    adopted: bool,
+}
+
+impl Tab {
+    /// Let go of the tab: close it if this server opened it; a tab the user had open stays open.
+    async fn release(self) {
+        if !self.adopted {
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.page.close()).await;
+        }
+    }
+}
+
+/// In the `connect` mode, a tab the user already has open on a web page and no job holds: the first job works in it, so
+/// the user sees the job where they are looking (and its logins and open dialogs are there) instead of in a new tab.
+async fn adopt_user_tab(run: &mut Running) -> Option<Page> {
+    let targets = run.browser.fetch_targets().await.ok()?;
+    let held: Vec<String> = run.tabs.iter().map(|(_, t)| t.page.target_id().inner().clone()).collect();
+    for t in targets {
+        let web = t.url.starts_with("https://") || t.url.starts_with("http://");
+        if t.r#type != "page" || !web || held.iter().any(|h| h == t.target_id.inner()) {
+            continue;
+        }
+        // fetch_targets attaches in the background: the page shows up a moment later
+        for _ in 0..30 {
+            if let Ok(p) = run.browser.get_page(t.target_id.clone()).await {
+                return Some(p);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    None
 }
 
 /// A page download Chrome fetched into the download folder, before it is placed (sanitised name) or denied. `done` is set when
@@ -692,9 +724,14 @@ impl Browsers {
             if run.tabs.is_empty() { break };
             let (id, t) = run.tabs.remove(i);
             run.active.retain(|_, v| *v != id);
-            let _ = t.page.close().await;
+            t.release().await;
         }
-        let page = run.browser.new_page("about:blank").await.map_err(|e| e.to_string())?;
+        let user_tab = if self.settings.connect.is_some() { adopt_user_tab(run).await } else { None };
+        let adopted = user_tab.is_some();
+        let page = match user_tab {
+            Some(p) => p,
+            None => run.browser.new_page("about:blank").await.map_err(|e| e.to_string())?,
+        };
         // where a page's download lands (a folder, the file name sanitised when placed), or denied so it never reaches here
         if let Some(dir) = self.settings.download_dir.clone() {
             let mut params = chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams::new(
@@ -738,7 +775,7 @@ impl Browsers {
         });
         // a new tab for this conversation is the one the tools act on until browser_tabs closes or switches it
         let id = format!("tab-{}", uuid::Uuid::new_v4().simple());
-        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now() }));
+        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted }));
         run.active.insert(conv.to_string(), id);
         Ok(page)
     }
@@ -946,7 +983,7 @@ impl Browsers {
                 let i = (0..run.tabs.len()).find(|&i| run.tabs[i].0 == id);
                 if let Some(i) = i {
                     let (_, t) = run.tabs.remove(i);
-                    let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+                    t.release().await;
                 }
             }
         }
@@ -1085,7 +1122,7 @@ impl Browsers {
                             if let Some(i) = i {
                                 let (_, t) = run.tabs.remove(i);
                                 run.active.retain(|_, v| *v != target.id);
-                                let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+                                t.release().await;
                             }
                         }
                         if let Some(page) = self.current(conv).await.or_else(|| guard.as_ref().and_then(|r| r.tabs.first().map(|(_, t)| t.page.clone()))) {
@@ -1154,7 +1191,7 @@ impl Browsers {
                 }
                 None => {
                     while let Some((_, t)) = r.tabs.pop() {
-                        let _ = t.page.close().await;
+                        t.release().await;
                     }
                     // dropping `browser` ends the DevTools connection without closing the user's browser
                 }
