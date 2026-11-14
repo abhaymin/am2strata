@@ -519,7 +519,9 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
 
-    /// One HTTP answer per connection, from a local server.
+    /// One HTTP answer per connection, from a local server. Each answer says `Connection: close`, so the client opens
+    /// a new connection for the next request and never reuses one this server has already dropped (which failed the
+    /// test now and then with "error sending request").
     fn serve(answers: Vec<String>) -> String {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = format!("http://{}/", l.local_addr().unwrap());
@@ -531,6 +533,7 @@ mod tests {
                 while r.read_line(&mut line).unwrap() > 2 {
                     line.clear();
                 }
+                let a = a.replacen("\r\n", "\r\nConnection: close\r\n", 1);
                 s.write_all(a.as_bytes()).unwrap();
             }
         });
