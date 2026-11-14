@@ -49,7 +49,12 @@ fn train_speaks_the_event_protocol_and_writes_a_peft_adapter() {
     }
     let logs: Vec<&str> = of(&events, "log").iter().filter_map(|e| e["message"].as_str()).collect();
     assert!(logs.iter().any(|m| m.contains("a 4-bit base (QLoRA) is not done")), "the command says what it does not do: {logs:?}");
-    assert!(logs.iter().any(|m| m.starts_with("fits: needs")), "{logs:?}");
+    // free RAM is read from /proc/meminfo: on Linux the verdict says it fits; elsewhere it says the system does not tell
+    if cfg!(target_os = "linux") {
+        assert!(logs.iter().any(|m| m.starts_with("fits: needs")), "{logs:?}");
+    } else {
+        assert!(logs.iter().any(|m| m.contains("this system does not say how much RAM is free")), "{logs:?}");
+    }
     assert!(logs.iter().any(|m| m.starts_with("held-out loss")), "{logs:?}");
     let done = events.last().unwrap();
     assert_eq!((done["event"].as_str(), done["kind"].as_str(), done["steps"].as_u64(), done["stopped"].as_bool()), (Some("done"), Some("lora-adapter"), Some(11), Some(false)));
