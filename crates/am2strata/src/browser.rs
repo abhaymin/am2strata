@@ -20,6 +20,10 @@
 //! - **Upload a file:** `browser_upload` gives a page's `<input type=file>` a file from one folder set in
 //!   `"browser": {"upload_dir": <a folder>}` (off by default, so the tool stays hidden until then); only an existing
 //!   file inside that folder is given — symlinks and ".." are resolved, and anything outside it is refused.
+//! - **Your own browser:** with `"browser": {"connect": "http://127.0.0.1:9222"}` the job works in a web tab you already
+//!   have open (one no other job holds), so you watch it where you look; that tab is never closed by the server and
+//!   gets no request filter (it pauses every request, and Chrome stalls a large upload that way). Tabs it opens itself
+//!   keep the filter.
 //! - **Tabs:** `browser_tabs {action: list|switch|close}` lists the pages open in this job, switches which one the
 //!   other tools act on, or closes one (the last one cannot be closed, the job would lose its browser).
 //! - **Select a choice:** `browser_select {selector, value}` sets a page's `<select>` to an option and fires input.
@@ -744,35 +748,40 @@ impl Browsers {
             let _ = page.execute(chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams::new(
                 chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorBehavior::Deny)).await;
         }
-        // every request the page makes: allowed only to public addresses (and data:, blob:, about:) and not on the lists
-        let mut paused = page.event_listener::<fetch::EventRequestPaused>().await.map_err(|e| e.to_string())?;
-        page.execute(fetch::EnableParams::default()).await.map_err(|e| e.to_string())?;
-        let (p2, private, allow, block) = (page.clone(), self.settings.private_urls, self.settings.site_allow.clone(), self.settings.site_block.clone());
-        tokio::spawn(async move {
-            let mut seen: HashMap<String, bool> = HashMap::new();
-            while let Some(ev) = paused.next().await {
-                let url = ev.request.url.clone();
-                let origin = reqwest::Url::parse(&url).ok().map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or(""))).unwrap_or_default();
-                let host = reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
-                let ok = match seen.get(&origin) {
-                    Some(v) => *v,
-                    None => {
-                        let v = allowed_host(&url, private).await && download_verdict(&host, &allow, &block).is_none();
-                        seen.insert(origin, v);
-                        v
+        // the request filter pauses each request until the server lets it go, and Chrome stalls a large upload that way
+        // (a video sent to YouTube Studio stayed at 0%): a tab the user had open is theirs, with their own logins, so it
+        // is left unfiltered as their browser would be; tabs this server opens keep the filter
+        if !adopted {
+            // every request the page makes: allowed only to public addresses (and data:, blob:, about:) and not on the lists
+            let mut paused = page.event_listener::<fetch::EventRequestPaused>().await.map_err(|e| e.to_string())?;
+            page.execute(fetch::EnableParams::default()).await.map_err(|e| e.to_string())?;
+            let (p2, private, allow, block) = (page.clone(), self.settings.private_urls, self.settings.site_allow.clone(), self.settings.site_block.clone());
+            tokio::spawn(async move {
+                let mut seen: HashMap<String, bool> = HashMap::new();
+                while let Some(ev) = paused.next().await {
+                    let url = ev.request.url.clone();
+                    let origin = reqwest::Url::parse(&url).ok().map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or(""))).unwrap_or_default();
+                    let host = reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+                    let ok = match seen.get(&origin) {
+                        Some(v) => *v,
+                        None => {
+                            let v = allowed_host(&url, private).await && download_verdict(&host, &allow, &block).is_none();
+                            seen.insert(origin, v);
+                            v
+                        }
+                    };
+                    let r = if ok {
+                        p2.execute(fetch::ContinueRequestParams::new(ev.request_id.clone())).await.map(|_| ())
+                    } else {
+                        tracing::info!(url = %url.chars().take(120).collect::<String>(), "browser: request blocked (on {} or not a public address)", download_verdict(&host, &allow, &block).unwrap_or("not a public address"));
+                        p2.execute(fetch::FailRequestParams::new(ev.request_id.clone(), ErrorReason::BlockedByClient)).await.map(|_| ())
+                    };
+                    if r.is_err() {
+                        return; // the page closed
                     }
-                };
-                let r = if ok {
-                    p2.execute(fetch::ContinueRequestParams::new(ev.request_id.clone())).await.map(|_| ())
-                } else {
-                    tracing::info!(url = %url.chars().take(120).collect::<String>(), "browser: request blocked (on {} or not a public address)", download_verdict(&host, &allow, &block).unwrap_or("not a public address"));
-                    p2.execute(fetch::FailRequestParams::new(ev.request_id.clone(), ErrorReason::BlockedByClient)).await.map(|_| ())
-                };
-                if r.is_err() {
-                    return; // the page closed
                 }
-            }
-        });
+            });
+        }
         // a new tab for this conversation is the one the tools act on until browser_tabs closes or switches it
         let id = format!("tab-{}", uuid::Uuid::new_v4().simple());
         run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted }));
