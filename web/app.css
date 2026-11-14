@@ -596,7 +596,30 @@ body.resizing iframe { pointer-events: none; }
 .ws-card { display: flex; flex-direction: column; gap: .35rem; margin: 0; }
 .ws-card > .st-btn { align-self: flex-start; margin-top: auto; }
 .ws-card--soon { opacity: .75; }
+.ws-data { display: flex; flex-direction: column; gap: .6rem; margin: 0; }
+.ws-data__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1rem; }
+.ws-data__row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.ws-data__row > select { flex: 1 1 14rem; min-width: 0; }
+.ws-review { border-top: 1px solid var(--st-border, rgba(127,127,127,.25)); padding-top: .6rem; display: flex; flex-direction: column; gap: .5rem; }
+.ws-review__card { white-space: pre-wrap; max-height: 16rem; overflow: auto; font-size: .8rem; }
+.ws-review__table { display: flex; flex-direction: column; gap: .4rem; }
+.ws-rec { display: grid; grid-template-columns: auto 1fr auto; gap: .5rem; align-items: start; padding: .5rem;
+  border: 1px solid var(--st-border, rgba(127,127,127,.25)); border-radius: .5rem; }
+.ws-rec__msgs { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+.ws-rec__msg { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
+.ws-rec__msg b { text-transform: capitalize; }
+.ws-rec__msg textarea { width: 100%; min-height: 4rem; font: inherit; }
+.ws-rec__side { display: flex; flex-direction: column; gap: .25rem; align-items: flex-end; }
+.ws-progress { width: 100%; height: .4rem; }
 /* Settings › Secure connection: the three ways to turn HTTPS on, side by side when there is room */
 .tls-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .75rem; margin: .75rem 0; }
 .st-card--inner { margin: 0; display: flex; flex-direction: column; gap: .4rem; }
 .st-card--inner > .st-btn { align-self: flex-start; margin-top: auto; }
+#ws-d-src-box, #ws-d-seed-box { display: flex; flex-direction: column; gap: .35rem; }
+.ws-data textarea.st-input { width: 100%; box-sizing: border-box; resize: vertical; }
+/* long paths and commands wrap instead of widening the page on a phone */
+.ws > * { min-width: 0; }
+.ws code, .ws .mcp-server__head span, .ws-rec__side span { overflow-wrap: anywhere; min-width: 0; }
+.ws .mcp-server__head { flex-wrap: wrap; }
+.ws-review__card { max-width: 100%; }
+.ws-rec__side { max-width: 7rem; }

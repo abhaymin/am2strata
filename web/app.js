@@ -3866,8 +3866,19 @@ async function wsFetch(path, opts = {}) {
   return j;
 }
 async function loadWorkshop() {
+  await wsFiles();
+  refreshJobs();
+}
+let wsKnownDatasets = "";
+async function wsFiles() {
   try {
     const f = await wsFetch("v1/workshop/files");
+    const ds = (f.datasets || []).map((x) => x.path);
+    $("ws-datasets").innerHTML = ds.map((p) => `<option value="${esc(p)}">`).join("");
+    wsKnownDatasets = ds.join("\n");
+    const pick = $("ws-r-pick"), was = pick.value;
+    pick.innerHTML = ds.length ? ds.map((p) => `<option value="${esc(p)}">${esc(p.split("/").pop())}</option>`).join("") : '<option value="">(none yet)</option>';
+    if (ds.includes(was)) pick.value = was;
     const opts = (list) => list.map((x) => `<option value="${esc(typeof x === "string" ? x : x.path)}">`).join("");
     $("ws-hf").innerHTML = opts(f.hf_models || []);
     $("ws-adapters").innerHTML = opts(f.adapters || []);
@@ -3875,7 +3886,6 @@ async function loadWorkshop() {
     $("ws-folders").textContent = `It works in ${(f.folders || []).join(", ")}; results go to ${f.output_folder}.` +
       (f.installed ? "" : " (The am2strata-workshop command is not installed beside the server.)");
   } catch (e) { wsError(e.message); }
-  refreshJobs();
 }
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; }
 async function refreshJobs() {
@@ -3887,12 +3897,15 @@ async function refreshJobs() {
       const badge = {queued: "st-badge--reading", running: "st-badge--generating", done: "", failed: "", cancelled: ""}[x.state] ?? "";
       const took = x.started_at && x.finished_at ? ` · ${fmt(x.finished_at - x.started_at)} s` : "";
       const res = x.result ? ` · ${esc(x.result.output)} (${fmtBytes(x.result.bytes || 0)})` : "";
+      const p = x.progress, live = x.state === "running" && p && p.total;
+      const bar = live ? `<progress class="ws-progress" max="${p.total}" value="${p.done}" aria-label="job ${x.id} progress"></progress>` : "";
       return `<div class="mcp-server"><div class="mcp-server__head"><strong>#${x.id} ${esc(x.kind)}</strong>` +
         `<span class="st-badge ${badge}">${esc(x.state)}</span><span class="muted small">${esc(x.last || "")}${took}${res}</span>` +
         ((x.state === "queued" || x.state === "running") ? `<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>` : "") +
-        (x.state === "done" && x.kind !== "strata" && x.result ? `<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>` : "") +
+        (x.state === "done" && !["strata", "datagen"].includes(x.kind) && x.result ? `<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>` : "") +
+        (x.kind === "datagen" && ["done", "cancelled"].includes(x.state) ? `<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>` : "") +
         (x.state === "done" && x.kind === "strata" ? `<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>` : "") +
-        `</div>${x.error ? `<div class="msg-error">${esc(x.error)}</div>` : ""}</div>`;
+        `</div>${bar}${x.error ? `<div class="msg-error">${esc(x.error)}</div>` : ""}</div>`;
     }).join("") : '<p class="muted small">No jobs yet.</p>';
     for (const b of document.querySelectorAll("[data-ws-cancel]")) b.onclick = async () => {
       try { await wsFetch(`v1/workshop/jobs/${b.dataset.wsCancel}`, {method: "DELETE"}); } catch (e) { wsError(e.message); }
@@ -3906,6 +3919,10 @@ async function refreshJobs() {
       if (x.kind === "quantize") $("ws-s-in").value = x.result.output; // quantized GGUF → install
     };
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
+    for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
+    // a dataset that a job just finished appears in the pickers
+    const made = jobs.filter((x) => x.kind === "datagen" && x.state !== "queued").map((x) => x.output);
+    if (made.some((o) => !wsKnownDatasets.split("\n").includes(o))) wsFiles();
     if (tab === "workshop" && jobs.some((x) => x.state === "queued" || x.state === "running")) wsTimer = setTimeout(refreshJobs, 1500);
   } catch (e) { wsError(e.message); }
 }
@@ -3924,3 +3941,115 @@ $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").val
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
 $("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);
+
+// ------------------------------------------------------------------ Workshop: training data (datagen) and its review
+const wsRecipe = () => {
+  const instruct = $("ws-d-recipe").value === "instruct";
+  $("ws-d-src-box").hidden = instruct; $("ws-d-seed-box").hidden = !instruct;
+};
+$("ws-d-recipe").onchange = wsRecipe;
+$("ws-d-files").onchange = async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  wsError("");
+  for (const [i, f] of files.entries()) {
+    $("ws-d-up").textContent = `Adding ${f.name} (${i + 1} of ${files.length})…`;
+    try {
+      const r = await fetch(`v1/workshop/uploads?name=${encodeURIComponent(f.name)}`, {method: "POST", headers: headers(), body: f});
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+      const box = $("ws-d-sources");
+      box.value = (box.value.trim() ? box.value.trim() + "\n" : "") + j.path;
+    } catch (err) { wsError(`${f.name}: ${err.message}`); }
+  }
+  $("ws-d-up").textContent = files.length ? `${files.length} file${files.length > 1 ? "s" : ""} added.` : "";
+};
+$("ws-datagen").onclick = (e) => {
+  const n = (id) => { const v = $(id).value.trim(); return v === "" ? "" : Number(v); };
+  const body = {kind: "datagen", recipe: $("ws-d-recipe").value, count: n("ws-d-count"), min_score: Number($("ws-d-judge").value),
+    per_chunk: n("ws-d-per"), chunk_chars: n("ws-d-chunk"), temperature: n("ws-d-temp"), topic: $("ws-d-topic").value.trim(),
+    language: $("ws-d-lang").value.trim(), output: $("ws-d-out").value.trim()};
+  if (body.recipe === "instruct") body.seeds = $("ws-d-seeds").value.trim();
+  else body.sources = $("ws-d-sources").value.split("\n").map((x) => x.trim()).filter(Boolean);
+  wsSubmit(body, e.currentTarget);
+};
+
+const wsRev = {path: "", offset: 0, limit: 20, total: 0, records: [], selected: new Set()};
+function wsReviewOpen(path) {
+  if (!path) return;
+  if (![...$("ws-r-pick").options].some((o) => o.value === path)) $("ws-r-pick").add(new Option(path.split("/").pop(), path));
+  $("ws-r-pick").value = path;
+  Object.assign(wsRev, {path, offset: 0});
+  wsReviewLoad();
+  $("ws-data").scrollIntoView({behavior: "smooth", block: "start"});
+}
+$("ws-r-open").onclick = () => wsReviewOpen($("ws-r-pick").value);
+$("ws-r-prev").onclick = () => { wsRev.offset = Math.max(0, wsRev.offset - wsRev.limit); wsReviewLoad(); };
+$("ws-r-next").onclick = () => { if (wsRev.offset + wsRev.limit < wsRev.total) { wsRev.offset += wsRev.limit; wsReviewLoad(); } };
+async function wsReviewLoad() {
+  wsError("");
+  try {
+    const j = await wsFetch(`v1/workshop/dataset?path=${encodeURIComponent(wsRev.path)}&offset=${wsRev.offset}&limit=${wsRev.limit}`);
+    Object.assign(wsRev, {total: j.total, records: j.records || []});
+    wsRev.selected.clear();
+    $("ws-r-body").hidden = false;
+    $("ws-r-total").textContent = `${j.total} record${j.total === 1 ? "" : "s"}`;
+    $("ws-r-note").textContent = j.writing ? "· a job is still writing it; open it again when it is done" : "";
+    $("ws-r-card-box").hidden = !j.card;
+    $("ws-r-card").textContent = j.card || "";
+    $("ws-r-page").textContent = j.total ? `${wsRev.offset + 1}–${Math.min(wsRev.offset + wsRev.limit, j.total)} of ${j.total}` : "";
+    $("ws-r-prev").disabled = wsRev.offset === 0;
+    $("ws-r-next").disabled = wsRev.offset + wsRev.limit >= j.total;
+    wsReviewRender(j.writing);
+  } catch (e) { wsError(e.message); }
+}
+function wsReviewRender(writing) {
+  $("ws-r-del").disabled = true;
+  $("ws-r-rows").innerHTML = wsRev.records.length ? wsRev.records.map(({i, record}) => {
+    const msgs = record.messages || [];
+    const meta = record.meta || {};
+    const body = msgs.length ? msgs.map((m) => `<p class="ws-rec__msg"><b>${esc(m.role)}:</b> ${esc(m.content)}</p>`).join("")
+      : `<p class="ws-rec__msg muted">${esc(JSON.stringify(record))}</p>`;
+    const src = meta.source ? `<span class="muted small" title="${esc(meta.source)}">${esc(String(meta.source).split("/").pop())}</span>` : "";
+    return `<div class="ws-rec" data-i="${i}"><input type="checkbox" aria-label="select record ${i + 1}" data-ws-sel="${i}"${writing ? " disabled" : ""}>` +
+      `<div class="ws-rec__msgs">${body}</div><div class="ws-rec__side"><span class="small">#${i + 1}</span>` +
+      (meta.score != null ? `<span class="st-badge" title="the judge's score">${esc(String(meta.score))}/5</span>` : "") + src +
+      (writing || !msgs.length ? "" : `<button class="st-btn st-btn--secondary" data-ws-edit="${i}">Edit</button>`) + `</div></div>`;
+  }).join("") : '<p class="muted small">No records.</p>';
+  for (const c of document.querySelectorAll("[data-ws-sel]")) c.onchange = () => {
+    const i = Number(c.dataset.wsSel);
+    c.checked ? wsRev.selected.add(i) : wsRev.selected.delete(i);
+    $("ws-r-del").disabled = !wsRev.selected.size;
+    $("ws-r-del").textContent = wsRev.selected.size ? `Delete selected (${wsRev.selected.size})` : "Delete selected";
+  };
+  for (const b of document.querySelectorAll("[data-ws-edit]")) b.onclick = () => wsReviewEdit(Number(b.dataset.wsEdit));
+}
+function wsReviewEdit(i) {
+  const row = $("ws-r-rows").querySelector(`.ws-rec[data-i="${i}"]`);
+  const rec = wsRev.records.find((r) => r.i === i)?.record;
+  if (!row || !rec) return;
+  const box = row.querySelector(".ws-rec__msgs");
+  box.innerHTML = rec.messages.map((m, k) => `<label class="ws-rec__msg"><b>${esc(m.role)}:</b>` +
+    `<textarea class="st-input" data-k="${k}" aria-label="${esc(m.role)} message">${esc(m.content)}</textarea></label>`).join("") +
+    `<div class="ws-data__row"><button class="st-btn st-btn--primary" data-save>Save</button><button class="st-btn st-btn--secondary" data-undo>Cancel</button></div>`;
+  box.querySelector("[data-undo]").onclick = () => wsReviewRender(false);
+  box.querySelector("[data-save]").onclick = async () => {
+    const messages = rec.messages.map((m, k) => ({...m, content: box.querySelector(`textarea[data-k="${k}"]`).value}));
+    if (messages.some((m) => !m.content.trim())) { wsError("A message cannot be empty."); return; }
+    try {
+      await wsFetch("v1/workshop/dataset", {method: "POST", body: JSON.stringify({path: wsRev.path, replace: {[i]: {...rec, messages}}})});
+      toast("success", "Record saved", `#${i + 1} in ${wsRev.path.split("/").pop()}`);
+      wsReviewLoad();
+    } catch (e) { wsError(e.message); }
+  };
+}
+$("ws-r-del").onclick = async () => {
+  const remove = [...wsRev.selected];
+  if (!remove.length || !confirm(`Delete ${remove.length} record${remove.length > 1 ? "s" : ""} from ${wsRev.path.split("/").pop()}? This cannot be undone.`)) return;
+  try {
+    const j = await wsFetch("v1/workshop/dataset", {method: "POST", body: JSON.stringify({path: wsRev.path, remove})});
+    toast("success", "Records deleted", `${j.total} left`);
+    if (wsRev.offset >= j.total) wsRev.offset = Math.max(0, j.total - wsRev.limit);
+    wsReviewLoad();
+  } catch (e) { wsError(e.message); }
+};

@@ -478,7 +478,7 @@ async fn main() -> Result<()> {
     // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
     let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // the Workshop: convert, quantize and merge jobs (workshop.rs)
-    workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest);
+    workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest).set_server(&host, port, state.api_key.clone());
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -563,6 +563,8 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/jobs", get(workshop::jobs_get).post(workshop::jobs_post))
         .route("/v1/workshop/jobs/{id}", get(workshop::job_get).delete(workshop::job_delete))
         .route("/v1/workshop/files", get(workshop::files_get))
+        .route("/v1/workshop/uploads", axum::routing::post(workshop::upload_post))
+        .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
         .route("/mcp", get(web::mcp))
         .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))

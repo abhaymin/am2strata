@@ -23,3 +23,6 @@ tokenizers = "0.21"
 sha2 = "0.10"
 half = "2"
 clap.workspace = true
+libc = "0.2"
+# datagen: the server's own chat API (the loaded model writes the data)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

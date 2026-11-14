@@ -187,3 +187,112 @@ fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
     assert_eq!(code, 202);
 }
 
+
+/// A stand-in for `am2strata-workshop datagen`: notes its arguments and the server address and key it was given (in
+/// its environment), reports progress, and writes three records.
+fn fake_datagen(dir: &std::path::Path) -> std::path::PathBuf {
+    let p = dir.join("fake-datagen.sh");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(&p, r#"#!/bin/sh
+here="$(dirname "$0")"
+echo "$@" > "$here/args.txt"
+printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/env.txt"
+out=""; prev=""
+for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+echo '{"event":"start","what":"qa data"}'
+echo '{"event":"progress","done":1,"total":2,"message":"2 records so far"}'
+mkdir -p "$(dirname "$out")"
+for q in one two three; do
+  echo "{\"messages\":[{\"role\":\"user\",\"content\":\"question $q\"},{\"role\":\"assistant\",\"content\":\"answer $q\"}],\"meta\":{\"score\":5}}" >> "$out"
+done
+echo '# card' > "${out%.jsonl}.card.md"
+echo '{"event":"progress","done":2,"total":2,"message":"3 records so far"}'
+echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"dataset\",\"bytes\":300,\"seconds\":0.1}"
+"#).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    p
+}
+
+#[test]
+fn training_data_jobs_get_the_server_by_environment_and_their_datasets_can_be_reviewed_and_edited() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-datagen-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+
+    // a document comes in through the upload endpoint, under a safe name, never over another
+    let up = |name: &str, body: &str| {
+        let r = reqwest::blocking::Client::new().post(format!("{}/v1/workshop/uploads", s.base)).query(&[("name", name)])
+            .bearer_auth(KEY).body(body.to_string()).send().unwrap();
+        (r.status().as_u16(), r.json::<Value>().unwrap_or_default())
+    };
+    let (code, a) = up("../../notes.md", "# Notes\nsome text");
+    assert_eq!(code, 200, "{a}");
+    let doc = a["path"].as_str().unwrap().to_string();
+    assert!(doc.ends_with("/workshop/uploads/notes.md"), "{doc}");
+    let (_, b) = up("notes.md", "other");
+    assert!(b["path"].as_str().unwrap().ends_with("/workshop/uploads/notes-2.md"), "{b}");
+    assert_eq!(std::fs::read_to_string(&doc).unwrap(), "# Notes\nsome text");
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/workshop/uploads?name=x.md", s.base)).body("x").send().unwrap();
+    assert_eq!(r.status().as_u16(), 401, "uploads need the key");
+
+    // checked before anything runs: documents are needed, inside the Workshop's folders, numbers in range
+    for (bad, why) in [(json!({"kind": "datagen", "recipe": "qa"}), "needs \"sources\""),
+                       (json!({"kind": "datagen", "sources": ["/etc/hostname"]}), "/etc/hostname"),
+                       (json!({"kind": "datagen", "sources": [doc], "count": 0}), "\"count\""),
+                       (json!({"kind": "datagen", "recipe": "instruct"}), "\"seeds\""),
+                       (json!({"kind": "datagen", "recipe": "poems", "sources": [doc]}), "\"recipe\"")] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{bad}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains(why), "{bad}: {e}");
+    }
+
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "sources": [doc], "count": 3, "min_score": 4, "topic": "notes"}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let out = done["output"].as_str().unwrap().to_string();
+    assert!(out.ends_with("/workshop/datasets/notes-qa.jsonl"), "{out}");
+    assert_eq!(done["progress"]["done"], 2, "{done}");
+    assert!(done["log"].as_array().unwrap().iter().any(|l| l == "[2/2] 3 records so far"), "{done}");
+    // the server's address and key reached it in its environment, and the key is nowhere on its command line
+    let env = std::fs::read_to_string(tools.join("env.txt")).unwrap();
+    assert_eq!(env, format!("http://127.0.0.1:{}\n{KEY}\n", s.port));
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(!args.contains(KEY), "{args}");
+    assert!(args.contains("--min-score 4") && args.contains("--count 3") && args.contains("--topic notes"), "{args}");
+    let (_, f) = s.get("/v1/workshop/files", true);
+    assert!(f["datasets"].as_array().unwrap().iter().any(|d| d["path"] == out.as_str()), "{f}");
+    assert!(f["uploads"].as_array().unwrap().len() >= 2, "{f}");
+    // a second run does not write over the first
+    let (_, j2) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "sources": [doc]}));
+    assert!(j2["output"].as_str().unwrap().ends_with("notes-qa-2.jsonl"), "{j2}");
+    wait_state(&s, j2["id"].as_u64().unwrap(), "done");
+
+    // review: a page of records with the card
+    let q = |p: &str| format!("/v1/workshop/dataset?path={}&{p}", urlencode(&out));
+    let (code, page) = s.get(&q("offset=1&limit=1"), true);
+    assert_eq!(code, 200, "{page}");
+    assert_eq!((page["total"].as_u64(), page["records"].as_array().unwrap().len()), (Some(3), 1));
+    assert_eq!(page["records"][0]["i"], 1);
+    assert_eq!(page["records"][0]["record"]["messages"][0]["content"], "question two");
+    assert_eq!(page["card"], "# card\n");
+    // edit one, delete another; a bad record is refused
+    let (code, e) = s.post("/v1/workshop/dataset", &json!({"path": out, "replace": {"0": {"messages": "x"}}}));
+    assert_eq!(code, 400, "{e}");
+    let fixed = json!({"messages": [{"role": "user", "content": "question one?"}, {"role": "assistant", "content": "a better answer"}], "meta": {"score": 5}});
+    let (code, r) = s.post("/v1/workshop/dataset", &json!({"path": out, "replace": {"0": fixed}, "remove": [1]}));
+    assert_eq!((code, r["total"].as_u64()), (200, Some(2)), "{r}");
+    let lines: Vec<Value> = std::fs::read_to_string(&out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines, vec![fixed, serde_json::from_str::<Value>(r#"{"messages":[{"role":"user","content":"question three"},{"role":"assistant","content":"answer three"}],"meta":{"score":5}}"#).unwrap()]);
+    // only datasets inside the Workshop's folders
+    let (code, _) = s.get("/v1/workshop/dataset?path=/etc/passwd", true);
+    assert_eq!(code, 400);
+    assert_eq!(s.get(&q(""), false).0, 401);
+}
+
+fn urlencode(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
