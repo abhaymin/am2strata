@@ -55,11 +55,8 @@ fn tiny_safetensors_writes_and_round_trips() -> Result<(), Box<dyn std::error::E
         assert_eq!(view.dtype().to_string(), exp.dtype, "{name}: dtype mismatch");
         assert_eq!(view.shape(), exp.shape.as_slice(), "{name}: shape mismatch");
 
-        // f32 is 4 little-endian bytes; reinterpret the same length of raw bytes.
-        let got = unsafe {
-            std::slice::from_raw_parts(view.data().as_ptr() as *const f32, view.data().len() / 4)
-        }
-        .to_vec();
+        // f32 is 4 little-endian bytes: decoded (a byte slice need not be aligned for f32)
+        let got: Vec<f32> = view.data().chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         assert_eq!(got, exp.values, "{name}: values mismatch");
         checked += 1;
     }

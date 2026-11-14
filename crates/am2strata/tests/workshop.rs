@@ -101,6 +101,25 @@ fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
     assert_eq!(code, 400);
     let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model.join("../../..")}));
     assert_eq!(code, 400, "no way out with ..");
+    // a symlink inside a Workshop folder that points outside it is outside
+    #[cfg(unix)]
+    {
+        let outside = std::env::temp_dir().join(format!("am2-ws-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("config.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&outside, s.dir.join("sneaky")).unwrap();
+        let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": s.dir.join("sneaky")}));
+        assert_eq!(code, 400, "{e}");
+        let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model, "output": s.dir.join("sneaky/out.gguf")}));
+        assert_eq!(code, 400, "an output through the link is outside too");
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+    // a refused output makes no folders, and a relative path is refused
+    let nowhere = std::env::temp_dir().join(format!("am2-ws-nowhere-{}", std::process::id()));
+    let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model, "output": nowhere.join("a/b/out.gguf")}));
+    assert_eq!(code, 400);
+    assert!(!nowhere.exists(), "no folder made outside the Workshop's folders");
+    assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": "hf-model"})).0, 400, "relative path");
     // and requests that make no sense are refused before anything runs
     assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "quantize", "input": out, "type": "q3_x"})).0, 400);
     assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "merge", "base": model, "adapter": model})).0, 400, "not an adapter");

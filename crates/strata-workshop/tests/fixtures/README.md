@@ -40,3 +40,9 @@ llama.cpp's converter output (pre forced to gpt-2, as above) for `tiny-llama-256
 `tiny-llama-gqa-hf/` (16 heads, 4 kv heads; written by `cargo run -p strata-workshop --example write-tiny-gqa-hf`), by
 the reviewer. They pin the q/k rotary permute with the real head counts: q by `num_attention_heads`, k by
 `num_key_value_heads`. (Step 6 first passed with a hardcoded head count of 2, which the 2-head tiny model could not show.)
+
+## tiny-llama-256.f16.gguf, tiny-llama-256-bf16-hf/, tiny-llama-256-bf16.f16.gguf
+
+llama.cpp's converter with `--outtype f16` (pre forced to gpt-2), by the reviewer: on `tiny-llama-256-hf/` (F32
+source), and on `tiny-llama-256-bf16-hf/` — the same model with its safetensors cast to BF16 by PyTorch, as real
+Hugging Face models are stored. 2-D weights F16 (rounded as numpy does), 1-D tensors F32.

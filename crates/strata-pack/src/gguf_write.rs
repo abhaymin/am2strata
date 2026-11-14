@@ -55,6 +55,9 @@ pub enum Kv {
     Ints(Vec<i32>),
     /// `tokenizer.ggml.scores`
     Floats(Vec<f32>),
+    /// a value copied as it is from another GGUF: its type tag and its encoded bytes (any type, arrays included), so
+    /// nothing is lost or retyped on the way (the quantizer keeps the input's metadata exactly)
+    Raw { ty: u32, payload: Vec<u8> },
 }
 
 fn put_kv(b: &mut Vec<u8>, key: &str, v: &Kv) {
@@ -77,6 +80,7 @@ fn put_kv(b: &mut Vec<u8>, key: &str, v: &Kv) {
             b.extend(ARRAY.to_le_bytes()); b.extend(FLOAT32.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
             for f in v { b.extend(f.to_le_bytes()); }
         }
+        Kv::Raw { ty, payload } => { b.extend(ty.to_le_bytes()); b.extend(payload); }
     }
 }
 

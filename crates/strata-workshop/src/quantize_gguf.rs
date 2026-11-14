@@ -8,7 +8,6 @@
 //! target's pure `LlamaFileType`, and tensor order is kept. This is exactly what `llama-quantize --pure <T>` produces,
 //! so the output of each target matches the reviewer's `.pure.gguf` fixtures byte for byte on every tensor.
 
-use std::fs::read;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -129,7 +128,9 @@ fn type_id(name: &str) -> u32 {
 fn tensor_bytes<'a>(buf: &'a [u8], g: &Gguf, t: &strata_gguf::TensorInfo) -> Result<&'a [u8]> {
     let start = (g.data_start + t.offset) as usize;
     let n = t.expected_bytes().context("input tensor size")? as usize;
-    Ok(&buf[start..start + n])
+    // a damaged or cut-off file is an error, never a crash
+    start.checked_add(n).filter(|end| *end <= buf.len()).map(|end| &buf[start..end])
+        .with_context(|| format!("{}: its data runs past the end of the file (damaged or incomplete GGUF?)", t.name))
 }
 
 /// Decode one input tensor's bytes to f32, the values `llama-quantize` re-quantizes from: F32 straight, F16/BF16 cast,
@@ -160,94 +161,97 @@ fn encode(x: &[f32], name: &str) -> Vec<u8> {
     }
 }
 
-/// A metadata value to write back. The `general.file_type` override (the target's pure file-type id) takes precedence;
-/// otherwise the JSON scalar/array is re-wrapped in the matching `Kv`. Numeric ints/floats are both passed through as-is
-/// because the caller compares metadata by value, not by which numeric gguf tag was chosen.
-fn value_to_kv(v: &Value, file_type_override: Option<u32>) -> Kv {
-    if let Some(id) = file_type_override {
-        return Kv::U32(id);
-    }
-    match v {
-        Value::Bool(b) => Kv::Bool(*b),
-        Value::String(s) => Kv::Str(s.clone()),
-        Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                if u <= u32::MAX as u64 { Kv::U32(u as u32) } else { Kv::I32(0) }
-            } else if let Some(i) = n.as_i64() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 { Kv::I32(i as i32) } else { Kv::I32(0) }
-            } else {
-                Kv::F32(n.as_f64().unwrap_or(0.0) as f32)
-            }
-        }
-        Value::Array(a) if a.iter().all(|v| v.is_string()) => {
-            Kv::Strings(a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-        }
-        Value::Array(a) if a.iter().all(|v| v.is_boolean()) => {
-            // an array of bools has no typed array variant here; keep it as strings so the values round-trip
-            Kv::Strings(a.iter().map(|v| v.as_bool().unwrap_or(false).to_string()).collect())
-        }
-        Value::Array(a) => {
-            if a.first().is_some_and(|v| v.is_string()) {
-                Kv::Strings(a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect())
-            } else if a.first().is_some_and(|v| v.is_number() && v.is_f64() && v.as_f64().unwrap().fract() != 0.0) {
-                Kv::Floats(a.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect())
-            } else {
-                Kv::Ints(a.iter().map(|v| v.as_i64().unwrap_or(0) as i32).collect())
-            }
-        }
-        _ => Kv::Str(String::new()),
-    }
-}
 
 /// Quantize `input` to a new GGUF at `output`, every tensor in `target`'s pure precision. 1-D tensors keep their type,
 /// incompatible rows fall back to F16 per `tensor_type_fallback`, metadata is copied (with the pure file-type id), and
 /// tensor order is preserved.
 pub fn quantize(input: &Path, output: &Path, target: PureType) -> Result<()> {
     let g = Gguf::open(input).with_context(|| format!("opening {}", input.display()))?;
-    let buf = read(input).with_context(|| format!("reading {}", input.display()))?;
+    let file = std::fs::File::open(input).with_context(|| format!("reading {}", input.display()))?;
+    // memory-mapped: only the tensor being converted is in memory as f32
+    let buf = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {}", input.display()))?;
     let target_name = target.ggml_name();
 
-    // metadata copied in order; only general.file_type becomes the target's pure LlamaFileType id.
-    let kv: Vec<(&str, Kv)> = g
-        .metadata
-        .iter()
-        .map(|(k, v)| (k.as_str(), value_to_kv(v, if k == "general.file_type" { Some(target.file_type()) } else { None })))
-        .collect();
+    // metadata copied byte for byte, in order (no value retyped or lost); only general.file_type becomes the target's
+    let raw = raw_kvs(&buf).with_context(|| format!("{}: reading its metadata", input.display()))?;
+    let kv: Vec<(&str, Kv)> = raw.iter().map(|(k, ty, payload)| {
+        if k == "general.file_type" { (k.as_str(), Kv::U32(target.file_type())) }
+        else { (k.as_str(), Kv::Raw { ty: *ty, payload: payload.clone() }) }
+    }).collect();
 
-    // resolve each tensor's output type and bytes first (the writer needs every spec before streaming any data).
+    // every tensor's output type and size first (the writer lays out the whole header before any data)
     let mut specs = Vec::with_capacity(g.tensors.len());
-    let mut encoders = Vec::with_capacity(g.tensors.len());
+    let mut out_types = Vec::with_capacity(g.tensors.len());
     for t in &g.tensors {
         let current = ggml_type_name(t.ggml_type);
         let numel = t.elements() as usize;
-        let x = read_as_f32(&buf, &g, t)?;
         // ne[0] is the innermost dimension (strata_gguf reads dims innermost-first); 1-D tensors keep their current type.
-        let out_type: String = if t.dims.len() == 1 {
-            current.clone()
-        } else {
-            resolve(target_name, t.dims[0] as usize).to_string()
-        };
-        specs.push(TensorSpec {
-            name: t.name.clone(),
-            shape: {
-                let mut d = t.dims.clone();
-                d.reverse(); // TensorSpec.shape is numpy order; strata_gguf's dims are innermost-first (ne[])
-                d
-            },
-            ggml_type: type_id(&out_type),
-            nbytes: type_nbytes(&out_type, numel),
-        });
-        encoders.push((x, out_type));
+        let out_type: String = if t.dims.len() == 1 { current.clone() } else { resolve(target_name, t.dims[0] as usize).to_string() };
+        let mut shape = t.dims.clone();
+        shape.reverse(); // TensorSpec.shape is numpy order; strata_gguf's dims are innermost-first (ne[])
+        specs.push(TensorSpec { name: t.name.clone(), shape, ggml_type: type_id(&out_type), nbytes: type_nbytes(&out_type, numel) });
+        out_types.push(out_type);
     }
 
+    // then one tensor at a time: decode, quantize, write
     let mut w = Writer::create_typed(output, &kv, specs)?;
-    for (x, out_type) in encoders {
-        let bytes = encode(&x, &out_type);
-        w.tensor_data(&bytes)?;
+    for (t, out_type) in g.tensors.iter().zip(&out_types) {
+        let x = read_as_f32(&buf, &g, t)?;
+        w.tensor_data(&encode(&x, out_type))?;
         w.end_tensor()?;
     }
     w.finish()?;
     Ok(())
+}
+
+/// The metadata of a GGUF as (key, type tag, encoded value bytes), in file order, read straight from its header.
+fn raw_kvs(buf: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>> {
+    struct R<'a> { b: &'a [u8], at: usize }
+    impl R<'_> {
+        fn take(&mut self, n: usize) -> Result<&[u8]> {
+            let end = self.at.checked_add(n).filter(|e| *e <= self.b.len()).context("metadata runs past the end of the file")?;
+            let s = &self.b[self.at..end];
+            self.at = end;
+            Ok(s)
+        }
+        fn u32(&mut self) -> Result<u32> { Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap())) }
+        fn u64(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
+        fn string(&mut self) -> Result<String> {
+            let n = self.u64()? as usize;
+            Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+        }
+        /// the bytes of one value of type `ty`, consumed
+        fn value_len(&mut self, ty: u32) -> Result<()> {
+            match ty {
+                0 | 1 | 7 => { self.take(1)?; }                  // u8 i8 bool
+                2 | 3 => { self.take(2)?; }                      // u16 i16
+                4 | 5 | 6 => { self.take(4)?; }                  // u32 i32 f32
+                10 | 11 | 12 => { self.take(8)?; }               // u64 i64 f64
+                8 => { let n = self.u64()? as usize; self.take(n)?; }
+                9 => {
+                    let et = self.u32()?;
+                    let n = self.u64()?;
+                    for _ in 0..n { self.value_len(et)?; }
+                }
+                t => anyhow::bail!("unknown metadata type {t}"),
+            }
+            Ok(())
+        }
+    }
+    let mut r = R { b: buf, at: 0 };
+    anyhow::ensure!(r.take(4)? == b"GGUF", "not a GGUF file");
+    let _version = r.u32()?;
+    let _tensors = r.u64()?;
+    let n_kv = r.u64()?;
+    let mut out = Vec::with_capacity(n_kv.min(4096) as usize);
+    for _ in 0..n_kv {
+        let key = r.string()?;
+        let ty = r.u32()?;
+        let start = r.at;
+        r.value_len(ty)?;
+        out.push((key, ty, buf[start..r.at].to_vec()));
+    }
+    Ok(out)
 }
 
 /// Compare two `Value`s ignoring the integer/float distinction of numbers (3 and 3.0 are equal), so a metadata set read

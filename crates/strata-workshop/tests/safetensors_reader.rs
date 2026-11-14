@@ -34,7 +34,8 @@ fn read_all(shard_files: &[std::path::PathBuf]) -> Result<HashMap<String, Expect
         for desc in shard.tensors() {
             let bytes = shard.bytes(&desc);
             assert_eq!(bytes.len() % 4, 0, "{}: f32 tensor is not a whole number of floats", desc.name());
-            let got = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, bytes.len() / 4) }.to_vec();
+            // decoded, not reinterpreted: a byte slice need not be aligned for f32
+            let got: Vec<f32> = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             // the first occurrence wins; if it was already present the name duplicated across shards
             let e = out.entry(desc.name().to_string()).or_insert_with(|| Expected { dtype: "F32".into(), shape: Vec::new(), values: vec![] });
             assert!(e.shape.is_empty(), "{} appears twice", desc.name());

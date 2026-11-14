@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
-use candle_core::{DType, Device};
+
 use serde_json::Value as Json;
 
 use strata_pack::gguf_write::{Kv, TensorSpec, Writer};
@@ -258,23 +258,22 @@ pub fn read_tensors(dir: &Path) -> Result<BTreeMap<String, TensorF32>> {
     for f in files {
         let shard = safetensors_io::Shard::open(&f)?;
         for t in shard.tensors() {
-            if t.dtype() != safetensors_io::Dtype::F32 {
-                bail!("{}: tensor {} is {}, only F32 sources are supported by the converter", f.display(), t.name(), t.dtype().as_str());
+            // F32 as is; BF16 and F16 (what Hugging Face models are stored in) widened to F32 exactly, as llama.cpp's
+            // converter does before writing the output precision
+            let raw: &[u8] = shard.bytes(t);
+            let vals: Vec<f32> = match t.dtype() {
+                safetensors_io::Dtype::F32 => raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                safetensors_io::Dtype::BF16 => raw.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+                safetensors_io::Dtype::F16 => raw.chunks_exact(2).map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect(),
+                other => bail!("{}: tensor {} is {}; the converter reads F32, BF16 and F16", f.display(), t.name(), other.as_str()),
+            };
+            if vals.len() != t.numel() as usize {
+                bail!("{}: tensor {} has {} values, its shape says {}", f.display(), t.name(), vals.len(), t.numel());
             }
-            let n = t.numel() as usize;
-            let mut vals = vec![0f32; n];
-            let mut data: &[u8] = shard.bytes(t);
-            std::io::Read::read_exact(&mut data, bytemuck_like(&mut vals))
-                .map_err(|e| anyhow!("{}: reading tensor {}: {e}", f.display(), t.name()))?;
             out.insert(t.name().to_string(), (t.shape().to_vec(), vals));
         }
     }
     Ok(out)
-}
-
-/// f32 slice as a `&mut [u8]` view, for the mmap byte copy.
-fn bytemuck_like(v: &mut [f32]) -> &mut [u8] {
-    unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
 }
 
 /// HF -> gguf rotary permute of q/k, the exact transform `LlamaModel.permute` applies (swap the two halves of each
@@ -449,34 +448,54 @@ fn chat_template(tc: &Json) -> String {
     tc["chat_template"].as_str().unwrap_or("").to_string()
 }
 
-/// A word that id_to_title should leave alone: a version number (leading digit) or an acronym (`vN...`), matching
-/// gguf's `id_to_title` regex `^(v\d+(?:\.\d+)*|\d.*)$`.
+/// A word id_to_title leaves alone: gguf's regex `^(v\d+(?:\.\d+)*|\d.*)$` matched against the whole word — a version
+/// (`v2`, `v1.5`) or anything starting with a digit (`256`, `1.5b`).
 fn looks_like_version_or_acronym(word: &str) -> bool {
-    match word.as_bytes().first() {
-        Some(b) if b.is_ascii_digit() => true,
-        Some(b'v') | Some(b'V') => word.len() >= 2 && word.as_bytes()[1].is_ascii_digit(),
+    let b = word.as_bytes();
+    if b.first().is_some_and(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    match b.split_first() {
+        Some((b'v', rest)) if !rest.is_empty() => {
+            // \d+ then (\.\d+)*, to the end
+            rest.split(|c| *c == b'.').all(|part| !part.is_empty() && part.iter().all(u8::is_ascii_digit))
+        }
         _ => false,
     }
 }
 
-/// Port of gguf's `id_to_title`: title-case each dash/space separated word unless it is a version/acronym, so
-/// `tiny-llama-hf` -> "Tiny Llama Hf".
+/// Python's `str.islower()`: at least one cased character, and every cased character lowercase (digits do not count).
+fn py_islower(w: &str) -> bool {
+    let mut cased = false;
+    for c in w.chars() {
+        if c.is_uppercase() { return false; }
+        if c.is_lowercase() { cased = true; }
+    }
+    cased
+}
+
+/// Python's `str.title()`: a letter after a non-letter is upper-cased, every other letter lower-cased ("bf16" -> "Bf16",
+/// "llama3b" -> "Llama3B").
+fn py_title(w: &str) -> String {
+    let mut out = String::with_capacity(w.len());
+    let mut prev_cased = false;
+    for c in w.chars() {
+        if c.is_alphabetic() {
+            if prev_cased { out.extend(c.to_lowercase()) } else { out.extend(c.to_uppercase()) }
+            prev_cased = true;
+        } else {
+            out.push(c);
+            prev_cased = false;
+        }
+    }
+    out
+}
+
+/// Port of gguf's `id_to_title`: dashes to spaces, then each word title-cased when it is all lowercase and not a
+/// version — `tiny-llama-256-bf16-hf` -> "Tiny Llama 256 Bf16 Hf".
 fn id_to_title(input: &str) -> String {
-    input
-        .split(|c: char| c == '-' || c == ' ')
-        .filter(|w| !w.is_empty())
-        .map(|word| {
-            let is_lower = !word.is_empty() && word.chars().all(|c| c.is_lowercase());
-            if is_lower && !looks_like_version_or_acronym(word) {
-                let mut chars = word.chars();
-                match chars.next() {
-                    Some(c) => format!("{}{}", c.to_uppercase().collect::<String>(), chars.collect::<String>().to_lowercase()),
-                    None => String::new(),
-                }
-            } else {
-                word.to_string()
-            }
-        })
+    input.trim().replace('-', " ").split_whitespace()
+        .map(|w| if py_islower(w) && !looks_like_version_or_acronym(w) { py_title(w) } else { w.to_string() })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -607,6 +626,17 @@ fn get_bool(tc: &Json, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn id_to_title_matches_python() {
+        // gguf-py: ' '.join([w.title() if w.islower() and not re.match(r'^(v\d+(?:\.\d+)*|\d.*)$', w) else w ...])
+        assert_eq!(id_to_title("tiny-llama-256-bf16-hf"), "Tiny Llama 256 Bf16 Hf");
+        assert_eq!(id_to_title("qwen3-8b-v2-instruct"), "Qwen3 8b v2 Instruct");
+        assert_eq!(id_to_title("llama3b"), "Llama3B");
+        assert_eq!(id_to_title("Mistral-7B-v0.3"), "Mistral 7B v0.3");
+        assert_eq!(id_to_title("v2beta"), "V2Beta", "not a version: title-cased");
+        assert_eq!(id_to_title("q4"), "Q4");
+    }
 
     #[test]
     fn permute_swaps_the_two_halves_of_each_head() {

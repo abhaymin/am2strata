@@ -18,7 +18,9 @@ const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12; // blocks of 16 within a super-block, packed into 12 bytes
 const GROUP_MAX_EPS: f32 = 1e-15f32;
 
-/// ggml's reference `nearest_int`: add 2^22 and truncate (round-half-to-even via the IEEE round mode).
+/// ggml's reference `nearest_int` (|fval| ≤ 2^22): adding 12_582_912 = 1.5·2^23 puts the value where an f32's ulp is
+/// exactly 1, so the addition itself rounds it to the nearest integer (ties to even); that integer is then read from
+/// the low 23 mantissa bits, offset by 2^22 (the 0.5·2^23 part of the constant).
 #[inline]
 fn nearest_int(fval: f32) -> i32 {
     let val = fval + 12_582_912.0_f32;

@@ -100,7 +100,15 @@ impl Workshop {
         if let Some(dirs) = rest.get("workshop").and_then(|w| w.get("dirs")).and_then(|d| d.as_array()) {
             roots.extend(dirs.iter().filter_map(|d| d.as_str()).map(|d| crate::expand_path(d)));
         }
-        let roots = roots.into_iter().map(|r| r.canonicalize().unwrap_or(r)).collect();
+        // every root resolved (symlinks followed) once, here; one that cannot be is left out, never compared unresolved
+        std::fs::create_dir_all(&out_dir).ok();
+        let roots = roots.into_iter().filter_map(|r| match r.canonicalize() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!("workshop: {} is not usable as a Workshop folder ({e}); left out", r.display());
+                None
+            }
+        }).collect();
         let (models_dir, packs_dir) = (models_dir.to_path_buf(), data_dir.join("packs"));
         WORKSHOP.get_or_init(|| Arc::new(Workshop { roots, out_dir, models_dir, packs_dir, jobs: Mutex::new(vec![]), next: Mutex::new(1),
                                                     gate: tokio::sync::Mutex::new(()) })).clone()
@@ -113,21 +121,44 @@ impl Workshop {
     /// `p` resolved, if it is inside one of the allowed folders (an output need not exist yet: its parent is checked).
     pub fn allowed(&self, p: &str, must_exist: bool) -> Result<PathBuf, String> {
         let path = crate::expand_path(p);
+        if !path.is_absolute() {
+            return Err(format!("{p}: give the full path (it is resolved on the server)"));
+        }
         let resolved = if path.exists() {
+            // symlinks followed: a link inside a Workshop folder that points outside it is outside
             path.canonicalize().map_err(|e| format!("{p}: {e}"))?
         } else if must_exist {
             return Err(format!("{p} does not exist"));
         } else {
-            let parent = path.parent().filter(|x| !x.as_os_str().is_empty()).ok_or_else(|| format!("{p}: no folder"))?;
-            std::fs::create_dir_all(parent).ok();
-            parent.canonicalize().map_err(|e| format!("{p}: {e}"))?.join(path.file_name().unwrap_or_default())
+            // a new output: the nearest folder that exists, resolved, plus the plain names after it (no "..")
+            let mut base = path.as_path();
+            let mut rest: Vec<&std::ffi::OsStr> = vec![];
+            while !base.exists() {
+                match (base.parent(), base.file_name()) {
+                    (Some(parent), Some(name)) => { rest.push(name); base = parent; }
+                    _ => return Err(format!("{p}: not a usable path")),
+                }
+            }
+            if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+                return Err(format!("{p}: \"..\" and \".\" are not allowed in a new path"));
+            }
+            let mut r = base.canonicalize().map_err(|e| format!("{p}: {e}"))?;
+            for name in rest.iter().rev() {
+                r.push(name);
+            }
+            r
         };
-        if self.roots.iter().any(|r| resolved.starts_with(r)) {
-            Ok(resolved)
-        } else {
-            Err(format!("{p} is outside the Workshop's folders ({}); add its folder to \"workshop\": {{\"dirs\": [...]}} in the run config",
-                        self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")))
+        if !self.roots.iter().any(|r| resolved.starts_with(r)) {
+            return Err(format!("{p} is outside the Workshop's folders ({}); add its folder to \"workshop\": {{\"dirs\": [...]}} in the run config",
+                               self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")));
         }
+        // only now, inside a Workshop folder, are missing folders for a new output made
+        if !must_exist {
+            if let Some(parent) = resolved.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+        }
+        Ok(resolved)
     }
 
     fn default_output(&self, input: &Path, suffix: &str) -> PathBuf {
@@ -211,7 +242,7 @@ impl Workshop {
     pub fn submit(self: &Arc<Self>, req: Value) -> Result<Job, String> {
         let (kind, args, output) = self.plan(&req)?;
         let exe = if kind == "strata" { PathBuf::new() } else {
-            exe().ok_or("the am2strata-workshop command is not installed beside the server")?
+            exe().ok_or("the am2strata-workshop command is not beside the server: build it (cargo build --release -p strata-workshop) or set AM2STRATA_WORKSHOP_EXE")?
         };
         let id = { let mut n = self.next.lock().unwrap(); let id = *n; *n += 1; id };
         let job = Job { id, kind, args, request: req, output, state: "queued", queued_at: now(), started_at: None,
@@ -403,7 +434,10 @@ impl Workshop {
 
 /// Only the server's own key: the Workshop reads and writes model files.
 fn admin(s: &AppState, headers: &HeaderMap) -> Result<Arc<Workshop>, Response> {
-    if !authorized(s, headers) || crate::clients::given_key(headers).is_some_and(|k| s.clients.by_key(k).is_some()) {
+    // a client profile's key also passes `authorized`, so it is turned away here by name
+    let valid = authorized(s, headers);
+    let client_profile = crate::clients::given_key(headers).is_some_and(|k| s.clients.by_key(k).is_some());
+    if !valid || client_profile {
         return Err(error(StatusCode::UNAUTHORIZED, "authentication_error", "the Workshop needs the server's own API key"));
     }
     get().ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "server_error", "the server is still starting"))
