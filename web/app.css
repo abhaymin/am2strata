@@ -114,6 +114,7 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
                  border-radius: 2px; background: var(--st-accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .msg-error { color: var(--st-danger-text); background: var(--st-danger-tint); border-radius: var(--st-r-md); padding: 10px 14px; font-size: var(--st-fs-md); }
+.msg-dropped { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; margin-top: var(--st-s-3); }
 .st-bubble .tool-call { margin: var(--st-s-3) 0; }
 .tool-call > summary { min-width: 0; padding: 8px 12px; }
 .tool-call__name { font: 500 var(--st-fs-sm)/1.2 var(--st-font-mono); color: var(--st-ink); white-space: nowrap; }
