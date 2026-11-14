@@ -400,6 +400,194 @@ fn a_client_key_gets_its_chat_and_the_public_topics_only() {
     assert_eq!(next(&mut w)["type"], "error");
 }
 
+// ------------------------------------------------------------------------------------------- the web app's chat
+
+fn reasoning_of(events: &[Value]) -> String {
+    events.iter().filter_map(|e| e["data"]["choices"][0]["delta"]["reasoning_content"].as_str()).collect()
+}
+
+/// The web app's chat as it goes over the socket: the model thinks, calls a tool the server runs (MCP), reads the
+/// result and answers, each as the HTTP stream has it; then a tool the client answers (OpenAI tool_calls), and the
+/// next request with the tool's result.
+#[test]
+fn a_chat_with_reasoning_and_tool_round_trips_over_the_socket() {
+    let m = Model { extra: json!({"mcp_servers": {"calc": {"command": env!("CARGO_BIN_EXE_strata-mock-mcp")}}}), ..Model::default() };
+    let mcp = "\n\n<tool_call>\n<function=calc__add>\n<parameter=a>\n2\n</parameter>\n<parameter=b>\n3\n</parameter>\n</function>\n</tool_call>";
+    let weather = "\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nPune\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[m], &[ids(&format!("Use the tool.\n</think>{mcp}")), ids("Adding.\n</think>\n\nThe sum is 5."),
+                                  ids(&format!("Need the weather.\n</think>{weather}")), ids("Read it.\n</think>\n\nSunny in Pune.")], json!({}));
+    let t0 = Instant::now();
+    while s.get("/mcp", true).1["tools"] != 1 {
+        assert!(t0.elapsed() < Duration::from_secs(10), "the MCP server came up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut w = owner(&s);
+    say(&mut w, json!({"type": "request", "id": "mcp", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [user("2+3?")], "stream": true, "strata_mcp": true}}));
+    let (events, end) = answer(&mut w, "mcp");
+    assert_eq!(end, json!({"type": "done", "id": "mcp", "status": 200}));
+    let tool: Vec<&Value> = events.iter().filter_map(|e| e["data"].get("strata_mcp")).collect();
+    let kinds: Vec<&str> = tool.iter().map(|e| e["event"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["start", "call", "result"], "{tool:?}");
+    assert_eq!((tool[1]["name"].as_str(), tool[1]["arguments"].clone()), (Some("calc__add"), json!({"a": 2, "b": 3})), "{}", tool[1]);
+    assert_eq!((tool[2]["text"].as_str(), tool[2]["ok"].as_bool()), (Some("5"), Some(true)));
+    assert_eq!(reasoning_of(&events), "Use the tool.\nAdding.\n", "both rounds' thinking, as reasoning_content");
+    assert_eq!(text_of(&events), "The sum is 5.");
+    assert_eq!(s.gen_lines().len(), 2, "a second round after the tool's result");
+
+    // a tool the client runs: the call streams in pieces, finish_reason tool_calls; the result goes back in the next
+    let tools = json!([{"type": "function", "function": {"name": "get_weather", "description": "Weather.",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]);
+    let q = user("Weather in Pune?");
+    say(&mut w, json!({"type": "request", "id": "call", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [q], "tools": tools, "stream": true}}));
+    let (events, end) = answer(&mut w, "call");
+    assert_eq!(end["type"], "done");
+    assert_eq!(reasoning_of(&events), "Need the weather.\n");
+    let pieces: Vec<Value> = events.iter().flat_map(|e| e["data"]["choices"][0]["delta"]["tool_calls"].as_array().cloned().unwrap_or_default()).collect();
+    let call_id = pieces.iter().find_map(|t| t["id"].as_str()).expect("the call's id").to_string();
+    let args: String = pieces.iter().filter_map(|t| t["function"]["arguments"].as_str()).collect();
+    assert_eq!(serde_json::from_str::<Value>(&args).unwrap(), json!({"city": "Pune"}));
+    assert!(events.iter().any(|e| e["data"]["choices"][0]["finish_reason"] == "tool_calls"), "{events:?}");
+    let back = json!([q, {"role": "assistant", "content": "", "tool_calls": [{"id": call_id, "type": "function",
+                          "function": {"name": "get_weather", "arguments": args}}]},
+                      {"role": "tool", "tool_call_id": call_id, "content": "sunny, 31 C"}]);
+    say(&mut w, json!({"type": "request", "id": "result", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": back, "tools": tools, "stream": true}}));
+    let (events, end) = answer(&mut w, "result");
+    assert_eq!(end["type"], "done");
+    assert_eq!(text_of(&events), "Sunny in Pune.");
+    let last = s.gen_lines().pop().unwrap();
+    let result = ids("sunny, 31 C");
+    assert!(line_ids(&last).windows(result.len()).any(|w| w == result.as_slice()), "the tool's result is in the next prompt");
+}
+
+/// Stop while the model is still thinking: the engine is told to stop, nothing more of that answer arrives, and the
+/// socket carries on.
+#[test]
+fn stop_while_it_thinks_stops_the_engine() {
+    let long: Vec<u32> = std::iter::repeat_n(ids("hmm ")[0], 400).collect();
+    let s = Server::start(&[Model::default()], &[long, ids("Fine.\n</think>\n\nok")], json!({"delay_ms": 10}));
+    let mut w = owner(&s);
+    say(&mut w, json!({"type": "request", "id": "think", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [user("ponder")], "stream": true}}));
+    until(&mut w, "its first thoughts", |m| m["id"] == "think" && m["data"]["choices"][0]["delta"]["reasoning_content"].is_string());
+    say(&mut w, json!({"type": "cancel", "id": "think"}));
+    until(&mut w, "cancelled", |m| m == &json!({"type": "cancelled", "id": "think"}));
+    let t0 = Instant::now();
+    while !s.commands().iter().any(|c| c == "STOP") {
+        assert!(t0.elapsed() < Duration::from_secs(3), "STOP after the cancel");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    say(&mut w, json!({"type": "request", "id": "next", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [user("again")], "stream": true}}));
+    let m = until(&mut w, "the next answer", |m| {
+        assert!(m["id"] != "think", "nothing of the stopped answer after its cancelled: {m}");
+        m["id"] == "next" && m["type"] == "done"
+    });
+    assert_eq!(m["status"], 200);
+}
+
+/// A chat with a pasted picture of about 8 MB (as a data URL) fits in one message (16 MB) and is read as over HTTP.
+#[test]
+fn a_chat_with_an_8_mb_picture_goes_over_the_socket() {
+    use base64::Engine as _;
+    let s = Server::start(&[Model::default()], &[ids("A noisy picture.")], json!({}));
+    // noise does not compress: a PNG of about 6 MB, 8 MB as base64
+    let (wd, ht) = (1450u32, 1450u32);
+    let mut x: u32 = 2463534242;
+    let img = image::RgbImage::from_fn(wd, ht, |_, _| {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        image::Rgb([x as u8, (x >> 8) as u8, (x >> 16) as u8])
+    });
+    let mut buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(buf.into_inner()));
+    assert!((7 << 20..15 << 20).contains(&url.len()), "about 8 MB: {}", url.len());
+    let mut w = owner(&s);
+    say(&mut w, json!({"type": "request", "id": "pic", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [{"role": "user", "content": [{"type": "text", "text": "What is this?"},
+                                {"type": "image_url", "image_url": {"url": url}}]}],
+                                "stream": true, "chat_template_kwargs": {"enable_thinking": false}}}));
+    let (events, end) = answer(&mut w, "pic");
+    assert_eq!(end, json!({"type": "done", "id": "pic", "status": 200}));
+    assert_eq!(text_of(&events), "A noisy picture.");
+    assert!(s.commands().iter().any(|c| c.starts_with("VISION ENC ")), "the picture was encoded");
+}
+
+fn chrome() -> Option<String> {
+    std::env::var_os("AM2STRATA_TEST_CHROME").map(std::path::PathBuf::from).or_else(|| {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        Some(std::path::PathBuf::from(home).join("Development/Strata-data/browser/chrome-headless-shell-linux64/chrome-headless-shell"))
+    }).filter(|p| p.is_file()).map(|p| p.display().to_string())
+}
+
+/// A sign-in page for the browser tool.
+fn login_page() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = c.read(&mut buf);
+            let body = "<html><head><title>Sign in</title></head><body><form action=\"/done\"><input id=\"pw\" type=\"password\"></form></body></html>";
+            let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+        }
+    });
+    port
+}
+
+/// A browser step that waits for the user's yes, all over one socket: the chat's stream brings the `approve` event,
+/// the page's answer (POST /api/tools/approve) goes back as another request on the same connection while the chat
+/// still runs, and the model hears it.
+#[test]
+fn a_browser_step_is_approved_over_the_same_socket() {
+    let Some(exe) = chrome() else { eprintln!("no chrome-headless-shell: skipped"); return };
+    let port = login_page();
+    let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/login\n</parameter>\n</function>\n</tool_call>");
+    let typ = "\n\n<tool_call>\n<function=browser_type>\n<parameter=selector>\n#pw\n</parameter>\n<parameter=text>\nhunter2\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"browser": {"exe": exe}, "allow_private_urls": true}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Open.\n</think>{open}")), ids(&format!("Type.\n</think>{typ}")),
+                                  ids("Ok.\n</think>\n\nYou did not allow it.")], json!({}));
+    // as the page connects: no header, the key in the first message, the page's own origin
+    let mut w = open_page(&s);
+    say(&mut w, json!({"type": "request", "id": "chat", "method": "POST", "path": "/v1/chat/completions",
+                       "body": {"messages": [user("sign in")], "stream": true, "strata_browser": true}}));
+    let ask = until(&mut w, "the approve event", |m| m["id"] == "chat" && m["data"]["strata_mcp"]["event"] == "approve");
+    let step = &ask["data"]["strata_mcp"];
+    assert!(step["what"].as_str().unwrap().contains("password"), "{step}");
+    say(&mut w, json!({"type": "request", "id": "no", "method": "POST", "path": "/api/tools/approve", "body": {"id": step["id"], "ok": false}}));
+    let mut answered = false;
+    let mut events = Vec::new();
+    loop {
+        let m = until(&mut w, "the answer and the chat's end", |m| m["id"] == "no" || m["id"] == "chat");
+        match (m["id"].as_str(), m["type"].as_str()) {
+            (Some("no"), _) => {
+                assert_eq!((m["type"].as_str(), m["status"].as_u64()), (Some("response"), Some(200)), "{m}");
+                assert_eq!(m["body"]["ok"], false);
+                answered = true;
+            }
+            (_, Some("event")) => events.push(m),
+            _ => { assert_eq!(m["type"], "done", "{m}"); break; }
+        }
+    }
+    assert!(answered, "the answer came back while the chat ran");
+    let result = events.iter().filter_map(|e| e["data"].get("strata_mcp")).find(|e| e["event"] == "result" && e["id"] == step["id"]).expect("the step's result");
+    assert!(result["text"].as_str().unwrap().contains("did not allow this step"), "{result}");
+    assert_eq!(text_of(&events), "You did not allow it.");
+    // an answer nothing waits for any more: 404, as over HTTP
+    say(&mut w, json!({"type": "request", "id": "late", "method": "POST", "path": "/api/tools/approve", "body": {"id": step["id"], "ok": true}}));
+    assert_eq!(answer(&mut w, "late").1["status"], 404);
+}
+
+/// Connected as the web app is: the page's origin, the key in the first message.
+fn open_page(s: &Server) -> Ws {
+    let mut w = open(s, None, Some(&s.base)).expect("the server's own page");
+    say(&mut w, json!({"type": "auth", "key": KEY}));
+    assert_eq!(next(&mut w)["type"], "ready");
+    w
+}
+
 // --------------------------------------------------------------------------------------------------------------- wss
 
 fn wait_https(dir: &std::path::Path, port: u16) -> Vec<u8> {
@@ -533,4 +721,27 @@ fn the_cli_prints_pushed_updates_over_ws_and_wss() {
     // without that certificate a self-signed server is not trusted; a wrong key prints nothing
     assert!(cli_lines(&["--url", &format!("wss://localhost:{port}"), "--api-key", KEY], 1).is_empty());
     assert!(cli_lines(&["--url", &s.base, "--api-key", "wrong"], 1).is_empty());
+}
+
+/// Not a test: the web app over the mock engine, to try the chat over the socket in a browser (AM2_UI_DEMO_SECS):
+/// four long answers that think first, then a browser step that waits for a yes (with Chrome), then long ones again.
+#[test]
+#[ignore]
+fn web_ui_demo_chat_over_live() {
+    let long = ids(&format!("{}\n</think>\n\n{}", "Thinking it over. ".repeat(20), "Here is a long answer, word by word. ".repeat(60)));
+    let mut replies = vec![long.clone(); 4];
+    let mut extra = json!({});
+    if let Some(exe) = chrome() {
+        let port = login_page();
+        let open = format!("\n\n<tool_call>\n<function=browser_open>\n<parameter=url>\nhttp://127.0.0.1:{port}/login\n</parameter>\n</function>\n</tool_call>");
+        let typ = "\n\n<tool_call>\n<function=browser_type>\n<parameter=selector>\n#pw\n</parameter>\n<parameter=text>\nhunter2\n</parameter>\n</function>\n</tool_call>";
+        replies.extend([ids(&format!("Open.\n</think>{open}")), ids(&format!("Type.\n</think>{typ}")), ids("Ok.\n</think>\n\nDone with the sign-in page.")]);
+        extra = json!({"browser": {"exe": exe}, "allow_private_urls": true});
+    }
+    replies.extend(vec![long; 20]);
+    let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let s = Server::start(&[Model { extra, ..Model::default() }], &replies, json!({"web_dir": web.to_str().unwrap(), "delay_ms": 40}));
+    println!("UI demo at {} (the test key)", s.base);
+    let secs = std::env::var("AM2_UI_DEMO_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(900);
+    std::thread::sleep(Duration::from_secs(secs));
 }

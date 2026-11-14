@@ -117,12 +117,16 @@ $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); 
 //   live.has(topic)                             true while the socket is delivering that topic (else: poll)
 //   live.request(method, path, body, onEvent)   a call to /v1/... or /api/... over the socket: a promise of
 //                                               {status, body, headers}; a streamed answer calls onEvent({data, event,
-//                                               comment}) per event; the promise has .cancel() (the model stops)
+//                                               comment}) per event; the promise has .cancel() (the model stops). It
+//                                               fails with err.notSent when nothing went out (not connected, or over
+//                                               the server's 16 MB per message): the caller may then use HTTP
+// The chat streams over it (streamInto), and its small calls go through api() below, each with HTTP as the fallback.
 const live = (() => {
   const handlers = {};          // topic -> [fn]
   const topics = new Map();     // topic -> params: what to subscribe to (again after a reconnect)
   const got = new Set();        // topics that have delivered since they were (re)subscribed
   const pending = new Map();    // request id -> {ok, fail, onEvent}
+  const MAX_MESSAGE = 16 << 20; // the server's cap on one message (live_channel.rs MAX_MESSAGE)
   let ws = null, ready = false, refused = false, allowed = [], tries = 0, timer = null, seq = 0;
   const address = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}v1/live`;
   let everLive = false;
@@ -133,9 +137,10 @@ const live = (() => {
     if (ready) everLive = true;
     const waiting = everLive ? "Reconnecting" : "Connecting";
     $("live-text").textContent = ready ? "Live" : refused ? "Not live" : waiting;
-    el.title = ready ? `Live: connected (${location.protocol === "https:" ? "wss" : "ws"}); updates are pushed, nothing is polled`
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    el.title = ready ? `Live: connected (${proto}); chat and updates over ${proto}, nothing is polled`
       : refused ? "Not live: the server refused the API key (Settings › Server and access). The page polls instead."
-      : `${waiting} to the server… The page polls meanwhile.`;
+      : `${waiting} to the server… The page polls, and the chat uses HTTP, meanwhile.`;
   }
   const sendNow = (o) => ws && ws.readyState === 1 && ready && (ws.send(JSON.stringify(o)), true);
   function subscribe(topic) {
@@ -146,7 +151,7 @@ const live = (() => {
   function dropped(sock, code) {
     if (ws !== sock) return;
     ws = null; ready = false; refused = code === 4401; got.clear();
-    for (const p of pending.values()) p.fail(new Error("the live connection closed"));
+    for (const p of pending.values()) p.fail(Object.assign(new Error("the live connection closed"), {dropped: true}));
     pending.clear();
     show();
     // again after 1 s, 2 s, 4 s … 30 s (spread a little, so pages do not all return at once); a refused key waits
@@ -189,6 +194,7 @@ const live = (() => {
   connect();
   return {
     get connected() { return ready; },
+    get _ws() { return ws; },                       // for the console: live._ws.close() tries the fallback
     on(topic, fn) { (handlers[topic] = handlers[topic] || []).push(fn); if (!topics.has(topic)) this.follow(topic); },
     follow(topic, params = null) { topics.set(topic, params); got.delete(topic); subscribe(topic); },
     unfollow(topic) { if (topics.delete(topic)) { got.delete(topic); sendNow({type: "unsubscribe", topics: [topic]}); } },
@@ -197,7 +203,15 @@ const live = (() => {
     request(method, path, body = null, onEvent = null) {
       const id = `r${++seq}`;
       const p = new Promise((ok, fail) => {
-        if (!sendNow({type: "request", id, method, path: path.startsWith("/") ? path : `/${path}`, body})) { fail(new Error("the live channel is not connected")); return; }
+        const notSent = (why) => fail(Object.assign(new Error(why), {notSent: true}));
+        if (!(ws && ws.readyState === 1 && ready)) { notSent("the live channel is not connected"); return; }
+        const text = JSON.stringify({type: "request", id, method, path: path.startsWith("/") ? path : `/${path}`, body});
+        // a message over the server's cap would close the socket (and everything on it): such a body goes over HTTP.
+        // UTF-8 is at least one byte per UTF-16 unit and at most three
+        if (text.length > MAX_MESSAGE || (text.length * 3 > MAX_MESSAGE && new TextEncoder().encode(text).length > MAX_MESSAGE)) {
+          notSent("the request is over the live channel's 16 MB per message"); return;
+        }
+        ws.send(text);
         pending.set(id, {ok, fail, onEvent});
       });
       p.cancel = () => { sendNow({type: "cancel", id}); };
@@ -207,6 +221,33 @@ const live = (() => {
     reconnect() { if (ws) { const w = ws; dropped(w, 1000); w.close(); } tries = 0; refused = false; show(); clearTimeout(timer); connect(); },
   };
 })();
+
+// A JSON call as fetch(path, init) makes it, over the live channel while it is connected: answered as a Response, so
+// the callers read it as they read fetch's. Not connected, a body that is not JSON, or too large for one message:
+// fetch itself. A GET whose socket drops is asked again over HTTP; anything else is not sent twice (it may already
+// have acted, e.g. allowed a browser step), it fails as a fetch does when its connection breaks.
+async function api(path, init = {}) {
+  const method = (init.method || "GET").toUpperCase();
+  let body = null;
+  if (init.body != null) {
+    if (typeof init.body !== "string") return fetch(path, init);
+    try { body = JSON.parse(init.body); } catch (e) { return fetch(path, init); }
+  }
+  if (!live.connected) return fetch(path, init);
+  let r;
+  try {
+    r = await live.request(method, path, body);
+  } catch (e) {
+    if (e.notSent || method === "GET") return fetch(path, init);
+    throw new TypeError(`${e.message} (sent over the live channel; not sent again)`);
+  }
+  const h = r.headers || {}, ct = String(h["content-type"] || "");
+  let data = null;
+  if ([204, 205, 304].includes(r.status)) data = null;
+  else if (r.body_base64 != null) data = Uint8Array.from(atob(r.body_base64), (c) => c.charCodeAt(0));
+  else if (r.body != null) data = typeof r.body === "string" && !ct.includes("json") ? r.body : JSON.stringify(r.body);
+  return new Response(data, {status: r.status, headers: h});
+}
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
@@ -1829,7 +1870,7 @@ document.addEventListener("click", async (e) => {
   if (!j || !j.tool) return;
   b.disabled = true;
   try {
-    const r = await fetch("api/jobs", {method: "POST", headers: headers(true), body: JSON.stringify({tool: j.tool.name, arguments: j.tool.arguments})});
+    const r = await api("api/jobs", {method: "POST", headers: headers(true), body: JSON.stringify({tool: j.tool.name, arguments: j.tool.arguments})});
     const nj = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((nj.error && nj.error.message) || `HTTP ${r.status}`);
     if (j.call) j.call.job = nj;
@@ -1849,7 +1890,7 @@ async function watchJob(id, t) {
   jobs[id] = Object.assign(jobs[id] || {}, {watching: true});
   try {
     for (;;) {
-      const r = await fetch(`api/jobs/${encodeURIComponent(id)}`, {headers: headers()});
+      const r = await api(`api/jobs/${encodeURIComponent(id)}`, {headers: headers()});
       if (r.status === 404) { Object.assign(jobs[id], {state: "gone"}); break; }
       if (r.ok) {
         const j = await r.json();
@@ -1923,7 +1964,9 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
-    bubble.innerHTML = answerHtml(m);
+    bubble.innerHTML = answerHtml(m) + (m.dropped && !streaming ? `<div class="msg-error msg-dropped"><span></span> ` +
+      `<button type="button" class="st-btn st-btn--secondary" data-msg-retry>Retry</button></div>` : "");
+    if (m.dropped && !streaming) bubble.querySelector(".msg-dropped span").textContent = m.dropped;
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -1956,7 +1999,7 @@ $("chat").addEventListener("click", async (e) => {
   const el = b.closest(".st-msg"), m = messages[+el.dataset.i];
   const t = m && (m.tools || []).find((x) => x.id === id);
   try {
-    const r = await fetch("api/tools/approve", {method: "POST", headers: headers(true), body: JSON.stringify({id, ok})});
+    const r = await api("api/tools/approve", {method: "POST", headers: headers(true), body: JSON.stringify({id, ok})});
     if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
     if (t) t.approve.answered = ok;
   } catch (err) { toast("error", "Not answered", String(err.message || err), 6000); if (t) t.approve.answered = "ended"; }
@@ -1969,7 +2012,7 @@ $("chat").addEventListener("click", (e) => {
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
-  const rg = e.target.closest("[data-msg-regen]");
+  const rg = e.target.closest("[data-msg-regen], [data-msg-retry]");
   if (rg) { regenerateMessage(+rg.closest(".st-msg").dataset.i); return; }
   const sk = e.target.closest("[data-msg-speak]");
   if (sk) { readAloud(+sk.closest(".st-msg").dataset.i, sk); return; }
@@ -2105,7 +2148,7 @@ function swipeLoad(m) {
   swipeInit(m);
   const v = m.swipes[m.swipeIndex] || {};
   Object.assign(m, {text: v.text || "", reasoning: v.reasoning || "", tools: v.tools || null, meta: v.meta || null,
-                    thinkSecs: null, stopped: false, error: null, limit: null});
+                    thinkSecs: null, stopped: false, error: null, limit: null, dropped: null});
 }
 function swipeGo(i, delta) {
   if (busy) return;
@@ -2131,7 +2174,7 @@ async function regenerateMessage(i) {
   swipeSave(m);
   m.swipes.length = m.swipeIndex + 1;
   const keep = swipeSnapshot(m);
-  Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null});
+  Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null, dropped: null});
    const controller = new AbortController();
    clearUsing();   // regenerating starts a fresh answer with no computer/browser in use
    busy = {controller, msg: m, cutoff: i};
@@ -2157,6 +2200,108 @@ async function regenerateMessage(i) {
    saveChat();
 }
 
+// One streamed chat answer's state and its events, whichever way they come: the HTTP stream's SSE lines and the live
+// channel's `event` messages both call comment() and data(), so the two cannot drift. data() throws the engine's error.
+function chatStream(m, el) {
+  const st = {firstAt: null, thinkStart: null, usage: null, frame: 0};
+  const paint = () => { st.frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  // a comment: "queued: 2 ahead" while it waits its turn behind other jobs (one at a time here); "keep-alive" while
+  // a long prompt is read
+  st.comment = (c) => {
+    const q = /^queued: (\d+) ahead/.exec(c);
+    if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); }
+  };
+  // an event's data: the chunk's JSON (text from an SSE line, or already parsed by the live channel), or "[DONE]"
+  st.data = (data) => {
+    if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; }
+    if (data === "[DONE]") return;
+    let j = data;
+    if (typeof data === "string") { try { j = JSON.parse(data); } catch (e) { return; } }
+    if (!j || typeof j !== "object") return;
+    if (j.error) throw new Error(j.error.message || "the engine reported an error");
+    if (j.usage) st.usage = j.usage;
+    if (j.strata_mcp) onTool(m, j.strata_mcp);
+    const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+    const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
+    if (d.reasoning_content) {
+      if (!st.firstAt) st.firstAt = performance.now();
+      if (!st.thinkStart) st.thinkStart = performance.now();
+      if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
+      m.reasoning += d.reasoning_content;
+    }
+    if (d.content) {
+      if (!st.firstAt) st.firstAt = performance.now();
+      if (st.thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - st.thinkStart) / 1000;
+      if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
+      m.text += d.content;
+    }
+    if (!st.frame) st.frame = requestAnimationFrame(paint);
+  };
+  return st;
+}
+// a refused chat request (HTTP's status and JSON body, from either path) as the error shown
+function chatError(status, j) {
+  if (status === 401) return new Error("This server needs an API key: add it under Settings › Server and access › API key.");
+  return new Error((j && j.error && j.error.message) || `HTTP ${status}`);
+}
+const droppedError = (why) => Object.assign(new Error(why), {dropped: true});
+// The chat over HTTP: fetch and its SSE lines.
+async function streamHttp(body, st, signal) {
+  const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body), signal});
+  if (!r.ok) {
+    let j = null;
+    try { j = await r.json(); } catch (e) { /* not json */ }
+    throw chatError(r.status, j);
+  }
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    let chunk;
+    try { chunk = await reader.read(); } catch (e) {
+      if (e.name === "AbortError") throw e;
+      throw droppedError("The connection dropped; the answer may be incomplete.");
+    }
+    if (chunk.done) break;
+    buf += dec.decode(chunk.value, {stream: true});
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line.startsWith(":")) st.comment(line.slice(1).trim());
+      else if (line.startsWith("data:")) st.data(line.slice(5).trim());
+    }
+  }
+}
+// The chat over the live channel: the same request, each `event` into the same handling, Stop as `cancel`. False when
+// it could not be sent (not connected, or too large for one message): nothing went out, the caller uses HTTP.
+async function streamLive(body, st, signal) {
+  if (!live.connected) return false;
+  let failed = null;
+  const req = live.request("POST", "/v1/chat/completions", body, (ev) => {
+    if (failed || signal.aborted) return;          // stopped: nothing more is shown, as when HTTP's reader is aborted
+    try {
+      if (ev.data !== undefined) st.data(ev.data);
+      else if (ev.comment != null) st.comment(ev.comment);
+    } catch (e) { failed = e; req.cancel(); }    // the engine's error: stop the request, as HTTP's throw closes it
+  });
+  const stop = () => req.cancel();
+  signal.addEventListener("abort", stop);
+  let r;
+  try {
+    r = await req;
+  } catch (e) {
+    if (e.notSent) return false;
+    if (failed) throw failed;
+    if (signal.aborted) throw new DOMException("stopped", "AbortError");
+    throw droppedError(e.dropped ? "The connection dropped; the answer may be incomplete." : `${e.message}; the answer may be incomplete.`);
+  } finally {
+    signal.removeEventListener("abort", stop);
+  }
+  if (failed) throw failed;
+  if (!r.streamed) throw chatError(r.status, r.body);
+  return true;
+}
+
 // The request and its stream into answer `m` (shared by send and regenerate). A Stop returns normally with m.stopped
 // set (the partial answer is kept); any other failure is thrown.
 async function streamInto(m, el, signal) {
@@ -2178,61 +2323,25 @@ async function streamInto(m, el, signal) {
   if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
   if (store.get("media-chat", true) && (media.models || []).some((x) => x.downloaded && x.kind !== "3d")) body.strata_media = true;  // Settings > Models
 
-  let firstAt = null, thinkStart = null, usage = null, frame = 0;
-  const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
+  const st = chatStream(m, el);
   try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body), signal});
-    if (!r.ok) {
-      let msg = `HTTP ${r.status}`;
-      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under Settings › Server and access › API key.";
-      throw new Error(msg);
-    }
-    const reader = r.body.getReader(), dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const {value, done} = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, {stream: true});
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl).trim();
-        buf = buf.slice(nl + 1);
-        const q = /^: queued: (\d+) ahead/.exec(line);       // waiting its turn behind other jobs (one at a time here)
-        if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); continue; }
-        if (!line.startsWith("data:")) continue;              // ": keep-alive" comments while a long prompt is read
-        if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; }
-        const data = line.slice(5).trim();
-        if (data === "[DONE]") continue;
-        let j;
-        try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || "the engine reported an error");
-        if (j.usage) usage = j.usage;
-        if (j.strata_mcp) onTool(m, j.strata_mcp);
-        const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
-        const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
-        if (d.reasoning_content) {
-          if (!firstAt) firstAt = performance.now();
-          if (!thinkStart) thinkStart = performance.now();
-          if (lastTool && m.reasoning && lastTool.rat === m.reasoning.length) m.reasoning += "\n\n";
-          m.reasoning += d.reasoning_content;
-        }
-        if (d.content) {
-          if (!firstAt) firstAt = performance.now();
-          if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-          if (lastTool && m.text && lastTool.at === m.text.length) m.text += "\n\n";
-          m.text += d.content;
-        }
-        if (!frame) frame = requestAnimationFrame(paint);
-      }
-    }
+    // over the live channel while it is connected; HTTP when it is not (or the body is too large for one message)
+    if (!(await streamLive(body, st, signal))) await streamHttp(body, st, signal);
   } catch (e) {
-    if (frame) cancelAnimationFrame(frame);
-    if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
-    if (e.name !== "AbortError") throw e;
-    m.stopped = true;
+    if (st.frame) cancelAnimationFrame(st.frame);
+    if (st.thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - st.thinkStart) / 1000;
+    if (e.dropped) {
+      // the connection broke mid-answer: what came is kept, with a note and Retry; never sent again by itself (a
+      // second run could repeat what its tools did)
+      m.dropped = e.message;
+    } else if (e.name !== "AbortError") {
+      throw e;
+    } else {
+      m.stopped = true;
+    }
   }
-  if (frame) cancelAnimationFrame(frame);
+  const {firstAt, thinkStart, usage} = st;
+  if (st.frame) cancelAnimationFrame(st.frame);
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
@@ -2919,7 +3028,7 @@ function newFrame(sandbox) {
 }
 async function previewUrl(html) {
   try {
-    const r = await fetch("api/preview", {method: "POST", headers: headers(true), body: JSON.stringify({html})});
+    const r = await api("api/preview", {method: "POST", headers: headers(true), body: JSON.stringify({html})});
     if (r.ok) return (await r.json()).url;
   } catch (e) { /* an older server */ }
   return null;
@@ -2994,7 +3103,7 @@ async function runCanvas() {
   out.innerHTML = `<div class="run-status"><span class="st-badge st-badge--reading">Running</span><span class="muted">on this PC, in a sandbox</span></div>`;
   note("");
   try {
-    const r = await fetch("api/run", {method: "POST", headers: headers(true), body: JSON.stringify({language: "python", code: cv.code})});
+    const r = await api("api/run", {method: "POST", headers: headers(true), body: JSON.stringify({language: "python", code: cv.code})});
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
     cv.result = j;

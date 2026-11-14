@@ -40,7 +40,7 @@ settings. It is free and open source (MIT); see [Credits](#credits).
 | **Computer tab** | Watch the desktop the agent works on, take control with your own mouse and keyboard, copy and paste across. |
 | **HTTPS and wss** | A self-signed, your own, or a Tailscale certificate, from Settings or one command. Plain HTTP keeps working beside it. |
 | **API keys and usage** | Make keys while the server runs, with tool sets, expiry, limits and allowed models; see requests and tokens per key and per model. |
-| **Live channel** | One WebSocket (`/v1/live`) that pushes status, queue and job changes, and carries any API request with streamed answers. |
+| **Live channel** | One WebSocket (`/v1/live`) that pushes status, queue and job changes, and carries any API request with streamed answers; the web app's chat runs over it. |
 | **Six platforms** | Downloads and installers for Linux, macOS and Windows on x64 and Arm, plus `am2strata-run doctor`. |
 | **Regression suite** | A contract for every route, recorded response shapes, and `am2strata-run regression` to check a running server after an update. |
 
@@ -242,7 +242,7 @@ MiniCPM-V and the others) over their line protocol.
 | Computer tab (live desktop, take control, clipboard) | done, Linux | integration test over WebSocket; a browser by hand |
 | HTTPS and wss (self-signed, own certificate, Tailscale), HSTS only when plain HTTP redirects | done | integration tests; live with a Tailscale certificate |
 | API keys made at run time, with usage per key and per model | done | integration tests; live |
-| Live channel `/v1/live` (pushes, requests over the socket, cancel) | done; the chat itself still streams over HTTP | integration tests over ws and wss; live |
+| Live channel `/v1/live` (pushes, requests over the socket, cancel) | done; the web app's chat streams over it (HTTP when not connected) | integration tests over ws and wss; live |
 | Installers and downloads for six platforms; `am2strata-run doctor` | done | built, installed, run and removed on GitHub's runners for each platform |
 | Regression suite (route contracts, response shapes, bug classes) and `am2strata-run regression` | done | CI; 20 of 20 checks against the live server |
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
@@ -304,7 +304,6 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
   on a dataset made in the Workshop and merge the adapter there.
 - **Outside Linux:** the Computer tab's desktop and the sandbox VM are Linux-only (the VM needs an x86_64 PC with
   KVM). On Linux arm64, Intel Macs and Windows Arm64 the Rust engine runs on the CPU only.
-- **Chat over the live channel:** the socket can carry chat requests, but the web app's chat still uses HTTP streaming.
 
 ## Use
 

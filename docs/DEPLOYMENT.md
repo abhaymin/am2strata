@@ -369,9 +369,10 @@ am2Strata without changing it.
 ## The live channel: ws:// and wss://
 
 One continuous WebSocket between a client and the server: the server **pushes** what changes (no polling), and the
-client can send its API requests over the same connection. The web app uses it for the Monitor tab and the header's
-status pill (the small **Live** mark beside the pill says whether it is connected) and falls back to polling by
-itself whenever the socket is not connected. Scripts, other clients and cluster nodes can use it the same way.
+client can send its API requests over the same connection. The web app uses it for the chat, the Monitor tab and the
+header's status pill (the small **Live** mark beside the pill says whether it is connected; its tooltip says "chat and
+updates over wss" over HTTPS) and falls back to HTTP by itself whenever the socket is not connected: it polls, and the
+chat streams over `fetch`. Scripts, other clients and cluster nodes can use it the same way.
 
 - **Address:** `ws://<host>:8000/v1/live` on the plain-HTTP port, `wss://<host>:8001/v1/live` on the HTTPS port.
   Both work at the same time; the plain-HTTP policy above applies to `ws://` as it does to every request.
@@ -452,8 +453,26 @@ commands. A self-signed server's certificate is `<data>/server-tls/cert.pem` on 
 
 `live.on(topic, fn)` (pushed data), `live.has(topic)` (is the socket delivering it — else poll),
 `live.request(method, path, body, onEvent)` (a promise of `{status, body}`; `onEvent` per streamed event;
-`.cancel()`). It reconnects by itself (1 s, 2 s, 4 s … up to 30 s) and subscribes again. The chat itself still
-streams over `fetch` for now.
+`.cancel()`; it fails with `notSent` when nothing went out). It reconnects by itself (1 s, 2 s, 4 s … up to 30 s)
+and subscribes again. `api(path, init)` makes a JSON call as `fetch(path, init)` does, over the socket while it is
+connected, and answers with a `Response`.
+
+**The chat over the socket.** While the socket is connected, the chat's `POST /v1/chat/completions` (the same body,
+`stream: true`) goes over it, and each `event` drives the same code as the HTTP stream's SSE lines (`chatStream` in
+`web/app.js`: text, reasoning, tool events, the `approve` of a browser or computer step, `queued: N ahead`). **Stop**
+sends `cancel`. The other calls of a chat go the same way: the answer to a step that waits for a yes
+(`POST /api/tools/approve`, a second request on the same connection while the chat runs), a media job's card
+(`GET /api/jobs/{id}`, and `POST /api/jobs` to make it again) and the canvas (`api/preview`, `api/run`).
+
+- **Fallback:** not connected (yet, reconnecting, a proxy without WebSockets, an older server): the same request
+  over HTTP. A body over the 16 MB per message — large PDFs, audio, a long chat with many pictures; a pasted 8 MB
+  picture still fits — goes over HTTP too, measured before it is sent (16 MB is kept: it bounds what any connection,
+  even one not yet past its key, can make the server hold; HTTP takes up to 256 MB).
+- **A connection that drops mid-answer:** the answer keeps what arrived and ends with "The connection dropped; the
+  answer may be incomplete" and a **Retry** button, as when an HTTP stream breaks. It is never sent again by itself
+  (a second run could repeat what its tools did). A GET (a job card) is asked again over HTTP.
+- **Still over HTTP:** binary answers and uploads — a media job's file, Read aloud's speech, file uploads and speech
+  to text — and the settings pages' calls.
 
 ## The Workshop: training data, convert, quantize
 
