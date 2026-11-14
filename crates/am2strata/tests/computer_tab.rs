@@ -62,6 +62,9 @@ fn the_computer_tab_needs_the_key_control_and_its_own_page() {
     w.send(tungstenite::Message::Text(json!({"type": "auth", "key": KEY}).to_string().into())).unwrap();
     let m = next_json(&mut w);
     match m["type"].as_str() {
+        #[cfg(not(target_os = "linux"))]
+        Some("state") => panic!("a desktop where there is none: {m}"),
+        #[cfg(target_os = "linux")]
         Some("state") => {
             assert_eq!(m["operator_in_control"], false);
             assert!(m["width"].as_u64().unwrap() > 0);
@@ -73,7 +76,12 @@ fn the_computer_tab_needs_the_key_control_and_its_own_page() {
             std::thread::sleep(std::time::Duration::from_millis(800));
             assert_eq!(s.get("/api/computer/status", true).1["operator_in_control"], false, "a closed tab hands control back");
         }
+        // Linux without Xvfb or bubblewrap: a plain error naming what is missing
+        #[cfg(target_os = "linux")]
         Some("error") => assert!(m["message"].as_str().unwrap().contains("Xvfb") || m["message"].as_str().unwrap().contains("sandbox"), "{m}"),
+        // the desktop itself (Xvfb in a sandbox) is Linux-only: everywhere else the stream says exactly that, and never a state
+        #[cfg(not(target_os = "linux"))]
+        Some("error") => assert!(m["message"].as_str().unwrap().contains("needs Linux"), "{m}"),
         _ => panic!("unexpected {m}"),
     }
 }

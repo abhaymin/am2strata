@@ -96,11 +96,12 @@ fn check_golden(name: &str, got: &Value) {
     if let Some(dir) = update_dir() {
         let out = dir.join(format!("{name}.json"));
         std::fs::write(&out, &pretty).unwrap();
-        let same = std::fs::read_to_string(&file).is_ok_and(|old| old == pretty);
+        let same = read_lf(&file).is_ok_and(|old| old == pretty);
         eprintln!("golden {name}: {} -> {}\n  to accept: cp {} {}", if same { "unchanged" } else { "CHANGED" }, out.display(), out.display(), file.display());
         return;
     }
-    let want = std::fs::read_to_string(&file).unwrap_or_else(|_| panic!(
+    // (line ends as git checked them out do not count: .gitattributes keeps these files LF, and this reads them so anyway)
+    let want = read_lf(&file).unwrap_or_else(|_| panic!(
         "no golden file {}: make it with UPDATE_GOLDEN=1 (docs/REGRESSION.md) and copy it in", file.display()));
     if want != pretty {
         let want_v: Value = serde_json::from_str(&want).unwrap_or(Value::Null);

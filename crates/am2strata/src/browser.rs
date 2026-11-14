@@ -1255,7 +1255,9 @@ mod tests {
         make_file(&up.join(&name), "x");
         // the same file, given via sub/../.. : it canonicalizes to above the folder, so it is refused
         assert!(upload_file_ok(&dir.join("sub/../..").join(&name), &dir).is_err());
-        clean(up);
+        // only the file this test made: `clean(up)` here once removed the whole system temp folder (every other test's
+        // files with it, and anything else of the user's there)
+        clean(&up.join(&name));
         clean(&dir);
     }
 

@@ -122,17 +122,41 @@ impl Server {
             std::fs::write(dir.join("memory/settings.json"), r#"{"api": false}"#).unwrap();
         }
         let record = dir.join("record.txt");
-        let port = free_port();
-        let child = spawn(&dir, port, models[0].id, &extra, &record);
-        let s = Server { child, model: models[0].id.to_string(), extra: extra.clone(), port, dir, record, base: format!("http://127.0.0.1:{port}") };
+        // a port another program took between `free_port` and the server's own bind stops the server at once: start
+        // it again on the next port instead of waiting 30 s for a server that is gone (seen once on a macOS runner)
+        let mut gone = Vec::new();
+        for _ in 0..3 {
+            let port = free_port();
+            let child = spawn(&dir, port, models[0].id, &extra, &record);
+            let mut s = Server { child, model: models[0].id.to_string(), extra: extra.clone(), port, dir: dir.clone(), record: record.clone(),
+                                 base: format!("http://127.0.0.1:{port}") };
+            match s.wait_until_up() {
+                Ok(()) => return s,
+                Err(why) => {
+                    gone.push(format!("port {port}: {why}"));
+                    // keep the folder for the next try (dropping a Server removes it)
+                    stop(&mut s.child);
+                    std::mem::forget(s);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        panic!("am2strata did not start: {}", gone.join("; "));
+    }
+
+    /// Wait for /health; Err says whether the server ended (and how) or is still running but does not answer.
+    fn wait_until_up(&mut self) -> Result<(), String> {
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(30) {
-            if reqwest::blocking::get(format!("{}/health", s.base)).is_ok_and(|r| r.status().is_success()) {
-                return s;
+            if reqwest::blocking::get(format!("{}/health", self.base)).is_ok_and(|r| r.status().is_success()) {
+                return Ok(());
+            }
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(format!("it ended after {:.1} s ({status})", t0.elapsed().as_secs_f32()));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("am2strata did not start");
+        Err("still running after 30 s, /health does not answer".into())
     }
 
     pub fn post(&self, path: &str, body: &Value) -> (u16, Value) {
@@ -242,14 +266,9 @@ impl Server {
     pub fn restart(&mut self) {
         stop(&mut self.child);
         self.child = spawn(&self.dir, self.port, &self.model, &self.extra, &self.record);
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_secs(30) {
-            if reqwest::blocking::get(format!("{}/health", self.base)).is_ok_and(|r| r.status().is_success()) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        if let Err(why) = self.wait_until_up() {
+            panic!("am2strata did not start again: {why}");
         }
-        panic!("am2strata did not start again");
     }
 }
 
