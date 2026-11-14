@@ -305,7 +305,7 @@ struct Mapped {
     vals: Vec<f32>,
 }
 
-fn mapped_tensors(tensors: &BTreeMap<String, TensorF32>) -> Result<Vec<Mapped>> {
+fn mapped_tensors(tensors: &BTreeMap<String, TensorF32>, hparams: &HfConfig) -> Result<Vec<Mapped>> {
     let mut out: Vec<Mapped> = Vec::new();
     for (hf, gguf) in [
         ("model.embed_tokens.weight", "token_embd"),
@@ -329,10 +329,12 @@ fn mapped_tensors(tensors: &BTreeMap<String, TensorF32>) -> Result<Vec<Mapped>> 
 
     for bid in bids {
         let p = |key: &str| format!("model.layers.{bid}.{key}");
-        // attn_q (permute with attention heads), attn_k (permute with kv heads).
+        // attn_q (permute with attention heads) and attn_k (permute with kv heads): exactly llama.cpp's
+        // `LlamaModel.permute(w, n_head, n_head_kv)` — q calls it with `(n_head, n_head)` so it keeps num_attention_heads,
+        // k with `(n_head, n_head_kv)` so GQA collapses it to num_key_value_heads (see conversion/llama.py modify_tensors).
         for (name, gguf, heads) in [
-            (p("self_attn.q_proj.weight").as_str(), format!("blk.{bid}.attn_q.weight"), 2),
-            (p("self_attn.k_proj.weight").as_str(), format!("blk.{bid}.attn_k.weight"), 2),
+            (p("self_attn.q_proj.weight").as_str(), format!("blk.{bid}.attn_q.weight"), hparams.num_attention_heads),
+            (p("self_attn.k_proj.weight").as_str(), format!("blk.{bid}.attn_k.weight"), hparams.num_key_value_heads),
         ] {
             if let Some((shape, vals)) = tensors.get(name) {
                 let vals = permute(vals, heads, shape[1] as usize);
@@ -529,7 +531,7 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         .with_context(|| format!("reading tokenizer_config.json in {}", dir.display()))?)?;
     let chat = chat_template(&tc);
 
-    let mapped = mapped_tensors(&tensors)?;
+    let mapped = mapped_tensors(&tensors, &hparams)?;
     // total number of parameters across every tensor — llama.cpp derives general.size_label from it.
     let total_params: u64 = mapped.iter().map(|m| m.shape.iter().product::<u64>()).sum();
 
@@ -612,6 +614,42 @@ mod tests {
         let got = permute(&w, 2, 1);
         let expected: Vec<f32> = vec![0.0, 2.0, 1.0, 3.0, 4.0, 6.0, 5.0, 7.0];
         assert_eq!(got, expected, "q/k permute bytes must match LlamaModel.permute");
+    }
+
+    #[test]
+    fn q_permutes_with_attention_heads_k_with_kv_heads() {
+        // mapped_tensors must read the head counts from HfConfig, not a literal: 8 attention heads / 5 kv heads, so
+        // head_dim is 4 (even, non-identity permute). A hardcoded `permute(...,2,...)` (the step-6 bug) reshapes with a
+        // head_dim of 16 and produces different bytes here — this fails loudly against such a constant.
+        let hparams = HfConfig {
+            arch: "LlamaForCausalLM".into(),
+            hidden_size: 32, num_hidden_layers: 1,
+            num_attention_heads: 8, num_key_value_heads: 5,
+            intermediate_size: 64, rms_norm_eps: 1e-5, vocab_size: 16,
+            max_position_embeddings: 64, rope_theta: 10_000,
+        };
+        let head_dim = hparams.hidden_size / hparams.num_attention_heads; // 4 -> kv dim is 5*4 = 20
+        let q_rows = hparams.num_attention_heads * head_dim; // 32 (== hidden)
+        let kv_rows = hparams.num_key_value_heads * head_dim; // 20
+        let q_vals: Vec<f32> = (0..(q_rows * hparams.hidden_size)).map(|i| (i as f32) * 0.5 + 0.25).collect();
+        let k_vals: Vec<f32> = (0..(kv_rows * hparams.hidden_size)).map(|i| (i as f32) * -0.3 + 1.0).collect();
+        let mut tensors = BTreeMap::new();
+        // a single-subname layer tensor establishes the layer id (attn_q/k/v/o and mlp names are 6-part, so they would
+        // not by themselves be parsed as a layer here - the real checkpoint has input_layernorm.weight); then the two
+        // projections under test.
+        tensors.insert("model.layers.0.input_layernorm.weight".into(), (vec![hparams.hidden_size], vec![1f32; hparams.hidden_size]));
+        tensors.insert("model.layers.0.self_attn.q_proj.weight".into(), (vec![q_rows, hparams.hidden_size], q_vals.clone()));
+        tensors.insert("model.layers.0.self_attn.k_proj.weight".into(), (vec![kv_rows, hparams.hidden_size], k_vals.clone()));
+
+        let mapped = mapped_tensors(&tensors, &hparams).unwrap();
+        let attn_q = mapped.iter().find(|m| m.name == "blk.0.attn_q.weight").expect("attn_q present");
+        let attn_k = mapped.iter().find(|m| m.name == "blk.0.attn_k.weight").expect("attn_k present");
+
+        assert_eq!(attn_q.shape, vec![q_rows as u64, hparams.hidden_size as u64]);
+        assert_eq!(attn_k.shape, vec![kv_rows as u64, hparams.hidden_size as u64], "k_proj carries num_key_value_heads*head_dim rows");
+        // q permuted with the attention head count, k with the kv head count (reproducing llama.cpp's per-name call).
+        assert_eq!(attn_q.vals, permute(&q_vals, hparams.num_attention_heads, hparams.hidden_size), "q must use num_attention_heads");
+        assert_eq!(attn_k.vals, permute(&k_vals, hparams.num_key_value_heads, hparams.hidden_size), "k must use num_key_value_heads");
     }
 
     #[test]
