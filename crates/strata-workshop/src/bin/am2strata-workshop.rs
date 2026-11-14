@@ -715,18 +715,53 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
     }
 }
 
+/// `--threads N`: candle and its matrix products size their thread pools from `RAYON_NUM_THREADS` and
+/// `CANDLE_NUM_THREADS` the first time they compute. This process never changes its own environment (other threads
+/// may read it, which makes `set_var` unsound); when the two variables do not say N yet, it starts itself again with
+/// them set for the new process only. On Unix that is `exec`: the same process (the same PID, so the server's SIGTERM
+/// still reaches the run). Elsewhere a child runs and its exit code is passed on. `None`: they say N, carry on.
+fn with_threads(n: usize) -> Option<ExitCode> {
+    let want = n.to_string();
+    let set = |k: &str| std::env::var(k).ok().as_deref() == Some(want.as_str());
+    if set("RAYON_NUM_THREADS") && set("CANDLE_NUM_THREADS") {
+        return None;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return None, // no way to start again: all cores, said by the start event's thread count being absent
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1)).env("RAYON_NUM_THREADS", &want).env("CANDLE_NUM_THREADS", &want);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let e = cmd.exec(); // returns only on failure
+        eprintln!("--threads {n}: could not restart with the thread count set ({e}); running on all cores");
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        match cmd.status() {
+            Ok(st) => Some(ExitCode::from(st.code().unwrap_or(1).clamp(0, 255) as u8)),
+            Err(e) => {
+                eprintln!("--threads {n}: could not restart with the thread count set ({e}); running on all cores");
+                None
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    // --threads: candle sizes its pools from these two variables the first time it computes anything, so they are set
-    // here, before any other thread exists
     let threads = match &cli.cmd {
         Cmd::Train { run, .. } | Cmd::FindLr { run, .. } | Cmd::Profile { run, .. } => run.threads,
         Cmd::Autopilot { threads, .. } => *threads,
         _ => None,
     };
     if let Some(n) = threads.filter(|n| *n > 0) {
-        std::env::set_var("RAYON_NUM_THREADS", n.to_string());
-        std::env::set_var("CANDLE_NUM_THREADS", n.to_string());
+        if let Some(code) = with_threads(n) {
+            return code;
+        }
     }
     let out = Out { json: cli.json };
     let t0 = Instant::now();
