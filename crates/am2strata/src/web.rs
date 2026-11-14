@@ -443,3 +443,99 @@ pub async fn clients(State(s): State<AppState>, headers: HeaderMap) -> Response 
     }
     Json(s.clients.view()).into_response()
 }
+
+/// GET /api/tls: HTTPS as it is now — on or off, mode, port, the certificate (names, issuer, expiry, SHA-256), the
+/// addresses to open, Tailscale's view of this PC, and the last error. Settings › Secure connection and
+/// `am2strata-run tls status` show this.
+pub async fn tls_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    match crate::server_tls::runtime() {
+        Some(rt) => Json(rt.status().await).into_response(),
+        None => error(StatusCode::SERVICE_UNAVAILABLE, "server_error", "the server is still starting"),
+    }
+}
+
+/// POST /api/tls {"action": "self-signed" | "load" | "tailscale" | "renew" | "off", "https_port"?, "http"?,
+/// "cert_pem"?, "key_pem"? (for load)}: change HTTPS now, without a restart, and keep it in the run config's "tls"
+/// block for the next start. Nothing changes when it fails (the error says why).
+pub async fn tls_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("HTTPS can be changed");
+    }
+    let Some(rt) = crate::server_tls::runtime() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", "the server is still starting");
+    };
+    let p = config_path(&s).await;
+    let mut cfg = match &p {
+        Some(p) => match read_config(p) {
+            Ok(c) => c,
+            Err(r) => return r,
+        },
+        None => json!({}),
+    };
+    let current = cfg.get("tls").cloned().filter(|t| t.is_object()).unwrap_or_else(|| json!({}));
+    let mut block = current.clone();
+    for k in ["https_port", "http", "hsts_max_age", "hsts_include_subdomains"] {
+        if let Some(v) = req.get(k) {
+            block[k] = v.clone();
+        }
+    }
+    let action = req["action"].as_str().unwrap_or("");
+    match action {
+        "off" => {
+            let _ = rt.apply(None).await;
+            if let Some(o) = cfg.as_object_mut() {
+                o.remove("tls");
+            }
+        }
+        "self-signed" | "tailscale" | "renew" | "load" => {
+            match action {
+                "self-signed" => { block["mode"] = json!("self-signed"); block.as_object_mut().unwrap().retain(|k, _| k != "cert" && k != "key"); }
+                "tailscale" => { block["mode"] = json!("tailscale"); block.as_object_mut().unwrap().retain(|k, _| k != "cert" && k != "key"); }
+                "load" => {
+                    let (Some(cert), Some(key)) = (req["cert_pem"].as_str(), req["key_pem"].as_str()) else {
+                        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "load needs \"cert_pem\" and \"key_pem\" (PEM text)");
+                    };
+                    match crate::server_tls::save_uploaded(&s.data_dir, cert, key) {
+                        Ok((c, k)) => {
+                            block["mode"] = json!("files");
+                            block["cert"] = json!(c.display().to_string());
+                            block["key"] = json!(k.display().to_string());
+                        }
+                        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+                    }
+                }
+                _ => {
+                    if current.as_object().is_none_or(|o| o.is_empty()) {
+                        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "HTTPS is off; nothing to renew");
+                    }
+                }
+            }
+            let mut probe = std::collections::BTreeMap::new();
+            probe.insert("tls".to_string(), block.clone());
+            let tcfg = match crate::server_tls::Config::from_config(&probe) {
+                Ok(c) => c,
+                Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+            };
+            if let Err(e) = rt.apply(tcfg).await {
+                return error(StatusCode::BAD_REQUEST, "invalid_request_error", e);
+            }
+            cfg["tls"] = block;
+        }
+        _ => return error(StatusCode::BAD_REQUEST, "invalid_request_error",
+                          "\"action\" must be self-signed, load, tailscale, renew or off"),
+    }
+    let mut out = rt.status().await;
+    if let Some(p) = &p {
+        match crate::settings::save(p, &cfg) {
+            Ok(_) => out["saved"] = json!(p.display().to_string()),
+            Err(e) => out["saved_error"] = json!(format!("applied, but the run config could not be written: {e}")),
+        }
+    }
+    Json(out).into_response()
+}
