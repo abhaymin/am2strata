@@ -41,6 +41,12 @@ rcgen = "0.13"
 x509-parser = "0.16"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1", "http2"] }
 jsonschema = { version = "0.30", default-features = false }
+# the live channel (live_channel.rs): the router called in-process for a request sent over the WebSocket (tower is
+# already in the build through axum), and `am2strata-run live`, a WebSocket client (the tungstenite axum uses; wss
+# through the rustls above, trusting the public roots reqwest already brings, or a certificate given with --cert)
+tower = { version = "0.5", default-features = false, features = ["util"] }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+webpki-roots = "1"
 tower-http = { version = "0.6", features = ["fs", "set-header", "catch-panic"] }
 # web_search / fetch_url: DuckDuckGo's HTML results and the text of a page (pure Rust, html5ever)
 scraper = "0.20"
@@ -52,8 +58,6 @@ libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
-# the Computer tab's WebSocket, from the tests
-tungstenite = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"

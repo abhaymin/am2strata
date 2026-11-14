@@ -210,16 +210,21 @@ pub async fn metrics(State(s): State<AppState>, headers: HeaderMap, Query(q): Qu
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    let (engine, loaded) = engine_facts(&s).await;
     // the request history: a page of it (newest first), or all of it with ?requests=all
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<usize>().ok());
     let page = if q.get("requests").is_some_and(|v| v == "all") { None }
                else { Some((num("page").unwrap_or(1), num("per").unwrap_or(crate::monitor::PAGE_DEFAULT))) };
+    Json(metrics_value(&s, page).await).into_response()
+}
+
+/// What GET /metrics answers (the live channel's "metrics" topic pushes the same).
+pub async fn metrics_value(s: &AppState, page: Option<(usize, usize)>) -> Value {
+    let (engine, loaded) = engine_facts(s).await;
     let mut m = s.mgr.monitor.metrics(engine, loaded, page);
     m["queue"] = s.mgr.queue.snapshot();
     m["prompt_snapshots"] = s.mgr.snapshots.stats();
     m["version"] = json!(env!("CARGO_PKG_VERSION"));
-    Json(m).into_response()
+    m
 }
 
 /// POST /api/monitor/clear: the Monitor's request history, its file and the media it kept. Only from this server's

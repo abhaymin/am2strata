@@ -106,7 +106,104 @@ function headers(json = false) {
   return h;
 }
 $("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); live.reconnect(); };
+
+// ------------------------------------------------------------------ the live channel (GET v1/live: ws://, or wss:// over HTTPS)
+// One WebSocket to the server for what it pushes (the Monitor's figures, the queue, jobs) and for requests, in place
+// of polling. Whatever uses it keeps its fetch as the fallback: while the socket is not connected the page polls as
+// before. The key goes in the first message (a browser cannot set headers on a WebSocket), never in the address.
+//   live.on(topic, fn)                          fn(data) at each pushed update of status | queue | jobs | workshop | metrics
+//   live.follow(topic, params) / unfollow(topic)   start or stop the pushes of a topic (on() follows it too)
+//   live.has(topic)                             true while the socket is delivering that topic (else: poll)
+//   live.request(method, path, body, onEvent)   a call to /v1/... or /api/... over the socket: a promise of
+//                                               {status, body, headers}; a streamed answer calls onEvent({data, event,
+//                                               comment}) per event; the promise has .cancel() (the model stops)
+const live = (() => {
+  const handlers = {};          // topic -> [fn]
+  const topics = new Map();     // topic -> params: what to subscribe to (again after a reconnect)
+  const got = new Set();        // topics that have delivered since they were (re)subscribed
+  const pending = new Map();    // request id -> {ok, fail, onEvent}
+  let ws = null, ready = false, refused = false, allowed = [], tries = 0, timer = null, seq = 0;
+  const address = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}v1/live`;
+  function show() {
+    const el = $("live-ind");
+    if (!el) return;                                // an older index.html (cached): no indicator
+    el.dataset.state = ready ? "on" : refused ? "off" : "wait";
+    $("live-text").textContent = ready ? "Live" : refused ? "Not live" : "Reconnecting";
+    el.title = ready ? `Live: connected (${location.protocol === "https:" ? "wss" : "ws"}); updates are pushed, nothing is polled`
+      : refused ? "Not live: the server refused the API key (Settings › Server and access). The page polls instead."
+      : "Reconnecting to the server… The page polls meanwhile.";
+  }
+  const sendNow = (o) => ws && ws.readyState === 1 && ready && (ws.send(JSON.stringify(o)), true);
+  function subscribe(topic) {
+    if (!allowed.includes(topic)) return;           // a client profile's key: the public topics only
+    const params = topics.get(topic);
+    sendNow(params ? {type: "subscribe", topics: [topic], params: {[topic]: params}} : {type: "subscribe", topics: [topic]});
+  }
+  function dropped(sock, code) {
+    if (ws !== sock) return;
+    ws = null; ready = false; refused = code === 4401; got.clear();
+    for (const p of pending.values()) p.fail(new Error("the live connection closed"));
+    pending.clear();
+    show();
+    // again after 1 s, 2 s, 4 s … 30 s (spread a little, so pages do not all return at once); a refused key waits
+    // for a new one (live.reconnect) or half a minute
+    const wait = refused ? 30000 : Math.min(30000, 1000 * 2 ** Math.min(tries, 5)) * (0.75 + Math.random() / 2);
+    tries++;
+    clearTimeout(timer);
+    timer = setTimeout(connect, wait);
+  }
+  function connect() {
+    clearTimeout(timer);
+    if (ws || !("WebSocket" in window)) return;
+    let sock;
+    try { sock = new WebSocket(address()); } catch (e) { timer = setTimeout(connect, 30000); return; }
+    ws = sock;
+    sock.onopen = () => sock.send(JSON.stringify({type: "auth", key: store.get("apikey", "")}));
+    sock.onclose = (ev) => dropped(sock, ev.code);
+    sock.onmessage = (ev) => {
+      if (ws !== sock || typeof ev.data !== "string") return;
+      let m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      if (m.type === "ready") {
+        if (ready) return;                          // (said again in answer to the key, where the server needs none)
+        ready = true; refused = false; tries = 0; allowed = m.topics || [];
+        show();
+        for (const t of topics.keys()) subscribe(t);
+      } else if (m.type === "update") {
+        got.add(m.topic);
+        for (const f of handlers[m.topic] || []) { try { f(m.data, m); } catch (e) { console.error(e); } }
+      } else if (m.id != null && pending.has(String(m.id))) {
+        const p = pending.get(String(m.id));
+        if (m.type === "event") { if (p.onEvent) { try { p.onEvent(m); } catch (e) { console.error(e); } } return; }
+        pending.delete(String(m.id));
+        if (m.type === "response" || m.type === "done") p.ok({status: m.status, body: m.body, headers: m.headers || {}, body_base64: m.body_base64, streamed: m.type === "done"});
+        else p.fail(new Error(m.type === "cancelled" ? "cancelled" : m.message || "the request failed"));
+      }
+    };
+  }
+  show();
+  connect();
+  return {
+    get connected() { return ready; },
+    on(topic, fn) { (handlers[topic] = handlers[topic] || []).push(fn); if (!topics.has(topic)) this.follow(topic); },
+    follow(topic, params = null) { topics.set(topic, params); got.delete(topic); subscribe(topic); },
+    unfollow(topic) { if (topics.delete(topic)) { got.delete(topic); sendNow({type: "unsubscribe", topics: [topic]}); } },
+    follows(topic) { return topics.has(topic); },
+    has(topic) { return ready && topics.has(topic) && got.has(topic); },
+    request(method, path, body = null, onEvent = null) {
+      const id = `r${++seq}`;
+      const p = new Promise((ok, fail) => {
+        if (!sendNow({type: "request", id, method, path: path.startsWith("/") ? path : `/${path}`, body})) { fail(new Error("the live channel is not connected")); return; }
+        pending.set(id, {ok, fail, onEvent});
+      });
+      p.cancel = () => { sendNow({type: "cancel", id}); };
+      return p;
+    },
+    // the key changed (Settings): connect again with it
+    reconnect() { if (ws) { const w = ws; dropped(w, 1000); w.close(); } tries = 0; refused = false; show(); clearTimeout(timer); connect(); },
+  };
+})();
 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
@@ -708,8 +805,22 @@ async function showReqMedia(el) {
 let reqPage = 1, reqPages = 1;
 let reqPer = (() => { const n = +store.get("req-per", 50); return [25, 50, 100, 200].includes(n) ? n : 50; })();
 let pollTimer = null;   // one poll loop: a page change polls at once and the loop goes on from there
+let liveMetricsPage = "";
+// the Monitor's figures and the header pill, pushed over the live channel: the page of the request history on show,
+// and nothing at all while this tab is in the background
+function followMetrics() {
+  if (document.hidden && live.connected) { live.unfollow("metrics"); liveMetricsPage = ""; return; }
+  const page = `${reqPage}/${reqPer}`;
+  if (page !== liveMetricsPage || !live.follows("metrics")) { liveMetricsPage = page; live.follow("metrics", {page: reqPage, per: reqPer}); }
+}
+live.on("metrics", (m) => { lastMetrics = m; metricsFailures = 0; render(m); showAlerts(m.alerts || []); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 async function poll() {
-  try {
+  followMetrics();
+  // pushed (above) while the live channel delivers; fetched as before while it does not (not connected yet, a
+  // reconnect, an older server, a proxy without WebSockets)
+  const pushed = live.has("metrics") || (document.hidden && live.connected);
+  if (!pushed) try {
     const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
       setPill("error", "API key needed");
@@ -3890,10 +4001,11 @@ async function wsFiles() {
   } catch (e) { wsError(e.message); }
 }
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; }
-async function refreshJobs() {
+// (`pushed`: the jobs as the live channel just sent them; without it they are fetched)
+async function refreshJobs(pushed = null) {
   clearTimeout(wsTimer);
   try {
-    const j = await wsFetch("v1/workshop/jobs");
+    const j = pushed || await wsFetch("v1/workshop/jobs");
     const jobs = j.jobs || [];
     $("ws-jobs").innerHTML = jobs.length ? jobs.map((x) => {
       const badge = {queued: "st-badge--reading", running: "st-badge--generating", done: "", failed: "", cancelled: ""}[x.state] ?? "";
@@ -3925,9 +4037,11 @@ async function refreshJobs() {
     // a dataset that a job just finished appears in the pickers
     const made = jobs.filter((x) => x.kind === "datagen" && x.state !== "queued").map((x) => x.output);
     if (made.some((o) => !wsKnownDatasets.split("\n").includes(o))) wsFiles();
-    if (tab === "workshop" && jobs.some((x) => x.state === "queued" || x.state === "running")) wsTimer = setTimeout(refreshJobs, 1500);
+    // while jobs run: pushed by the live channel, else asked for again
+    if (tab === "workshop" && !live.has("workshop") && jobs.some((x) => x.state === "queued" || x.state === "running")) wsTimer = setTimeout(refreshJobs, 1500);
   } catch (e) { wsError(e.message); }
 }
+live.on("workshop", (d) => { if (tab === "workshop") refreshJobs(d); });
 function fmtBytes(b) { return b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} KB`; }
 async function wsSubmit(body, btn) {
   wsError("");

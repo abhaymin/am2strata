@@ -358,6 +358,29 @@ fn pr15_the_desktop_stream_needs_the_key_before_anything() {
     assert_eq!(s.get("/api/computer/status", true).1["operator_in_control"], false, "no refused socket took control");
 }
 
+/// PR #21: the live channel is a WebSocket held to the same rule as the desktop stream: a plain request gets 401
+/// without a key and 426 with one, and another site's page is refused at the handshake.
+#[test]
+fn pr21_the_live_channel_needs_the_key_before_anything() {
+    let s = Server::start(&[client_model(json!({}))], &[ids("hi")], json!({}));
+    assert_eq!(get(&s, "/v1/live", None).status, 401);
+    assert_eq!(get(&s, "/v1/live", Some(WRONG_KEY)).status, 401);
+    assert_eq!(get(&s, "/v1/live", Some(KEY)).status, 426);
+    assert_eq!(get(&s, "/v1/live", Some(CLIENT_KEY)).status, 426, "a client key may open it (as a client)");
+    use tungstenite::client::IntoClientRequest;
+    for key in [None, Some(KEY)] {
+        let mut req = format!("ws://127.0.0.1:{}/v1/live", s.port).into_client_request().unwrap();
+        req.headers_mut().insert("origin", FOREIGN_ORIGIN.parse().unwrap());
+        if let Some(k) = key {
+            req.headers_mut().insert("authorization", format!("Bearer {k}").parse().unwrap());
+        }
+        match tungstenite::connect(req) {
+            Err(tungstenite::Error::Http(r)) => assert_eq!(r.status(), 403),
+            other => panic!("a foreign origin must be refused: {:?}", other.map(|_| ())),
+        }
+    }
+}
+
 /// PR #13 and PR #15: a client profile's key opens the model APIs and nothing of the owner's: not the Workshop
 /// (model files), not the Computer tab (the desktop), not settings, and it may not ask for the owner's priority.
 #[test]

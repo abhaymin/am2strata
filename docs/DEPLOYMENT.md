@@ -362,6 +362,95 @@ the server at start with the reason, so it never runs on plain HTTP by surprise.
 **Alternative:** `tailscale serve --https=443 http://127.0.0.1:8000` puts Tailscale's own HTTPS in front of
 am2Strata without changing it.
 
+## The live channel: ws:// and wss://
+
+One continuous WebSocket between a client and the server: the server **pushes** what changes (no polling), and the
+client can send its API requests over the same connection. The web app uses it for the Monitor tab and the header's
+status pill (the small **Live** mark beside the pill says whether it is connected) and falls back to polling by
+itself whenever the socket is not connected. Scripts, other clients and cluster nodes can use it the same way.
+
+- **Address:** `ws://<host>:8000/v1/live` on the plain-HTTP port, `wss://<host>:8001/v1/live` on the HTTPS port.
+  Both work at the same time; the plain-HTTP policy above applies to `ws://` as it does to every request.
+- **Messages:** JSON, one object per text frame, each with a `"type"`. At most 16 MB per message (larger request
+  bodies, and uploads, go over HTTP); an answer over 32 MB is refused with an error (fetch it over HTTP).
+- **Key:** the `Authorization: Bearer <key>` header, or — for a browser, which cannot set headers on a WebSocket —
+  the first message `{"type":"auth","key":"<key>"}` within 5 seconds. Never in the address. A refused key gets an
+  `error` and the socket is closed with code **4401**. A web page of another origin is refused (403) before the
+  socket opens, as for Settings (`trusted_origins` in the run config allows more origins).
+- **Who gets what:** the server's own key gets everything. A client profile's key (`"clients"` in the run config)
+  gets the topics `status` and `queue` (the queue without anyone else's jobs) and may send requests, which are
+  answered exactly as over HTTP with that key — so never the settings, the Workshop, the Computer tab or another
+  user's data.
+
+After the key is accepted the server says
+`{"type":"ready","role":"owner"|"client"|"node","topics":[...],"version":"..."}` (`topics`: what this key may follow).
+
+### Pushed updates
+
+```json
+{"type":"subscribe","topics":["status","queue"]}
+{"type":"unsubscribe","topics":["queue"]}
+```
+
+The server answers `{"type":"subscribed","topics":[...]}`, then one
+`{"type":"update","topic":"status","data":{...},"snapshot":true}` per topic (where it stands now), and after that an
+`update` (without `snapshot`) **each time that state changes** — never on a timer, never the same state twice.
+
+| Topic | `data` | Sent when |
+|---|---|---|
+| `status` | the model (`model.id`, `model.name`, `loaded`), `state` (`idle`, `reading`, `generating`, `media`, `switching`, `loading`, `unloading`, `unloaded`), `phase`, `target` (the model being switched to), `media` (kind and step), `queue` (`running`, `waiting` count), `alerts` (count) | the model is loaded, switched or unloaded; a request starts, changes phase or ends; a media job steps |
+| `queue` | what `GET /api/queue` answers: the running job and the waiting ones in order. A client profile's key gets `{"running":{"kind"},"waiting":<count>,"mine":[its own waiting jobs]}` | a job joins, takes its turn, leaves; the order changes (the `*_s` clocks are as of the push) |
+| `jobs` | `{"jobs":[...]}`: the newest 50 media jobs, each as `GET /v1/media/jobs/{id}` | a media job is queued, runs, steps, ends |
+| `workshop` | `{"jobs":[...]}`: as `GET /v1/workshop/jobs` | a Workshop job starts, reports progress, ends |
+| `metrics` | what `GET /metrics` answers (the Monitor tab's figures). Another page of the request history: `{"type":"subscribe","topics":["metrics"],"params":{"metrics":{"page":2,"per":50}}}` | about once a second while its figures move (a request runs, the hardware readings change) |
+
+`jobs`, `workshop` and `metrics` need the server's own key. Behind the topics is one task for all connections; it runs
+only while someone is subscribed (no subscriber: nothing runs), wakes when the queue or a Workshop job changes, and
+otherwise looks once a second.
+
+### Requests over the socket
+
+```json
+{"type":"request","id":"abc","method":"POST","path":"/v1/chat/completions","body":{"messages":[...],"stream":true}}
+```
+
+The request runs through the same routes as HTTP, with this connection's key, origin and address: every rule, limit,
+queue priority, client profile and the Monitor apply identically. `method` is GET (the default), POST, PUT, DELETE or
+PATCH; `path` must be under `/v1/` or `/api/` (never `/v1/live` itself); `body` is JSON; `"headers"` may carry
+`x-strata-*`, `accept`, `anthropic-version`, `anthropic-beta`, `openai-beta` and `idempotency-key` (never a key, a
+Host or an Origin). `id` is yours (a string of up to 128 characters, or a number) and comes back on every message of
+that request. Up to 32 requests may run at once on one connection.
+
+| The server sends | When |
+|---|---|
+| `{"type":"response","id":"abc","status":200,"headers":{...},"body":{...}}` | a plain answer: `body` is the JSON (text for a text answer; `body_base64` for a file). Errors are the HTTP errors, with their status |
+| `{"type":"event","id":"abc","data":{...}}` … then `{"type":"done","id":"abc","status":200}` | a streamed answer (SSE): each event's `data` (JSON, or text such as `"[DONE]"`), `"event"` when it has a name (the Anthropic and Responses streams), `"comment"` for a comment line (`queued: 2 ahead` while it waits its turn) |
+| `{"type":"cancelled","id":"abc"}` | after `{"type":"cancel","id":"abc"}`: the request is dropped as when an HTTP client disconnects (the model stops generating) and nothing more of it is sent. Closing the socket cancels every request it has running |
+| `{"type":"error","id":"abc","message":"..."}` | the message could not be run (a path outside `/v1/` and `/api/`, an id already in use, a stream that broke). Without `id`: a message that was not understood (not JSON, an unknown `type` or topic); the connection stays open |
+
+`{"type":"ping"}` is answered with `{"type":"pong","t":<unix ms>}`. The server also sends a WebSocket ping every 25 s
+(browsers and WebSocket libraries answer it by themselves) and closes a connection that has been silent for 60 s.
+
+### From a terminal
+
+```
+am2strata-run live                                   # this PC's server: status and queue, one JSON per line, until Ctrl+C
+am2strata-run live --topics status,queue,jobs,workshop,metrics
+am2strata-run live --url https://pc.tailnet.ts.net:8001          # wss://, a certificate browsers trust
+am2strata-run live --url https://192.168.1.20:8001 --cert cert.pem   # wss://, trusting that self-signed certificate
+```
+
+Each pushed `update` is one line on stdout (for `jq`, a script, another node); what the connection says (connected,
+following, errors) goes to stderr. `--api-key` / `AM2STRATA_API_KEY` and `--url` / `AM2STRATA_URL` as for the other
+commands. A self-signed server's certificate is `<data>/server-tls/cert.pem` on that server.
+
+### In the web app's code
+
+`live.on(topic, fn)` (pushed data), `live.has(topic)` (is the socket delivering it — else poll),
+`live.request(method, path, body, onEvent)` (a promise of `{status, body}`; `onEvent` per streamed event;
+`.cancel()`). It reconnects by itself (1 s, 2 s, 4 s … up to 30 s) and subscribes again. The chat itself still
+streams over `fetch` for now.
+
 ## The Workshop: training data, convert, quantize
 
 The **Workshop** tab (and `am2strata-run workshop …` in a terminal) makes models on this PC, all in Rust. Jobs run

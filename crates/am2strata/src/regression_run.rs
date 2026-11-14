@@ -443,6 +443,16 @@ fn usage(r: &mut Runner) -> Check {
     Check::Ok("answers".into())
 }
 
+/// The live channel is a WebSocket: a plain request with the key is told so (426). No socket is opened here.
+fn live_channel(r: &mut Runner) -> Check {
+    let a = tri!(r.get("/v1/live").map_err(Check::Fail));
+    match a.status {
+        426 => Check::Ok("there (a plain request is told to use a WebSocket)".into()),
+        404 | 405 => Check::Skip("this server has no live channel (/v1/live)".into()),
+        _ => Check::Fail(a.why()),
+    }
+}
+
 fn media_and_tools(r: &mut Runner) -> Check {
     let caps = tri!(ok200(r.get("/api/media/capabilities")));
     let mcp = tri!(ok200(r.get("/mcp")));
@@ -491,6 +501,7 @@ const CHECKS: &[(&str, bool, CheckFn)] = &[
     ("Computer status", false, computer),
     ("VM status", false, vm),
     ("usage", false, usage),
+    ("live channel", false, live_channel),
     ("media, MCP, memory", true, media_and_tools),
 ];
 

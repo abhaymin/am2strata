@@ -21,6 +21,7 @@ mod api_monitor;
 mod api_keys;
 mod audio_api;
 mod langdetect;
+mod live_channel;
 mod music;
 mod code_run;
 mod image_gen;
@@ -624,6 +625,8 @@ async fn main() -> Result<()> {
         .route("/api/monitor/media/{name}", get(web::monitor_media))
         .route("/metrics/prometheus", get(web::prometheus))
         .route("/v1/status", get(web::status))
+        // the live channel: one WebSocket for pushed updates and requests (live_channel.rs)
+        .route("/v1/live", get(live_channel::live))
         // the web app: the page at /, its files under /web/ (as PolyStrata serves them), the monitor at /api-monitor
         .route_service("/", ServeFile::new(web_dir.join("index.html")))
         .route_service("/api-monitor", ServeFile::new(web_dir.join("monitor.html")))
@@ -668,6 +671,7 @@ async fn main() -> Result<()> {
     let worker_tls = if cluster.role == cluster::Role::Worker { cluster.tls_port(port) } else { None };
     let tls_rt = server_tls::Runtime::init(expand(&args.data_dir), host.clone(), port, worker_tls);
     tls_rt.set_app(app.clone());
+    live_channel::set_app(app.clone());
     if tls_cfg.is_some() {
         if let Err(e) = tls_rt.apply(tls_cfg).await {
             tracing::error!("https: not started: {e} (plain HTTP keeps working as before)");

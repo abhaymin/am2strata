@@ -21,8 +21,8 @@ harness in `tests/common/`), each test its own server on its own port in its own
 
 ### Route contracts
 
-`ROUTES` in `regression_api.rs` has one row for every method of every route the server registers (138 rows
-for 117 paths today). A row says who may call the route (no key / a client key / the owner's key only / its
+`ROUTES` in `regression_api.rs` has one row for every method of every route the server registers (139 rows
+for 118 paths today). A row says who may call the route (no key / a client key / the owner's key only / its
 own proof) and the status each caller gets:
 
 1. no key
@@ -78,6 +78,7 @@ One named test per class of bug, each with the pull request it came from:
 | The desktop WebSocket without the key (401, 426, 403, no frame) | PR #15 | `pr15_the_desktop_stream_needs_the_key_before_anything` |
 | A client key on owner routes (Workshop, Computer, VM, keys, settings) | PR #13, #15 | `pr13_pr15_a_client_key_is_refused_on_every_owner_route` |
 | A generated key acting as the owner; a revoked key still working | PR #19 | `pr19_a_generated_key_is_a_client_key_and_a_revoked_one_opens_nothing` |
+| The live channel's WebSocket without the key, or from another site | PR #21 | `pr21_the_live_channel_needs_the_key_before_anything` |
 | DNS rebinding (a `Host` this server does not answer to) | cf65b1a | `security_a_rebound_host_is_refused_before_anything_else` |
 | Numbers from requests trusted instead of clamped | PR #16, dae5323 | `numbers_from_requests_are_clamped_not_trusted` |
 | Tests changing the process environment | PR #14 | `pr14_no_test_changes_the_process_environment` |
@@ -125,7 +126,7 @@ Rows: health; the API key is needed; models list; chat; chat, streamed; messages
 (stateless, and with `--full` a call); Gemini (lists and countTokens, and with `--full` generateContent);
 tool round trip (`--full`); errors; metrics; queue; status and system; web app; HTTPS and HSTS (when TLS is
 on: the HTTPS port answers and carries HSTS; plain HTTP never does); Workshop files; Computer status; VM
-status; usage; media, MCP and memory (`--full`).
+status; usage; live channel; media, MCP and memory (`--full`).
 
 ## Running it
 

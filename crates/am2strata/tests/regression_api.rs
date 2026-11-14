@@ -305,6 +305,7 @@ const ROUTES: &[Row] = &[
     row("DELETE", "/api/keys/{id}", Owner).at("/api/keys/nope").ok(404),
     row("GET", "/api/usage", Owner),
     row("GET", "/v1/usage", Client).note("each key reads its own usage"),
+    row("GET", "/v1/live", Client).ok(426).note("a WebSocket (the live channel): a plain request gets 401 without a key, 426 with one"),
     // ------------------------------------------------------------------------------------------------ the web app
     row("GET", "/", Public),
     row("GET", "/api-monitor", Public),
