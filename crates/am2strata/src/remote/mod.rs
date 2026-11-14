@@ -34,6 +34,8 @@ use tokio::sync::{mpsc, Semaphore};
 const LIST_FOR: Duration = Duration::from_secs(600);
 /// How long a failed model list is kept before it is asked again.
 const FAILED_LIST_FOR: Duration = Duration::from_secs(60);
+/// A provider silent this long: the client is sent a keep-alive (one that left ends the call).
+const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
 pub struct Remote {
     cfg: RwLock<Option<Config>>,
@@ -197,7 +199,8 @@ fn is_mix_name(model: &str) -> bool {
 /// For api_keys.rs's check of a generated key's list; false while the feature is off.
 pub fn grant_covers(grant: &str, model: &str) -> bool {
     let Some((_, c)) = on() else { return false };
-    covers(&c, grant, model)
+    // a Gemini path's model comes percent-encoded (openai%2Fgpt-5.5)
+    covers(&c, grant, &percent_decoded(model))
 }
 
 fn covers(c: &Config, grant: &str, model: &str) -> bool {
@@ -592,10 +595,20 @@ impl RemoteRound {
         let mut stream = resp.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut complete = false;
+        // something goes to the client at least every KEEP_ALIVE (a Ping when the provider sends no data, only its own
+        // keep-alives or nothing), so a client that left is noticed and the call ends
+        let mut last_sent = Instant::now();
         loop {
             let chunk = tokio::select! {
                 c = stream.next() => c,
                 _ = tx.closed() => return,
+                _ = tokio::time::sleep_until((last_sent + KEEP_ALIVE).into()) => {
+                    if tx.send(RunEvent::Ping).await.is_err() {
+                        return;
+                    }
+                    last_sent = Instant::now();
+                    continue;
+                }
             };
             match chunk {
                 None => break,
@@ -624,7 +637,14 @@ impl RemoteRound {
                     if tx.send(e).await.is_err() || stop {
                         return;
                     }
+                    last_sent = Instant::now();
                 }
+            }
+            if last_sent.elapsed() >= KEEP_ALIVE {
+                if tx.send(RunEvent::Ping).await.is_err() {
+                    return;
+                }
+                last_sent = Instant::now();
             }
         }
         let evs = match self.p.kind {
