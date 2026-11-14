@@ -30,9 +30,14 @@ use serde_json::{json, Value};
 use crate::model::{BaseDtype, Family, LoraSpec, ModelConfig, Target};
 
 /// Share of a raw matrix-product benchmark that training really reaches on the CPU (the rest goes to memory traffic
-/// and small operations). Measured with an f32 or bf16 base on a 12-block, 27 M-parameter model (docs/DEPLOYMENT.md:
-/// 12.8 s for an estimate of 15 s at this value); an f16 base ran about twice as slow there (candle widens f16 slowly).
-pub const CPU_TRAINING_EFFICIENCY: f64 = 0.6;
+/// and small operations), by how the base is held. Measured on a 12-block, 27 M-parameter model (docs/DEPLOYMENT.md):
+/// f32 12.8 s and bf16 12.9 s for an estimate of 15 s at 0.6; f16 25.9 s, twice as slow (candle widens f16 slowly).
+pub fn cpu_training_efficiency(dtype: BaseDtype) -> f64 {
+    match dtype {
+        BaseDtype::F32 | BaseDtype::BF16 => 0.6,
+        BaseDtype::F16 => 0.3,
+    }
+}
 /// A 16 GB-class GPU's training throughput in GFLOP/s. **Assumed, not measured**: no GPU run is part of this trainer yet.
 pub const ASSUMED_GPU_GFLOPS: f64 = 1500.0;
 /// Room left for the process itself, the tokenizer and the allocator on top of the estimate.
@@ -75,6 +80,8 @@ pub struct Estimate {
     pub steps: usize,
     /// floating-point operations for the whole run
     pub flops: f64,
+    /// how the base is held (the CPU's speed depends on it)
+    pub base_dtype: BaseDtype,
 }
 
 /// f32 values per token that one trained block keeps for the backward pass, counted from `model.rs`'s forward:
@@ -148,7 +155,7 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
         optimizer_bytes: 2 * adapter, gradient_bytes: 2 * adapter, activation_bytes: activations, widening_bytes: widening, fill_bytes: fill,
         total_bytes: (weights + 5 * adapter + activations + widening).max(fill),
         cache_disk_bytes: if cached { (p.examples * p.avg_tokens.clamp(2, seq) * cfg.hidden_size * 4) as u64 } else { 0 },
-        steps, flops,
+        steps, flops, base_dtype: p.base_dtype,
     }
 }
 
@@ -235,7 +242,7 @@ pub fn need_bytes(e: &Estimate) -> u64 {
 }
 
 pub fn cpu_seconds(e: &Estimate, cpu_gflops: f64) -> f64 {
-    e.flops / (cpu_gflops.max(0.01) * CPU_TRAINING_EFFICIENCY * 1e9)
+    e.flops / (cpu_gflops.max(0.01) * cpu_training_efficiency(e.base_dtype) * 1e9)
 }
 
 pub fn verdict(e: &Estimate, m: &Machine) -> Verdict {
@@ -276,7 +283,7 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
                          human_bytes(e.cache_disk_bytes), p.cfg.num_hidden_layers - e.trained_blocks, human_bytes(e.fill_bytes)));
     }
     out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on a 16 GB-class GPU (assumed {:.0} GFLOP/s, not measured — GPU runs are not part of this trainer yet)",
-                     e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * CPU_TRAINING_EFFICIENCY, human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
+                     e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
     out.push(match v.fits_ram {
         Some(true) => format!("fits: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         Some(false) => format!("DOES NOT FIT: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),

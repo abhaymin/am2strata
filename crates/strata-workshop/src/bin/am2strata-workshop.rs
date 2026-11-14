@@ -502,7 +502,7 @@ fn training_event(out: &Out, e: Event) {
 fn install_term_handler() {
     // a cancel (SIGTERM from the server) is noticed after the current step: a checkpoint is written, then the run ends
     #[cfg(unix)]
-    unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t); }
+    unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t); }
 }
 
 fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
@@ -682,7 +682,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             out.event(json!({"event": "start", "what": format!("{} data with {} into {}", recipe, model.name, dst.display())}));
             // a cancel (SIGTERM from the server) stops after the current request and still writes what was made
             #[cfg(unix)]
-            unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t); }
+            unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t); }
             let r = datagen::run(&settings, &model,
                 |done, total, msg| out.event(json!({"event": "progress", "done": done, "total": total, "message": msg})),
                 || TERM.load(std::sync::atomic::Ordering::SeqCst)).map_err(|e| e.to_string())?;

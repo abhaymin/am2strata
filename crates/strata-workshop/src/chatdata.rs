@@ -174,28 +174,37 @@ impl ChatTokenizer {
         let messages: Vec<Value> = record.messages.iter().map(|(r, c)| json!({"role": r, "content": c})).collect();
         let full = self.render(&messages, false)?;
         let mut spans = Vec::new();
-        let mut from = 0usize;
+        // Where the text of message i can start: the end of the last message found. Every message moves it, not only
+        // the assistant's, so an answer that a user turn (or the system prompt) quotes is found where the assistant
+        // says it, never in the quote.
+        let mut cursor = 0usize;
         for (i, (role, content)) in record.messages.iter().enumerate() {
             if role != "assistant" {
+                // a template may drop or rewrite a message (a system prompt folded into the first turn): then it moves
+                // nothing, and the next message is searched from where we are
+                if let Some(p) = (!content.is_empty()).then(|| full[cursor..].find(content.as_str())).flatten() {
+                    cursor += p + content.len();
+                }
                 continue;
             }
             // the text up to this answer, and up to the end of this answer
             let before = self.render(&messages[..i], true)?;
             let through = self.render(&messages[..=i], false)?;
-            let span = if through.starts_with(&before) && full.starts_with(&through) && through.len() > before.len() {
+            let span = if through.starts_with(&before) && full.starts_with(&through) && through.len() > before.len() && before.len() >= cursor {
                 // trailing white space after the end-of-turn marker (ChatML's newline) is the next turn's business
                 let end = before.len() + through[before.len()..].trim_end().len();
                 (before.len(), end)
             } else {
-                // a template that rewrites earlier turns (or adds nothing for the prompt): find the answer's own text
-                let at = full[from..].find(content.as_str()).map(|p| p + from)
+                // a template whose generation prompt is not how it writes past answers (or that rewrites earlier
+                // turns): find the answer's own text, after everything said before it
+                let at = full[cursor..].find(content.as_str()).map(|p| p + cursor)
                     .ok_or_else(|| anyhow!("the chat template does not write assistant message {i} as it is; cannot tell which tokens to score"))?;
                 (at, at + content.len())
             };
             if span.1 <= span.0 {
                 bail!("assistant message {i} is empty");
             }
-            from = span.1;
+            cursor = span.1;
             spans.push(span);
         }
         if spans.is_empty() {

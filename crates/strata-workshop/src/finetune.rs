@@ -290,7 +290,9 @@ impl ActCache {
         std::fs::create_dir_all(&work)?;
         let part = |i: usize| work.join(format!("{i}.safetensors"));
         let save = |i: usize, h: &Tensor| -> Result<()> { Ok(candle_core::safetensors::save(&HashMap::from([("h".to_string(), h.clone())]), part(i))?) };
-        let total = examples.len() * (first_trained + 1);
+        // per conversation: the embeddings pass, then one pass per frozen block
+        let passes_per_example = 1 + first_trained;
+        let total = examples.len() * passes_per_example;
         let mut done = 0;
         let mut tick = |on_event: &mut dyn FnMut(Event)| {
             done += 1;

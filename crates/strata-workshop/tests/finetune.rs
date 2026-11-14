@@ -211,3 +211,42 @@ fn a_step_is_the_mean_over_its_conversations() {
     assert!((together.losses[0] - mean).abs() < 1e-5, "{} vs the mean {mean}", together.losses[0]);
     assert!(singles.losses.iter().any(|l| (l - mean).abs() > 1e-3), "the four losses are not all alike, so the mean means something");
 }
+
+#[test]
+fn an_answer_quoted_earlier_is_scored_where_the_assistant_says_it() {
+    // a user turn quotes the answer before the assistant gives it, and quotes the first answer again before the
+    // second, identical one: each span must be the assistant's own words, never a quote
+    let (root, model, _data) = common::model_and_data("quote");
+    let rec = Record { messages: vec![
+        ("user".into(), "Repeat after me: It is white.".into()), ("assistant".into(), "It is white.".into()),
+        ("user".into(), "You said It is white. Say It is white. again.".into()), ("assistant".into(), "It is white.".into()),
+    ] };
+    // ChatML renders its generation prompt as it writes past answers: the prefix difference finds the spans.
+    // A Qwen3-style template adds an empty think block to the generation prompt only, which past answers do not
+    // have: the prefix difference does not apply, and the spans are found in the text after what came before.
+    let think = root.join("think");
+    std::fs::create_dir_all(&think).unwrap();
+    for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "model.safetensors", "model-00001-of-00001.safetensors"] {
+        if model.join(f).exists() {
+            std::fs::copy(model.join(f), think.join(f)).unwrap();
+        }
+    }
+    std::fs::write(think.join("chat_template.jinja"), "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n' }}{% endfor %}\
+        {% if add_generation_prompt %}{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}{% endif %}").unwrap();
+    for (dir, marker) in [(&model, "<|im_end|>"), (&think, "")] {
+        let tok = ChatTokenizer::load(dir, None).unwrap();
+        let (text, spans) = tok.render_with_spans(&rec).unwrap();
+        assert_eq!(spans.len(), 2);
+        let turns: Vec<usize> = text.match_indices("<|im_start|>").map(|(p, _)| p).collect();
+        for (k, (s, e)) in spans.iter().enumerate() {
+            assert_eq!(&text[*s..*e], format!("It is white.{marker}"), "{}: span {k}", dir.display());
+            // inside the assistant's own turn (turns 1 and 3), after the user turn that quotes it
+            let turn = [1, 3][k];
+            assert!(*s > turns[turn] && turns.get(turn + 1).map_or(true, |next| *e < *next), "{}: span {k} at {s}..{e}, turns at {turns:?}", dir.display());
+        }
+        // the scored tokens decode to the two answers only
+        let ex = tok.encode(&rec, 512, false).unwrap();
+        let scored: Vec<u32> = ex.tokens.iter().zip(&ex.supervised).filter(|(_, s)| **s).map(|(t, _)| *t).collect();
+        assert_eq!(tok.decode(&scored).unwrap(), format!("It is white.{marker}It is white.{marker}"), "{}", dir.display());
+    }
+}

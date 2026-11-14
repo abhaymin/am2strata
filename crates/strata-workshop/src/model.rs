@@ -447,6 +447,8 @@ impl Linear {
         // FrozenLinear sends the gradient to the input only.
         let wide = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
         let value = x.detach().matmul(&wide.t()?)?;
+        // not redundant: `wide` would otherwise live to the end of this function; for a 16-bit base it is a fresh f32
+        // copy of the whole weight, freed here before the graph node and the bias add allocate (a lower peak)
         drop(wide);
         let y = if x.track_op() { x.apply_op1(FrozenLinear { y: Mutex::new(Some(value)), w: self.w.clone() })? } else { value };
         Ok(match &self.bias {

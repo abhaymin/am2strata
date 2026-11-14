@@ -132,10 +132,20 @@ fn the_verdict_compares_with_free_memory() {
     assert_eq!(m.gpus[1].free_bytes, 4096 << 20);
     assert_eq!(profile::verdict(&e, &m).fits_gpu, vec![(0, true), (1, false)]);
     // time: operations over (GFLOP/s × the share training reaches)
-    assert_eq!(profile::cpu_seconds(&e, 100.0), e.flops / (100.0 * profile::CPU_TRAINING_EFFICIENCY * 1e9));
+    assert_eq!(profile::cpu_seconds(&e, 100.0), e.flops / (100.0 * profile::cpu_training_efficiency(BaseDtype::F16) * 1e9));
     let lines = profile::report_lines(&p, &e, &m).join("\n");
     assert!(lines.contains("524288 adapter parameters") && lines.contains("fits: needs") && lines.contains("would not fit") && lines.contains("not measured"), "{lines}");
     assert_eq!(profile::parse_meminfo("MemTotal:       61712345 kB\nMemFree: 1 kB\nMemAvailable:   20000000 kB\n"), (61712345 * 1024, 20000000 * 1024));
+}
+
+#[test]
+fn the_time_estimate_depends_on_how_the_base_is_held() {
+    // the same work: f16 ran twice as long as f32 and bf16 on this CPU (docs/DEPLOYMENT.md), and the estimate says so
+    let at = |dtype| profile::cpu_seconds(&profile::estimate(&input(tiny(), 4, None, dtype, 16, false)), 100.0);
+    let (f32_s, bf16_s, f16_s) = (at(BaseDtype::F32), at(BaseDtype::BF16), at(BaseDtype::F16));
+    assert_eq!(f32_s, 27_648_000.0 / (100.0 * 0.6 * 1e9));
+    assert_eq!(bf16_s, f32_s, "the same operations at the same speed");
+    assert!((f16_s / f32_s - 2.0).abs() < 1e-12, "f16 {f16_s} s against f32 {f32_s} s");
 }
 
 #[test]
