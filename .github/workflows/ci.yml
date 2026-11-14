@@ -1,4 +1,5 @@
-# Runs on Linux only, and only when code changes: Windows and macOS build in release.yml, on a version tag.
+# Runs when code changes. The whole suite runs on Linux; the other platforms are compiled, and one macOS and one Windows
+# runner also run the regression targets. Everything runs everywhere in release.yml, on a version tag.
 name: CI
 on:
   push:
@@ -78,9 +79,10 @@ jobs:
           # Windows Arm64 bundle, and its Linux Arm64 bundle does not unpack where the build expects it. So those three
           # get the engine without `gpu`: it runs models on the CPU, and --devices is refused there.
           - { os: ubuntu-22.04-arm, label: linux-arm64, engine: "" }
-          - { os: macos-15, label: macos-arm64, engine: "--features gpu" }
+          # run: also RUN the fast regression targets there (one macOS, one Windows), not only compile them
+          - { os: macos-15, label: macos-arm64, engine: "--features gpu", run: true }
           - { os: macos-15-intel, label: macos-x86_64, engine: "" }
-          - { os: windows-2022, label: windows-x86_64, engine: "--features gpu" }
+          - { os: windows-2022, label: windows-x86_64, engine: "--features gpu", run: true }
           - { os: windows-11-arm, label: windows-arm64, engine: "" }
     steps:
       - uses: actions/checkout@v4
@@ -92,7 +94,15 @@ jobs:
             crates/strata-hybrid
           # pull requests read the cache and do not add to it
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # checked for compilation, not run (the tests run on Linux above, and everywhere in release.yml): the OS-specific
-      # code is all gated on `target_os` / `unix` / `windows`.
+      # everything is checked for compilation here (the OS-specific code is gated on `target_os` / `unix` / `windows`);
+      # the whole suite runs on Linux above and on every platform in release.yml, and on macOS and Windows the fast
+      # regression targets also run below.
       - run: cargo check --locked --workspace --tests
       - run: cargo check --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features ${{ matrix.engine }}
+      # Compiling is not enough: the first full release test run after these tests were written failed on macOS and
+      # Windows only (routes and a desktop that exist on Linux only, `\r\n` checkouts, a `#!/bin/sh` stand-in), and only
+      # release.yml would have said so, on a version tag. So the tests that talk to a real server about what each
+      # platform has are run on one macOS and one Windows runner before a merge.
+      - name: the regression targets, run on this platform
+        if: matrix.run
+        run: cargo test --locked -p am2strata --test regression_api --test regression_bugs --test regression_shapes --test vm_api --test computer_tab -- --test-threads=4

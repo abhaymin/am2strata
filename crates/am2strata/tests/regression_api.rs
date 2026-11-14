@@ -391,6 +391,12 @@ fn excerpt(a: &Answer) -> String {
     a.text.chars().take(160).collect::<String>().replace('\n', " ")
 }
 
+/// A 501 that says a feature is not installed on this machine (`error.type` "not_available"): a correct answer, not a
+/// server failure. The suite must pass wherever the server runs, not only where every optional tool is installed.
+fn not_installed(a: &Answer) -> bool {
+    a.status == 501 && a.json()["error"]["type"] == "not_available"
+}
+
 /// THE WALK: every row, every kind of caller. All mismatches are reported together.
 #[test]
 fn every_route_answers_each_caller_as_its_row_says() {
@@ -401,7 +407,10 @@ fn every_route_answers_each_caller_as_its_row_says() {
         let name = format!("{} {}", r.method, r.path);
         let mut check = |what: &str, want: u16, a: Answer| {
             checks += 1;
-            if a.status != want {
+            // a caller who may use the route, on a machine where the feature behind it is not installed (the release
+            // runners have no bubblewrap; macOS and Windows never do): "not available" is the right answer there
+            let owner_call = matches!(what, "owner key" | "malformed body") || (what == "foreign origin" && want != 403);
+            if a.status != want && !(owner_call && not_installed(&a)) {
                 wrong.borrow_mut().push(format!("{name} [{what}]: expected {want}, got {} ({})", a.status, excerpt(&a)));
             }
             a
@@ -464,7 +473,7 @@ fn wrong_typed_json_is_refused_never_a_500() {
         for j in &junk {
             let a = Req::new(r.method, &s.base, r.path).key(Some(KEY)).json(j).send();
             checks += 1;
-            if a.status >= 500 && !ALLOWED_5XX.iter().any(|(m, p, code, _)| *m == r.method && *p == r.route && *code == a.status) {
+            if a.status >= 500 && !not_installed(&a) && !ALLOWED_5XX.iter().any(|(m, p, code, _)| *m == r.method && *p == r.route && *code == a.status) {
                 wrong.push(format!("{} {} with {}: {} ({})", r.method, r.path, j.to_string().chars().take(60).collect::<String>(), a.status, excerpt(&a)));
             }
         }

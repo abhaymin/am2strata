@@ -2,12 +2,32 @@
 //! are checked before anything runs, settings are kept and clamped, and a start without the Debian image says what is
 //! missing. (Booting a real VM needs KVM and the 326 MB image: tested by hand, see docs/DEPLOYMENT.md.)
 
+//!
+//! The VM (`computer/vm`, QEMU with KVM) and its `/api/vm…` routes exist on Linux only: that test is Linux's, and
+//! everywhere else the routes are checked to be absent (a plain 404, with or without the key).
+
 mod common;
 
 use common::*;
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+/// Not Linux: `computer::vm_routes()` is an empty router, so there is no such route for anyone.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn there_are_no_vm_routes_where_there_is_no_vm() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    for auth in [false, true] {
+        assert_eq!(s.get("/api/vm", auth).0, 404, "GET /api/vm (key: {auth})");
+        assert_eq!(s.get("/api/vm/apps", auth).0, 404, "GET /api/vm/apps (key: {auth})");
+    }
+    assert_eq!(s.post("/api/vm", &json!({"action": "start"})).0, 404, "nothing to start");
+    assert_eq!(s.post("/api/vm/exec", &json!({"command": "id"})).0, 404, "nothing to run a command in");
+}
+
+// Linux only: the sandbox VM and its routes exist nowhere else.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_vm_api_is_owner_only_checks_requests_and_explains_what_is_missing() {
     let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));

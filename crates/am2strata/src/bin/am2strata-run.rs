@@ -308,6 +308,9 @@ enum Cmd {
         /// the result as JSON
         #[arg(long)]
         json: bool,
+        /// trust a certificate that cannot be verified (a self-signed one) on a server that is not this PC
+        #[arg(long)]
+        insecure: bool,
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
@@ -827,7 +830,7 @@ fn main() -> ExitCode {
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
-        Cmd::Regression { url, api_key, quick: _, full, json, models_dir } => {
+        Cmd::Regression { url, api_key, quick: _, full, json, insecure, models_dir } => {
             // the run configs are read only for what was not given (a server elsewhere needs none of them)
             let from_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
             let (url, key) = match (url.or_else(|| from_env("AM2STRATA_URL")), api_key.or_else(|| from_env("AM2STRATA_API_KEY"))) {
@@ -839,7 +842,7 @@ fn main() -> ExitCode {
                     (u.unwrap_or(local_url), k.or(if local { local_key } else { None }))
                 }
             };
-            if regression_run::run(regression_run::Options { url, key, full, json }) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+            if regression_run::run(regression_run::Options { url, key, full, json, insecure }) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
         Cmd::Vm { action, args, kind, root, lists, yes, no_wait, url, api_key, models_dir } =>

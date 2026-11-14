@@ -441,9 +441,12 @@ fn pr19_a_generated_key_is_a_client_key_and_a_revoked_one_opens_nothing() {
     let (key, id) = (made["key"].as_str().unwrap().to_string(), made["id"].as_str().unwrap().to_string());
     assert_eq!(get(&s, "/v1/models", Some(&key)).status, 200, "the new key opens the model APIs");
     assert_eq!(get(&s, "/v1/usage", Some(&key)).status, 200, "and its own usage");
-    for path in ["/api/keys", "/api/usage", "/settings", "/config", "/v1/workshop/files", "/api/computer/status", "/api/clients", "/api/vm"] {
+    for path in ["/api/keys", "/api/usage", "/settings", "/config", "/v1/workshop/files", "/api/computer/status", "/api/clients"] {
         assert_eq!(get(&s, path, Some(&key)).status, 401, "{path} with a generated key");
     }
+    // the sandbox VM's routes exist on Linux only (computer::vm_routes): refused there, no such route elsewhere
+    let vm = if cfg!(target_os = "linux") { 401 } else { 404 };
+    assert_eq!(get(&s, "/api/vm", Some(&key)).status, vm, "/api/vm with a generated key");
     for (method, path) in [("POST", "/api/keys"), ("POST", &*format!("/api/keys/{id}")), ("DELETE", &*format!("/api/keys/{id}"))] {
         let a = Req::new(method, &s.base, path).key(Some(&key)).json(&json!({"name": "more"})).send();
         assert_eq!(a.status, 401, "{method} {path}: a key may not make, change or revoke keys (itself included)");

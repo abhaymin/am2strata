@@ -125,14 +125,17 @@ const live = (() => {
   const pending = new Map();    // request id -> {ok, fail, onEvent}
   let ws = null, ready = false, refused = false, allowed = [], tries = 0, timer = null, seq = 0;
   const address = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}v1/live`;
+  let everLive = false;
   function show() {
     const el = $("live-ind");
     if (!el) return;                                // an older index.html (cached): no indicator
     el.dataset.state = ready ? "on" : refused ? "off" : "wait";
-    $("live-text").textContent = ready ? "Live" : refused ? "Not live" : "Reconnecting";
+    if (ready) everLive = true;
+    const waiting = everLive ? "Reconnecting" : "Connecting";
+    $("live-text").textContent = ready ? "Live" : refused ? "Not live" : waiting;
     el.title = ready ? `Live: connected (${location.protocol === "https:" ? "wss" : "ws"}); updates are pushed, nothing is polled`
       : refused ? "Not live: the server refused the API key (Settings › Server and access). The page polls instead."
-      : "Reconnecting to the server… The page polls meanwhile.";
+      : `${waiting} to the server… The page polls meanwhile.`;
   }
   const sendNow = (o) => ws && ws.readyState === 1 && ready && (ws.send(JSON.stringify(o)), true);
   function subscribe(topic) {
@@ -816,10 +819,11 @@ function followMetrics() {
 live.on("metrics", (m) => { lastMetrics = m; metricsFailures = 0; render(m); showAlerts(m.alerts || []); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 async function poll() {
+  if (document.hidden) return;   // a tab in the background fetches nothing: it catches up when shown (visibilitychange)
   followMetrics();
   // pushed (above) while the live channel delivers; fetched as before while it does not (not connected yet, a
   // reconnect, an older server, a proxy without WebSockets)
-  const pushed = live.has("metrics") || (document.hidden && live.connected);
+  const pushed = live.has("metrics");
   if (!pushed) try {
     const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
@@ -4186,7 +4190,7 @@ function cvConnect() {
   ws.onmessage = async (ev) => {
     if (typeof ev.data !== "string") {
       const bmp = await createImageBitmap(ev.data);
-      if (cvCanvas.width !== bmp.width || cvCanvas.height !== bmp.height) { cvCanvas.width = bmp.width; cvCanvas.height = bmp.height; }
+      if (cvCanvas.width !== bmp.width || cvCanvas.height !== bmp.height) { cvCanvas.width = bmp.width; cvCanvas.height = bmp.height; cvFit(); }
       cvCanvas.getContext("2d").drawImage(bmp, 0, 0);
       return;
     }
@@ -4211,6 +4215,8 @@ function cvRender(m) {
   $("cv-take").textContent = you ? "Hand back" : "Take control";
   $("cv-take").className = `st-btn ${you ? "st-btn--danger" : "st-btn--primary"}`;
   cvCanvas.classList.toggle("cv-live", you);
+  $("cv-fit").hidden = m.target !== "vm";
+  if (m.target === "vm" && you) cvFollowSize();
   if (m.target === "vm") { vmFillOpen(); return; }
   const sel = $("cv-app");
   sel.innerHTML = '<option value="">Open an app…</option>' + (m.apps || []).map((a) => `<option>${esc(a)}</option>`).join("");
@@ -4235,6 +4241,44 @@ $("cv-app").onchange = async () => {
   const r = await fetch("api/computer/open", {method: "POST", headers: {...headers(), "Content-Type": "application/json"}, body: JSON.stringify({app})});
   if (!r.ok) cvErr((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
 };
+// The picture as large as its space allows, keeping its shape (it is scaled up as well as down).
+const cvScreen = cvCanvas.parentElement;
+function cvFit() {
+  const w = cvCanvas.width, h = cvCanvas.height, cw = cvScreen.clientWidth, ch = cvScreen.clientHeight;
+  if (!w || !h || !cw || !ch) return;
+  const k = Math.min(cw / w, ch / h);
+  cvCanvas.style.width = `${Math.floor(w * k)}px`;
+  cvCanvas.style.height = `${Math.floor(h * k)}px`;
+}
+// While you have control of the VM, its screen follows this space's size by itself (a moment after the last change,
+// and only when it differs by more than a few pixels, so it settles after one step)
+let cvSizeTimer = null;
+function cvFollowSize() {
+  clearTimeout(cvSizeTimer);
+  cvSizeTimer = setTimeout(() => {
+    if (cvState?.target !== "vm" || !cvState.operator_in_control || tab !== "computer") return;
+    const cw = cvScreen.clientWidth, ch = cvScreen.clientHeight;
+    if (cw < 400 || ch < 300) return;
+    if (Math.abs(cw - cvCanvas.width) > 16 || Math.abs(ch - cvCanvas.height) > 16) cvSend({type: "resize", width: cw, height: ch});
+  }, 700);
+}
+new ResizeObserver(() => { cvFit(); cvFollowSize(); }).observe(cvScreen);
+// "Fit to window": the VM's own screen takes this space's size, so it is sharp and has no bars
+function cvAskSize() {
+  if (cvState?.target !== "vm") return;
+  if (!cvState.operator_in_control) { toast("info", "Desktop", "Take control first, then fit the desktop to the window."); return; }
+  cvSend({type: "resize", width: cvScreen.clientWidth, height: cvScreen.clientHeight});
+}
+$("cv-fit").onclick = cvAskSize;
+$("cv-full").onclick = () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else cvScreen.requestFullscreen?.().then(() => cvCanvas.focus()).catch((e) => cvErr(`Full screen was refused: ${e.message}`));
+};
+document.addEventListener("fullscreenchange", () => {
+  $("cv-full").textContent = document.fullscreenElement ? "Leave full screen" : "Full screen";
+  // on the whole screen the VM's desktop takes the screen's size; the picture is fitted either way
+  setTimeout(() => { cvFit(); if (document.fullscreenElement === cvScreen && cvState?.target === "vm" && cvState.operator_in_control) cvAskSize(); }, 150);
+});
 function cvXY(e) {
   const r = cvCanvas.getBoundingClientRect();
   return {x: Math.round((e.clientX - r.left) * cvCanvas.width / r.width), y: Math.round((e.clientY - r.top) * cvCanvas.height / r.height)};

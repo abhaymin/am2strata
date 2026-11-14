@@ -18,6 +18,17 @@ pub struct Options {
     pub key: Option<String>,
     pub full: bool,
     pub json: bool,
+    /// accept a certificate that cannot be verified (a self-signed one) on a server that is not this PC
+    pub insecure: bool,
+}
+
+/// Whether `url` is this PC (localhost or a loopback address): its certificate is the one made here.
+pub fn is_this_pc(url: &str) -> bool {
+    // parsed as the HTTP client parses it, so what is judged here is the host that is really contacted (a URL such
+    // as https://localhost:8001@evil.example names evil.example, with "localhost" as a user name)
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    let host = u.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -511,8 +522,9 @@ pub const QUICK_MODEL_CALLS: usize = 3;
 /// Run the checklist and print it. True when nothing failed.
 pub fn run(o: Options) -> bool {
     let http = match reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none())
-        // a self-signed certificate is the usual one on a home server: the same trust the browser was given by hand
-        .danger_accept_invalid_certs(o.url.starts_with("https://")).build() {
+        // the certificate is checked (the API key travels on this connection), except on this PC itself, whose
+        // self-signed certificate was made here, or when --insecure says to trust another server's
+        .danger_accept_invalid_certs(o.url.starts_with("https://") && (o.insecure || is_this_pc(&o.url))).build() {
         Ok(c) => c,
         Err(e) => { eprintln!("regression: {e}"); return false; }
     };
@@ -556,4 +568,22 @@ pub fn run(o: Options) -> bool {
         println!("{passed} passed, {failed} failed, {skipped} skipped; {} model calls; {:.1} s", r.model_calls, started.elapsed().as_secs_f64());
     }
     failed == 0
+}
+
+#[cfg(test)]
+mod this_pc_tests {
+    use super::is_this_pc;
+
+    /// The runner skips certificate checks only for this PC (regress: it used to skip them for every https:// URL,
+    /// sending the API key to a server it had not verified).
+    #[test]
+    fn regress_only_this_pc_is_trusted_without_a_checked_certificate() {
+        for u in ["https://localhost:8001", "https://127.0.0.1:8001/", "https://[::1]:8001/x", "http://LOCALHOST"] {
+            assert!(is_this_pc(u), "{u}");
+        }
+        for u in ["https://pc.tail.ts.net:8001", "https://192.168.1.5:8001", "https://localhost.evil.example", "https://example.com/127.0.0.1",
+                  "https://localhost:8001@evil.example", "https://127.0.0.1@evil.example/", "https://evil.example#@localhost", "not a url"] {
+            assert!(!is_this_pc(u), "{u}");
+        }
+    }
 }

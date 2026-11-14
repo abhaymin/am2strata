@@ -184,30 +184,37 @@ fn new_key() -> String {
     k
 }
 
-/// A file only this account reads: written beside it and moved into place.
+/// A file only this account reads: written beside it under a name of its own and moved into place. Each write has
+/// its own temporary name (so two writers never share one), and a write that fails is tried once more from the start
+/// (the folder made again): a test run saw the move fail with "No such file" once in several hundred runs, with no
+/// second writer found, so the error also says which step failed.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // a file left from before keeps its old mode otherwise
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let once = || -> std::io::Result<()> {
+        use std::io::Write;
+        let step = |what: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"));
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d).map_err(|e| step("making the folder", e))?;
+        }
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp).map_err(|e| step("opening the temporary file", e))?;
+        let written = f.write_all(bytes).and_then(|_| f.sync_all()).map_err(|e| step("writing", e));
+        drop(f);
+        let moved = written.and_then(|_| std::fs::rename(&tmp, path).map_err(|e| step("moving it into place", e)));
+        if moved.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        moved
+    };
+    once().or_else(|_| once())
 }
 
 fn check_name(name: &str) -> Result<String, String> {
@@ -859,28 +866,65 @@ impl Drop for Meter {
     }
 }
 
-/// The model a request names: Gemini's in the path, the others in the JSON body or the upload's form.
-fn asked_model(path: &str, headers: &HeaderMap, body: &[u8]) -> Option<String> {
+/// The model a request names: Gemini's in the path, the others in the JSON body or the upload's form. An upload may
+/// carry the field more than once: every value is returned, so a key's model list is checked against each of them
+/// (whichever the handler then reads was checked). Err: an upload whose parts cannot be told apart.
+fn asked_models(path: &str, headers: &HeaderMap, body: &[u8]) -> Result<Vec<String>, String> {
     if let Some(target) = path.strip_prefix("/v1beta/models/") {
-        return target.split(':').next().filter(|m| !m.is_empty()).map(str::to_string);
+        return Ok(target.split(':').next().filter(|m| !m.is_empty()).map(str::to_string).into_iter().collect());
     }
-    let multipart = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("multipart/"));
-    let m = if multipart {
-        form_field(body, "model")
-    } else {
-        serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
-    };
-    m.filter(|m| !m.is_empty())
+    let ct = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if ct.starts_with("multipart/") {
+        let boundary = ct.split(';').filter_map(|p| p.trim().strip_prefix("boundary=")).next().map(|b| b.trim_matches('"'))
+            .filter(|b| !b.is_empty()).ok_or("the upload names no boundary")?;
+        return Ok(form_fields(body, boundary, "model").into_iter().filter(|m| !m.is_empty()).collect());
+    }
+    Ok(serde_json::from_slice::<Value>(body).ok().and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
+        .filter(|m| !m.is_empty()).into_iter().collect())
 }
 
-/// A text field of a multipart/form-data body, by its name.
-fn form_field(body: &[u8], name: &str) -> Option<String> {
-    let key = format!("name=\"{name}\"");
-    let at = body.windows(key.len()).position(|w| w == key.as_bytes())?;
-    let rest = &body[at + key.len()..];
-    let start = rest.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
-    let end = rest[start..].windows(2).position(|w| w == b"\r\n")?;
-    String::from_utf8(rest[start..start + end].to_vec()).ok().map(|v| v.trim().to_string())
+#[cfg(test)]
+fn asked_model(path: &str, headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    asked_models(path, headers, body).ok().and_then(|v| v.into_iter().next())
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The values of the text fields called `name` in a multipart/form-data body, read part by part: the name is looked
+/// for only in a part's own Content-Disposition header, never in a part's content (an uploaded file holding the text
+/// `name="model"` is not a field).
+fn form_fields(body: &[u8], boundary: &str, name: &str) -> Vec<String> {
+    let delim = format!("--{boundary}");
+    let want = format!("name=\"{name}\"");
+    let mut out = vec![];
+    let mut rest = body;
+    let mut first = true;
+    loop {
+        // a delimiter is a line of its own: at the very start of the body, or after a line break (the same text
+        // inside a part's content, not at a line's start, is content)
+        let at = if first && rest.starts_with(delim.as_bytes()) { Some(0) } else { find(rest, format!("\r\n{delim}").as_bytes()).map(|i| i + 2) };
+        first = false;
+        let Some(at) = at else { break };
+        rest = &rest[at + delim.len()..];
+        if rest.starts_with(b"--") {
+            break; // the closing delimiter
+        }
+        let Some(head_end) = find(rest, b"\r\n\r\n") else { break };
+        let head = String::from_utf8_lossy(&rest[..head_end]).to_string();
+        let content = &rest[head_end + 4..];
+        let end = find(content, format!("\r\n{delim}").as_bytes()).unwrap_or(content.len());
+        let named = head.lines().any(|l| {
+            let l = l.trim();
+            l.to_ascii_lowercase().starts_with("content-disposition:") && l.split(';').any(|p| p.trim() == want)
+        });
+        if named {
+            out.push(String::from_utf8_lossy(&content[..end]).trim().to_string());
+        }
+        rest = &content[end..];
+    }
+    out
 }
 
 /// The layer around every route: a revoked or expired key is refused anywhere; the model APIs are limited and counted.
@@ -903,15 +947,18 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
             let Ok(bytes) = axum::body::to_bytes(body, 256 << 20).await else {
                 return error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request body is too large");
             };
-            let m = match asked_model(&path, &parts.headers, &bytes) {
-                Some(m) => m,
-                None => default_model(&s, &path).await,
+            let mut asked = match asked_models(&path, &parts.headers, &bytes) {
+                Ok(v) => v,
+                Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
             };
-            if !allowed.iter().any(|a| a.eq_ignore_ascii_case(&m)) {
+            if asked.is_empty() {
+                asked.push(default_model(&s, &path).await);
+            }
+            if let Some(m) = asked.iter().find(|m| !allowed.iter().any(|a| a.eq_ignore_ascii_case(m))) {
                 return error(StatusCode::FORBIDDEN, "permission_error",
                              format!("this key ({}) may not use the model {m:?}; it may use: {}", rec.name, allowed.join(", ")));
             }
-            model = Some(m);
+            model = asked.pop();
             req = Request::from_parts(parts, Body::from(bytes));
         }
         if let Err(msg) = keys.usage.admit(&who, &rec.name, &rec.limits, now) {
@@ -940,7 +987,30 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
     let sse = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|c| c.starts_with("text/event-stream"));
     let (parts, body) = resp.into_parts();
     if !sse {
-        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+        // a JSON answer is read for its usage block while it stays small. One that grows past the limit goes out as
+        // it is from there on (counted as a request, with no token figures), so this layer never holds a large
+        // answer in memory.
+        const READ_UP_TO: usize = 4 << 20;
+        let mut stream = body.into_data_stream();
+        let (mut held, mut size): (Vec<Bytes>, usize) = (vec![], 0);
+        loop {
+            match stream.next().await {
+                Some(Ok(b)) => {
+                    size += b.len();
+                    held.push(b);
+                    if size > READ_UP_TO {
+                        let first = futures::stream::iter(held.into_iter().map(Ok::<Bytes, axum::Error>));
+                        return Response::from_parts(parts, Body::from_stream(first.chain(stream)));
+                    }
+                }
+                Some(Err(e)) => {
+                    let first = futures::stream::iter(held.into_iter().map(Ok::<Bytes, axum::Error>).chain(std::iter::once(Err(e))));
+                    return Response::from_parts(parts, Body::from_stream(first));
+                }
+                None => break,
+            }
+        }
+        let bytes: Bytes = if held.len() == 1 { held.pop().unwrap() } else { held.concat().into() };
         if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
             meter.seen.take(&v);
         }
@@ -1248,5 +1318,22 @@ mod tests {
         assert_eq!(asked_model("/v1beta/models/gem:generateContent", &HeaderMap::new(), b""), Some("gem".into()));
         assert_eq!(asked_model("/v1/chat/completions", &HeaderMap::new(), br#"{"model":"x"}"#), Some("x".into()));
         assert_eq!(asked_model("/v1/chat/completions", &HeaderMap::new(), br#"{"messages":[]}"#), None);
+        // an upload: fields are read part by part, so text inside a file is never taken for the field, and a field
+        // sent twice gives both values (each is checked against a key's model list)
+        let mut h = HeaderMap::new();
+        h.insert("content-type", "multipart/form-data; boundary=XX".parse().unwrap());
+        let body = b"--XX\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\r\n\
+            junk name=\"model\"\r\n\r\nallowed-model\r\n more junk\r\n\
+            --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsecret-model\r\n\
+            --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nother\r\n--XX--\r\n";
+        assert_eq!(asked_models("/v1/audio/transcriptions", &h, body).unwrap(), vec!["secret-model".to_string(), "other".to_string()]);
+        // the delimiter's text in the middle of a line of a file is content, not a new part
+        let tricky = b"--XX\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n\
+            x --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nallowed-model\r\n\
+            --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nreal\r\n--XX--\r\n";
+        assert_eq!(asked_models("/v1/audio/transcriptions", &h, tricky).unwrap(), vec!["real".to_string()]);
+        let mut nob = HeaderMap::new();
+        nob.insert("content-type", "multipart/form-data".parse().unwrap());
+        assert!(asked_models("/v1/audio/transcriptions", &nob, body).is_err(), "no boundary: refused, not guessed");
     }
 }

@@ -133,11 +133,17 @@ fn src() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
+/// A text file of the repository with `\n` line ends, however git checked it out (Windows runners check sources out
+/// with `\r\n`, and what is searched for here is written with `\n`).
+pub fn read_lf(path: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(path).map(|t| t.replace("\r\n", "\n"))
+}
+
 /// Every route the server registers, as (METHOD, path pattern): main.rs's own and those of the sub-routers it merges
 /// (`MERGED`). Panics if main.rs builds its router in a way this cannot read (an unlisted merge, a nested router, a
 /// fallback), so such a change is taught to the suite rather than slipping past it.
 pub fn routes_in_main() -> BTreeSet<(String, String)> {
-    let main = std::fs::read_to_string(src().join("main.rs")).expect("src/main.rs");
+    let main = read_lf(&src().join("main.rs")).expect("src/main.rs");
     let app = main.split("let app = Router::new()").nth(1).expect("main.rs builds `let app = Router::new()`")
         .split(".with_state(").next().expect("the router ends in .with_state(");
     let mut code: String = app.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
@@ -145,7 +151,7 @@ pub fn routes_in_main() -> BTreeSet<(String, String)> {
     for (merge, file, func) in MERGED {
         assert!(code.contains(merge), "main.rs no longer has `{merge}`: remove it from MERGED in tests/common/regress.rs");
         code = code.replace(merge, "");
-        let text = std::fs::read_to_string(src().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let text = read_lf(&src().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         let body = text.split(func).nth(1).unwrap_or_else(|| panic!("{file} no longer has `{func}`: update MERGED in tests/common/regress.rs"));
         // the function's body: up to the first line that is only its closing brace
         let body = body.split("\n}\n").next().unwrap_or("");
@@ -182,7 +188,7 @@ pub fn routers_outside_main() -> Vec<String> {
         if rel == "main.rs" || MERGED.iter().any(|(_, file, _)| *file == rel) {
             continue;
         }
-        let text = std::fs::read_to_string(&f).unwrap_or_default();
+        let text = read_lf(&f).unwrap_or_default();
         // unit tests (after `#[cfg(test)]`) may build a router of their own
         let live = text.split("#[cfg(test)]").next().unwrap_or("");
         if live.contains("Router::new()") {

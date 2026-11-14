@@ -511,6 +511,13 @@ async fn vm_session(c: Arc<crate::computer::Computers>, vm: Arc<crate::computer:
     }
 }
 
+/// A desktop size a viewer asked for, made usable: even, at least 800x600, at most 3840x2160.
+#[cfg(target_os = "linux")]
+pub fn vm_size(w: f64, h: f64) -> (u32, u32) {
+    let fit = |v: f64, lo: u32, hi: u32| ((if v.is_finite() { v } else { 0.0 }).clamp(lo as f64, hi as f64) as u32) & !1;
+    (fit(w, 800, 3840), fit(h, 600, 2160))
+}
+
 /// One input message from the viewer, into the VM: the mouse and keys over VNC (keys as X keysyms, which Xvnc maps),
 /// text and the clipboard through the guest's xdotool and xclip.
 #[cfg(target_os = "linux")]
@@ -538,6 +545,14 @@ fn vm_input(vm: &crate::computer::vm::Vm, s: &crate::computer::vm::rfb::Rfb, kin
                 .or_else(|| { let mut c = key.chars(); match (c.next(), c.next()) { (Some(ch), None) => Some(0x0100_0000 + ch as u32), _ => None } })
                 .ok_or_else(|| format!("unknown key {key:?}"))?;
             s.key(sym, v["down"].as_bool().unwrap_or(true))
+        }
+        "resize" => {
+            // the desktop takes the viewer's size (even numbers, within sane bounds): a mode of that size is added to
+            // the VM's display and switched to; the screen then reports its new size and the frames follow
+            let (w, h) = vm_size(v["width"].as_f64().unwrap_or(0.0), v["height"].as_f64().unwrap_or(0.0));
+            let m = format!("am2_{w}x{h}");
+            vm.sh_ok(&format!("xrandr --newmode {m} 60 {w} {} {} {} {h} {} {} {} 2>/dev/null; xrandr --addmode VNC-0 {m} 2>/dev/null; \
+                               xrandr --output VNC-0 --mode {m}", w + 16, w + 32, w + 48, h + 1, h + 2, h + 3), false).map(|_| ())
         }
         "text" => vm.type_text(v["text"].as_str().unwrap_or("")),
         "clipboard_set" => vm.clipboard_set(v["text"].as_str().unwrap_or("")),
@@ -694,6 +709,16 @@ fn input(x: &std::sync::Mutex<x11::Display>, display: &str, kind: &str, v: &Valu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_viewers_size_becomes_a_usable_desktop_size() {
+        assert_eq!(vm_size(1903.4, 951.0), (1902, 950), "even numbers");
+        assert_eq!(vm_size(10.0, 10.0), (800, 600));
+        assert_eq!(vm_size(99999.0, 99999.0), (3840, 2160));
+        assert_eq!(vm_size(f64::NAN, -5.0), (800, 600));
+    }
 
     #[test]
     fn browser_keys_map_to_x_keysyms() {

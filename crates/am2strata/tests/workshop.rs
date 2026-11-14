@@ -3,6 +3,9 @@
 //! at a time, report their output or their error, can be cancelled, and cannot touch files outside the Workshop's
 //! folders. Only the server's own key may use it.
 
+// (off Unix the two tests that need the `#!/bin/sh` stand-in are not built, and their helpers go unused)
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 mod common;
 
 use common::*;
@@ -46,6 +49,8 @@ fn wait_state(s: &Server, id: u64, want: &str) -> Value {
     }
 }
 
+// Unix only: the stand-in for am2strata-workshop is a `#!/bin/sh` script, which Windows cannot start as a program.
+#[cfg(unix)]
 #[test]
 fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
     // the server is given this (the stand-in command) in its own environment; this process's is never changed
@@ -216,6 +221,8 @@ echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"dataset\",\"bytes\":300
     p
 }
 
+// Unix only: the stand-in for am2strata-workshop is a `#!/bin/sh` script, which Windows cannot start as a program.
+#[cfg(unix)]
 #[test]
 fn training_data_jobs_get_the_server_by_environment_and_their_datasets_can_be_reviewed_and_edited() {
     let tools = std::env::temp_dir().join(format!("am2-ws-datagen-{}", std::process::id()));

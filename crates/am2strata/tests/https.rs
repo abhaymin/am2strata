@@ -152,3 +152,29 @@ fn a_forged_host_is_refused_not_redirected() {
     }
     assert_eq!(reqwest::blocking::get(format!("{}/health", s.base)).unwrap().status(), 200, "still serving");
 }
+
+/// Browsers speak HTTP/2 over HTTPS, and HTTP/2 has no Host header. The web app's own writes (its Origin is this
+/// server's HTTPS address) must be taken as its own page there too: they were refused as another site's, so the
+/// Computer tab could not start the VM and Settings could not save over https://. A real other site is still refused.
+#[test]
+fn regress_the_web_apps_own_writes_work_over_http2() {
+    let port = free_port();
+    let s = Server::start(&[Model { extra: json!({"tls": {"https_port": port}}), ..Model::default() }], &[ids("hi")], json!({}));
+    let c = wait_https(&s.dir, port);
+    let own = format!("https://localhost:{port}");
+    let post = |origin: &str| {
+        let r = c.post(format!("{own}/api/vm/settings")).bearer_auth(KEY).header("origin", origin).json(&json!({"cpus": 2})).send().unwrap();
+        (r.version(), r.status().as_u16(), r.text().unwrap_or_default())
+    };
+    let (version, code, body) = post(&own);
+    assert_eq!(version, reqwest::Version::HTTP_2, "the test must speak HTTP/2, as a browser does");
+    // on a platform without the VM the route is absent (404); what matters is that the page is not taken for another site
+    assert!(code == 200 || code == 404, "{code} {body}");
+    let (_, code, body) = post("https://evil.example");
+    assert!(code == 403 || code == 404, "another site's page is still refused: {code} {body}");
+    // a setting saved from the page over HTTP/2 (a route every platform has)
+    let r = c.post(format!("{own}/settings")).bearer_auth(KEY).header("origin", &own).json(&json!({"defaults": {"max_tokens": 9}})).send().unwrap();
+    assert_eq!((r.version(), r.status().as_u16()), (reqwest::Version::HTTP_2, 200));
+    let r = c.post(format!("{own}/settings")).bearer_auth(KEY).header("origin", "https://evil.example").json(&json!({"defaults": {"max_tokens": 9}})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 403);
+}

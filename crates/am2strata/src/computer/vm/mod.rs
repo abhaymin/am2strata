@@ -515,7 +515,7 @@ impl Vm {
             return Err(format!("this PC needs: {}", missing.join("; ")));
         }
         if !self.image().exists() {
-            return Err("the Debian image is not downloaded yet: use \"Download the Debian image\" (342 MB) first".into());
+            return Err("the Debian image is not downloaded yet: use \"Download the Debian image\" (326 MB) first".into());
         }
         let cfg = self.config();
         if let Some(avail) = mem_available_mb() {
