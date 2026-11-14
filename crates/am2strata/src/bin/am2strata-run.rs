@@ -26,6 +26,8 @@
 mod agents;
 #[path = "../regression_run.rs"]
 mod regression_run;
+#[path = "../doctor.rs"]
+mod doctor;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -38,7 +40,7 @@ const TEMP_UNIT: &str = "am2strata";
 const BOOT_UNIT: &str = "am2strata-boot";
 
 #[derive(Parser)]
-#[command(name = "am2strata-run", about = "Run am2Strata: in the foreground, as a temporary service, or as the boot service")]
+#[command(name = "am2strata-run", version, about = "Run am2Strata: in the foreground, as a temporary service, or as the boot service")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -70,6 +72,17 @@ enum Cmd {
     Uninstall,
     /// run the whole test suite (no GPU)
     Test,
+    /// which optional features this PC is ready for (HTTPS, the Workshop, PDFs, ffmpeg, the browser tool, the
+    /// Computer tab, the sandbox VM) and exactly what each still needs; installs nothing
+    Doctor {
+        /// print only the packages this package manager would install for what is missing: apt, dnf, pacman, brew
+        /// or winget (the installers' --with-deps)
+        #[arg(long)]
+        packages: Option<String>,
+        /// the server's data folder, where the installer puts the browser tool's Chrome
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
     /// download a model from Hugging Face and write its run config (no --quant: list what the repository offers)
     Pull(PullArgs),
     /// coding agents on am2Strata, this PC's or another's: list | start <agent> | setup <agent> | reset <agent> | show <agent>
@@ -775,6 +788,15 @@ fn main() -> ExitCode {
         }
         Cmd::Install { s } => install(&s),
         Cmd::Uninstall => uninstall(),
+        Cmd::Doctor { packages, data_dir } => {
+            let host = doctor::Host::probe(data_dir.as_deref().map(expand_path).as_deref());
+            let features = doctor::report(&host);
+            match packages {
+                Some(manager) => println!("{}", doctor::packages(&features, &manager).join(" ")),
+                None => print!("{}", doctor::render(&host, &features, env!("CARGO_PKG_VERSION"))),
+            }
+            ExitCode::SUCCESS
+        }
         Cmd::Pull(p) => pull(p),
         Cmd::Agent(a) => agent(a),
         Cmd::Agentrun { args } => match agentrun_args(args) {

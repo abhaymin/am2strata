@@ -15,6 +15,10 @@ The settings in these configs are the ones measured on an RTX 5060 Ti 16 GB with
 
 Other cards work too; the engines size their expert caches to the free VRAM.
 
+**Not building anything?** The one-line installers put a ready download (CPU, or any GPU through wgpu: small models)
+on Linux, macOS and Windows; see [Installing a release](#installing-a-release-linux-macos-windows) at the end. The
+rest of this guide is the build from source, the fast path for NVIDIA cards.
+
 ## 1. What you need
 
 - Linux (tested on Ubuntu 26.04) and an NVIDIA GPU with its driver: an RTX 30, 40 or 50 card, 12 GB of VRAM or more.
@@ -578,3 +582,109 @@ am2Strata attaches to that Chrome: it opens and drives tabs there, and when it s
 never your browser. Downloads are still denied, private and LAN addresses are still blocked unless `allow_private_urls`,
 and typing a password or submitting a form still waits for your Allow. Sign in to that Chrome once and the sessions stay in
 its profile folder. This is your own session, used by your choice; am2Strata does nothing to defeat a site's checks.
+
+## Installing a release (Linux, macOS, Windows)
+
+Six downloads are built for every release (`.github/workflows/release.yml`): Linux x86_64 and arm64, macOS Apple
+silicon and Intel, Windows x64 and Arm64. Each holds the server, `am2strata-run`, the Workshop (`am2strata-workshop`),
+the Rust engine (`am2strata-hybrid`) and the web app. The installers pick the right one.
+
+The engine runs models on the CPU everywhere. On Linux x86_64, macOS Apple silicon and Windows x64 it can also put
+weights on any GPU through wgpu (`--devices`). The Linux arm64, macOS Intel and Windows Arm64 downloads are built
+without that: the GPU kernels' build needs a prebuilt LLVM (tracel-llvm 20.1.4-7) that is not published for macOS x64
+or Windows Arm64 and does not unpack on Linux arm64.
+
+```bash
+curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh       # Linux, macOS
+```
+
+```powershell
+irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex            # Windows
+```
+
+**What they do:**
+
+- **Pick the download** from the system and processor. `arm64` and `aarch64` are the same; a terminal under Rosetta on
+  an Apple silicon Mac still gets the Apple silicon build; an x64 PowerShell on Windows on Arm still gets the Arm64
+  build. A Linux with a glibc older than 2.35 (before Ubuntu 22.04), or with musl, is told to build from source.
+- **Check the SHA-256** against the release's `.sha256` file; on a mismatch nothing is installed.
+- **Install without admin rights or sudo:** the program in `~/.local/share/am2strata/app` (Windows:
+  `%LOCALAPPDATA%\am2strata\app`), the commands `am2strata`, `am2strata-run` and `am2strata-workshop` in `~/.local/bin`
+  (Windows: `%LOCALAPPDATA%\am2strata\bin`, added to your user PATH). Models, run configs and settings live beside the
+  program, in `~/.local/share/am2strata`, and an update or an uninstall never touches them.
+- **Report the optional features** (below), and install nothing for them unless asked.
+
+| `install.sh` | `install.ps1` | |
+|---|---|---|
+| `--version X` | `-Version X` | release X instead of the latest |
+| `--dir DIR` | `-Dir DIR` | install into DIR, models and settings included (`--bin-dir DIR`: where the commands go) |
+| `--from DIR` | `-From DIR` | install from a folder holding the download and its `.sha256` (no network) |
+| `--service` | `-Service` | start the server when you sign in |
+| `--no-service` | `-NoService` | the default; also removes what an earlier `--service` made |
+| `--with-deps` | `-WithDeps` | install what the optional features miss; the command is printed and runs only after a yes |
+| `--yes` | `-Yes` | with `--with-deps`: do not ask |
+| `--no-browser` | | do not fetch Chrome for Testing's headless shell |
+| `--uninstall` | `-Uninstall` | remove the program, the commands and the service; models and settings stay |
+
+Options follow `sh -s --` (`curl -fsSL .../install.sh | sh -s -- --service --with-deps`), or in PowerShell
+`& ([scriptblock]::Create((irm .../install.ps1))) -Service`.
+
+**The service (`--service`)** runs `am2strata serve` as you, never as root:
+
+| System | What is made | Stop or look |
+|---|---|---|
+| Linux | the systemd user service `am2strata-app.service` (`~/.config/systemd/user`) | `systemctl --user status am2strata-app`, `journalctl --user -u am2strata-app` |
+| macOS | the launchd agent `io.github.abhaymin.am2strata` (`~/Library/LaunchAgents`) | `launchctl print gui/$UID/io.github.abhaymin.am2strata`; log in `~/.local/share/am2strata/service.log` |
+| Windows | a shortcut in your Startup folder, "am2Strata server" | delete the shortcut, or `-NoService` |
+
+It starts once a model is there (`am2strata pull ...`). On Linux, `loginctl enable-linger $USER` starts it at boot,
+before you sign in. This is not the `am2strata-boot` service of the build from source (section 5), which drives
+PolyStrata's engines.
+
+**Platforms and features:**
+
+| | Linux x86_64 | Linux arm64 | macOS Apple silicon | macOS Intel | Windows x64 | Windows Arm64 |
+|---|---|---|---|---|---|---|
+| Server, web app, APIs, coding agents, HTTPS | yes | yes | yes | yes | yes | yes |
+| Rust engine | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU |
+| Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
+| PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
+| Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
+| Browser tool | Chrome or Chromium, else fetched | an installed Chromium | Chrome, Edge or Chromium, else fetched | Chrome, Edge or Chromium, else fetched | Edge or Chrome | Edge or Chrome |
+| Python in the canvas | needs `bubblewrap` | needs `bubblewrap` | no | no | no | no |
+| Computer tab (sandbox desktop) | needs `xvfb xdotool xclip` | needs `xvfb xdotool xclip` | no | no | no | no |
+| Sandbox VM | needs `qemu-system-x86 qemu-utils ovmf openssh-client` and `/dev/kvm` | no | no | no | no | no |
+| Start at sign-in (`--service`, `-Service`) | systemd user service | systemd user service | launchd agent | launchd agent | Startup shortcut | Startup shortcut |
+
+"needs" names the Debian/Ubuntu packages. The same report for the PC you are on, with the command for its package
+manager (apt, dnf, pacman, Homebrew, winget):
+
+```bash
+am2strata doctor                          # or: am2strata-run doctor
+```
+
+```text
+am2Strata 0.1.8 on linux x86_64
+
+  ready     HTTPS                           built in (am2strata-run tls self-signed)
+  ready     Workshop                        included (convert, quantize, merge, training data)
+  ready     PDFs in chats                   poppler found
+  missing   Video from API clients          needs ffmpeg
+  ready     Browser tool                    a browser found
+  ready     Python in the canvas            bubblewrap found
+  missing   Computer tab (sandbox desktop)  needs Xvfb, xdotool, xclip
+  missing   Sandbox VM                      needs qemu-system-x86_64, qemu-img, OVMF (UEFI firmware)
+
+To add what is missing:
+  sudo apt-get install -y ffmpeg xvfb xdotool xclip qemu-system-x86 qemu-utils ovmf
+```
+
+`--with-deps` runs exactly that command after you confirm it. The sandbox VM's line checks the same things as the
+Computer tab ("What this PC needs", above): `qemu-system-x86`, `qemu-utils`, `ovmf`, `openssh-client` and access to
+`/dev/kvm`. That access is not a package: `sudo usermod -aG kvm $USER`, then sign in again. The VM's Debian image is
+downloaded from the tab, or with `am2strata vm download`. The Windows downloads carry Poppler; the other optional features
+there are ffmpeg (`winget install -e --id Gyan.FFmpeg`) and a browser, and the rest is Linux only.
+
+**Checked on every pull request** that touches the installers (`.github/workflows/install-check.yml`): each of the six
+platforms builds and packages the download, installs it with the installer from the same commit, runs
+`am2strata --version` and `am2strata-run doctor`, updates, uninstalls, and checks that only the data is left.

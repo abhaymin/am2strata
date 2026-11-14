@@ -62,18 +62,26 @@ jobs:
           git status --porcelain
           test -z "$(git status --porcelain)"
 
-  # macOS and Windows never checked here before this job. The v0.1.7 release check failed on them because
-  # `computer/backend.rs`/`engine.rs` used Linux-only types (`LinuxBackend`, `SandboxDesktop`) at module scope, so code that
-  # compiled only on Linux could merge. This checks the am2strata crate + tests build on the others too, catching it pre-merge.
+  # Every platform a release is built for (release.yml) except the Linux one above. The v0.1.7 release check failed on
+  # macOS and Windows because `computer/backend.rs`/`engine.rs` used Linux-only types (`LinuxBackend`, `SandboxDesktop`) at
+  # module scope, so code that compiled only on Linux could merge. This checks that everything a download carries compiles
+  # on each of them before a merge: the workspace with its tests, and the Rust engine as the releases build it.
   check-other-os:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false      # one platform's failure does not hide another's: a run shows everything to fix at once
       matrix:
         include:
-          - { os: macos-15, label: macos-arm64 }
-          - { os: windows-2022, label: windows-x86_64 }
+          # engine: the Rust engine's features. `gpu` (weights on any GPU through wgpu) pulls in CubeCL's CPU runtime, whose
+          # build downloads a prebuilt LLVM from tracel-ai/tracel-llvm v20.1.4-7. That release has no macOS x64 and no
+          # Windows Arm64 bundle, and its Linux Arm64 bundle does not unpack where the build expects it. So those three
+          # get the engine without `gpu`: it runs models on the CPU, and --devices is refused there.
+          - { os: ubuntu-22.04-arm, label: linux-arm64, engine: "" }
+          - { os: macos-15, label: macos-arm64, engine: "--features gpu" }
+          - { os: macos-15-intel, label: macos-x86_64, engine: "" }
+          - { os: windows-2022, label: windows-x86_64, engine: "--features gpu" }
+          - { os: windows-11-arm, label: windows-arm64, engine: "" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.93.1
@@ -81,5 +89,10 @@ jobs:
         with:
           workspaces: |
             .
-      # tests are checked for compilation, not run: the am2strata crate's OS-specific code is all gated on `target_os`.
-      - run: cargo check --locked -p am2strata --tests
+            crates/strata-hybrid
+          # pull requests read the cache and do not add to it
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # checked for compilation, not run (the tests run on Linux above, and everywhere in release.yml): the OS-specific
+      # code is all gated on `target_os` / `unix` / `windows`.
+      - run: cargo check --locked --workspace --tests
+      - run: cargo check --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features ${{ matrix.engine }}
