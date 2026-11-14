@@ -217,6 +217,7 @@ fn mapped_tensors(tensors: &BTreeMap<String, TensorF32>) -> Result<Vec<Mapped>> 
             } else { None }
         }).collect();
     bids.sort_unstable();
+    bids.dedup(); // one entry per weight shared the same layer id; process each layer once
 
     for bid in bids {
         let p = |key: &str| format!("model.layers.{bid}.{key}");
