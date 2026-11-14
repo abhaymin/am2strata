@@ -21,7 +21,8 @@
 //! is widened to f32 only for the one product that uses it; activations, LoRA and the loss are f32. Inside the trained
 //! region a plain `matmul` would keep that widened copy alive in the graph until the backward pass (f16 + f32 of the
 //! whole region: worse than f32 alone), so there the product goes through [`FrozenLinear`], a custom operation that
-//! keeps only the 16-bit weight and widens it again, briefly, to send the gradient back.
+//! keeps only the 16-bit weight and widens it again, briefly, to send the gradient back. Every frozen product goes
+//! through it, in f32 too: candle's `matmul` backward would also compute a (useless, weight-sized) gradient for W.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -315,9 +316,10 @@ impl BaseDtype {
     }
 }
 
-/// A frozen product `x Wᵀ` whose weight stays in 16 bits inside the graph. The value is computed outside the graph
-/// (the widened weight is dropped at once) and handed over here; the backward pass widens the weight again for
-/// `grad · W`. Without this, candle's `matmul` node would hold the f32 copy of every weight of the trained region.
+/// A frozen product `x Wᵀ` as one graph node that sends the gradient to `x` only. The value is computed outside the
+/// graph and handed over here; the backward pass computes `grad · W` (widening a 16-bit `W` for that product only).
+/// Without it, candle's `matmul` node would compute a full gradient for every frozen weight on the path (its backward
+/// does both operands), and with a 16-bit base would also hold the widened f32 copy of every trained block's weights.
 struct FrozenLinear {
     /// the forward value, taken (not copied twice) by the forward call
     y: Mutex<Option<Tensor>>,
@@ -335,7 +337,8 @@ impl CustomOp1 for FrozenLinear {
     }
 
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
-        Ok(Some(grad_res.matmul(&self.w.to_dtype(DType::F32)?)?))
+        let w = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
+        Ok(Some(grad_res.matmul(&w)?))
     }
 }
 
@@ -438,17 +441,14 @@ fn unit(state: &mut u64) -> f32 {
 
 impl Linear {
     fn frozen(&self, x: &Tensor) -> Result<Tensor> {
-        let y = if self.w.dtype() == DType::F32 {
-            x.matmul(&self.w.t()?)?
-        } else {
-            // widen for this one product; the copy is gone when this block ends
-            let value = x.detach().matmul(&self.w.to_dtype(DType::F32)?.t()?)?;
-            if x.track_op() {
-                x.apply_op1(FrozenLinear { y: Mutex::new(Some(value)), w: self.w.clone() })?
-            } else {
-                value
-            }
-        };
+        // The value is computed outside the graph in every dtype. candle's own `matmul` node, in its backward pass,
+        // computes the gradient of BOTH operands whether or not they need one: a full `[out, in]` f32 gradient for
+        // every frozen weight on the path, every step (measured: 542 MB peak against 180 MB on a 12-block model).
+        // FrozenLinear sends the gradient to the input only.
+        let wide = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
+        let value = x.detach().matmul(&wide.t()?)?;
+        drop(wide);
+        let y = if x.track_op() { x.apply_op1(FrozenLinear { y: Mutex::new(Some(value)), w: self.w.clone() })? } else { value };
         Ok(match &self.bias {
             Some(b) => y.broadcast_add(b)?,
             None => y,
@@ -910,4 +910,26 @@ pub fn adapter_config(spec: &LoraSpec, cfg: &ModelConfig, base: &str) -> Value {
 /// The adapter tensors as an ordered map, for saving.
 pub fn adapter_tensors(model: &LlamaModel) -> BTreeMap<String, Tensor> {
     model.lora_vars().into_iter().map(|(n, v)| (n, v.as_tensor().detach())).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// candle's `matmul` backward computes a gradient for both operands: through it, every frozen weight on the path
+    /// got a full-size f32 gradient each step (542 MB peak instead of 228 MB on a 12-block model). No gradient may be
+    /// bigger than the largest adapter matrix or activation; a weight-sized one means a frozen weight got one.
+    #[test]
+    fn regress_frozen_weights_get_no_gradient() {
+        let (o, i, rows) = (64, 48, 3);
+        let w = Tensor::from_vec((0..o * i).map(|k| (k % 13) as f32 / 13.0 - 0.5).collect::<Vec<f32>>(), (o, i), &Device::Cpu).unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let lin = Linear { w: w.to_dtype(dtype).unwrap(), bias: None, lora: None };
+            let x = Var::from_tensor(&Tensor::ones((rows, i), DType::F32, &Device::Cpu).unwrap()).unwrap();
+            let grads = lin.forward(x.as_tensor(), &Ctx::eval()).unwrap().sqr().unwrap().sum_all().unwrap().backward().unwrap();
+            assert!(grads.get(&x).is_some(), "{dtype:?}: the input's gradient");
+            let biggest = grads.get_ids().filter_map(|id| grads.get_id(*id)).map(|g| g.elem_count()).max().unwrap();
+            assert!(biggest <= rows * o, "{dtype:?}: a gradient of {biggest} values, the weight has {}", o * i);
+        }
+    }
 }

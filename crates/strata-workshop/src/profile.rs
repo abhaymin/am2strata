@@ -29,9 +29,10 @@ use serde_json::{json, Value};
 
 use crate::model::{BaseDtype, Family, LoraSpec, ModelConfig, Target};
 
-/// Share of a raw matrix-product benchmark that training really reaches on the CPU (the rest goes to memory traffic,
-/// small operations and, with a 16-bit base, widening the weights). Measured on the tiny models; see docs/DEPLOYMENT.md.
-pub const CPU_TRAINING_EFFICIENCY: f64 = 0.35;
+/// Share of a raw matrix-product benchmark that training really reaches on the CPU (the rest goes to memory traffic
+/// and small operations). Measured with an f32 or bf16 base on a 12-block, 27 M-parameter model (docs/DEPLOYMENT.md:
+/// 12.8 s for an estimate of 15 s at this value); an f16 base ran about twice as slow there (candle widens f16 slowly).
+pub const CPU_TRAINING_EFFICIENCY: f64 = 0.6;
 /// A 16 GB-class GPU's training throughput in GFLOP/s. **Assumed, not measured**: no GPU run is part of this trainer yet.
 pub const ASSUMED_GPU_GFLOPS: f64 = 1500.0;
 /// Room left for the process itself, the tokenizer and the allocator on top of the estimate.
