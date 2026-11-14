@@ -453,9 +453,11 @@
           <label class="small"><input type="checkbox" id="ws-s-over"> replace a model with the same name</label>
           <button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button>
         </div>
-        <div class="st-card ws-card ws-card--soon"><span class="card-title">Train · coming next</span>
-          <p class="muted small">LoRA training in Rust is built and tested on a small model; training real models (rotary
-            attention, the full Llama forward) is being finished. Until then, train with Unsloth on a dataset made below and merge here.</p>
+        <div class="st-card ws-card ws-card--soon"><span class="card-title">Train · from the command line</span>
+          <p class="muted small">LoRA training runs on this PC's CPU for Llama, Mistral and Qwen models:
+            <code>am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</code> on a dataset made below,
+            then merge the adapter here. <code>profile</code> and <code>autopilot</code> say what fits this PC;
+            training from this tab comes next.</p>
         </div>
       </div>
       <div class="st-card ws-data" id="ws-data"><span class="card-title">Training data · written by the loaded model</span>
