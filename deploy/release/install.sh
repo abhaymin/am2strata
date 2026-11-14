@@ -79,7 +79,7 @@ detect_label() {
 # a folder name that is safe inside the launchers, the systemd unit and the launchd plist this script writes
 check_dir() {
     case "$1" in
-        *'"'*|*'$'*|*'`'*|*'\'*|*'&'*|*'<'*|*'>'*|*'%'*) fail "the folder $1 has a character the launchers cannot carry (one of \" \$ \` \\ & < > %): choose another" ;;
+        *[\"\$\`\\\&\<\>%]*) fail "the folder $1 has a character the launchers cannot carry (one of \" \$ \` \\ & < > %): choose another" ;;
     esac
     case "$1" in
         *"
@@ -201,6 +201,7 @@ fetch_browser() {
     if [ -n "$FROM" ]; then say "Skipping the browser tool's Chrome (--from: no network)."; return 0; fi
     if ! have unzip; then say "Skipping the browser tool's Chrome: unzip is missing."; return 0; fi
     json=https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json
+    # shellcheck disable=SC2020  # three characters to three line breaks, one for one
     url=$(curl -fsSL "$json" 2>/dev/null | tr ',{}' '\n\n\n' | grep -o "https://[^\"]*/$plat/chrome-headless-shell-$plat.zip" | head -1 || true)
     [ -n "$url" ] || { say "Chrome for Testing could not be reached; the rest works without the browser tool."; return 0; }
     say "Fetching Chrome for Testing's headless shell for the browser tool (about 100 MB; --no-browser skips it)..."
