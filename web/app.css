@@ -632,6 +632,18 @@ body.resizing iframe { pointer-events: none; }
   background: var(--color-surface-2, #111); border-radius: .5rem; }
 #cv-canvas { max-width: 100%; max-height: 100%; height: auto; outline: none; cursor: not-allowed; image-rendering: auto; }
 #cv-canvas.cv-live { cursor: default; box-shadow: 0 0 0 2px var(--color-accent, #4ade80); }
+
+/* Computer tab: the sandbox VM's panel */
+.cv-vm { display: flex; flex-direction: column; gap: .5rem; }
+.cv-vm__log { max-height: 12rem; overflow: auto; white-space: pre-wrap; font-size: .78rem; margin: .25rem 0 0; }
+.cv-vm__more { display: grid; grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr)); gap: .75rem; }
+.cv-vm__apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr)); gap: .4rem; }
+.cv-vm__app { border: 1px solid var(--st-border, rgba(127,127,127,.25)); border-radius: .5rem; padding: .4rem .5rem;
+  display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+.cv-vm__app .cv-bar { gap: .3rem; }
+.cv-vm__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .4rem; }
+.cv-vm__grid label { display: flex; flex-direction: column; gap: .15rem; }
+.msg-warn { padding: .4rem .6rem; border-radius: .4rem; background: color-mix(in srgb, #f5a524 18%, transparent); }
 /* Settings › Clients: API keys and usage (api-keys.js) */
 .key-row--off > :not(.mcp-server__head) { opacity: .6; }
 .key-facts { overflow-wrap: anywhere; }

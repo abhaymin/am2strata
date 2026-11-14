@@ -415,6 +415,57 @@ From a terminal: `am2strata-run computer status | screenshot desk.png | take | g
 type "text" | open <app>`. The stream is a WebSocket (`wss://` on the HTTPS port); only the server's own key opens it,
 and only from am2Strata's own page.
 
+## The sandbox VM: a whole computer for computer use
+
+Computer use can run in its own small **Debian 13 virtual machine** that am2Strata creates and runs itself (QEMU with
+KVM; no root, no Docker). Inside it the agent is root: it installs and removes software, runs a shell and uses a
+desktop, and nothing in it can touch this PC. Turn it on in **Settings › Computer and browser use › Mode: Sandbox VM**
+(`"computer": {"use": true, "mode": "vm"}`); you can also use the VM yourself from the **Computer** tab without that.
+
+**What this PC needs** (the tab says what is missing): `qemu-system-x86`, `qemu-utils`, `ovmf`, `openssh-client`,
+access to `/dev/kvm`, and the Debian cloud image (326 MB, downloaded from cloud.debian.org by the **Download** button
+and checked against Debian's SHA512SUMS). The first start sets the desktop up once (about three minutes).
+
+**Light on this PC.**
+- It runs only when used: it pauses its CPUs after 2 minutes unused, and after 15 minutes is saved to disk and quit
+  (no RAM, no CPU). A start then restores it, with its open apps, in about a second.
+- QEMU runs with `CPUWeight=idle`, idle scheduling and I/O class: it gets only the CPU the inference engine is not
+  using. It has no GPU and never touches VRAM.
+- Memory has a hard ceiling (2 GB by default) and unused memory goes back to the host. It refuses to start if that
+  would leave this PC less than `host_reserve_mb` (3 GB) free, so a loaded model is never pushed out.
+- Measured here: 0.9 GB of RAM idle with the desktop up, 1–4% of one core; a cold boot 11 s; a restore 0.8 s.
+
+**Software.** The catalog installs with one click or `am2strata-run vm install <app>`: Chromium, Firefox ESR,
+Bitwarden (app and browser extension), Tailscale, NetBird, Mullvad VPN, Surfshark, WireGuard and OpenVPN, VS Code,
+LibreOffice, Thunderbird, KeePassXC, GIMP, VLC, Obsidian, developer tools and Docker. Anything else:
+`--kind apt <packages>`, `--kind flatpak <Flathub id>`, `--kind deb <https URL>`, `--kind appimage <https URL>`.
+The agent has the same through its `computer_install` and `computer_shell` tools. Sign-ins (Bitwarden, a VPN, a
+browser account) are yours: open the app in the Computer tab, take control and sign in; the VM keeps it.
+
+**Ads.** `am2strata-run vm ads on [--lists pihole,adguard] [site.to.let.through …]` / `vm ads off`, the panel's
+*Ads and trackers* card, the agent's `computer_ads` tool, or the **Ads and trackers** app on the VM's own desktop. It
+is a DNS filter for every program in the VM (dnsmasq, as Pi-hole uses), with Pi-hole's default list (StevenBlack),
+the AdGuard DNS filter, or both; it blocks subdomains and IPv6 too, and adds uBlock Origin to the browsers. A
+scraping job that must see a site as it is lists that site to let through, or turns blocking off.
+
+**VPNs.** The VM has its own kernel, so real tunnels work: Tailscale and NetBird join it to your network as its own
+device; Mullvad and Surfshark have their apps; any other provider works with its WireGuard or OpenVPN file
+(`sudo wg-quick up ./provider.conf`). Only the VM's traffic goes through the VPN, never this PC's.
+
+**Private.** The VM's network is QEMU's user-mode network: it can reach the internet, nothing can reach it. Its screen
+and shell go over SSH on this PC's loopback with keys am2Strata made (the VM's host key is checked), into Unix
+sockets in a private folder. Everything is in `<data>/sandbox`; **Reset** deletes the VM and the next start makes a
+new one.
+
+```bash
+am2strata-run vm status
+am2strata-run vm start
+am2strata-run vm install chromium
+am2strata-run vm exec --root -- apt list --installed
+am2strata-run vm settings memory_mb=4096 cpus=4
+am2strata-run vm stop
+```
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your

@@ -481,6 +481,9 @@ async fn main() -> Result<()> {
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
+    // the sandbox VM (computer/vm): made before computer use, whose "vm" mode drives it; it starts only when used
+    #[cfg(target_os = "linux")]
+    computer::vm::Vm::init(&expand(&args.data_dir));
     // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
     let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // the Workshop: convert, quantize and merge jobs (workshop.rs)
@@ -580,6 +583,7 @@ async fn main() -> Result<()> {
         .route("/api/computer/clipboard", get(computer::live::clipboard_get_h).post(computer::live::clipboard_post))
         .route("/api/computer/type", post(computer::live::type_post))
         .route("/api/computer/open", post(computer::live::open_post))
+        .merge(computer::vm_routes())
         .route("/mcp", get(web::mcp))
         .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))
         .route("/api/mcp/servers/test", post(mcp_api::test))
@@ -668,6 +672,13 @@ async fn main() -> Result<()> {
     mgr.unload().await;
     if let Some(c) = mgr.computer.get() {
         c.shutdown();
+    }
+    // the sandbox VM is saved, so it comes back as it was at the next start
+    #[cfg(target_os = "linux")]
+    if let Some(vm) = computer::vm::get() {
+        if let Err(e) = tokio::task::spawn_blocking(move || vm.shutdown_for_exit()).await {
+            tracing::warn!("sandbox VM: saving it at exit failed: {e}");
+        }
     }
     if let Some(b) = mgr.browser.get() {
         b.close().await;

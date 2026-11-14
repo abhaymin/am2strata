@@ -163,7 +163,11 @@ fn error_result(text: String, ms: u64) -> Value {
     /// sees them only for a request whose run config turned it on. `vision` adds that each step returns a screenshot.
     pub fn offered_tools(&self, vision: bool) -> Vec<Value> {
         if !self.enabled() { return Vec::new(); }
-        crate::computer::tools::tools(vision)
+        let mut t = crate::computer::tools::tools(vision);
+        if self.computer_mode() == Mode::Vm {
+            t.extend(crate::computer::tools::vm_tools());
+        }
+        t
     }
 
     /// One computer-use tool call over this desktop, checked and run. `tx` sends the "approve" event when a step waits;
@@ -178,6 +182,10 @@ fn error_result(text: String, ms: u64) -> Value {
                 return error_result("error: the operator still has control of the desktop; the step was not run".into(), 0);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        // the sandbox VM's shell and installs: a separate machine where the agent is root, so they run without asking
+        if name == "computer_shell" || name == "computer_install" || name == "computer_ads" {
+            return self.vm_tool(name, args).await;
         }
         // arm the idle watcher so a sandbox display is stopped after 10 minutes with no step (item 1); a non-sandbox server has none
         self.arm_watchdog();
@@ -195,6 +203,51 @@ fn error_result(text: String, ms: u64) -> Value {
         run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, disp_size, started_at, now, tx).await
     }
 
+    /// The sandbox VM, when computer use runs in it (`"mode": "vm"`).
+    #[cfg(target_os = "linux")]
+    pub fn vm(&self) -> Option<Arc<crate::computer::vm::Vm>> {
+        (self.computer_mode() == Mode::Vm).then(crate::computer::vm::get).flatten()
+    }
+
+    async fn vm_tool(&self, name: &str, args: &Value) -> Value {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(vm) = self.vm() else {
+                return error_result("error: the shell and installs are only in the sandbox VM mode (Settings › Computer and browser use › Mode: Sandbox VM)".into(), 0);
+            };
+            let (name, args, t0) = (name.to_string(), args.clone(), Instant::now());
+            let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                vm.ensure()?;
+                if name == "computer_ads" {
+                    let allow: Vec<String> = args["allow"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                    let lists: Vec<String> = args["lists"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+                    return vm.set_ads(args["block"].as_bool().unwrap_or(true), &lists, &allow);
+                }
+                if name == "computer_shell" {
+                    let cmd = args["command"].as_str().filter(|c| !c.trim().is_empty()).ok_or("give \"command\"")?;
+                    let secs = args["timeout_s"].as_u64().unwrap_or(300).clamp(1, 3600);
+                    let (code, out) = vm.sh(cmd, args["root"].as_bool().unwrap_or(false), None, Duration::from_secs(secs), &|_| {})?;
+                    let out = if out.len() > 20_000 { format!("…{}", &out[out.len() - 20_000..]) } else { out };
+                    Ok(format!("exit {code}\n{out}"))
+                } else {
+                    let remove = args["remove"].as_bool().unwrap_or(false);
+                    let (what, target) = match (args["app"].as_str(), args["kind"].as_str()) {
+                        (Some(a), _) => (a.to_string(), String::new()),
+                        (None, Some(k)) => (k.to_string(), args["target"].as_str().unwrap_or("").to_string()),
+                        _ => return Err("give \"app\" (a catalog id) or \"kind\" and \"target\"".into()),
+                    };
+                    vm.install(&what, &target, !remove, &|_| {})
+                }
+            }).await.unwrap_or_else(|e| Err(e.to_string()));
+            match r {
+                Ok(s) => json!({"ok": true, "chars": s.chars().count(), "text": s, "truncated": false, "ms": t0.elapsed().as_millis() as u64}),
+                Err(e) => error_result(format!("error: {e}"), t0.elapsed().as_millis() as u64),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        { let _ = (name, args); error_result("error: the sandbox VM needs Linux".into(), 0) }
+    }
+
     /// The Computer tab's view: the sandbox desktop (started if it is not running), when this server has one.
     pub fn sandbox_display(&self) -> Result<String, String> {
         if !self.config.computer.use_ {
@@ -210,6 +263,10 @@ fn error_result(text: String, ms: u64) -> Value {
     pub fn touch(&self) {
         if let Some(d) = &self.desktop {
             let _ = d.ensure();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(vm) = self.vm() {
+            vm.touch();
         }
     }
 
@@ -271,6 +328,13 @@ fn idle_watcher(desktop: Arc<SandboxDesktop>, period: Duration, slot: std::sync:
 fn select_backend(_mode: Mode, _size: Size) -> (Option<Box<dyn Backend + Send + Sync>>, Option<Arc<SandboxDesktop>>) {
     #[cfg(target_os = "linux")]
     {
+        if _mode == Mode::Vm {
+            // the sandbox VM (vm/): available once the server made it (main.rs, before this)
+            return match crate::computer::vm::get() {
+                Some(vm) => (Some(Box::new(crate::computer::vm::backend::VmBackend { vm })), None),
+                None => (None, None),
+            };
+        }
         if _mode == Mode::Sandbox && !(crate::computer::backend::tool_available("Xvfb") && crate::computer::backend::tool_available("xdotool")) {
             return (None, None);  // the sandbox needs both Xvfb and xdotool; without them the desktop tools are not offered
         }
