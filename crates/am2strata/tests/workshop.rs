@@ -172,8 +172,12 @@ fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
     let cfg: Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
     assert_eq!((cfg["model_name"].as_str(), cfg["display_name"].as_str()), (Some("my-tiny"), Some("My Tiny Llama")));
     assert!(std::path::Path::new(done["result"]["tokenizer"].as_str().unwrap()).join("tokenizer.json").exists(), "tokenizer folder");
-    let (_, l) = s.get("/api/models", true);
-    assert!(l["models"].as_array().unwrap().iter().any(|m| m["id"] == "my-tiny"), "listed: {l}");
+    // it is listed where its engine is installed (a llama model runs on the Rust engine, built here but not on CI)
+    let engine = cfg["exe"].as_str().unwrap_or("").replace("${AM2STRATA_HOME}", concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    if std::path::Path::new(&engine).exists() {
+        let (_, l) = s.get("/api/models", true);
+        assert!(l["models"].as_array().unwrap().iter().any(|m| m["id"] == "my-tiny"), "listed: {l}");
+    }
     // the same name again is refused before anything runs; with overwrite it is allowed
     let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "strata", "input": gguf, "name": "my-tiny"}));
     assert_eq!(code, 400);

@@ -168,7 +168,9 @@ fn encode(x: &[f32], name: &str) -> Vec<u8> {
 pub fn quantize(input: &Path, output: &Path, target: PureType) -> Result<()> {
     let g = Gguf::open(input).with_context(|| format!("opening {}", input.display()))?;
     let file = std::fs::File::open(input).with_context(|| format!("reading {}", input.display()))?;
-    // memory-mapped: only the tensor being converted is in memory as f32
+    // memory-mapped: only the tensor being converted is in memory as f32.
+    // SAFETY: the map is read only, and the input is a model file nothing writes while it is quantized (if another
+    // program changed it meanwhile the bytes read could be wrong, but never memory-unsafe beyond what any mmap risks).
     let buf = unsafe { memmap2::Mmap::map(&file) }.with_context(|| format!("mapping {}", input.display()))?;
     let target_name = target.ggml_name();
 
@@ -218,7 +220,8 @@ fn raw_kvs(buf: &[u8]) -> Result<Vec<(String, u32, Vec<u8>)>> {
         fn u64(&mut self) -> Result<u64> { Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap())) }
         fn string(&mut self) -> Result<String> {
             let n = self.u64()? as usize;
-            Ok(String::from_utf8_lossy(self.take(n)?).into_owned())
+            // GGUF keys are UTF-8: anything else is a damaged file, refused rather than altered
+            String::from_utf8(self.take(n)?.to_vec()).context("a metadata key is not valid UTF-8")
         }
         /// the bytes of one value of type `ty`, consumed
         fn value_len(&mut self, ty: u32) -> Result<()> {

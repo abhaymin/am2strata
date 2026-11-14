@@ -25,6 +25,8 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
     if n == 0 || max_chars == 0 {
         return Vec::new();
     }
+    // an overlap as long as a chunk would never move forward: keep it under half a chunk
+    let overlap = overlap.min(max_chars / 2);
 
     // Tokenize into words with the whitespace run that follows each word. A `Token` spans `[start, end)` in char space;
     // `ws_after` holds the length (in chars) of trailing whitespace, and `paragraph` is true when that whitespace breaks
@@ -192,15 +194,9 @@ fn min_hash_signature(text: &str) -> [u64; NUM_HASHES] {
     sig
 }
 
-/// MinHash Jaccard estimate: fraction of the 128 hash signs shared by the two signatures.
+/// MinHash Jaccard estimate: the fraction of the 128 minimum hashes that are equal in the two signatures.
 fn jaccard_estimate(a: &[u64; NUM_HASHES], b: &[u64; NUM_HASHES]) -> f64 {
-    let mut matches = 0usize;
-    for (x, y) in a.iter().zip(b) {
-        if (x ^ y) & (u64::MAX >> 1) == 0 {
-            matches += 1;
-        }
-    }
-    matches as f64 / NUM_HASHES as f64
+    a.iter().zip(b).filter(|(x, y)| x == y).count() as f64 / NUM_HASHES as f64
 }
 
 /// Return the indices to drop — later texts that are near-duplicates (MinHash Jaccard ≥ `threshold`) of an earlier,
@@ -528,5 +524,14 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
-}
 
+    #[test]
+    fn an_overlap_as_long_as_a_chunk_still_finishes() {
+        let text = "one two three four five six seven eight nine ten ".repeat(20);
+        for overlap in [10, 15, 100] {
+            let cs = chunk(&text, 15, overlap);
+            assert!(!cs.is_empty() && cs.len() < 400, "overlap {overlap}: {} chunks", cs.len());
+            assert!(cs.windows(2).all(|w| w[1].start > w[0].start), "every chunk moves forward");
+        }
+    }
+}
