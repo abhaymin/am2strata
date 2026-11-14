@@ -20,3 +20,10 @@ To be a real Hugging Face folder that `convert_hf_to_gguf.py` and transformers a
   ByteLevel decoder, and a `BPE` model with every field the library writes);
 - `tokenizer_config.json` with `bos_token`/`eos_token` as plain strings (`"tok_0"`, `"tok_1"`), and
   `tokenizer_class: "PreTrainedTokenizerFast"` (`LlamaTokenizerFast` adds a default `<unk>`, making 33 tokens).
+
+## tiny-llama.{Q8_0,Q4_K,F16}-pure.gguf
+
+`llama-quantize --pure tiny-llama.f32.gguf tiny-llama.<T>-pure.gguf <T>` (Unsloth's build), by the reviewer. With
+16-wide rows no matrix can hold a whole 32/256-value block, so llama-quantize falls back: every 2-D weight becomes F16
+and the 1-D norms stay F32, for all three targets. These pin the fallback rules, not the block quantizers (those are
+pinned by strata-pack's `quant-*.gguf`).
