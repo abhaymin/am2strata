@@ -1776,7 +1776,8 @@ fn security_every_route_needs_the_key() {
     for cap in &caps {
         let cap = [String::new(), cap.0.clone(), cap.1.clone()];
         let path = cap[1].replace("{*rest}", "x").replace("{id}", "mj-1");
-        if matches!(path.as_str(), "/health" | "/api/health" | "/preview/mj-1") {
+        // /rtenai: the remote models' page (static, no data); its API below it needs the key
+        if matches!(path.as_str(), "/health" | "/api/health" | "/preview/mj-1" | "/rtenai") {
             continue;
         }
         // a worker's join is proven by its pairing code, not a key (a_worker_pairs_by_its_code_and_is_removed_cleanly);
