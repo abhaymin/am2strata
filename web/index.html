@@ -453,15 +453,84 @@
         </div>
         <div class="st-card ws-card ws-card--soon"><span class="card-title">Train · coming next</span>
           <p class="muted small">LoRA training in Rust is built and tested on a small model; training real models (rotary
-            attention, the full Llama forward) is being finished. Until then, train with Unsloth and merge here.</p>
+            attention, the full Llama forward) is being finished. Until then, train with Unsloth on a dataset made below and merge here.</p>
+        </div>
+      </div>
+      <div class="st-card ws-data" id="ws-data"><span class="card-title">Training data · written by the loaded model</span>
+        <p class="muted small">Turn documents into a chat dataset (JSONL with <code>messages</code>, as Unsloth and the
+          trainer read it). The model you have loaded writes it through this server; a judge pass can check each answer
+          against its source. Every run writes a dataset card beside the file saying what it was made from and what was dropped.</p>
+        <div class="ws-data__grid">
+          <div class="ws-card">
+            <label class="st-label" for="ws-d-recipe">Recipe</label>
+            <select class="st-input" id="ws-d-recipe">
+              <option value="qa">Questions and answers from documents</option>
+              <option value="chat">Multi-turn chats about documents</option>
+              <option value="instruct">More examples like my own (seed JSONL)</option></select>
+            <div id="ws-d-src-box">
+              <label class="st-label" for="ws-d-sources">Documents <output>files or folders, one per line</output></label>
+              <textarea class="st-input mono" id="ws-d-sources" rows="3" placeholder="~/docs/manual.pdf&#10;~/notes/"></textarea>
+              <div class="ws-data__row">
+                <label class="st-btn st-btn--secondary" for="ws-d-files">Add files…</label>
+                <input type="file" id="ws-d-files" multiple hidden accept=".txt,.md,.markdown,.rst,.pdf,.html,.htm,.json,.jsonl,.csv,.py,.rs,.js,.ts,.go,.java,.c,.cpp,.h,.sh,.toml,.yaml,.yml">
+                <span class="muted small" id="ws-d-up"></span>
+              </div>
+              <p class="muted small">Text, Markdown, code, HTML and PDF. Added files are kept in the Workshop's uploads folder.</p>
+            </div>
+            <div id="ws-d-seed-box" hidden>
+              <label class="st-label" for="ws-d-seeds">Seed examples (JSONL of chats)</label>
+              <input class="st-input mono" id="ws-d-seeds" list="ws-datasets" placeholder="~/data/examples.jsonl">
+            </div>
+          </div>
+          <div class="ws-card">
+            <label class="st-label" for="ws-d-count">Records</label>
+            <input class="st-input" id="ws-d-count" type="number" min="1" max="100000" value="100">
+            <label class="st-label" for="ws-d-judge">Quality check</label>
+            <select class="st-input" id="ws-d-judge">
+              <option value="0">None (fastest)</option><option value="3">Judge: keep 3 of 5 and up</option>
+              <option value="4" selected>Judge: keep 4 of 5 and up</option><option value="5">Judge: only 5 of 5</option></select>
+            <label class="st-label" for="ws-d-topic">Focus <output>optional</output></label>
+            <input class="st-input" id="ws-d-topic" placeholder="e.g. setting up HTTPS">
+            <details class="small"><summary>More options</summary>
+              <label class="st-label" for="ws-d-per">Records per passage</label>
+              <input class="st-input" id="ws-d-per" type="number" min="1" max="20" value="4">
+              <label class="st-label" for="ws-d-chunk">Passage length (characters)</label>
+              <input class="st-input" id="ws-d-chunk" type="number" min="500" max="20000" step="500" value="3000">
+              <label class="st-label" for="ws-d-temp">Temperature</label>
+              <input class="st-input" id="ws-d-temp" type="number" min="0" max="2" step="0.1" value="0.7">
+              <label class="st-label" for="ws-d-lang">Language <output>optional: the documents'</output></label>
+              <input class="st-input" id="ws-d-lang" placeholder="e.g. English">
+              <label class="st-label" for="ws-d-out">Output file <output>optional</output></label>
+              <input class="st-input mono" id="ws-d-out" placeholder="(in the Workshop's datasets folder)">
+            </details>
+            <button type="button" class="st-btn st-btn--primary" id="ws-datagen">Generate</button>
+          </div>
+        </div>
+        <div class="ws-review">
+          <div class="ws-data__row">
+            <label class="st-label" for="ws-r-pick">Review a dataset</label>
+            <select class="st-input mono" id="ws-r-pick"><option value="">(none yet)</option></select>
+            <button type="button" class="st-btn st-btn--secondary" id="ws-r-open">Open</button>
+          </div>
+          <div id="ws-r-body" hidden>
+            <p class="small"><strong id="ws-r-total"></strong> <span class="muted" id="ws-r-note"></span></p>
+            <details class="small" id="ws-r-card-box"><summary>Dataset card</summary><pre class="ws-review__card" id="ws-r-card"></pre></details>
+            <div class="ws-review__table" id="ws-r-rows"></div>
+            <div class="ws-data__row">
+              <button type="button" class="st-btn st-btn--secondary" id="ws-r-prev">Previous</button>
+              <button type="button" class="st-btn st-btn--secondary" id="ws-r-next">Next</button>
+              <span class="muted small" id="ws-r-page"></span>
+              <button type="button" class="st-btn st-btn--danger" id="ws-r-del" disabled>Delete selected</button>
+            </div>
+          </div>
         </div>
       </div>
       <div class="msg-error" id="ws-error" hidden></div>
       <div class="st-card"><span class="card-title">Jobs</span>
         <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
-      <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|jobs|cancel</code> (through this server),
+      <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|strata|datagen|upload|dataset|jobs|cancel</code> (through this server),
         or <code>am2strata-workshop</code> on its own.</p>
-      <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist>
+      <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist><datalist id="ws-datasets"></datalist>
     </div>
   </section>
 

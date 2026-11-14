@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
-use strata_workshop::{convert, merge, quantize_gguf};
+use strata_workshop::{convert, datagen, merge, quantize_gguf};
 
 #[derive(Parser)]
 #[command(name = "am2strata-workshop", about = "Convert, quantize and merge models in Rust (am2Strata's Workshop)")]
@@ -54,6 +54,38 @@ enum Cmd {
         #[arg(long = "type")]
         ty: String,
     },
+    /// training data written by the server's loaded model (AM2STRATA_URL, AM2STRATA_API_KEY): from documents (qa,
+    /// chat) or from seed examples (instruct), filtered, de-duplicated and optionally judged
+    Datagen {
+        /// qa, chat or instruct
+        #[arg(long, default_value = "qa")]
+        recipe: String,
+        /// documents: files or folders (text, Markdown, code, HTML, PDF)
+        #[arg(long = "source")]
+        sources: Vec<PathBuf>,
+        /// instruct: a JSONL of example chat records
+        #[arg(long)]
+        seeds: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        count: usize,
+        #[arg(long, default_value_t = 4)]
+        per_chunk: usize,
+        #[arg(long, default_value_t = 3000)]
+        chunk_chars: usize,
+        #[arg(long, default_value_t = 200)]
+        overlap: usize,
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f64,
+        /// judge each answer 1-5 against its source and keep those at least this (0: no judge)
+        #[arg(long, default_value_t = 0)]
+        min_score: u8,
+        #[arg(long)]
+        topic: Option<String>,
+        #[arg(long)]
+        language: Option<String>,
+    },
     /// a LoRA adapter (PEFT or Unsloth: adapter_model.safetensors + adapter_config.json) into its base model
     Merge {
         base: PathBuf,
@@ -61,6 +93,14 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
     },
+}
+
+/// set by SIGTERM (a cancel from the server): datagen stops after the current request and writes what it made
+static TERM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_term(_: libc::c_int) {
+    TERM.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 struct Out {
@@ -76,6 +116,7 @@ impl Out {
         match v["event"].as_str() {
             Some("start") => println!("{} …", v["what"].as_str().unwrap_or("")),
             Some("log") => println!("  {}", v["message"].as_str().unwrap_or("")),
+            Some("progress") => println!("  [{}/{}] {}", v["done"], v["total"], v["message"].as_str().unwrap_or("")),
             Some("done") => println!("done in {:.1} s: {} ({})", v["seconds"].as_f64().unwrap_or(0.0),
                                      v["output"].as_str().unwrap_or(""), human(v["bytes"].as_u64().unwrap_or(0))),
             Some("error") => eprintln!("error: {}", v["message"].as_str().unwrap_or("")),
@@ -178,6 +219,37 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             out.event(json!({"event": "start", "what": format!("quantize {} to {} ({ty})", input.display(), dst.display())}));
             quantize_gguf::quantize(input, dst, t).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "gguf".into()))
+        }
+        Cmd::Datagen { recipe, sources, seeds, out: dst, count, per_chunk, chunk_chars, overlap, temperature, min_score, topic, language } => {
+            let settings = datagen::Settings {
+                recipe: datagen::Recipe::from_s(recipe).map_err(|e| e.to_string())?, sources: sources.clone(), seeds: seeds.clone(),
+                count: *count, per_chunk: (*per_chunk).clamp(1, 20), chunk_chars: (*chunk_chars).clamp(500, 20_000),
+                overlap: *overlap, temperature: *temperature, min_score: (*min_score).min(5), topic: topic.clone(),
+                language: language.clone(), out: dst.clone(),
+            };
+            let model = datagen::Model::from_env().map_err(|e| e.to_string())?;
+            out.event(json!({"event": "start", "what": format!("{} data with {} into {}", recipe, model.name, dst.display())}));
+            // a cancel (SIGTERM from the server) stops after the current request and still writes what was made
+            #[cfg(unix)]
+            unsafe { libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t); }
+            let r = datagen::run(&settings, &model,
+                |done, total, msg| out.event(json!({"event": "progress", "done": done, "total": total, "message": msg})),
+                || TERM.load(std::sync::atomic::Ordering::SeqCst)).map_err(|e| e.to_string())?;
+            out.event(json!({"event": "log", "message": format!("kept {} of {} written ({} filtered, {} duplicates, {} judged out)",
+                r.kept, r.generated, r.filtered.values().sum::<usize>(), r.duplicates, r.judged_out)}));
+            if r.kept == 0 && !TERM.load(std::sync::atomic::Ordering::SeqCst) {
+                let why = if r.generated == 0 {
+                    format!("{} of {} replies from {} held no records in the asked-for JSON: try a larger or instruction-tuned model",
+                            r.unparsable, r.asked, model.name)
+                } else {
+                    "every record was dropped by the filters, as duplicates or by the judge: see the dataset card".to_string()
+                };
+                // nothing to train on: no empty dataset is left behind (its card would only repeat this)
+                std::fs::remove_file(dst).ok();
+                std::fs::remove_file(datagen::card_path(dst)).ok();
+                return Err(format!("no records kept: {why}"));
+            }
+            Ok((dst.clone(), "dataset".into()))
         }
         Cmd::Merge { base, adapter, out: dst } => {
             out.event(json!({"event": "start", "what": format!("merge {} into {} as {}", adapter.display(), base.display(), dst.display())}));

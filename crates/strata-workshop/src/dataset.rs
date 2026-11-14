@@ -29,12 +29,10 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
     let overlap = overlap.min(max_chars / 2);
 
     // Tokenize into words with the whitespace run that follows each word. A `Token` spans `[start, end)` in char space;
-    // `ws_after` holds the length (in chars) of trailing whitespace, and `paragraph` is true when that whitespace breaks
-    // to a new line. Sentence-end detection keys off the last visible character of the word.
+    // `paragraph` is true when the whitespace after the word breaks to a new line. Sentence-end detection keys off the last visible character of the word.
     struct Token {
         start: usize,
         end: usize,
-        ws_after: usize,
         paragraph: bool,
         sentence_end: bool,
     }
@@ -58,13 +56,10 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
         while i < n && chars[i].is_whitespace() {
             i += 1;
         }
-        let ws_after = i - ws_start;
         let word: &[char] = &chars[start..end];
         let sentence_end = ends_with_punct(word) || end == n;
-        let paragraph = chars[ws_start..ws_start + ws_after]
-            .iter()
-            .any(|c| *c == '\n');
-        tokens.push(Token { start, end, ws_after, paragraph, sentence_end });
+        let paragraph = chars[ws_start..i].contains(&'\n');
+        tokens.push(Token { start, end, paragraph, sentence_end });
     }
 
     let mut out: Vec<Chunk> = Vec::new();

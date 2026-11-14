@@ -123,6 +123,7 @@ enum Cmd {
     },
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
     /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
+    /// | datagen [<doc>] --source <doc> --recipe qa --count 100 | upload <file> | dataset <jsonl>
     /// | jobs | job <id> | cancel <id> | files
     Workshop {
         action: String,
@@ -157,6 +158,8 @@ enum Cmd {
         api_key: Option<String>,
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
+        #[command(flatten)]
+        dg: DatagenOpts,
     },
     /// the Computer tab from a terminal: status | screenshot <file.png> | take | give | copy | paste <text>
     /// | type <text> | open <app>  (the sandbox desktop computer use works on)
@@ -686,8 +689,8 @@ fn main() -> ExitCode {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
-        Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir } =>
-            workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir),
+        Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir, dg } =>
+            workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir, dg),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
@@ -848,12 +851,48 @@ fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
+/// `workshop datagen` (training data written by the loaded model) and `workshop dataset` (paging through one).
+#[derive(clap::Args, Debug, Default)]
+struct DatagenOpts {
+    /// datagen: qa (questions and answers from documents), chat (multi-turn chats about them) or instruct (more like
+    /// the --seeds examples)
+    #[arg(long)]
+    recipe: Option<String>,
+    /// datagen: a document or folder (repeat it); text, Markdown, code, HTML or PDF
+    #[arg(long = "source")]
+    sources: Vec<String>,
+    /// datagen instruct: a JSONL of example chats
+    #[arg(long)]
+    seeds: Option<String>,
+    /// datagen: how many records (default 100)
+    #[arg(long)]
+    count: Option<u64>,
+    #[arg(long)]
+    per_chunk: Option<u64>,
+    #[arg(long)]
+    chunk_chars: Option<u64>,
+    #[arg(long)]
+    temperature: Option<f64>,
+    /// datagen: judge each answer 1-5 against its source and keep those at least this
+    #[arg(long)]
+    min_score: Option<u64>,
+    #[arg(long)]
+    topic: Option<String>,
+    #[arg(long)]
+    language: Option<String>,
+    /// dataset: the first record to show, and how many
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    #[arg(long, default_value_t = 10)]
+    limit: usize,
+}
+
 /// `am2strata-run workshop ...`: the server's /v1/workshop API, as the Workshop tab uses it.
 #[allow(clippy::too_many_arguments)]
 fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out: Option<String>, ty: Option<String>,
                 outtype: Option<String>, pre: Option<String>, install: (Option<String>, Option<String>, bool), wait: bool,
                 url: Option<String>, api_key: Option<String>,
-                models_dir: &str) -> ExitCode {
+                models_dir: &str, dg: DatagenOpts) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
     let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
     let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
@@ -887,6 +926,38 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                           "output": out.clone().map(abs)}),
             "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
                                            "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),
+            "datagen" => {
+                let mut sources: Vec<String> = first.clone().into_iter().chain(dg.sources.iter().cloned()).map(abs).collect();
+                sources.dedup();
+                serde_json::json!({"kind": "datagen", "recipe": dg.recipe.clone().unwrap_or_else(|| "qa".into()), "sources": sources,
+                                   "seeds": dg.seeds.clone().map(abs), "output": out.clone().map(abs), "count": dg.count,
+                                   "per_chunk": dg.per_chunk, "chunk_chars": dg.chunk_chars, "temperature": dg.temperature,
+                                   "min_score": dg.min_score, "topic": dg.topic.clone(), "language": dg.language.clone()})
+            }
+            "upload" => {
+                let file = first.clone().ok_or("upload <file>")?;
+                let bytes = std::fs::read(expand_path(Path::new(&file))).map_err(|e| format!("{file}: {e}"))?;
+                let name = Path::new(&file).file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
+                let up = reqwest::blocking::Client::builder().timeout(Duration::from_secs(600)).build().unwrap();
+                let rb = up.post(format!("{url}/v1/workshop/uploads")).query(&[("name", name)]).body(bytes);
+                let j = send(rb)?;
+                println!("{} ({} KB)", j["path"].as_str().unwrap_or(""), j["bytes"].as_u64().unwrap_or(0) / 1024);
+                return Ok(());
+            }
+            "dataset" => {
+                let path = abs(first.clone().ok_or("dataset <file.jsonl>")?);
+                let j = send(client.get(format!("{url}/v1/workshop/dataset"))
+                    .query(&[("path", path), ("offset", dg.offset.to_string()), ("limit", dg.limit.to_string())]))?;
+                println!("{}: {} records{}", j["path"].as_str().unwrap_or(""), j["total"],
+                         if j["writing"] == true { " (a job is still writing it)" } else { "" });
+                for r in j["records"].as_array().into_iter().flatten() {
+                    println!("--- #{}", r["i"]);
+                    for m in r["record"]["messages"].as_array().into_iter().flatten() {
+                        println!("{}: {}", m["role"].as_str().unwrap_or("?"), m["content"].as_str().unwrap_or(""));
+                    }
+                }
+                return Ok(());
+            }
             "jobs" => {
                 let j = send(client.get(format!("{url}/v1/workshop/jobs")))?;
                 for x in j["jobs"].as_array().into_iter().flatten() { show(x); }
@@ -905,7 +976,7 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 for l in j["log"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
                 return Ok(());
             }
-            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, jobs, job, cancel, files")),
+            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, datagen, upload, dataset, jobs, job, cancel, files")),
         };
         let mut body = body;
         if let Some(o) = body.as_object_mut() { o.retain(|_, v| !v.is_null()); }
