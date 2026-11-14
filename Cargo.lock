@@ -3338,11 +3338,14 @@ dependencies = [
  "anyhow",
  "candle-core-mold",
  "candle-nn-mold",
+ "half",
  "memmap2",
  "prost",
  "safetensors",
  "serde",
  "serde_json",
+ "strata-gguf",
+ "strata-pack",
  "thiserror 2.0.21",
 ]
 

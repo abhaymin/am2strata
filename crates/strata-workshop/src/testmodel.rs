@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
+use serde_json::json;
 use safetensors::tensor as st;
 
 /// A tiny random Llama (2 layers by default) laid out the way a real checkpoint's tensors are named. All weights are
@@ -21,13 +22,17 @@ pub struct TinyLlama {
     pub vocab_size: usize,
     pub hidden: usize,
     pub intermediate: usize,
-    /// number of shard files to write (1 = one file; >=2 lets step 1 exercise shard enumeration)
+    /// attention heads (hidden is a multiple of these), written to config.json and used for the rotary q/k permute
+    pub num_attention_heads: usize,
+    /// GQA key/value heads (defaults to full attention here)
+    pub num_key_value_heads: usize,
+    /// how many shard files to write (1 = one file; >=2 lets step 1 exercise shard enumeration)
     pub shard_count: usize,
 }
 
 impl Default for TinyLlama {
     fn default() -> Self {
-        Self { seed: 0x5EED, num_layers: 2, vocab_size: 32, hidden: 16, intermediate: 32, shard_count: 1 }
+        Self { seed: 0x5EED, num_layers: 2, vocab_size: 32, hidden: 16, intermediate: 32, num_attention_heads: 2, num_key_value_heads: 2, shard_count: 1 }
     }
 }
 
@@ -58,17 +63,20 @@ impl TinyLlama {
             out.push(TensorData { name: p("self_attn.k_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
             out.push(TensorData { name: p("self_attn.v_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
             out.push(TensorData { name: p("self_attn.o_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
-            out.push(TensorData { name: p("post_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
+            out.push(TensorData { name: p("post_attention_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
             out.push(TensorData { name: p("mlp.gate_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, w) });
             out.push(TensorData { name: p("mlp.up_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, w) });
             out.push(TensorData { name: p("mlp.down_proj.weight"), shape: vec![self.hidden, self.intermediate], values: mat(&mut gen, self.hidden, self.intermediate, 1.0 / (self.intermediate as f32).sqrt()) });
         }
         out.push(TensorData { name: "model.norm.weight".into(), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
+        // a distinct output head (tie_word_embeddings = false in config.json), so the converter writes an `output` tensor
+        out.push(TensorData { name: "lm_head.weight".into(), shape: vec![self.vocab_size, self.hidden], values: mat(&mut gen, self.vocab_size, self.hidden, 1.0 / (self.hidden as f32).sqrt()) });
         out
     }
 
-    /// Write the fixture into `dir`: `<count>` safetensors shards named like an HF checkpoint plus a minimal
-    /// `tokenizer.json`. Returns the shard files (in order) and the tokenizer path.
+    /// Write the fixture into `dir`: `<count>` safetensors shards named like an HF checkpoint, a real `config.json` and
+    /// `tokenizer_config.json`, plus a minimal `tokenizer.json`. Returns the shard files (in order). The config and
+    /// tokenizer are exactly what the step-6 converter reads to build the GGUF.
     pub fn write(&self, dir: &Path) -> anyhow::Result<ShardFiles> {
         let tensors = self.generate();
         std::fs::create_dir_all(dir)?;
@@ -79,8 +87,27 @@ impl TinyLlama {
             write_shard(dir.join(&name), chunk)?;
             shard_files.push(dir.join(name));
         }
-        write_tokenizer_json(dir)?;
+        write_config_json(dir, &self.hf_config())?;
+        write_tokenizer_config_json(dir)?;
+        write_tokenizer_json(dir, self.vocab_size)?;
         Ok(ShardFiles { dir: dir.to_path_buf(), shard_files })
+    }
+
+    /// The config.json contents this fixture writes, as a serde_json value — so the converter can be tested against it.
+    pub fn hf_config(&self) -> serde_json::Value {
+        json!({
+            "architectures": ["LlamaForCausalLM"],
+            "hidden_size": self.hidden,
+            "num_hidden_layers": self.num_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "intermediate_size": self.intermediate,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": self.vocab_size,
+            "max_position_embeddings": 512,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": false,
+        })
     }
 }
 
@@ -115,28 +142,42 @@ fn write_shard(path: PathBuf, chunk: &[TensorData]) -> anyhow::Result<()> {
 
 /// A minimal but valid HuggingFace `tokenizer.json` (ByteLevel BPE, no merges) so later steps that read a tokenizer
 /// from the fixture have something loadable. Vocab tokens are derived from the seed.
-fn write_tokenizer_json(dir: &Path) -> anyhow::Result<()> {
-    let vocab_size = 8usize; // keeps it tiny; shape is what matters for reader reuse
+fn write_config_json(dir: &Path, cfg: &serde_json::Value) -> anyhow::Result<()> {
+    std::fs::write(dir.join("config.json"), serde_json::to_string_pretty(cfg)?)?;
+    Ok(())
+}
+
+/// Write the HF `tokenizer_config.json` (chat template, bos/eos, add flags) so the converter and llama.cpp agree on the
+/// tokenizer's special tokens. bos is tok_0 / eos is tok_1, both present in the vocab written alongside this.
+fn write_tokenizer_config_json(dir: &Path) -> anyhow::Result<()> {
+    let tc = json!({
+        "add_bos_token": true,
+        "add_eos_token": false,
+        "tokenizer_class": "LlamaTokenizerFast",
+        "bos_token": {"content": "tok_0", "special": true},
+        "eos_token": {"content": "tok_1", "special": true},
+        "chat_template": "{% for message in messages %}{% if loop.first and message['role'] != 'system' %}{{ system_prompt }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}",
+    });
+    std::fs::write(dir.join("tokenizer_config.json"), serde_json::to_string_pretty(&tc)?)?;
+    Ok(())
+}
+
+fn write_tokenizer_json(dir: &Path, vocab_size: usize) -> anyhow::Result<()> {
     let mut vocab = BTreeMap::new();
     for i in 0..vocab_size {
         vocab.insert(format!("tok_{i}"), i);
     }
-    // hand-build the JSON so the structure (model.vocab / model.merges / pre_tokenizer) is explicit and correct
-    let mut pairs = String::from("{ ");
-    for (i, (k, v)) in vocab.iter().enumerate() {
-        if i > 0 {
-            pairs.push_str(", ");
-        }
-        pairs.push_str(&format!("\"{k}\": {v}"));
-    }
-    pairs.push_str(" }");
-    let text = format!(
-        "{{\n  \"version\": \"1.1\",\n  \"add_bos_token\": false,\n  \"add_eos_token\": false,\n  \
-         \"model\": {{ \"type\": \"BPE\", \"dropout\": null, \"vocab\": {pairs}, \"merges\": [] }},\n  \
-         \"pre_tokenizer\": {{ \"type\": \"ByteLevel\", \"use_regex\": true }},\n  \
-         \"decoders\": null,\n  \"special_tokens\": {{ \"bos\": null, \"eos\": null }}\n}}\n"
-    );
-    std::fs::write(dir.join("tokenizer.json"), text)?;
+    // serde so the structure (model.vocab / model.merges / pre_tokenizer / special_tokens) is always valid JSON.
+    let tj = json!({
+        "version": "1.1",
+        "add_bos_token": true,
+        "add_eos_token": false,
+        "model": { "type": "BPE", "dropout": null, "vocab": vocab, "merges": [] },
+        "pre_tokenizer": { "type": "ByteLevel", "use_regex": true },
+        "decoders": null,
+        "special_tokens": { "bos": "tok_0", "eos": "tok_1" },
+    });
+    std::fs::write(dir.join("tokenizer.json"), serde_json::to_string_pretty(&tj)?)?;
     Ok(())
 }
 

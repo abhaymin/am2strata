@@ -150,7 +150,7 @@ impl TinyLlama {
             let p = |k: &str| format!("model.layers.{i}.{k}");
             norms.push([
                 base.get(&p("input_layernorm.weight")).ok_or_else(|| anyhow!("missing {}", p("input_layernorm.weight")))?.clone(),
-                base.get(&p("post_layernorm.weight")).ok_or_else(|| anyhow!("missing {}", p("post_layernorm.weight")))?.clone(),
+                base.get(&p("post_attention_layernorm.weight")).ok_or_else(|| anyhow!("missing {}", p("post_attention_layernorm.weight")))?.clone(),
             ]);
             mlp.push([
                 base.get(&p("mlp.gate_proj.weight")).ok_or_else(|| anyhow!("missing {}", p("mlp.gate_proj.weight")))?.clone(),

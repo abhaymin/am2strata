@@ -15,3 +15,6 @@ serde_json.workspace = true
 prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+strata-pack.workspace = true
+strata-gguf.workspace = true
+half = "2"

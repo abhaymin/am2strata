@@ -14,6 +14,7 @@
 pub const QLORA_READY: bool = false;
 
 pub mod checkpoint;
+pub mod convert;
 pub mod lora;
 pub mod merge;
 pub mod safetensors_io;
