@@ -74,6 +74,42 @@ impl Buffer {
     }
 }
 
+/// The virtual display geometry (`WxHxD`), defaulting to 1280x800x24 when the config gives none. Portable: every OS parses it,
+/// so `engine.rs` uses it on Linux and the macOS / Windows stubs alike — there is no OS in this type (it is why `Size` lives here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Size { pub width: u32, pub height: u32, pub depth: u32 }
+
+impl Size {
+    /// The default sandbox display geometry (1280x800x24).
+    pub const DEFAULT: Size = Size { width: 1280, height: 800, depth: 24 };
+    /// Parse "WxHxD" (e.g. "1280x800x24"); unknown or empty falls back to the default.
+    pub fn parse(s: Option<&str>) -> Size {
+        match s.and_then(|v| v.split_once('x')) {
+            Some((w, rest)) => match (w.trim().parse::<u32>(), rest.split_once('x')) {
+                (Ok(w), Some((h, d))) => match (h.trim().parse::<u32>(), d.trim().parse::<u32>()) {
+                    (Ok(h), Ok(d)) if w > 0 && h > 0 && d > 0 => Size { width: w, height: h, depth: d },
+                    _ => Size::DEFAULT,
+                },
+                _ => Size::DEFAULT,
+            },
+            None => Size::DEFAULT,
+        }
+    }
+}
+
+impl Default for Size { fn default() -> Self { Size::DEFAULT } }
+
+/// Whether a tool (`name`) is on the system's PATH, so a backend fails cleanly on a box without it instead of panicking. Portable
+/// — it only walks `PATH`, no OS call — so every platform gates its tools on it (`engine.rs`, item 2), Linux and macOS / Windows alike.
+pub fn tool_available(name: &str) -> bool {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            if dir.join(name).is_file() { return true; }
+        }
+    }
+    false
+}
+
 /// The desktop a step acts on. Chosen by mode and OS at runtime; in tests it is any type that implements it (a mock).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub trait Backend {
@@ -223,29 +259,6 @@ mod linux {
         }
     }
 
-    /// The virtual display geometry (`WxHxD`), defaulting to 1280x800x24 when the config gives none.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct Size { pub width: u32, pub height: u32, pub depth: u32 }
-
-    impl Size {
-        /// The default sandbox display geometry (1280x800x24).
-        pub const DEFAULT: Size = Size { width: 1280, height: 800, depth: 24 };
-        /// Parse "WxHxD" (e.g. "1280x800x24"); unknown or empty falls back to the default.
-        pub fn parse(s: Option<&str>) -> Size {
-            match s.and_then(|v| v.split_once('x')) {
-                Some((w, rest)) => match (w.trim().parse::<u32>(), rest.split_once('x')) {
-                    (Ok(w), Some((h, d))) => match (h.trim().parse::<u32>(), d.trim().parse::<u32>()) {
-                        (Ok(h), Ok(d)) if h > 0 && d > 0 => Size { width: w, height: h, depth: d },
-                        _ => Size::DEFAULT,
-                    },
-                    _ => Size::DEFAULT,
-                },
-                None => Size::DEFAULT,
-            }
-        }
-    }
-
-    impl Default for Size { fn default() -> Self { Size::DEFAULT } }
 
     /// Start `Xvfb` privately for the sandbox (`item 1`). It picks its own free display via `-displayfd`, which reports that
     /// display number back on a pipe, so there is no window between choosing a number and starting Xvfb for another server to
@@ -414,16 +427,6 @@ mod linux {
         fn drop(&mut self) { self.stop(); }
     }
 
-    /// The tools a real session needs, so a backend on a box without them fails cleanly instead of panicking. Visible crate-wide
-    /// (re-exported below) so the engine can gate the sandbox's tools on their presence (`server_tools.rs`, item 2).
-    pub fn tool_available(name: &str) -> bool {
-        if let Some(path) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&path) {
-                if dir.join(name).is_file() { return true; }
-            }
-        }
-        false
-    }
 
     /// A child X tool must run against the sandbox display with nothing inherited from the server's environment (the am2strata
     /// service runs with `DISPLAY=:0` / `WAYLAND_DISPLAY=wayland-0`, so a leaked DISPLAY would drive the owner's real screen),
@@ -511,7 +514,36 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxBackend, SandboxDesktop, Size, tool_available};
+pub use linux::{LinuxBackend, SandboxDesktop};
+
+// ------------------------------------------------------------------------------------------------- Non-Linux helpers
+
+/// macOS / Windows: the same desktop handle type as Linux, so `engine.rs`'s `Computers.desktop` slot, its idle watcher and the
+/// sandbox tests are well-typed everywhere. There is never a real display here (the backend is `None`, so no tool is offered), but
+/// this keeps those fields and functions compiling; it only records that it was asked to stop. Kept behind cfg since Linux has the
+/// real Xvfb-backed one in `mod linux` — both are named `SandboxDesktop` at this path, which is why the engine needs no OS check.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug)]
+pub struct SandboxDesktop {
+    /// whether it has been told to stop (the idle watcher / engine read this), mirroring the Linux sandbox's flag.
+    pub stopped: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl SandboxDesktop {
+    /// Construct a phantom desktop at `size`; there is no Xvfb to launch on these platforms (nothing is ever started).
+    pub fn new(_size: Size) -> SandboxDesktop { SandboxDesktop { stopped: std::sync::atomic::AtomicBool::new(false) } }
+
+    /// There is nothing running here (`LinuxBackend` does not exist on this platform), so a step never drives it.
+    pub fn ensure(&self) -> Result<String, String> { Ok(":99".into()) }
+
+    /// Mark it stopped; there is no child process to kill.
+    pub fn stop(&self) { self.stopped.store(true, std::sync::atomic::Ordering::Relaxed) }
+
+    /// Report idle so the idle watcher stops a phantom display just like the real one (nothing depends on the quiet time here).
+    pub fn is_idle(&self, _within: std::time::Duration) -> bool { true }
+}
 
 // -------------------------------------------------------------------------------------------------------- Non-Linux stub
 
@@ -624,7 +656,7 @@ mod tests {
     #[ignore = "needs Xvfb + an X client on a running session"]
     #[test]
     fn sandbox_launches_a_virtual_display_and_clicks_an_app() -> Result<(), String> {
-        if !linux::tool_available("Xvfb") || !linux::tool_available("xdotool") { return Ok(()); }
+        if !tool_available("Xvfb") || !tool_available("xdotool") { return Ok(()); }
 
         // the sandbox: a virtual display at 1280x800, driven on that display by LinuxBackend
         let mut xvfb = std::process::Command::new("Xvfb").args([":99", "-screen", "0", "1280x800x24"])
@@ -660,6 +692,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_linux_backend_constructs_and_degrades_without_a_display() {
         // an unlikely-running virtual display; without a screenshot tool there it must fail cleanly, not panic
@@ -681,7 +714,7 @@ mod tests {
         // Inspecting the built Command needs no running display, but building an xdotool command goes through the availability
         // guard — so on a box without xdotool (this CI box) there is nothing to build; the assertions below run wherever the
         // sandbox actually runs, which requires `xdotool` (`computer/engine.rs`, item 2).
-        if !linux::tool_available("xdotool") {
+        if !tool_available("xdotool") {
             match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
             return;
         }
@@ -745,6 +778,7 @@ mod tests {
         assert_eq!(Size::parse(None), Size::DEFAULT);
         assert_eq!(Size::parse(Some("garbage")), Size::DEFAULT);
         assert_eq!(Size::parse(Some("1024x768x24")), Size { width: 1024, height: 768, depth: 24 });
+        assert_eq!(Size::parse(Some("0x768x24")), Size::DEFAULT, "a zero width falls back to the default");
     }
 
     /// Xvfb reports its chosen display on `-displayfd`; parse that number back (item 1). Pure, no Xvfb needed. Accepts a
@@ -766,7 +800,7 @@ mod tests {
     #[ignore = "needs Xvfb on a running session"]
     #[test]
     fn the_sandbox_xvfb_reports_a_display_number_that_is_usable() -> Result<(), String> {
-        if !linux::tool_available("Xvfb") { return Ok(()); }
+        if !tool_available("Xvfb") { return Ok(()); }
         // a desktop at 640x480; Xvfb runs privately, reports its display over the pipe, stays up so it can be driven.
         let d = SandboxDesktop::new(Size { width: 640, height: 480, depth: 24 });
         let disp = d.ensure()?;
@@ -782,7 +816,7 @@ mod tests {
     #[ignore = "needs Xvfb on a running session"]
     #[test]
     fn ensure_clears_stopped_when_the_display_restarts() -> Result<(), String> {
-        if !linux::tool_available("Xvfb") { return Ok(()); }
+        if !tool_available("Xvfb") { return Ok(()); }
         let d = SandboxDesktop::new(Size { width: 320, height: 240, depth: 24 });
         let _ = d.stop();                                       // an idle watcher stopped the display
         assert!(d.stopped.load(std::sync::atomic::Ordering::Relaxed), "it is stopped");

@@ -2418,7 +2418,7 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawe
 // ------------------------------------------------------------------ Settings: sections
 let section = store.get("settings-section", "models");
 function showSection(name) {
-  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients", "cluster", "computer"].includes(name) ? name : "models";
+  section = ["models", "config", "defaults", "server", "tools", "memory", "appearance", "connect", "clients", "cluster", "computer", "https"].includes(name) ? name : "models";
   store.set("settings-section", section);
   for (const b of $("set-nav").children) b.setAttribute("aria-current", String(b.dataset.sec === section));
   for (const p of document.querySelectorAll(".set-panel")) p.hidden = p.id !== `sec-${section}`;
@@ -2432,9 +2432,64 @@ function showSection(name) {
   if (section === "connect") { renderAppSetup(); renderAgents(); }
   if (section === "clients") loadClients();
   if (section === "cluster") loadCluster();
+  if (section === "https") loadTls();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of $("set-nav").children) b.onclick = () => showSection(b.dataset.sec);
+
+// Settings › Secure connection: HTTPS as it is now, and the three ways to turn it on (server_tls.rs, /api/tls)
+async function loadTls() {
+  try {
+    const r = await fetch("api/tls", {headers: headers()});
+    if (!r.ok) throw new Error(r.status === 401 ? "An API key is needed (Settings › Server and access › API key)." : `HTTP ${r.status}`);
+    renderTls(await r.json());
+  } catch (e) { $("tls-status").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
+}
+function renderTls(j) {
+  const c = j.certificate || {};
+  const here = location.protocol === "https:" ? '<span class="st-badge st-badge--generating">This page is secure</span>' : "";
+  let html = `<div class="mcp-server__head"><strong>${j.on ? "HTTPS is on" : "HTTPS is off"}</strong>` +
+    `<span class="st-badge ${j.on ? "st-badge--generating" : ""}">${j.on ? esc(j.mode) + " · port " + esc(j.https_port) : "plain HTTP only, port " + esc(j.api_port)}</span>${here}</div>`;
+  if (j.on) {
+    html += `<dl class="facts">` +
+      `<dt>Open</dt><dd>${(j.urls || []).map((u) => `<a href="${esc(u)}" class="mono">${esc(u)}</a>`).join("<br>")}</dd>` +
+      `<dt>Plain HTTP</dt><dd>${esc({"local-only": "this PC only; other devices go to HTTPS", redirect: "everyone goes to HTTPS", keep: "still answers everyone"}[j.http] || j.http)}</dd>` +
+      `<dt>HSTS</dt><dd class="mono">${esc(j.hsts || "")}</dd>` +
+      `<dt>Certificate</dt><dd>${esc(c.subject || "")}${c.self_signed ? " (self-signed)" : ` · issued by ${esc(c.issuer || "")}`}</dd>` +
+      `<dt>Names</dt><dd class="mono small">${(c.names || []).map(esc).join(", ")}</dd>` +
+      `<dt>Valid until</dt><dd>${esc(c.not_after || "")}${c.expires_in_days != null ? ` (${fmt(c.expires_in_days)} days)` : ""}</dd>` +
+      `<dt>SHA-256</dt><dd class="mono small" style="word-break:break-all">${esc(c.sha256 || "")}</dd></dl>`;
+    $("tls-port").value = j.https_port; $("tls-http").value = j.http;
+  }
+  if (j.tailscale) html += `<p class="muted small">Tailscale: ${esc(j.tailscale.name || "no MagicDNS name")} · ${(j.tailscale.ips || []).map(esc).join(", ")}</p>`;
+  else html += `<p class="muted small">Tailscale is not running on this PC (or not logged in).</p>`;
+  if (j.last_error) html += `<div class="msg-error">${esc(j.last_error)}</div>`;
+  $("tls-status").innerHTML = html;
+  $("tls-ts").disabled = !j.tailscale;
+  $("tls-renew").disabled = $("tls-off").disabled = !j.on;
+}
+async function tlsAction(body, btn) {
+  $("tls-error").hidden = true;
+  const label = btn.textContent; btn.disabled = true; btn.textContent = "Working…";
+  try {
+    body.https_port = Number($("tls-port").value) || 8001; body.http = $("tls-http").value;
+    const r = await fetch("api/tls", {method: "POST", headers: {...headers(), "Content-Type": "application/json"}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+    renderTls(j);
+    if (j.saved_error) { $("tls-error").textContent = j.saved_error; $("tls-error").hidden = false; }
+  } catch (e) { $("tls-error").textContent = e.message; $("tls-error").hidden = false; }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+$("tls-self").onclick = (e) => tlsAction({action: "self-signed"}, e.currentTarget);
+$("tls-ts").onclick = (e) => tlsAction({action: "tailscale"}, e.currentTarget);
+$("tls-renew").onclick = (e) => tlsAction({action: "renew"}, e.currentTarget);
+$("tls-off").onclick = (e) => { if (confirm("Turn HTTPS off? Devices that use the HTTPS address will lose the connection.")) tlsAction({action: "off"}, e.currentTarget); };
+$("tls-load").onclick = async (e) => {
+  const [cf, kf] = [$("tls-cert").files[0], $("tls-key").files[0]];
+  if (!cf || !kf) { $("tls-error").textContent = "Choose both the certificate and its private key."; $("tls-error").hidden = false; return; }
+  tlsAction({action: "load", cert_pem: await cf.text(), key_pem: await kf.text()}, e.currentTarget);
+};
 
 // Settings › Clients: the run config's client profiles (keys masked), read only
 async function loadClients() {

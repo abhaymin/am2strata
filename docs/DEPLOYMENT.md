@@ -260,6 +260,44 @@ Logs: each model's engine log is the config's `log` file. The server logs to the
 
 Neither download holds the media engine, whose audio and video codecs have their own terms (NOTICE), or any run config.
 
+## HTTPS and secure WebSockets
+
+am2Strata can answer over HTTPS (and `wss://` for streams) on its own port, **8001** by default, next to the API's
+plain-HTTP port. Turn it on in the web app (**Settings › Secure connection**), from a terminal, or in the run config.
+It applies at once, without a restart, and is kept in the run config.
+
+Three ways to get a certificate:
+
+| | What it is | Command |
+|---|---|---|
+| **Self-signed** | made on this PC for every name and address it has (localhost, its hostname, LAN and Tailscale addresses); browsers warn once, so compare the SHA-256 shown in Settings with the browser's | `am2strata-run tls self-signed` |
+| **Tailscale** | a real certificate for this PC's tailnet name (`<pc>.<tailnet>.ts.net`), trusted by browsers, renewed daily. Needs MagicDNS and **HTTPS Certificates** turned on in the Tailscale admin console (DNS page); if `tailscale cert` says access denied, run `sudo tailscale set --operator=$USER` once | `am2strata-run tls tailscale` |
+| **Your own** | any PEM certificate (with its chain) and key; checked to belong together before it is used, reloaded when the files change | `am2strata-run tls load --cert cert.pem --key key.pem` |
+
+`am2strata-run tls status` shows what is in force (names, issuer, expiry, fingerprint, the addresses to open);
+`tls renew` gets a fresh certificate; `tls off` turns HTTPS off. `--port` and `--http` set the port and what plain
+HTTP does.
+
+**Plain HTTP once HTTPS is on** (`"http"`): `local-only` (the default) keeps answering this PC's own tools on
+127.0.0.1 and sends every other device to HTTPS (a 308 redirect, so the method and body are kept); `redirect` sends
+everyone except `/health`; `keep` changes nothing (not recommended).
+
+**HSTS** (`Strict-Transport-Security: max-age=31536000`) is sent on HTTPS responses only. Browsers apply it to a
+trusted name (the Tailscale one), not to bare IP addresses or certificates they do not trust.
+
+The run config block, if you prefer to write it:
+
+```json
+"tls": { "mode": "tailscale", "https_port": 8001, "http": "local-only" }
+```
+
+`mode` is `self-signed`, `tailscale` or `files` (with `"cert"` and `"key"` paths); a mistake in this block stops
+the server at start with the reason, so it never runs on plain HTTP by surprise. The certificate and key live in
+`<data>/server-tls/` (the key readable by its owner only).
+
+**Alternative:** `tailscale serve --https=443 http://127.0.0.1:8000` puts Tailscale's own HTTPS in front of
+am2Strata without changing it.
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your

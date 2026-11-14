@@ -596,3 +596,7 @@ body.resizing iframe { pointer-events: none; }
 .ws-card { display: flex; flex-direction: column; gap: .35rem; margin: 0; }
 .ws-card > .st-btn { align-self: flex-start; margin-top: auto; }
 .ws-card--soon { opacity: .75; }
+/* Settings › Secure connection: the three ways to turn HTTPS on, side by side when there is room */
+.tls-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .75rem; margin: .75rem 0; }
+.st-card--inner { margin: 0; display: flex; flex-direction: column; gap: .4rem; }
+.st-card--inner > .st-btn { align-self: flex-start; margin-top: auto; }

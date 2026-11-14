@@ -11,7 +11,14 @@
 //! - **Modes gate input.** In `watch-only` no input is sent (only a screenshot or a wait).
 
 use crate::browser;
-use crate::computer::backend::{Backend, LinuxBackend, SandboxDesktop, Size};
+// `Backend` and `Size` are portable (every OS); `tool_available` too. `LinuxBackend` exists only on Linux. `SandboxDesktop`
+// exists everywhere — the real Xvfb-backed one here, a tiny phantom stub on macOS / Windows — so this engine's fields compile
+// on all OSes without an OS check (`backend.rs`).
+#[cfg(target_os = "linux")]
+use crate::computer::backend::{LinuxBackend, SandboxDesktop};
+#[cfg(not(target_os = "linux"))]
+use crate::computer::backend::SandboxDesktop;
+use crate::computer::backend::{Backend, Size};
 use crate::computer::rules::{self, Ctx, Decision, Intent, RuleSet};
 use crate::computer::settings::{Config, Mode};
 use crate::computer::step::classify_step;
@@ -218,15 +225,15 @@ fn idle_watcher(desktop: Arc<SandboxDesktop>, period: Duration, slot: std::sync:
 /// The desktop for `mode` on this OS: the sandbox builds a private Xvfb-backed display (never the real desktop), the others use
 /// a fixed one (`XTEST_DISPLAY`); when the sandbox is short of Xvfb or xdotool it has no backend, so the tools are not offered
 /// (`server_tools.rs`, item 2). Returns the backend and its Arc so the engine can stop the display after idle.
-fn select_backend(mode: Mode, size: Size) -> (Option<Box<dyn Backend + Send + Sync>>, Option<Arc<SandboxDesktop>>) {
+fn select_backend(_mode: Mode, _size: Size) -> (Option<Box<dyn Backend + Send + Sync>>, Option<Arc<SandboxDesktop>>) {
     #[cfg(target_os = "linux")]
     {
-        if mode == Mode::Sandbox && !(crate::computer::backend::tool_available("Xvfb") && crate::computer::backend::tool_available("xdotool")) {
+        if _mode == Mode::Sandbox && !(crate::computer::backend::tool_available("Xvfb") && crate::computer::backend::tool_available("xdotool")) {
             return (None, None);  // the sandbox needs both Xvfb and xdotool; without them the desktop tools are not offered
         }
-        let desktop = if mode == Mode::Sandbox { Some(Arc::new(SandboxDesktop::new(size))) } else { None };
-        let backend: Box<dyn Backend + Send + Sync> = if mode == Mode::Sandbox {
-            Box::new(LinuxBackend::new_sandbox(size))
+        let desktop = if _mode == Mode::Sandbox { Some(Arc::new(SandboxDesktop::new(_size))) } else { None };
+        let backend: Box<dyn Backend + Send + Sync> = if _mode == Mode::Sandbox {
+            Box::new(LinuxBackend::new_sandbox(_size))
         } else {
             Box::new(LinuxBackend::new(std::env::var("XTEST_DISPLAY").ok().as_deref()))
         };
@@ -506,6 +513,10 @@ mod tests {
     /// loop (item 1). A short period is passed so the test runs in milliseconds and needs no Xvfb (`new` marks it last-used now, so
     /// it reads idle once the quiet period elapses; watch `stopped` flip). The watcher clears its slot on exit, so the same slot can arm
     /// a fresh one for a restarted display (see the next test).
+    // The sandbox display is a Linux-only Xvfb concept (the engine's `Computers.desktop` slot stays `None` on other OSes), so these
+    // watcher tests — which build one and drive the idle stop — run only where there is a real `SandboxDesktop`. On macOS / Windows the
+    // phantom stub would let them compile, but they test Linux display semantics, so gate them.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_idle_watcher_stops_a_quiet_sandbox() {
         let desktop = Arc::new(SandboxDesktop::new(DEFAULT_DISPLAY));
@@ -518,6 +529,8 @@ mod tests {
 
     /// At most one idle watcher is alive at a time (item 1): while a watcher runs, arming again does not start a second one, even if it
     /// has just stopped the display; and once it exits the slot frees so a restarted display can arm a fresh watcher that stops it again.
+    // The sandbox display is Linux-only, so — like the previous test — these are gated to run only where a real `SandboxDesktop` exists.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_watcher_stops_itself_at_most_once_then_rearms() {
         // a single desktop with one watcher: arming while it is alive starts only that one (the second call returns false).

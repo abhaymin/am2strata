@@ -470,6 +470,7 @@
         <button type="button" data-sec="config"><b>Model config</b><span>Context, KV cache, sampling</span></button>
         <button type="button" data-sec="defaults"><b>Chat defaults</b><span>Shared with other apps</span></button>
         <button type="button" data-sec="server"><b>Server and access</b><span>Address, API key, monitor</span></button>
+        <button type="button" data-sec="https"><b>Secure connection</b><span>HTTPS and wss: self-signed, your certificate or Tailscale</span></button>
         <button type="button" data-sec="tools"><b>Tools (MCP)</b><span>Tool servers for the chat</span></button>
         <button type="button" data-sec="memory"><b>Memory</b><span>Facts kept on this PC, chats past the context</span></button>
         <button type="button" data-sec="appearance"><b>Appearance</b><span>Light, dark or system; accent</span></button>
@@ -582,6 +583,49 @@
             <p class="muted small">To make am2Strata the boot service in place of PolyStrata's (strata-orca), with the same configs and models, run in the am2strata folder:</p>
             <pre class="snippet"><code>cargo run -q --release --bin am2strata-run -- install --port 8000</code><button class="st-btn st-btn--icon" data-copy="cargo run -q --release --bin am2strata-run -- install --port 8000" aria-label="Copy"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></pre>
             <p class="muted small"><code>am2strata-run uninstall</code> gives the boot service back to PolyStrata.</p>
+          </div>
+        </section>
+
+        <section class="set-panel" id="sec-https" aria-labelledby="h-https" hidden>
+          <h2 id="h-https">Secure connection (HTTPS)</h2>
+          <div class="st-card" id="tls-status"><p class="muted small">Reading&hellip;</p></div>
+          <div class="st-card"><span class="card-title">Turn on or change</span>
+            <p class="muted small">Applied at once, no restart, and kept in the run config. The web app, the API and streams
+              (<code>wss://</code>) answer on the HTTPS port; this PC's own tools keep plain HTTP on the API port.</p>
+            <div class="st-field">
+              <label class="st-label" for="tls-port">HTTPS port</label>
+              <input class="st-input mono" id="tls-port" type="number" min="1" max="65535" value="8001" style="width:8em">
+            </div>
+            <div class="st-field">
+              <label class="st-label" for="tls-http">Plain HTTP (the API port) then</label>
+              <select class="st-input" id="tls-http">
+                <option value="local-only">answers this PC only; other devices are sent to HTTPS</option>
+                <option value="redirect">sends everyone to HTTPS</option>
+                <option value="keep">keeps answering everyone (not recommended)</option>
+              </select>
+            </div>
+            <div class="tls-actions">
+              <div class="st-card st-card--inner"><b>Self-signed certificate</b>
+                <p class="muted small">Made on this PC for its names and addresses (LAN and Tailscale). Browsers warn once;
+                  check the fingerprint below, then accept it.</p>
+                <button type="button" class="st-btn st-btn--primary" id="tls-self">Create and use</button></div>
+              <div class="st-card st-card--inner"><b>Tailscale certificate</b>
+                <p class="muted small">A real certificate for this PC's tailnet name (<code>*.ts.net</code>), trusted by
+                  browsers, renewed every day. Needs MagicDNS and HTTPS turned on in the Tailscale admin console.</p>
+                <button type="button" class="st-btn st-btn--primary" id="tls-ts">Use Tailscale</button></div>
+              <div class="st-card st-card--inner"><b>Your own certificate</b>
+                <p class="muted small">PEM files: the certificate (with its chain) and its private key.</p>
+                <div class="st-field"><label class="st-label" for="tls-cert">Certificate (.pem, .crt)</label>
+                  <input class="st-input" id="tls-cert" type="file" accept=".pem,.crt,.cer"></div>
+                <div class="st-field"><label class="st-label" for="tls-key">Private key (.pem, .key)</label>
+                  <input class="st-input" id="tls-key" type="file" accept=".pem,.key"></div>
+                <button type="button" class="st-btn st-btn--primary" id="tls-load">Load and use</button></div>
+            </div>
+            <p><button type="button" class="st-btn st-btn--secondary" id="tls-renew">Renew now</button>
+               <button type="button" class="st-btn st-btn--danger" id="tls-off">Turn HTTPS off</button></p>
+            <div class="msg-error" id="tls-error" hidden></div>
+            <p class="muted small">Also from a terminal: <code>am2strata-run tls status</code>, <code>tls self-signed</code>,
+              <code>tls tailscale</code>, <code>tls load --cert &lt;file&gt; --key &lt;file&gt;</code>, <code>tls renew</code>, <code>tls off</code>.</p>
           </div>
         </section>
 

@@ -158,6 +158,31 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    /// HTTPS on the running server, applied at once and kept in its run config:
+    /// status | self-signed | tailscale | load --cert <pem> --key <pem> | renew | off
+    Tls {
+        action: String,
+        /// load: the certificate (PEM, with its chain)
+        #[arg(long)]
+        cert: Option<PathBuf>,
+        /// load: its private key (PEM)
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// the HTTPS (and wss) port (default 8001)
+        #[arg(long)]
+        port: Option<u16>,
+        /// what plain HTTP does then: local-only (default), redirect or keep
+        #[arg(long)]
+        http: Option<String>,
+        /// the server (default: this PC's, from its run configs; or AM2STRATA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// its API key (default: from the run configs; or AM2STRATA_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// what upstream (PolyStrata, Strata) changed since am2Strata's ports: tools/upstream.json against GitHub, read-only
     UpstreamCheck {
         /// the manifest (default: tools/upstream.json in this checkout)
@@ -649,6 +674,7 @@ fn main() -> ExitCode {
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
         Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir } =>
             workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir),
+        Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
@@ -892,6 +918,83 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => { eprintln!("workshop: {e}"); ExitCode::from(1) }
     }
+}
+
+/// `am2strata-run tls ...`: the same /api/tls the web app's Settings › Secure connection uses.
+#[allow(clippy::too_many_arguments)]
+fn tls_cmd(action: &str, cert: Option<PathBuf>, key_file: Option<PathBuf>, port: Option<u16>, http: Option<String>,
+           url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let api_key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let mut body = match action {
+        "status" => None,
+        "self-signed" | "tailscale" | "renew" | "off" => Some(serde_json::json!({"action": action})),
+        "load" => {
+            let (Some(c), Some(k)) = (cert, key_file) else {
+                eprintln!("tls load needs --cert <certificate.pem> and --key <private-key.pem>");
+                return ExitCode::from(2);
+            };
+            let read = |p: &Path| std::fs::read_to_string(expand_path(p)).map_err(|e| format!("{}: {e}", p.display()));
+            match (read(&c), read(&k)) {
+                (Ok(cp), Ok(kp)) => Some(serde_json::json!({"action": "load", "cert_pem": cp, "key_pem": kp})),
+                (Err(e), _) | (_, Err(e)) => { eprintln!("tls load: {e}"); return ExitCode::from(2); }
+            }
+        }
+        other => {
+            eprintln!("tls: unknown action {other:?} (status, self-signed, tailscale, load, renew, off)");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(b) = body.as_mut() {
+        if let Some(p) = port { b["https_port"] = serde_json::json!(p); }
+        if let Some(h) = &http { b["http"] = serde_json::json!(h); }
+    }
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(120)).build().unwrap();
+    let mut rb = match &body {
+        None => client.get(format!("{url}/api/tls")),
+        Some(b) => client.post(format!("{url}/api/tls")).json(b),
+    };
+    if let Some(k) = &api_key {
+        rb = rb.bearer_auth(k);
+    }
+    let r = match rb.send() {
+        Ok(r) => r,
+        Err(e) => { eprintln!("tls: {url} does not answer ({e}); is the server running?"); return ExitCode::from(1); }
+    };
+    let ok = r.status().is_success();
+    let j: serde_json::Value = r.json().unwrap_or_default();
+    if !ok {
+        eprintln!("tls {action}: {}", j["error"]["message"].as_str().unwrap_or("failed"));
+        return ExitCode::from(1);
+    }
+    print_tls(&j);
+    if let Some(e) = j["saved_error"].as_str() { eprintln!("warning: {e}"); }
+    ExitCode::SUCCESS
+}
+
+fn print_tls(j: &serde_json::Value) {
+    let s = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    if j["on"] != true {
+        println!("HTTPS: off (plain HTTP on port {})", j["api_port"]);
+    } else {
+        println!("HTTPS: on, {} certificate, port {} (wss on the same port)", s(&j["mode"]), j["https_port"]);
+        println!("  plain HTTP: {}", s(&j["http"]));
+        println!("  HSTS: {}", s(&j["hsts"]));
+        let c = &j["certificate"];
+        println!("  certificate: {}{}", s(&c["subject"]), if c["self_signed"] == true { " (self-signed)".into() } else { format!(", issued by {}", s(&c["issuer"])) });
+        println!("  names: {}", c["names"].as_array().map(|a| a.iter().map(|x| s(x)).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+        println!("  valid until: {} ({} days)", s(&c["not_after"]), c["expires_in_days"]);
+        println!("  SHA-256: {}", s(&c["sha256"]));
+        for u in j["urls"].as_array().into_iter().flatten() { println!("  open: {}", s(u)); }
+    }
+    match j["tailscale"].as_object() {
+        Some(t) => println!("Tailscale: {} {}", t.get("name").and_then(|v| v.as_str()).unwrap_or("(no MagicDNS name)"),
+                            t.get("ips").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()),
+        None => println!("Tailscale: not running or not logged in"),
+    }
+    if let Some(e) = j["last_error"].as_str() { println!("last error: {e}"); }
+    if let Some(p) = j["saved"].as_str() { println!("kept in {p}"); }
 }
 
 /// This PC's server from its run configs: the address (127.0.0.1 and the port) and the key.
