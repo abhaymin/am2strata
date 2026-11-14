@@ -34,3 +34,10 @@ It also carries, ported to Rust (crates/strata-media/src/acestep, parler_hf.rs):
 - The loading of Parler-TTS mini multilingual v1.1 (Apache-2.0, Hugging Face) and Indic Parler-TTS (Apache-2.0,
   AI4Bharat) into candle's Parler model; their weights and Flan-T5's tokenizer (Apache-2.0, Google) are downloaded on
   request.
+
+The Workshop's trainer (crates/strata-workshop: model.rs, finetune.rs, profile.rs, soup.rs) is modelled on Soup
+(https://github.com/MakazhanAlpamys/Soup, Apache-2.0, Copyright 2026 Makazhan Alpamys): Soup is the reference for the
+`soup.yaml` config format the trainer imports and for the idea of `profile` (estimate memory and time before training),
+`autopilot` (pick the settings from the model, the data and the machine) and the learning-rate range test. The trainer
+is written from scratch in Rust on candle; no code of Soup is used. Three small example configs written by Soup's own
+CLI are kept, unchanged, as test fixtures under crates/strata-workshop/tests/fixtures/soup/ (Apache-2.0).

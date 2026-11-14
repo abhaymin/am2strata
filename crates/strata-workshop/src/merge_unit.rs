@@ -3,7 +3,7 @@
 //! scaling factor that gate 4 keys off. The expert einsum is checked against an independent PyTorch/PEFT reference
 //! (`tests/fixtures/peft-expert-delta.safetensors`), not a re-typing of the code — see lesson in TASK-8h.
 
-use super::{add_delta_2d, add_expert_delta, apply_scaling, peft_to_base_name};
+use super::{add_delta_2d, add_expert_delta, apply_scaling, from_f32s, peft_to_base_name, to_f32s};
 
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
@@ -87,4 +87,18 @@ fn square_expert_parameter_is_refused_not_guess() {
 
     let err = add_expert_delta("square_param", &vec![0f32; 75], &a, &b, 3, /*d1=*/5, /*d2=*/5, scaling).unwrap_err();
     assert!(err.to_string().contains("square"), "square target should be refused with a clear message, got: {err}");
+}
+
+/// A base stored in 16 bits (as most Hugging Face models are) is widened, merged and narrowed back to its own dtype;
+/// before, its bytes were read as f32 whatever the dtype said. Other dtypes are refused by name.
+#[test]
+fn regress_half_precision_weights_are_decoded_by_dtype() {
+    use crate::safetensors_io::Dtype;
+    let values = [1.0f32, -0.5, 0.15625, 3.0];
+    for dtype in [Dtype::F32, Dtype::F16, Dtype::BF16] {
+        let bytes = from_f32s(dtype, &values);
+        assert_eq!(bytes.len(), values.len() * dtype.size_bytes());
+        assert_eq!(to_f32s("w", dtype, &bytes).unwrap(), values, "{dtype:?} round trip");
+    }
+    assert!(to_f32s("w", Dtype::I64, &[0u8; 8]).unwrap_err().to_string().contains("I64"));
 }

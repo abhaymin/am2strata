@@ -24,7 +24,7 @@ use candle_core::{Device, Tensor};
 use serde_json::{json, Value};
 
 use crate::checkpoint;
-use crate::safetensors_io::{self, Dtype, Shard};
+use crate::safetensors_io::{Dtype, Shard};
 
 /// One base weight and what it became after the merge: same shape, plus how big its relative change was.
 #[derive(Debug, Clone)]
@@ -86,9 +86,8 @@ impl<'a> Merger<'a> {
         // The whole model is never resident at once: enumerate the base shards in order and read every weight off its mmap,
         // tagged with the shard it came from so the output reproduces the same split. Only the tiny adapter (already on the
         // CPU) is fully materialised into Rust.
-        let fname = base_first_name(self.base_dir)?;
-        let first = self.base_dir.join(fname);
-        let shard_files = safetensors_io::shards(&first);
+        // `model.safetensors`, or the `model-0000i-of-0000n` shards, as the folder has them
+        let shard_files = crate::model::weight_files(self.base_dir)?;
         let n_shards = shard_files.len();
 
         let adapters = load_adapters(self.adapter_dir)?;
@@ -111,7 +110,7 @@ impl<'a> Merger<'a> {
         let mut weight_map: serde_json::Map<String, Value> = serde_json::Map::new();
 
         for (i, in_shard) in shards.into_iter().enumerate() {
-            let fname = format!("model-{:05}-of-{:05}.safetensors", i + 1, n_shards);
+            let fname = shard_files[i].file_name().and_then(|n| n.to_str()).ok_or_else(|| anyhow!("a shard without a file name"))?.to_string();
 
             // pack: for each weight either copy its mmap bytes unchanged (untargeted) or rewrite with the folded delta.
             let mut payload: Vec<u8> = Vec::new();
@@ -124,17 +123,17 @@ impl<'a> Merger<'a> {
                             let o = wt.shape[0];
                             let in_ = wt.shape[1];
                             let r = ad.a.len().div_ceil(in_);
-                            let base = le_f32s(&wt.bytes)?;
+                            let base = to_f32s(&wt.name, wt.dtype, &wt.bytes)?;
                             let (w, delta) = add_delta_2d(&base, &ad.a, &ad.b, o, in_, r, scaling);
-                            (f32_le_bytes(&w), rel_norm(&base, &delta))
+                            (from_f32s(wt.dtype, &w), rel_norm(&base, &delta))
                         }
                         3 => {
                             let e = wt.shape[0];
                             let d1 = wt.shape[1];
                             let d2 = wt.shape[2];
-                            let base = le_f32s(&wt.bytes)?;
+                            let base = to_f32s(&wt.name, wt.dtype, &wt.bytes)?;
                             let (w, delta) = add_expert_delta(&wt.name, &base, &ad.a, &ad.b, e, d1, d2, scaling)?;
-                            (f32_le_bytes(&w), rel_norm(&base, &delta))
+                            (from_f32s(wt.dtype, &w), rel_norm(&base, &delta))
                         }
                         other => return Err(anyhow!("{}: base weight of rank {other} is not a LoRA target", wt.name)),
                     },
@@ -165,6 +164,13 @@ impl<'a> Merger<'a> {
         if n_shards > 1 {
             let index = json!({ "format": "PT", "total": weight_map.len(), "weight_map": weight_map });
             std::fs::write(self.out_dir.join("model.safetensors.index.json"), serde_json::to_string_pretty(&index)?)?;
+        }
+        // what makes the folder a model again: config.json, the tokenizer and its template, copied as they are
+        for e in std::fs::read_dir(self.base_dir)?.flatten() {
+            let (path, name) = (e.path(), e.file_name().to_string_lossy().to_string());
+            if path.is_file() && !name.ends_with(".safetensors") && name != "model.safetensors.index.json" && !self.out_dir.join(&name).exists() {
+                std::fs::copy(&path, self.out_dir.join(&name))?;
+            }
         }
 
         Ok(MergeReport { out_dir: self.out_dir.to_path_buf(), per_tensor: report })
@@ -349,25 +355,24 @@ fn write_shard(payload: &[u8], header: &serde_json::Map<String, Value>) -> Resul
     Ok(out)
 }
 
-/// f32 -> little-endian bytes.
-fn f32_le_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+/// A weight's bytes as f32 values: F32 as stored, F16 and BF16 widened (exactly). Real Hugging Face models are mostly
+/// BF16; reading their bytes as f32 would merge into garbage, so any other dtype is refused by name.
+fn to_f32s(name: &str, dtype: Dtype, b: &[u8]) -> Result<Vec<f32>> {
+    Ok(match dtype {
+        Dtype::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        Dtype::F16 => b.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        Dtype::BF16 => b.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+        other => return Err(anyhow!("{name}: a {} weight cannot take a LoRA delta (F32, F16 and BF16 can)", other.as_str())),
+    })
 }
 
-/// little-endian bytes -> f32 (the base fixture is all F32).
-fn le_f32s(b: &[u8]) -> Result<Vec<f32>> {
-    Ok(b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
-
-/// The first base shard's file name (`model-00001-of-0000N.safetensors`).
-fn base_first_name(base_dir: &Path) -> Result<String> {
-    let files = safetensors_io::shards(&base_dir.join("model-00001-of-00001.safetensors"));
-    let first = files
-        .first()
-        .ok_or_else(|| anyhow!("no base shards in {}", base_dir.display()))?;
-    Ok(first.file_name().unwrap().to_string_lossy().to_string())
+/// f32 values back to the weight's own dtype (F16 and BF16 round to nearest, as a cast does).
+fn from_f32s(dtype: Dtype, v: &[f32]) -> Vec<u8> {
+    match dtype {
+        Dtype::F16 => v.iter().flat_map(|x| half::f16::from_f32(*x).to_le_bytes()).collect(),
+        Dtype::BF16 => v.iter().flat_map(|x| half::bf16::from_f32(*x).to_le_bytes()).collect(),
+        _ => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    }
 }
 
 #[cfg(test)]

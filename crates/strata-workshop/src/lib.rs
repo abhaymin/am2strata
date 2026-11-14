@@ -13,13 +13,18 @@
 //! **4-bit** base is not ready — [`QLORA_READY`] records that so nothing pretends it trains on 4-bit bases today.
 pub const QLORA_READY: bool = false;
 
+pub mod chatdata;
 pub mod checkpoint;
 pub mod convert;
 pub mod dataset;
+pub mod finetune;
 pub mod datagen;
 pub mod lora;
 pub mod merge;
+pub mod model;
+pub mod profile;
 pub mod quantize_gguf;
 pub mod safetensors_io;
+pub mod soup;
 pub mod train;
 pub mod testmodel;
