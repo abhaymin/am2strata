@@ -18,6 +18,7 @@ mod anthropic;
 mod browser;
 mod computer;
 mod api_monitor;
+mod api_keys;
 mod audio_api;
 mod langdetect;
 mod music;
@@ -109,6 +110,8 @@ pub struct AppState {
     pub api_key: Option<String>,
     /// the run config's client profiles: other API keys, each with its tools (clients.rs)
     pub clients: Arc<clients::Clients>,
+    /// the keys made while the server runs, and everyone's usage counts (api_keys.rs)
+    pub keys: Arc<api_keys::ApiKeys>,
     /// the MCP servers: the default model's run config's and the app's (always there; it may have none)
     pub mcp: Option<Arc<mcp::McpHub>>,
     /// web origins besides this server's own that may change settings and run tools (the config's trusted_origins)
@@ -254,7 +257,7 @@ pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<client
     if state.cluster.is_master_key(k, cluster_tls::peer_of(headers)) {
         return Some(None);
     }
-    state.clients.by_key(k).map(|p| Some(p.clone()))
+    state.clients.by_key(k).map(Some)
 }
 
 /// The main key, or (on a worker) a key it gave its master: what the master polls, the model list and the queue.
@@ -446,7 +449,10 @@ async fn main() -> Result<()> {
         }
     }
     // client profiles: an API key per client, with its tools (clients.rs)
-    let clients = clients::Clients::from_config(&first.cfg.rest, api_key.as_deref()).map_err(anyhow::Error::msg)?;
+    // keys made while the server runs (api_keys.rs): each is a client profile too
+    let keys = api_keys::ApiKeys::open(Some(&expand(&args.data_dir)));
+    keys.start_flush();
+    let clients = clients::Clients::from_config(&first.cfg.rest, api_key.as_deref()).map_err(anyhow::Error::msg)?.with_generated(keys.clone());
     if !clients.is_empty() {
         tracing::info!("client profiles: {}", clients.names().join(", "));
     }
@@ -477,7 +483,7 @@ async fn main() -> Result<()> {
     cluster.start(port);
     let clients = Arc::new(clients);
     let _ = mgr.clients.set(clients.clone());
-    let state = AppState { mgr: mgr.clone(), api_key, clients: clients.clone(), mcp: Some(hub.clone()), trusted_origins,
+    let state = AppState { mgr: mgr.clone(), api_key, clients: clients.clone(), keys: keys.clone(), mcp: Some(hub.clone()), trusted_origins,
                            api_monitor: api_monitor::ApiMonitor::new(monitor_on, Some(expand(&args.data_dir).join("api-calls"))),
                            hub_job: Arc::new(std::sync::Mutex::new(json!({"state": "idle"}))),
                            models_dir: dir.clone(), data_dir: expand(&args.data_dir),
@@ -497,6 +503,9 @@ async fn main() -> Result<()> {
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
+    // the sandbox VM (computer/vm): made before computer use, whose "vm" mode drives it; it starts only when used
+    #[cfg(target_os = "linux")]
+    computer::vm::Vm::init(&expand(&args.data_dir));
     // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
     let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // the Workshop: convert, quantize and merge jobs (workshop.rs)
@@ -596,6 +605,7 @@ async fn main() -> Result<()> {
         .route("/api/computer/clipboard", get(computer::live::clipboard_get_h).post(computer::live::clipboard_post))
         .route("/api/computer/type", post(computer::live::type_post))
         .route("/api/computer/open", post(computer::live::open_post))
+        .merge(computer::vm_routes())
         .route("/mcp", get(web::mcp))
         .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))
         .route("/api/mcp/servers/test", post(mcp_api::test))
@@ -605,6 +615,10 @@ async fn main() -> Result<()> {
         .route("/api/monitor/clear", post(web::monitor_clear))
         .route("/api/agents", get(web::agents))
         .route("/api/clients", get(web::clients))
+        .route("/api/keys", get(api_keys::list).post(api_keys::create))
+        .route("/api/keys/{id}", post(api_keys::update).delete(api_keys::revoke))
+        .route("/api/usage", get(api_keys::usage))
+        .route("/v1/usage", get(api_keys::own_usage))
         .route("/v1beta/models", get(gemini::models))
         .route("/v1beta/models/{target}", get(gemini::model).post(gemini::call))
         .route("/api/monitor/media/{name}", get(web::monitor_media))
@@ -630,6 +644,8 @@ async fn main() -> Result<()> {
         // a chat whose model a worker should answer goes there (cluster.rs); inside the records, so they show it
         .layer(axum::middleware::from_fn_with_state(state.clone(), cluster::route))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
+        // generated keys: a revoked or expired one refused, limits, and everyone's usage counted (api_keys.rs)
+        .layer(axum::middleware::from_fn_with_state(state.clone(), api_keys::layer))
         // overload told plainly: Retry-After on every refusal for load, a warning header while the PC is short of memory
         // or the queue is long
         .layer(axum::middleware::from_fn_with_state(state.clone(), overload_headers))
@@ -676,9 +692,17 @@ async fn main() -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    keys.usage.flush();
     mgr.unload().await;
     if let Some(c) = mgr.computer.get() {
         c.shutdown();
+    }
+    // the sandbox VM is saved, so it comes back as it was at the next start
+    #[cfg(target_os = "linux")]
+    if let Some(vm) = computer::vm::get() {
+        if let Err(e) = tokio::task::spawn_blocking(move || vm.shutdown_for_exit()).await {
+            tracing::warn!("sandbox VM: saving it at exit failed: {e}");
+        }
     }
     if let Some(b) = mgr.browser.get() {
         b.close().await;

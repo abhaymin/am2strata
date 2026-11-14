@@ -196,6 +196,8 @@ constant time. Besides the key:
   could read any file of this account, or your LAN, through the model's answer.
 - **Running code** (the canvas's Python) runs in bubblewrap with no network, a read-only system and no home folder,
   and is off on a server that listens beyond this PC without a key.
+- **Keys for others.** Give each app or person a generated key instead of the main one: it cannot reach the
+  settings, can be limited and revoked, and its use is counted ("API keys and usage" below).
 - **Limits.** 256 MB per request, at most 64 jobs waiting in the queue (a client that leaves takes its place out), 4
   audio attachments per chat request, 3 media jobs per answer.
 
@@ -203,6 +205,62 @@ Dependencies are checked against the OSV / RustSec advisories. On 2026-10-28, af
 `zip` 8.6 (its advisories are about `extract()`, which neither candle nor mold calls; the fix is zip 9, waiting on
 upstream candle), `block-buffer` 0.10.4 (fixed only in 0.12; the panic path is not reached), and the unmaintained
 `paste` and `number_prefix` (no known flaw).
+
+## API keys and usage
+
+The run config's `"api_key"` is the **main key**: it opens everything, the settings included. For everything else that
+connects (an app, a person, an agent, another machine of a cluster) make a key of its own while the server runs. No
+restart: a key works as soon as it is made and stops as soon as it is revoked.
+
+**Make one.** Settings › Clients › New key in the web app, or:
+
+```sh
+am2strata-run keys create --name "phone app" --tools web,memory --expires 30d
+am2strata-run keys create --name ci --requests-per-day 500 --tokens-per-day 2000000 --models qwen3.5-35b
+am2strata-run keys list
+am2strata-run keys revoke <id>
+am2strata-run keys usage --days 30            # everyone: totals, per key, per model, per day
+am2strata-run keys usage --key <id>           # one key ("owner" is the main key, "client:<name>" a run-config profile)
+```
+
+The key (`am2_` and 40 random characters) is printed **once**. The server keeps only its SHA-256 hash, in
+`<data-dir>/api-keys.json` (readable by this account only), so a lost key cannot be read back: revoke it and make
+another. A client sends it as any API key: `Authorization: Bearer am2_...` or `x-api-key`.
+
+**What a key may do.** It is a client profile (see `"clients"` in the run config) made at run time:
+
+- It opens the model APIs: chat, messages, responses, Gemini, pictures, video, speech, `/v1/models`, `/v1/memory`.
+  It never opens the settings, the run config, the Workshop, the Computer tab, MCP server settings, or the keys.
+- `tools`: the tool sets its chats get with no request flag: `memory`, `web`, `image`, `video`, `speech`, `music`,
+  `browser`, `code`, `mcp:<server>`, `mcp:*`. None by default.
+- `memory`: its memory space (default: one of its own, so keys do not read each other's facts).
+- `expires`: `30d`, `12h`, or never. An expired or revoked key is refused with 401 and the reason.
+- Limits per UTC day: `requests_per_day`, `tokens_per_day` (prompt + completion). Past one, the key gets 429 with the
+  reason and a `Retry-After` until the next day. The tokens limit is checked when a request starts, so the request
+  that crosses it still finishes.
+- `models`: the only models it may name. A request for another gets 403; a request that names none is checked
+  against the loaded model.
+
+**Usage.** Every model API call is counted, streamed answers too: per UTC day, per caller, per model: requests,
+prompt, completion and cached tokens, media jobs, errors, and the last use. The main key is counted as `owner`, a
+run-config client profile as `client:<name>`, each key by its id. Settings › Clients shows it (per key, per model, a
+bar a day); the counts are kept in `<data-dir>/usage/YYYY-MM.json`, written every 20 s while they change and at
+shutdown (a server that is killed loses at most those seconds).
+
+The API, with the main key (write calls only from the server's own page or a trusted origin):
+
+| Call | What |
+| --- | --- |
+| `GET /api/keys` | the keys (no secrets), each with today's and 30 days' use |
+| `POST /api/keys` | make one: `{"name", "tools", "memory", "expires_in": "30d"` or `"expires_at"`, `"limits": {"requests_per_day", "tokens_per_day"}, "models"}`; the answer's `"key"` is the key, this once |
+| `POST /api/keys/{id}` | change any of those (`null` clears a limit, the expiry or the model list) |
+| `DELETE /api/keys/{id}` | revoke (the record and its usage stay) |
+| `GET /api/usage?days=30&key=<id>` | totals, `by_day`, `by_model`, `by_key` |
+
+A key reads its own usage and limits with `GET /v1/usage?days=30`.
+
+On a server with no main key every request already passes without a key, so generated keys limit nothing there: set
+`"api_key"` first.
 
 ## Folders
 
@@ -356,6 +414,57 @@ Editor, Files, Calculator) work as they are.
 From a terminal: `am2strata-run computer status | screenshot desk.png | take | give | copy | paste "text" |
 type "text" | open <app>`. The stream is a WebSocket (`wss://` on the HTTPS port); only the server's own key opens it,
 and only from am2Strata's own page.
+
+## The sandbox VM: a whole computer for computer use
+
+Computer use can run in its own small **Debian 13 virtual machine** that am2Strata creates and runs itself (QEMU with
+KVM; no root, no Docker). Inside it the agent is root: it installs and removes software, runs a shell and uses a
+desktop, and nothing in it can touch this PC. Turn it on in **Settings › Computer and browser use › Mode: Sandbox VM**
+(`"computer": {"use": true, "mode": "vm"}`); you can also use the VM yourself from the **Computer** tab without that.
+
+**What this PC needs** (the tab says what is missing): `qemu-system-x86`, `qemu-utils`, `ovmf`, `openssh-client`,
+access to `/dev/kvm`, and the Debian cloud image (326 MB, downloaded from cloud.debian.org by the **Download** button
+and checked against Debian's SHA512SUMS). The first start sets the desktop up once (about three minutes).
+
+**Light on this PC.**
+- It runs only when used: it pauses its CPUs after 2 minutes unused, and after 15 minutes is saved to disk and quit
+  (no RAM, no CPU). A start then restores it, with its open apps, in about a second.
+- QEMU runs with `CPUWeight=idle`, idle scheduling and I/O class: it gets only the CPU the inference engine is not
+  using. It has no GPU and never touches VRAM.
+- Memory has a hard ceiling (2 GB by default) and unused memory goes back to the host. It refuses to start if that
+  would leave this PC less than `host_reserve_mb` (3 GB) free, so a loaded model is never pushed out.
+- Measured here: 0.9 GB of RAM idle with the desktop up, 1–4% of one core; a cold boot 11 s; a restore 0.8 s.
+
+**Software.** The catalog installs with one click or `am2strata-run vm install <app>`: Chromium, Firefox ESR,
+Bitwarden (app and browser extension), Tailscale, NetBird, Mullvad VPN, Surfshark, WireGuard and OpenVPN, VS Code,
+LibreOffice, Thunderbird, KeePassXC, GIMP, VLC, Obsidian, developer tools and Docker. Anything else:
+`--kind apt <packages>`, `--kind flatpak <Flathub id>`, `--kind deb <https URL>`, `--kind appimage <https URL>`.
+The agent has the same through its `computer_install` and `computer_shell` tools. Sign-ins (Bitwarden, a VPN, a
+browser account) are yours: open the app in the Computer tab, take control and sign in; the VM keeps it.
+
+**Ads.** `am2strata-run vm ads on [--lists pihole,adguard] [site.to.let.through …]` / `vm ads off`, the panel's
+*Ads and trackers* card, the agent's `computer_ads` tool, or the **Ads and trackers** app on the VM's own desktop. It
+is a DNS filter for every program in the VM (dnsmasq, as Pi-hole uses), with Pi-hole's default list (StevenBlack),
+the AdGuard DNS filter, or both; it blocks subdomains and IPv6 too, and adds uBlock Origin to the browsers. A
+scraping job that must see a site as it is lists that site to let through, or turns blocking off.
+
+**VPNs.** The VM has its own kernel, so real tunnels work: Tailscale and NetBird join it to your network as its own
+device; Mullvad and Surfshark have their apps; any other provider works with its WireGuard or OpenVPN file
+(`sudo wg-quick up ./provider.conf`). Only the VM's traffic goes through the VPN, never this PC's.
+
+**Private.** The VM's network is QEMU's user-mode network: it can reach the internet, nothing can reach it. Its screen
+and shell go over SSH on this PC's loopback with keys am2Strata made (the VM's host key is checked), into Unix
+sockets in a private folder. Everything is in `<data>/sandbox`; **Reset** deletes the VM and the next start makes a
+new one.
+
+```bash
+am2strata-run vm status
+am2strata-run vm start
+am2strata-run vm install chromium
+am2strata-run vm exec --root -- apt list --installed
+am2strata-run vm settings memory_mb=4096 cpus=4
+am2strata-run vm stop
+```
 
 ## The browser tool: your own Chrome
 

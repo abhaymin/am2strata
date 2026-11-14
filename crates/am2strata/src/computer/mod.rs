@@ -20,9 +20,29 @@ pub mod rules;
 pub mod settings;
 pub mod step;
 pub mod tools;
+#[cfg(target_os = "linux")]
+pub mod vm;
 
 /// The desktop computer-use tool names (re-exported so run.rs dispatches them like `browser`/`web_tools`, etc.).
 pub use tools::TOOL_NAMES;
+
+/// The sandbox VM's routes (`/api/vm…`, vm/api.rs); none where there is no VM.
+#[cfg(target_os = "linux")]
+pub fn vm_routes() -> axum::Router<crate::AppState> {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/api/vm", get(vm::api::status_get).post(vm::api::action_post))
+        .route("/api/vm/settings", post(vm::api::settings_post))
+        .route("/api/vm/tasks/{id}", get(vm::api::task_get))
+        .route("/api/vm/apps", get(vm::api::apps_get).post(vm::api::apps_post))
+        .route("/api/vm/exec", post(vm::api::exec_post))
+        .route("/api/vm/ads", post(vm::api::ads_post))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn vm_routes() -> axum::Router<crate::AppState> {
+    axum::Router::new()
+}
 
 /// The desktop computer use for one server, held by the manager and chosen from the run config at start.
 pub use engine::Computers;
@@ -32,10 +52,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_registry_lists_the_seven_desktop_tools() {
-        assert_eq!(TOOL_NAMES.len(), 7);
+    fn the_registry_lists_the_desktop_tools() {
+        assert_eq!(TOOL_NAMES.len(), 10);
         for name in ["computer_screenshot", "computer_click", "computer_type", "computer_key",
-                     "computer_scroll", "computer_open_app", "computer_wait"] {
+                     "computer_scroll", "computer_open_app", "computer_wait", "computer_shell", "computer_install", "computer_ads"] {
             assert!(TOOL_NAMES.contains(&name), "{name} is a computer-use tool");
         }
     }
