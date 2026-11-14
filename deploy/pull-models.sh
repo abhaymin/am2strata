@@ -47,7 +47,7 @@ orca() {
   # the draft vocabulary is a data file of PolyStrata's repository
   if [ ! -f "$STRATA_DATA/mtp/rt/draft_vocab.bin" ]; then
     if [ -f "$STRATA_HOME/data/draft_vocab.bin" ]; then cp "$STRATA_HOME/data/draft_vocab.bin" "$STRATA_DATA/mtp/rt/"
-    else echo "copy PolyStrata's data/draft_vocab.bin to $STRATA_DATA/mtp/rt/ (without it the engine drafts by lookup only)"; fi
+    else echo "copy data/draft_vocab.bin of the engines' source checkout to $STRATA_DATA/mtp/rt/ (without it the engine drafts by lookup only)"; fi
   fi
 }
 case "$WHICH" in

@@ -1,6 +1,6 @@
 [package]
 name = "strata-pack"
-description = "The packing tools in Rust: iq_pack (native packs for the strata engine), mtp_fetch, mtp_pack and mtp_rt (the MTP draft runtime), ports of PolyStrata's Python tools"
+description = "The packing tools in Rust: iq_pack (native packs for the strata engine), mtp_fetch, mtp_pack and mtp_rt (the MTP draft runtime)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

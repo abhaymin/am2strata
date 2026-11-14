@@ -1,6 +1,6 @@
 [package]
 name = "strata-frontend"
-description = "Request normalization and prompt building: port of PolyStrata serve/frontend.py and Service.encode_prompt"
+description = "Request normalization, prompt building and output parsing for the am2Strata server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

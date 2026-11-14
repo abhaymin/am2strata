@@ -1,6 +1,6 @@
 [package]
 name = "strata-engine"
-description = "Starts a PolyStrata engine process from its run config and drives it over the line protocol"
+description = "Starts an engine process from its run config and drives it over the line protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

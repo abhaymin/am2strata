@@ -37,8 +37,8 @@ sudo apt install build-essential cmake ninja-build git poppler-utils ffmpeg bubb
 
 ## 2. Get the code
 
-am2Strata drives PolyStrata's engines, so you need both checkouts. The default folders are the ones the configs and
-scripts expect; others work, see "Folders" below.
+The C++/CUDA engines are built from the source in the PolyStrata repository (MIT), so you need both checkouts. The
+default folders are the ones the configs and scripts expect; others work, see "Folders" below.
 
 ```bash
 mkdir -p ~/Development && cd ~/Development
@@ -57,8 +57,8 @@ deploy/build-engines.sh --install
   `strata-vision` (the image encoder).
 - **Which cards:** RTX 30 and RTX 50 by default. `--archs "86;89;120"` adds RTX 40.
 - **Time:** about 30–60 minutes.
-- **Where they go:** `--install` copies them into `PolyStrata/engine/` and `engine-poly/`, keeping the old ones in a
-  backup folder.
+- **Where they go:** `--install` copies them into `engine/` and `engine-poly/` of that checkout
+  (`~/Development/PolyStrata`), keeping the old ones in a backup folder.
 
 ## 4. Get the models
 
@@ -81,10 +81,9 @@ deploy/pull-models.sh orca --token hf_...   # Orca (gated: accept its terms on h
 | `am2strata-run mtp-pack --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf` | the MTP draft block as a GGUF |
 | `am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt` | the draft runtime the engine loads (`--mtp`) |
 
-These are ports of PolyStrata's `tools/iq_pack.py`, `mtp_fetch.py`, `mtp_pack.py` and `mtp_rt.py`. They write the
-same files byte for byte (checked on the installed Orca pack and MTP files, and on recorded fixtures), and they are
-faster: the Orca pack takes ~4 s, the MTP GGUF ~25 s. The draft vocabulary, `data/draft_vocab.bin`, is a data file of
-PolyStrata's repository and is copied from there.
+Their output is checked byte for byte against reference files (the installed Orca pack and MTP files, and recorded
+fixtures). The Orca pack takes ~4 s, the MTP GGUF ~25 s. The draft vocabulary, `data/draft_vocab.bin`, is a data file
+of the engines' repository (the checkout from step 2) and is copied from there.
 
 Any other GGUF from Hugging Face whose architecture the engines run can be added later, from the web app (Settings ›
 Models) or with `target/release/am2strata-run pull <repo> --quant <quant>`. Either way the run config is written for
@@ -100,7 +99,7 @@ deploy/install.sh --host 0.0.0.0 --new-key --service --model tiel   # ... and st
 
 The script does four things:
 - **Builds** am2Strata.
-- **Copies the configs** into PolyStrata's folder (`~/Development/PolyStrata/strata-*.json`), with your folders, port,
+- **Copies the configs** into the engines' folder (`~/Development/PolyStrata/strata-*.json`), with your folders, port,
   address and key filled in. Each file is readable only by you, and an existing file is kept unless you pass `--force`.
 - **Checks** the GPU and the optional tools.
 - **With `--service`:** installs the systemd user service `am2strata-boot`. To start it before you log in, run
@@ -160,12 +159,13 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Authorization: Bearer $KEY" -
 | `am2strata-run temp-service --model X` | a temporary service, e.g. to try a model; it stops on reboot |
 | `am2strata-run stop-temp-service` | stops the temporary service |
 
-When PolyStrata's own `strata-orca` service is installed, these swap with it and give it back when am2Strata stops.
+When a `strata-orca` user service is installed on this PC, these swap with it and give it back when am2Strata stops.
 
-## Keeping up with PolyStrata and Strata
+## Keeping up with upstream
 
-am2Strata runs PolyStrata's engines and carries ports of its server, tokenizer and pack tools in Rust;
-`tools/upstream.json` records which upstream file each port is current with (by git blob). To see what changed since:
+The C++/CUDA engines come from the PolyStrata repository, and parts of the server, the tokenizer and the pack tools are
+Rust ports of its code; `tools/upstream.json` records which upstream file each port is current with (by git blob). To
+see what changed since:
 
 ```bash
 am2strata-run upstream-check
@@ -272,7 +272,7 @@ The configs in `configs/` are written with two placeholders, so they can be shar
 
 | Placeholder | Meaning | Default |
 |---|---|---|
-| `${STRATA_HOME}` | PolyStrata's folder: engines, run configs, logs | `~/Development/PolyStrata` |
+| `${STRATA_HOME}` | the engines' folder: engines, run configs, logs | `~/Development/PolyStrata` |
 | `${STRATA_DATA}` | models, packs, tokenizers | `~/Development/Strata-data` |
 
 Any string in a run config may also use `~/` or another `${VARIABLE}`. For other folders:
@@ -701,7 +701,7 @@ Options follow `sh -s --` (`curl -fsSL .../install.sh | sh -s -- --service --wit
 
 It starts once a model is there (`am2strata pull ...`). On Linux, `loginctl enable-linger $USER` starts it at boot,
 before you sign in. This is not the `am2strata-boot` service of the build from source (section 5), which drives
-PolyStrata's engines.
+the C++/CUDA engines.
 
 **Platforms and features:**
 
