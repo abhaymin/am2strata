@@ -2,19 +2,26 @@
 # am2Strata from a release: runs from this folder and keeps models and settings in $AM2STRATA_DATA.
 #   ./am2strata                          start the server (http://127.0.0.1:8000)
 #   ./am2strata pull <repo> [<quant>]    download a model from Hugging Face; no quant lists what the repository has
-#   ./am2strata doctor                   check this PC (the NVIDIA download)
+#   ./am2strata doctor                   what this PC is ready for (PDFs, the browser tool, the Computer tab...) and what is missing
+#   ./am2strata tls status|self-signed|tailscale|load|renew|off          HTTPS on the running server
+#   ./am2strata workshop convert|quantize|merge|strata|datagen|jobs ...  the Workshop, through the running server
+#   ./am2strata computer status|screenshot|take|give|copy|paste|type|open   the Computer tab from a terminal
+#   ./am2strata vm status|start|stop|download|setup|apps|install|exec ...   the sandbox VM (Linux x86_64)
+#   ./am2strata keys ...                                                    the server's API keys
+#   ./am2strata --version
 #   ./am2strata agent list|start|setup|reset|show <agent>   coding agents on this server or another (--url)
 #   ./am2strata agentrun <agent> [options] [agent args]     run one, as `unsloth start <agent>` does
 set -eu
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 DATA=${AM2STRATA_DATA:-$HOME/.local/share/am2strata}
 mkdir -p "$DATA"
 for d in engine engine-poly; do
     if [ -d "$HERE/$d" ]; then ln -sfn "$HERE/$d" "$DATA/$d"; fi
 done
 
-doctor() {
-    [ -e "$HERE/engine-poly/strata-poly" ] || { echo "This download runs on the CPU, or any GPU through --devices: nothing to check."; return 0; }
+# the NVIDIA download's engines: the driver and the CUDA libraries they need (the portable download has nothing to check)
+engines_ok() {
+    [ -e "$HERE/engine-poly/strata-poly" ] || return 0
     ok=1
     if command -v nvidia-smi >/dev/null 2>&1; then
         nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | sed 's/^/GPU: /'
@@ -34,12 +41,23 @@ doctor() {
         ok=0
     fi
     rm -f "$DATA/.ldd"
-    [ "$ok" = 1 ] && echo "This PC is ready."
     [ "$ok" = 1 ]
 }
 
 case "${1:-serve}" in
-    doctor) doctor ;;
+    doctor)
+        shift
+        rc=0
+        engines_ok || rc=1
+        "$HERE/bin/am2strata-run" doctor --data-dir "$DATA/data" "$@" || rc=1
+        exit "$rc"
+        ;;
+    --version|-V|version) exec "$HERE/bin/am2strata" --version ;;
+    tls|workshop|computer|vm|keys)
+        cmd=$1
+        shift
+        exec "$HERE/bin/am2strata-run" "$cmd" --models-dir "$DATA" "$@"
+        ;;
     pull)
         shift
         [ $# -ge 1 ] || { echo "usage: ./am2strata pull <repo> [<quant>]" >&2; exit 2; }
@@ -58,12 +76,12 @@ case "${1:-serve}" in
         ;;
     serve)
         [ $# -ge 1 ] && shift
-        doctor || echo "Starting anyway: a model will not load until that is fixed."
+        engines_ok || echo "Starting anyway: a model will not load until that is fixed."
         if ! ls "$DATA"/strata-*.json >/dev/null 2>&1; then
             echo "No model yet. See QUICKSTART.md for a small one to start with."
             exit 1
         fi
         exec "$HERE/bin/am2strata" --models-dir "$DATA" --data-dir "$DATA/data" "$@"
         ;;
-    *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | agent <action> [<agent>] | agentrun <agent> | doctor]" >&2; exit 2 ;;
+    *) echo "usage: ./am2strata [serve [options] | pull <repo> [<quant>] | agent <action> [<agent>] | agentrun <agent> | doctor | tls|workshop|computer|vm|keys <action> | --version]" >&2; exit 2 ;;
 esac
