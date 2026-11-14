@@ -54,14 +54,19 @@ impl TinyLlama {
         // about ±1, projections about ±1/sqrt(fan-in). Everything at ±0.02, norm gains included, made the tied head's
         // logits ~0.006, i.e. a uniform output no adapter could change.
         let w = 1.0 / (self.hidden as f32).sqrt();
+        // head_dim drives the projection output dims: q projects to num_attention_heads*head_dim rows, k/v to
+        // num_key_value_heads*head_dim (GQA); when the two are equal this is exactly `hidden` for every projection.
+        let head_dim = self.hidden / self.num_attention_heads;
+        let q_out = self.num_attention_heads * head_dim;
+        let kv_out = self.num_key_value_heads * head_dim;
         // embeddings + output norm are shared across layers
         out.push(TensorData { name: "model.embed_tokens.weight".into(), shape: vec![self.vocab_size, self.hidden], values: mat(&mut gen, self.vocab_size, self.hidden, 1.0) });
         for layer in 0..self.num_layers {
             let p = |key: &str| format!("model.layers.{layer}.{key}");
             out.push(TensorData { name: p("input_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
-            out.push(TensorData { name: p("self_attn.q_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
-            out.push(TensorData { name: p("self_attn.k_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
-            out.push(TensorData { name: p("self_attn.v_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.q_proj.weight"), shape: vec![q_out, self.hidden], values: mat(&mut gen, q_out, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.k_proj.weight"), shape: vec![kv_out, self.hidden], values: mat(&mut gen, kv_out, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.v_proj.weight"), shape: vec![kv_out, self.hidden], values: mat(&mut gen, kv_out, self.hidden, w) });
             out.push(TensorData { name: p("self_attn.o_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
             out.push(TensorData { name: p("post_attention_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
             out.push(TensorData { name: p("mlp.gate_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, w) });
