@@ -152,7 +152,12 @@ fn small_llama_gguf(path: &std::path::Path) {
 
 #[test]
 fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
-    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    // a stand-in for the Rust engine (a llama model runs on it), so the model is listed on any machine, CI included
+    let home = std::env::temp_dir().join(format!("am2-ws-home-{}", std::process::id()));
+    let engine = home.join("crates/strata-hybrid/target/release/am2strata-hybrid");
+    std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
+    std::fs::write(&engine, "#!/bin/sh\n").unwrap();
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_HOME": home}}));
     // a GGUF llama.cpp itself would not load (a BPE vocabulary without merges) is refused, saying why
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures/tiny-llama.f32.gguf");
     let nomerges = s.dir.join("workshop/tiny-llama.f32.gguf");
@@ -172,12 +177,8 @@ fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
     let cfg: Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
     assert_eq!((cfg["model_name"].as_str(), cfg["display_name"].as_str()), (Some("my-tiny"), Some("My Tiny Llama")));
     assert!(std::path::Path::new(done["result"]["tokenizer"].as_str().unwrap()).join("tokenizer.json").exists(), "tokenizer folder");
-    // it is listed where its engine is installed (a llama model runs on the Rust engine, built here but not on CI)
-    let engine = cfg["exe"].as_str().unwrap_or("").replace("${AM2STRATA_HOME}", concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
-    if std::path::Path::new(&engine).exists() {
-        let (_, l) = s.get("/api/models", true);
-        assert!(l["models"].as_array().unwrap().iter().any(|m| m["id"] == "my-tiny"), "listed: {l}");
-    }
+    let (_, l) = s.get("/api/models", true);
+    assert!(l["models"].as_array().unwrap().iter().any(|m| m["id"] == "my-tiny"), "listed: {l}");
     // the same name again is refused before anything runs; with overwrite it is allowed
     let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "strata", "input": gguf, "name": "my-tiny"}));
     assert_eq!(code, 400);

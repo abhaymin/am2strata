@@ -213,6 +213,9 @@ fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Ch
             .env("MOCK_RECORD", record)
             .env("RUST_LOG", "warn")
             .env("AM2STRATA_NO_MDNS", "1")
+            // more environment for the server, from the test (e.g. AM2STRATA_HOME), never changed in this process
+            .envs(extra.get("env").and_then(|e| e.as_object()).into_iter().flatten()
+                  .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

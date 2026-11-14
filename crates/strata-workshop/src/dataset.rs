@@ -69,6 +69,9 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
 
     let mut out: Vec<Chunk> = Vec::new();
     let mut prev_end: Option<usize> = None;
+    // the first word of the previous chunk: each chunk starts strictly after it, so the loop always moves forward
+    // whatever the overlap and the sentence lengths are
+    let mut prev_first: Option<usize> = None;
     let mut idx = 0usize;
     while idx < tokens.len() {
         // Choose this chunk's start: overlap into the previous chunk, or zero for the first one.
@@ -79,7 +82,16 @@ pub fn chunk(text: &str, max_chars: usize, overlap: usize) -> Vec<Chunk> {
 
         // If the start lands inside a word, back up to that word's real start so `text[start..]` is meaningful; the lost
         // characters are just overlap noise anyway.
-        let first = tokens.iter().position(|t| t.start >= start).unwrap_or(tokens.len() - 1);
+        let mut first = tokens.iter().position(|t| t.start >= start).unwrap_or(tokens.len() - 1);
+        if let Some(p) = prev_first {
+            if first <= p {
+                first = p + 1;
+                if first >= tokens.len() {
+                    break;
+                }
+            }
+        }
+        prev_first = Some(first);
         let chunk_start = tokens[first].start;
 
         // Greedily consume whole words until the next one would push the chunk over `max_chars`. Prefer cutting at a
@@ -527,6 +539,14 @@ mod tests {
 
     #[test]
     fn an_overlap_as_long_as_a_chunk_still_finishes() {
+        // Kilo's case: a short first sentence, then an overlap longer than that chunk
+        let short = format!("Hi. {}", "one two three four five six seven eight nine ten ".repeat(5));
+        for overlap in [5, 20, 100] {
+            let cs = chunk(&short, 15, overlap);
+            assert!(!cs.is_empty() && cs.len() < 200, "overlap {overlap}: {} chunks", cs.len());
+            assert!(cs.windows(2).all(|w| w[1].start > w[0].start), "every chunk moves forward");
+            assert_eq!(cs.last().unwrap().end, short.trim_end().chars().count(), "the text is covered to its end");
+        }
         let text = "one two three four five six seven eight nine ten ".repeat(20);
         for overlap in [10, 15, 100] {
             let cs = chunk(&text, 15, overlap);
