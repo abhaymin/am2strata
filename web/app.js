@@ -81,9 +81,11 @@ function refreshMedia() {
   try { if (health.image_generation) loadMediaModels(); } catch (e) { /* still starting */ }
 }
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "workshop", "settings", "calls"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "workshop", "computer", "settings", "calls"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "workshop", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "workshop", "computer", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
+  // after app.js has finished loading (the Computer code is further down the file)
+  queueMicrotask(() => { if (tab === "computer") cvConnect(); else cvDisconnect(); });
   if (tab === "images") { $("img-prompt").focus(); refreshMedia(); }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
@@ -4053,3 +4055,78 @@ $("ws-r-del").onclick = async () => {
     wsReviewLoad();
   } catch (e) { wsError(e.message); }
 };
+// ------------------------------------------------------------------ Computer: the sandbox desktop live (computer/live.rs)
+let cvWs = null, cvState = null, cvMoveAt = 0;
+const cvCanvas = $("cv-canvas");
+function cvErr(m) { $("cv-error").textContent = m || ""; $("cv-error").hidden = !m; }
+function cvSend(o) { if (cvWs && cvWs.readyState === 1) cvWs.send(JSON.stringify(o)); }
+function cvConnect() {
+  if (cvWs) return;
+  cvErr("");
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}api/computer/stream`);
+  ws.binaryType = "blob";
+  cvWs = ws;
+  ws.onopen = () => ws.send(JSON.stringify({type: "auth", key: store.get("apikey", "")}));
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data !== "string") {
+      const bmp = await createImageBitmap(ev.data);
+      if (cvCanvas.width !== bmp.width || cvCanvas.height !== bmp.height) { cvCanvas.width = bmp.width; cvCanvas.height = bmp.height; }
+      cvCanvas.getContext("2d").drawImage(bmp, 0, 0);
+      return;
+    }
+    const m = JSON.parse(ev.data);
+    if (m.type === "state") cvRender(m);
+    else if (m.type === "error") { cvErr(m.message); $("cv-who").textContent = "Not available"; }
+    else if (m.type === "notice") toast("info", "Desktop", m.message);
+    else if (m.type === "clipboard") {
+      try { await navigator.clipboard.writeText(m.text); toast("success", "Copied", `${m.text.length} characters from the desktop`); }
+      catch (e) { prompt("The desktop's clipboard (this page cannot write to yours without HTTPS):", m.text); }
+    }
+  };
+  ws.onclose = () => { if (cvWs === ws) { cvWs = null; if (tab === "computer") { $("cv-who").textContent = "Disconnected"; setTimeout(() => tab === "computer" && cvConnect(), 3000); } } };
+}
+function cvDisconnect() { if (cvWs) { const w = cvWs; cvWs = null; w.close(); } }
+function cvRender(m) {
+  cvState = m;
+  const you = m.operator_in_control;
+  $("cv-who").textContent = you ? "You have control" : "am2Strata may act";
+  $("cv-who").className = `st-badge ${you ? "st-badge--generating" : ""}`;
+  $("cv-info").textContent = `display ${m.display} · ${m.width}×${m.height} · ${m.mode}`;
+  $("cv-take").textContent = you ? "Hand back" : "Take control";
+  $("cv-take").className = `st-btn ${you ? "st-btn--danger" : "st-btn--primary"}`;
+  cvCanvas.classList.toggle("cv-live", you);
+  const sel = $("cv-app");
+  sel.innerHTML = '<option value="">Open an app…</option>' + (m.apps || []).map((a) => `<option>${esc(a)}</option>`).join("");
+  sel.disabled = !(m.apps || []).length;
+}
+$("cv-take").onclick = () => { cvSend({type: cvState?.operator_in_control ? "give" : "take"}); if (!cvState?.operator_in_control) cvCanvas.focus(); };
+$("cv-copy").onclick = () => cvSend({type: "clipboard_get"});
+$("cv-paste").onclick = async () => {
+  let text = null;
+  try { text = await navigator.clipboard.readText(); } catch (e) { text = prompt("Text to put on the desktop's clipboard (this page cannot read yours without HTTPS):"); }
+  if (text) { cvSend({type: "clipboard_set", text}); toast("success", "Sent", "On the desktop's clipboard: paste with Ctrl+V there."); }
+};
+$("cv-shot").onclick = () => cvCanvas.toBlob((b) => {
+  if (!b) { cvErr("The screenshot could not be made (no picture yet?)."); return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = `desktop-${Date.now()}.png`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+});
+$("cv-app").onchange = async () => {
+  const app = $("cv-app").value; $("cv-app").value = "";
+  if (!app) return;
+  const r = await fetch("api/computer/open", {method: "POST", headers: {...headers(), "Content-Type": "application/json"}, body: JSON.stringify({app})});
+  if (!r.ok) cvErr((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
+};
+function cvXY(e) {
+  const r = cvCanvas.getBoundingClientRect();
+  return {x: Math.round((e.clientX - r.left) * cvCanvas.width / r.width), y: Math.round((e.clientY - r.top) * cvCanvas.height / r.height)};
+}
+const cvLive = () => cvState?.operator_in_control;
+cvCanvas.addEventListener("mousemove", (e) => { if (!cvLive()) return; const t = performance.now(); if (t - cvMoveAt < 30) return; cvMoveAt = t; cvSend({type: "move", ...cvXY(e)}); });
+cvCanvas.addEventListener("mousedown", (e) => { if (!cvLive()) return; e.preventDefault(); cvCanvas.focus(); cvSend({type: "button", button: [1, 2, 3][e.button] || 1, down: true, ...cvXY(e)}); });
+cvCanvas.addEventListener("mouseup", (e) => { if (!cvLive()) return; e.preventDefault(); cvSend({type: "button", button: [1, 2, 3][e.button] || 1, down: false, ...cvXY(e)}); });
+cvCanvas.addEventListener("contextmenu", (e) => { if (cvLive()) e.preventDefault(); });
+cvCanvas.addEventListener("wheel", (e) => { if (!cvLive()) return; e.preventDefault(); cvSend({type: "wheel", dx: e.deltaX, dy: e.deltaY, ...cvXY(e)}); }, {passive: false});
+for (const [ev, down] of [["keydown", true], ["keyup", false]]) {
+  cvCanvas.addEventListener(ev, (e) => { if (!cvLive()) return; e.preventDefault(); cvSend({type: "key", key: e.key, down, shift: e.shiftKey}); });
+}

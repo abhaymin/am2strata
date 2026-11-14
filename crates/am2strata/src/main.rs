@@ -566,6 +566,14 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/uploads", axum::routing::post(workshop::upload_post))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
+        // the Computer tab: the sandbox desktop live, the operator's control and clipboard (computer/live.rs)
+        .route("/api/computer/status", get(computer::live::status_get))
+        .route("/api/computer/stream", get(computer::live::stream))
+        .route("/api/computer/screenshot", get(computer::live::screenshot_get))
+        .route("/api/computer/control", post(computer::live::control_post))
+        .route("/api/computer/clipboard", get(computer::live::clipboard_get_h).post(computer::live::clipboard_post))
+        .route("/api/computer/type", post(computer::live::type_post))
+        .route("/api/computer/open", post(computer::live::open_post))
         .route("/mcp", get(web::mcp))
         .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))
         .route("/api/mcp/servers/test", post(mcp_api::test))
@@ -630,10 +638,24 @@ async fn main() -> Result<()> {
     // each request's address is known (adding a command MCP server is allowed only from this PC)
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(async {
+            // Ctrl+C, or SIGTERM (how systemd stops the service): either way the clean shutdown below runs, so the
+            // engine and the sandbox desktop's Xvfb stop with the server instead of being left running
+            #[cfg(unix)]
+            {
+                let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = async { match term.as_mut() { Some(t) => { t.recv().await; } None => std::future::pending::<()>().await } } => {}
+                }
+            }
+            #[cfg(not(unix))]
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
     mgr.unload().await;
+    if let Some(c) = mgr.computer.get() {
+        c.shutdown();
+    }
     if let Some(b) = mgr.browser.get() {
         b.close().await;
     }

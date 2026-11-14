@@ -4,7 +4,7 @@
 //!   relative RMS error must stay under each encoding's known ggml bound (a proxy for "round-trips faithfully").
 //! - [`save_quant_input_fixture`] writes the shared fixed-seed F32 GGUF that `llama-quantize` is quantized from.
 //! - [`quantized_bytes_match_llama_quantize`] compares our bytes with llama-quantize's, byte for byte on the committed
-//!   `fixtures/quant-<TYPE>.gguf` (see fixtures/NEEDED.md), skipping any type whose reference file is absent.
+//!   `fixtures/quant-<TYPE>.gguf` (see fixtures/README.md), skipping any type whose reference file is absent.
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -76,29 +76,21 @@ fn save_quant_input_fixture() {
     // `llama-quantize` is run against. TensorSpec.shape is in numpy order (outermost first); the writer reverses it into
     // the file's ggml dimension order, so [64, 256] -> ne = [256, 64]. A K-quant needs the last dim a multiple of 8;
     // ne[1] = 64 is (ne[0] = 256 would not be).
-    ensure_dir();
+    // written to a temporary file and compared with the committed one (never rewritten here: another test reads it
+    // in parallel, and llama-quantize's references were made from exactly those bytes)
     let input = quantize_input(64 * 256);
     let raw: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
 
     let specs = vec![TensorSpec { name: "weight".into(), shape: vec![64, 256], ggml_type: 0 /* F32 */, nbytes: raw.len() as u64 }];
     let kv = [("general.architecture", "quantize-fixture".to_string())];
-    let path = fixtures().join("quant-input-f32.gguf");
+    let path = std::env::temp_dir().join(format!("quant-input-f32-{}.gguf", std::process::id()));
     let mut w = Writer::create(&path, &kv, specs).unwrap();
     w.tensor_data(&raw).unwrap();
     w.end_tensor().unwrap();
     w.finish().unwrap();
-
-    // tell the reviewer how to produce the references; committed alongside so they stay in sync.
-    std::fs::write(fixtures().join("NEEDED.md"), concat!(
-        "# quant-<TYPE>.gguf fixtures\n",
-        "Each is produced by `llama-quantize` from `quant-input-f32.gguf`; tests compare our bytes to these byte for byte.\n",
-        "Run (in the crate dir) and commit every output:\n\n",
-        "    llama-quantize quant-input-f32.gguf quant-Q8_0.gguf Q8_0\n",
-        "    llama-quantize quant-input-f32.gguf quant-Q4_0.gguf Q4_0\n",
-        "    llama-quantize quant-input-f32.gguf quant-Q4_K.gguf Q4_K\n",
-        "    llama-quantize quant-input-f32.gguf quant-Q5_K.gguf Q5_K\n",
-        "    llama-quantize quant-input-f32.gguf quant-Q6_K.gguf Q6_K\n"
-    )).unwrap();
+    let (ours, committed) = (std::fs::read(&path).unwrap(), std::fs::read(fixtures().join("quant-input-f32.gguf")).unwrap());
+    let _ = std::fs::remove_file(&path);
+    assert!(ours == committed, "the generator no longer writes the committed quant-input-f32.gguf (the references were made from it)");
 }
 
 fn input_f32() -> Vec<f32> {
@@ -124,7 +116,7 @@ fn reference_tensor_bytes(path: &Path) -> (u32, Vec<u8>) {
     (t.ggml_type, b)
 }
 
-// Byte-for-byte against llama-quantize's output on the committed fixtures (`tests/NEEDED.md` says how they were made).
+// Byte-for-byte against llama-quantize's output on the committed fixtures (`tests/fixtures/README.md` says how they were made).
 // Runs by default now that the type ids are right; each type is skipped only when its reference file is absent.
 #[test]
 fn quantized_bytes_match_llama_quantize() {

@@ -200,9 +200,7 @@ mod linux {
             // run on this display; an app not installed (NotFound) is a clear "is it in the allow list?" message. Pin DISPLAY and
             // drop WAYLAND_DISPLAY so a Wayland-capable app cannot open on the real desktop instead of the sandbox.
             let disp = self.disp()?;
-            let mut cmd = std::process::Command::new(name);
-            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-            let mut cmd = use_sandbox_display(cmd, &disp);
+            let mut cmd = sandbox_app(name, &disp);
             match cmd.spawn() {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
@@ -264,7 +262,35 @@ mod linux {
     /// display number back on a pipe, so there is no window between choosing a number and starting Xvfb for another server to
     /// take it (and we never talk to a display we did not start). Returns the running child and the display name it wrote
     /// (`:NN`); `-nolisten tcp` keeps it off TCP, and if Xvfb exits early or writes nothing within 5 s this returns an error.
+    /// Sandbox displays left by an am2Strata that died without cleaning up (a crash, an out-of-memory kill, SIGKILL):
+    /// Xvfb with exactly our arguments whose parent is no longer an am2Strata server. Stopped before a new one starts,
+    /// so they do not pile up. Another running server's display (its parent is that server) is never touched.
+    fn reap_orphan_sandboxes() {
+        let Ok(rd) = std::fs::read_dir("/proc") else { return };
+        let me = unsafe { libc::getuid() };
+        for e in rd.flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+            let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else { continue };
+            let args: Vec<String> = cmd.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            // our own: Xvfb -displayfd N -nolisten tcp -screen 0 WxHxD
+            if args.len() != 8 || !args[0].ends_with("Xvfb") || args[1] != "-displayfd" || args[3] != "-nolisten" || args[5] != "-screen" {
+                continue;
+            }
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { continue };
+            let field = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u32>().ok());
+            if field("Uid:") != Some(me) {
+                continue;
+            }
+            let ppid = field("PPid:").unwrap_or(0);
+            let parent = std::fs::read_to_string(format!("/proc/{ppid}/comm")).unwrap_or_default();
+            if parent.trim() != "am2strata" {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+            }
+        }
+    }
+
     fn start_sandbox_xvfb(size: Size) -> Result<(std::process::Child, String), String> {
+        reap_orphan_sandboxes();
         unsafe {
             // a pipe so Xvfb can write its chosen display number back on `-displayfd`; the read end is parsed below.
             let mut fds = [0i32; 2];
@@ -432,6 +458,33 @@ mod linux {
     /// service runs with `DISPLAY=:0` / `WAYLAND_DISPLAY=wayland-0`, so a leaked DISPLAY would drive the owner's real screen),
     /// yet keep PATH so the binary resolves. Applies this pinned environment to any Command; xdotool reads its display only from
     /// DISPLAY, so no `-d` argument is needed or allowed anymore.
+    /// An app started on the sandbox display (the Computer tab's "Open an app" and the agent's `open_app`). It keeps the
+    /// user's environment (HOME and the rest: apps need them) but loses everything that leads to the real desktop session:
+    /// WAYLAND_DISPLAY (a window on the real screen), XAUTHORITY, and the session D-Bus — through which a browser finds an
+    /// instance already open on the real desktop and opens its window there. Toolkits are told to use X11. Firefox also
+    /// gets its own profile (in ~/snap/firefox/common for a snap Firefox, which may not write elsewhere) and no remote.
+    pub fn sandbox_app(name: &str, disp: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(name);
+        for k in ["WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"] {
+            cmd.env_remove(k);
+        }
+        cmd.env("DISPLAY", disp).env("GDK_BACKEND", "x11").env("QT_QPA_PLATFORM", "xcb")
+            .env("MOZ_ENABLE_WAYLAND", "0").env("MOZ_DBUS_REMOTE", "0");
+        let base = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name).to_string();
+        if base.starts_with("firefox") {
+            if let Some(home) = std::env::var_os("HOME") {
+                // a snap Firefox may only write in its own ~/snap/firefox (AppArmor), any other in ~/.local/share
+                let home = std::path::PathBuf::from(home);
+                let profile = if home.join("snap/firefox").is_dir() { home.join("snap/firefox/common/am2strata-sandbox-profile") }
+                              else { home.join(".local/share/am2strata/sandbox-firefox-profile") };
+                let _ = std::fs::create_dir_all(&profile);
+                cmd.arg("--no-remote").arg("--profile").arg(profile);
+            }
+        }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        cmd
+    }
+
     fn use_sandbox_display(mut cmd: std::process::Command, disp: &str) -> std::process::Command {
         // capture PATH before clearing (env_clear drops all inherited vars); DISPLAY is pinned to the sandbox display below.
         let path = std::env::var_os("PATH");
@@ -514,7 +567,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxBackend, SandboxDesktop};
+pub use linux::{sandbox_app, LinuxBackend, SandboxDesktop};
 
 // ------------------------------------------------------------------------------------------------- Non-Linux helpers
 

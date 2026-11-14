@@ -35,6 +35,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
     <button class="st-tab" role="tab" id="tab-btn-workshop" aria-controls="view-workshop" aria-selected="false" data-tab="workshop">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-layers"/></svg>Workshop</button>
+    <button class="st-tab" role="tab" id="tab-btn-computer" aria-controls="view-computer" aria-selected="false" data-tab="computer">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-eye"/></svg>Computer</button>
     <button class="st-tab" role="tab" id="tab-btn-settings" aria-controls="view-settings" aria-selected="false" data-tab="settings">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>Settings</button>
     <button class="st-tab" role="tab" id="tab-btn-calls" aria-controls="view-calls" aria-selected="false" data-tab="calls">
@@ -529,6 +531,28 @@
       <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|strata|datagen|upload|dataset|jobs|cancel</code> (through this server),
         or <code>am2strata-workshop</code> on its own.</p>
       <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist><datalist id="ws-datasets"></datalist>
+    </div>
+  </section>
+
+  <section class="view view--computer" id="view-computer" role="tabpanel" aria-labelledby="tab-btn-computer" hidden>
+    <div class="cv">
+      <div class="cv-bar">
+        <strong>Desktop</strong>
+        <span class="st-badge" id="cv-who">Connecting&hellip;</span>
+        <span class="muted small" id="cv-info"></span>
+        <span class="cv-spacer"></span>
+        <button type="button" class="st-btn st-btn--primary" id="cv-take">Take control</button>
+        <button type="button" class="st-btn st-btn--secondary" id="cv-paste" title="Your clipboard to the desktop's (then Ctrl+V there)">Paste to desktop</button>
+        <button type="button" class="st-btn st-btn--secondary" id="cv-copy" title="The desktop's clipboard to yours">Copy from desktop</button>
+        <button type="button" class="st-btn st-btn--secondary" id="cv-shot">Screenshot</button>
+        <select class="st-input" id="cv-app" aria-label="Open an app" style="width:auto"><option value="">Open an app&hellip;</option></select>
+      </div>
+      <div class="msg-error" id="cv-error" hidden></div>
+      <div class="cv-screen"><canvas id="cv-canvas" tabindex="0" aria-label="The desktop"></canvas></div>
+      <p class="muted small">This is the private desktop computer use works on (never this PC's own screen). While
+        <b>you have control</b>, your mouse and keyboard go to it and am2Strata's steps wait; hand it back to let a job go
+        on. Closing this tab hands it back. Copy and paste need this page on HTTPS (Settings › Secure connection).
+        From a terminal: <code>am2strata-run computer status|screenshot|take|give|paste|copy|type|open</code>.</p>
     </div>
   </section>
 

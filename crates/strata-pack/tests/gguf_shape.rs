@@ -6,8 +6,6 @@ use strata_pack::{gguf_write::{TensorSpec, Writer}};
 
 #[test]
 fn numpy_shape_read_back_as_ggml_ne() {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&dir).unwrap();
 
     // rows=2, cols=256 in numpy order; F32, so this many bytes of data.
     let (rows, cols) = (2usize, 256usize);
@@ -16,7 +14,7 @@ fn numpy_shape_read_back_as_ggml_ne() {
 
     let specs = vec![TensorSpec { name: "weight".into(), shape: vec![rows as u64, cols as u64], ggml_type: 0 /* F32 */, nbytes: raw.len() as u64 }];
     let kv = [("general.architecture", "shape-test".to_string())];
-    let path = dir.join("shape-convention.gguf");
+    let path = std::env::temp_dir().join(format!("shape-convention-{}.gguf", std::process::id()));
     let mut w = Writer::create(&path, &kv, specs).unwrap();
     w.tensor_data(&raw).unwrap();
     w.end_tensor().unwrap();
