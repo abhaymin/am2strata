@@ -121,6 +121,43 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         check_experts: usize,
     },
+    /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
+    /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
+    /// | jobs | job <id> | cancel <id> | files
+    Workshop {
+        action: String,
+        /// convert/quantize: the input; merge: the base model; job/cancel: the job id
+        first: Option<String>,
+        /// merge: the adapter folder
+        second: Option<String>,
+        #[arg(long)]
+        out: Option<String>,
+        /// quantize: q8_0, q6_k, q5_k, q4_k, q4_0 or f16
+        #[arg(long = "type")]
+        ty: Option<String>,
+        /// convert: f16 or f32
+        #[arg(long)]
+        outtype: Option<String>,
+        /// convert: name the BPE pre-tokenizer when its hash is unknown
+        #[arg(long)]
+        pre_tokenizer: Option<String>,
+        /// strata: the model's name (default: from the file) and display name; --overwrite replaces one of that name
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        overwrite: bool,
+        /// follow the job until it ends
+        #[arg(long)]
+        wait: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// HTTPS on the running server, applied at once and kept in its run config:
     /// status | self-signed | tailscale | load --cert <pem> --key <pem> | renew | off
     Tls {
@@ -635,6 +672,8 @@ fn main() -> ExitCode {
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
+        Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir } =>
+            workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
@@ -793,6 +832,92 @@ fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
     }
     let _ = child.wait();
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// `am2strata-run workshop ...`: the server's /v1/workshop API, as the Workshop tab uses it.
+#[allow(clippy::too_many_arguments)]
+fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out: Option<String>, ty: Option<String>,
+                outtype: Option<String>, pre: Option<String>, install: (Option<String>, Option<String>, bool), wait: bool,
+                url: Option<String>, api_key: Option<String>,
+                models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+    let send = |rb: reqwest::blocking::RequestBuilder| -> Result<serde_json::Value, String> {
+        let rb = match &key { Some(k) => rb.bearer_auth(k), None => rb };
+        let r = rb.send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        let ok = r.status().is_success();
+        let j: serde_json::Value = r.json().unwrap_or_default();
+        if ok { Ok(j) } else { Err(j["error"]["message"].as_str().unwrap_or("failed").to_string()) }
+    };
+    // a relative path is the caller's: make it absolute before the server sees it
+    let abs = |p: String| -> String {
+        let e = expand_path(Path::new(&p));
+        if e.is_absolute() { e.display().to_string() } else { std::env::current_dir().map(|d| d.join(&e)).unwrap_or(e).display().to_string() }
+    };
+    let show = |j: &serde_json::Value| {
+        let res = j["result"]["output"].as_str().map(|o| format!(" -> {o}")).unwrap_or_default();
+        println!("#{} {} {}{}", j["id"], j["kind"].as_str().unwrap_or(""), j["state"].as_str().unwrap_or(""), res);
+        if let Some(e) = j["error"].as_str() { println!("  error: {e}"); }
+    };
+    let result = (|| -> Result<(), String> {
+        let body = match action {
+            "convert" => serde_json::json!({"kind": "convert", "input": abs(first.clone().ok_or("convert <hf-folder>")?),
+                                            "output": out.clone().map(abs), "outtype": outtype, "pre_tokenizer": pre}),
+            "quantize" => serde_json::json!({"kind": "quantize", "input": abs(first.clone().ok_or("quantize <gguf> --type q4_k")?),
+                                             "type": ty.clone().ok_or("quantize needs --type (q8_0, q6_k, q5_k, q4_k, q4_0, f16)")?,
+                                             "output": out.clone().map(abs)}),
+            "merge" => serde_json::json!({"kind": "merge", "base": abs(first.clone().ok_or("merge <base-folder> <adapter-folder>")?),
+                                          "adapter": abs(second.clone().ok_or("merge <base-folder> <adapter-folder>")?),
+                                          "output": out.clone().map(abs)}),
+            "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
+                                           "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),
+            "jobs" => {
+                let j = send(client.get(format!("{url}/v1/workshop/jobs")))?;
+                for x in j["jobs"].as_array().into_iter().flatten() { show(x); }
+                return Ok(());
+            }
+            "files" => {
+                let j = send(client.get(format!("{url}/v1/workshop/files")))?;
+                println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default());
+                return Ok(());
+            }
+            "job" | "cancel" => {
+                let id = first.clone().ok_or(format!("{action} <job id>"))?;
+                let j = if action == "job" { send(client.get(format!("{url}/v1/workshop/jobs/{id}")))? }
+                        else { send(client.delete(format!("{url}/v1/workshop/jobs/{id}")))? };
+                show(&j);
+                for l in j["log"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
+                return Ok(());
+            }
+            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, jobs, job, cancel, files")),
+        };
+        let mut body = body;
+        if let Some(o) = body.as_object_mut() { o.retain(|_, v| !v.is_null()); }
+        let j = send(client.post(format!("{url}/v1/workshop/jobs")).json(&body))?;
+        show(&j);
+        if wait {
+            let id = j["id"].clone();
+            let mut seen = 0usize;
+            loop {
+                std::thread::sleep(Duration::from_millis(800));
+                let j = send(client.get(format!("{url}/v1/workshop/jobs/{id}")))?;
+                let log = j["log"].as_array().cloned().unwrap_or_default();
+                for l in log.iter().skip(seen) { println!("  {}", l.as_str().unwrap_or("")); }
+                seen = log.len();
+                if !matches!(j["state"].as_str(), Some("queued" | "running")) {
+                    show(&j);
+                    return if j["state"] == "done" { Ok(()) } else { Err(format!("job {id} {}", j["state"].as_str().unwrap_or(""))) };
+                }
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("workshop: {e}"); ExitCode::from(1) }
+    }
 }
 
 /// `am2strata-run tls ...`: the same /api/tls the web app's Settings › Secure connection uses.

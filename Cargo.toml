@@ -9,6 +9,7 @@ members = [
     "crates/strata-gguf",
     "crates/strata-hub",
     "crates/strata-pack",
+    "crates/strata-workshop",
     "crates/am2strata",
 ]
 
@@ -51,6 +52,16 @@ strata-gguf = { path = "crates/strata-gguf" }
 strata-hub = { path = "crates/strata-hub" }
 strata-pack = { path = "crates/strata-pack" }
 strata-frontend = { path = "crates/strata-frontend" }
+
+# strata-workshop (the mold candle fork — same pinned rev as strata-media, CPU build here: no cuda feature). autograd +
+# AdamW prove the training path; llama/qwen/mistral defs load a frozen base when step 3 needs it.
+candle-core = { package = "candle-core-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+candle-nn = { package = "candle-nn-mold", git = "https://github.com/utensils/candle.git", rev = "bf2cd29a791dbc053df826b4377d092c3809d17f" }
+# safetensors: write the tiny random fixtures; memmap2 reads them back without copying (merge/quantize steps reuse this)
+safetensors = "0.8"
+memmap2 = "0.9"
+# prost: ONNX graph writer (step 7); only the proto, nothing compiled against ONNX Runtime
+prost = "0.13"
 
 [profile.release]
 # the server is ~1% of request time (the engine is the rest): fast builds matter more than the last few percent

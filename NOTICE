@@ -6,6 +6,9 @@ Bundled third-party files keep their own licenses:
 - web/fonts: the Outfit font, SIL Open Font License 1.1 (web/fonts/OFL.txt)
 - poppler/ (the Windows download only): Poppler's pdftotext and pdftoppm, GPL-2.0-or-later, run as separate
   programs to read PDFs (poppler/README.txt says where their source is)
+- .agent/ref/ggml/ (ggml-quants.c, ggml-quants.h, ggml-common.h, LICENSE-llama.cpp): the ggml reference quantizers,
+  MIT, Copyright (c) 2023-2026 the ggml authors. crates/strata-pack/src/quantize.rs is a byte-for-byte port of these;
+  their MIT notice is kept in that file's header comment and in .agent/ref/ggml/LICENSE-llama.cpp
 
 vendor/mold is a copy of mold (https://github.com/utensils/mold, MIT, Copyright (c) James Brink and Jeffrey Dilley;
 parts Apache-2.0 and others, see its LICENSE-* and THIRD_PARTY_NOTICES.md files) at rev bf0ea4a0, with one fix of

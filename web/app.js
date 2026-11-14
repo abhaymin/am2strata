@@ -81,14 +81,15 @@ function refreshMedia() {
   try { if (health.image_generation) loadMediaModels(); } catch (e) { /* still starting */ }
 }
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "settings", "calls"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "workshop", "settings", "calls"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "workshop", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") { $("img-prompt").focus(); refreshMedia(); }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
   if (tab === "settings") { showSection(section); refreshMedia(); }
   if (tab === "calls") refreshCalls();
+  if (tab === "workshop") loadWorkshop();
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -3855,3 +3856,71 @@ if (tab === "settings" && section === "connect") { renderAppSetup(); renderAgent
   });
   window.addEventListener("resize", () => { if (!box.hidden) fit(); });
 })();
+
+// ------------------------------------------------------------------ Workshop: convert, quantize, merge (workshop.rs)
+let wsTimer = null;
+async function wsFetch(path, opts = {}) {
+  const r = await fetch(path, {...opts, headers: {...headers(), ...(opts.body ? {"Content-Type": "application/json"} : {})}});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || (r.status === 401 ? "The Workshop needs the server's API key (Settings › Server and access)." : `HTTP ${r.status}`));
+  return j;
+}
+async function loadWorkshop() {
+  try {
+    const f = await wsFetch("v1/workshop/files");
+    const opts = (list) => list.map((x) => `<option value="${esc(typeof x === "string" ? x : x.path)}">`).join("");
+    $("ws-hf").innerHTML = opts(f.hf_models || []);
+    $("ws-adapters").innerHTML = opts(f.adapters || []);
+    $("ws-gguf").innerHTML = opts(f.gguf || []);
+    $("ws-folders").textContent = `It works in ${(f.folders || []).join(", ")}; results go to ${f.output_folder}.` +
+      (f.installed ? "" : " (The am2strata-workshop command is not installed beside the server.)");
+  } catch (e) { wsError(e.message); }
+  refreshJobs();
+}
+function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; }
+async function refreshJobs() {
+  clearTimeout(wsTimer);
+  try {
+    const j = await wsFetch("v1/workshop/jobs");
+    const jobs = j.jobs || [];
+    $("ws-jobs").innerHTML = jobs.length ? jobs.map((x) => {
+      const badge = {queued: "st-badge--reading", running: "st-badge--generating", done: "", failed: "", cancelled: ""}[x.state] ?? "";
+      const took = x.started_at && x.finished_at ? ` · ${fmt(x.finished_at - x.started_at)} s` : "";
+      const res = x.result ? ` · ${esc(x.result.output)} (${fmtBytes(x.result.bytes || 0)})` : "";
+      return `<div class="mcp-server"><div class="mcp-server__head"><strong>#${x.id} ${esc(x.kind)}</strong>` +
+        `<span class="st-badge ${badge}">${esc(x.state)}</span><span class="muted small">${esc(x.last || "")}${took}${res}</span>` +
+        ((x.state === "queued" || x.state === "running") ? `<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>` : "") +
+        (x.state === "done" && x.kind !== "strata" && x.result ? `<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>` : "") +
+        (x.state === "done" && x.kind === "strata" ? `<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>` : "") +
+        `</div>${x.error ? `<div class="msg-error">${esc(x.error)}</div>` : ""}</div>`;
+    }).join("") : '<p class="muted small">No jobs yet.</p>';
+    for (const b of document.querySelectorAll("[data-ws-cancel]")) b.onclick = async () => {
+      try { await wsFetch(`v1/workshop/jobs/${b.dataset.wsCancel}`, {method: "DELETE"}); } catch (e) { wsError(e.message); }
+      refreshJobs();
+    };
+    for (const b of document.querySelectorAll("[data-ws-next]")) b.onclick = () => {
+      const x = jobs.find((y) => String(y.id) === b.dataset.wsNext);
+      if (!x) return;
+      if (x.kind === "merge") $("ws-c-in").value = x.result.output;   // merged model → convert
+      if (x.kind === "convert") $("ws-q-in").value = x.result.output; // GGUF → quantize
+      if (x.kind === "quantize") $("ws-s-in").value = x.result.output; // quantized GGUF → install
+    };
+    for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
+    if (tab === "workshop" && jobs.some((x) => x.state === "queued" || x.state === "running")) wsTimer = setTimeout(refreshJobs, 1500);
+  } catch (e) { wsError(e.message); }
+}
+function fmtBytes(b) { return b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} KB`; }
+async function wsSubmit(body, btn) {
+  wsError("");
+  const label = btn.textContent; btn.disabled = true;
+  try {
+    for (const k of Object.keys(body)) if (body[k] === "") delete body[k];
+    await wsFetch("v1/workshop/jobs", {method: "POST", body: JSON.stringify(body)});
+    refreshJobs();
+  } catch (e) { wsError(e.message); }
+  finally { btn.disabled = false; btn.textContent = label; }
+}
+$("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").value.trim(), adapter: $("ws-m-adapter").value.trim(), output: $("ws-m-out").value.trim()}, e.currentTarget);
+$("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
+$("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
+$("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);

@@ -13,5 +13,6 @@ pub mod mtp_fetch;
 pub mod mtp_pack;
 pub mod mtp_rt;
 pub mod num;
+pub mod quantize;
 pub mod quants;
 pub mod stack_experts;
