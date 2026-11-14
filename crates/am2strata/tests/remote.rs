@@ -614,3 +614,35 @@ fn a_client_that_leaves_ends_the_providers_call() {
     }
     assert!(mock.closed.load(Ordering::SeqCst), "the provider's connection was closed after the client left");
 }
+
+#[test]
+fn the_command_line_shows_tests_and_sets_keys() {
+    let run = |s: &Server, args: &[&str], stdin: Option<&str>| {
+        use std::io::Write;
+        let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_am2strata-run"));
+        c.arg("remote").args(args).args(["--url", &s.base, "--api-key", KEY, "--models-dir", "/nonexistent"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        if let Some(t) = stdin {
+            child.stdin.take().unwrap().write_all(t.as_bytes()).unwrap();
+        }
+        let o = child.wait_with_output().unwrap();
+        (o.status.success(), String::from_utf8_lossy(&o.stdout).to_string(), String::from_utf8_lossy(&o.stderr).to_string())
+    };
+    let off = Server::start(&[Model { vision: false, ..Model::default() }], &[ids("x")], json!({}));
+    let (ok, _, err) = run(&off, &["status"], None);
+    assert!(!ok && err.contains("remote models are off"), "{err}");
+    let (port, _mock) = mock_providers();
+    let s = start(port, json!({}), &[ids("x")], json!({}));
+    let (ok, out, err) = run(&s, &["status"], None);
+    assert!(ok, "{err}");
+    assert!(out.contains("openai") && out.contains("key set (env") && out.contains("mix: 3 rule(s), default local"), "{out}");
+    assert!(!out.contains(PROVIDER_KEY));
+    let (ok, out, _) = run(&s, &["models", "listed"], None);
+    assert!(ok && out.contains("listed/listed-1"), "{out}");
+    let (ok, out, err) = run(&s, &["test", "anthropic"], None);
+    assert!(ok && out.contains("ok: 2 models"), "{out} {err}");
+    let (ok, out, err) = run(&s, &["set-key", "listed"], Some(&format!("{PROVIDER_KEY}\n")));
+    assert!(ok && out.contains("key set (…cdef)"), "{out} {err}");
+    assert!(!out.contains(PROVIDER_KEY) && !err.contains(PROVIDER_KEY));
+}

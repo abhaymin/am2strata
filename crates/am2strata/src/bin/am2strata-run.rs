@@ -223,6 +223,19 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    // remote models of the running server (docs/internal/REMOTE-MODELS.md): status | test <provider> |
+    // models <provider> | set-key <provider> (the key read from stdin). Not listed in --help.
+    #[command(hide = true)]
+    Remote {
+        action: String,
+        provider: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// API keys of the running server, and their usage:
     /// create --name X [--tools web,memory] [--expires 30d] | list | revoke <id> | usage [--days 30] [--key <id>]
     Keys {
@@ -849,6 +862,7 @@ fn main() -> ExitCode {
             vm_cmd(&action, &args, kind, root, &lists, yes, !no_wait, url, api_key, &models_dir),
         Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir, dg } =>
             workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir, dg),
+        Cmd::Remote { action, provider, url, api_key, models_dir } => remote_cmd(&action, provider, url, api_key, &models_dir),
         Cmd::Keys { action, id, name, tools, expires, memory, requests_per_day, tokens_per_day, models, days, key, url, api_key, models_dir } =>
             keys_cmd(&action, id, serde_json::json!({"name": name, "tools": tools, "expires_in": expires, "memory": memory, "models": models,
                                                      "limits": {"requests_per_day": requests_per_day, "tokens_per_day": tokens_per_day}}),
@@ -1587,6 +1601,81 @@ fn keys_cmd(action: &str, id: Option<String>, spec: serde_json::Value, days: u64
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => { eprintln!("keys: {e}"); ExitCode::from(1) }
+    }
+}
+
+/// `am2strata-run remote ...`: the running server's /api/rtenai (its own key only).
+fn remote_cmd(action: &str, provider: Option<String>, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+    let send = |rb: reqwest::blocking::RequestBuilder| -> Result<serde_json::Value, String> {
+        let rb = match &key { Some(k) => rb.bearer_auth(k), None => rb };
+        let r = rb.send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        let ok = r.status().is_success();
+        let j: serde_json::Value = r.json().unwrap_or_default();
+        if ok { Ok(j) } else { Err(j["error"]["message"].as_str().unwrap_or("failed").to_string()) }
+    };
+    let result = (|| -> Result<(), String> {
+        let st = send(client.get(format!("{url}/api/rtenai")))?;
+        if st["enabled"] != true {
+            return Err("remote models are off on this server (no \"remote\" block in its run config)".into());
+        }
+        let p = || provider.clone().ok_or(format!("{action} <provider> (one of: {})",
+            st["providers"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>().join(", ")));
+        match action {
+            "status" => {
+                for p in st["providers"].as_array().into_iter().flatten() {
+                    let k = &p["key"];
+                    let key = if k["set"] == true {
+                        format!("key set ({}{})", k["source"].as_str().unwrap_or(""), k["last4"].as_str().map(|l| format!(", …{l}")).unwrap_or_default())
+                    } else {
+                        format!("NO KEY: {}", k["error"].as_str().unwrap_or(""))
+                    };
+                    let models: Vec<&str> = p["models"].as_array().into_iter().flatten().filter_map(|m| m.as_str()).collect();
+                    println!("{:<12} {:<9} {}  {}  models: {}", p["name"].as_str().unwrap_or(""), p["kind"].as_str().unwrap_or(""),
+                             p["base_url"].as_str().unwrap_or(""), key, if models.is_empty() { "(the provider's list)".to_string() } else { models.join(", ") });
+                }
+                let mix = &st["mix"];
+                println!("mix: {} rule(s), default {}", mix["routes"].as_array().map(|r| r.len()).unwrap_or(0), mix["default"].as_str().unwrap_or("local"));
+                for (name, m) in st["mixes"].as_object().into_iter().flatten() {
+                    println!("mix/{name}: {} rule(s), default {}", m["routes"].as_array().map(|r| r.len()).unwrap_or(0), m["default"].as_str().unwrap_or("local"));
+                }
+            }
+            "test" => {
+                let j = send(client.post(format!("{url}/api/rtenai/test/{}", p()?)))?;
+                if j["ok"] == true {
+                    println!("ok: {} models", j["models"].as_array().map(|m| m.len()).unwrap_or(0));
+                } else {
+                    return Err(j["error"].as_str().unwrap_or("failed").to_string());
+                }
+            }
+            "models" => {
+                let j = send(client.get(format!("{url}/api/rtenai/models/{}", p()?)))?;
+                for m in j["models"].as_array().into_iter().flatten() {
+                    println!("{}/{}", j["provider"].as_str().unwrap_or(""), m.as_str().unwrap_or(""));
+                }
+            }
+            "set-key" => {
+                let name = p()?;
+                eprintln!("the key of {name}, then Enter (read from stdin, not echoed to any log):");
+                let mut k = String::new();
+                std::io::stdin().read_line(&mut k).map_err(|e| e.to_string())?;
+                let k = k.trim();
+                if k.is_empty() {
+                    return Err("no key was given".into());
+                }
+                let j = send(client.post(format!("{url}/api/rtenai/keys/{name}")).json(&serde_json::json!({"key": k})))?;
+                println!("{name}: key set{}", j["key"]["last4"].as_str().map(|l| format!(" (…{l})")).unwrap_or_default());
+            }
+            other => return Err(format!("unknown action {other:?} (status, test, models, set-key)")),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("remote: {e}"); ExitCode::from(1) }
     }
 }
 
