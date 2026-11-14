@@ -17,6 +17,10 @@ serde.workspace = true
 thiserror.workspace = true
 strata-pack.workspace = true
 strata-gguf.workspace = true
+# the model's own chat template renders the training conversations (the same renderer the server uses)
+strata-template.workspace = true
+# soup.yaml import (Soup configs are YAML); serde_yaml itself is unmaintained, this is its maintained fork
+serde_norway = "0.9"
 # tokenizers loads the fixture's tokenizer.json and tokenizes the pre-tokenizer probe string (the port of llama.cpp's
 # get_vocab_base_pre); sha2 hashes that id list to look it up in llama.cpp's chkhsh table.
 tokenizers = "0.21"

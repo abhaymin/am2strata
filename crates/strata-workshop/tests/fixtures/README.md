@@ -46,3 +46,24 @@ the reviewer. They pin the q/k rotary permute with the real head counts: q by `n
 llama.cpp's converter with `--outtype f16` (pre forced to gpt-2), by the reviewer: on `tiny-llama-256-hf/` (F32
 source), and on `tiny-llama-256-bf16-hf/` — the same model with its safetensors cast to BF16 by PyTorch, as real
 Hugging Face models are stored. 2-D weights F16 (rounded as numpy does), 1-D tensors F32.
+
+## forward-reference.json, tiny-qwen2-hf/, tiny-qwen3-hf/, tiny-llama-tied-hf/, tiny-gqa-peft-adapter/
+
+The parity reference of the trainer's own forward pass (`src/model.rs`, `tests/model_parity.rs`). Made once, on the
+CPU, with Python from the Soup virtual environment (torch 2.11.0, transformers 5.15.1, peft 0.20.0); nothing in
+`cargo test` runs Python:
+
+    cd crates/strata-workshop/tests/fixtures
+    CUDA_VISIBLE_DEVICES="" ~/Development/soup-project/.venv/bin/python make-forward-reference.py
+
+`make-forward-reference.py` writes:
+- `tiny-qwen2-hf/` (q/k/v biases), `tiny-qwen3-hf/` (q_norm/k_norm, `head_dim` 16 with hidden 32) and
+  `tiny-llama-tied-hf/` (embeddings tied to the head): random models of 3 blocks, hidden 32, 4 heads, 2 key/value
+  heads, vocabulary 64, seed 1234, saved by transformers' `save_pretrained` (so `config.json` is transformers 5's:
+  `rope_parameters`, `model_type`). They have no tokenizer: only token ids go through them;
+- `forward-reference.json`: for those three and for `tiny-llama-hf`, `tiny-llama-256-hf`, `tiny-llama-gqa-hf`,
+  `tiny-llama-256-bf16-hf`, the 12 token ids `(7·i + 3) mod vocab` and transformers' float32 logits `[12][vocab]`;
+- `tiny-gqa-peft-adapter/`: a PEFT rsLoRA adapter (r 4, alpha 8, all seven targets, A and B random with seed 4321,
+  so the adapter is not a no-op) on `tiny-llama-gqa-hf`, and PEFT's logits of base + adapter under that name in the JSON.
+
+The files are transformers' and PEFT's own output; the models' weights are random numbers (no licence applies to them).
