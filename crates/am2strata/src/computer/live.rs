@@ -162,7 +162,14 @@ fn on_display(program: &str, display: &str) -> std::process::Command {
 pub fn clipboard_get(display: &str) -> Result<String, String> {
     let o = on_display("xclip", display).args(["-selection", "clipboard", "-o"]).output()
         .map_err(|e| format!("xclip: {e} (install xclip for clipboard sync)"))?;
-    // an empty clipboard is not an error
+    if !o.status.success() {
+        let why = String::from_utf8_lossy(&o.stderr).trim().to_string();
+        // an empty clipboard is not an error (xclip says so on stderr); anything else is
+        if why.is_empty() || why.contains("target STRING not available") || why.contains("Error: target") {
+            return Ok(String::new());
+        }
+        return Err(format!("xclip: {why}"));
+    }
     Ok(String::from_utf8_lossy(&o.stdout).into_owned())
 }
 
@@ -172,7 +179,8 @@ pub fn clipboard_set(display: &str, text: &str) -> Result<(), String> {
         .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
         .spawn().map_err(|e| format!("xclip: {e} (install xclip for clipboard sync)"))?;
     child.stdin.take().unwrap().write_all(text.as_bytes()).map_err(|e| e.to_string())?;
-    // xclip stays in the background to serve the selection; it exits when another owner takes it
+    // xclip stays to serve the selection and exits when another owner takes it: reaped then, never left a zombie
+    std::thread::spawn(move || { let _ = child.wait(); });
     Ok(())
 }
 

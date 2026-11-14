@@ -21,17 +21,13 @@ const REF_GGUF: &str = "tiny-llama.f32.gguf";
 
 fn fixtures() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures") }
 
-/// Write the shared tiny HF checkpoint folder deterministically, so our converter and llama.cpp read byte-identical
-/// inputs. Returns its path (the committed `tiny-llama.f32.gguf` was produced from this same folder by
-/// `convert_hf_to_gguf.py`).
-fn write_tiny_checkpoint() -> PathBuf {
-    let fx = fixtures();
-    std::fs::create_dir_all(&fx).ok();
-    let hf = fx.join(HF_DIR);
-    // deterministic: rewrite from scratch each run so the committed folder stays in sync with this crate.
+/// The shared tiny HF checkpoint, written by this crate into a fresh temporary folder (never into the committed
+/// fixtures: tests run in parallel, and another one reads that folder). Its files must equal the committed
+/// `tests/fixtures/tiny-llama-hf/`, from which llama.cpp made `tiny-llama.f32.gguf` (checked by `save_tiny_checkpoint`).
+fn write_tiny_checkpoint(tag: &str) -> PathBuf {
+    let hf = std::env::temp_dir().join(format!("am2-tiny-llama-hf-{tag}-{}", std::process::id()));
     std::fs::remove_dir_all(&hf).ok();
     Fixture::default().write(&hf).expect("tiny fixture writes a HF checkpoint");
-
     hf
 }
 
@@ -45,16 +41,32 @@ fn tensor_bytes(path: &Path, data_start: u64, t: &strata_gguf::TensorInfo) -> Op
     Some(b)
 }
 
+/// The generator still writes exactly the committed tiny folder (if it drifted, the llama.cpp reference no longer
+/// matches what our converter reads). To update the fixture deliberately: copy this test's folder over it.
 #[test]
 fn save_tiny_checkpoint() {
-    write_tiny_checkpoint();
+    let hf = write_tiny_checkpoint("check");
+    let committed = fixtures().join(HF_DIR);
+    let mut names: Vec<String> = std::fs::read_dir(&committed).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    for n in &names {
+        let (a, b) = (std::fs::read(hf.join(n)).unwrap_or_default(), std::fs::read(committed.join(n)).unwrap());
+        if n.ends_with(".json") {
+            let (a, b): (serde_json::Value, serde_json::Value) = (serde_json::from_slice(&a).unwrap(), serde_json::from_slice(&b).unwrap());
+            assert_eq!(a, b, "{n}: the generator and the committed fixture differ");
+        } else {
+            assert!(a == b, "{n}: the generator and the committed fixture differ");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&hf);
 }
 
 // Byte-for-byte (per tensor) plus names/shapes/types and metadata, against `convert_hf_to_gguf.py`'s committed output.
 // Skips the whole comparison when the reference GGUF is absent (see write_tiny_checkpoint for how to make it).
 #[test]
 fn converted_matches_llama_convert_hf_to_gguf() {
-    let hf = write_tiny_checkpoint();
+    // the committed folder, exactly what llama.cpp read (only read here; save_tiny_checkpoint keeps it in sync)
+    let hf = fixtures().join(HF_DIR);
     let ref_path = fixtures().join(REF_GGUF);
     if !ref_path.exists() {
         eprintln!("[skip] {REF_GGUF} is not present under tests/fixtures/; generate it locally with \

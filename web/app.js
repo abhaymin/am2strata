@@ -3978,7 +3978,11 @@ $("cv-paste").onclick = async () => {
   try { text = await navigator.clipboard.readText(); } catch (e) { text = prompt("Text to put on the desktop's clipboard (this page cannot read yours without HTTPS):"); }
   if (text) { cvSend({type: "clipboard_set", text}); toast("success", "Sent", "On the desktop's clipboard: paste with Ctrl+V there."); }
 };
-$("cv-shot").onclick = () => cvCanvas.toBlob((b) => { const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = `desktop-${Date.now()}.png`; a.click(); });
+$("cv-shot").onclick = () => cvCanvas.toBlob((b) => {
+  if (!b) { cvErr("The screenshot could not be made (no picture yet?)."); return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(b); a.download = `desktop-${Date.now()}.png`; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+});
 $("cv-app").onchange = async () => {
   const app = $("cv-app").value; $("cv-app").value = "";
   if (!app) return;
