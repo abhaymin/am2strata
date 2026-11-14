@@ -492,9 +492,10 @@ fn model_size_label(params: u64) -> String {
     } else {
         (value * 1e-3, "K")
     };
-    // min_digits is fixed at 2 in llama.cpp; fix = max(min_digits - len(str(round(scaled)).lstrip('0')), 0).
+    // min_digits is fixed at 2 in llama.cpp; fix = max(min_digits - len(str(round(scaled)).lstrip('0')), 0). saturating so a
+    // label whose integer part has >=3 digits (a model of >= ~1e5 params) can't underflow the subtraction.
     let rounded_len = (scaled.round() as i64).to_string().trim_start_matches('0').len();
-    let decimals = (2 - rounded_len).max(0);
+    let decimals = 2usize.saturating_sub(rounded_len);
 
     // Render `scaled` with exactly `decimals` fractional digits (no dynamic-width format spec), then append suffix.
     let magnitude = 10i64.pow(decimals as u32);
