@@ -318,6 +318,64 @@ pub fn q5_K(x: &[f32], out: &mut Vec<u8>) {
     }
 }
 
+/// ggml reference Q5_0 as `quantize_row_q5_0_ref` (block size 32): d = max/-16, code = min(31, trunc(x/d + 16.5)). The
+/// block layout is d (fp16) at bytes 0..2, the high bits as a little-endian u32 at 2..6, then the low nibbles in 16
+/// bytes (element j and element j+16 packed into byte j), so it is the byte-for-byte inverse of `quants::dequantize`'s
+/// Q5_0 decode.
+pub fn q5_0(x: &[f32], out: &mut Vec<u8>) {
+    debug_assert!(x.len() % 32 == 0);
+    for b in x.chunks_exact(32) {
+        let (mut amax, mut maxv) = (0.0_f32, 0.0_f32);
+        for &v in b {
+            if amax < v.abs() { amax = v.abs(); maxv = v; }
+        }
+        let d = maxv / -16.0_f32;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut qh: u32 = 0;
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            // C: MIN(31, (int8_t)(x*id + 16.5)); cast to i8 then u8 exactly reproduces the truncation/clip/bit extract.
+            let xi0 = std::cmp::min(31i8, (b[j] * id + 16.5_f32) as i8) as u8;
+            let xi1 = std::cmp::min(31i8, (b[16 + j] * id + 16.5_f32) as i8) as u8;
+            qs[j] = (xi0 & 0x0f) | ((xi1 & 0x0f) << 4);
+            qh |= ((xi0 as u32 & 0x10) >> 4) << j;
+            qh |= ((xi1 as u32 & 0x10) >> 4) << (j + 16);
+        }
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend_from_slice(&qh.to_le_bytes());
+        out.extend_from_slice(&qs);
+    }
+}
+
+/// ggml reference Q5_1 as `quantize_row_q5_1_ref` (block size 32): d = (max-min)/31, code = trunc((x-min)*d^-1 + 0.5).
+/// Block layout is d (fp16) at 0..2, m (fp16) at 2..4, the high bits as a u32 at 4..8, then the low nibbles in 16 bytes.
+pub fn q5_1(x: &[f32], out: &mut Vec<u8>) {
+    debug_assert!(x.len() % 32 == 0);
+    for b in x.chunks_exact(32) {
+        let (mut minv, mut maxv) = (f32::MAX, f32::MIN);
+        for &v in b {
+            if v < minv { minv = v; }
+            if v > maxv { maxv = v; }
+        }
+        let d = (maxv - minv) / 31.0_f32;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let mut qh: u32 = 0;
+        let mut qs = [0u8; 16];
+        for j in 0..16 {
+            // C: (uint8_t)((x-min)*id + 0.5); truncation toward zero, no clip since the values are bounded by 31.
+            let xi0 = ((b[j] - minv) * id + 0.5_f32) as u8;
+            let xi1 = ((b[16 + j] - minv) * id + 0.5_f32) as u8;
+            qs[j] = (xi0 & 0x0f) | ((xi1 & 0x0f) << 4);
+            qh |= ((xi0 & 0x10) as u32 >> 4) << j;
+            qh |= ((xi1 & 0x10) as u32 >> 4) << (j + 16);
+        }
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        out.extend_from_slice(&f32_to_f16(minv).to_le_bytes());
+        out.extend_from_slice(&qh.to_le_bytes());
+        out.extend_from_slice(&qs);
+    }
+}
+
 /// ggml reference Q6_K as `quantize_row_q6_K_ref`.
 pub fn q6_K(x: &[f32], out: &mut Vec<u8>) {
     debug_assert!(x.len() % QK_K == 0);
@@ -382,10 +440,12 @@ pub fn quantize(kind: &str, x: &[f32], out: &mut Vec<u8>) -> Result<(), String> 
     match kind {
         "Q8_0" => q8_0(x, out),
         "Q4_0" => q4_0(x, out),
+        "Q5_0" => q5_0(x, out),
+        "Q5_1" => q5_1(x, out),
         "Q4_K" => q4_K(x, out),
         "Q5_K" => q5_K(x, out),
         "Q6_K" => q6_K(x, out),
-        _ => return Err(format!("unsupported quantization {kind} (expected Q8_0 Q4_0 Q4_K Q5_K Q6_K)")),
+        _ => return Err(format!("unsupported quantization {kind} (expected Q8_0 Q4_0 Q5_0 Q5_1 Q4_K Q5_K Q6_K)")),
     }
     Ok(())
 }
