@@ -1,0 +1,8 @@
+{
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "bos_token": "tok_0",
+  "eos_token": "tok_1",
+  "chat_template": "{% for message in messages %}{% if loop.first and message['role'] != 'system' %}{{ system_prompt }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}"
+}

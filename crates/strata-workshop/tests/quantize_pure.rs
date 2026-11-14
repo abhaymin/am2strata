@@ -77,6 +77,49 @@ fn metadata_almost_equal(a: &Gguf, b: &Gguf) -> bool {
     })
 }
 
+/// The name -> (dims, ggml type, bytes) map for one GGUF file, keyed by tensor name so converter/reference order drift
+/// does not matter. Reads each tensor's raw data at its own offset from the given file path.
+fn tensor_map(path: &Path, g: &Gguf) -> std::collections::BTreeMap<String, (Vec<u64>, u32, Vec<u8>)> {
+    let mut m = std::collections::BTreeMap::new();
+    for t in &g.tensors {
+        let i = g.tensors.iter().position(|x| x.name == t.name).unwrap();
+        let (ty, bytes) = tensor_bytes(path, g, i);
+        m.insert(t.name.clone(), (t.dims.clone(), ty, bytes));
+    }
+    m
+}
+
+/// Exactly which tensors differ between our GGUF at `our_path` and the reference file — names only, so a converter
+/// divergence such as an old hardcoded head count reports `blk.0.attn_q.weight` / `attn_k.weight` instead of both byte
+/// maps. Also records count mismatches and tensors present on only one side.
+fn differing_tensor_names(our_path: &Path, ref_path: &Path) -> Vec<String> {
+    let ga = Gguf::open(our_path).expect("our GGUF opens");
+    let gb = Gguf::open(ref_path).expect("reference GGUF opens");
+    let mut diffs = Vec::new();
+    if ga.tensors.len() != gb.tensors.len() {
+        diffs.push(format!("<tensor count differs: {} ours vs {} reference>", ga.tensors.len(), gb.tensors.len()));
+    }
+    let our = tensor_map(our_path, &ga);
+    for t in &gb.tensors {
+        match our.get(&t.name) {
+            Some(o) => {
+                let j = gb.tensors.iter().position(|x| x.name == t.name).unwrap();
+                let (_, bytes2) = tensor_bytes(ref_path, &gb, j);
+                if o.0 != t.dims || o.1 != t.ggml_type || o.2 != bytes2 {
+                    diffs.push(t.name.clone());
+                }
+            }
+            None => diffs.push(format!("present in reference, missing from ours: {}", t.name)),
+        }
+    }
+    for name in our.keys() {
+        if !gb.tensors.iter().any(|x| x.name == *name) {
+            diffs.push(format!("present in ours, missing from reference: {}", name));
+        }
+    }
+    diffs
+}
+
 /// Gate 1: quantize the tiny F32 GGUF to each of its pure targets and confirm it reproduces llama.cpp's `.pure.gguf`
 /// fixtures byte for byte on every tensor, and metadata by value. Skips a target when that reference is absent.
 #[test]
@@ -114,8 +157,9 @@ fn tiny_matches_pure_reference() {
 }
 
 /// Gate 2: a wide tiny model whose every 2-D row is a whole block (hidden 256) really gets quantized. Convert its HF
-/// checkpoint to F32 with this crate's converter, then quantize each target and compare byte-for-byte to the reviewer's
-/// `llama-quantize --pure` reference — skipping until that file exists.
+/// checkpoint to F32 with this crate's converter, assert that F32 matches llama.cpp's byte-for-byte (naming exactly the
+/// diverging tensor on failure - the q/k permute's head count), then quantize each target and compare byte-for-byte to
+/// the reviewer's `llama-quantize --pure` reference — skipping until those files exist.
 #[test]
 fn wide_matches_pure_reference() {
     let root = std::env::temp_dir().join(format!("am2-workshop-256-hf-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
@@ -128,6 +172,20 @@ fn wide_matches_pure_reference() {
     // The F32 GGUF `llama-quantize` quantizes from; this crate's converter matches llama.cpp on tensor bytes (step 6).
     let base = root.join("model.f32.gguf");
     convert(&ckpt.dir, &base, OutType::F32, Some("gpt-2")).expect("convert 256-hf to F32 GGUF");
+
+    // The loud gate: our F32 must equal llama.cpp's BEFORE any quantizing. Under the old hardcoded head count this
+    // failed on blk.*.attn_q / attn_k bytes; failing here (not later) names exactly which tensor diverged. Skip until
+    // the reviewer places tiny-llama-256.f32.gguf in tests/fixtures/ (see NEEDED-ref.md); a wrong permute makes the
+    // .pure references below fail too, so this is where the bug shows up first and clearest.
+    let ref_f32 = fixtures().join("tiny-llama-256.f32.gguf");
+    if !ref_f32.exists() {
+        eprintln!("[skip] no tiny-llama-256.f32.gguf to compare our F32 against; make it and commit it in tests/fixtures/ \
+                  (see NEEDED-ref.md): `python3 .agent/ref/llama.cpp/convert_hf_to_gguf.py tiny-llama-256-hf --outtype f32 --outfile tiny-llama-256.f32.gguf`");
+    } else {
+        let diffs = differing_tensor_names(&base, &ref_f32);
+        assert!(diffs.is_empty(), "our F32 conversion of the wide model differs from llama.cpp in: {}", diffs.join(", "));
+        println!("F32: our wide converter matches llama.cpp byte-for-byte ({} tensors)", Gguf::open(&base).unwrap().tensors.len());
+    }
 
     for target in [PureType::Q8_0, PureType::Q4_0, PureType::Q4_K, PureType::Q5_K, PureType::Q6_K] {
         let outp = out(&format!("wide-{}", target.ggml_name()));
@@ -150,3 +208,41 @@ fn wide_matches_pure_reference() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Gate 3 (GQA): a tiny model with grouped attention - num_attention_heads != num_key_value_heads. Its k/v projections
+/// carry kv_heads*head_dim rows, so attn_k's rotary permute must use num_key_value_heads (llama.cpp collapses the k
+/// permute to n_head_kv). Convert its HF checkpoint to F32 and assert it matches llama.cpp's; skip until the reviewer
+/// places tiny-llama-gqa.f32.gguf in tests/fixtures/ (see NEEDED-gqa.md). A hardcoded head count in the converter fails
+/// exactly here, where no fixture used that value before this test existed.
+#[test]
+fn gqa_matches_llama_f32_reference() {
+    let root = std::env::temp_dir().join(format!("am2-workshop-gqa-hf-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 16 attention heads, 4 kv heads, hidden 256 (head_dim 16), kv dim 64 = 4*16; intermediate 512, one layer, vocab 32.
+    let gqa = Fixture { seed: 0x5EED, num_layers: 1, vocab_size: 32, hidden: 256, intermediate: 512, num_attention_heads: 16, num_key_value_heads: 4, shard_count: 1 };
+    let ckpt = gqa.write(&root).expect("write the GQA checkpoint");
+
+    let base = root.join("model.f32.gguf");
+    convert(&ckpt.dir, &base, OutType::F32, Some("gpt-2")).expect("convert GQA to F32 GGUF");
+
+    // v_proj / k_proj must have kv dim 64 (4 heads * head_dim 16) and q_proj the full 256 - proves the fixture is really
+    // GQA, so this test actually exercises a mismatched head count.
+    let g = Gguf::open(&base).expect("GQA F32 GGUF opens");
+    let q_rows = g.tensors.iter().find(|t| t.name == "blk.0.attn_q.weight").expect("attn_q present").dims[1];
+    let k_rows = g.tensors.iter().find(|t| t.name == "blk.0.attn_k.weight").expect("attn_k present").dims[1];
+    assert_eq!(q_rows, 256, "q_proj carries num_attention_heads*head_dim rows");
+    assert_eq!(k_rows, 64, "k_proj carries num_key_value_heads*head_dim rows");
+
+    let ref_f32 = fixtures().join("tiny-llama-gqa.f32.gguf");
+    if !ref_f32.exists() {
+        eprintln!("[skip] no tiny-llama-gqa.f32.gguf to compare our F32 against; make it and commit it in tests/fixtures/ \
+                  (see NEEDED-gqa.md): `python3 .agent/ref/llama.cpp/convert_hf_to_gguf.py <GQA HF folder> --outtype f32 --outfile tiny-llama-gqa.f32.gguf`");
+    } else {
+        let diffs = differing_tensor_names(&base, &ref_f32);
+        assert!(diffs.is_empty(), "our GQA F32 conversion differs from llama.cpp in: {}", diffs.join(", "));
+        println!("F32: our GQA converter matches llama.cpp byte-for-byte ({} tensors)", g.tensors.len());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
