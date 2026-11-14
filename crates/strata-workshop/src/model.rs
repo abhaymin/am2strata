@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use candle_core::{CpuStorage, CustomOp1, DType, Device, Layout, Shape, Storage, Tensor, Var, D};
+use candle_core::{CpuStorage, CustomOp1, DType, Device, Layout, Shape, Tensor, Var, D};
 use serde_json::Value;
 
 /// The decoder families this forward pass covers (each checked against transformers).
@@ -331,20 +331,61 @@ impl CustomOp1 for FrozenLinear {
     }
 
     fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
-        let y = self.y.lock().map_err(|_| candle_core::Error::Msg("frozen-half-linear: lock".into()))?.take()
-            .ok_or_else(|| candle_core::Error::Msg("frozen-half-linear: forward ran twice".into()))?;
-        let y = y.contiguous()?;
-        let shape = y.shape().clone();
-        let (storage, layout) = y.storage_and_layout();
-        match &*storage {
-            Storage::Cpu(c) if layout.start_offset() == 0 => Ok((c.clone(), shape)),
-            _ => Err(candle_core::Error::Msg("frozen-half-linear: the value is not a plain CPU tensor".into())),
-        }
+        take_value(&self.y, "frozen-half-linear")
     }
 
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         Ok(Some(grad_res.matmul(&self.w.to_dtype(DType::F32)?)?))
     }
+}
+
+/// `softmax(x · scale + mask)` over the last dimension as ONE node of the graph. Built from candle's differentiable
+/// operations it would keep five `[heads, seq, seq]` tensors per block for the backward pass (scaled, masked, shifted,
+/// exponentiated, normalised) — the largest part of a long sequence's memory; this keeps the result only, and sends
+/// the gradient back with the closed form `scale · y · (g − Σ g·y)`. (candle_nn's own `softmax_last_dim` is no
+/// substitute: it has no backward pass and cuts the graph without an error, so q and k adapters would never train.)
+struct MaskedSoftmax {
+    y: Mutex<Option<Tensor>>,
+    scale: f64,
+}
+
+impl CustomOp1 for MaskedSoftmax {
+    fn name(&self) -> &'static str {
+        "masked-softmax"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        take_value(&self.y, "masked-softmax")
+    }
+
+    fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
+        let gy = grad_res.mul(res)?;
+        let inner = gy.broadcast_sub(&res.broadcast_mul(&gy.sum_keepdim(D::Minus1)?)?)?;
+        Ok(Some((inner * self.scale)?))
+    }
+}
+
+/// The value a precomputed custom operation hands to the graph: taken once, as a plain CPU tensor.
+fn take_value(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(CpuStorage, Shape)> {
+    let y = slot.lock().map_err(|_| candle_core::Error::Msg(format!("{name}: lock")))?.take()
+        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: forward ran twice")))?;
+    // one copy of the values into a buffer of their own (the tensor may be a view of a larger one)
+    let shape = y.shape().clone();
+    Ok((CpuStorage::F32(y.flatten_all()?.to_vec1::<f32>()?), shape))
+}
+
+/// The plain version, from differentiable operations (what [`masked_softmax`] is checked against).
+pub fn masked_softmax_reference(x: &Tensor, scale: f64, mask: &Tensor) -> Result<Tensor> {
+    Ok(candle_nn::ops::softmax(&(x * scale)?.broadcast_add(mask)?, D::Minus1)?)
+}
+
+/// See [`MaskedSoftmax`]. Without a graph to keep (`x` descends from no variable) it is just the value.
+pub fn masked_softmax(x: &Tensor, scale: f64, mask: &Tensor) -> Result<Tensor> {
+    let value = masked_softmax_reference(&x.detach(), scale, mask)?;
+    if !x.track_op() {
+        return Ok(value);
+    }
+    Ok(x.apply_op1(MaskedSoftmax { y: Mutex::new(Some(value)), scale })?)
 }
 
 /// One LoRA adapter: `A` `[r, in]`, `B` `[out, r]`.
@@ -486,14 +527,22 @@ fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 impl LlamaModel {
-    /// Load the frozen base, holding its matrices as `base_dtype`. `skip_lower` leaves out everything below block
-    /// `first` (the embeddings too, unless they are the output head): for a run whose activation cache is complete.
+    /// Load the frozen base, holding its matrices as `base_dtype`.
     pub fn load(dir: &Path, base_dtype: BaseDtype, dev: &Device) -> Result<Self> {
-        Self::load_from(dir, base_dtype, dev, 0)
+        let layers = ModelConfig::load(dir)?.num_hidden_layers;
+        Self::load_parts(dir, base_dtype, dev, 0..layers, true, true)
     }
 
-    /// As [`load`], without the blocks below `skip_below` (and without the embeddings when the head is its own tensor).
+    /// As [`load`], without the blocks below `skip_below` (and without the embeddings when the head is its own
+    /// tensor): for a run whose activation cache holds what those blocks would compute.
     pub fn load_from(dir: &Path, base_dtype: BaseDtype, dev: &Device, skip_below: usize) -> Result<Self> {
+        let layers = ModelConfig::load(dir)?.num_hidden_layers;
+        Self::load_parts(dir, base_dtype, dev, skip_below..layers, skip_below == 0, true)
+    }
+
+    /// Load only some of the model: the blocks in `blocks`, the embeddings and the output head each on request (a
+    /// tied head needs the embeddings and loads them). The activation cache is filled this way, one block at a time.
+    pub fn load_parts(dir: &Path, base_dtype: BaseDtype, dev: &Device, blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool) -> Result<Self> {
         let cfg = ModelConfig::load(dir)?;
         let files = weight_files(dir)?;
         // mapped, not read: each tensor is copied out (and narrowed to the base dtype) one at a time
@@ -515,7 +564,7 @@ impl LlamaModel {
 
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            if i < skip_below {
+            if !blocks_wanted.contains(&i) {
                 blocks.push(None);
                 continue;
             }
@@ -541,15 +590,14 @@ impl LlamaModel {
         if !has_head && !cfg.tie_word_embeddings {
             bail!("{}: no lm_head.weight and tie_word_embeddings is false", dir.display());
         }
-        let need_embed = skip_below == 0 || !has_head;
-        let embed = if need_embed {
+        let embed = if with_embeddings || (with_head && !has_head) {
             let e = matrix(&format!("{prefix}embed_tokens.weight"))?;
             expect(&e, &[cfg.vocab_size, cfg.hidden_size], "embed_tokens.weight")?;
             Some(e)
         } else {
             None
         };
-        let lm_head = if has_head { Some(matrix("lm_head.weight")?) } else { None };
+        let lm_head = if has_head && with_head { Some(matrix("lm_head.weight")?) } else { None };
         let norm = vector(&format!("{prefix}norm.weight"))?;
         Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone() })
     }
@@ -747,10 +795,7 @@ impl LlamaModel {
             if rep == 1 { Ok(t) } else { Ok(t.unsqueeze(1)?.broadcast_as((nkv, rep, seq, hd))?.reshape((nh, seq, hd))?) }
         };
         let (k, v) = (spread(k)?, spread(v)?);
-        let scores = (q.matmul(&k.transpose(1, 2)?.contiguous()?)? * (1.0 / (hd as f64).sqrt()))?.broadcast_add(mask)?;
-        // candle_nn's `softmax_last_dim` is faster but has no backward pass (it cuts the graph without an error, and the
-        // q and k adapters would then never train); this one is built from differentiable operations
-        let att = candle_nn::ops::softmax(&scores, D::Minus1)?;
+        let att = masked_softmax(&q.matmul(&k.transpose(1, 2)?.contiguous()?)?, 1.0 / (hd as f64).sqrt(), mask)?;
         let out = att.matmul(&v)?.transpose(0, 1)?.reshape((seq, nh * hd))?;
         let x = (x + block.lin[3].forward(&out, ctx)?)?;
 
@@ -771,7 +816,7 @@ impl LlamaModel {
         }
         let (rope, mask) = (self.rope(seq)?, self.causal_mask(seq)?);
         for i in range {
-            let block = self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (it was dropped for the activation cache)"))?;
+            let block = self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (the activation cache stands in for it)"))?;
             x = self.block_forward(block, &x, &rope, &mask, ctx)?;
         }
         Ok(x)
@@ -780,13 +825,22 @@ impl LlamaModel {
     /// The hidden state `[seq, hidden]` entering the first trained block: embeddings and the frozen blocks below it.
     /// No adapter is involved, so nothing is recorded for a backward pass; the result is detached.
     pub fn lower(&self, tokens: &[u32]) -> Result<Tensor> {
-        let embed = self.embed.as_ref().ok_or_else(|| anyhow!("the embeddings are not in memory (dropped for the activation cache)"))?;
+        self.frozen_blocks(&self.embed_tokens(tokens)?, 0..self.first_trained)
+    }
+
+    /// The embeddings of `tokens`, `[seq, hidden]` in f32.
+    pub fn embed_tokens(&self, tokens: &[u32]) -> Result<Tensor> {
+        let embed = self.embed.as_ref().ok_or_else(|| anyhow!("the embeddings are not in memory (the activation cache stands in for them)"))?;
         if let Some(bad) = tokens.iter().find(|t| **t as usize >= self.cfg.vocab_size) {
             bail!("token id {bad} is outside the vocabulary of {}", self.cfg.vocab_size);
         }
         let ids = Tensor::from_vec(tokens.to_vec(), (tokens.len(),), &self.dev)?;
-        let x = embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
-        Ok(self.run_blocks(x, 0..self.first_trained, &Ctx::eval())?.detach())
+        Ok(embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
+    }
+
+    /// Run `h` through the blocks in `range` as plain inference (they must carry no adapter); the result is detached.
+    pub fn frozen_blocks(&self, h: &Tensor, range: std::ops::Range<usize>) -> Result<Tensor> {
+        Ok(self.run_blocks(h.clone(), range, &Ctx::eval())?.detach())
     }
 
     /// From that hidden state through the trained blocks to the final norm: `[seq, hidden]`.

@@ -279,6 +279,48 @@ impl ActCache {
         Ok(Some(t.remove("h").ok_or_else(|| anyhow!("{}: no hidden state", p.display()))?))
     }
 
+    /// Compute the states of `examples` without ever holding the frozen part in memory: the embeddings first, then
+    /// one block at a time — load it, pass every conversation's state through it (the states wait on disk in
+    /// `filling/`), drop it. Memory: the embeddings or one block, plus one conversation. The states are the same bits
+    /// as [`LlamaModel::lower`] computes with everything loaded: the same operations in the same order.
+    pub fn fill(&mut self, model_dir: &Path, dtype: BaseDtype, dev: &Device, first_trained: usize, examples: &[&Example], on_event: &mut dyn FnMut(Event)) -> Result<()> {
+        let work = self.dir.join("filling");
+        // a fill that was interrupted starts again: half-way states are of no use
+        std::fs::remove_dir_all(&work).ok();
+        std::fs::create_dir_all(&work)?;
+        let part = |i: usize| work.join(format!("{i}.safetensors"));
+        let save = |i: usize, h: &Tensor| -> Result<()> { Ok(candle_core::safetensors::save(&HashMap::from([("h".to_string(), h.clone())]), part(i))?) };
+        let total = examples.len() * (first_trained + 1);
+        let mut done = 0;
+        let mut tick = |on_event: &mut dyn FnMut(Event)| {
+            done += 1;
+            if done % 16 == 0 || done == total {
+                on_event(Event::Cache { done, total });
+            }
+        };
+        {
+            let embeddings = LlamaModel::load_parts(model_dir, dtype, dev, 0..0, true, false)?;
+            for (i, ex) in examples.iter().enumerate() {
+                save(i, &embeddings.embed_tokens(&ex.tokens)?)?;
+                tick(on_event);
+            }
+        }
+        for block in 0..first_trained {
+            let one = LlamaModel::load_parts(model_dir, dtype, dev, block..block + 1, false, false)?;
+            for i in 0..examples.len() {
+                let h = candle_core::safetensors::load(part(i), dev)?.remove("h").ok_or_else(|| anyhow!("{}: no state", part(i).display()))?;
+                save(i, &one.frozen_blocks(&h, block..block + 1)?)?;
+                tick(on_event);
+            }
+        }
+        for (i, ex) in examples.iter().enumerate() {
+            let h = candle_core::safetensors::load(part(i), dev)?.remove("h").ok_or_else(|| anyhow!("{}: no state", part(i).display()))?;
+            self.put(&ex.tokens, &h)?;
+        }
+        std::fs::remove_dir_all(&work).ok();
+        Ok(())
+    }
+
     pub fn put(&mut self, tokens: &[u32], h: &Tensor) -> Result<()> {
         let p = self.path(tokens);
         let tmp = p.with_extension("tmp");
@@ -389,30 +431,21 @@ impl Runner {
             Some(dir) => Some(ActCache::open(dir, &cache_fingerprint(&s.model, first, s.base_dtype)?)?),
             None => None,
         };
-        // with every state already on disk the lower blocks are never loaded
-        let complete = cache.as_ref().is_some_and(|c| data.train.iter().chain(&data.eval).all(|ex| c.has(&ex.tokens)));
-        let mut model = LlamaModel::load_from(&s.model, s.base_dtype, &dev, if complete { first } else { 0 })?;
-        model.add_lora(&s.lora)?;
-        let mut lower_in_memory = !complete;
+        // with the cache, the frozen blocks are never all in memory: what is missing is computed one block at a time
+        let mut lower_in_memory = true;
         if let Some(c) = cache.as_mut() {
-            if complete {
+            let missing: Vec<&Example> = data.train.iter().chain(&data.eval).filter(|ex| !c.has(&ex.tokens)).collect();
+            if missing.is_empty() {
                 on_event(Event::Log(format!("activation cache complete: blocks 0 to {} were not loaded", first - 1)));
             } else {
-                let all: Vec<&Example> = data.train.iter().chain(&data.eval).collect();
-                for (i, ex) in all.iter().enumerate() {
-                    if !c.has(&ex.tokens) {
-                        c.put(&ex.tokens, &model.lower(&ex.tokens)?)?;
-                    }
-                    if (i + 1) % 16 == 0 || i + 1 == all.len() {
-                        on_event(Event::Cache { done: i + 1, total: all.len() });
-                    }
-                }
-                // from here on the states come from disk: the frozen blocks can leave memory
-                model.drop_lower();
-                lower_in_memory = false;
-                on_event(Event::Log(format!("activation cache filled ({} states, {:.1} MB): blocks 0 to {} freed", c.misses, c.bytes_written as f64 / 1e6, first - 1)));
+                c.fill(&s.model, s.base_dtype, &dev, first, &missing, on_event)?;
+                on_event(Event::Log(format!("activation cache filled block by block ({} states, {:.1} MB): never more than one of the {first} frozen blocks was in memory",
+                                            c.misses, c.bytes_written as f64 / 1e6)));
             }
+            lower_in_memory = false;
         }
+        let mut model = LlamaModel::load_from(&s.model, s.base_dtype, &dev, if cache.is_some() { first } else { 0 })?;
+        model.add_lora(&s.lora)?;
         let (names, vars): (Vec<String>, Vec<Var>) = model.lora_vars().into_iter().unzip();
         let mut params = ParamsAdamW::default();
         params.lr = s.lr;
@@ -424,12 +457,7 @@ impl Runner {
 
     fn hidden(&mut self, ex: &Example) -> Result<Tensor> {
         if let Some(c) = self.cache.as_mut() {
-            if let Some(h) = c.get(&ex.tokens, self.model.device())? {
-                return Ok(h);
-            }
-            let h = self.model.lower(&ex.tokens)?;
-            c.put(&ex.tokens, &h)?;
-            return Ok(h);
+            return c.get(&ex.tokens, self.model.device())?.ok_or_else(|| anyhow!("a hidden state is missing from the activation cache (was the folder changed during the run?)"));
         }
         self.model.lower(&ex.tokens)
     }

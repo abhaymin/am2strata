@@ -112,7 +112,8 @@ fn the_top_blocks_alone_train_and_the_adapter_says_which() {
 fn the_activation_cache_changes_nothing_but_the_work() {
     let (root, model, data) = common::model_and_data("cache");
     // without the cache: the frozen blocks run for every conversation, every epoch
-    let plain = settings(&model, &data, &root.join("plain"));
+    let mut plain = settings(&model, &data, &root.join("plain"));
+    plain.lora.train_layers = Some(1); // of 3: two frozen blocks, so the block-by-block fill passes states between blocks
     let a = finetune::train(&plain, &mut |_| {}, &|| false).unwrap();
     assert!(a.lower_in_memory);
     assert_eq!((a.cache_hits, a.cache_misses), (0, 0));
@@ -128,8 +129,9 @@ fn the_activation_cache_changes_nothing_but_the_work() {
     assert_eq!(b.cache_misses, 24, "one state per conversation (21 trained on, 3 held out)");
     // 21 conversations × 3 epochs read back, and the 3 held-out ones once
     assert_eq!(b.cache_hits, 21 * 3 + 3);
-    assert!(!b.lower_in_memory, "the frozen blocks were freed once the cache was full");
-    assert!(logs.iter().any(|m| m.contains("blocks 0 to 1 freed")), "{logs:?}");
+    assert!(!b.lower_in_memory, "the frozen blocks were never in memory together: the cache was filled one block at a time");
+    assert!(logs.iter().any(|m| m.contains("filled block by block")), "{logs:?}");
+    assert!(!root.join("activations/filling").exists(), "the fill's working folder is gone");
 
     // a second run finds the cache complete and never loads the frozen blocks; the curve is still the same
     let mut again = cached.clone();
@@ -193,6 +195,32 @@ fn the_frozen_blocks_leave_memory_with_the_cache() {
     // a model loaded without its lower part is the same thing
     let partial = LlamaModel::load_from(&dir, BaseDtype::F32, &Device::Cpu, 5).unwrap();
     assert_eq!(partial.base_bytes(), model.base_bytes());
+}
+
+#[test]
+fn the_one_node_softmax_has_the_plain_softmaxs_value_and_gradient() {
+    use candle_core::{Tensor, Var};
+    use strata_workshop::model::{masked_softmax, masked_softmax_reference};
+    // [heads 2, seq 5, seq 5] scores from a variable, a causal mask, a scale, and a loss that weighs every entry differently
+    let vals: Vec<f32> = (0..50).map(|i| ((i * 29 % 17) as f32 - 8.0) / 3.0).collect();
+    let mask: Vec<f32> = (0..5).flat_map(|i| (0..5).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();
+    let mask = Tensor::from_vec(mask, (5, 5), &Device::Cpu).unwrap();
+    let weights = Tensor::from_vec((0..50).map(|i| (i % 7) as f32 - 2.5).collect::<Vec<f32>>(), (2, 5, 5), &Device::Cpu).unwrap();
+    let run = |one_node: bool| {
+        let x = Var::from_tensor(&Tensor::from_vec(vals.clone(), (2, 5, 5), &Device::Cpu).unwrap()).unwrap();
+        let input = (x.as_tensor() * 1.5).unwrap();
+        let y = if one_node { masked_softmax(&input, 0.25, &mask).unwrap() } else { masked_softmax_reference(&input, 0.25, &mask).unwrap() };
+        let loss = (y.sqr().unwrap() * &weights).unwrap().sum_all().unwrap();
+        let g = loss.backward().unwrap().get(&x).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        (y.flatten_all().unwrap().to_vec1::<f32>().unwrap(), g)
+    };
+    let ((y1, g1), (y0, g0)) = (run(true), run(false));
+    assert_eq!(y1, y0, "the same values");
+    let worst = g1.iter().zip(&g0).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+    println!("one-node softmax gradient vs plain: max abs difference {worst:.3e}");
+    assert!(worst < 1e-6 && g0.iter().any(|g| g.abs() > 1e-3), "gradients differ by {worst}");
+    // rows of the mask are probabilities: the masked (future) entries are exactly 0
+    assert!(y1.chunks(5).enumerate().all(|(row, r)| r.iter().enumerate().all(|(j, p)| j <= row % 5 || *p == 0.0)));
 }
 
 #[test]
