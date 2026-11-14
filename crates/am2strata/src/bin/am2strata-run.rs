@@ -171,6 +171,36 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    /// the sandbox VM (a Debian virtual machine am2Strata runs; anything may be installed in it):
+    /// status | start | stop | pause | shutdown | setup | download | reset --yes | apps | install <app> |
+    /// install --kind apt|flatpak|deb|appimage <target> | remove … | open <app> | exec [--root] <command> |
+    /// settings key=value … | ads on|off [--lists pihole,adguard] [allowed.domain …]
+    Vm {
+        action: String,
+        /// install/remove/open: a catalog app or the target; exec: the command; settings: key=value pairs
+        args: Vec<String>,
+        /// install/remove by kind instead of a catalog app
+        #[arg(long)]
+        kind: Option<String>,
+        /// exec as root
+        #[arg(long)]
+        root: bool,
+        /// ads: pihole (Pi-hole's default list), adguard (the AdGuard DNS filter) or both
+        #[arg(long, value_delimiter = ',')]
+        lists: Vec<String>,
+        /// reset: yes, delete the VM's disk
+        #[arg(long)]
+        yes: bool,
+        /// do not wait for a task to finish
+        #[arg(long)]
+        no_wait: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// HTTPS on the running server, applied at once and kept in its run config:
     /// status | self-signed | tailscale | load --cert <pem> --key <pem> | renew | off
     Tls {
@@ -686,6 +716,8 @@ fn main() -> ExitCode {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
+        Cmd::Vm { action, args, kind, root, lists, yes, no_wait, url, api_key, models_dir } =>
+            vm_cmd(&action, &args, kind, root, &lists, yes, !no_wait, url, api_key, &models_dir),
         Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir } =>
             workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
@@ -935,6 +967,119 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
 }
 
 /// `am2strata-run computer ...`: the Computer tab's REST side (/api/computer/*).
+/// `am2strata-run vm …`: the server's /api/vm, as the Computer tab's VM panel uses it.
+#[allow(clippy::too_many_arguments)]
+fn vm_cmd(action: &str, args: &[String], kind: Option<String>, root: bool, lists: &[String], yes: bool, wait: bool, url: Option<String>,
+          api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(3700)).build().unwrap();
+    let send = |rb: reqwest::blocking::RequestBuilder| -> Result<serde_json::Value, String> {
+        let rb = match &key { Some(k) => rb.bearer_auth(k), None => rb };
+        let r = rb.send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        let ok = r.status().is_success();
+        let j: serde_json::Value = r.json().unwrap_or_default();
+        if ok { Ok(j) } else { Err(j["error"]["message"].as_str().unwrap_or("failed").to_string()) }
+    };
+    let follow = |j: serde_json::Value| -> Result<(), String> {
+        let Some(id) = j["task"].as_u64() else { return Ok(()) };
+        if !wait {
+            println!("task {id} started (am2strata-run vm status to follow it)");
+            return Ok(());
+        }
+        let mut seen = 0usize;
+        loop {
+            std::thread::sleep(Duration::from_millis(700));
+            let t = send(client.get(format!("{url}/api/vm/tasks/{id}")))?;
+            let log = t["log"].as_array().cloned().unwrap_or_default();
+            // the log keeps its last lines: print only the new ones
+            for l in log.iter().skip(seen.min(log.len())) { println!("  {}", l.as_str().unwrap_or("")); }
+            seen = log.len();
+            match t["state"].as_str() {
+                Some("running") => continue,
+                Some("done") => { println!("{}: {}", t["what"].as_str().unwrap_or(""), t["result"].as_str().unwrap_or("done")); return Ok(()); }
+                _ => return Err(format!("{}: {}", t["what"].as_str().unwrap_or(""), t["error"].as_str().unwrap_or("failed"))),
+            }
+        }
+    };
+    let joined = args.join(" ");
+    let result = (|| -> Result<(), String> {
+        match action {
+            "status" => {
+                let j = send(client.get(format!("{url}/api/vm")))?;
+                println!("phase: {}", j["phase"].as_str().unwrap_or("?"));
+                if !j["host"].is_null() {
+                    println!("on this PC: {} MB RAM, {}% CPU", j["host"]["rss_mb"], j["host"]["cpu_percent"]);
+                }
+                println!("settings: {}", j["config"]);
+                println!("disk used: {} MB · free RAM on this PC: {} MB · image: {}", j["disk_used_mb"], j["host_free_mb"], j["image"]);
+                for m in j["requirements_missing"].as_array().into_iter().flatten() { println!("needs: {}", m.as_str().unwrap_or("")); }
+                if let Some(t) = j["task"].as_object() {
+                    println!("task: {} ({})", t["what"].as_str().unwrap_or(""), t["state"].as_str().unwrap_or(""));
+                }
+                if let Some(e) = j["error"].as_str() { println!("last error: {e}"); }
+                Ok(())
+            }
+            "start" | "stop" | "pause" | "shutdown" | "setup" | "download" | "reset" => {
+                if action == "reset" && !yes {
+                    return Err("reset deletes the VM's disk (its apps and files): add --yes".into());
+                }
+                let j = send(client.post(format!("{url}/api/vm")).json(&serde_json::json!({"action": action, "confirm": yes})))?;
+                follow(j)
+            }
+            "apps" => {
+                let j = send(client.get(format!("{url}/api/vm/apps")))?;
+                for a in j["apps"].as_array().into_iter().flatten() {
+                    let st = match a["installed"].as_bool() { Some(true) => "installed", Some(false) => "-", None => "?" };
+                    println!("{:<20} {:<10} {:<8} {}", a["id"].as_str().unwrap_or(""), st, a["source"].as_str().unwrap_or(""), a["about"].as_str().unwrap_or(""));
+                }
+                Ok(())
+            }
+            "install" | "remove" | "open" => {
+                let body = match &kind {
+                    Some(k) => serde_json::json!({"kind": k, "target": joined, "action": action}),
+                    None => serde_json::json!({"app": args.first().ok_or(format!("vm {action} <app> (or --kind apt|flatpak|deb|appimage <target>)"))?, "action": action}),
+                };
+                follow(send(client.post(format!("{url}/api/vm/apps")).json(&body))?)
+            }
+            "ads" => {
+                let block = match args.first().map(String::as_str) {
+                    Some("on" | "block") => true,
+                    Some("off" | "allow") => false,
+                    _ => return Err("vm ads on [--lists pihole,adguard] [allowed.domain …] | vm ads off".into()),
+                };
+                let j = send(client.post(format!("{url}/api/vm/ads")).json(&serde_json::json!({"block": block, "lists": lists, "allow": &args[1..]})))?;
+                println!("{}", j["message"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            "exec" => {
+                if joined.trim().is_empty() { return Err("vm exec <command>".into()); }
+                let j = send(client.post(format!("{url}/api/vm/exec")).json(&serde_json::json!({"command": joined, "root": root, "timeout_s": 3600})))?;
+                print!("{}", j["output"].as_str().unwrap_or(""));
+                let code = j["code"].as_i64().unwrap_or(0);
+                if code != 0 { return Err(format!("exit {code}")); }
+                Ok(())
+            }
+            "settings" => {
+                let mut body = serde_json::Map::new();
+                for kv in args {
+                    let (k, v) = kv.split_once('=').ok_or(format!("{kv:?}: give key=value (cpus, memory_mb, disk_gb, width, height, idle_pause_s, idle_stop_s, host_reserve_mb)"))?;
+                    body.insert(k.into(), v.parse::<u64>().map(serde_json::Value::from).map_err(|_| format!("{k}: a number"))?);
+                }
+                let j = send(client.post(format!("{url}/api/vm/settings")).json(&body))?;
+                println!("{} (applies {})", j["config"], j["applies"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            other => Err(format!("unknown action {other:?}: status, start, stop, pause, shutdown, setup, download, reset, apps, install, remove, open, exec, settings, ads")),
+        }
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("vm: {e}"); ExitCode::from(1) }
+    }
+}
+
 fn computer_cmd(action: &str, arg: Option<String>, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
     let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();

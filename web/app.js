@@ -85,7 +85,7 @@ function showTab(name) {
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   for (const v of ["chat", "images", "monitor", "workshop", "computer", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
   // after app.js has finished loading (the Computer code is further down the file)
-  queueMicrotask(() => { if (tab === "computer") cvConnect(); else cvDisconnect(); });
+  queueMicrotask(() => { if (tab === "computer") { vmShow(); cvConnect(); } else { cvDisconnect(); vmShow(); } });
   if (tab === "images") { $("img-prompt").focus(); refreshMedia(); }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
   if (tab === "chat") $("input").focus();
@@ -3934,11 +3934,13 @@ function cvErr(m) { $("cv-error").textContent = m || ""; $("cv-error").hidden = 
 function cvSend(o) { if (cvWs && cvWs.readyState === 1) cvWs.send(JSON.stringify(o)); }
 function cvConnect() {
   if (cvWs) return;
+  // the VM's screen only while it runs (its panel connects when it starts)
+  if (cvTarget() === "vm" && !["running", "paused"].includes(vmLast?.phase)) { $("cv-who").textContent = "VM not running"; return; }
   cvErr("");
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}api/computer/stream`);
   ws.binaryType = "blob";
   cvWs = ws;
-  ws.onopen = () => ws.send(JSON.stringify({type: "auth", key: store.get("apikey", "")}));
+  ws.onopen = () => ws.send(JSON.stringify({type: "auth", key: store.get("apikey", ""), target: cvTarget()}));
   ws.onmessage = async (ev) => {
     if (typeof ev.data !== "string") {
       const bmp = await createImageBitmap(ev.data);
@@ -3963,10 +3965,11 @@ function cvRender(m) {
   const you = m.operator_in_control;
   $("cv-who").textContent = you ? "You have control" : "am2Strata may act";
   $("cv-who").className = `st-badge ${you ? "st-badge--generating" : ""}`;
-  $("cv-info").textContent = `display ${m.display} · ${m.width}×${m.height} · ${m.mode}`;
+  $("cv-info").textContent = m.target === "vm" ? `${m.width}×${m.height}${m.agent ? " · the agent works here" : ""}` : `display ${m.display} · ${m.width}×${m.height} · ${m.mode}`;
   $("cv-take").textContent = you ? "Hand back" : "Take control";
   $("cv-take").className = `st-btn ${you ? "st-btn--danger" : "st-btn--primary"}`;
   cvCanvas.classList.toggle("cv-live", you);
+  if (m.target === "vm") { vmFillOpen(); return; }
   const sel = $("cv-app");
   sel.innerHTML = '<option value="">Open an app…</option>' + (m.apps || []).map((a) => `<option>${esc(a)}</option>`).join("");
   sel.disabled = !(m.apps || []).length;
@@ -3986,6 +3989,7 @@ $("cv-shot").onclick = () => cvCanvas.toBlob((b) => {
 $("cv-app").onchange = async () => {
   const app = $("cv-app").value; $("cv-app").value = "";
   if (!app) return;
+  if (cvTarget() === "vm") { vmApp(app, "open"); return; }
   const r = await fetch("api/computer/open", {method: "POST", headers: {...headers(), "Content-Type": "application/json"}, body: JSON.stringify({app})});
   if (!r.ok) cvErr((await r.json().catch(() => ({}))).error?.message || `HTTP ${r.status}`);
 };
@@ -4002,3 +4006,170 @@ cvCanvas.addEventListener("wheel", (e) => { if (!cvLive()) return; e.preventDefa
 for (const [ev, down] of [["keydown", true], ["keyup", false]]) {
   cvCanvas.addEventListener(ev, (e) => { if (!cvLive()) return; e.preventDefault(); cvSend({type: "key", key: e.key, down, shift: e.shiftKey}); });
 }
+
+// ------------------------------------------------------------------ Computer: the sandbox VM (computer/vm)
+const cvTarget = () => { try { return localStorage.getItem("strata.cvTarget") || "vm"; } catch (e) { return "vm"; } };
+$("cv-target").value = cvTarget();
+$("cv-target").onchange = () => {
+  try { localStorage.setItem("strata.cvTarget", $("cv-target").value); } catch (e) {}
+  cvDisconnect(); vmShow(); cvConnect();
+};
+let vmTimer = null, vmLast = null, vmApps = [], vmWasRunning = false, vmAds = null;
+async function vmFetch(path, opts = {}) {
+  const r = await fetch(path, {...opts, headers: {...headers(), ...(opts.body ? {"Content-Type": "application/json"} : {})}});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+  return j;
+}
+function vmShow() {
+  const on = cvTarget() === "vm" && tab === "computer";
+  $("cv-vm").hidden = cvTarget() !== "vm";
+  clearTimeout(vmTimer);
+  if (on) vmPoll();
+}
+async function vmPoll() {
+  clearTimeout(vmTimer);
+  if (tab !== "computer" || cvTarget() !== "vm") return;
+  try { vmRender(await vmFetch("api/vm")); } catch (e) { cvErr(e.message); }
+  vmTimer = setTimeout(vmPoll, vmLast?.task?.state === "running" ? 1500 : 4000);
+}
+const VM_PHASE = {off: "Off", saved: "Saved (starts in about a second)", starting: "Starting…", "setting-up": "Setting up…",
+  running: "Running", paused: "Paused (0 CPU)", stopping: "Stopping…"};
+function vmRender(j) {
+  vmLast = j;
+  const p = j.phase, running = p === "running" || p === "paused", busy = j.task?.state === "running";
+  $("vm-phase").textContent = VM_PHASE[p] || p;
+  $("vm-phase").className = `st-badge ${p === "running" ? "st-badge--generating" : p === "paused" || p === "saved" ? "st-badge--reading" : ""}`;
+  const h = j.host;
+  $("vm-use").textContent = (h ? `this PC: ${h.rss_mb ?? "?"} MB RAM, ${h.cpu_percent ?? 0}% CPU · ` : "") +
+    (j.disk_used_mb != null ? `disk ${j.disk_used_mb} MB · ` : "") + `free RAM ${j.host_free_mb ?? "?"} MB`;
+  const need = [...(j.requirements_missing || [])];
+  if (!j.image) need.push("the Debian 13 image (326 MB)");
+  $("vm-need").hidden = !need.length;
+  $("vm-need").innerHTML = need.length ? `Needed: ${need.map(esc).join("; ")}.` +
+    (!j.image ? ` <button type="button" class="st-btn st-btn--secondary" id="vm-dl">Download the Debian image</button>` : "") : "";
+  if ($("vm-dl")) $("vm-dl").onclick = () => vmAction({action: "download"});
+  $("vm-start").textContent = p === "paused" ? "Resume" : p === "saved" ? "Restore" : "Start";
+  $("vm-start").disabled = busy || p === "running" || !j.image || (j.requirements_missing || []).length > 0;
+  $("vm-pause").disabled = busy || p !== "running";
+  $("vm-stop").disabled = busy || !running;
+  $("vm-off").disabled = busy || !running;
+  const t = j.task;
+  $("vm-task").hidden = !t || (t.state !== "running" && t.finished && Date.now() / 1000 - t.finished > 120);
+  if (t) {
+    $("vm-task-what").textContent = t.what;
+    $("vm-task-state").textContent = t.state === "running" ? "working…" : t.state === "done" ? `done${t.result ? ": " + t.result : ""}` : `failed: ${t.error || ""}`;
+    const log = $("vm-task-log"), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 4;
+    log.textContent = (t.log || []).slice(-60).join("\n");
+    if (atEnd) log.scrollTop = log.scrollHeight;
+  }
+  if (j.error && !busy) cvErr(j.error);
+  for (const k of Object.keys(j.config || {})) { const el = $(`vm-s-${k}`); if (el && document.activeElement !== el) el.value = j.config[k]; }
+  $("vm-folder").textContent = j.folder || "";
+  if (!vmAds && document.activeElement !== $("vm-ads-allow")) {
+    $("vm-ads-block").checked = !!j.config?.block_ads;
+    $("vm-ads-lists").value = (j.config?.ads_lists || ["pihole"]).join(",");
+    $("vm-ads-allow").value = (j.config?.ads_allow || []).join(", ");
+  }
+  // the screen: connect when it is running, and reload the app list once
+  if (p === "running" && !vmWasRunning) { cvDisconnect(); cvConnect(); vmLoadApps(); }
+  vmWasRunning = p === "running";
+}
+async function vmAction(body) {
+  cvErr("");
+  try { await vmFetch("api/vm", {method: "POST", body: JSON.stringify(body)}); } catch (e) { cvErr(e.message); }
+  vmPoll();
+}
+$("vm-start").onclick = () => vmAction({action: "start"});
+$("vm-pause").onclick = () => vmAction({action: "pause"});
+$("vm-stop").onclick = () => vmAction({action: "stop"});
+$("vm-off").onclick = () => vmAction({action: "shutdown"});
+$("vm-setup").onclick = () => vmAction({action: "setup"});
+$("vm-reset").onclick = () => {
+  if (confirm("Delete the sandbox VM's disk: every app and file installed in it? This cannot be undone. The next Start makes a new one.")) vmAction({action: "reset", confirm: true});
+};
+$("vm-more").onclick = () => {
+  const open = $("vm-panel").hidden;
+  $("vm-panel").hidden = !open; $("vm-more").setAttribute("aria-expanded", String(open));
+  if (open) vmLoadApps();
+};
+$("vm-save").onclick = async () => {
+  const body = {};
+  for (const k of ["cpus", "memory_mb", "disk_gb", "width", "height", "idle_pause_s", "idle_stop_s", "host_reserve_mb"]) body[k] = Number($(`vm-s-${k}`).value);
+  try { const r = await vmFetch("api/vm/settings", {method: "POST", body: JSON.stringify(body)}); toast("success", "Saved", `Applies ${r.applies}.`); }
+  catch (e) { cvErr(e.message); }
+  vmPoll();
+};
+async function vmLoadApps() {
+  if (cvTarget() !== "vm") return;
+  try {
+    const r = await vmFetch("api/vm/apps");
+    vmApps = r.apps || [];
+    if (r.ads) {
+      vmAds = r.ads; $("vm-ads-block").checked = r.ads.block; $("vm-ads-allow").value = (r.ads.allow || []).join(", ");
+      if ((r.ads.lists || []).length) $("vm-ads-lists").value = r.ads.lists.join(",");
+    }
+  } catch (e) { return; }
+  $("vm-apps").innerHTML = vmApps.map((a) => {
+    const st = a.installed == null ? "" : a.installed ? "installed" : "not installed";
+    return `<div class="cv-vm__app"><b>${esc(a.name)}</b><span class="muted small">${esc(a.about)}</span>` +
+      `<span class="small">${esc(st)}${a.source !== "base" ? ` · ${esc(a.source)}` : ""}</span><div class="cv-bar">` +
+      (a.installed && a.launch ? `<button class="st-btn st-btn--primary" data-vm-app="${esc(a.id)}" data-act="open">Open</button>` : "") +
+      (a.installed === false ? `<button class="st-btn st-btn--secondary" data-vm-app="${esc(a.id)}" data-act="install">Install</button>` : "") +
+      (a.installed && a.removable ? `<button class="st-btn st-btn--secondary" data-vm-app="${esc(a.id)}" data-act="remove">Remove</button>` : "") +
+      `</div></div>`;
+  }).join("");
+  for (const b of document.querySelectorAll("[data-vm-app]")) b.onclick = () => vmApp(b.dataset.vmApp, b.dataset.act);
+  vmFillOpen();
+}
+function vmFillOpen() {
+  const sel = $("cv-app"), apps = vmApps.filter((a) => a.installed && a.launch);
+  sel.innerHTML = '<option value="">Open an app…</option>' + apps.map((a) => `<option value="${esc(a.id)}">${esc(a.name)}</option>`).join("");
+  sel.disabled = !apps.length;
+}
+async function vmApp(id, act) {
+  cvErr("");
+  try {
+    await vmFetch("api/vm/apps", {method: "POST", body: JSON.stringify({app: id, action: act})});
+    if (act !== "open") { toast("info", "Sandbox VM", `${act === "install" ? "Installing" : "Removing"} ${id}…`); vmPoll(); vmWaitThenApps(); }
+  } catch (e) { cvErr(e.message); }
+}
+async function vmWaitThenApps() {
+  for (let i = 0; i < 900; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (vmLast?.task?.state !== "running") break;
+  }
+  vmLoadApps();
+}
+for (const [id, act] of [["vm-install", "install"], ["vm-remove", "remove"]]) $(id).onclick = async () => {
+  cvErr("");
+  const target = $("vm-target").value.trim();
+  if (!target) { cvErr("Say what to install: package names, a Flathub id or a URL."); return; }
+  try {
+    await vmFetch("api/vm/apps", {method: "POST", body: JSON.stringify({kind: $("vm-kind").value, target, action: act})});
+    vmPoll(); vmWaitThenApps();
+  } catch (e) { cvErr(e.message); }
+};
+async function vmRun() {
+  const command = $("vm-cmd").value.trim();
+  if (!command) return;
+  const out = $("vm-out"); out.hidden = false; out.textContent = `$ ${command}\n…`;
+  $("vm-run").disabled = true;
+  try {
+    const j = await vmFetch("api/vm/exec", {method: "POST", body: JSON.stringify({command, root: $("vm-root").checked, timeout_s: 600})});
+    out.textContent = `$ ${command}\n${j.output}${j.code ? `\n(exit ${j.code})` : ""}`;
+  } catch (e) { out.textContent = `$ ${command}\n${e.message}`; }
+  finally { $("vm-run").disabled = false; }
+}
+$("vm-run").onclick = vmRun;
+$("vm-ads-apply").onclick = async () => {
+  cvErr(""); $("vm-ads-apply").disabled = true; $("vm-ads-note").textContent = "applying…";
+  const allow = $("vm-ads-allow").value.split(/[\s,]+/).filter(Boolean);
+  try {
+    const r = await vmFetch("api/vm/ads", {method: "POST", body: JSON.stringify({block: $("vm-ads-block").checked, lists: $("vm-ads-lists").value.split(","), allow})});
+    $("vm-ads-note").textContent = r.message + " (browsers pick it up when restarted)";
+    vmAds = {block: $("vm-ads-block").checked, allow};
+  } catch (e) { $("vm-ads-note").textContent = ""; cvErr(e.message); }
+  finally { $("vm-ads-apply").disabled = false; vmPoll(); }
+};
+$("vm-cmd").addEventListener("keydown", (e) => { if (e.key === "Enter") vmRun(); });

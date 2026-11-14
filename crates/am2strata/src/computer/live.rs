@@ -39,8 +39,12 @@ fn computers(s: &AppState) -> Result<Arc<crate::computer::Computers>, String> {
 
 /// What the tab and `am2strata-run computer status` show.
 pub fn status(c: &crate::computer::Computers) -> Value {
+    #[cfg(target_os = "linux")]
+    let vm = crate::computer::vm::get().map(|v| json!(v.phase().as_str()));
+    #[cfg(not(target_os = "linux"))]
+    let vm: Option<Value> = None;
     json!({"on": c.is_on(), "mode": c.mode_name(), "available": cfg!(target_os = "linux"),
-           "operator_in_control": c.human_in_control(), "apps": c.apps()})
+           "operator_in_control": c.human_in_control(), "apps": c.apps(), "vm": vm})
 }
 
 // ----------------------------------------------------------------------------------------------------- the display
@@ -220,6 +224,21 @@ fn bad(e: String) -> Response {
     error(StatusCode::CONFLICT, "invalid_request_error", e)
 }
 
+/// The sandbox VM when computer use runs in it.
+#[cfg(target_os = "linux")]
+fn vm_of(c: &crate::computer::Computers) -> Option<Arc<crate::computer::vm::Vm>> { c.vm() }
+#[cfg(not(target_os = "linux"))]
+fn vm_of(_c: &crate::computer::Computers) -> Option<Arc<NoVm>> { None }
+#[cfg(not(target_os = "linux"))]
+struct NoVm;
+#[cfg(not(target_os = "linux"))]
+impl NoVm {
+    fn clipboard_get(&self) -> Result<String, String> { Err(String::new()) }
+    fn clipboard_set(&self, _: &str) -> Result<(), String> { Err(String::new()) }
+    fn type_text(&self, _: &str) -> Result<(), String> { Err(String::new()) }
+    fn open_app(&self, _: &str) -> Result<(), String> { Err(String::new()) }
+}
+
 pub async fn status_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
     match guard(&s, &headers) {
         Ok(c) => Json(status(&c)).into_response(),
@@ -232,6 +251,10 @@ pub async fn screenshot_get(State(s): State<AppState>, headers: HeaderMap) -> Re
     #[cfg(target_os = "linux")]
     {
         let r = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+            if let Some(vm) = c.vm() {
+                let s = vm.screen()?;
+                return s.frame(|f| encode(&f.rgb(), f.width, f.height, None))?;
+            }
             let d = c.sandbox_display()?;
             let x = x11::Display::open(&d)?;
             encode(&x.grab()?, x.width, x.height, None)
@@ -261,7 +284,7 @@ pub async fn control_post(State(s): State<AppState>, headers: HeaderMap, Json(re
 
 pub async fn clipboard_get_h(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let c = match guard(&s, &headers) { Ok(c) => c, Err(r) => return r };
-    let r = tokio::task::spawn_blocking(move || c.sandbox_display().and_then(|d| clipboard_get(&d))).await.unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match vm_of(&c) { Some(vm) => vm.clipboard_get(), None => c.sandbox_display().and_then(|d| clipboard_get(&d)) }).await.unwrap_or_else(|e| Err(e.to_string()));
     match r {
         Ok(t) => Json(json!({"text": t})).into_response(),
         Err(e) => bad(e),
@@ -276,7 +299,7 @@ pub async fn clipboard_post(State(s): State<AppState>, headers: HeaderMap, Json(
     let Some(text) = req["text"].as_str().map(str::to_string) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "\"text\" is required");
     };
-    let r = tokio::task::spawn_blocking(move || c.sandbox_display().and_then(|d| clipboard_set(&d, &text))).await.unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match vm_of(&c) { Some(vm) => vm.clipboard_set(&text), None => c.sandbox_display().and_then(|d| clipboard_set(&d, &text)) }).await.unwrap_or_else(|e| Err(e.to_string()));
     match r {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => bad(e),
@@ -294,7 +317,7 @@ pub async fn type_post(State(s): State<AppState>, headers: HeaderMap, Json(req):
     let Some(text) = req["text"].as_str().map(str::to_string) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "\"text\" is required");
     };
-    let r = tokio::task::spawn_blocking(move || c.sandbox_display().and_then(|d| type_text(&d, &text))).await.unwrap_or_else(|e| Err(e.to_string()));
+    let r = tokio::task::spawn_blocking(move || match vm_of(&c) { Some(vm) => vm.type_text(&text), None => c.sandbox_display().and_then(|d| type_text(&d, &text)) }).await.unwrap_or_else(|e| Err(e.to_string()));
     match r {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(e) => bad(e),
@@ -312,6 +335,9 @@ pub async fn open_post(State(s): State<AppState>, headers: HeaderMap, Json(req):
                      format!("{app:?} is not in the allowed apps (Settings › Computer and browser use › Allowed apps)"));
     }
     let r = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        if let Some(vm) = vm_of(&c) {
+            return vm.open_app(&app);
+        }
         let d = c.sandbox_display()?;
         #[cfg(target_os = "linux")]
         { crate::computer::backend::sandbox_app(&app, &d).spawn().map(|_| ()).map_err(|e| format!("{app}: {e}")) }
@@ -351,9 +377,11 @@ async fn session(s: AppState, headers: HeaderMap, sock: WebSocket) {
     let (mut tx, mut rx) = sock.split();
     // the key: the Authorization header (CLI), else the first message (the browser)
     let mut ok = owner_key(&s, &headers);
+    let mut want_vm = false;
     if !ok {
         if let Ok(Some(Ok(Message::Text(t)))) = tokio::time::timeout(Duration::from_secs(5), rx.next()).await {
             let v: Value = serde_json::from_str(&t).unwrap_or_default();
+            want_vm = v["target"] == "vm";
             if let (Some("auth"), Some(k)) = (v["type"].as_str(), v["key"].as_str()) {
                 let mut h = HeaderMap::new();
                 if let Ok(val) = HeaderValue::from_str(&format!("Bearer {k}")) {
@@ -377,7 +405,144 @@ async fn session(s: AppState, headers: HeaderMap, sock: WebSocket) {
         let _ = c;
     }
     #[cfg(target_os = "linux")]
-    linux_session(c, tx, rx).await;
+    {
+        let vm = if want_vm { crate::computer::vm::get() } else { c.vm() };
+        match vm {
+            Some(vm) => vm_session(c, vm, tx, rx).await,
+            None => linux_session(c, tx, rx).await,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = want_vm;
+}
+
+/// The Computer tab on the sandbox VM: frames from its VNC screen when it changed (at most ~8 a second), the
+/// operator's input into it. While the agent works in the VM (the "vm" mode) input needs Take control, as on the
+/// local sandbox; otherwise the operator may use it freely.
+#[cfg(target_os = "linux")]
+async fn vm_session(c: Arc<crate::computer::Computers>, vm: Arc<crate::computer::vm::Vm>,
+                    mut tx: futures::stream::SplitSink<WebSocket, Message>, mut rx: futures::stream::SplitStream<WebSocket>) {
+    use crate::computer::vm::Phase;
+    if !matches!(vm.phase(), Phase::Running | Phase::Paused) {
+        let _ = send_json(&mut tx, json!({"type": "error", "message": format!("the sandbox VM is {}: start it first", vm.phase().as_str())})).await;
+        return;
+    }
+    vm.viewers.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    struct Leave(Arc<crate::computer::vm::Vm>);
+    impl Drop for Leave {
+        fn drop(&mut self) { self.0.viewers.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); }
+    }
+    let _leave = Leave(vm.clone());
+    let v2 = vm.clone();
+    let screen = match tokio::task::spawn_blocking(move || v2.screen()).await.unwrap_or_else(|e| Err(e.to_string())) {
+        Ok(s) => s,
+        Err(e) => { let _ = send_json(&mut tx, json!({"type": "error", "message": e})).await; return; }
+    };
+    let agent = c.vm().is_some();
+    let state = |c: &crate::computer::Computers, w: u16, h: u16| json!({"type": "state", "display": "vm", "target": "vm", "width": w, "height": h,
+        "operator_in_control": c.human_in_control() || !agent, "agent": agent, "mode": c.mode_name(), "apps": c.apps()});
+    let (mut w, mut h) = screen.size();
+    if !send_json(&mut tx, state(&c, w, h)).await {
+        return;
+    }
+    let (mut took, mut seen, mut last_state) = (false, 0u64, c.human_in_control());
+    let mut tick = tokio::time::interval(Duration::from_millis(125));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                vm.touch();
+                if !screen.alive() {
+                    let _ = send_json(&mut tx, json!({"type": "error", "message": format!("the VM's screen closed: {}", screen.error().unwrap_or_default())})).await;
+                    break;
+                }
+                if c.human_in_control() != last_state {
+                    last_state = c.human_in_control();
+                    if !send_json(&mut tx, state(&c, w, h)).await { break; }
+                }
+                let v = screen.version();
+                if v == seen { continue; }
+                seen = v;
+                let s2 = screen.clone();
+                let jpeg = tokio::task::spawn_blocking(move || s2.frame(|f| (f.width, f.height, encode(&f.rgb(), f.width, f.height, Some(70)))))
+                    .await.unwrap_or_else(|e| Err(e.to_string()));
+                match jpeg {
+                    Ok((fw, fh, Ok(j))) => {
+                        if (fw, fh) != (w, h) {
+                            (w, h) = (fw, fh);
+                            if !send_json(&mut tx, state(&c, w, h)).await { break; }
+                        }
+                        if tx.send(Message::Binary(j.into())).await.is_err() { break; }
+                    }
+                    Ok((_, _, Err(e))) | Err(e) => { let _ = send_json(&mut tx, json!({"type": "error", "message": e})).await; break; }
+                }
+            }
+            msg = rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
+                let Message::Text(t) = msg else { continue };
+                let v: Value = serde_json::from_str(&t).unwrap_or_default();
+                let kind = v["type"].as_str().unwrap_or("").to_string();
+                match kind.as_str() {
+                    "take" => { c.set_human(true); took = true; }
+                    "give" => { c.set_human(false); took = false; }
+                    "clipboard_get" => {
+                        let vm2 = vm.clone();
+                        let r = tokio::task::spawn_blocking(move || vm2.clipboard_get()).await.unwrap_or_else(|e| Err(e.to_string()));
+                        let msg = match r { Ok(text) => json!({"type": "clipboard", "text": text}), Err(e) => json!({"type": "error", "message": e}) };
+                        if !send_json(&mut tx, msg).await { break; }
+                    }
+                    _ => {
+                        if agent && !c.human_in_control() {
+                            let _ = send_json(&mut tx, json!({"type": "notice", "message": "take control first: the agent may be acting in the VM"})).await;
+                            continue;
+                        }
+                        let (vm2, s2) = (vm.clone(), screen.clone());
+                        let r = tokio::task::spawn_blocking(move || vm_input(&vm2, &s2, &kind, &v)).await.unwrap_or_else(|e| Err(e.to_string()));
+                        if let Err(e) = r {
+                            if !send_json(&mut tx, json!({"type": "notice", "message": e})).await { break; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if took {
+        c.set_human(false);
+    }
+}
+
+/// One input message from the viewer, into the VM: the mouse and keys over VNC (keys as X keysyms, which Xvnc maps),
+/// text and the clipboard through the guest's xdotool and xclip.
+#[cfg(target_os = "linux")]
+fn vm_input(vm: &crate::computer::vm::Vm, s: &crate::computer::vm::rfb::Rfb, kind: &str, v: &Value) -> Result<(), String> {
+    let (x, y) = (v["x"].as_f64().unwrap_or(0.0) as i32, v["y"].as_f64().unwrap_or(0.0) as i32);
+    match kind {
+        "move" => s.move_to(x, y),
+        "button" => {
+            s.move_to(x, y)?;
+            s.button(x, y, v["button"].as_u64().unwrap_or(1).clamp(1, 3) as u8, v["down"].as_bool().unwrap_or(true))
+        }
+        "wheel" => {
+            let (dy, dx) = (v["dy"].as_f64().unwrap_or(0.0), v["dx"].as_f64().unwrap_or(0.0));
+            let (b, n) = if dy.abs() >= dx.abs() { (if dy < 0.0 { 4 } else { 5 }, (dy.abs() / 50.0).ceil().clamp(1.0, 10.0)) }
+                         else { (if dx < 0.0 { 6 } else { 7 }, (dx.abs() / 50.0).ceil().clamp(1.0, 10.0)) };
+            for _ in 0..n as u32 {
+                s.button(x, y, b, true)?;
+                s.button(x, y, b, false)?;
+            }
+            Ok(())
+        }
+        "key" => {
+            let key = v["key"].as_str().unwrap_or("");
+            let sym = keysym_of(key)
+                .or_else(|| { let mut c = key.chars(); match (c.next(), c.next()) { (Some(ch), None) => Some(0x0100_0000 + ch as u32), _ => None } })
+                .ok_or_else(|| format!("unknown key {key:?}"))?;
+            s.key(sym, v["down"].as_bool().unwrap_or(true))
+        }
+        "text" => vm.type_text(v["text"].as_str().unwrap_or("")),
+        "clipboard_set" => vm.clipboard_set(v["text"].as_str().unwrap_or("")),
+        other => Err(format!("unknown message {other:?}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
