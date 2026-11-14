@@ -263,6 +263,17 @@ const ROUTES: &[Row] = &[
     // ------------------------------------------------------------------------------------------- HTTPS, Computer
     row("GET", "/api/tls", Owner),
     row("POST", "/api/tls", Owner).json(r#"{"action": "nope"}"#).ok(400).note("an unknown action: HTTPS stays as it is"),
+    // remote models (docs/internal/REMOTE-MODELS.md): intentionally unlinked from the app, the help and the docs; the
+    // page is there with the feature off (the owner turns it on there) and shows nothing without the owner's key
+    row("GET", "/rtenai", Public).note("intentionally unlinked: the remote models' page, empty until its API accepts the owner's key"),
+    row("GET", "/api/rtenai", Owner).note("intentionally unlinked: off here, so it says so"),
+    row("POST", "/api/rtenai", Owner).json(r#"{"remote": 5}"#).ok(400).note("intentionally unlinked; not a block: the run config is not written"),
+    row("POST", "/api/rtenai/keys/{provider}", Owner).at("/api/rtenai/keys/nope").json(r#"{"key": "x"}"#).ok(404)
+        .note("intentionally unlinked; the feature is off here: no key is kept"),
+    row("DELETE", "/api/rtenai/keys/{provider}", Owner).at("/api/rtenai/keys/nope").ok(404).note("intentionally unlinked"),
+    row("POST", "/api/rtenai/test/{provider}", Owner).at("/api/rtenai/test/nope").ok(404).note("intentionally unlinked; no provider is called"),
+    row("GET", "/api/rtenai/models/{provider}", Owner).at("/api/rtenai/models/nope").ok(404).note("intentionally unlinked"),
+    row("GET", "/api/rtenai/usage", Owner).note("intentionally unlinked"),
     row("GET", "/api/computer/status", Owner),
     row("GET", "/api/computer/stream", Owner).ok(426).note("a WebSocket: a plain request gets 401 without the key, 426 with it"),
     row("GET", "/api/computer/screenshot", Owner).ok(409).note("computer use is off in this run config"),

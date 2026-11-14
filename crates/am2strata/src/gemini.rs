@@ -265,7 +265,7 @@ pub async fn call(State(s): State<AppState>, headers: HeaderMap, Path(target): P
     };
     // a Gemini model name (gemini-2.5-pro, the CLI's default) runs on the loaded model; an installed one is used
     let model = model.trim_start_matches("models/");
-    let installed = s.mgr.entry(model).is_some();
+    let installed = s.mgr.entry(model).is_some() || crate::remote::knows(model);
     let model_for_engine = if installed { model } else { "" };
     let req = match to_openai(model_for_engine, &g) {
         Ok(r) => r,

@@ -208,8 +208,12 @@ fn dub_narration_tool() -> Value {
 }
 
 /// Start the request: with the server's tools, in the tool loop; else as it is.
-pub async fn start(mgr: Arc<crate::manager::Manager>, loaded: Arc<crate::manager::Loaded>, prep: Prepared, req: Value, opts: RunOpts,
+pub async fn start(mgr: Arc<crate::manager::Manager>, target: crate::remote::Target, prep: Prepared, req: Value, opts: RunOpts,
                    offered: Offered) -> Result<Started, Refusal> {
+    let loaded = match target {
+        crate::remote::Target::Local(l) => l,
+        crate::remote::Target::Remote(models) => return crate::remote::start(mgr, models, prep, req, opts, offered).await,
+    };
     match offered {
         Some((hub, names)) => run::start_mcp(mgr, loaded, prep, req, opts, hub, names).await,
         None => run::start(mgr, loaded, prep, req, opts).await,

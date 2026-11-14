@@ -29,7 +29,13 @@ pub async fn list_models(State(s): State<AppState>, headers: HeaderMap) -> Respo
     if !crate::authorized_or_master(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    Json(s.mgr.list().await).into_response()
+    let mut list = s.mgr.list().await;
+    // the owner's remote models and mixes (remote/), for the picker; none while the feature is off
+    let remote = crate::remote::app_models(&s, &headers).await;
+    if let (false, Some(a)) = (remote.is_empty(), list["models"].as_array_mut()) {
+        a.extend(remote);
+    }
+    Json(list).into_response()
 }
 
 pub async fn current_model(State(s): State<AppState>, headers: HeaderMap) -> Response {

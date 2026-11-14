@@ -276,12 +276,20 @@ async function loadModels() {
   } catch (e) { return; }
   // nothing loaded (a media job stopped it): the server's default, which a request loads; never the first in the list,
   // which a chat would load by name (it loaded the Rust CPU edition of the default model on 2026-11-09)
+  // the owner's remote models and mixes (when the server has them on), grouped by provider after the local ones
+  const far = models.filter((m) => m.remote || m.mix);
+  models = models.filter((m) => !m.remote && !m.mix);
+  if (remoteModel && !far.some((m) => m.id === remoteModel)) remoteModel = "";
   const pick = models.find((m) => m.current) || models.find((m) => m.default);
+  const groups = {};
+  for (const m of far) (groups[m.provider || "mix"] = groups[m.provider || "mix"] || []).push(m);
   sel.innerHTML = models.map((m) =>
-    `<option value="${esc(m.id)}"${pick && m.id === pick.id ? " selected" : ""}${m.status === "unavailable" ? " disabled" : ""}>` +
+    `<option value="${esc(m.id)}"${!remoteModel && pick && m.id === pick.id ? " selected" : ""}${m.status === "unavailable" ? " disabled" : ""}>` +
     `${esc(m.display_name && m.display_name !== m.id ? `${m.display_name} (${m.id})` : m.id)}` +
-    `${m.status === "unavailable" ? " - unavailable" : ""}</option>`).join("");
-  sel.hidden = models.length < 2;
+    `${m.status === "unavailable" ? " - unavailable" : ""}</option>`).join("") +
+    Object.entries(groups).map(([g, list]) => `<optgroup label="${esc(g)}">` + list.map((m) =>
+      `<option value="${esc(m.id)}" data-remote="1"${m.id === remoteModel ? " selected" : ""}>${esc(m.id)}</option>`).join("") + `</optgroup>`).join("");
+  sel.hidden = models.length + far.length < 2;
   sel.dataset.current = (models.find((m) => m.current) || {}).id || "";
   installed = models;
   if (!$("gpus-line").dataset.loaded) { $("gpus-line").dataset.loaded = "1"; loadGpus(); }
@@ -290,6 +298,8 @@ async function loadModels() {
   if (optJob.state === undefined) { optJob = {state: "unknown"}; optTick(); }
 }
 let installed = [], updatesOf = {};
+// a remote model chosen in the picker: chats name it; the local model stays as it is
+let remoteModel = "";
 // Updates: models downloaded here remember their Hugging Face files; a newer upload of them is offered as an update
 $("check-updates").onclick = async () => {
   $("check-updates").disabled = true;
@@ -759,7 +769,13 @@ $("models-list").addEventListener("click", async (e) => {
 });
 $("model-select").onchange = async () => {
   const sel = $("model-select"), name = sel.value, before = sel.dataset.current;
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); sel.value = before; return; }
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); sel.value = remoteModel || before; return; }
+  if (sel.selectedOptions[0] && sel.selectedOptions[0].dataset.remote) {
+    remoteModel = name;
+    toast("info", `${name} answers`, "Sent to its provider; the model in memory stays loaded.");
+    return;
+  }
+  if (remoteModel) { remoteModel = ""; if (name === before) return; }
   sel.disabled = true;
   toast("info", `Switching to ${name}`, "The model in memory is stopped first, then this one is loaded.", 8000);
   let message = "";
@@ -2305,7 +2321,7 @@ async function streamLive(body, st, signal) {
 // The request and its stream into answer `m` (shared by send and regenerate). A Stop returns normally with m.stopped
 // set (the partial answer is kept); any other failure is thrown.
 async function streamInto(m, el, signal) {
-  const body = {model: health.model, messages: withHints(apiMessages()), stream: true,
+  const body = {model: remoteModel || health.model, messages: withHints(apiMessages()), stream: true,
                 reasoning_effort: settings.thinking};
   if (!(settings.temperature > 0)) {
     body.temperature = 0;

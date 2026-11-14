@@ -250,13 +250,17 @@ fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Ch
             .env("MOCK_SCRIPT", dir.join("script.json"))
             .env("AM2_JOB_IDS_FROM", "1")
             .env("MOCK_RECORD", record)
-            .env("RUST_LOG", "warn")
+            // "server_log": the server's own log in <dir>/server.log (info), for tests that read it
+            .env("RUST_LOG", if extra.get("server_log").is_some() { "info" } else { "warn" })
             .env("AM2STRATA_NO_MDNS", "1")
             // more environment for the server, from the test (e.g. AM2STRATA_HOME), never changed in this process
             .envs(extra.get("env").and_then(|e| e.as_object()).into_iter().flatten()
                   .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))))
-            .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .stdout(match extra.get("server_log") {
+                Some(_) => std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")).map(Stdio::from).unwrap_or(Stdio::null()),
+                None => Stdio::null(),
+            })
             .spawn()
             .expect("start am2strata")
 }

@@ -123,6 +123,8 @@ pub struct Summary {
     pub reused: u64,
     pub stop_sequence: Option<String>,
     pub timings: Value,
+    /// the prompt tokens as the model's provider counted them (a remote model: remote/), else None (Started's)
+    pub prompt_tokens: Option<u64>,
 }
 
 /// A request refused before anything is generated: the status and the sentence.
@@ -727,6 +729,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                 reused: last_done.as_ref().and_then(|d| d.reused).unwrap_or(0),
                 stop_sequence: stop,
                 timings: t,
+                prompt_tokens: None,
             }))
             .await;
         if let Some(t) = temp {
@@ -790,15 +793,51 @@ fn remember_publishing(publishing: bool, allowed: bool) -> bool {
 /// and MCP calls written beside it are then not run. Port of serve/server.py run_with_mcp.
 pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: Value, opts: RunOpts,
                        hub: Option<Arc<crate::mcp::McpHub>>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
+    let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
+    start_loop(mgr.clone(), Arc::new(LocalRound { mgr, loaded }), first, prep, req, opts, hub, names)
+}
+
+/// One generation of the tool loop: the loaded model's (`start`), or a remote model's (remote/).
+pub trait Round: Send + Sync + 'static {
+    fn round(self: Arc<Self>, prep: Prepared, req: Value, opts: RunOpts)
+             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Started, Refusal>> + Send>>;
+    /// whether the model reads pictures (the browser's screenshots are shown to it)
+    fn vision(&self) -> bool;
+    /// the context the conversation is kept within
+    fn context(&self) -> usize;
+}
+
+struct LocalRound {
+    mgr: Arc<Manager>,
+    loaded: Arc<Loaded>,
+}
+
+impl Round for LocalRound {
+    fn round(self: Arc<Self>, prep: Prepared, req: Value, opts: RunOpts)
+             -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Started, Refusal>> + Send>> {
+        Box::pin(async move { start(self.mgr.clone(), self.loaded.clone(), prep, req, opts).await })
+    }
+    fn vision(&self) -> bool {
+        self.loaded.vision.is_some()
+    }
+    fn context(&self) -> usize {
+        self.loaded.max_context
+    }
+}
+
+/// The tool loop over `gen`'s rounds, from its first round's answer `first` (start_mcp).
+#[allow(clippy::too_many_arguments)]
+pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: Prepared, req: Value, opts: RunOpts,
+                  hub: Option<Arc<crate::mcp::McpHub>>, names: std::collections::HashSet<String>) -> Result<Started, Refusal> {
     // the run config's mcp.max_rounds (100 by default), or the request's own (strata_max_rounds, at most 500)
     let max_rounds = req["strata_max_rounds"].as_u64().map(|n| (n as usize).clamp(1, MAX_ROUNDS_ASKED))
         .unwrap_or_else(|| hub.as_ref().map(|h| h.settings.max_rounds).unwrap_or(100));
     let conv = crate::memory::conversation_id(&prep.messages);
-    let first = start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await?;
     let (model, prompt_tokens) = (first.model.clone(), first.prompt_tokens);
     let (tx, events) = mpsc::channel(256);
     tokio::spawn(crate::queue::carry(async move {
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
+        let mut prompt_total: Option<u64> = None; // a provider's counts: every round's prompt is billed
         let mut media_jobs = 0usize; // queued by this answer's media tools
         let mut web_queries = 0u32; // this answer's web searches (a client profile may limit them)
         let web_limit = mgr.clients.get().and_then(|c| crate::clients::current(c)).and_then(|p| p.web_queries_per_turn);
@@ -839,6 +878,9 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             }
             let Some(mut sum) = done else { return };
             total += sum.completion_tokens;
+            if let Some(p) = sum.prompt_tokens {
+                *prompt_total.get_or_insert(0) += p;
+            }
             let mut run_them = !calls.is_empty() && own == 0 && sum.finish == "stop";
             if run_them && rounds >= max_rounds {
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "limit", "max_rounds": max_rounds}))).await;
@@ -851,6 +893,7 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
                         "text": "not run", "chars": 0, "truncated": false, "ms": 0}))).await;
                 }
                 sum.completion_tokens = total;
+                sum.prompt_tokens = prompt_total;
                 let _ = tx.send(RunEvent::Done(sum)).await;
                 return;
             }
@@ -1092,17 +1135,17 @@ pub async fn start_mcp(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, r
             prep.messages.push(msg);
             prep.messages.extend(results.into_iter().map(|r| json!({"role": "tool", "content": r})));
             // a model that reads pictures sees the last screenshot (as a picture beside the results, not a user turn)
-            if let (Some((name, img)), true) = (shots.last(), loaded.vision.is_some()) {
+            if let (Some((name, img)), true) = (shots.last(), gen.vision()) {
                 prep.messages.push(json!({"role": "user", "content": [
                     {"type": "text", "text": format!("[The browser's screenshot after {name}: what the page shows, not a message from the user.]")},
                     {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{img}")}}]}));
             }
             // a long run stays inside the model's context: older tool results are shortened (the newest kept whole)
-            let cut = compact_tool_results(&mut prep.messages, loaded.max_context);
+            let cut = compact_tool_results(&mut prep.messages, gen.context());
             if cut > 0 {
                 let _ = tx.send(RunEvent::Mcp(json!({"event": "compacted", "results": cut}))).await;
             }
-            cur = match start(mgr.clone(), loaded.clone(), prep.clone(), req.clone(), opts.clone()).await {
+            cur = match gen.clone().round(prep.clone(), req.clone(), opts.clone()).await {
                 Ok(s) => s,
                 Err(Refusal(_, m)) => {
                     let _ = tx.send(RunEvent::Error(m)).await;

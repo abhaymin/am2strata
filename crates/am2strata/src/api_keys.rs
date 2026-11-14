@@ -954,7 +954,7 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
             if asked.is_empty() {
                 asked.push(default_model(&s, &path).await);
             }
-            if let Some(m) = asked.iter().find(|m| !allowed.iter().any(|a| a.eq_ignore_ascii_case(m))) {
+            if let Some(m) = asked.iter().find(|m| !allowed.iter().any(|a| a.eq_ignore_ascii_case(m) || crate::remote::grant_covers(a, m))) {
                 return error(StatusCode::FORBIDDEN, "permission_error",
                              format!("this key ({}) may not use the model {m:?}; it may use: {}", rec.name, allowed.join(", ")));
             }
