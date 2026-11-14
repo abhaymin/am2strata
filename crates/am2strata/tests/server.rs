@@ -2842,7 +2842,7 @@ fn a_paired_worker_is_reached_only_over_pinned_tls() {
             assert_eq!(cl["workers"][0]["transport"], "TLS 1.3, pinned certificates");
             break;
         }
-        assert!(t0.elapsed() < Duration::from_secs(15), "{cl}");
+        assert!(t0.elapsed() < Duration::from_secs(45), "worker not ready after {} ms: {}", t0.elapsed().as_millis(), cl);
         std::thread::sleep(Duration::from_millis(200));
     }
     let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));

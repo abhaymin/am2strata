@@ -32,18 +32,76 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend(s.as_bytes());
 }
 
+// GGUF value types (gguf-py's GGUFValueType)
+const UINT32: u32 = 4;
+const INT32: u32 = 5;
+const FLOAT32: u32 = 6;
+const BOOL: u32 = 7;
+const STRING: u32 = 8;
+const ARRAY: u32 = 9;
+
+/// A metadata value with its GGUF type, as llama.cpp's converter writes them: numbers as numbers, token lists as typed
+/// arrays. On disk a scalar is `type u32, payload`; an array is `ARRAY u32, element type u32, count u64, elements`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Kv {
+    Str(String),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    /// `tokenizer.ggml.tokens`, `.merges`
+    Strings(Vec<String>),
+    /// `tokenizer.ggml.token_type`
+    Ints(Vec<i32>),
+    /// `tokenizer.ggml.scores`
+    Floats(Vec<f32>),
+    /// a value copied as it is from another GGUF: its type tag and its encoded bytes (any type, arrays included), so
+    /// nothing is lost or retyped on the way (the quantizer keeps the input's metadata exactly)
+    Raw { ty: u32, payload: Vec<u8> },
+}
+
+fn put_kv(b: &mut Vec<u8>, key: &str, v: &Kv) {
+    put_str(b, key);
+    match v {
+        Kv::Str(s) => { b.extend(STRING.to_le_bytes()); put_str(b, s); }
+        Kv::U32(n) => { b.extend(UINT32.to_le_bytes()); b.extend(n.to_le_bytes()); }
+        Kv::I32(n) => { b.extend(INT32.to_le_bytes()); b.extend(n.to_le_bytes()); }
+        Kv::F32(f) => { b.extend(FLOAT32.to_le_bytes()); b.extend(f.to_le_bytes()); }
+        Kv::Bool(x) => { b.extend(BOOL.to_le_bytes()); b.push(*x as u8); }
+        Kv::Strings(v) => {
+            b.extend(ARRAY.to_le_bytes()); b.extend(STRING.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
+            for s in v { put_str(b, s); }
+        }
+        Kv::Ints(v) => {
+            b.extend(ARRAY.to_le_bytes()); b.extend(INT32.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
+            for n in v { b.extend(n.to_le_bytes()); }
+        }
+        Kv::Floats(v) => {
+            b.extend(ARRAY.to_le_bytes()); b.extend(FLOAT32.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
+            for f in v { b.extend(f.to_le_bytes()); }
+        }
+        Kv::Raw { ty, payload } => { b.extend(ty.to_le_bytes()); b.extend(payload); }
+    }
+}
+
 impl Writer {
     /// Writes the header, the key/values (all strings) and the tensor infos; the data follows with `tensor_data`.
+    /// The same bytes as `create_typed` with every value a `Kv::Str` (the MTP draft writer uses this).
     pub fn create(path: &Path, kv: &[(&str, String)], tensors: Vec<TensorSpec>) -> std::io::Result<Writer> {
+        let typed: Vec<(&str, Kv)> = kv.iter().map(|(k, v)| (*k, Kv::Str(v.clone()))).collect();
+        Self::create_typed(path, &typed, tensors)
+    }
+
+    /// Writes the header, typed key/values in the given order (general.architecture first, as gguf-py does) and the
+    /// tensor infos; the data follows with `tensor_data`.
+    pub fn create_typed(path: &Path, kv: &[(&str, Kv)], tensors: Vec<TensorSpec>) -> std::io::Result<Writer> {
         let mut b = Vec::new();
         b.extend(b"GGUF");
         b.extend(3u32.to_le_bytes());
         b.extend((tensors.len() as u64).to_le_bytes());
         b.extend((kv.len() as u64).to_le_bytes());
         for (k, v) in kv {
-            put_str(&mut b, k);
-            b.extend(8u32.to_le_bytes());
-            put_str(&mut b, v);
+            put_kv(&mut b, k, v);
         }
         let mut off = 0u64;
         for t in &tensors {

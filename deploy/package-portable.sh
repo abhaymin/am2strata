@@ -11,7 +11,7 @@ EXT=""
 case "$LABEL" in windows*) EXT=.exe ;; esac
 HYBRID="${HYBRID_TARGET:-$ROOT/crates/strata-hybrid/target/release}"
 rm -rf "$OUT" && mkdir -p "$OUT/bin"
-cp "$ROOT/target/release/am2strata$EXT" "$ROOT/target/release/am2strata-run$EXT" "$HYBRID/am2strata-hybrid$EXT" "$OUT/bin/"
+cp "$ROOT/target/release/am2strata$EXT" "$ROOT/target/release/am2strata-run$EXT" "$ROOT/target/release/am2strata-workshop$EXT" "$HYBRID/am2strata-hybrid$EXT" "$OUT/bin/"
 cp -r "$ROOT/web" "$OUT/web"
 cp "$ROOT/LICENSE" "$ROOT/NOTICE" "$ROOT/deploy/release/QUICKSTART.md" "$OUT/"
 cd "$ROOT/dist"

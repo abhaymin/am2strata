@@ -33,6 +33,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Media Generation</button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+    <button class="st-tab" role="tab" id="tab-btn-workshop" aria-controls="view-workshop" aria-selected="false" data-tab="workshop">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-layers"/></svg>Workshop</button>
     <button class="st-tab" role="tab" id="tab-btn-computer" aria-controls="view-computer" aria-selected="false" data-tab="computer">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-eye"/></svg>Computer</button>
     <button class="st-tab" role="tab" id="tab-btn-settings" aria-controls="view-settings" aria-selected="false" data-tab="settings">
@@ -391,6 +393,78 @@
   </section>
 
   <!-- ============================ Settings ============================ -->
+  <section class="view view--workshop" id="view-workshop" role="tabpanel" aria-labelledby="tab-btn-workshop" hidden>
+    <div class="ws">
+      <header class="ws-head">
+        <h2>Workshop</h2>
+        <p class="muted small">Make models in Rust on this PC: convert a Hugging Face model to GGUF, quantize it, merge a
+          LoRA adapter (from Unsloth or PEFT) into its base. Jobs run one at a time and keep running if you leave this tab.
+          <span id="ws-folders"></span></p>
+      </header>
+      <div class="ws-grid">
+        <div class="st-card ws-card"><span class="card-title">1 · Merge an adapter</span>
+          <p class="muted small">A LoRA adapter folder (<code>adapter_model.safetensors</code> + <code>adapter_config.json</code>)
+            into the Hugging Face model it was trained on. rsLoRA and MoE expert adapters are handled.</p>
+          <label class="st-label" for="ws-m-base">Base model (HF folder)</label>
+          <input class="st-input mono" id="ws-m-base" list="ws-hf" placeholder="~/models/Qwen3-8B">
+          <label class="st-label" for="ws-m-adapter">Adapter folder</label>
+          <input class="st-input mono" id="ws-m-adapter" list="ws-adapters" placeholder="~/outputs/my-lora">
+          <label class="st-label" for="ws-m-out">Output folder <output>optional</output></label>
+          <input class="st-input mono" id="ws-m-out" placeholder="(in the Workshop folder)">
+          <button type="button" class="st-btn st-btn--primary" id="ws-merge">Merge</button>
+        </div>
+        <div class="st-card ws-card"><span class="card-title">2 · Convert to GGUF</span>
+          <p class="muted small">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, byte for
+            byte as llama.cpp's converter writes it. Llama-family models for now.</p>
+          <label class="st-label" for="ws-c-in">Model (HF folder)</label>
+          <input class="st-input mono" id="ws-c-in" list="ws-hf" placeholder="~/models/Qwen3-8B">
+          <label class="st-label" for="ws-c-type">Precision</label>
+          <select class="st-input" id="ws-c-type"><option value="f16">F16 (half the size)</option><option value="f32">F32</option></select>
+          <label class="st-label" for="ws-c-pre">Pre-tokenizer <output>only if asked for</output></label>
+          <input class="st-input mono" id="ws-c-pre" placeholder="e.g. llama-bpe, qwen2">
+          <label class="st-label" for="ws-c-out">Output file <output>optional</output></label>
+          <input class="st-input mono" id="ws-c-out" placeholder="(in the Workshop folder)">
+          <button type="button" class="st-btn st-btn--primary" id="ws-convert">Convert</button>
+        </div>
+        <div class="st-card ws-card"><span class="card-title">3 · Quantize</span>
+          <p class="muted small">A GGUF to a smaller type, matching <code>llama-quantize --pure</code> byte for byte.</p>
+          <label class="st-label" for="ws-q-in">GGUF</label>
+          <input class="st-input mono" id="ws-q-in" list="ws-gguf" placeholder="~/models/model-f16.gguf">
+          <label class="st-label" for="ws-q-type">Type</label>
+          <select class="st-input" id="ws-q-type">
+            <option value="q8_0">Q8_0 (best quality, 8.5 bits)</option><option value="q6_k">Q6_K (6.6 bits)</option>
+            <option value="q5_k">Q5_K (5.5 bits)</option><option value="q4_k" selected>Q4_K (4.5 bits, the usual choice)</option>
+            <option value="q4_0">Q4_0 (4.5 bits, older)</option><option value="f16">F16</option></select>
+          <label class="st-label" for="ws-q-out">Output file <output>optional</output></label>
+          <input class="st-input mono" id="ws-q-out" placeholder="(in the Workshop folder)">
+          <button type="button" class="st-btn st-btn--primary" id="ws-quantize">Quantize</button>
+        </div>
+        <div class="st-card ws-card"><span class="card-title">4 · Make it a model am2Strata runs</span>
+          <p class="muted small">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for
+            its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p>
+          <label class="st-label" for="ws-s-in">GGUF</label>
+          <input class="st-input mono" id="ws-s-in" list="ws-gguf" placeholder="~/models/model-Q4_K.gguf">
+          <label class="st-label" for="ws-s-name">Name <output>optional: from the file</output></label>
+          <input class="st-input mono" id="ws-s-name" placeholder="my-model-q4_k">
+          <label class="st-label" for="ws-s-display">Display name <output>optional</output></label>
+          <input class="st-input" id="ws-s-display" placeholder="My model Q4_K">
+          <label class="small"><input type="checkbox" id="ws-s-over"> replace a model with the same name</label>
+          <button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button>
+        </div>
+        <div class="st-card ws-card ws-card--soon"><span class="card-title">Train · coming next</span>
+          <p class="muted small">LoRA training in Rust is built and tested on a small model; training real models (rotary
+            attention, the full Llama forward) is being finished. Until then, train with Unsloth and merge here.</p>
+        </div>
+      </div>
+      <div class="msg-error" id="ws-error" hidden></div>
+      <div class="st-card"><span class="card-title">Jobs</span>
+        <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
+      <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|jobs|cancel</code> (through this server),
+        or <code>am2strata-workshop</code> on its own.</p>
+      <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist>
+    </div>
+  </section>
+
   <section class="view view--computer" id="view-computer" role="tabpanel" aria-labelledby="tab-btn-computer" hidden>
     <div class="cv">
       <div class="cv-bar">

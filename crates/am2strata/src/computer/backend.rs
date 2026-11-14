@@ -755,20 +755,17 @@ mod tests {
     }
 
     /// The sandbox display is handed to child X tools on their environment, never inherited from the server's DISPLAY (`/computer/backend.rs`, item 3).
-    /// Unlike the old check (which only compared the stored string), this sets `DISPLAY=:0` in the process — like the real service would — and asserts what each
-    /// built Command actually passes the child: DISPLAY is the sandbox display, there is no WAYLAND_DISPLAY leaked in, PATH is kept, and `-d` is no longer an xdotool
-    /// argument (for click, type, key, scroll and focus). Without the fix the inherited `DISPLAY=:0` would hit the owner's real desktop.
+    /// Unlike the old check (which only compared the stored string), this asserts what each built Command actually passes the child: DISPLAY is the sandbox
+    /// display, there is no WAYLAND_DISPLAY leaked in, PATH is kept, and `-d` is no longer an xdotool argument (for click, type, key, scroll and focus). The
+    /// command's env is pinned by use_sandbox_display doing env_clear() then setting only PATH and the sandbox DISPLAY, so it never depends on the server's
+    /// real DISPLAY (`:0` / `wayland-0`) — that global-env mutation is gone, keeping this test safe under the full multithreaded suite.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_sandbox_backend_never_uses_the_environment_display() {
-        let original = std::env::var("DISPLAY").ok();
-        std::env::set_var("DISPLAY", ":0");  // the server's real display; a leaked one would drive the owner's desktop
-
         // Inspecting the built Command needs no running display, but building an xdotool command goes through the availability
         // guard — so on a box without xdotool (this CI box) there is nothing to build; the assertions below run wherever the
         // sandbox actually runs, which requires `xdotool` (`computer/engine.rs`, item 2).
         if !tool_available("xdotool") {
-            match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
             return;
         }
 
@@ -795,8 +792,6 @@ mod tests {
         // scroll: xdotool scroll 0 0 [direction]
         let mut s = linux::dotool("scroll", SANDBOX).unwrap(); s.arg("0").arg("0");
         assert_sandbox_env(&s, "DISPLAY", "WAYLAND_DISPLAY", "PATH", SANDBOX);
-
-        match original { Some(o) => std::env::set_var("DISPLAY", o), None => std::env::remove_var("DISPLAY") }
     }
 
     /// What every built child X command must receive: DISPLAY pinned to the sandbox display, no WAYLAND_DISPLAY leaked in, PATH kept so

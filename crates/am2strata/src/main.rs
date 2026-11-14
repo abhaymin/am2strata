@@ -8,6 +8,7 @@
 mod agents;
 mod cluster;
 mod cluster_tls;
+mod workshop;
 mod server_tls;
 mod machine;
 mod optimizer;
@@ -312,6 +313,11 @@ async fn check_host(axum::extract::State(hosts): axum::extract::State<Hosts>, re
     next.run(req).await
 }
 
+/// `~/` expanded (for the modules that take paths from requests or the run config).
+pub fn expand_path(p: &str) -> PathBuf {
+    expand(p)
+}
+
 fn expand(p: &str) -> PathBuf {
     match p.strip_prefix("~/") {
         Some(rest) => std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).map(|h| PathBuf::from(h).join(rest)).unwrap_or_else(|_| PathBuf::from(p)),
@@ -471,6 +477,8 @@ async fn main() -> Result<()> {
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
     let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
+    // the Workshop: convert, quantize and merge jobs (workshop.rs)
+    workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest);
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -552,6 +560,9 @@ async fn main() -> Result<()> {
         .route("/unload", post(api_monitor::unload))
         .route("/settings", get(web::settings_get).post(web::settings_post))
         .route("/config", get(web::config_get).post(web::config_post))
+        .route("/v1/workshop/jobs", get(workshop::jobs_get).post(workshop::jobs_post))
+        .route("/v1/workshop/jobs/{id}", get(workshop::job_get).delete(workshop::job_delete))
+        .route("/v1/workshop/files", get(workshop::files_get))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
         // the Computer tab: the sandbox desktop live, the operator's control and clipboard (computer/live.rs)
         .route("/api/computer/status", get(computer::live::status_get))
