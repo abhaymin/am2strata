@@ -893,7 +893,13 @@ fn form_fields(body: &[u8], boundary: &str, name: &str) -> Vec<String> {
     let want = format!("name=\"{name}\"");
     let mut out = vec![];
     let mut rest = body;
-    while let Some(at) = find(rest, delim.as_bytes()) {
+    let mut first = true;
+    loop {
+        // a delimiter is a line of its own: at the very start of the body, or after a line break (the same text
+        // inside a part's content, not at a line's start, is content)
+        let at = if first && rest.starts_with(delim.as_bytes()) { Some(0) } else { find(rest, format!("\r\n{delim}").as_bytes()).map(|i| i + 2) };
+        first = false;
+        let Some(at) = at else { break };
         rest = &rest[at + delim.len()..];
         if rest.starts_with(b"--") {
             break; // the closing delimiter
@@ -1314,6 +1320,11 @@ mod tests {
             --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsecret-model\r\n\
             --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nother\r\n--XX--\r\n";
         assert_eq!(asked_models("/v1/audio/transcriptions", &h, body).unwrap(), vec!["secret-model".to_string(), "other".to_string()]);
+        // the delimiter's text in the middle of a line of a file is content, not a new part
+        let tricky = b"--XX\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n\
+            x --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nallowed-model\r\n\
+            --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nreal\r\n--XX--\r\n";
+        assert_eq!(asked_models("/v1/audio/transcriptions", &h, tricky).unwrap(), vec!["real".to_string()]);
         let mut nob = HeaderMap::new();
         nob.insert("content-type", "multipart/form-data".parse().unwrap());
         assert!(asked_models("/v1/audio/transcriptions", &nob, body).is_err(), "no boundary: refused, not guessed");
