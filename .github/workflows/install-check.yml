@@ -1,7 +1,19 @@
-# Runs the one-line installers on fresh Linux, macOS and Windows runners against a published release, as a new user
-# would: install, then the launcher answers. Only when a release is published, or by hand.
+# The one-line installers, run as a new user would on every platform a release is built for: install, the commands
+# answer, uninstall leaves nothing but the data.
+#   - on a pull request that touches them: this checkout's installers against a download packaged from this checkout
+#     (nothing is fetched from a release), so a change is proved before it merges;
+#   - when a release is published, or by hand: the published installers against the published downloads.
 name: Install check
 on:
+  pull_request:
+    paths:
+      - "deploy/release/**"
+      - "deploy/package-portable.sh"
+      - "deploy/fetch-poppler-windows.sh"
+      - "crates/am2strata/src/doctor.rs"
+      - "crates/am2strata/src/bin/am2strata-run.rs"
+      - ".github/scripts/install-check.*"
+      - ".github/workflows/install-check.yml"
   release:
     types: [published]
   workflow_dispatch:
@@ -10,37 +22,123 @@ on:
         description: "release tag (empty: the latest)"
         required: false
 
+concurrency:
+  group: install-check-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: never
+
 jobs:
-  install:
+  lint:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck --version | sed -n 2p
+          shellcheck deploy/release/install.sh deploy/release/am2strata .github/scripts/install-check.sh deploy/package-portable.sh
+      - name: the installer under other shells (syntax)
+        run: |
+          sudo apt-get install -y --no-install-recommends busybox >/dev/null 2>&1 || true
+          for sh in "dash" "bash --posix" "busybox sh"; do
+            if command -v ${sh%% *} >/dev/null; then $sh -n deploy/release/install.sh && echo "$sh: ok"; fi
+          done
+      - name: PowerShell parses
+        shell: pwsh
+        run: |
+          foreach ($f in "deploy/release/install.ps1", ".github/scripts/install-check.ps1") {
+            $errors = $null; $tokens = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { $errors | ForEach-Object { Write-Host "${f}: $_" }; exit 1 }
+            Write-Host "${f}: ok"
+          }
+
+  # this checkout: build as release.yml does, package, install from the package
+  local:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false      # one platform's failure does not hide another's
+      matrix:
+        include:
+          - { os: ubuntu-22.04, label: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, label: linux-arm64 }
+          - { os: macos-15, label: macos-arm64 }
+          - { os: macos-15-intel, label: macos-x86_64 }
+          - { os: windows-2022, label: windows-x86_64 }
+          - { os: windows-11-arm, label: windows-arm64 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/strata-hybrid
+          # pull requests read the cache and do not add to it
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --release --locked -p am2strata -p strata-workshop --bin am2strata --bin am2strata-run --bin am2strata-workshop
+      - run: cargo build --release --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu
+      - run: bash deploy/package-portable.sh ${{ matrix.label }}
+      - name: Install, run, uninstall (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: sh .github/scripts/install-check.sh dist ${{ matrix.label }}
+      # both PowerShells a Windows PC can have: the one it comes with (5.1) and PowerShell 7
+      - name: Install, run, uninstall (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./.github/scripts/install-check.ps1 -Dist dist -Label ${{ matrix.label }}
+      - name: Install, run, uninstall (PowerShell 7)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./.github/scripts/install-check.ps1 -Dist dist -Label ${{ matrix.label }}
+
+  # a published release, from the network, as the README's one line does it
+  published:
+    if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, macos-15, windows-2022]
+        # releases before v0.1.8 have no linux-arm64, macos-x86_64 or windows-arm64 download: those three fail on them
+        # (Windows on Arm takes the x64 download instead, as the installer says)
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-2022, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     env:
       VERSION: ${{ github.event.release.tag_name || inputs.version }}
     steps:
-      - name: Install (Linux, macOS)
+      - name: Install, run, uninstall (Linux, macOS)
         if: runner.os != 'Windows'
         run: |
           if [ -n "$VERSION" ]; then base=download/$VERSION; else base=latest/download; fi
-          curl -fsSL "https://github.com/${{ github.repository }}/releases/$base/install.sh" \
-            | sh -s -- ${VERSION:+--version $VERSION} --no-browser
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/$base/install.sh" -o install.sh
+          sh install.sh ${VERSION:+--version $VERSION} --no-browser
           out=$("$HOME/.local/bin/am2strata" 2>&1 || true)
           echo "$out"
           echo "$out" | grep -q "No model yet"
-      - name: Install (Windows)
+          "$HOME/.local/bin/am2strata" doctor
+          sh install.sh --uninstall
+          [ ! -e "$HOME/.local/share/am2strata/app" ] && [ ! -e "$HOME/.local/bin/am2strata" ]
+      - name: Install, run, uninstall (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $base = if ($env:VERSION) { "download/$env:VERSION" } else { "latest/download" }
-          & ([scriptblock]::Create((irm "https://github.com/${{ github.repository }}/releases/$base/install.ps1"))) -Version $env:VERSION
+          $script = irm "https://github.com/${{ github.repository }}/releases/$base/install.ps1"
+          & ([scriptblock]::Create($script)) -Version $env:VERSION
           $out = & "$env:LOCALAPPDATA\am2strata\bin\am2strata.cmd" 2>&1 | Out-String
           $out
           if ($out -notmatch "No model yet") { exit 1 }
           if (-not (Test-Path "$env:LOCALAPPDATA\am2strata\app\am2strata-*\poppler\bin\pdftotext.exe")) { throw "no bundled poppler" }
+          & "$env:LOCALAPPDATA\am2strata\bin\am2strata.cmd" doctor
+          & ([scriptblock]::Create($script)) -Uninstall
+          if ((Test-Path "$env:LOCALAPPDATA\am2strata\app") -or (Test-Path "$env:LOCALAPPDATA\am2strata\bin")) { throw "uninstall left files" }
           exit 0   # the launcher's "no model yet" exits 1, which the step would otherwise report

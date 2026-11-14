@@ -36,13 +36,13 @@ Plans and where each stands: [docs/LEDGER.md](docs/LEDGER.md).
 
 ## Install
 
-**Linux (x86_64) and macOS (Apple Silicon):**
+**Linux (x86_64, arm64) and macOS (Apple silicon, Intel):**
 
 ```bash
 curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh
 ```
 
-**Windows (x64), in PowerShell:**
+**Windows (x64, Arm64), in PowerShell:**
 
 ```powershell
 irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
@@ -55,10 +55,44 @@ am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M
 am2strata                      # open http://127.0.0.1:8000
 ```
 
-The installers check each download's SHA-256 and need no admin rights. You can also take the archive for your system
-from [Releases](https://github.com/abhaymin/am2strata/releases); `QUICKSTART.md` inside takes a few minutes. These
-downloads run models on the CPU, or on any GPU through wgpu, so they suit small models. The build from source below is
-the fast path, for NVIDIA cards.
+The installers pick the download for your system and processor, check its SHA-256 and need no admin rights or sudo.
+Everything goes under your home folder (`~/.local/share/am2strata` and `~/.local/bin`; on Windows
+`%LOCALAPPDATA%\am2strata`), and an update keeps your models and settings. At the end they print what each optional
+feature still needs on your PC; `am2strata doctor` prints that report again at any time.
+
+| Option (`install.sh` / `install.ps1`) | What it does |
+|---|---|
+| `--version v0.1.8` / `-Version v0.1.8` | that release instead of the latest |
+| `--dir DIR` / `-Dir DIR` | install there, models and settings included |
+| `--service` / `-Service` | start the server when you sign in; `--no-service` / `-NoService` removes that |
+| `--with-deps` / `-WithDeps` | install what the optional features miss (apt, dnf, pacman, Homebrew; winget): the command is shown and runs only after you say yes (`--yes` / `-Yes` skips the question) |
+| `--from DIR` / `-From DIR` | install from a folder holding the download and its `.sha256`, without the network |
+| `--uninstall` / `-Uninstall` | remove the program; your models and settings stay |
+
+Options go after `sh -s --`: `curl -fsSL .../install.sh | sh -s -- --service`. In PowerShell:
+`& ([scriptblock]::Create((irm .../install.ps1))) -Service`.
+
+**What each platform's download supports:**
+
+| | Linux x86_64 | Linux arm64 | macOS Apple silicon | macOS Intel | Windows x64 | Windows Arm64 |
+|---|---|---|---|---|---|---|
+| Server, web app, APIs, coding agents, HTTPS | yes | yes | yes | yes | yes | yes |
+| Rust engine (CPU, or any GPU through wgpu) | yes | yes | yes | yes | yes | yes |
+| Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
+| PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
+| Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
+| Browser tool | Chrome or Chromium, else fetched | an installed Chromium | Chrome, Edge or Chromium, else fetched | Chrome, Edge or Chromium, else fetched | Edge or Chrome | Edge or Chrome |
+| Python in the canvas | needs `bubblewrap` | needs `bubblewrap` | no | no | no | no |
+| Computer tab (sandbox desktop) | needs `xvfb xdotool xclip` | needs `xvfb xdotool xclip` | no | no | no | no |
+| Sandbox VM | needs `qemu-system-x86 qemu-utils ovmf openssh-client` and `/dev/kvm` | no | no | no | no | no |
+| Start at sign-in (`--service`, `-Service`) | systemd user service | systemd user service | launchd agent | launchd agent | Startup shortcut | Startup shortcut |
+
+"needs" names the Debian/Ubuntu packages (Homebrew's on macOS); the doctor report gives the command for your system.
+On Windows on Arm, a release without an Arm64 download installs the x64 one, which Windows runs emulated.
+
+You can also take the archive for your system from [Releases](https://github.com/abhaymin/am2strata/releases);
+`QUICKSTART.md` inside takes a few minutes. These downloads run models on the CPU, or on any GPU through wgpu, so they
+suit small models. The build from source below is the fast path, for NVIDIA cards.
 
 ### Coding agents
 

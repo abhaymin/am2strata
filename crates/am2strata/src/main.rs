@@ -64,7 +64,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
-#[command(name = "am2strata", about = "am2Strata: every installed PolyStrata model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
+#[command(name = "am2strata", version, about = "am2Strata: every installed PolyStrata model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
 struct Args {
     /// folder with the strata-<model>.json run configs (a PolyStrata folder)
     #[arg(long, default_value = "~/Development/PolyStrata")]
