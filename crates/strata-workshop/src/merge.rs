@@ -10,8 +10,9 @@
 //! * **Name mapping** ([`peft_to_base_name`]): drop `base_model.model.` and the `.lora_A.weight`/`.lora_B.weight` suffix,
 //!   then add `.weight`, so `...q_proj.lora_B.weight` -> `...q_proj.weight`.
 //! * **2-D targets** (the q/k/v/o projections): `delta[o][i] = scaling * sum_r B[o][r] * A[r][i]`.
-//! * **Fused MoE experts** ([`add_expert_delta`]): a 3-D `[E, out, in]` target takes the expert einsum
-//!   `einsum("ore,eri->eio", B.reshape(o,-1,E), A.reshape(E,-1,i)) * scaling`, i.e. per-expert `B_e @ A_e`.
+//! * **Fused MoE experts** ([`add_expert_delta`]): a 3-D `[E, d1, d2]` target takes the expert einsum `einsum("o r e, e r i -> e*")`, per-expert
+//!   `scaling * B_e @ A_e`. PEFT has two layouts (`-> e i o` by default, `-> e o i` after `_did_swap_in_out_features`) and the fold picks the one
+//!   whose output shape matches the parameter's own `[E, d1, d2]`, refusing a square target its layouts are indistinguishable on.
 //! * **Report** ([`MergeReport`]): per tensor the relative-norm delta `|ΔW|/|W|` — targeted tensors are > 0, untargeted
 //!   ones are exactly 0 (their bytes never left disk).
 
@@ -129,11 +130,10 @@ impl<'a> Merger<'a> {
                         }
                         3 => {
                             let e = wt.shape[0];
-                            let o = wt.shape[1];
-                            let i = wt.shape[2];
-                            let r = ad.b.len().div_ceil(o * e);
+                            let d1 = wt.shape[1];
+                            let d2 = wt.shape[2];
                             let base = le_f32s(&wt.bytes)?;
-                            let (w, delta) = add_expert_delta(&base, &ad.a, &ad.b, e, o, i, r, scaling);
+                            let (w, delta) = add_expert_delta(&wt.name, &base, &ad.a, &ad.b, e, d1, d2, scaling)?;
                             (f32_le_bytes(&w), rel_norm(&base, &delta))
                         }
                         other => return Err(anyhow!("{}: base weight of rank {other} is not a LoRA target", wt.name)),
@@ -229,20 +229,72 @@ fn add_delta_2d(base: &[f32], a: &[f32], b: &[f32], out: usize, in_: usize, r: u
     (w, delta)
 }
 
-/// Fold the fused-MoE expert einsum into a 3-D `[E, out, in]` weight. `B.reshape(out,-1,E)` is `[out,r,E]`, `A.reshape(E,-1,i)`
-/// is `[E,r,i]`; the result `einsum("ore,eri->eio")` reshaped back to `[E,out,in]` is per-expert `scaling * B_e @ A_e`.
-fn add_expert_delta(base: &[f32], a: &[f32], b: &[f32], e: usize, o: usize, i: usize, r: usize, scaling: f32) -> (Vec<f32>, Vec<f32>) {
+/// Fold `scaling * B @ A` into a fused-MoE expert weight of the parameter's own shape `[E, d1, d2]` — which is also the delta's.
+/// PEFT computes each expert `scaling * B_e @ A_e` with one of two layouts: default `einsum("o r e, e r i -> e i o")`, a delta of
+/// shape `[E, in, out]`, and after `_did_swap_in_out_features` `einsum("o r e, e r i -> e o i")`, a delta of `[E, out, in]`. The
+/// flattened A is `[E*r, a_in]` and B is `[b_out, r*E]` either way, so `(a_in, b_out)` is the parameter's inner dims in some order:
+/// pick the layout matching it against `(d1, d2)`, refuse when `d1 == d2` (both layouts look identical from the files), and refuse
+/// anything that matches neither. `name` names the tensor in those error messages.
+fn add_expert_delta(name: &str, base: &[f32], a: &[f32], b: &[f32], e: usize, d1: usize, d2: usize, scaling: f32) -> Result<(Vec<f32>, Vec<f32>)> {
+    let len_a = a.len();
+    let len_b = b.len();
+
+    // Default layout `-> e i o`: (a_in, b_out) == (d1, d2). The result is placed at delta[e][ii][oo], so base dim d1 is `in`, d2 is `out`.
+    if let Some(r) = layout_rank(len_a, e, d1, len_b, d2) {
+        if d1 == d2 {
+            return Err(anyhow!("{name}: fused-expert parameter is square [{e}, {d1}, {d2}]; PEFT's two expert layouts are indistinguishable from the shapes alone, so refuse rather than guess"));
+        }
+        return Ok(expert_delta(base, a, b, e, d2, d1, false, r, scaling));
+    }
+
+    // Swapped layout `-> e o i`: (a_in, b_out) == (d2, d1). The result is placed at delta[e][oo][ii], so base dim d1 is `out`, d2 is `in`.
+    if let Some(r) = layout_rank(len_a, e, d2, len_b, d1) {
+        return Ok(expert_delta(base, a, b, e, d1, d2, true, r, scaling));
+    }
+
+    if d1 == d2 {
+        return Err(anyhow!("{name}: fused-expert parameter is square [{e}, {d1}, {d2}]; PEFT's two expert layouts are indistinguishable from the shapes alone, so refuse rather than guess"));
+    }
+    Err(anyhow!("{name}: fused-expert adapter A[E*r, {len_a}/{e}] and B[{len_b}/{e}, r*E] don't fit parameter shape [{e}, {d1}, {d2}]"))
+}
+
+/// Consistent rank when A is `[E*r, a_in]` and B is `[b_out, r*E]`: returns `r` only if both flat lengths divide evenly on it and the
+/// two independent estimates agree — this is what disambiguates the two PEFT layouts from shapes alone.
+fn layout_rank(len_a: usize, e: usize, a_in: usize, len_b: usize, out_b: usize) -> Option<usize> {
+    if e == 0 || a_in == 0 || out_b == 0 {
+        return None;
+    }
+    if len_a % (e * a_in) != 0 || len_b % (e * out_b) != 0 {
+        return None;
+    }
+    let r_a = len_a / (e * a_in);
+    let r_b = len_b / (e * out_b);
+    if r_a == r_b { Some(r_a) } else { None }
+}
+
+/// Per-expert `scaling * B_e @ A_e` folded into `base`, writing the result as `[E, out_dim, in_dim]` when `o_first` is true (delta[e][oo][ii],
+/// base dim d1 is the outer `out`) or `[E, in_dim, out_dim]` when false (delta[e][ii][oo]). A is `[E*r, a_in=in_dim]`, B is `[b_out=out_dim, r*E]`;
+/// both axes are contracted over rank `r`.
+fn expert_delta(base: &[f32], a: &[f32], b: &[f32], e: usize, out_dim: usize, in_dim: usize, o_first: bool, r: usize, scaling: f32) -> (Vec<f32>, Vec<f32>) {
     let mut w = base.to_vec();
-    let mut delta = vec![0f32; e * o * i];
+    let mut delta = vec![0f32; e * out_dim * in_dim];
+    let re = b.len() / out_dim; // r*E: stride pairing B's contracted rank with its expert axis
     for ee in 0..e {
-        for oo in 0..o {
-            for ii in 0..i {
+        for oo in 0..out_dim {
+            for ii in 0..in_dim {
                 let mut acc = 0f32;
-                // b reshaped [out,r,E]: element[oo][rr][ee] at flat ((oo*r + rr)*E + ee)
+                // b reshaped [out,r,E]: element[oo][rr][ee] lives at flat oo*(r*E) + rr*E + ee
                 for rr in 0..r {
-                    acc += b[((oo * r) + rr) * e + ee] * a[(ee * r + rr) * i + ii];
+                    let be = b[oo * re + rr * e + ee];
+                    // a reshaped [E,r,in]: element[ee][rr][ii] lives at flat (ee*r + rr)*in + ii
+                    let ae = a[(ee * r + rr) * in_dim + ii];
+                    acc += be * ae;
                 }
-                delta[ee * o * i + oo * i + ii] = scaling * acc;
+                if o_first {
+                    delta[(ee * out_dim + oo) * in_dim + ii] = scaling * acc; // delta[e][oo][ii], base dim d1 is `out`
+                } else {
+                    delta[(ee * in_dim + ii) * out_dim + oo] = scaling * acc; // delta[e][ii][oo], base dim d1 is `in`
+                }
             }
         }
     }
