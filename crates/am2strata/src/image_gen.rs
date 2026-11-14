@@ -570,6 +570,9 @@ pub async fn pull(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("media models can be downloaded");
+    }
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available", "the media engine is not built");
     }
@@ -696,6 +699,9 @@ pub async fn pull_status(State(s): State<AppState>, headers: HeaderMap) -> Respo
 pub async fn set_default(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("the media model can be chosen");
     }
     let Some(model) = req["model"].as_str() else { return bad("send {\"model\": ...}") };
     let mut kind = "image".to_string();

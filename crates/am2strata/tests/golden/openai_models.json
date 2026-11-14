@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "context_length": "int",
+      "created": "int",
+      "id": "string",
+      "loaded": "bool",
+      "meta": {
+        "n_ctx": "int"
+      },
+      "object": "=model",
+      "owned_by": "string",
+      "status": {
+        "value": "string"
+      }
+    }
+  ],
+  "object": "=list"
+}

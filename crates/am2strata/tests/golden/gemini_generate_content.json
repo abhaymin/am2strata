@@ -1,0 +1,27 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "text": "string",
+            "thought": "bool"
+          },
+          {
+            "text": "string"
+          }
+        ],
+        "role": "=model"
+      },
+      "finishReason": "=STOP",
+      "index": "int"
+    }
+  ],
+  "modelVersion": "string",
+  "usageMetadata": {
+    "cachedContentTokenCount": "int",
+    "candidatesTokenCount": "int",
+    "promptTokenCount": "int",
+    "totalTokenCount": "int"
+  }
+}

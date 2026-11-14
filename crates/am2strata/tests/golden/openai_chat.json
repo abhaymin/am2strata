@@ -1,0 +1,36 @@
+{
+  "choices": [
+    {
+      "finish_reason": "=stop",
+      "index": "int",
+      "message": {
+        "content": "string",
+        "reasoning_content": "string",
+        "role": "=assistant"
+      }
+    }
+  ],
+  "created": "int",
+  "id": "string",
+  "model": "string",
+  "object": "=chat.completion",
+  "timings": {
+    "cache_n": "int",
+    "draft_n": "int",
+    "draft_n_accepted": "int",
+    "predicted_ms": "float",
+    "predicted_n": "int",
+    "predicted_per_second": "float",
+    "prompt_ms": "float",
+    "prompt_n": "int",
+    "prompt_per_second": "float"
+  },
+  "usage": {
+    "completion_tokens": "int",
+    "prompt_tokens": "int",
+    "prompt_tokens_details": {
+      "cached_tokens": "int"
+    },
+    "total_tokens": "int"
+  }
+}

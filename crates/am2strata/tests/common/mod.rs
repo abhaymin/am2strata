@@ -3,6 +3,9 @@
 
 #![allow(dead_code)]
 
+/// the regression suite's shared helpers (docs/REGRESSION.md)
+pub mod regress;
+
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

@@ -1,0 +1,24 @@
+{
+  "content": [
+    {
+      "signature": "string",
+      "thinking": "string",
+      "type": "=thinking"
+    },
+    {
+      "text": "string",
+      "type": "=text"
+    }
+  ],
+  "id": "string",
+  "model": "string",
+  "role": "=assistant",
+  "stop_reason": "=end_turn",
+  "stop_sequence": "null",
+  "type": "=message",
+  "usage": {
+    "cache_read_input_tokens": "int",
+    "input_tokens": "int",
+    "output_tokens": "int"
+  }
+}

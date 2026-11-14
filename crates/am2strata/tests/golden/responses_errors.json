@@ -1,0 +1,46 @@
+{
+  "get_a_response": {
+    "body": {
+      "error": {
+        "code": "string",
+        "message": "string",
+        "param": "null",
+        "type": "=invalid_request_error"
+      }
+    },
+    "status": 404
+  },
+  "input_missing": {
+    "body": {
+      "error": {
+        "code": "string",
+        "message": "string",
+        "param": "string",
+        "type": "=invalid_request_error"
+      }
+    },
+    "status": 400
+  },
+  "no_key": {
+    "body": {
+      "error": {
+        "code": "null",
+        "message": "string",
+        "param": "null",
+        "type": "=authentication_error"
+      }
+    },
+    "status": 401
+  },
+  "stored_response_asked_for": {
+    "body": {
+      "error": {
+        "code": "string",
+        "message": "string",
+        "param": "string",
+        "type": "=invalid_request_error"
+      }
+    },
+    "status": 400
+  }
+}

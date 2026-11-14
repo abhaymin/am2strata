@@ -1,0 +1,83 @@
+{
+  "data": [
+    "=[DONE]",
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "string",
+            "role": "=assistant"
+          },
+          "finish_reason": "null",
+          "index": "int"
+        }
+      ],
+      "created": "int",
+      "id": "string",
+      "model": "string",
+      "object": "=chat.completion.chunk"
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "string"
+          },
+          "finish_reason": "null",
+          "index": "int"
+        }
+      ],
+      "created": "int",
+      "id": "string",
+      "model": "string",
+      "object": "=chat.completion.chunk"
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "reasoning_content": "string"
+          },
+          "finish_reason": "null",
+          "index": "int"
+        }
+      ],
+      "created": "int",
+      "id": "string",
+      "model": "string",
+      "object": "=chat.completion.chunk"
+    },
+    {
+      "choices": [
+        {
+          "delta": {},
+          "finish_reason": "=stop",
+          "index": "int"
+        }
+      ],
+      "created": "int",
+      "id": "string",
+      "model": "string",
+      "object": "=chat.completion.chunk",
+      "timings": {
+        "cache_n": "int",
+        "draft_n": "int",
+        "draft_n_accepted": "int",
+        "predicted_ms": "float",
+        "predicted_n": "int",
+        "predicted_per_second": "float",
+        "prompt_ms": "float",
+        "prompt_n": "int",
+        "prompt_per_second": "float"
+      },
+      "usage": {
+        "completion_tokens": "int",
+        "prompt_tokens": "int",
+        "prompt_tokens_details": {
+          "cached_tokens": "int"
+        },
+        "total_tokens": "int"
+      }
+    }
+  ]
+}

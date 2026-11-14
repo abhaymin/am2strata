@@ -1,0 +1,13 @@
+{
+  "models": [
+    {
+      "baseModelId": "string",
+      "displayName": "string",
+      "name": "string",
+      "supportedGenerationMethods": [
+        "string"
+      ],
+      "version": "string"
+    }
+  ]
+}

@@ -140,6 +140,10 @@ pub fn config_sampling(cfg_rest: &std::collections::BTreeMap<String, Value>) -> 
 /// The request with the shared max tokens and thinking level filled in where it has none of its own.
 /// `api`: "openai" (also the Responses API, as its chat request) or "anthropic".
 pub fn with_shared(req: &mut Value, shared: &Defaults, config_effort: Option<&str>, api: &str) {
+    // a body that is no JSON object has no fields to fill (writing one into it would panic): its API refuses it next
+    if !req.is_object() {
+        return;
+    }
     let effort = shared.get("reasoning_effort").and_then(Value::as_str).or(config_effort);
     fn given(req: &Value, k: &str) -> bool {
         req.get(k).is_some_and(|v| !v.is_null() && v.as_str() != Some("") && v != &json!(0) && v != &json!(false))
