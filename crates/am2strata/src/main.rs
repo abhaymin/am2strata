@@ -28,6 +28,7 @@ mod image_gen;
 mod preview;
 mod production;
 mod queue;
+mod remote;
 mod manager;
 mod hub_api;
 mod mcp_api;
@@ -454,6 +455,8 @@ async fn main() -> Result<()> {
     let keys = api_keys::ApiKeys::open(Some(&expand(&args.data_dir)));
     keys.start_flush();
     let clients = clients::Clients::from_config(&first.cfg.rest, api_key.as_deref()).map_err(anyhow::Error::msg)?.with_generated(keys.clone());
+    // remote models (remote/): off unless the run config has a "remote" block
+    remote::init(&first.cfg.rest, &expand(&args.data_dir), Some(first.path.clone())).map_err(anyhow::Error::msg)?;
     if !clients.is_empty() {
         tracing::info!("client profiles: {}", clients.names().join(", "));
     }
@@ -598,6 +601,13 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/uploads", axum::routing::post(workshop::upload_post))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
+        // remote models: the owner's page and its API (remote/api.rs), linked from nowhere
+        .route("/rtenai", get(remote::api::page))
+        .route("/api/rtenai", get(remote::api::status).post(remote::api::save))
+        .route("/api/rtenai/keys/{provider}", post(remote::api::set_key).delete(remote::api::remove_key))
+        .route("/api/rtenai/test/{provider}", post(remote::api::test))
+        .route("/api/rtenai/models/{provider}", get(remote::api::models))
+        .route("/api/rtenai/usage", get(remote::api::usage))
         // the Computer tab: the sandbox desktop live, the operator's control and clipboard (computer/live.rs)
         .route("/api/computer/status", get(computer::live::status_get))
         .route("/api/computer/stream", get(computer::live::stream))
@@ -646,6 +656,8 @@ async fn main() -> Result<()> {
         .layer(axum::middleware::from_fn_with_state(state.clone(), body_rejections))
         // a chat whose model a worker should answer goes there (cluster.rs); inside the records, so they show it
         .layer(axum::middleware::from_fn_with_state(state.clone(), cluster::route))
+        // remote models and the mix (remote/): who may use them, the mix's choice, x-strata-routed; a no-op while off
+        .layer(axum::middleware::from_fn_with_state(state.clone(), remote::layer))
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_monitor::layer))
         // generated keys: a revoked or expired one refused, limits, and everyone's usage counted (api_keys.rs)
         .layer(axum::middleware::from_fn_with_state(state.clone(), api_keys::layer))

@@ -54,18 +54,18 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         }
         None => WebServerTools::default(),
     };
-    let (loaded, early_pass) = match s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await {
+    let (target, early_pass) = match crate::remote::ensure_for(&s, req.get("model").and_then(Value::as_str)).await {
         Ok(l) => l,
         Err(e) => return anthropic_error(StatusCode::SERVICE_UNAVAILABLE, "api_error", format!("{e:#}")),
     };
-    if let Err(e) = media::expand_documents(&mut req, loaded.vision.is_some(), true).await {
+    if let Err(e) = media::expand_documents(&mut req, target.vision(), true).await {
         return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
     {
-        let shared = loaded.shared.read().unwrap().clone();
-        crate::settings::with_shared(&mut req, &shared, loaded.config_effort().as_deref(), "anthropic");
+        let (shared, effort) = target.shared();
+        crate::settings::with_shared(&mut req, &shared, effort.as_deref(), "anthropic");
     }
-    let (mut prep, budget) = match anthropic_to_messages(&req, &loaded.tool_orders, true) {
+    let (mut prep, budget) = match anthropic_to_messages(&req, target.tool_orders(), true) {
         Ok(p) => p,
         Err(e) => return anthropic_error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),
     };
@@ -80,7 +80,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
         Ok(o) => o,
         Err(r) => return r,
     };
-    let started = match crate::server_tools::start(s.mgr.clone(), loaded, prep, req.clone(), opts, offered).await {
+    let started = match crate::server_tools::start(s.mgr.clone(), target, prep, req.clone(), opts, offered).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             return anthropic_error(StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST), "invalid_request_error", msg)
@@ -200,6 +200,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
                     } else {
                         match sum.finish.as_str() { "length" => "max_tokens", _ => "end_turn" }
                     };
+                    let n_prompt = sum.prompt_tokens.unwrap_or(n_prompt);
                     let reused = sum.reused.min(n_prompt.saturating_sub(1));
                     let mut usage = json!({"input_tokens": n_prompt - reused, "cache_read_input_tokens": reused,
                                            "output_tokens": sum.completion_tokens});

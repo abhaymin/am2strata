@@ -861,7 +861,7 @@ impl Assembler {
             }
         }
         let n = sum.completion_tokens;
-        let prompt = self.prompt_tokens;
+        let prompt = sum.prompt_tokens.unwrap_or(self.prompt_tokens);
         self.response["usage"] = json!({
             "input_tokens": prompt, "input_tokens_details": {"cached_tokens": sum.reused.min(prompt)},
             "output_tokens": n, "output_tokens_details": {"reasoning_tokens": 0}, "total_tokens": prompt + n});
@@ -970,7 +970,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     if let Err(e) = media::expand_videos(&mut chat).await {
         return RespError::new(e.to_string(), None).into_response();
     }
-    let (loaded, early_pass) = match s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await {
+    let (target, early_pass) = match crate::remote::ensure_for(&s, req.get("model").and_then(Value::as_str)).await {
         Ok(l) => l,
         Err(e) => {
             let mut r = RespError::new(format!("{e:#}"), None);
@@ -979,10 +979,10 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         }
     };
     {
-        let shared = loaded.shared.read().unwrap().clone();
-        crate::settings::with_shared(&mut chat, &shared, loaded.config_effort().as_deref(), "openai");
+        let (shared, effort) = target.shared();
+        crate::settings::with_shared(&mut chat, &shared, effort.as_deref(), "openai");
     }
-    let mut prep = match openai_to_messages(&chat, &loaded.tool_orders) {
+    let mut prep = match openai_to_messages(&chat, target.tool_orders()) {
         Ok(p) => p,
         Err(e) => return RespError::new(e.0, None).into_response(),
     };
@@ -1003,7 +1003,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
         Ok(o) => o,
         Err(r) => return r,
     };
-    let started = match crate::server_tools::start(s.mgr.clone(), loaded, prep, chat.clone(), opts, offered).await {
+    let started = match crate::server_tools::start(s.mgr.clone(), target, prep, chat.clone(), opts, offered).await {
         Ok(st) => st,
         Err(run::Refusal(code, msg)) => {
             let mut r = RespError::new(msg, None);

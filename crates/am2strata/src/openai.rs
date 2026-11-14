@@ -34,6 +34,8 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
                    "status": {"value": if loaded { "loaded" } else { "unloaded" }}})
         })
         .collect();
+    let mut data = data;
+    data.extend(crate::remote::v1_models(&s, &headers).await);
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
@@ -52,7 +54,7 @@ pub async fn chat(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     // a stream that must wait for the model to load again (stopped for a media job) behind other jobs starts at once
     // and says its place (SSE comments); the answer follows on the same stream once the model is loaded
-    if stream && s.mgr.must_load(req.get("model").and_then(Value::as_str)).await && s.mgr.queue.busy() {
+    if stream && !crate::remote::planned() && s.mgr.must_load(req.get("model").and_then(Value::as_str)).await && s.mgr.queue.busy() {
         return waiting_stream(s, headers, req);
     }
     chat_with(s, headers, req, None).await
@@ -117,24 +119,24 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
     let got = match pre {
-        Some(l) => Ok(l),
-        None => s.mgr.ensure_for(req.get("model").and_then(Value::as_str)).await,
+        Some((l, p)) => Ok((crate::remote::Target::Local(l), p)),
+        None => crate::remote::ensure_for(&s, req.get("model").and_then(Value::as_str)).await,
     };
-    let (loaded, early_pass) = match got {
+    let (target, early_pass) = match got {
         Ok(l) => l,
         Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "server_error", format!("{e:#}")),
     };
     if let Err(e) = crate::media_jobs::expand_audio(&s, &mut req).await {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", e);
     }
-    if let Err(e) = media::expand_documents(&mut req, loaded.vision.is_some(), false).await {
+    if let Err(e) = media::expand_documents(&mut req, target.vision(), false).await {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.to_string());
     }
     {
-        let shared = loaded.shared.read().unwrap().clone();
-        crate::settings::with_shared(&mut req, &shared, loaded.config_effort().as_deref(), "openai");
+        let (shared, effort) = target.shared();
+        crate::settings::with_shared(&mut req, &shared, effort.as_deref(), "openai");
     }
-    let mut prep = match openai_to_messages(&req, &loaded.tool_orders) {
+    let mut prep = match openai_to_messages(&req, target.tool_orders()) {
         Ok(p) => p,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e.0),
     };
@@ -160,13 +162,13 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     };
     let pass_slot = opts.pass.clone();
     let has_pass = pass_slot.lock().unwrap().is_some();
-    let (mgr, req2, model_id) = (s.mgr.clone(), req.clone(), loaded.entry.id.clone());
+    let (mgr, req2, model_id, local) = (s.mgr.clone(), req.clone(), target.id(), target.is_local());
     let run_it = async move {
-        crate::server_tools::start(mgr, loaded, prep, req2, opts, mcp).await
+        crate::server_tools::start(mgr, target, prep, req2, opts, mcp).await
     };
     // a stream that has to wait for its turn starts at once and says its place in the queue (SSE comments); its
     // refusals then come as an error event, not a status code
-    if stream && validator.is_none() && !has_pass && s.mgr.queue.busy() {
+    if stream && validator.is_none() && !has_pass && local && s.mgr.queue.busy() {
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Value>>(256);
         let mgr = s.mgr.clone();
         let queue = s.mgr.queue.clone();
@@ -266,7 +268,7 @@ async fn pump(started: run::Started, tx: tokio::sync::mpsc::Sender<Option<Value>
                 RunEvent::Done(sum) => {
                     let open = streamed.keys().any(|k| !finished.contains(k));
                     let mut last = chunk(json!({}), Some(finish_reason(&sum, calls, open)));
-                    let pt = prompt_tokens as u64;
+                    let pt = sum.prompt_tokens.unwrap_or(prompt_tokens as u64);
                     last["usage"] = json!({"prompt_tokens": pt, "completion_tokens": sum.completion_tokens,
                                            "total_tokens": pt + sum.completion_tokens,
                                            "prompt_tokens_details": {"cached_tokens": sum.reused}});
