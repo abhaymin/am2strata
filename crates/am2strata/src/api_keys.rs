@@ -184,30 +184,37 @@ fn new_key() -> String {
     k
 }
 
-/// A file only this account reads: written beside it and moved into place.
+/// A file only this account reads: written beside it under a name of its own and moved into place. Each write has
+/// its own temporary name (so two writers never share one), and a write that fails is tried once more from the start
+/// (the folder made again): a test run saw the move fail with "No such file" once in several hundred runs, with no
+/// second writer found, so the error also says which step failed.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // a file left from before keeps its old mode otherwise
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let once = || -> std::io::Result<()> {
+        use std::io::Write;
+        let step = |what: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"));
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d).map_err(|e| step("making the folder", e))?;
+        }
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp).map_err(|e| step("opening the temporary file", e))?;
+        let written = f.write_all(bytes).and_then(|_| f.sync_all()).map_err(|e| step("writing", e));
+        drop(f);
+        let moved = written.and_then(|_| std::fs::rename(&tmp, path).map_err(|e| step("moving it into place", e)));
+        if moved.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        moved
+    };
+    once().or_else(|_| once())
 }
 
 fn check_name(name: &str) -> Result<String, String> {
