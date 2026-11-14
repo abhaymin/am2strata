@@ -117,6 +117,42 @@ impl TinyLlama {
     }
 }
 
+/// The chat fixture's vocabulary: three special tokens, then the 256 byte-level symbols.
+pub const CHAT_VOCAB: usize = 259;
+
+/// ChatML, as Qwen and many fine-tunes use it.
+pub const CHATML_TEMPLATE: &str = "{% for message in messages %}{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
+
+/// A tiny random model that can read real text, for the trainer's tests: [`TinyLlama`] with a vocabulary of
+/// [`CHAT_VOCAB`] and, in place of the `tok_N` tokenizer, a byte-level one (every byte is a token, so any text
+/// tokenises) with `<|endoftext|>`, `<|im_start|>`, `<|im_end|>` as ids 0 to 2 and a ChatML chat template.
+pub fn write_chat_model(dir: &Path, model: &TinyLlama) -> anyhow::Result<()> {
+    anyhow::ensure!(model.vocab_size == CHAT_VOCAB, "the chat fixture needs vocab_size {CHAT_VOCAB}");
+    model.write(dir)?;
+    let specials = ["<|endoftext|>", "<|im_start|>", "<|im_end|>"];
+    let mut symbols: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet().into_iter().collect();
+    symbols.sort();
+    let mut vocab = serde_json::Map::new();
+    for (i, s) in specials.iter().enumerate() {
+        vocab.insert(s.to_string(), json!(i));
+    }
+    for (i, c) in symbols.iter().enumerate() {
+        vocab.insert(c.to_string(), json!(i + specials.len()));
+    }
+    anyhow::ensure!(vocab.len() == CHAT_VOCAB, "byte-level alphabet of {} symbols", symbols.len());
+    let mut tok = tokenizer_json(0);
+    tok["added_tokens"] = Json::Array(specials.iter().enumerate().map(|(i, s)| added_token(i as u64, s, true)).collect());
+    tok["model"]["vocab"] = Json::Object(vocab);
+    std::fs::write(dir.join("tokenizer.json"), serde_json::to_string_pretty(&tok)?)?;
+    std::fs::write(dir.join("tokenizer_config.json"), serde_json::to_string_pretty(&json!({
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "eos_token": "<|im_end|>",
+        "pad_token": "<|endoftext|>",
+        "chat_template": CHATML_TEMPLATE,
+    }))?)?;
+    Ok(())
+}
+
 /// Where a written fixture landed.
 pub struct ShardFiles {
     pub dir: PathBuf,

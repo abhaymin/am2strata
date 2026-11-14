@@ -44,6 +44,18 @@ pub fn cosine_with_warmup_lr(peak: f64, step: usize, warmup_steps: usize, total_
     }
 }
 
+/// The schedule Hugging Face's `get_cosine_schedule_with_warmup` gives (what Soup's `scheduler: cosine` runs): a linear
+/// ramp `step / warmup` for the first `warmup_steps` steps, then half a cosine down to 0 at `total_steps`. Unlike
+/// [`cosine_with_warmup_lr`], no warm-up means the first step already runs at the peak rate.
+pub fn hf_cosine_lr(peak: f64, step: usize, warmup_steps: usize, total_steps: usize) -> f64 {
+    if step < warmup_steps {
+        return peak * step as f64 / warmup_steps as f64;
+    }
+    let span = total_steps.saturating_sub(warmup_steps).max(1);
+    let progress = ((step - warmup_steps) as f64 / span as f64).min(1.0);
+    peak * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+}
+
 /// Deterministic training data: `num_sequences` sequences of `seq_len` token ids, each split into a `prompt_len`-token
 /// prompt (masked from the loss) and the rest (whose next tokens are supervised). Synthetic — no tokenizer needed for
 /// this CPU proof; what matters is that a learnable signal exists so masked CE falls as the LoRA adapters train.
@@ -132,12 +144,23 @@ impl AdamWState {
     }
 
     pub fn step(&mut self, grads: &candle_core::backprop::GradStore) -> Res<()> {
+        let per_slot: Vec<Option<Tensor>> = self.slots.iter().map(|(theta, _, _)| grads.get(theta).cloned()).collect();
+        self.step_grads(&per_slot)
+    }
+
+    /// One AdamW update from gradients given per slot, in slot order (`None` leaves that variable alone). This is what
+    /// gradient accumulation over several backward passes needs: the caller sums each variable's gradients itself, so
+    /// only one example's graph is alive at a time.
+    pub fn step_grads(&mut self, grads: &[Option<Tensor>]) -> Res<()> {
+        if grads.len() != self.slots.len() {
+            return Err(format!("{} gradients for {} variables", grads.len(), self.slots.len()).into());
+        }
         self.step_t += 1;
         let p = &self.params;
         let scale_m = 1f64 / (1f64 - p.beta1.powi(self.step_t as i32));
         let scale_v = 1f64 / (1f64 - p.beta2.powi(self.step_t as i32));
-        for (theta, m, v) in &self.slots {
-            if let Some(g) = grads.get(theta) {
+        for ((theta, m, v), g) in self.slots.iter().zip(grads) {
+            if let Some(g) = g {
                 let next_m = ((m.as_tensor() * p.beta1)? + (g * (1.0 - p.beta1))?)?;
                 let next_v = ((v.as_tensor() * p.beta2)? + (g.sqr()? * (1.0 - p.beta2))?)?;
                 let adjusted = ((&next_m * scale_m)? / ((&next_v * scale_v)?.sqrt()? + p.eps)?)?;
