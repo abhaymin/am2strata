@@ -8,12 +8,28 @@ use strata_workshop::testmodel::{write_chat_model, TinyLlama, CHAT_VOCAB};
 
 static N: AtomicUsize = AtomicUsize::new(0);
 
-/// A fresh folder under the system temp dir (never in the repository).
-pub fn temp_dir(tag: &str) -> PathBuf {
+/// A test's own folder: unique, under the system temp dir (never in the repository, never the temp dir's top level),
+/// and removed with everything in it when the test ends.
+pub struct Tmp(PathBuf);
+
+impl std::ops::Deref for Tmp {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+pub fn temp_dir(tag: &str) -> Tmp {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let d = std::env::temp_dir().join(format!("am2-trainer-{tag}-{}-{nanos}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Tmp(d)
 }
 
 /// A 3-block chat model: hidden 32, 4 heads over 2 key/value heads, byte-level tokenizer, ChatML template.
@@ -47,7 +63,7 @@ pub fn write_jsonl(path: &Path, rows: &[serde_json::Value]) {
 }
 
 /// A model folder and a 24-conversation dataset in one temp folder: `(root, model, data)`.
-pub fn model_and_data(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+pub fn model_and_data(tag: &str) -> (Tmp, PathBuf, PathBuf) {
     let root = temp_dir(tag);
     let (model, data) = (root.join("model"), root.join("train.jsonl"));
     chat_model(&model);
