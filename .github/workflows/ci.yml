@@ -36,6 +36,32 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo test --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu --bin am2strata-hybrid
 
+  # The regression suite by name (docs/REGRESSION.md): the route contract table and its guard, the golden response
+  # shapes, one test per bug class fixed before, and the live runner against a test server. The `test` job runs them
+  # too (with everything else); this job says plainly when it is a REGRESSION that failed, and checks that the tests
+  # wrote nothing into the repository.
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: route contracts, golden shapes, bug regressions, the live runner
+        run: cargo test --locked -p am2strata --test regression_api --test regression_shapes --test regression_bugs --test regression_runner -- --test-threads=4
+      - name: regressions beside the code they guard
+        run: |
+          cargo test --locked -p am2strata --bin am2strata regress
+          cargo test --locked -p strata-workshop --lib regress
+      - name: the tests wrote nothing into the repository
+        run: |
+          git status --porcelain
+          test -z "$(git status --porcelain)"
+
   # macOS and Windows never checked here before this job. The v0.1.7 release check failed on them because
   # `computer/backend.rs`/`engine.rs` used Linux-only types (`LinuxBackend`, `SandboxDesktop`) at module scope, so code that
   # compiled only on Linux could merge. This checks the am2strata crate + tests build on the others too, catching it pre-merge.

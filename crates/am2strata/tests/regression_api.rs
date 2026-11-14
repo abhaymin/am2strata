@@ -289,12 +289,33 @@ const ROUTES: &[Row] = &[
     row("GET", "/api/monitor/media/{name}", Owner).at("/api/monitor/media/nope").ok(404),
     row("GET", "/metrics/prometheus", Owner),
     row("GET", "/v1/status", Owner),
+    // --------------------------------------------------------------------------------- the sandbox VM (Linux only)
+    row("GET", "/api/vm", Owner).note("status only: nothing in this table ever starts the VM"),
+    row("POST", "/api/vm", Owner).json(r#"{"action": "nope"}"#).ok(400).note("an unknown action: the VM is not started"),
+    row("POST", "/api/vm/settings", Owner).json(r#"{"gpu": true}"#).ok(400).note("an unknown setting: nothing is changed"),
+    row("GET", "/api/vm/tasks/{id}", Owner).at("/api/vm/tasks/999").ok(404),
+    row("GET", "/api/vm/apps", Owner),
+    row("POST", "/api/vm/apps", Owner).json(r#"{"action": "install"}"#).ok(400).note("no app named: nothing is installed"),
+    row("POST", "/api/vm/exec", Owner).json(r#"{}"#).ok(400).note("no command: nothing runs"),
+    row("POST", "/api/vm/ads", Owner).json(r#"{}"#).ok(400),
+    // ------------------------------------------------------------------------------------------ API keys and usage
+    row("GET", "/api/keys", Owner),
+    row("POST", "/api/keys", Owner).json(r#"{"name": ""}"#).ok(400).note("no name: no key is made"),
+    row("POST", "/api/keys/{id}", Owner).at("/api/keys/nope").json(r#"{}"#).ok(404),
+    row("DELETE", "/api/keys/{id}", Owner).at("/api/keys/nope").ok(404),
+    row("GET", "/api/usage", Owner),
+    row("GET", "/v1/usage", Client).note("each key reads its own usage"),
     // ------------------------------------------------------------------------------------------------ the web app
     row("GET", "/", Public),
     row("GET", "/api-monitor", Public),
     row("GET", "/web", Public).at("/web/index.html"),
     row("GET", "/fonts", Public).at("/fonts/nope.woff2").ok(404).note("the test web folder has no fonts"),
 ];
+
+/// The rows this platform's server has: the sandbox VM's routes exist on Linux only.
+fn rows() -> impl Iterator<Item = &'static Row> {
+    ROUTES.iter().filter(|r| cfg!(target_os = "linux") || !r.route.starts_with("/api/vm"))
+}
 
 fn table() -> BTreeSet<(String, String)> {
     ROUTES.iter().map(|r| (r.method.to_string(), r.route.to_string())).collect()
@@ -375,7 +396,7 @@ fn every_route_answers_each_caller_as_its_row_says() {
     let s = Server::start(&[client_model(json!({"api_monitor": true}))], &[ids("Thinking.\n</think>\n\nhello")], json!({}));
     let wrong: std::cell::RefCell<Vec<String>> = Default::default();
     let mut checks = 0;
-    for r in ROUTES {
+    for r in rows() {
         let name = format!("{} {}", r.method, r.path);
         let mut check = |what: &str, want: u16, a: Answer| {
             checks += 1;
@@ -416,7 +437,7 @@ fn every_route_answers_each_caller_as_its_row_says() {
     }
     let wrong = wrong.into_inner();
     assert!(wrong.is_empty(), "{} of {checks} contract checks failed:\n  {}", wrong.len(), wrong.join("\n  "));
-    assert!(checks >= ROUTES.len() * 7);
+    assert!(checks >= rows().count() * 7);
     // the server is still up and still answers a chat after all of it
     let a = Req::new("POST", &s.base, "/v1/chat/completions").key(Some(KEY)).raw("application/json", CHAT.as_bytes()).send();
     assert_eq!(a.status, 200, "the server after the walk: {}", excerpt(&a));
@@ -438,7 +459,7 @@ fn wrong_typed_json_is_refused_never_a_500() {
     ];
     let mut wrong: Vec<String> = Vec::new();
     let mut checks = 0;
-    for r in ROUTES.iter().filter(|r| r.method != "GET" && r.who != Public) {
+    for r in rows().filter(|r| r.method != "GET" && r.who != Public) {
         for j in &junk {
             let a = Req::new(r.method, &s.base, r.path).key(Some(KEY)).json(j).send();
             checks += 1;
@@ -475,7 +496,7 @@ const KNOWN_BUG_BODY_READ_BEFORE_KEY: &[(&str, &str)] = &[];
 fn a_stranger_with_a_broken_body_gets_401_not_a_parse_error() {
     let s = Server::start(&[client_model(json!({}))], &[ids("hi")], json!({}));
     let (mut wrong, mut fixed) = (Vec::new(), Vec::new());
-    for r in ROUTES.iter().filter(|r| r.no_key == 401) {
+    for r in rows().filter(|r| r.no_key == 401) {
         let listed = KNOWN_BUG_BODY_READ_BEFORE_KEY.contains(&(r.method, r.route));
         let mut codes = Vec::new();
         for key in [None, Some(WRONG_KEY)] {

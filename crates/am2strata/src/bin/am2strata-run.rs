@@ -16,10 +16,16 @@
 //!                                       download (token optional: --token, HF_TOKEN or the hf login file), check, and
 //!                                       write its run config when an engine here runs its architecture
 //!
+//!   cargo run -q --release --bin am2strata-run -- regression [--url http://host:8000 --api-key KEY] [--quick|--full] [--json]
+//!                                       check a RUNNING server after an update (docs/REGRESSION.md): a pass/fail table,
+//!                                       non-zero exit on a failure; --quick changes nothing and makes 3 short model calls
+//!
 //! Everything after `--` on serve / temp-service / install goes to the am2strata server (`am2strata --help`).
 
 #[path = "../agents.rs"]
 mod agents;
+#[path = "../regression_run.rs"]
+mod regression_run;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -268,6 +274,27 @@ enum Cmd {
         /// its API key (default: from the run configs; or AM2STRATA_API_KEY)
         #[arg(long)]
         api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// check a RUNNING server after an update (docs/REGRESSION.md): health, every API's minimal call, metrics, queue,
+    /// HTTPS, Workshop, Computer and VM status; a pass/fail table with timings, non-zero exit on any failure
+    Regression {
+        /// the server (default: this PC's, from its run configs; or AM2STRATA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// its API key (default: from the run configs; or AM2STRATA_API_KEY); never printed
+        #[arg(long)]
+        api_key: Option<String>,
+        /// the default: no state changes, at most 3 short model calls
+        #[arg(long, conflicts_with = "full")]
+        quick: bool,
+        /// also a real call to every compatibility API and a tool round trip (about 8 short model calls)
+        #[arg(long)]
+        full: bool,
+        /// the result as JSON
+        #[arg(long)]
+        json: bool,
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
@@ -760,6 +787,20 @@ fn main() -> ExitCode {
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
+        Cmd::Regression { url, api_key, quick: _, full, json, models_dir } => {
+            // the run configs are read only for what was not given (a server elsewhere needs none of them)
+            let from_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+            let (url, key) = match (url.or_else(|| from_env("AM2STRATA_URL")), api_key.or_else(|| from_env("AM2STRATA_API_KEY"))) {
+                (Some(u), Some(k)) => (u, Some(k)),
+                (u, k) => {
+                    let (local_url, local_key) = local_server(&models_dir);
+                    // a key from this PC's run configs is for this PC's server only: never sent to another address
+                    let local = u.is_none();
+                    (u.unwrap_or(local_url), k.or(if local { local_key } else { None }))
+                }
+            };
+            if regression_run::run(regression_run::Options { url, key, full, json }) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
         Cmd::Vm { action, args, kind, root, lists, yes, no_wait, url, api_key, models_dir } =>
             vm_cmd(&action, &args, kind, root, &lists, yes, !no_wait, url, api_key, &models_dir),

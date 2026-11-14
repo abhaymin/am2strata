@@ -236,8 +236,10 @@ fn pr12_a_malformed_host_never_panics_the_server() {
             // hyper may refuse a Host it cannot parse before am2Strata sees it (400), or close: both are fine
             if let Some((status, head)) = got {
                 assert!(status < 500, "Host {host:?} on the {what} server: {status}\n{head}");
-                assert!(!head.contains("location:") || head.contains("location: https://localhost") || head.contains("location: https://[::1]")
-                        || head.contains("location: https://127."), "Host {host:?} on the {what} server was redirected:\n{head}");
+                // a redirect, if any, goes to this PC only: localhost or an IP literal, never a name the Host carried in
+                let target = head.lines().find_map(|l| l.strip_prefix("location: https://")).map(|t| t.split('/').next().unwrap_or("").to_string());
+                assert!(target.as_deref().is_none_or(|t| t.starts_with("localhost") || t.chars().all(|c| c.is_ascii_hexdigit() || ":.[]".contains(c))),
+                        "Host {host:?} on the {what} server was redirected to {target:?}:\n{head}");
             }
         }
     }
@@ -373,6 +375,13 @@ fn pr13_pr15_a_client_key_is_refused_on_every_owner_route() {
         ("POST", "/config", Some(json!({"set": {"api_monitor": true}}))), ("GET", "/api/clients", None), ("GET", "/api/tls", None),
         ("POST", "/api/tls", Some(json!({"action": "off"}))), ("POST", "/api/models/unload", None), ("POST", "/unload", None),
         ("GET", "/api/mcp/servers", None), ("POST", "/api/run", Some(json!({"code": "print(1)"}))), ("GET", "/metrics", None),
+        ("GET", "/api/keys", None), ("POST", "/api/keys", Some(json!({"name": "mine"}))), ("GET", "/api/usage", None),
+        #[cfg(target_os = "linux")]
+        ("GET", "/api/vm", None),
+        #[cfg(target_os = "linux")]
+        ("POST", "/api/vm", Some(json!({"action": "start"}))),
+        #[cfg(target_os = "linux")]
+        ("POST", "/api/vm/exec", Some(json!({"command": "id"}))),
     ] {
         let mut q = Req::new(method, &s.base, path).key(Some(CLIENT_KEY));
         if let Some(b) = &body {
@@ -393,6 +402,44 @@ fn pr13_pr15_a_client_key_is_refused_on_every_owner_route() {
     // either the request is the owner's (200) or it is refused, never half of each
     let a = Req::new("GET", &s.base, "/settings").key(Some(CLIENT_KEY)).header("x-api-key", WRONG_KEY).send();
     assert_eq!(a.status, 401);
+}
+
+// =====================================================================================================================
+// PR #18, #19 — the sandbox VM, API keys
+// =====================================================================================================================
+
+/// PR #19: a key made at run time is a client profile's key: it opens the model APIs and nothing of the owner's (not
+/// the keys themselves, not the VM, not settings); it is told once and never listed; revoked, it opens nothing at all.
+#[test]
+fn pr19_a_generated_key_is_a_client_key_and_a_revoked_one_opens_nothing() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    let (code, made) = s.post("/api/keys", &json!({"name": "regress"}));
+    assert_eq!(code, 201, "{made}");
+    let (key, id) = (made["key"].as_str().unwrap().to_string(), made["id"].as_str().unwrap().to_string());
+    assert_eq!(get(&s, "/v1/models", Some(&key)).status, 200, "the new key opens the model APIs");
+    assert_eq!(get(&s, "/v1/usage", Some(&key)).status, 200, "and its own usage");
+    for path in ["/api/keys", "/api/usage", "/settings", "/config", "/v1/workshop/files", "/api/computer/status", "/api/clients", "/api/vm"] {
+        assert_eq!(get(&s, path, Some(&key)).status, 401, "{path} with a generated key");
+    }
+    for (method, path) in [("POST", "/api/keys"), ("POST", &*format!("/api/keys/{id}")), ("DELETE", &*format!("/api/keys/{id}"))] {
+        let a = Req::new(method, &s.base, path).key(Some(&key)).json(&json!({"name": "more"})).send();
+        assert_eq!(a.status, 401, "{method} {path}: a key may not make, change or revoke keys (itself included)");
+    }
+    // the key is told once: no listing holds it, nor anything it could be rebuilt from
+    let list = get(&s, "/api/keys", Some(KEY));
+    assert_eq!(list.status, 200);
+    assert!(!list.text.contains(&key) && !list.text.contains(&key[8..]) && !list.text.contains("\"hash\""), "the listing holds a key or its hash");
+    let on_disk = std::fs::read_to_string(s.dir.join("api-keys.json")).unwrap_or_default();
+    assert!(!on_disk.contains(&key[8..]), "the key itself is not kept on disk");
+    // revoked: refused everywhere, at once
+    let (code, r) = s.delete(&format!("/api/keys/{id}"));
+    assert_eq!(code, 200, "{r}");
+    for path in ["/v1/models", "/v1/usage", "/api/keys"] {
+        assert_eq!(get(&s, path, Some(&key)).status, 401, "{path} with a revoked key");
+    }
+    let a = Req::new("POST", &s.base, "/v1/chat/completions").key(Some(&key)).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send();
+    assert_eq!(a.status, 401, "a chat with a revoked key: {}", a.text);
+    assert_eq!(get(&s, "/v1/models", Some(KEY)).status, 200, "the owner's key is untouched");
 }
 
 // =====================================================================================================================
@@ -605,8 +652,13 @@ fn the_fixture_gates_and_unit_regressions_still_exist() {
         // commit dae5323: computer.max_steps clamped, not truncated; PR #12: the plain-HTTP policy and HSTS values
         ("am2strata/src/computer/settings.rs", &["fn max_steps_is_clamped_not_truncated"][..]),
         ("am2strata/src/server_tls.rs", &["fn plain_http_policy", "fn hsts_value"][..]),
-        // PR #16: upload names; PR #14: the sandbox display never comes from the environment
+        // PR #16: upload names
         ("am2strata/src/workshop.rs", &["fn upload_names_are_made_safe"][..]),
+        // PR #18 (commit 9812a60): the VM's RFB client refuses an oversized screen, at the handshake and at a resize
+        ("am2strata/src/computer/vm/rfb.rs", &["fn sizes_from_the_guest_are_bounded", "fn regress_pr18_an_oversized_screen_is_refused_at_the_handshake",
+                                               "fn regress_pr18_an_oversized_resize_or_rectangle_stops_the_reader"][..]),
+        // PR #19: a key is told once and only its hash is kept
+        ("am2strata/src/api_keys.rs", &["fn a_key_is_told_once_and_only_its_hash_is_kept"][..]),
     ] {
         let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         for t in tests {

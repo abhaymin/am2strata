@@ -1,18 +1,9 @@
 {
-  "adapted": [
-    "string"
-  ],
+  "adapted": "string",
   "alerts": "int",
   "hardware": {
     "cpus": "int",
-    "gpus": [
-      {
-        "arch": "int",
-        "index": "int",
-        "name": "string",
-        "vram_mib": "int"
-      }
-    ],
+    "gpus": "string",
     "ram_mib": "int"
   },
   "image_generation": "bool",

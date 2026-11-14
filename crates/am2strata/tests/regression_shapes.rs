@@ -179,7 +179,13 @@ fn ok_stream(a: &Answer) -> Vec<(String, Value)> {
 fn openai_models_and_health() {
     let s = Server::start(&[Model::default()], &[ids(ANSWER)], json!({}));
     check_golden("openai_models", &named_shape(&ok_json(&Req::new("GET", &s.base, "/v1/models").key(Some(KEY)).send())));
-    check_golden("health", &named_shape(&ok_json(&Req::new("GET", &s.base, "/health").send())));
+    // /health also tells this PC's hardware: lists whose items depend on the machine (no GPU on a CI runner) are
+    // checked to be lists and left out of the shape
+    let mut h = ok_json(&Req::new("GET", &s.base, "/health").send());
+    assert!(h["hardware"]["gpus"].is_array() && h["adapted"].is_array(), "{h}");
+    h["hardware"]["gpus"] = json!("(a list: this PC's)");
+    h["adapted"] = json!("(a list: this PC's)");
+    check_golden("health", &named_shape(&h));
 }
 
 #[test]

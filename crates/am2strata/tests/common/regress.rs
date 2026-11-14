@@ -100,24 +100,20 @@ impl<'a> Req<'a> {
     }
 }
 
-/// Every route main.rs registers, as (METHOD, path pattern): `.route("…", get(..).post(..))` one per method,
-/// `.route_service` and `.nest_service` as GET. Panics if main.rs builds its router in a way this cannot read
-/// (a merged or nested sub-router), so such a change is taught to the suite rather than slipping past it.
-pub fn routes_in_main() -> BTreeSet<(String, String)> {
-    let main = include_str!("../../src/main.rs");
-    let app = main.split("let app = Router::new()").nth(1).expect("main.rs builds `let app = Router::new()`")
-        .split(".with_state(").next().expect("the router ends in .with_state(");
-    let code: String = app.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
-    for sub in [".merge(", ".nest(", ".fallback(", ".fallback_service(", ".route_layer("] {
-        assert!(!code.contains(sub), "main.rs now uses `{sub}`: teach tests/common/regress.rs::routes_in_main to read its routes \
-                                       (and add them to the table in tests/regression_api.rs)");
-    }
-    let mut out = BTreeSet::new();
+/// Sub-routers main.rs merges in, each with the file and function that builds it (the Linux one where there are
+/// two). A merge that is not listed here fails `routes_in_main`, so its routes cannot go unread.
+const MERGED: &[(&str, &str, &str)] = &[
+    (".merge(computer::vm_routes())", "computer/mod.rs", "#[cfg(target_os = \"linux\")]\npub fn vm_routes()"),
+];
+
+/// The (METHOD, path) of every `.route("…", get(..).post(..))`, `.route_service` and `.nest_service` in `code`.
+fn routes_in(code: &str, out: &mut BTreeSet<(String, String)>) {
+    let code: String = code.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
     let method_re = regex::Regex::new(r"\b(get|post|put|delete|patch|head|options|any)\(").unwrap();
     for part in code.split(".route(\"").skip(1) {
         let (path, rest) = part.split_once('"').expect("a path");
-        // up to the next builder call that is not a method of this route
-        let rest = rest.split("\n").next().unwrap_or("");
+        // each route is written on one line
+        let rest = rest.split('\n').next().unwrap_or("");
         let methods: Vec<String> = method_re.captures_iter(rest).map(|c| c[1].to_uppercase()).collect();
         assert!(!methods.is_empty(), "no method read for route {path:?}: {rest}");
         for m in methods {
@@ -131,10 +127,41 @@ pub fn routes_in_main() -> BTreeSet<(String, String)> {
             out.insert(("GET".to_string(), path.to_string()));
         }
     }
+}
+
+fn src() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// Every route the server registers, as (METHOD, path pattern): main.rs's own and those of the sub-routers it merges
+/// (`MERGED`). Panics if main.rs builds its router in a way this cannot read (an unlisted merge, a nested router, a
+/// fallback), so such a change is taught to the suite rather than slipping past it.
+pub fn routes_in_main() -> BTreeSet<(String, String)> {
+    let main = std::fs::read_to_string(src().join("main.rs")).expect("src/main.rs");
+    let app = main.split("let app = Router::new()").nth(1).expect("main.rs builds `let app = Router::new()`")
+        .split(".with_state(").next().expect("the router ends in .with_state(");
+    let mut code: String = app.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    let mut out = BTreeSet::new();
+    for (merge, file, func) in MERGED {
+        assert!(code.contains(merge), "main.rs no longer has `{merge}`: remove it from MERGED in tests/common/regress.rs");
+        code = code.replace(merge, "");
+        let text = std::fs::read_to_string(src().join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        let body = text.split(func).nth(1).unwrap_or_else(|| panic!("{file} no longer has `{func}`: update MERGED in tests/common/regress.rs"));
+        // the function's body: up to the first line that is only its closing brace
+        let body = body.split("\n}\n").next().unwrap_or("");
+        let before = out.len();
+        routes_in(body, &mut out);
+        assert!(out.len() > before, "no routes read from {file}'s `{func}`");
+    }
+    for sub in [".merge(", ".nest(", ".fallback(", ".fallback_service(", ".route_layer("] {
+        assert!(!code.contains(sub), "main.rs now uses `{sub}` in a way the regression suite does not know: list it in MERGED in \
+                                       tests/common/regress.rs (so its routes are read) and add the routes to the table in tests/regression_api.rs");
+    }
+    routes_in(&code, &mut out);
     out
 }
 
-/// Routers built anywhere else in the server's sources (outside tests): none are expected.
+/// Routers built anywhere else in the server's sources (outside unit tests and the files in `MERGED`): none are expected.
 pub fn routers_outside_main() -> Vec<String> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
@@ -146,19 +173,20 @@ pub fn routers_outside_main() -> Vec<String> {
             }
         }
     }
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = src();
     let mut files = Vec::new();
     walk(&src, &mut files);
     let mut found = Vec::new();
     for f in files {
-        if f.file_name().and_then(|n| n.to_str()) == Some("main.rs") {
+        let rel = f.strip_prefix(&src).unwrap_or(&f).display().to_string().replace('\\', "/");
+        if rel == "main.rs" || MERGED.iter().any(|(_, file, _)| *file == rel) {
             continue;
         }
         let text = std::fs::read_to_string(&f).unwrap_or_default();
         // unit tests (after `#[cfg(test)]`) may build a router of their own
         let live = text.split("#[cfg(test)]").next().unwrap_or("");
         if live.contains("Router::new()") {
-            found.push(f.strip_prefix(&src).unwrap_or(&f).display().to_string());
+            found.push(rel);
         }
     }
     found

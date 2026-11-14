@@ -310,6 +310,9 @@ Logs: each model's engine log is the config's `log` file. The server logs to the
 ## Releases and CI
 
 - **`.github/workflows/ci.yml`:** Linux tests, on code changes only. A new push cancels the run it replaces.
+- **The regression suite** ([REGRESSION.md](REGRESSION.md)): a contract row for every route, golden response shapes, a test for
+  every bug fixed before. After an update, check the running server: `deploy/regression.sh --url http://127.0.0.1:8000 --live-only`
+  (3 short model calls, no changes).
 - **`.github/workflows/release.yml`:** builds and tests Linux, Windows and macOS on a `v*` tag, then leaves a draft release to
   publish by hand. Linux builds on Ubuntu 22.04 so that its binaries run on older systems. Run it by hand from the Actions tab to
   check all three before tagging; that publishes nothing.
