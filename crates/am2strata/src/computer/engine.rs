@@ -140,6 +140,8 @@ fn error_result(text: String, ms: u64) -> Value {
         /// the idle watcher for the sandbox desktop: it stops the display after 10 min quiet, then frees this slot on exit so a
         /// restarted display gets a fresh one; `None` means none is alive (at most one at a time), and the Arc lets it clear the slot itself.
         watchdog: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
+        /// the operator took control in the Computer tab: the agent's steps wait until it is handed back
+        human: std::sync::atomic::AtomicBool,
     }
 
     impl Computers {
@@ -149,7 +151,8 @@ fn error_result(text: String, ms: u64) -> Value {
             let mode = config.computer.mode;
             let size = Size::parse(config.computer.display_size.as_deref());
             let (backend, desktop) = select_backend(mode, size);
-            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), steps: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: Arc::new(std::sync::Mutex::new(None)) }
+            Computers { config, started_at: Instant::now(), grants: tokio::sync::Mutex::new(HashMap::new()), steps: tokio::sync::Mutex::new(HashMap::new()), backend, desktop, watchdog: Arc::new(std::sync::Mutex::new(None)),
+                        human: std::sync::atomic::AtomicBool::new(false) }
         }
 
     /// Whether desktop use is on AND this computer has a backend (so the tools can be offered). Off by default. On a sandbox
@@ -167,6 +170,15 @@ fn error_result(text: String, ms: u64) -> Value {
     /// `conv` is the conversation (its once-per-job grant). The job's clock is this store's start and now, for the
     /// preset's time limit. Each step also returns a screenshot, like the browser's.
     pub async fn step(&self, conv: &str, name: &str, args: &Value, id: &str, tx: &mpsc::Sender<RunEvent>) -> Value {
+        // the operator has control (Computer tab): wait until it is handed back, up to 30 minutes, so the agent never
+        // acts on the desktop while a person is using it
+        let t0 = Instant::now();
+        while self.human_in_control() {
+            if t0.elapsed() > Duration::from_secs(30 * 60) || tx.is_closed() {
+                return error_result("error: the operator still has control of the desktop; the step was not run".into(), 0);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
         // arm the idle watcher so a sandbox display is stopped after 10 minutes with no step (item 1); a non-sandbox server has none
         self.arm_watchdog();
         let rules = self.config.rules.rule_set(self.computer_apps());
@@ -182,6 +194,37 @@ fn error_result(text: String, ms: u64) -> Value {
         let mut step_counts = self.steps.lock().await;
         run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, disp_size, started_at, now, tx).await
     }
+
+    /// The Computer tab's view: the sandbox desktop (started if it is not running), when this server has one.
+    pub fn sandbox_display(&self) -> Result<String, String> {
+        if !self.config.computer.use_ {
+            return Err("computer use is off (Settings › Computer and browser use)".into());
+        }
+        let d = self.desktop.as_ref().ok_or("this computer has no sandbox desktop (computer use mode is not \"sandbox\", or Xvfb/xdotool are missing)")?;
+        let disp = d.ensure()?;
+        self.arm_watchdog();
+        Ok(disp)
+    }
+
+    /// Keep the sandbox desktop from being stopped as idle while someone watches it.
+    pub fn touch(&self) {
+        if let Some(d) = &self.desktop {
+            let _ = d.ensure();
+        }
+    }
+
+    /// The server is stopping: stop the sandbox desktop (its Xvfb and everything on it).
+    pub fn shutdown(&self) {
+        if let Some(d) = &self.desktop {
+            d.stop();
+        }
+    }
+
+    pub fn human_in_control(&self) -> bool { self.human.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn set_human(&self, on: bool) { self.human.store(on, std::sync::atomic::Ordering::SeqCst) }
+    pub fn mode_name(&self) -> &'static str { self.config.computer.mode.as_str() }
+    pub fn apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
+    pub fn is_on(&self) -> bool { self.config.computer.use_ }
 
     fn computer_apps(&self) -> Vec<String> { self.config.computer.apps.clone() }
     fn computer_mode(&self) -> Mode { self.config.computer.mode }
@@ -247,6 +290,25 @@ fn select_backend(_mode: Mode, _size: Size) -> (Option<Box<dyn Backend + Send + 
 
 #[cfg(test)]
 mod tests {
+    /// While the operator has the desktop (the Computer tab's "Take control"), the agent's steps wait; handing it back
+    /// lets them go on. (What the step then does depends on this machine: what matters is when it runs.)
+    #[tokio::test]
+    async fn the_agent_waits_while_the_operator_has_control() {
+        let c = std::sync::Arc::new(Computers::new(Config::default()));
+        c.set_human(true);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let c2 = c.clone();
+        let t0 = Instant::now();
+        let step = tokio::spawn(async move { c2.step("conv", "computer_screenshot", &json!({}), "id", &tx).await });
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!step.is_finished(), "the step waits while the operator has control");
+        c.set_human(false);
+        let r = tokio::time::timeout(Duration::from_secs(5), step).await.expect("it goes on once handed back").unwrap();
+        assert!(t0.elapsed() >= Duration::from_millis(1200));
+        // it ran only after the hand-back (with or without a desktop on this machine)
+        assert!(r.is_object(), "{r}");
+    }
+
     use super::*;
     use crate::computer::backend::{Buffer, Button, Key, Window, WindowId};
     use std::cell::RefCell;

@@ -298,6 +298,28 @@ the server at start with the reason, so it never runs on plain HTTP by surprise.
 **Alternative:** `tailscale serve --https=443 http://127.0.0.1:8000` puts Tailscale's own HTTPS in front of
 am2Strata without changing it.
 
+## The Computer tab: see and use the desktop
+
+With computer use on in sandbox mode (Settings › Computer and browser use), the **Computer** tab shows the private
+desktop am2Strata works on — a virtual X display of its own, never this PC's screen — live, and lets you use it:
+
+- **Take control** to use it with your own mouse and keyboard (for a sign-in, a setting, a fix the job needs). While
+  you have it, am2Strata's computer steps wait; **Hand back** lets the job go on. Closing the tab hands it back.
+- **Paste to desktop** / **Copy from desktop** move text between your clipboard and the desktop's. The browser lets a
+  page use your clipboard only over HTTPS (see above); on plain HTTP you get a box to paste into instead.
+- **Open an app** starts one of the allowed apps (Settings › Computer and browser use › Allowed apps) on that desktop.
+- **Screenshot** saves what you see.
+
+It needs `xvfb`, `xdotool` and `xclip` (`sudo apt install xvfb xdotool xclip`). Apps run on the sandbox display with
+your environment minus everything that would reach your real session (Wayland, the session bus), so a window can
+never open on your own screen. **Use a non-snap browser there** (Mozilla's .deb Firefox, Google Chrome or Chromium
+from a .deb): the snap Firefox is confined to your real display and cannot open on the sandbox. GNOME apps (Text
+Editor, Files, Calculator) work as they are.
+
+From a terminal: `am2strata-run computer status | screenshot desk.png | take | give | copy | paste "text" |
+type "text" | open <app>`. The stream is a WebSocket (`wss://` on the HTTPS port); only the server's own key opens it,
+and only from am2Strata's own page.
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your
