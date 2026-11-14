@@ -32,6 +32,8 @@ server can run on the same machine (one at a time).
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
 support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and settings.
 
+![am2Strata v0.1.8 at a glance, in nine cards. Four API families: OpenAI, Anthropic, Responses and Gemini. Web app: chat with a live canvas, monitor, settings. Workshop: Hugging Face to GGUF, quantize, merge a LoRA adapter, training data. Sandbox VM (Linux with KVM): computer use in its own Debian VM. Computer tab (Linux): watch and take control of the agent's desktop. Security: HTTPS and wss, API keys with limits, usage per key. One live channel: a single WebSocket for pushes and requests. Media (build from source): songs, voices, images, video, speech to text. Install and verify: one line on six platforms, doctor and regression commands.](docs/media/infographic.webp)
+
 **New in v0.1.8** ([release notes](docs/releases/v0.1.8.md)):
 
 | | |
