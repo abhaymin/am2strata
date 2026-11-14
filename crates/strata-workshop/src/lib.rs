@@ -18,6 +18,7 @@ pub mod convert;
 pub mod dataset;
 pub mod lora;
 pub mod merge;
+pub mod naming;
 pub mod quantize_gguf;
 pub mod safetensors_io;
 pub mod train;
