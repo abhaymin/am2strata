@@ -9,8 +9,13 @@
 //! quantizer, LoRA train, merge, convert, quantize, ONNX, GGUF→safetensors, strata-ready, dataset, API. See
 //! `docs/MODEL-WORKSHOP-PLAN.md`.
 
+//! Capabilities: a 16-bit base trains (LoRA adapters, merged into the base), converts to GGUF, and quantizes. Training a
+//! **4-bit** base is not ready — [`QLORA_READY`] records that so nothing pretends it trains on 4-bit bases today.
+pub const QLORA_READY: bool = false;
+
 pub mod checkpoint;
 pub mod lora;
+pub mod merge;
 pub mod safetensors_io;
 pub mod train;
 pub mod testmodel;
