@@ -8,6 +8,7 @@
 mod agents;
 mod cluster;
 mod cluster_tls;
+mod server_tls;
 mod machine;
 mod optimizer;
 mod clients;
@@ -400,6 +401,8 @@ async fn main() -> Result<()> {
     let extra_hosts: Vec<String> = first.cfg.rest.get("allowed_hosts").and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let hosts = Hosts::new(&trusted_origins, &extra_hosts);
+    // HTTPS (server_tls.rs): checked now so a wrong "tls" block stops the start; turned on once the app exists
+    let tls_cfg = server_tls::Config::from_config(&first.cfg.rest).map_err(anyhow::Error::msg)?;
     tracing::info!("answering to IP addresses, localhost and {}", hosts.0.join(", "));
     let loopback = matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost");
     let flag = |k: &str| first.cfg.rest.get(k).and_then(|v| v.as_bool());
@@ -549,6 +552,7 @@ async fn main() -> Result<()> {
         .route("/unload", post(api_monitor::unload))
         .route("/settings", get(web::settings_get).post(web::settings_post))
         .route("/config", get(web::config_get).post(web::config_post))
+        .route("/api/tls", get(web::tls_get).post(web::tls_post))
         .route("/mcp", get(web::mcp))
         .route("/api/mcp/servers", get(mcp_api::list).post(mcp_api::add))
         .route("/api/mcp/servers/test", post(mcp_api::test))
@@ -589,12 +593,25 @@ async fn main() -> Result<()> {
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         // a handler that panics is answered with a JSON error, never a dropped connection
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))
+        // HTTPS: HSTS on TLS responses; plain HTTP from elsewhere than this PC sent to HTTPS (server_tls.rs). Inside
+        // check_host, so a redirect only ever names a host this server answers to (no open redirect via a forged Host)
+        .layer(axum::middleware::from_fn(server_tls::security_headers))
+        .layer(axum::middleware::from_fn(server_tls::http_policy))
         .layer(axum::middleware::from_fn_with_state(hosts, check_host))
         // a TLS peer's pin (cluster_tls.rs): set only for the cluster listener's requests, removed from all others
         .layer(axum::middleware::from_fn(cluster_tls::peer_header))
         .with_state(state);
     // a worker: the encrypted listener for its paired masters (the same app)
     cluster.serve_tls(app.clone(), host.clone(), port);
+    // HTTPS: the same app over TLS on its own port (8001 by default), changeable later from Settings or the CLI
+    let worker_tls = if cluster.role == cluster::Role::Worker { cluster.tls_port(port) } else { None };
+    let tls_rt = server_tls::Runtime::init(expand(&args.data_dir), host.clone(), port, worker_tls);
+    tls_rt.set_app(app.clone());
+    if tls_cfg.is_some() {
+        if let Err(e) = tls_rt.apply(tls_cfg).await {
+            tracing::error!("https: not started: {e} (plain HTTP keeps working as before)");
+        }
+    }
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await.with_context(|| format!("bind {host}:{port}"))?;
     tracing::info!("listening on http://{host}:{port}/ (web app from {}), API at /v1", web_dir.display());
     // each request's address is known (adding a command MCP server is allowed only from this PC)
