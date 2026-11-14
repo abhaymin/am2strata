@@ -33,3 +33,10 @@ pinned by strata-pack's `quant-*.gguf`).
 The wide fixture `tiny-llama-256-hf/` (hidden 256, 16 heads, intermediate 512, 1 layer) converted to F32 by llama.cpp's
 converter (pre forced to gpt-2, as above), then `llama-quantize --pure` per type, by the reviewer. Every 2-D weight's
 rows hold whole 32/256 blocks, so all 9 matrices are really quantized (no fallback); norms stay F32.
+
+## tiny-llama-256.f32.gguf, tiny-llama-gqa.f32.gguf
+
+llama.cpp's converter output (pre forced to gpt-2, as above) for `tiny-llama-256-hf/` (16 heads, 16 kv heads) and
+`tiny-llama-gqa-hf/` (16 heads, 4 kv heads; written by `cargo run -p strata-workshop --example write-tiny-gqa-hf`), by
+the reviewer. They pin the q/k rotary permute with the real head counts: q by `num_attention_heads`, k by
+`num_key_value_heads`. (Step 6 first passed with a hardcoded head count of 2, which the 2-head tiny model could not show.)
