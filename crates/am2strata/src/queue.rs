@@ -184,6 +184,7 @@ impl Drop for Pass {
         }
         drop(s);
         self.q.changed.notify_waiters();
+        crate::live_channel::poke();
     }
 }
 
@@ -199,6 +200,7 @@ impl Drop for Waiting<'_> {
         if !self.done {
             self.q.state.lock().unwrap().queue.retain(|t| t.id != self.id);
             self.q.changed.notify_waiters();
+            crate::live_channel::poke();
         }
     }
 }
@@ -345,6 +347,7 @@ impl Queue {
                                        priority: current_priority(), client: current_client() });
             id
         };
+        crate::live_channel::poke();
         let mut w = Waiting { q: self, id, done: false };
         let since = Instant::now();
         let mut told = 0usize;
@@ -362,6 +365,7 @@ impl Queue {
                     if pos > 0 { s.batched += 1 } else { s.batched = 0 }
                     s.running = Some((id, t.need, t.kind, t.label, Instant::now()));
                     w.done = true;
+                    crate::live_channel::poke();
                     return Ok(Pass { q: self.clone(), id });
                 }
                 // its place in the order the jobs will run (priorities included), told outside the lock (the
@@ -391,6 +395,7 @@ impl Queue {
     pub fn set_resident(&self, r: Resident) {
         self.state.lock().unwrap().resident = r;
         self.changed.notify_waiters();
+        crate::live_channel::poke();
     }
 
     pub fn resident(&self) -> Resident {

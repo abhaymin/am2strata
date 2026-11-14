@@ -57,7 +57,7 @@ pub struct Job {
 }
 
 impl Job {
-    fn view(&self, with_log: bool) -> Value {
+    pub fn view(&self, with_log: bool) -> Value {
         let mut v = json!({"id": self.id, "kind": self.kind, "state": self.state, "request": self.request,
                            "output": self.output.display().to_string(), "queued_at": self.queued_at,
                            "started_at": self.started_at, "finished_at": self.finished_at, "error": self.error,
@@ -350,6 +350,7 @@ impl Workshop {
         if let Some(j) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
             f(j);
         }
+        crate::live_channel::poke();
     }
 
     async fn run(self: Arc<Self>, id: u64, exe: PathBuf) {

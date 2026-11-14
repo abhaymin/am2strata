@@ -745,6 +745,12 @@ impl Jobs {
         None
     }
 
+    /// The newest jobs as GET /v1/media/jobs/{id} shows each (the live channel's "jobs" topic), newest first.
+    pub fn newest(&self, max: usize) -> Vec<Value> {
+        let ids: Vec<String> = self.jobs.lock().unwrap().values().rev().take(max).map(|j| j.id.clone()).collect();
+        ids.iter().filter_map(|id| self.status(id)).collect()
+    }
+
     fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();
