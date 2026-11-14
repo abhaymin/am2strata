@@ -639,7 +639,11 @@ body.resizing iframe { pointer-events: none; }
 .cv-spacer { flex: 1; }
 .cv-screen { flex: 1; min-height: 0; display: flex; align-items: flex-start; justify-content: center; overflow: auto;
   background: var(--color-surface-2, #111); border-radius: .5rem; }
-#cv-canvas { max-width: 100%; max-height: 100%; height: auto; outline: none; cursor: not-allowed; image-rendering: auto; }
+#cv-canvas { max-width: 100%; max-height: 100%; outline: none; cursor: not-allowed; image-rendering: auto; }
+/* the picture fills the space it has (its size is set by cvFit, keeping its shape); on the whole screen it is centred */
+.cv-screen { align-items: center; }
+.cv-screen:fullscreen { background: #000; border-radius: 0; }
+.cv-screen:fullscreen #cv-canvas.cv-live { box-shadow: none; }
 #cv-canvas.cv-live { cursor: default; box-shadow: 0 0 0 2px var(--color-accent, #4ade80); }
 
 /* Computer tab: the sandbox VM's panel */
@@ -678,3 +682,8 @@ body.resizing iframe { pointer-events: none; }
 .usage-scroll { width: 0; min-width: 100%; overflow-x: auto; }
 .usage-table th, .usage-table td { padding: 8px 10px; white-space: nowrap; }
 .usage-table td:first-child { white-space: normal; overflow-wrap: anywhere; min-width: 110px; }
+/* the VM's panel never grows past part of the window: each card keeps its own height and scrolls inside itself, so the
+   long app list does not push the desktop off the page or stretch the cards beside it */
+.cv-vm__more { align-items: start; }
+.cv-vm__more > .st-card { max-height: min(24rem, 42vh); overflow-y: auto; overscroll-behavior: contain; }
+.cv-vm__log { overscroll-behavior: contain; }
