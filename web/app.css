@@ -593,3 +593,12 @@ body.resizing iframe { pointer-events: none; }
 .tls-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .75rem; margin: .75rem 0; }
 .st-card--inner { margin: 0; display: flex; flex-direction: column; gap: .4rem; }
 .st-card--inner > .st-btn { align-self: flex-start; margin-top: auto; }
+
+/* Computer tab: the desktop scaled to the width, the bar above it */
+.cv { display: flex; flex-direction: column; gap: .6rem; padding: .75rem 1rem; height: 100%; min-height: 0; }
+.cv-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.cv-spacer { flex: 1; }
+.cv-screen { flex: 1; min-height: 0; display: flex; align-items: flex-start; justify-content: center; overflow: auto;
+  background: var(--color-surface-2, #111); border-radius: .5rem; }
+#cv-canvas { max-width: 100%; max-height: 100%; height: auto; outline: none; cursor: not-allowed; image-rendering: auto; }
+#cv-canvas.cv-live { cursor: default; box-shadow: 0 0 0 2px var(--color-accent, #4ade80); }

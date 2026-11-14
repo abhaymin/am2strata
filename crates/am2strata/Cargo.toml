@@ -52,9 +52,15 @@ libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 [dev-dependencies]
+# the Computer tab's WebSocket, from the tests
+tungstenite = "0.28"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 jsonschema = { version = "0.30", default-features = false }
 # web_assets: check the client JS this box serves, since it has no node to parse it (no duplicate top-level declarations)
 regex = "1"
+
+# the Computer tab: frames from the sandbox's own X display and the operator's input into it (pure-Rust X client)
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

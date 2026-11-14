@@ -200,9 +200,7 @@ mod linux {
             // run on this display; an app not installed (NotFound) is a clear "is it in the allow list?" message. Pin DISPLAY and
             // drop WAYLAND_DISPLAY so a Wayland-capable app cannot open on the real desktop instead of the sandbox.
             let disp = self.disp()?;
-            let mut cmd = std::process::Command::new(name);
-            cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-            let mut cmd = use_sandbox_display(cmd, &disp);
+            let mut cmd = sandbox_app(name, &disp);
             match cmd.spawn() {
                 Ok(_) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
@@ -432,6 +430,33 @@ mod linux {
     /// service runs with `DISPLAY=:0` / `WAYLAND_DISPLAY=wayland-0`, so a leaked DISPLAY would drive the owner's real screen),
     /// yet keep PATH so the binary resolves. Applies this pinned environment to any Command; xdotool reads its display only from
     /// DISPLAY, so no `-d` argument is needed or allowed anymore.
+    /// An app started on the sandbox display (the Computer tab's "Open an app" and the agent's `open_app`). It keeps the
+    /// user's environment (HOME and the rest: apps need them) but loses everything that leads to the real desktop session:
+    /// WAYLAND_DISPLAY (a window on the real screen), XAUTHORITY, and the session D-Bus — through which a browser finds an
+    /// instance already open on the real desktop and opens its window there. Toolkits are told to use X11. Firefox also
+    /// gets its own profile (in ~/snap/firefox/common for a snap Firefox, which may not write elsewhere) and no remote.
+    pub fn sandbox_app(name: &str, disp: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(name);
+        for k in ["WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN"] {
+            cmd.env_remove(k);
+        }
+        cmd.env("DISPLAY", disp).env("GDK_BACKEND", "x11").env("QT_QPA_PLATFORM", "xcb")
+            .env("MOZ_ENABLE_WAYLAND", "0").env("MOZ_DBUS_REMOTE", "0");
+        let base = std::path::Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name).to_string();
+        if base.starts_with("firefox") {
+            if let Some(home) = std::env::var_os("HOME") {
+                // a snap Firefox may only write in its own ~/snap/firefox (AppArmor), any other in ~/.local/share
+                let home = std::path::PathBuf::from(home);
+                let profile = if home.join("snap/firefox").is_dir() { home.join("snap/firefox/common/am2strata-sandbox-profile") }
+                              else { home.join(".local/share/am2strata/sandbox-firefox-profile") };
+                let _ = std::fs::create_dir_all(&profile);
+                cmd.arg("--no-remote").arg("--profile").arg(profile);
+            }
+        }
+        cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        cmd
+    }
+
     fn use_sandbox_display(mut cmd: std::process::Command, disp: &str) -> std::process::Command {
         // capture PATH before clearing (env_clear drops all inherited vars); DISPLAY is pinned to the sandbox display below.
         let path = std::env::var_os("PATH");
@@ -514,7 +539,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{LinuxBackend, SandboxDesktop};
+pub use linux::{sandbox_app, LinuxBackend, SandboxDesktop};
 
 // ------------------------------------------------------------------------------------------------- Non-Linux helpers
 

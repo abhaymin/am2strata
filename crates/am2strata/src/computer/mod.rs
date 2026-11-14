@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod engine;
+pub mod live;
 pub mod rules;
 pub mod settings;
 pub mod step;

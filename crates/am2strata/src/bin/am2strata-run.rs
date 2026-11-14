@@ -121,6 +121,19 @@ enum Cmd {
         #[arg(long, default_value_t = 8)]
         check_experts: usize,
     },
+    /// the Computer tab from a terminal: status | screenshot <file.png> | take | give | copy | paste <text>
+    /// | type <text> | open <app>  (the sandbox desktop computer use works on)
+    Computer {
+        action: String,
+        /// screenshot: the file; paste/type: the text; open: the app
+        arg: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// HTTPS on the running server, applied at once and kept in its run config:
     /// status | self-signed | tailscale | load --cert <pem> --key <pem> | renew | off
     Tls {
@@ -635,6 +648,7 @@ fn main() -> ExitCode {
         Cmd::MtpPack { src, experts, out, check_experts } => done(strata_pack::mtp_pack::run(&strata_pack::mtp_pack::Options {
             src: expand_path(&src), experts, out: expand_path(&out), check_experts })),
         Cmd::UpstreamCheck { manifest } => upstream_check(manifest),
+        Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
@@ -793,6 +807,58 @@ fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
     }
     let _ = child.wait();
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+/// `am2strata-run computer ...`: the Computer tab's REST side (/api/computer/*).
+fn computer_cmd(action: &str, arg: Option<String>, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+    let auth = |rb: reqwest::blocking::RequestBuilder| match &key { Some(k) => rb.bearer_auth(k), None => rb };
+    let need = |what: &str| arg.clone().ok_or_else(|| format!("computer {action} needs {what}"));
+    let result = (|| -> Result<(), String> {
+        let rb = match action {
+            "status" => client.get(format!("{url}/api/computer/status")),
+            "screenshot" => {
+                let file = need("a file name (e.g. desktop.png)")?;
+                let r = auth(client.get(format!("{url}/api/computer/screenshot"))).send().map_err(|e| format!("{url}: {e}"))?;
+                if !r.status().is_success() {
+                    let j: serde_json::Value = r.json().unwrap_or_default();
+                    return Err(j["error"]["message"].as_str().unwrap_or("failed").to_string());
+                }
+                let bytes = r.bytes().map_err(|e| e.to_string())?;
+                std::fs::write(&file, &bytes).map_err(|e| format!("{file}: {e}"))?;
+                println!("saved {file} ({} KB)", bytes.len() / 1024);
+                return Ok(());
+            }
+            "take" | "give" => client.post(format!("{url}/api/computer/control")).json(&serde_json::json!({"action": action})),
+            "copy" => client.get(format!("{url}/api/computer/clipboard")),
+            "paste" => client.post(format!("{url}/api/computer/clipboard")).json(&serde_json::json!({"text": need("the text")?})),
+            "type" => client.post(format!("{url}/api/computer/type")).json(&serde_json::json!({"text": need("the text")?})),
+            "open" => client.post(format!("{url}/api/computer/open")).json(&serde_json::json!({"app": need("an app name")?})),
+            other => return Err(format!("unknown action {other:?}: status, screenshot, take, give, copy, paste, type, open")),
+        };
+        let r = auth(rb).send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        let ok = r.status().is_success();
+        let j: serde_json::Value = r.json().unwrap_or_default();
+        if !ok {
+            return Err(j["error"]["message"].as_str().unwrap_or("failed").to_string());
+        }
+        match action {
+            "copy" => print!("{}", j["text"].as_str().unwrap_or("")),
+            "status" | "take" | "give" => println!("computer use: {}, mode {}, {}{}",
+                if j["on"] == true { "on" } else { "off" }, j["mode"].as_str().unwrap_or("?"),
+                if j["operator_in_control"] == true { "you have control" } else { "am2Strata may act" },
+                j["apps"].as_array().filter(|a| !a.is_empty()).map(|a| format!(", apps: {}", a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default()),
+            _ => println!("done"),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("computer: {e}"); ExitCode::from(1) }
+    }
 }
 
 /// `am2strata-run tls ...`: the same /api/tls the web app's Settings › Secure connection uses.
