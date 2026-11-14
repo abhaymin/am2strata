@@ -188,8 +188,20 @@ impl Server {
 }
 
 /// The server process over `dir` (its run configs, data and script).
+/// Stop a test server and everything it started (its own process group: an engine, a sandbox desktop's Xvfb), so a
+/// test never leaves processes behind even though it kills rather than asks.
+fn stop(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_am2strata"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_am2strata"));
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    cmd
             .args(["--models-dir"]).arg(&dir)
             .args(["--model", model, "--port", &port.to_string(), "--host", "127.0.0.1"])
             .arg("--web-dir").arg(extra.get("web_dir").and_then(|v| v.as_str()).map(PathBuf::from).unwrap_or_else(|| testdata().join("web")))
@@ -215,8 +227,7 @@ fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Ch
 impl Server {
     /// Stop the server and start it again on the same data folder and port (a restart, as the service does).
     pub fn restart(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop(&mut self.child);
         self.child = spawn(&self.dir, self.port, &self.model, &self.extra, &self.record);
         let t0 = Instant::now();
         while t0.elapsed() < Duration::from_secs(30) {
@@ -231,8 +242,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        stop(&mut self.child);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

@@ -262,7 +262,35 @@ mod linux {
     /// display number back on a pipe, so there is no window between choosing a number and starting Xvfb for another server to
     /// take it (and we never talk to a display we did not start). Returns the running child and the display name it wrote
     /// (`:NN`); `-nolisten tcp` keeps it off TCP, and if Xvfb exits early or writes nothing within 5 s this returns an error.
+    /// Sandbox displays left by an am2Strata that died without cleaning up (a crash, an out-of-memory kill, SIGKILL):
+    /// Xvfb with exactly our arguments whose parent is no longer an am2Strata server. Stopped before a new one starts,
+    /// so they do not pile up. Another running server's display (its parent is that server) is never touched.
+    fn reap_orphan_sandboxes() {
+        let Ok(rd) = std::fs::read_dir("/proc") else { return };
+        let me = unsafe { libc::getuid() };
+        for e in rd.flatten() {
+            let Ok(pid) = e.file_name().to_string_lossy().parse::<i32>() else { continue };
+            let Ok(cmd) = std::fs::read(format!("/proc/{pid}/cmdline")) else { continue };
+            let args: Vec<String> = cmd.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+            // our own: Xvfb -displayfd N -nolisten tcp -screen 0 WxHxD
+            if args.len() != 8 || !args[0].ends_with("Xvfb") || args[1] != "-displayfd" || args[3] != "-nolisten" || args[5] != "-screen" {
+                continue;
+            }
+            let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { continue };
+            let field = |k: &str| status.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u32>().ok());
+            if field("Uid:") != Some(me) {
+                continue;
+            }
+            let ppid = field("PPid:").unwrap_or(0);
+            let parent = std::fs::read_to_string(format!("/proc/{ppid}/comm")).unwrap_or_default();
+            if parent.trim() != "am2strata" {
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+            }
+        }
+    }
+
     fn start_sandbox_xvfb(size: Size) -> Result<(std::process::Child, String), String> {
+        reap_orphan_sandboxes();
         unsafe {
             // a pipe so Xvfb can write its chosen display number back on `-displayfd`; the read end is parsed below.
             let mut fds = [0i32; 2];
