@@ -685,6 +685,17 @@ impl LlamaModel {
         }
     }
 
+    /// Bytes the frozen base holds in memory right now (matrices in the base dtype, norms and biases in f32).
+    pub fn base_bytes(&self) -> u64 {
+        let size = |t: &Tensor| (t.elem_count() * t.dtype().size_in_bytes()) as u64;
+        let mut n = self.embed.as_ref().map_or(0, size) + self.lm_head.as_ref().map_or(0, size) + size(&self.norm);
+        for b in self.blocks.iter().flatten() {
+            n += b.lin.iter().map(|l| size(&l.w) + l.bias.as_ref().map_or(0, size)).sum::<u64>();
+            n += size(&b.norm1) + size(&b.norm2) + b.q_norm.as_ref().map_or(0, size) + b.k_norm.as_ref().map_or(0, size);
+        }
+        n
+    }
+
     /// Whether the embeddings and every block below the first trained one are in memory.
     pub fn has_lower(&self) -> bool {
         self.embed.is_some() && self.blocks.iter().take(self.first_trained).all(Option::is_some)
