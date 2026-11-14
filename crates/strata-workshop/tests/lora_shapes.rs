@@ -75,11 +75,17 @@ fn lora_output_is_base_plus_scaled_delta() -> Result<(), Box<dyn std::error::Err
     let base_out = x.matmul(&base_w.t()?).unwrap();
     assert!(max_abs_diff(&lora.forward(&x)?, &base_out) < 1e-4, "untrained adapter (B=0) must equal the frozen base");
 
-    // set a known B; A stays at its 0.5 initial value. The forward must be `base + scaling * (B A) x`.
+    // A is initialised Kaiming-uniform in ±1/sqrt(in), with distinct rows (a constant A would make the adapter rank 1)
+    let a = lora.a.as_tensor().clone();
+    let a_vals = a.flatten_all()?.to_vec1::<f32>()?;
+    let bound = 1.0 / (in_ as f32).sqrt();
+    assert!(a_vals.iter().all(|v| v.abs() <= bound), "A within ±1/sqrt(in)");
+    assert!(a_vals[..in_] != a_vals[in_..2 * in_], "A's rows differ");
+
+    // set a known B, keep that A. The forward must be `base + scaling * (B A) x`.
     let b_flat: Vec<f32> = (0..(out_ * r) as usize).map(|i| ((i % 5) as i32 - 2) as f32).collect();
     lora.set_b_values(&b_flat).unwrap();
 
-    let a = Tensor::from_vec(vec![0.5_f32; r * in_], (r, in_), &dev).unwrap();
     let b = Tensor::from_vec(b_flat, (out_, r), &dev).unwrap();
     let ba = b.matmul(&a)?; // [out, in]
     let exp_delta = (x.matmul(&ba.t()?)? * cfg.scaling() as f64)?;

@@ -45,21 +45,25 @@ impl TinyLlama {
     pub fn generate(&self) -> Vec<TensorData> {
         let mut gen = SplitMix64::new(self.seed);
         let mut out = Vec::new();
+        // realistic scales, so the model's outputs can move: norm gains 1.0 (as Llama initialises them), embeddings
+        // about ±1, projections about ±1/sqrt(fan-in). Everything at ±0.02, norm gains included, made the tied head's
+        // logits ~0.006, i.e. a uniform output no adapter could change.
+        let w = 1.0 / (self.hidden as f32).sqrt();
         // embeddings + output norm are shared across layers
-        out.push(TensorData { name: "model.embed_tokens.weight".into(), shape: vec![self.vocab_size, self.hidden], values: mat(&mut gen, self.vocab_size, self.hidden, 0.02) });
+        out.push(TensorData { name: "model.embed_tokens.weight".into(), shape: vec![self.vocab_size, self.hidden], values: mat(&mut gen, self.vocab_size, self.hidden, 1.0) });
         for layer in 0..self.num_layers {
             let p = |key: &str| format!("model.layers.{layer}.{key}");
-            out.push(TensorData { name: p("input_layernorm.weight"), shape: vec![self.hidden], values: vec_init(&mut gen, self.hidden, 0.02) });
-            out.push(TensorData { name: p("self_attn.q_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, 0.02) });
-            out.push(TensorData { name: p("self_attn.k_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, 0.02) });
-            out.push(TensorData { name: p("self_attn.v_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, 0.02) });
-            out.push(TensorData { name: p("self_attn.o_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, 0.02) });
-            out.push(TensorData { name: p("post_layernorm.weight"), shape: vec![self.hidden], values: vec_init(&mut gen, self.hidden, 0.02) });
-            out.push(TensorData { name: p("mlp.gate_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, 0.02) });
-            out.push(TensorData { name: p("mlp.up_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, 0.02) });
-            out.push(TensorData { name: p("mlp.down_proj.weight"), shape: vec![self.hidden, self.intermediate], values: mat(&mut gen, self.hidden, self.intermediate, 0.02) });
+            out.push(TensorData { name: p("input_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
+            out.push(TensorData { name: p("self_attn.q_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.k_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.v_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
+            out.push(TensorData { name: p("self_attn.o_proj.weight"), shape: vec![self.hidden, self.hidden], values: mat(&mut gen, self.hidden, self.hidden, w) });
+            out.push(TensorData { name: p("post_layernorm.weight"), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
+            out.push(TensorData { name: p("mlp.gate_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, w) });
+            out.push(TensorData { name: p("mlp.up_proj.weight"), shape: vec![self.intermediate, self.hidden], values: mat(&mut gen, self.intermediate, self.hidden, w) });
+            out.push(TensorData { name: p("mlp.down_proj.weight"), shape: vec![self.hidden, self.intermediate], values: mat(&mut gen, self.hidden, self.intermediate, 1.0 / (self.intermediate as f32).sqrt()) });
         }
-        out.push(TensorData { name: "model.norm.weight".into(), shape: vec![self.hidden], values: vec_init(&mut gen, self.hidden, 0.02) });
+        out.push(TensorData { name: "model.norm.weight".into(), shape: vec![self.hidden], values: vec![1.0; self.hidden] });
         out
     }
 
@@ -161,8 +165,4 @@ impl SplitMix64 {
 
 fn mat(gen: &mut SplitMix64, rows: usize, cols: usize, scale: f32) -> Vec<f32> {
     (0..rows * cols).map(|_| scale * (gen.next_f32() * 2.0 - 1.0)).collect()
-}
-
-fn vec_init(gen: &mut SplitMix64, len: usize, scale: f32) -> Vec<f32> {
-    (0..len).map(|_| scale * (gen.next_f32() * 2.0 - 1.0)).collect()
 }

@@ -68,9 +68,24 @@ impl LoraLinear {
     pub fn new(base_w: Tensor, cfg: &LoraConfig, dev: &Device) -> Res<Self> {
         let out = base_w.dim(0)?;
         let in_ = base_w.dim(1)?;
-        // A starts non-zero (constant), B at zero: the very first backward has a nonzero gradient on B so both learn,
-        // and untrained output equals the frozen base exactly.
-        let a = Var::from_slice(&vec![0.5_f32; cfg.r * in_], (cfg.r, in_), dev)?;
+        // A starts random, B at zero, as PEFT does: untrained output equals the frozen base exactly, and the first
+        // backward has a nonzero gradient on B. A is Kaiming-uniform in ±1/sqrt(in) (PEFT's kaiming_uniform_(a=√5)
+        // bound); a constant A would make every row equal and the adapter rank 1 whatever `r` is. Deterministic: the
+        // seed comes from the shapes and the frozen weight's first values, so each layer differs and runs repeat.
+        let first: Vec<f32> = base_w.flatten_all()?.narrow(0, 0, 8.min(out * in_))?.to_vec1::<f32>()?;
+        let mut seed = (cfg.r as u64) << 40 ^ (in_ as u64) << 20 ^ out as u64;
+        for v in first { seed = seed.rotate_left(13) ^ v.to_bits() as u64; }
+        let bound = 1.0 / (in_ as f32).sqrt();
+        let mut state = seed;
+        let a_init: Vec<f32> = (0..cfg.r * in_).map(|_| {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            let u = ((z ^ (z >> 31)) >> 40) as f32 / 16_777_216.0; // uniform [0, 1)
+            bound * (2.0 * u - 1.0)
+        }).collect();
+        let a = Var::from_slice(&a_init, (cfg.r, in_), dev)?;
         let b = Var::from_slice(&vec![0f32; out * cfg.r], (out, cfg.r), dev)?;
         Ok(Self { base_w, a, b, a_shape: (cfg.r, in_), b_shape: (out, cfg.r), scaling: cfg.scaling(), dev: dev.clone() })
     }
@@ -116,6 +131,11 @@ pub struct TinyLlama {
 }
 
 impl TinyLlama {
+    /// The device this model was built on.
+    pub fn device(&self) -> Device {
+        self.dev.clone()
+    }
+
     /// Assemble the model from a frozen base's tensors (`key -> weight tensor`) and LoRA config. Keys are an HF
     /// checkpoint's names: `model.embed_tokens.weight`, `model.layers.{i}.{input,output}_layernorm.weight`,
     /// `...self_attn.{q,k,v,o}_proj.weight`, `...mlp.{gate,up,down}_proj.weight`, `model.norm.weight`.
@@ -175,24 +195,33 @@ impl TinyLlama {
         let mean_sq = (summed * (1.0 / d))?;             // [rows, 1], mean of squares
         // normalized then gain-scaled: multiply by 1/sqrt(mean-of-squares); epsilon omitted (negligible for this proof)
         let inv_rms = mean_sq.powf(-0.5)?;               // [rows, 1]
-        let normed = x.mul(&inv_rms)?;                   // [rows, hidden] broadcasts over the trailing dim
-        normed.mul(gamma).map_err(Into::into)            // gain-scale: [rows, hidden] * [hidden] broadcasts to [rows, hidden]
+        let normed = x.broadcast_mul(&inv_rms)?;         // [rows, hidden], scales each row by its own rms
+        normed.broadcast_mul(gamma).map_err(Into::into)  // gain-scale: [rows, hidden] * [hidden] broadcasts to [rows, hidden]
     }
 
-    /// Multi-head attention with LoRA on q/k/v/o. This tiny proof model omits rotary embeddings (noted in the plan).
+    /// Multi-head attention with LoRA on q/k/v/o. Project the full hidden representation through the LoRA'd projections
+    /// (as in a real Llama), then split each projected output into heads for the scaled dot-product; rotary embeddings
+    /// are omitted here (noted in the plan).
     fn attn_layer(&self, x: &Tensor, li: usize) -> Res<Tensor> {
         let head_dim = self.hidden / self.num_heads;
         let scale = 1.0 / (head_dim as f32);
+        // project the full `[seq, hidden]` through the LoRA'd q/k/v/o, then split each into `num_heads` head slices
+        let q = self.attn[li][0].forward(x)?;
+        let k = self.attn[li][1].forward(x)?;
+        let v = self.attn[li][2].forward(x)?;
+        let qh = q.chunk(self.num_heads, 1)?;
+        let kh = k.chunk(self.num_heads, 1)?;
+        let vh = v.chunk(self.num_heads, 1)?;
+        // causal mask: position i attends to keys 0..=i only (a causal LM must not see the token it predicts)
+        let seq = x.dim(0)?;
+        let mask: Vec<f32> = (0..seq).flat_map(|i| (0..seq).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();
+        let mask = Tensor::from_vec(mask, (seq, seq), x.device())?;
         let mut out = Vec::with_capacity(self.num_heads);
         for h in 0..self.num_heads {
-            let xb = x.chunk(self.num_heads, 1)?; // split `[seq, hidden]` into `num_heads` head slices along dim 1
-            let q = self.attn[li][0].forward(&xb[h])?;
-            let k = self.attn[li][1].forward(&xb[h])?;
-            let v = self.attn[li][2].forward(&xb[h])?;
-            // scaled dot-product attention over the sequence dimension of keys/values
-            let scores = (q.matmul(&k.t()?)? * scale as f64)?; // `[seq, seq]`
+            // scaled dot-product attention over the sequence dimension of keys/values, future keys masked out
+            let scores = (qh[h].matmul(&kh[h].t()?)? * scale as f64)?.add(&mask)?; // `[seq, seq]`
             let a = softmax(&scores)?;
-            out.push(a.matmul(&v)?); // `[seq, head_dim]`
+            out.push(a.matmul(&vh[h])?); // `[seq, head_dim]`
         }
         let heads = Tensor::cat(&out, 1)?; // back to `[seq, hidden]`, then the (LoRA'd) o projection mixes heads out
         self.attn[li][3].forward(&heads)
@@ -205,7 +234,8 @@ impl TinyLlama {
         let u = x.matmul(&up.t()?)?;
         let up_g = silu(&g)?;
         let gated = up_g.mul(&u)?;
-        down.matmul(&gated).map_err(|e| anyhow!("mlp down: {e}").into())
+        // down_proj weight is `[intermediate, hidden]` applied as `gated @ down^T` → `[seq, hidden]`
+        gated.matmul(&down.t()?).map_err(|e| anyhow!("mlp down: {e}").into())
     }
 
     fn decoder_layer(&self, x: &Tensor, li: usize) -> Res<Tensor> {
@@ -275,10 +305,11 @@ impl TinyLlama {
 }
 
 fn softmax(x: &Tensor) -> Res<Tensor> {
-    let m = x.max(1)?; // `[B]` over sequence dim
-    let e = x.sub(&m)?.exp()?;
-    let s = e.sum(1)?;
-    e.div(&s).map_err(Into::into)
+    // scaled dot-product attention normalizes over the key dim; keep it as a column so broadcasting matches query rows
+    let m = x.max_keepdim(1)?;       // [seq, 1]
+    let e = x.broadcast_sub(&m)?.exp()?;   // [seq, seq]
+    let s = e.sum_keepdim(1)?;              // [seq, 1]
+    e.broadcast_div(&s).map_err(Into::into)
 }
 
 fn silu(x: &Tensor) -> Res<Tensor> {
