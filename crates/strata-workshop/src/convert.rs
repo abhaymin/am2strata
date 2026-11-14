@@ -266,8 +266,8 @@ fn serialize(vals: &[f32], outtype: OutType) -> Vec<u8> {
 
 /// The five tokenizer arrays (pre, model, tokens, scores, token_type) + the bos/eos ids, from tokenizer.json /
 /// tokenizer_config.json. Mirrors llama.cpp's `_set_vocab_llama_hf`: model "llama", pre "default", tokens sorted by
-/// id, scores all -1000.0 (the value gguf-py writes for HF base tokens), token_type CONTROL for the special ids and
-/// NORMAL (1) otherwise.
+/// id, special-token scores 100.0 and base-token scores -1000.0 (SpecialVocab's write_internal_scores), token_type
+/// CONTROL for the special ids and NORMAL (1) otherwise.
 fn tokenizer_arrays(dir: &Path, vocab_size: usize) -> Result<(Vec<Kv>, u32, u32)> {
     let tj: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer.json"))
         .with_context(|| format!("reading tokenizer.json in {}", dir.display()))?)?;
@@ -298,7 +298,9 @@ fn tokenizer_arrays(dir: &Path, vocab_size: usize) -> Result<(Vec<Kv>, u32, u32)
     };
 
     let tokens: Vec<String> = vocab.iter().map(|(t, _)| t.clone()).collect();
-    let scores: Vec<f32> = vec![-1000.0f32; vocab_size];
+    // SpecialVocab's internal scores: special tokens (bos/eos) bias to 100.0, base tokens to -1000.0 — the value this
+    // version's HF tokenizer extraction writes for every non-special token.
+    let scores: Vec<f32> = (0..vocab_size).map(|i| if special_ids.contains(&i) { 100.0 } else { -1000.0 }).collect();
     let token_type: Vec<i32> = (0..vocab_size)
         .map(|i| if special_ids.contains(&i) { 3 } else { 1 }) // CONTROL / NORMAL (gguf TokenType enum)
         .collect();

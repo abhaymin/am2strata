@@ -1,0 +1,14 @@
+{
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "tokenizer_class": "LlamaTokenizerFast",
+  "bos_token": {
+    "content": "tok_0",
+    "special": true
+  },
+  "eos_token": {
+    "content": "tok_1",
+    "special": true
+  },
+  "chat_template": "{% for message in messages %}{% if loop.first and message['role'] != 'system' %}{{ system_prompt }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}"
+}

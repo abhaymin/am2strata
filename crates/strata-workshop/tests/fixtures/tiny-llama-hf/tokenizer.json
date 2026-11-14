@@ -1,0 +1,53 @@
+{
+  "version": "1.1",
+  "add_bos_token": true,
+  "add_eos_token": false,
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "vocab": {
+      "tok_0": 0,
+      "tok_1": 1,
+      "tok_10": 10,
+      "tok_11": 11,
+      "tok_12": 12,
+      "tok_13": 13,
+      "tok_14": 14,
+      "tok_15": 15,
+      "tok_16": 16,
+      "tok_17": 17,
+      "tok_18": 18,
+      "tok_19": 19,
+      "tok_2": 2,
+      "tok_20": 20,
+      "tok_21": 21,
+      "tok_22": 22,
+      "tok_23": 23,
+      "tok_24": 24,
+      "tok_25": 25,
+      "tok_26": 26,
+      "tok_27": 27,
+      "tok_28": 28,
+      "tok_29": 29,
+      "tok_3": 3,
+      "tok_30": 30,
+      "tok_31": 31,
+      "tok_4": 4,
+      "tok_5": 5,
+      "tok_6": 6,
+      "tok_7": 7,
+      "tok_8": 8,
+      "tok_9": 9
+    },
+    "merges": []
+  },
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "use_regex": true
+  },
+  "decoders": null,
+  "special_tokens": {
+    "bos": "tok_0",
+    "eos": "tok_1"
+  }
+}
