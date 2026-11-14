@@ -353,4 +353,90 @@ mod tests {
         assert_eq!(got[4], [4, 0, 0, 0, 0, 0, 0xff, 0x0d]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // Regressions (docs/REGRESSION.md). PR #18 (commit 9812a60): sizes sent by the guest's screen server are
+    // bounded before anything is allocated.
+
+    /// A hostile RFB server: announces `init` as its screen, then (if the client is still there) sends one update
+    /// with `rect` = (x, y, w, h, encoding) and no pixels.
+    fn hostile(sock: std::path::PathBuf, init: (u16, u16), rect: Option<(u16, u16, u16, u16, i32)>) -> std::thread::JoinHandle<()> {
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            // the client may hang up at any point: nothing here is asserted, the test looks at the client
+            let _ = (|| -> std::io::Result<()> {
+                c.write_all(b"RFB 003.008\n")?;
+                read_exact(&mut c, 12)?;
+                c.write_all(&[1, 1])?;
+                read_exact(&mut c, 1)?;
+                c.write_all(&0u32.to_be_bytes())?;
+                read_exact(&mut c, 1)?;
+                let mut m = Vec::new();
+                m.extend(init.0.to_be_bytes());
+                m.extend(init.1.to_be_bytes());
+                m.extend([0u8; 16]);
+                m.extend(0u32.to_be_bytes());
+                c.write_all(&m)?;
+                let Some((x, y, w, h, enc)) = rect else { return Ok(()) };
+                read_exact(&mut c, 20 + 12 + 10)?; // SetPixelFormat, SetEncodings, the first update request
+                let mut u = vec![0u8, 0, 0, 1];
+                for v in [x, y, w, h] {
+                    u.extend(v.to_be_bytes());
+                }
+                u.extend(enc.to_be_bytes());
+                c.write_all(&u)?;
+                // keep the socket open until the client goes: the client must refuse by itself, not by a closed socket
+                let mut rest = [0u8; 64];
+                while std::io::Read::read(&mut c, &mut rest)? > 0 {}
+                Ok(())
+            })();
+        })
+    }
+
+    fn socket(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("am2-rfb-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (dir.clone(), dir.join("s"))
+    }
+
+    /// The first size the server names: 65535x65535 would be a 17 GB frame. Refused at the handshake.
+    #[test]
+    fn regress_pr18_an_oversized_screen_is_refused_at_the_handshake() {
+        for (w, h) in [(65535u16, 65535u16), (4097, 800), (800, 4097), (0, 800), (800, 0), (0, 0)] {
+            let (dir, sock) = socket("init");
+            let server = hostile(sock.clone(), (w, h), None);
+            let err = Rfb::connect(&sock, Duration::from_millis(1)).err().unwrap_or_else(|| panic!("a {w}x{h} screen was accepted"));
+            assert!(err.contains("refused") && err.contains(&format!("{w}x{h}")), "{w}x{h}: {err}");
+            let _ = server.join();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        // the largest allowed is allowed
+        assert!(check_size(MAX_W, MAX_H).is_ok() && check_size(MAX_W + 1, 1).is_err() && check_size(1, MAX_H + 1).is_err());
+    }
+
+    /// A later resize (the DesktopSize pseudo-encoding) to an oversized or empty screen, and a rectangle outside the
+    /// screen: the reader stops with the reason, the frame stays the size it was, nothing is allocated or read for it.
+    #[test]
+    fn regress_pr18_an_oversized_resize_or_rectangle_stops_the_reader() {
+        for (rect, why) in [((0, 0, 65535, 65535, ENC_DESKTOP_SIZE), "refused"), ((0, 0, 4097, 4096, ENC_DESKTOP_SIZE), "refused"),
+                            ((0, 0, 0, 0, ENC_DESKTOP_SIZE), "refused"), ((0, 0, 65535, 65535, ENC_RAW), "outside"),
+                            ((3, 1, 2, 1, ENC_RAW), "outside"), ((65535, 65535, 1, 1, ENC_RAW), "outside"), ((0, 0, 1, 1, 16), "unexpected encoding")] {
+            let (dir, sock) = socket("resize");
+            let server = hostile(sock.clone(), (4, 2), Some(rect));
+            let rfb = Rfb::connect(&sock, Duration::from_millis(1)).expect("a 4x2 screen is fine");
+            let t0 = std::time::Instant::now();
+            while rfb.alive() {
+                assert!(t0.elapsed() < Duration::from_secs(10), "{rect:?}: the reader did not stop");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let err = rfb.error().unwrap_or_default();
+            assert!(err.contains(why), "{rect:?}: {err}");
+            assert_eq!(rfb.size(), (4, 2), "{rect:?}: the frame kept its size");
+            assert!(rfb.frame(|f| f.bgrx.len()).is_err(), "{rect:?}: a closed screen gives no picture");
+            drop(rfb);
+            // the reader thread has ended and its socket is closed, so the server's read ends too
+            let _ = server.join();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }

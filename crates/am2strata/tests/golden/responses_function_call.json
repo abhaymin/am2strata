@@ -1,0 +1,78 @@
+{
+  "background": "bool",
+  "completed_at": "int",
+  "created_at": "int",
+  "error": "null",
+  "id": "string",
+  "incomplete_details": "null",
+  "instructions": "null",
+  "max_output_tokens": "null",
+  "metadata": {},
+  "model": "string",
+  "object": "=response",
+  "output": [
+    {
+      "arguments": "string",
+      "call_id": "string",
+      "id": "string",
+      "name": "string",
+      "status": "=completed",
+      "type": "=function_call"
+    },
+    {
+      "content": [
+        {
+          "text": "string",
+          "type": "=reasoning_text"
+        }
+      ],
+      "id": "string",
+      "status": "=completed",
+      "summary": [],
+      "type": "=reasoning"
+    }
+  ],
+  "parallel_tool_calls": "bool",
+  "previous_response_id": "null",
+  "reasoning": {
+    "effort": "null",
+    "summary": "null"
+  },
+  "status": "=completed",
+  "store": "bool",
+  "temperature": "null",
+  "text": {
+    "format": {
+      "type": "=text"
+    }
+  },
+  "tool_choice": "string",
+  "tools": [
+    {
+      "name": "string",
+      "parameters": {
+        "properties": {
+          "city": {
+            "type": "=string"
+          }
+        },
+        "type": "=object"
+      },
+      "type": "=function"
+    }
+  ],
+  "top_p": "null",
+  "truncation": "string",
+  "usage": {
+    "input_tokens": "int",
+    "input_tokens_details": {
+      "cached_tokens": "int"
+    },
+    "output_tokens": "int",
+    "output_tokens_details": {
+      "reasoning_tokens": "int"
+    },
+    "total_tokens": "int"
+  },
+  "user": "null"
+}

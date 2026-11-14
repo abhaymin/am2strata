@@ -1,0 +1,52 @@
+{
+  "broken_json": {
+    "body": {
+      "error": {
+        "code": "int",
+        "message": "string",
+        "status": "=INVALID_ARGUMENT"
+      }
+    },
+    "status": 400
+  },
+  "models_no_key": {
+    "body": {
+      "error": {
+        "code": "int",
+        "message": "string",
+        "status": "=PERMISSION_DENIED"
+      }
+    },
+    "status": 401
+  },
+  "no_key": {
+    "body": {
+      "error": {
+        "code": "int",
+        "message": "string",
+        "status": "=PERMISSION_DENIED"
+      }
+    },
+    "status": 401
+  },
+  "unknown_method": {
+    "body": {
+      "error": {
+        "code": "int",
+        "message": "string",
+        "status": "=NOT_FOUND"
+      }
+    },
+    "status": 404
+  },
+  "wrong_key_in_query": {
+    "body": {
+      "error": {
+        "code": "int",
+        "message": "string",
+        "status": "=PERMISSION_DENIED"
+      }
+    },
+    "status": 401
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "parts": [
+          {
+            "functionCall": {
+              "args": {
+                "city": "string"
+              },
+              "id": "string",
+              "name": "string"
+            }
+          },
+          {
+            "text": "string",
+            "thought": "bool"
+          }
+        ],
+        "role": "=model"
+      },
+      "finishReason": "=STOP",
+      "index": "int"
+    }
+  ],
+  "modelVersion": "string",
+  "usageMetadata": {
+    "cachedContentTokenCount": "int",
+    "candidatesTokenCount": "int",
+    "promptTokenCount": "int",
+    "totalTokenCount": "int"
+  }
+}

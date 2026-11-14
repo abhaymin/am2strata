@@ -1,0 +1,56 @@
+{
+  "data": [
+    {
+      "candidates": [
+        {
+          "content": {
+            "parts": [],
+            "role": "=model"
+          },
+          "finishReason": "=STOP",
+          "index": "int"
+        }
+      ],
+      "modelVersion": "string",
+      "usageMetadata": {
+        "cachedContentTokenCount": "int",
+        "candidatesTokenCount": "int",
+        "promptTokenCount": "int",
+        "totalTokenCount": "int"
+      }
+    },
+    {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "string",
+                "thought": "bool"
+              }
+            ],
+            "role": "=model"
+          },
+          "index": "int"
+        }
+      ],
+      "modelVersion": "string"
+    },
+    {
+      "candidates": [
+        {
+          "content": {
+            "parts": [
+              {
+                "text": "string"
+              }
+            ],
+            "role": "=model"
+          },
+          "index": "int"
+        }
+      ],
+      "modelVersion": "string"
+    }
+  ]
+}

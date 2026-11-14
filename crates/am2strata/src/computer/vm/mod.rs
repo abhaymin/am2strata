@@ -154,11 +154,16 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// The private folder for the VM's sockets: short (a Unix socket path is at most 107 bytes) and only ours.
-fn runtime_dir() -> PathBuf {
+/// The private folder for the VM's sockets: short (a Unix socket path is at most 107 bytes) and only ours. One per
+/// data folder (named by a hash of its path): two servers of one account, such as the installed one and one a test
+/// starts, must never share it, or starting a VM in one removes the other's control socket.
+fn runtime_dir(data_dir: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
     let base = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_dir())
         .unwrap_or_else(|| PathBuf::from(format!("/tmp/am2strata-{}", unsafe { libc::getuid() })));
-    base.join("am2strata-vm")
+    let of = data_dir.canonicalize().unwrap_or_else(|_| data_dir.to_path_buf());
+    let hash = Sha256::digest(of.as_os_str().as_encoded_bytes());
+    base.join(format!("am2strata-vm-{}", hash[..6].iter().map(|b| format!("{b:02x}")).collect::<String>()))
 }
 
 pub fn mem_available_mb() -> Option<u64> {
@@ -236,11 +241,12 @@ pub fn qemu_args(cfg: &VmConfig, vm_dir: &Path, rt: &Path, code: &Path, ssh_port
 
 impl Vm {
     pub fn init(data_dir: &Path) -> Arc<Vm> {
+        let rt = runtime_dir(data_dir);
         let dir = data_dir.join("sandbox");
         let cfg = std::fs::read(dir.join("vm.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let vm = Arc::new(Vm {
             phase: Mutex::new(if dir.join("vm/state.bin").exists() { Phase::Saved } else { Phase::Off }),
-            dir, rt: runtime_dir(), cfg: Mutex::new(cfg), run: Mutex::new(None), op: Mutex::new(()),
+            dir, rt, cfg: Mutex::new(cfg), run: Mutex::new(None), op: Mutex::new(()),
             tunnel: Mutex::new(None), screen: Mutex::new(None), last_used: Mutex::new(Instant::now()),
             viewers: AtomicUsize::new(0), tasks: Mutex::new(vec![]), next_task: Mutex::new(1), busy: Mutex::new(false),
             cpu_sample: Mutex::new(None), last_error: Mutex::new(None),
@@ -995,6 +1001,16 @@ impl Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression (docs/REGRESSION.md), found by the regression suite: the VM's socket folder was one per account,
+    /// so a second server (a test's) that started a VM removed the installed server's control socket.
+    #[test]
+    fn regress_each_data_folder_has_its_own_socket_folder() {
+        let (a, b) = (runtime_dir(Path::new("/data/one")), runtime_dir(Path::new("/data/two")));
+        assert_ne!(a, b, "two data folders share the VM's sockets");
+        assert_eq!(a, runtime_dir(Path::new("/data/one")), "the same folder at every start");
+        assert!(a.join("qmp.sock").as_os_str().len() < 100, "a Unix socket path is at most 107 bytes: {}", a.display());
+    }
 
     #[test]
     fn qemu_runs_minimal_and_private() {

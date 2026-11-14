@@ -597,6 +597,9 @@ pub async fn job_get(State(s): State<AppState>, headers: HeaderMap, UrlPath(id):
 
 pub async fn job_delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(id): UrlPath<String>) -> Response {
     let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("Workshop jobs can be cancelled");
+    }
     let id = match job_id(&id) { Ok(i) => i, Err(r) => return r };
     match w.cancel(id) {
         Ok(j) => Json(j.view(false)).into_response(),

@@ -1090,14 +1090,15 @@ pub async fn content(State(s): State<AppState>, headers: HeaderMap, Path(id): Pa
 /// The chat's audio attachments (OpenAI's `input_audio` parts) transcribed on the CPU into text parts, before the
 /// prompt is built, the way documents become text.
 pub async fn expand_audio(s: &AppState, req: &mut Value) -> Result<(), String> {
-    let Some(msgs) = req["messages"].as_array_mut() else { return Ok(()) };
+    // read with get_mut: indexing a body that is no object (or a message that is none) for writing panics
+    let Some(msgs) = req.get_mut("messages").and_then(Value::as_array_mut) else { return Ok(()) };
     // each one is a transcription job: a few per request, none over 100 MB
     let count = msgs.iter().filter_map(|m| m["content"].as_array()).flatten().filter(|p| p["type"] == "input_audio").count();
     if count > MAX_AUDIO_PARTS {
         return Err(format!("{count} audio attachments: at most {MAX_AUDIO_PARTS} per request"));
     }
     for m in msgs.iter_mut() {
-        let Some(parts) = m["content"].as_array_mut() else { continue };
+        let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
         for p in parts.iter_mut() {
             if p["type"] != "input_audio" {
                 continue;

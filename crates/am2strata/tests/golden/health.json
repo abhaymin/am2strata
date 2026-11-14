@@ -1,0 +1,16 @@
+{
+  "adapted": "string",
+  "alerts": "int",
+  "hardware": {
+    "cpus": "int",
+    "gpus": "string",
+    "ram_mib": "int"
+  },
+  "image_generation": "bool",
+  "images": "bool",
+  "loaded": "bool",
+  "model": "string",
+  "server": "string",
+  "status": "=ok",
+  "video": "bool"
+}

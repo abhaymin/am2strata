@@ -48,9 +48,8 @@ fn wait_state(s: &Server, id: u64, want: &str) -> Value {
 
 #[test]
 fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
-    // the server inherits this (the stand-in command), set before it starts
-    unsafe { std::env::set_var("AM2STRATA_WORKSHOP_EXE", fake_workshop()) };
-    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    // the server is given this (the stand-in command) in its own environment; this process's is never changed
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": fake_workshop()}}));
     // an HF model folder inside the models folder
     let model = s.dir.join("hf-model");
     std::fs::create_dir_all(&model).unwrap();

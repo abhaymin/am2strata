@@ -1,0 +1,51 @@
+{
+  "broken_json": {
+    "body": {
+      "error": {
+        "message": "string",
+        "type": "=invalid_request_error"
+      }
+    },
+    "status": 400
+  },
+  "messages_missing": {
+    "body": {
+      "error": {
+        "message": "string",
+        "type": "=invalid_request_error"
+      },
+      "type": "=error"
+    },
+    "status": 400
+  },
+  "no_key": {
+    "body": {
+      "error": {
+        "message": "string",
+        "type": "=authentication_error"
+      },
+      "type": "=error"
+    },
+    "status": 401
+  },
+  "over_the_context": {
+    "body": {
+      "error": {
+        "message": "string",
+        "type": "=invalid_request_error"
+      },
+      "type": "=error"
+    },
+    "status": 400
+  },
+  "wrong_x_api_key": {
+    "body": {
+      "error": {
+        "message": "string",
+        "type": "=authentication_error"
+      },
+      "type": "=error"
+    },
+    "status": 401
+  }
+}
