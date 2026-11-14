@@ -168,7 +168,7 @@ fn model_pre_tokenizer(dir: &Path, override_pre: Option<&str>) -> Result<String>
 
 /// Output element precision (the `--outtype` setting), mapping to llama.cpp's file-type enum: F32 = ALL_F32, F16 =
 /// MOSTLY_F16.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutType {
     F32,
     F16,
@@ -358,19 +358,19 @@ fn mapped_tensors(tensors: &BTreeMap<String, TensorF32>, hparams: &HfConfig) -> 
     Ok(out)
 }
 
-/// Serialize f32 values to the target precision's raw bytes (F16 via candle).
-fn serialize(vals: &[f32], outtype: OutType) -> Vec<u8> {
-    match outtype {
+/// The ggml type a tensor is written as: llama.cpp's converter keeps 1-D tensors (norms, biases) in F32 whatever the
+/// `--outtype`, and writes the rest in the chosen precision.
+fn tensor_type(shape: &[usize], outtype: OutType) -> (u32, OutType) {
+    if shape.len() <= 1 { (0, OutType::F32) } else {
+        match outtype { OutType::F32 => (0, OutType::F32), OutType::F16 => (1, OutType::F16) }
+    }
+}
+
+/// f32 values as the raw little-endian bytes of `t`. F16 rounds to nearest even, as numpy's `astype(np.float16)` does.
+fn serialize(vals: &[f32], t: OutType) -> Vec<u8> {
+    match t {
         OutType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-        OutType::F16 => candle_core::Tensor::from_vec(vals.to_vec(), /*shape=*/ &[], &Device::Cpu)
-            .unwrap()
-            .to_dtype(DType::F16)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<half::f16>()
-            .unwrap()
-            .into_iter().flat_map(|h| h.to_bits().to_le_bytes()).collect(),
+        OutType::F16 => vals.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect(),
     }
 }
 
@@ -579,16 +579,17 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         kv.push(("tokenizer.chat_template", Kv::Str(chat)));
     }
 
-    let specs: Vec<TensorSpec> = mapped.iter().map(|m| TensorSpec {
-        name: m.name.clone(),
-        shape: m.shape.clone(),
-        ggml_type: outtype.file_type(),
-        nbytes: serialize(&m.vals, outtype).len() as u64,
+    let specs: Vec<TensorSpec> = mapped.iter().map(|m| {
+        let dims: Vec<usize> = m.shape.iter().map(|&d| d as usize).collect();
+        let (ggml_type, t) = tensor_type(&dims, outtype);
+        let elem = if t == OutType::F16 { 2 } else { 4 };
+        TensorSpec { name: m.name.clone(), shape: m.shape.clone(), ggml_type, nbytes: m.vals.len() as u64 * elem }
     }).collect();
 
     let mut w = Writer::create_typed(out, &kv, specs)?;
     for m in &mapped {
-        let bytes = serialize(&m.vals, outtype);
+        let dims: Vec<usize> = m.shape.iter().map(|&d| d as usize).collect();
+        let bytes = serialize(&m.vals, tensor_type(&dims, outtype).1);
         w.tensor_data(&bytes)?;
         w.end_tensor()?;
     }

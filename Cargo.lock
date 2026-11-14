@@ -3385,6 +3385,7 @@ dependencies = [
  "anyhow",
  "candle-core-mold",
  "candle-nn-mold",
+ "clap",
  "half",
  "memmap2",
  "prost",

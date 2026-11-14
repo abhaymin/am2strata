@@ -144,6 +144,13 @@ impl Server {
         (code, r.json().unwrap_or(Value::Null))
     }
 
+    /// DELETE with the key.
+    pub fn delete(&self, path: &str) -> (u16, Value) {
+        let r = reqwest::blocking::Client::new().delete(format!("{}{path}", self.base)).bearer_auth(KEY).send().unwrap();
+        let code = r.status().as_u16();
+        (code, r.json().unwrap_or(Value::Null))
+    }
+
     pub fn get(&self, path: &str, auth: bool) -> (u16, Value) {
         let mut rb = reqwest::blocking::Client::new().get(format!("{}{path}", self.base));
         if auth {

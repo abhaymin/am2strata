@@ -22,3 +22,4 @@ strata-gguf.workspace = true
 tokenizers = "0.21"
 sha2 = "0.10"
 half = "2"
+clap.workspace = true

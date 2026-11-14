@@ -55,7 +55,7 @@ jobs:
       - run: cargo test --release --locked --workspace --no-fail-fast
         env:
           AM2STRATA_TEST_TOOLS: "1"     # a missing tool fails the test instead of skipping it
-      - run: cargo build --release --locked -p am2strata
+      - run: cargo build --release --locked -p am2strata -p strata-workshop --bin am2strata --bin am2strata-run --bin am2strata-workshop
       - run: cargo build --release --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu
       - run: bash deploy/package-portable.sh ${{ matrix.label }}
       - uses: actions/upload-artifact@v4
