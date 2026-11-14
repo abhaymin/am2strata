@@ -221,6 +221,79 @@ pub fn near_duplicates(texts: &[String], threshold: f64) -> Vec<usize> {
     drop.into_iter().enumerate().filter(|(_, d)| *d).map(|(i, _)| i).collect()
 }
 
+// ---------------------------------------------------------------------------
+// filter: drop a chat record for a reason, or keep it (None)
+// ---------------------------------------------------------------------------
+
+/// A single chat exchange — ordered `(role, content)` messages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Record {
+    pub messages: Vec<(String, String)>,
+}
+
+/// Length bounds used by [`filter`]. Refusal phrases are a fixed builtin list.
+#[derive(Debug, Clone, Copy)]
+pub struct Rules {
+    /// Minimum accepted answer length in characters.
+    pub min_chars: usize,
+    /// Maximum accepted answer length in characters.
+    pub max_chars: usize,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Rules { min_chars: 10, max_chars: 8192 }
+    }
+}
+
+/// Refusal phrases (compared case-insensitively, as substrings of the answer).
+const REFUSAL_PHRASES: &[&str] = &[
+    "i can't", "i cannot", "as an ai", "as an artificial intelligence", "i am sorry i", "sorry, i",
+    "i am unable to", "cannot fulfill", "i apologize but", "as a language model", "however, i",
+];
+
+fn answer_of(record: &Record) -> Option<&str> {
+    record.messages.iter().rev().find(|(role, _)| role.eq_ignore_ascii_case("assistant")).map(|(_, c)| c.as_str())
+}
+
+fn question_of(record: &Record) -> Option<&str> {
+    record.messages.iter().rev().find(|(role, _)| role.eq_ignore_ascii_case("user") || role.eq_ignore_ascii_case("human")).map(|(_, c)| c.as_str())
+}
+
+/// Return the reason a chat record should be dropped, or `None` to keep it.
+pub fn filter(record: &Record, rules: &Rules) -> Option<&'static str> {
+    let answer = match answer_of(record) {
+        Some(a) => a,
+        None => return None,
+    };
+    let trimmed = answer.trim();
+
+    // An answer with no content.
+    if trimmed.is_empty() {
+        return Some("empty_answer");
+    }
+    // A canned refusal.
+    let lower = answer.to_lowercase();
+    if REFUSAL_PHRASES.iter().any(|p| lower.contains(p)) {
+        return Some("refusal");
+    }
+    // Out of bounds length.
+    if trimmed.chars().count() < rules.min_chars {
+        return Some("too_short");
+    }
+    if trimmed.chars().count() > rules.max_chars {
+        return Some("too_long");
+    }
+    // The answer just echoes the question back.
+    if let Some(q) = question_of(record) {
+        if q.trim() == trimmed {
+            return Some("answer_equals_question");
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +384,55 @@ mod tests {
         let b = "apple banana cherry date fig grape".to_string();
         let c = "apple banana cherry date fig grape".to_string();
         assert_eq!(near_duplicates(&[a, b, c], 0.9), vec![1, 2]);
+    }
+
+    fn rec(pairs: &[(&str, &str)]) -> Record {
+        Record { messages: pairs.iter().map(|(r, c)| (r.to_string(), c.to_string())).collect() }
+    }
+
+    #[test]
+    fn keeps_good_record() {
+        let rules = Rules::default();
+        let r = rec(&[("user", "What is 2+2?"), ("assistant", "It is four.")]);
+        assert_eq!(filter(&r, &rules), None);
+    }
+
+    #[test]
+    fn drops_too_short() {
+        let rules = Rules { min_chars: 10, max_chars: 8192 };
+        let r = rec(&[("user", "Explain gravity."), ("assistant", "Yes.")]);
+        assert_eq!(filter(&r, &rules), Some("too_short"));
+    }
+
+    #[test]
+    fn drops_too_long() {
+        let rules = Rules { min_chars: 10, max_chars: 20 };
+        let long = "a".repeat(50);
+        let r = rec(&[("user", "q?"), ("assistant", long.as_str())]);
+        assert_eq!(filter(&r, &rules), Some("too_long"));
+    }
+
+    #[test]
+    fn drops_refusal() {
+        let rules = Rules::default();
+        for phrase in ["I can't help with that.", "As an AI, I don't know.", "I cannot do that."] {
+            let r = rec(&[("user", "do X"), ("assistant", phrase)]);
+            assert_eq!(filter(&r, &rules), Some("refusal"), "failed for {phrase:?}");
+        }
+    }
+
+    #[test]
+    fn drops_empty_answer() {
+        let rules = Rules::default();
+        let r = rec(&[("user", "hello?"), ("assistant", "   \n  ")]);
+        assert_eq!(filter(&r, &rules), Some("empty_answer"));
+    }
+
+    #[test]
+    fn drops_answer_equal_to_question() {
+        let rules = Rules::default();
+        let r = rec(&[("user", "What is the capital of France?"), ("assistant", "What is the capital of France?")]);
+        assert_eq!(filter(&r, &rules), Some("answer_equals_question"));
     }
 }
 
