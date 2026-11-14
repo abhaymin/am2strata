@@ -27,3 +27,9 @@ To be a real Hugging Face folder that `convert_hf_to_gguf.py` and transformers a
 16-wide rows no matrix can hold a whole 32/256-value block, so llama-quantize falls back: every 2-D weight becomes F16
 and the 1-D norms stay F32, for all three targets. These pin the fallback rules, not the block quantizers (those are
 pinned by strata-pack's `quant-*.gguf`).
+
+## tiny-llama-256-{Q8_0,Q4_0,Q4_K,Q5_K,Q6_K}-pure.gguf
+
+The wide fixture `tiny-llama-256-hf/` (hidden 256, 16 heads, intermediate 512, 1 layer) converted to F32 by llama.cpp's
+converter (pre forced to gpt-2, as above), then `llama-quantize --pure` per type, by the reviewer. Every 2-D weight's
+rows hold whole 32/256 blocks, so all 9 matrices are really quantized (no fallback); norms stay F32.
