@@ -20,6 +20,10 @@
 //! - **Upload a file:** `browser_upload` gives a page's `<input type=file>` a file from one folder set in
 //!   `"browser": {"upload_dir": <a folder>}` (off by default, so the tool stays hidden until then); only an existing
 //!   file inside that folder is given — symlinks and ".." are resolved, and anything outside it is refused.
+//! - **Your own browser:** with `"browser": {"connect": "http://127.0.0.1:9222"}` the job works in a web tab you already
+//!   have open (one no other job holds), so you watch it where you look; that tab is never closed by the server and
+//!   gets no request filter (it pauses every request, and Chrome stalls a large upload that way). Tabs it opens itself
+//!   keep the filter.
 //! - **Tabs:** `browser_tabs {action: list|switch|close}` lists the pages open in this job, switches which one the
 //!   other tools act on, or closes one (the last one cannot be closed, the job would lose its browser).
 //! - **Select a choice:** `browser_select {selector, value}` sets a page's `<select>` to an option and fires input.
@@ -408,6 +412,38 @@ fn upload_file_ok(path: &Path, upload_dir: &Path) -> Result<PathBuf, String> {
 struct Tab {
     page: Page,
     used: Instant,
+    /// a tab the user already had open (the `connect` mode): the job works in it and never closes it
+    adopted: bool,
+}
+
+impl Tab {
+    /// Let go of the tab: close it if this server opened it; a tab the user had open stays open.
+    async fn release(self) {
+        if !self.adopted {
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.page.close()).await;
+        }
+    }
+}
+
+/// In the `connect` mode, a tab the user already has open on a web page and no job holds: the first job works in it, so
+/// the user sees the job where they are looking (and its logins and open dialogs are there) instead of in a new tab.
+async fn adopt_user_tab(run: &mut Running) -> Option<Page> {
+    let targets = run.browser.fetch_targets().await.ok()?;
+    let held: Vec<String> = run.tabs.iter().map(|(_, t)| t.page.target_id().inner().clone()).collect();
+    for t in targets {
+        let web = t.url.starts_with("https://") || t.url.starts_with("http://");
+        if t.r#type != "page" || !web || held.iter().any(|h| h == t.target_id.inner()) {
+            continue;
+        }
+        // fetch_targets attaches in the background: the page shows up a moment later
+        for _ in 0..30 {
+            if let Ok(p) = run.browser.get_page(t.target_id.clone()).await {
+                return Some(p);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    None
 }
 
 /// A page download Chrome fetched into the download folder, before it is placed (sanitised name) or denied. `done` is set when
@@ -584,7 +620,7 @@ impl Browsers {
         if upload {
             // only when an upload folder is set: hidden until then, and a call is refused with the setting named
             tools.push(json!({"name": "browser_upload",
-                               "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
+                               "description": format!("Attach a file from the upload folder to this page's file input (the `selector`, else the first `<input type=file>`), so it can be sent when there is an Upload button. Open the page's upload dialog first (YouTube Studio: .../videos/upload?d=ud opens it); never click a \"Select files\" button, which opens a system file picker the tools cannot see. The upload folder is set in \"browser\": {{\"upload_dir\": ...}}.{shot}"),
                                "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "selector": {"type": "string"}}, "required": ["path"]}}));
         }
         tools.extend([
@@ -692,9 +728,14 @@ impl Browsers {
             if run.tabs.is_empty() { break };
             let (id, t) = run.tabs.remove(i);
             run.active.retain(|_, v| *v != id);
-            let _ = t.page.close().await;
+            t.release().await;
         }
-        let page = run.browser.new_page("about:blank").await.map_err(|e| e.to_string())?;
+        let user_tab = if self.settings.connect.is_some() { adopt_user_tab(run).await } else { None };
+        let adopted = user_tab.is_some();
+        let page = match user_tab {
+            Some(p) => p,
+            None => run.browser.new_page("about:blank").await.map_err(|e| e.to_string())?,
+        };
         // where a page's download lands (a folder, the file name sanitised when placed), or denied so it never reaches here
         if let Some(dir) = self.settings.download_dir.clone() {
             let mut params = chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams::new(
@@ -707,38 +748,43 @@ impl Browsers {
             let _ = page.execute(chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams::new(
                 chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorBehavior::Deny)).await;
         }
-        // every request the page makes: allowed only to public addresses (and data:, blob:, about:) and not on the lists
-        let mut paused = page.event_listener::<fetch::EventRequestPaused>().await.map_err(|e| e.to_string())?;
-        page.execute(fetch::EnableParams::default()).await.map_err(|e| e.to_string())?;
-        let (p2, private, allow, block) = (page.clone(), self.settings.private_urls, self.settings.site_allow.clone(), self.settings.site_block.clone());
-        tokio::spawn(async move {
-            let mut seen: HashMap<String, bool> = HashMap::new();
-            while let Some(ev) = paused.next().await {
-                let url = ev.request.url.clone();
-                let origin = reqwest::Url::parse(&url).ok().map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or(""))).unwrap_or_default();
-                let host = reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
-                let ok = match seen.get(&origin) {
-                    Some(v) => *v,
-                    None => {
-                        let v = allowed_host(&url, private).await && download_verdict(&host, &allow, &block).is_none();
-                        seen.insert(origin, v);
-                        v
+        // the request filter pauses each request until the server lets it go, and Chrome stalls a large upload that way
+        // (a video sent to YouTube Studio stayed at 0%): a tab the user had open is theirs, with their own logins, so it
+        // is left unfiltered as their browser would be; tabs this server opens keep the filter
+        if !adopted {
+            // every request the page makes: allowed only to public addresses (and data:, blob:, about:) and not on the lists
+            let mut paused = page.event_listener::<fetch::EventRequestPaused>().await.map_err(|e| e.to_string())?;
+            page.execute(fetch::EnableParams::default()).await.map_err(|e| e.to_string())?;
+            let (p2, private, allow, block) = (page.clone(), self.settings.private_urls, self.settings.site_allow.clone(), self.settings.site_block.clone());
+            tokio::spawn(async move {
+                let mut seen: HashMap<String, bool> = HashMap::new();
+                while let Some(ev) = paused.next().await {
+                    let url = ev.request.url.clone();
+                    let origin = reqwest::Url::parse(&url).ok().map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or(""))).unwrap_or_default();
+                    let host = reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_string)).unwrap_or_default();
+                    let ok = match seen.get(&origin) {
+                        Some(v) => *v,
+                        None => {
+                            let v = allowed_host(&url, private).await && download_verdict(&host, &allow, &block).is_none();
+                            seen.insert(origin, v);
+                            v
+                        }
+                    };
+                    let r = if ok {
+                        p2.execute(fetch::ContinueRequestParams::new(ev.request_id.clone())).await.map(|_| ())
+                    } else {
+                        tracing::info!(url = %url.chars().take(120).collect::<String>(), "browser: request blocked (on {} or not a public address)", download_verdict(&host, &allow, &block).unwrap_or("not a public address"));
+                        p2.execute(fetch::FailRequestParams::new(ev.request_id.clone(), ErrorReason::BlockedByClient)).await.map(|_| ())
+                    };
+                    if r.is_err() {
+                        return; // the page closed
                     }
-                };
-                let r = if ok {
-                    p2.execute(fetch::ContinueRequestParams::new(ev.request_id.clone())).await.map(|_| ())
-                } else {
-                    tracing::info!(url = %url.chars().take(120).collect::<String>(), "browser: request blocked (on {} or not a public address)", download_verdict(&host, &allow, &block).unwrap_or("not a public address"));
-                    p2.execute(fetch::FailRequestParams::new(ev.request_id.clone(), ErrorReason::BlockedByClient)).await.map(|_| ())
-                };
-                if r.is_err() {
-                    return; // the page closed
                 }
-            }
-        });
+            });
+        }
         // a new tab for this conversation is the one the tools act on until browser_tabs closes or switches it
         let id = format!("tab-{}", uuid::Uuid::new_v4().simple());
-        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now() }));
+        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted }));
         run.active.insert(conv.to_string(), id);
         Ok(page)
     }
@@ -946,7 +992,7 @@ impl Browsers {
                 let i = (0..run.tabs.len()).find(|&i| run.tabs[i].0 == id);
                 if let Some(i) = i {
                     let (_, t) = run.tabs.remove(i);
-                    let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+                    t.release().await;
                 }
             }
         }
@@ -1037,7 +1083,10 @@ impl Browsers {
                 let ids = page.execute(chromiumoxide::cdp::browser_protocol::dom::QuerySelectorAllParams::new(root.result.root.node_id, raw_selector(args)?))
                     .await.map_err(|e| format!("finding a file input on the page: {e}"))?;
                 let node_id = ids.result.node_ids.into_iter().next()
-                    .ok_or_else(|| "there is no file input here: give its selector with `selector`".to_string())?;
+                    .ok_or_else(|| "there is no file input on this page yet: open the page's upload dialog first (a page usually adds its \
+                                   <input type=file> only then; on YouTube Studio open https://studio.youtube.com/channel/<id>/videos/upload?d=ud, \
+                                   which shows it), or give its selector with `selector`. Do not click \"Select files\": that opens the \
+                                   system's file picker, which these tools cannot use".to_string())?;
                 // carry only the files and which input (by node id); chromium fills in the fake path itself
                 let mut files = chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams::new(vec![path.to_string_lossy().to_string()]);
                 files.node_id = Some(node_id);
@@ -1085,7 +1134,7 @@ impl Browsers {
                             if let Some(i) = i {
                                 let (_, t) = run.tabs.remove(i);
                                 run.active.retain(|_, v| *v != target.id);
-                                let _ = tokio::time::timeout(Duration::from_secs(5), t.page.close()).await;
+                                t.release().await;
                             }
                         }
                         if let Some(page) = self.current(conv).await.or_else(|| guard.as_ref().and_then(|r| r.tabs.first().map(|(_, t)| t.page.clone()))) {
@@ -1154,7 +1203,7 @@ impl Browsers {
                 }
                 None => {
                     while let Some((_, t)) = r.tabs.pop() {
-                        let _ = t.page.close().await;
+                        t.release().await;
                     }
                     // dropping `browser` ends the DevTools connection without closing the user's browser
                 }
