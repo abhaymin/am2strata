@@ -49,7 +49,7 @@ pub fn supported(arch: &str) -> Result<&'static str, String> {
     }
     if arch == "qwen4exp" {
         return Err("a qwen4exp (Qwen3.8-Flash-Next family) model runs on the strata engine, which needs a prepared pack \
-                    that `pull` does not build yet".into());
+                    that `pull` does not build yet (the native engines' own setup builds it)".into());
     }
     let list: Vec<&str> = POLY_ARCHS.iter().chain(HYBRID_ARCHS.iter()).map(|(a, _)| *a).collect();
     Err(format!("its architecture is '{arch}', which no engine here runs yet (the engines run: {})", list.join(", ")))

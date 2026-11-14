@@ -1,6 +1,6 @@
-am2Strata includes code derived from Strata (https://github.com/Niko1221/Strata) and PolyStrata
-(https://github.com/VecSzn/PolyStrata), including parts of its web app: MIT, Copyright (c) 2026 Niko1221 and the
-Strata contributors (web/LICENSE-PolyStrata.txt).
+am2Strata includes code derived from Strata (https://github.com/Niko1221/Strata) and from PolyStrata
+(https://github.com/VecSzn/PolyStrata), including parts of PolyStrata's web app: MIT, Copyright (c) 2026 Niko1221
+and the Strata contributors (web/LICENSE-PolyStrata.txt).
 
 Bundled third-party files keep their own licenses:
 - web/vendor/mermaid.min.js: Mermaid 11.4.1, MIT (web/vendor/LICENSE-mermaid.txt)
