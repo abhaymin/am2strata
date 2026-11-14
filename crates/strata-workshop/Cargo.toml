@@ -12,6 +12,7 @@ candle-nn.workspace = true
 safetensors.workspace = true
 memmap2.workspace = true
 serde_json.workspace = true
+regex.workspace = true
 prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true

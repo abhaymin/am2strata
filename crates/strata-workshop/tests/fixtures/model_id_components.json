@@ -1,0 +1,602 @@
+[
+ {
+  "model_id": "tiny-llama-hf",
+  "total_params": 0,
+  "name": "tiny-llama-hf",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "tiny-llama-hf",
+  "total_params": 8000000000,
+  "name": "tiny-llama-hf",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "tiny-llama-hf",
+  "total_params": -1000000,
+  "name": "tiny-llama-hf",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "tiny-llama-256-bf16-hf",
+  "total_params": 0,
+  "name": "tiny-llama-256-bf16-hf",
+  "org": null,
+  "basename": "tiny-llama-256",
+  "finetune": "hf",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "tiny-llama-256-bf16-hf",
+  "total_params": 8000000000,
+  "name": "tiny-llama-256-bf16-hf",
+  "org": null,
+  "basename": "tiny-llama-256",
+  "finetune": "hf",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "tiny-llama-256-bf16-hf",
+  "total_params": -1000000,
+  "name": "tiny-llama-256-bf16-hf",
+  "org": null,
+  "basename": "tiny-llama-256",
+  "finetune": "hf",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "Qwen3-8B",
+  "total_params": 0,
+  "name": "Qwen3-8B",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": null,
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "Qwen3-8B",
+  "total_params": 8000000000,
+  "name": "Qwen3-8B",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": null,
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "Qwen3-8B",
+  "total_params": -1000000,
+  "name": "Qwen3-8B",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": null,
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "Qwen3-30B-A3B-Instruct-2507",
+  "total_params": 0,
+  "name": "Qwen3-30B-A3B-Instruct-2507",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": "Instruct",
+  "version": "2507",
+  "size_label": "30B-A3B"
+ },
+ {
+  "model_id": "Qwen3-30B-A3B-Instruct-2507",
+  "total_params": 8000000000,
+  "name": "Qwen3-30B-A3B-Instruct-2507",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": "30b-Instruct",
+  "version": "2507",
+  "size_label": "A3B"
+ },
+ {
+  "model_id": "Qwen3-30B-A3B-Instruct-2507",
+  "total_params": -1000000,
+  "name": "Qwen3-30B-A3B-Instruct-2507",
+  "org": null,
+  "basename": "Qwen3",
+  "finetune": "Instruct",
+  "version": "2507",
+  "size_label": "30B-A3B"
+ },
+ {
+  "model_id": "Mistral-7B-Instruct-v0.3",
+  "total_params": 0,
+  "name": "Mistral-7B-Instruct-v0.3",
+  "org": null,
+  "basename": "Mistral",
+  "finetune": "Instruct",
+  "version": "v0.3",
+  "size_label": "7B"
+ },
+ {
+  "model_id": "Mistral-7B-Instruct-v0.3",
+  "total_params": 8000000000,
+  "name": "Mistral-7B-Instruct-v0.3",
+  "org": null,
+  "basename": "Mistral",
+  "finetune": "Instruct",
+  "version": "v0.3",
+  "size_label": "7B"
+ },
+ {
+  "model_id": "Mistral-7B-Instruct-v0.3",
+  "total_params": -1000000,
+  "name": "Mistral-7B-Instruct-v0.3",
+  "org": null,
+  "basename": "Mistral",
+  "finetune": "Instruct",
+  "version": "v0.3",
+  "size_label": "7B"
+ },
+ {
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "total_params": 0,
+  "name": "Llama-3.1-8B-Instruct",
+  "org": "meta-llama",
+  "basename": "Llama-3.1",
+  "finetune": "Instruct",
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "total_params": 8000000000,
+  "name": "Llama-3.1-8B-Instruct",
+  "org": "meta-llama",
+  "basename": "Llama-3.1",
+  "finetune": "Instruct",
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "meta-llama/Llama-3.1-8B-Instruct",
+  "total_params": -1000000,
+  "name": "Llama-3.1-8B-Instruct",
+  "org": "meta-llama",
+  "basename": "Llama-3.1",
+  "finetune": "Instruct",
+  "version": null,
+  "size_label": "8B"
+ },
+ {
+  "model_id": "Phi-3-mini-4k-instruct",
+  "total_params": 0,
+  "name": "Phi-3-mini-4k-instruct",
+  "org": null,
+  "basename": "Phi-3-mini",
+  "finetune": "instruct",
+  "version": null,
+  "size_label": "4K"
+ },
+ {
+  "model_id": "Phi-3-mini-4k-instruct",
+  "total_params": 8000000000,
+  "name": "Phi-3-mini-4k-instruct",
+  "org": null,
+  "basename": "Phi-3",
+  "finetune": "4k-instruct",
+  "version": null,
+  "size_label": "mini"
+ },
+ {
+  "model_id": "Phi-3-mini-4k-instruct",
+  "total_params": -1000000,
+  "name": "Phi-3-mini-4k-instruct",
+  "org": null,
+  "basename": "Phi-3",
+  "finetune": "4k-instruct",
+  "version": null,
+  "size_label": "mini"
+ },
+ {
+  "model_id": "gemma-2-9b-it",
+  "total_params": 0,
+  "name": "gemma-2-9b-it",
+  "org": null,
+  "basename": "gemma-2",
+  "finetune": "it",
+  "version": null,
+  "size_label": "9B"
+ },
+ {
+  "model_id": "gemma-2-9b-it",
+  "total_params": 8000000000,
+  "name": "gemma-2-9b-it",
+  "org": null,
+  "basename": "gemma-2",
+  "finetune": "it",
+  "version": null,
+  "size_label": "9B"
+ },
+ {
+  "model_id": "gemma-2-9b-it",
+  "total_params": -1000000,
+  "name": "gemma-2-9b-it",
+  "org": null,
+  "basename": "gemma-2",
+  "finetune": "it",
+  "version": null,
+  "size_label": "9B"
+ },
+ {
+  "model_id": "DeepSeek-R1-Distill-Qwen-7B",
+  "total_params": 0,
+  "name": "DeepSeek-R1-Distill-Qwen-7B",
+  "org": null,
+  "basename": "DeepSeek-R1-Distill-Qwen",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "DeepSeek-R1-Distill-Qwen-7B",
+  "total_params": 8000000000,
+  "name": "DeepSeek-R1-Distill-Qwen-7B",
+  "org": null,
+  "basename": "DeepSeek-R1-Distill-Qwen",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "DeepSeek-R1-Distill-Qwen-7B",
+  "total_params": -1000000,
+  "name": "DeepSeek-R1-Distill-Qwen-7B",
+  "org": null,
+  "basename": "DeepSeek-R1-Distill-Qwen",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "bloom-7b1",
+  "total_params": 0,
+  "name": "bloom-7b1",
+  "org": null,
+  "basename": "bloom",
+  "finetune": null,
+  "version": null,
+  "size_label": "7.1B"
+ },
+ {
+  "model_id": "bloom-7b1",
+  "total_params": 8000000000,
+  "name": "bloom-7b1",
+  "org": null,
+  "basename": "bloom",
+  "finetune": null,
+  "version": null,
+  "size_label": "7.1B"
+ },
+ {
+  "model_id": "bloom-7b1",
+  "total_params": -1000000,
+  "name": "bloom-7b1",
+  "org": null,
+  "basename": "bloom",
+  "finetune": null,
+  "version": null,
+  "size_label": "7.1B"
+ },
+ {
+  "model_id": "Mixtral-8x7B-Instruct-v0.1",
+  "total_params": 0,
+  "name": "Mixtral-8x7B-Instruct-v0.1",
+  "org": null,
+  "basename": "Mixtral",
+  "finetune": "Instruct",
+  "version": "v0.1",
+  "size_label": "8x7B"
+ },
+ {
+  "model_id": "Mixtral-8x7B-Instruct-v0.1",
+  "total_params": 8000000000,
+  "name": "Mixtral-8x7B-Instruct-v0.1",
+  "org": null,
+  "basename": "Mixtral",
+  "finetune": "Instruct",
+  "version": "v0.1",
+  "size_label": "8x7B"
+ },
+ {
+  "model_id": "Mixtral-8x7B-Instruct-v0.1",
+  "total_params": -1000000,
+  "name": "Mixtral-8x7B-Instruct-v0.1",
+  "org": null,
+  "basename": "Mixtral",
+  "finetune": "Instruct",
+  "version": "v0.1",
+  "size_label": "8x7B"
+ },
+ {
+  "model_id": "SmolLM2-135M",
+  "total_params": 0,
+  "name": "SmolLM2-135M",
+  "org": null,
+  "basename": "SmolLM2",
+  "finetune": null,
+  "version": null,
+  "size_label": "135M"
+ },
+ {
+  "model_id": "SmolLM2-135M",
+  "total_params": 8000000000,
+  "name": "SmolLM2-135M",
+  "org": null,
+  "basename": "SmolLM2",
+  "finetune": "135m",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "SmolLM2-135M",
+  "total_params": -1000000,
+  "name": "SmolLM2-135M",
+  "org": null,
+  "basename": "SmolLM2",
+  "finetune": null,
+  "version": null,
+  "size_label": "135M"
+ },
+ {
+  "model_id": "my-lora",
+  "total_params": 0,
+  "name": "my-lora",
+  "org": null,
+  "basename": "my",
+  "finetune": "lora",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "my-lora",
+  "total_params": 8000000000,
+  "name": "my-lora",
+  "org": null,
+  "basename": "my",
+  "finetune": "lora",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "my-lora",
+  "total_params": -1000000,
+  "name": "my-lora",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "Llama-2-7b-chat-hf",
+  "total_params": 0,
+  "name": "Llama-2-7b-chat-hf",
+  "org": null,
+  "basename": "Llama-2",
+  "finetune": "chat-hf",
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "Llama-2-7b-chat-hf",
+  "total_params": 8000000000,
+  "name": "Llama-2-7b-chat-hf",
+  "org": null,
+  "basename": "Llama-2",
+  "finetune": "chat-hf",
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "Llama-2-7b-chat-hf",
+  "total_params": -1000000,
+  "name": "Llama-2-7b-chat-hf",
+  "org": null,
+  "basename": "Llama-2",
+  "finetune": "chat-hf",
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "falcon-mamba-7b",
+  "total_params": 0,
+  "name": "falcon-mamba-7b",
+  "org": null,
+  "basename": "falcon-mamba",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "falcon-mamba-7b",
+  "total_params": 8000000000,
+  "name": "falcon-mamba-7b",
+  "org": null,
+  "basename": "falcon-mamba",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "falcon-mamba-7b",
+  "total_params": -1000000,
+  "name": "falcon-mamba-7b",
+  "org": null,
+  "basename": "falcon-mamba",
+  "finetune": null,
+  "version": null,
+  "size_label": "7B"
+ },
+ {
+  "model_id": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "total_params": 0,
+  "name": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "org": null,
+  "basename": "Qwen2.5-Coder",
+  "finetune": "Instruct-GGUF",
+  "version": null,
+  "size_label": "32B"
+ },
+ {
+  "model_id": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "total_params": 8000000000,
+  "name": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "org": null,
+  "basename": "Qwen2.5-Coder",
+  "finetune": "32b-Instruct-GGUF",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "total_params": -1000000,
+  "name": "Qwen2.5-Coder-32B-Instruct-GGUF",
+  "org": null,
+  "basename": "Qwen2.5-Coder",
+  "finetune": "Instruct-GGUF",
+  "version": null,
+  "size_label": "32B"
+ },
+ {
+  "model_id": "c4ai-command-r-v01",
+  "total_params": 0,
+  "name": "c4ai-command-r-v01",
+  "org": null,
+  "basename": "c4ai-command-r",
+  "finetune": null,
+  "version": "v01",
+  "size_label": null
+ },
+ {
+  "model_id": "c4ai-command-r-v01",
+  "total_params": 8000000000,
+  "name": "c4ai-command-r-v01",
+  "org": null,
+  "basename": "c4ai-command-r",
+  "finetune": null,
+  "version": "v01",
+  "size_label": null
+ },
+ {
+  "model_id": "c4ai-command-r-v01",
+  "total_params": -1000000,
+  "name": "c4ai-command-r-v01",
+  "org": null,
+  "basename": "c4ai-command-r",
+  "finetune": null,
+  "version": "v01",
+  "size_label": null
+ },
+ {
+  "model_id": "TinyLlama-1.1B-Chat-v1.0",
+  "total_params": 0,
+  "name": "TinyLlama-1.1B-Chat-v1.0",
+  "org": null,
+  "basename": "TinyLlama",
+  "finetune": "Chat",
+  "version": "v1.0",
+  "size_label": "1.1B"
+ },
+ {
+  "model_id": "TinyLlama-1.1B-Chat-v1.0",
+  "total_params": 8000000000,
+  "name": "TinyLlama-1.1B-Chat-v1.0",
+  "org": null,
+  "basename": "TinyLlama",
+  "finetune": "Chat",
+  "version": "v1.0",
+  "size_label": "1.1B"
+ },
+ {
+  "model_id": "TinyLlama-1.1B-Chat-v1.0",
+  "total_params": -1000000,
+  "name": "TinyLlama-1.1B-Chat-v1.0",
+  "org": null,
+  "basename": "TinyLlama",
+  "finetune": "Chat",
+  "version": "v1.0",
+  "size_label": "1.1B"
+ },
+ {
+  "model_id": "model",
+  "total_params": 0,
+  "name": "model",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "model",
+  "total_params": 8000000000,
+  "name": "model",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "model",
+  "total_params": -1000000,
+  "name": "model",
+  "org": null,
+  "basename": null,
+  "finetune": null,
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "openai/gpt-oss-20b",
+  "total_params": 0,
+  "name": "gpt-oss-20b",
+  "org": "openai",
+  "basename": "gpt-oss",
+  "finetune": null,
+  "version": null,
+  "size_label": "20B"
+ },
+ {
+  "model_id": "openai/gpt-oss-20b",
+  "total_params": 8000000000,
+  "name": "gpt-oss-20b",
+  "org": "openai",
+  "basename": "gpt-oss",
+  "finetune": "20b",
+  "version": null,
+  "size_label": null
+ },
+ {
+  "model_id": "openai/gpt-oss-20b",
+  "total_params": -1000000,
+  "name": "gpt-oss-20b",
+  "org": "openai",
+  "basename": "gpt-oss",
+  "finetune": null,
+  "version": null,
+  "size_label": "20B"
+ }
+]
