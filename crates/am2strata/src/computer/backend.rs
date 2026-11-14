@@ -513,7 +513,7 @@ mod linux {
     }
 
     /// `xwininfo -root -tree` lines: each window starts with a 0x id and ends with a quoted title; the root has none.
-    fn parse_wininfo(out: &str) -> Vec<Window> {
+    pub(crate) fn parse_wininfo(out: &str) -> Vec<Window> {
         let mut windows = Vec::new();
         for line in out.lines() {
             if !line.contains('"') { continue; } // the root window, or a line of another format
@@ -534,7 +534,7 @@ mod linux {
     }
 
     /// Join key tokens into an xdotool key sequence...
-    pub(super) fn keys_to_xdotool(keys: &[Key]) -> String {
+    pub(crate) fn keys_to_xdotool(keys: &[Key]) -> String {
         let mut seq = Vec::new();
         for k in keys {
             if k.as_str().is_empty() { continue; }
@@ -568,6 +568,8 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 pub use linux::{sandbox_app, LinuxBackend, SandboxDesktop};
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{keys_to_xdotool, parse_wininfo};
 
 // ------------------------------------------------------------------------------------------------- Non-Linux helpers
 

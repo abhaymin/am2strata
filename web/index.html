@@ -539,7 +539,8 @@
   <section class="view view--computer" id="view-computer" role="tabpanel" aria-labelledby="tab-btn-computer" hidden>
     <div class="cv">
       <div class="cv-bar">
-        <strong>Desktop</strong>
+        <select class="st-input" id="cv-target" aria-label="Which desktop" style="width:auto">
+          <option value="vm">Sandbox VM</option><option value="local">Local sandbox</option></select>
         <span class="st-badge" id="cv-who">Connecting&hellip;</span>
         <span class="muted small" id="cv-info"></span>
         <span class="cv-spacer"></span>
@@ -550,11 +551,83 @@
         <select class="st-input" id="cv-app" aria-label="Open an app" style="width:auto"><option value="">Open an app&hellip;</option></select>
       </div>
       <div class="msg-error" id="cv-error" hidden></div>
+      <div class="cv-vm" id="cv-vm" hidden>
+        <div class="cv-bar">
+          <span class="st-badge" id="vm-phase">…</span>
+          <span class="muted small" id="vm-use"></span>
+          <span class="cv-spacer"></span>
+          <button type="button" class="st-btn st-btn--primary" id="vm-start">Start</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vm-pause" title="Stop its CPUs (instant resume)">Pause</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vm-stop" title="Save it to disk and quit: 0 RAM, 0 CPU; Start restores it in about a second">Save &amp; stop</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vm-off" title="A clean power-off (open apps close)">Shut down</button>
+          <button type="button" class="st-btn st-btn--secondary" id="vm-more" aria-expanded="false">Apps, terminal, settings</button>
+        </div>
+        <div class="msg-warn small" id="vm-need" hidden></div>
+        <div class="cv-vm__task" id="vm-task" hidden><b id="vm-task-what"></b> <span class="muted small" id="vm-task-state"></span>
+          <pre class="cv-vm__log" id="vm-task-log"></pre></div>
+        <div class="cv-vm__more" id="vm-panel" hidden>
+          <div class="st-card st-card--inner"><b>Apps</b>
+            <p class="muted small">Inside the VM: nothing here touches this PC. Bitwarden and browsers: you sign in yourself.</p>
+            <div class="cv-vm__apps" id="vm-apps"><p class="muted small">Start the VM to see what is installed.</p></div>
+            <div class="cv-bar">
+              <select class="st-input" id="vm-kind" aria-label="Install from" style="width:auto">
+                <option value="apt">Debian packages</option><option value="flatpak">Flathub app id</option>
+                <option value="deb">.deb from a URL</option><option value="appimage">AppImage from a URL</option></select>
+              <input class="st-input mono" id="vm-target" placeholder="e.g. htop git  ·  org.gimp.GIMP  ·  https://…" style="flex:1;min-width:12rem">
+              <button type="button" class="st-btn st-btn--primary" id="vm-install">Install</button>
+              <button type="button" class="st-btn st-btn--secondary" id="vm-remove">Remove</button>
+            </div>
+          </div>
+          <div class="st-card st-card--inner"><b>Ads and trackers</b>
+            <p class="muted small">A DNS filter for every program in the VM (as Pi-hole and AdGuard Home work), plus uBlock
+              in the browsers. For a scraping job that must see a site as it is, list it under <i>let through</i>, or
+              allow all. The desktop's own <b>Ads and trackers</b> app does the same.</p>
+            <div class="cv-bar">
+              <label class="small"><input type="checkbox" id="vm-ads-block"> block ads</label>
+              <select class="st-input" id="vm-ads-lists" aria-label="Block list" style="width:auto">
+                <option value="pihole">Pi-hole's default list</option><option value="adguard">AdGuard DNS filter</option>
+                <option value="pihole,adguard">Both lists</option></select>
+              <input class="st-input mono" id="vm-ads-allow" placeholder="let through: example.com, shop.io" style="flex:1;min-width:10rem">
+              <button type="button" class="st-btn st-btn--primary" id="vm-ads-apply">Apply</button>
+            </div>
+            <span class="muted small" id="vm-ads-note"></span>
+          </div>
+          <div class="st-card st-card--inner"><b>Terminal</b>
+            <div class="cv-bar">
+              <input class="st-input mono" id="vm-cmd" placeholder="a command, e.g. df -h" style="flex:1;min-width:12rem" aria-label="Command">
+              <label class="small"><input type="checkbox" id="vm-root"> as root</label>
+              <button type="button" class="st-btn st-btn--primary" id="vm-run">Run</button>
+            </div>
+            <pre class="cv-vm__log" id="vm-out" hidden></pre>
+          </div>
+          <div class="st-card st-card--inner"><b>Settings</b>
+            <div class="cv-vm__grid">
+              <label class="small">CPUs <input class="st-input" id="vm-s-cpus" type="number" min="1" max="16"></label>
+              <label class="small">Memory, at most (MB) <input class="st-input" id="vm-s-memory_mb" type="number" min="768" step="256"></label>
+              <label class="small">Disk (GB) <input class="st-input" id="vm-s-disk_gb" type="number" min="8"></label>
+              <label class="small">Width <input class="st-input" id="vm-s-width" type="number" min="800"></label>
+              <label class="small">Height <input class="st-input" id="vm-s-height" type="number" min="600"></label>
+              <label class="small">Pause after idle (s, 0 never) <input class="st-input" id="vm-s-idle_pause_s" type="number" min="0"></label>
+              <label class="small">Save &amp; stop after idle (s, 0 never) <input class="st-input" id="vm-s-idle_stop_s" type="number" min="0"></label>
+              <label class="small">Leave the host this much RAM (MB) <input class="st-input" id="vm-s-host_reserve_mb" type="number" min="512" step="256"></label>
+            </div>
+            <div class="cv-bar">
+              <button type="button" class="st-btn st-btn--primary" id="vm-save">Save settings</button>
+              <button type="button" class="st-btn st-btn--secondary" id="vm-setup" title="Run the desktop setup again">Repair desktop</button>
+              <button type="button" class="st-btn st-btn--danger" id="vm-reset">Reset the VM…</button>
+              <span class="muted small" id="vm-folder"></span>
+            </div>
+          </div>
+        </div>
+      </div>
       <div class="cv-screen"><canvas id="cv-canvas" tabindex="0" aria-label="The desktop"></canvas></div>
       <p class="muted small">This is the private desktop computer use works on (never this PC's own screen). While
         <b>you have control</b>, your mouse and keyboard go to it and am2Strata's steps wait; hand it back to let a job go
         on. Closing this tab hands it back. Copy and paste need this page on HTTPS (Settings › Secure connection).
-        From a terminal: <code>am2strata-run computer status|screenshot|take|give|paste|copy|type|open</code>.</p>
+        From a terminal: <code>am2strata-run computer status|screenshot|take|give|paste|copy|type|open</code> and
+        <code>am2strata-run vm status|start|stop|apps|install|exec</code>. The <b>Sandbox VM</b> is a Debian virtual machine
+        am2Strata runs itself: anything can be installed in it (apt, Flathub, .deb, AppImage), and it only gets CPU this PC
+        is not using.</p>
     </div>
   </section>
 
@@ -974,7 +1047,7 @@
               <div class="st-field">
                 <label class="st-label">Mode <span class="muted small">how the model acts in the desktop</span></label>
                 <div class="seg seg--4" id="cu-mode" role="radiogroup" aria-label="Desktop mode">
-                  <button type="button" role="radio" data-v="sandbox" aria-checked="true">Sandbox</button><button type="button" role="radio" data-v="watch-only">Watch only</button>
+                  <button type="button" role="radio" data-v="sandbox" aria-checked="true">Sandbox</button><button type="button" role="radio" data-v="vm" title="A Debian virtual machine am2Strata runs: the agent is root in it and may install anything; this PC is untouched">Sandbox VM</button><button type="button" role="radio" data-v="watch-only">Watch only</button>
                   <button type="button" role="radio" data-v="assist">Assist <span class="muted small">(ask)</span></button><button type="button" role="radio" data-v="trusted-job">Trusted job</button></div></div>
               <div class="st-field"><label class="st-label">Allowed apps<br><span class="muted small">the sandbox desktop may open, one per line or comma-separated</span></label>
                 <textarea class="st-input mono" id="cu-apps" rows="2" placeholder="firefox&#10;LibreOffice"></textarea></div>

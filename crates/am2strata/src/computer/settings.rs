@@ -10,9 +10,9 @@ use std::path::Path;
 
 /// The desktop mode: a virtual display with only the listed apps (`Sandbox`, the default when turned on), a read-only view
 /// of the real desktop (`WatchOnly`), the real desktop where every action asks (`Assist`), or input approved once per job
-/// (`TrustedJob`).
+/// (`TrustedJob`), or the sandbox VM (`Vm`: a Debian virtual machine where the agent is root and may install anything).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Mode { #[default] Sandbox, WatchOnly, Assist, TrustedJob }
+pub enum Mode { #[default] Sandbox, WatchOnly, Assist, TrustedJob, Vm }
 
 impl Mode {
     pub fn parse(s: &str) -> Mode {
@@ -20,6 +20,7 @@ impl Mode {
             "watch-only" => Mode::WatchOnly,
             "assist" => Mode::Assist,
             "trusted-job" => Mode::TrustedJob,
+            "vm" | "sandbox-vm" | "virtual-machine" => Mode::Vm,
             _ => Mode::Sandbox,
         }
     }
@@ -29,6 +30,7 @@ impl Mode {
             Mode::WatchOnly => "watch-only",
             Mode::Assist => "assist",
             Mode::TrustedJob => "trusted-job",
+            Mode::Vm => "vm",
         }
     }
     /// When computer use is turned on and no mode is set, this one is used (the sandbox).
@@ -267,6 +269,8 @@ mod tests {
         assert_eq!(Mode::parse("assist"), Mode::Assist);
         assert_eq!(Mode::parse("trusted job"), Mode::TrustedJob);
         assert_eq!(Mode::parse("weird"), Mode::Sandbox, "unknown falls back to the sandbox default");
+        assert_eq!(Mode::parse("Sandbox VM"), Mode::Vm);
+        assert_eq!(Mode::Vm.as_str(), "vm");
         assert_eq!(Mode::Sandbox.as_str(), "sandbox");
     }
 

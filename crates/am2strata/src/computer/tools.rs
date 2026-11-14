@@ -6,10 +6,38 @@
 //! `computer_open_app` opens only an app in the allow list (the rules engine refuses the rest before the step runs).
 
 /// The desktop computer tools, matched against a request's tool call in run.rs (`crate::computer::TOOL_NAMES`).
-pub const TOOL_NAMES: [&str; 7] = [
+pub const TOOL_NAMES: [&str; 10] = [
     "computer_screenshot", "computer_click", "computer_type", "computer_key",
     "computer_scroll", "computer_open_app", "computer_wait",
+    // only in the sandbox VM mode
+    "computer_shell", "computer_install", "computer_ads",
 ];
+
+/// The sandbox VM's own tools: a root shell and installs. The VM is a separate machine, so these run without asking.
+pub fn vm_tools() -> Vec<Value> {
+    vec![
+        json!({"name": "computer_shell", "description": "Run a shell command in the sandbox VM (Debian 13; you are root there with sudo, \
+            and may change anything in it; the user's PC is not affected). Returns the exit code and output. The desktop is DISPLAY=:1; \
+            start GUI apps with `am2-run <command>`. Use root: true for system changes.",
+               "parameters": {"type": "object", "properties": {"command": {"type": "string"},
+                   "root": {"type": "boolean", "default": false}, "timeout_s": {"type": "number", "description": "default 300"}},
+                   "required": ["command"]}}),
+        json!({"name": "computer_install", "description": "Install or remove software in the sandbox VM: a catalog app (chromium, firefox, \
+            bitwarden, bitwarden-extension, tailscale, netbird, mullvad, surfshark, vpn (WireGuard and OpenVPN), vscode, libreoffice, thunderbird, keepassxc, gimp, vlc, obsidian, dev-tools, docker), or \
+            by kind: apt (Debian package names), flatpak (a Flathub app id), deb (an https URL of a .deb), appimage (an https URL).",
+               "parameters": {"type": "object", "properties": {
+                   "app": {"type": "string", "description": "a catalog id"},
+                   "kind": {"type": "string", "enum": ["apt", "flatpak", "deb", "appimage"]},
+                   "target": {"type": "string", "description": "package names, the Flathub id, or the URL"},
+                   "remove": {"type": "boolean", "default": false}}}}),
+        json!({"name": "computer_ads", "description": "Block or allow ads and trackers in the sandbox VM (every program, and the \
+            browsers). For a scraping or checking job that must see a site as it is, block with that site in \"allow\", or allow all.",
+               "parameters": {"type": "object", "properties": {"block": {"type": "boolean"},
+                   "lists": {"type": "array", "items": {"type": "string", "enum": ["pihole", "adguard"]}, "description": "default: pihole"},
+                   "allow": {"type": "array", "items": {"type": "string"}, "description": "domains whose ads stay (while blocking)"}},
+                   "required": ["block"]}}),
+    ]
+}
 
 /// The tools and their parameter schemas for the model (the `strata_computer: true` flag offers them; server_tools.rs).
 pub fn tools(vision: bool) -> Vec<Value> {
