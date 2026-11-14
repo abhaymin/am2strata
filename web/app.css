@@ -632,3 +632,28 @@ body.resizing iframe { pointer-events: none; }
   background: var(--color-surface-2, #111); border-radius: .5rem; }
 #cv-canvas { max-width: 100%; max-height: 100%; height: auto; outline: none; cursor: not-allowed; image-rendering: auto; }
 #cv-canvas.cv-live { cursor: default; box-shadow: 0 0 0 2px var(--color-accent, #4ade80); }
+/* Settings › Clients: API keys and usage (api-keys.js) */
+.key-row--off > :not(.mcp-server__head) { opacity: .6; }
+.key-facts { overflow-wrap: anywhere; }
+.key-facts code { font: 400 12px var(--st-font-mono); }
+.key-once { display: flex; flex-direction: column; align-items: flex-start; gap: var(--st-s-2); padding: var(--st-s-4); border-radius: var(--st-r-md);
+            border: 1.5px solid var(--st-accent); background: var(--st-accent-tint); }
+.key-once__row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--st-s-2); width: 100%; }
+.key-once__row code { flex: 1 1 200px; min-width: 0; padding: 10px 12px; border-radius: 8px; background: var(--st-surface); border: 1px solid var(--st-line);
+                      font: 400 13px var(--st-font-mono); overflow-wrap: anywhere; user-select: all; }
+.key-form { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.key-form .st-input, #usage-card .st-input { width: 100%; min-width: 0; }
+.key-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: var(--st-s-3); }
+.key-tools { margin: 0; padding: 0; border: 0; min-width: 0; }
+.key-tools legend { padding: 0; margin-bottom: 8px; }
+.key-tools__list { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.key-tool { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; font-size: var(--st-fs-sm); cursor: pointer; }
+.usage-bars { display: flex; align-items: flex-end; gap: 2px; height: 96px; padding-top: 4px; border-bottom: 1px solid var(--st-line); }
+.usage-bar { flex: 1 1 0; min-width: 0; height: 100%; display: flex; align-items: flex-end; }
+.usage-bar i { display: block; width: 100%; border-radius: 2px 2px 0 0; background: var(--st-accent); }
+.usage-bar:hover i { background: var(--st-accent-hover); }
+.usage-axis { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+/* the table scrolls inside its own box and never widens the page: it adds nothing to the card's own width */
+.usage-scroll { width: 0; min-width: 100%; overflow-x: auto; }
+.usage-table th, .usage-table td { padding: 8px 10px; white-space: nowrap; }
+.usage-table td:first-child { white-space: normal; overflow-wrap: anywhere; min-width: 110px; }

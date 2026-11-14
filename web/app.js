@@ -2432,7 +2432,7 @@ function showSection(name) {
   if (section === "memory") loadMemory();
   if (section === "server") loadSystem();
   if (section === "connect") { renderAppSetup(); renderAgents(); }
-  if (section === "clients") loadClients();
+  if (section === "clients") { loadClients(); if (window.loadApiKeys) window.loadApiKeys(); }
   if (section === "cluster") loadCluster();
   if (section === "https") loadTls();
   if (lastMetrics) render(lastMetrics);

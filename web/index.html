@@ -568,7 +568,7 @@
         <button type="button" data-sec="memory"><b>Memory</b><span>Facts kept on this PC, chats past the context</span></button>
         <button type="button" data-sec="appearance"><b>Appearance</b><span>Light, dark or system; accent</span></button>
         <button type="button" data-sec="connect"><b>Connect</b><span>Base URLs for your apps</span></button>
-        <button type="button" data-sec="clients"><b>Clients</b><span>Keys with their own tools</span></button>
+        <button type="button" data-sec="clients"><b>Clients</b><span>API keys, tools and usage</span></button>
         <button type="button" data-sec="cluster"><b>Cluster</b><span>Other machines that answer for this one</span></button>
         <button type="button" data-sec="computer"><b>Computer and browser use</b><span>Preset, mode, allowed apps and sites</span></button>
       </nav>
@@ -844,6 +844,54 @@
 
         <section class="set-panel" id="sec-clients" aria-labelledby="h-clients" hidden>
           <h2 id="h-clients">Clients</h2>
+          <div class="st-card"><span class="card-title">API keys</span>
+            <p class="muted small">A key for each app, user or machine that connects to this server. A key opens the model APIs
+              (chat, pictures, speech) with the tools you give it, never these settings. It works as soon as it is made and
+              stops as soon as it is revoked.</p>
+            <p class="msg-error" id="keys-open" hidden>This server has no main API key, so anyone who reaches it can use it with
+              no key at all. Set "api_key" in the run config for these keys to mean something.</p>
+            <div class="key-once" id="key-once" hidden>
+              <strong>Copy the key for <span id="key-once-name"></span> now</strong>
+              <p class="small">It is shown this once and kept nowhere: the server stores only its fingerprint. If it is
+                lost, revoke it and make another.</p>
+              <div class="key-once__row"><code id="key-once-value"></code>
+                <button type="button" class="st-btn st-btn--primary" id="key-once-copy">Copy</button></div>
+              <button type="button" class="st-btn st-btn--secondary" id="key-once-done">I have copied it</button>
+            </div>
+            <div class="mcp-list" id="keys-list"><p class="muted">Loading&hellip;</p></div></div>
+          <div class="st-card"><span class="card-title">New key</span>
+            <form class="key-form" id="key-form">
+              <label class="st-field">Name
+                <input class="st-input" id="key-name" maxlength="40" required autocomplete="off" placeholder="e.g. phone app"></label>
+              <fieldset class="key-tools"><legend>Tools it gets</legend><div class="key-tools__list" id="key-tools"></div></fieldset>
+              <div class="key-grid">
+                <label class="st-field">Expires
+                  <select class="st-input" id="key-expires"><option value="">Never</option><option value="1d">In 1 day</option>
+                    <option value="7d">In 7 days</option><option value="30d">In 30 days</option><option value="90d">In 90 days</option>
+                    <option value="365d">In 1 year</option></select></label>
+                <label class="st-field">Requests a day
+                  <input class="st-input" id="key-req-day" type="number" min="1" inputmode="numeric" placeholder="No limit"></label>
+                <label class="st-field">Tokens a day
+                  <input class="st-input" id="key-tok-day" type="number" min="1" inputmode="numeric" placeholder="No limit"></label>
+                <label class="st-field">Only these models
+                  <input class="st-input" id="key-models" autocomplete="off" placeholder="Every model (or ids, comma separated)"></label>
+              </div>
+              <div><button class="st-btn st-btn--primary" type="submit">Create key</button></div>
+            </form></div>
+          <div class="st-card" id="usage-card"><span class="card-title">Usage</span>
+            <div class="key-grid">
+              <label class="st-field">Whose
+                <select class="st-input" id="usage-key"><option value="">Everyone</option></select></label>
+              <label class="st-field">Days
+                <select class="st-input" id="usage-days"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option>
+                  <option value="90">Last 90 days</option><option value="365">Last year</option></select></label>
+            </div>
+            <p class="small" id="usage-sum"></p>
+            <div class="usage-bars" id="usage-bars" role="img"></div>
+            <div class="usage-axis muted small" id="usage-axis"></div>
+            <div id="usage-models"></div>
+            <div id="usage-keys"></div>
+            <p class="muted small">Days are UTC. The main key, each client profile and each key are counted apart, per model.</p></div>
           <div class="st-card"><span class="card-title">Client profiles</span>
             <p class="muted small">Each client (a laptop, an agent, a phone app) gets its own API key with its own tools and memory. An
               agent that sends only the address and the key gets these tools with no other setting. They are set in the run
@@ -1070,5 +1118,6 @@
   </div>
   <button type="button" class="viewer-open" id="viewer-open" hidden>Open large</button>
 <script src="web/app.js"></script>
+<script src="web/api-keys.js"></script>
 </body>
 </html>

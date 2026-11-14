@@ -15,6 +15,9 @@
 //! - `memory`: the profile's memory space (default: the profile's name); two profiles naming the same space share it.
 //! - `default` (no key): what the main key gets; without it, the main key gets only what its requests ask for.
 //!
+//! Keys made while the server runs (api_keys.rs: Settings › Clients, `am2strata-run keys`) are profiles too: `by_key`
+//! and `by_name` find a working one after the run config's.
+//!
 //! A client key opens the model APIs (chat, messages, responses, Gemini, media), not the server's settings. One request
 //! may narrow its set with `x-strata-tools: web,image`; naming a set the profile lacks is refused.
 
@@ -44,6 +47,12 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// A generated key's profile (api_keys.rs): its tools and memory space, no limits of the media kind.
+    pub fn generated(name: String, tools: BTreeSet<String>, memory: String) -> Profile {
+        Profile { name, key: None, tools, memory: Some(memory), media_jobs_per_hour: None, media_in_turn: None,
+                  max_image_pixels: None, max_video_seconds: None, web_queries_per_turn: None }
+    }
+
     /// The memory space of this profile's requests.
     pub fn memory_space(&self) -> String {
         self.memory.clone().unwrap_or_else(|| self.name.clone())
@@ -85,11 +94,19 @@ pub struct Clients {
     profiles: Vec<Profile>,
     /// what the main key gets (the "default" profile)
     pub default: Option<Profile>,
+    /// the keys made while the server runs (api_keys.rs): each is a profile too
+    generated: Option<std::sync::Arc<crate::api_keys::ApiKeys>>,
+}
+
+/// `t` as a tool set's name (SETS, mcp:<server>, mcp:*), or None.
+pub fn valid_set(t: &str) -> Option<String> {
+    let t = t.trim().to_ascii_lowercase();
+    (SETS.contains(&t.as_str()) || (t.starts_with("mcp:") && t.len() > 4)).then_some(t)
 }
 
 fn check_set(name: &str, t: &str) -> Result<String, String> {
     let t = t.trim().to_ascii_lowercase();
-    if SETS.contains(&t.as_str()) || (t.starts_with("mcp:") && t.len() > 4) {
+    if let Some(t) = valid_set(&t) {
         Ok(t)
     } else {
         Err(format!("config clients.{name}.tools: {t:?} is not a tool set (one of {}, or mcp:<server>, mcp:*)", SETS.join(", ")))
@@ -150,13 +167,30 @@ impl Clients {
         self.profiles.is_empty()
     }
 
-    /// The profile whose key is `given` (compared in constant time).
-    pub fn by_key(&self, given: &str) -> Option<&Profile> {
+    /// With the keys made while the server runs: a working one is a profile like the run config's.
+    pub fn with_generated(mut self, keys: std::sync::Arc<crate::api_keys::ApiKeys>) -> Clients {
+        self.generated = Some(keys);
+        self
+    }
+
+    /// The run config's profile whose key is `given` (compared in constant time).
+    pub fn config_by_key(&self, given: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.key.as_deref().is_some_and(|k| same(given, k)))
     }
 
-    pub fn by_name(&self, name: &str) -> Option<&Profile> {
-        self.profiles.iter().find(|p| p.name == name)
+    /// Whether the run config has a profile of this name.
+    pub fn has_name(&self, name: &str) -> bool {
+        self.profiles.iter().any(|p| p.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The profile whose key is `given`: the run config's, or a generated key's that is neither revoked nor expired.
+    pub fn by_key(&self, given: &str) -> Option<Profile> {
+        self.config_by_key(given).cloned().or_else(|| self.generated.as_ref().and_then(|g| g.profile_by_key(given)))
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<Profile> {
+        self.profiles.iter().find(|p| p.name == name).cloned()
+            .or_else(|| self.generated.as_ref().and_then(|g| g.profile_by_name(name)))
     }
 
     /// Settings › Clients: each profile without its key (the key's last 4 characters only).
@@ -181,7 +215,7 @@ fn same(a: &str, b: &str) -> bool {
 
 /// The client profile this task serves (its key picked it), for its limits; None for the main key.
 pub fn current(c: &Clients) -> Option<Profile> {
-    c.by_name(&crate::queue::current_client()).cloned()
+    c.by_name(&crate::queue::current_client())
 }
 
 /// Err: the size `w`x`h` is past this task's profile's limit.
