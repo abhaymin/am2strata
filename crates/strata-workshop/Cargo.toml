@@ -17,4 +17,8 @@ serde.workspace = true
 thiserror.workspace = true
 strata-pack.workspace = true
 strata-gguf.workspace = true
+# tokenizers loads the fixture's tokenizer.json and tokenizes the pre-tokenizer probe string (the port of llama.cpp's
+# get_vocab_base_pre); sha2 hashes that id list to look it up in llama.cpp's chkhsh table.
+tokenizers = "0.21"
+sha2 = "0.10"
 half = "2"

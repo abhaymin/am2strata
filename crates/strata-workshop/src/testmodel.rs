@@ -4,10 +4,10 @@
 //! `convert_hf_to_gguf` output of this tiny model, the `llama-quantize` bytes) are made once by the reviewer and
 //! committed under `tests/fixtures/` with a README; tests only read them.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use candle_core::{Device, Tensor};
+use serde_json::Value as Json;
 use serde_json::json;
 use safetensors::tensor as st;
 
@@ -75,8 +75,9 @@ impl TinyLlama {
     }
 
     /// Write the fixture into `dir`: `<count>` safetensors shards named like an HF checkpoint, a real `config.json` and
-    /// `tokenizer_config.json`, plus a minimal `tokenizer.json`. Returns the shard files (in order). The config and
-    /// tokenizer are exactly what the step-6 converter reads to build the GGUF.
+    /// `tokenizer_config.json`, plus a real `tokenizer.json`. Returns the shard files (in order). The config and
+    /// tokenizer are exactly what the step-6 converter reads to build the GGUF and what llama.cpp's converter produced
+    /// the reference from; they are byte-identical to `tests/fixtures/tiny-llama-hf/`.
     pub fn write(&self, dir: &Path) -> anyhow::Result<ShardFiles> {
         let tensors = self.generate();
         std::fs::create_dir_all(dir)?;
@@ -148,37 +149,115 @@ fn write_config_json(dir: &Path, cfg: &serde_json::Value) -> anyhow::Result<()> 
 }
 
 /// Write the HF `tokenizer_config.json` (chat template, bos/eos, add flags) so the converter and llama.cpp agree on the
-/// tokenizer's special tokens. bos is tok_0 / eos is tok_1, both present in the vocab written alongside this.
+/// tokenizer's special tokens. bos is tok_0 / eos is tok_1 (plain strings, as a real `PreTrainedTokenizerFast` writes),
+/// matching `tests/fixtures/tiny-llama-hf/tokenizer_config.json` byte for byte.
 fn write_tokenizer_config_json(dir: &Path) -> anyhow::Result<()> {
-    let tc = json!({
-        "add_bos_token": true,
-        "add_eos_token": false,
-        "tokenizer_class": "LlamaTokenizerFast",
-        "bos_token": {"content": "tok_0", "special": true},
-        "eos_token": {"content": "tok_1", "special": true},
-        "chat_template": "{% for message in messages %}{% if loop.first and message['role'] != 'system' %}{{ system_prompt }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}",
-    });
-    std::fs::write(dir.join("tokenizer_config.json"), serde_json::to_string_pretty(&tc)?)?;
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_string_pretty(&tokenizer_config_json())?,
+    )?;
     Ok(())
 }
 
+/// Write a real Hugging Face `tokenizer.json` (version, truncation/padding, `added_tokens` for tok_0/tok_1 as special,
+/// normalizer, ByteLevel pre_tokenizer and decoder, and a full BPE model). Identical to the one committed in
+/// `tests/fixtures/tiny-llama-hf/tokenizer.json`.
 fn write_tokenizer_json(dir: &Path, vocab_size: usize) -> anyhow::Result<()> {
-    let mut vocab = BTreeMap::new();
+    std::fs::write(
+        dir.join("tokenizer.json"),
+        serde_json::to_string_pretty(&tokenizer_json(vocab_size))?,
+    )?;
+    Ok(())
+}
+
+/// One entry of `tokenizer.json`'s `added_tokens`: tok_0 / tok_1, special and otherwise inert. Kept as a builder so both
+/// the writer and the reference-equality test construct it identically.
+fn added_token(id: u64, content: &str, special: bool) -> Json {
+    json!({
+        "id": id,
+        "content": content,
+        "single_word": false,
+        "lstrip": false,
+        "rstrip": false,
+        "normalized": false,
+        "special": special,
+    })
+}
+
+/// The `tokenizer.json` this fixture writes — the exact structure committed alongside the reference GGUF. Built as a
+/// value so a test can assert (with `serde_json::Value` equality) that the writer never drifts back to an old form and
+/// destroys the fixture on disk.
+fn tokenizer_json(vocab_size: usize) -> Json {
+    let mut vocab = serde_json::Map::new();
     for i in 0..vocab_size {
-        vocab.insert(format!("tok_{i}"), i);
+        vocab.insert(format!("tok_{i}"), json!(i));
     }
-    // serde so the structure (model.vocab / model.merges / pre_tokenizer / special_tokens) is always valid JSON.
-    let tj = json!({
-        "version": "1.1",
+    let mut added_tokens = Vec::new();
+    if vocab_size > 0 {
+        added_tokens.push(added_token(0, "tok_0", true));
+    }
+    if vocab_size > 1 {
+        added_tokens.push(added_token(1, "tok_1", true));
+    }
+    json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added_tokens,
+        "normalizer": null,
+        "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true },
+        "post_processor": null,
+        "decoder": { "type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true },
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": null,
+            "continuing_subword_prefix": null,
+            "end_of_word_suffix": null,
+            "fuse_unk": false,
+            "byte_fallback": false,
+            "ignore_merges": false,
+            "vocab": Json::Object(vocab),
+            "merges": [],
+        },
+    })
+}
+
+/// The `tokenizer_config.json` this fixture writes (bos/eos as plain strings). Matches the committed reference exactly.
+fn tokenizer_config_json() -> Json {
+    json!({
         "add_bos_token": true,
         "add_eos_token": false,
-        "model": { "type": "BPE", "dropout": null, "vocab": vocab, "merges": [] },
-        "pre_tokenizer": { "type": "ByteLevel", "use_regex": true },
-        "decoders": null,
-        "special_tokens": { "bos": "tok_0", "eos": "tok_1" },
-    });
-    std::fs::write(dir.join("tokenizer.json"), serde_json::to_string_pretty(&tj)?)?;
-    Ok(())
+        "tokenizer_class": "PreTrainedTokenizerFast",
+        "bos_token": "tok_0",
+        "eos_token": "tok_1",
+        "chat_template": "{% for message in messages %}{% if loop.first and message['role'] != 'system' %}{{ system_prompt }}{% endif %}{% if message['role'] == 'system' %}{{ message['content'] }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The committed fixture tokenizer files are the reference; re-derive the expected value in the test and compare
+    /// with `serde_json::Value` equality so a drift in [`tokenizer_json`] / [`tokenizer_config_json`] is caught here
+    /// (and, crucially, before [`save_tiny_checkpoint`](crate::tests::convert_reference::save_tiny_checkpoint) overwrites
+    /// the folder and hides it).
+    #[test]
+    fn tokenizer_files_match_reference() {
+        let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-llama-hf");
+        let got_tok: Json = serde_json::from_str(
+            &std::fs::read_to_string(fx.join("tokenizer.json")).expect("committed tokenizer.json parses"),
+        )
+        .expect("committed tokenizer.json parses");
+        let got_cfg: Json = serde_json::from_str(
+            &std::fs::read_to_string(fx.join("tokenizer_config.json")).expect("committed tokenizer_config.json parses"),
+        )
+        .expect("committed tokenizer_config.json parses");
+        assert_eq!(got_tok, tokenizer_json(32), "committed tokenizer.json differs from what TinyLlama writes");
+        assert_eq!(got_cfg, tokenizer_config_json(), "committed tokenizer_config.json differs from what TinyLlama writes");
+    }
 }
 
 /// Deterministic generator so `write` and a test's expected values agree exactly.

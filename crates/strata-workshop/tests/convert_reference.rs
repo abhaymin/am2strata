@@ -81,7 +81,7 @@ fn converted_matches_llama_convert_hf_to_gguf() {
 
     // our converter, on the SAME committed HF folder the reviewer's tool read.
     let out = std::env::temp_dir().join(format!("our-tiny-llama-f32-{}.gguf", std::process::id()));
-    convert(&hf, &out, OutType::F32).expect("converter writes the tiny GGUF");
+    convert(&hf, &out, OutType::F32, Some("gpt-2")).expect("converter writes the tiny GGUF");
 
     let our = Gguf::open(&out).expect("our GGUF opens");
     let theirs = Gguf::open(&ref_path).expect("reference GGUF opens");

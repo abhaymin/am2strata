@@ -27,7 +27,7 @@ fn converted_gguf_has_expected_tensors_metadata_and_tokenizer() -> Result<(), Bo
     let written = Fixture::default().write(&fdir)?;
     let out = fdir.join("model.f32.gguf");
 
-    convert(&written.dir, &out, OutType::F32)?;
+    convert(&written.dir, &out, OutType::F32, Some("gpt-2"))?;
     let g = Gguf::open(&out)?;
 
     // strata_gguf reads dims in file order (innermost-first), the reverse of a tensor's numpy shape; flip them back so
@@ -42,22 +42,22 @@ fn converted_gguf_has_expected_tensors_metadata_and_tokenizer() -> Result<(), Bo
     assert_eq!(g.tensors.len(), 3 + 2 * 9, "one tensor per HF weight, mapped to GGUF names");
     let dim = |name: &str| shapes.get(name).cloned().unwrap_or_default();
 
-    // shared tensors keep their HF shapes.
-    assert_eq!(dim("token_embd"), vec![32u64, 16]);
-    assert_eq!(dim("output_norm"), vec![16]);
-    assert_eq!(dim("output"), vec![32u64, 16]);
+    // shared tensors keep their HF shapes (gguf names carry llama.cpp's .weight suffix).
+    assert_eq!(dim("token_embd.weight"), vec![32u64, 16]);
+    assert_eq!(dim("output_norm.weight"), vec![16]);
+    assert_eq!(dim("output.weight"), vec![32u64, 16]);
 
     // block tensors: attn_q/k/v/output [hidden,hidden], ffn_gate/up [intermediate,hidden], ffn_down [hidden,intermediate].
     for n in 0..2 {
-        assert_eq!(dim(&format!("blk.{n}.attn_norm")), vec![16]);
-        assert_eq!(dim(&format!("blk.{n}.attn_q")), vec![16, 16]);
-        assert_eq!(dim(&format!("blk.{n}.attn_k")), vec![16, 16]);
-        assert_eq!(dim(&format!("blk.{n}.attn_v")), vec![16, 16]);
-        assert_eq!(dim(&format!("blk.{n}.attn_output")), vec![16, 16]);
-        assert_eq!(dim(&format!("blk.{n}.ffn_norm")), vec![16]);
-        assert_eq!(dim(&format!("blk.{n}.ffn_gate")), vec![32, 16]);
-        assert_eq!(dim(&format!("blk.{n}.ffn_up")), vec![32, 16]);
-        assert_eq!(dim(&format!("blk.{n}.ffn_down")), vec![16, 32]);
+        assert_eq!(dim(&format!("blk.{n}.attn_norm.weight")), vec![16]);
+        assert_eq!(dim(&format!("blk.{n}.attn_q.weight")), vec![16, 16]);
+        assert_eq!(dim(&format!("blk.{n}.attn_k.weight")), vec![16, 16]);
+        assert_eq!(dim(&format!("blk.{n}.attn_v.weight")), vec![16, 16]);
+        assert_eq!(dim(&format!("blk.{n}.attn_output.weight")), vec![16, 16]);
+        assert_eq!(dim(&format!("blk.{n}.ffn_norm.weight")), vec![16]);
+        assert_eq!(dim(&format!("blk.{n}.ffn_gate.weight")), vec![32, 16]);
+        assert_eq!(dim(&format!("blk.{n}.ffn_up.weight")), vec![32, 16]);
+        assert_eq!(dim(&format!("blk.{n}.ffn_down.weight")), vec![16, 32]);
     }
 
     // metadata llama.cpp reads for a llama model (values from the fixture's config.json).
