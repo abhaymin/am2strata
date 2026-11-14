@@ -70,11 +70,14 @@ fn converted_gguf_has_expected_tensors_metadata_and_tokenizer() -> Result<(), Bo
     assert_eq!(g.u64("llama.attention.head_count_kv"), Some(2));
     let eps = g.metadata.get("llama.attention.layer_norm_rms_epsilon").unwrap().as_f64().unwrap();
     assert!((eps - 1e-5).abs() < 1e-9, "rms epsilon ~= 1e-5, got {eps}");
-    assert_eq!(g.u64("llama.rope.freq_base"), Some(10000));
+    // llama.cpp stores rope.freq_base as FLOAT32 (not UINT32), so read it back as a float like the rms epsilon above.
+    let freq = g.metadata.get("llama.rope.freq_base").unwrap().as_f64().unwrap();
+    assert!((freq - 10000.0).abs() < 1e-3, "rope freq base ~= 10000, got {freq}");
     assert_eq!(g.u64("llama.vocab_size"), Some(32));
 
-    // tokenizer: model + sorted vocab + special-token flags + chat template.
-    assert_eq!(g.str("tokenizer.ggml.model"), Some("llama"));
+    // tokenizer: model + sorted vocab + special-token flags + chat template. The tiny fixture is a BPE tokenizer.json, so
+    // llama.cpp (and the reference GGUF) record "gpt2" here, not "llama".
+    assert_eq!(g.str("tokenizer.ggml.model"), Some("gpt2"));
     let toks = g.metadata.get("tokenizer.ggml.tokens").unwrap().as_array().unwrap();
     assert_eq!(toks.len(), 32);
     assert_eq!(toks[0], serde_json::json!("tok_0"));

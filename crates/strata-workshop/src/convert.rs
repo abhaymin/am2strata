@@ -413,10 +413,17 @@ fn tokenizer_arrays(dir: &Path, vocab_size: usize, pre: &str) -> Result<(Vec<Kv>
         .map(|i| if special_ids.contains(&i) { 3 } else { 1 }) // CONTROL / NORMAL (gguf TokenType enum)
         .collect();
 
+    // llama.cpp writes "gpt2" for a BPE tokenizer.json (the HF path) and "llama" only for a SentencePiece tokenizer.model.
+    let ggml_model = tj["model"]
+        .get("type")
+        .and_then(Json::as_str)
+        .map(|t| t.eq_ignore_ascii_case("BPE"))
+        .unwrap_or(false);
+
     Ok((
         vec![
             Kv::Str(pre.into()),
-            Kv::Str("llama".into()),
+            Kv::Str(if ggml_model { "gpt2" } else { "llama" }.into()),
             Kv::Strings(tokens),
             Kv::Floats(scores),
             Kv::Ints(token_type),
@@ -440,6 +447,70 @@ fn chat_template(tc: &Json) -> String {
     tc["chat_template"].as_str().unwrap_or("").to_string()
 }
 
+/// A word that id_to_title should leave alone: a version number (leading digit) or an acronym (`vN...`), matching
+/// gguf's `id_to_title` regex `^(v\d+(?:\.\d+)*|\d.*)$`.
+fn looks_like_version_or_acronym(word: &str) -> bool {
+    match word.as_bytes().first() {
+        Some(b) if b.is_ascii_digit() => true,
+        Some(b'v') | Some(b'V') => word.len() >= 2 && word.as_bytes()[1].is_ascii_digit(),
+        _ => false,
+    }
+}
+
+/// Port of gguf's `id_to_title`: title-case each dash/space separated word unless it is a version/acronym, so
+/// `tiny-llama-hf` -> "Tiny Llama Hf".
+fn id_to_title(input: &str) -> String {
+    input
+        .split(|c: char| c == '-' || c == ' ')
+        .filter(|w| !w.is_empty())
+        .map(|word| {
+            let is_lower = !word.is_empty() && word.chars().all(|c| c.is_lowercase());
+            if is_lower && !looks_like_version_or_acronym(word) {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(c) => format!("{}{}", c.to_uppercase().collect::<String>(), chars.collect::<String>().to_lowercase()),
+                    None => String::new(),
+                }
+            } else {
+                word.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Port of gguf's `size_label` for a dense (non-expert) model: the parameter count in rounded K/M/B/T notation, via
+/// gguf's `model_weight_count_rounded_notation`.
+fn model_size_label(params: u64) -> String {
+    let value = params as f64;
+    let (scaled, suffix) = if value > 1e12 {
+        (value * 1e-12, "T")
+    } else if value > 1e9 {
+        (value * 1e-9, "B")
+    } else if value > 1e6 {
+        (value * 1e-6, "M")
+    } else {
+        (value * 1e-3, "K")
+    };
+    // min_digits is fixed at 2 in llama.cpp; fix = max(min_digits - len(str(round(scaled)).lstrip('0')), 0).
+    let rounded_len = (scaled.round() as i64).to_string().trim_start_matches('0').len();
+    let decimals = (2 - rounded_len).max(0);
+
+    // Render `scaled` with exactly `decimals` fractional digits (no dynamic-width format spec), then append suffix.
+    let magnitude = 10i64.pow(decimals as u32);
+    let rounded = (scaled * magnitude as f64).round() as i64;
+    let int_part = rounded / magnitude;
+    let mut frac = ((rounded % magnitude) as u64).to_string();
+    while frac.len() < decimals {
+        frac.insert(0, '0');
+    }
+    if decimals == 0 {
+        format!("{int_part}{suffix}")
+    } else {
+        format!("{int_part}.{frac}{suffix}")
+    }
+}
+
 /// Write the GGUF file. `dir` holds the HF checkpoint (config/tokenizer/shards); `out` is the destination path.
 pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>) -> Result<()> {
     let hparams = HfConfig::load(dir)?;
@@ -457,24 +528,44 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         .with_context(|| format!("reading tokenizer_config.json in {}", dir.display()))?)?;
     let chat = chat_template(&tc);
 
-    // metadata key/value pairs (general first, then the llama.* hyper-parameters, then tokenizer).
+    let mapped = mapped_tensors(&tensors)?;
+    // total number of parameters across every tensor — llama.cpp derives general.size_label from it.
+    let total_params: u64 = mapped.iter().map(|m| m.shape.iter().product::<u64>()).sum();
+
+    // general.name (a title-cased form of the HF folder) and general.size_label (the parameter count) are derived like
+    // convert_hf_to_gguf.py does; head_dim drives llama.rope.dimension_count, which the engine needs.
+    let name = match dir.file_name().and_then(|n| n.to_str()) {
+        Some(folder) => id_to_title(folder),
+        None => "llama".to_string(),
+    };
+    let size_label = model_size_label(total_params);
+    let head_dim = hparams.hidden_size / hparams.num_attention_heads;
+
+    // metadata key/value pairs, in convert_hf_to_gguf.py's exact order (general.* first, then the llama.* hyper-parameters,
+    // then tokenizer.*), matching llama.cpp for a BPE (HF) checkpoint.
     let mut kv: Vec<(&'static str, Kv)> = vec![
         ("general.architecture", Kv::Str("llama".into())),
-        ("general.file_type", Kv::U32(outtype.file_type())),
+        ("general.type", Kv::Str("model".into())),
+        ("general.name", Kv::Str(name)),
+        ("general.size_label", Kv::Str(size_label)),
+        ("llama.block_count", Kv::U32(hparams.num_hidden_layers as u32)),
         ("llama.context_length", Kv::U32(hparams.max_position_embeddings as u32)),
         ("llama.embedding_length", Kv::U32(hparams.hidden_size as u32)),
-        ("llama.block_count", Kv::U32(hparams.num_hidden_layers as u32)),
         ("llama.feed_forward_length", Kv::U32(hparams.intermediate_size as u32)),
         ("llama.attention.head_count", Kv::U32(hparams.num_attention_heads as u32)),
         ("llama.attention.head_count_kv", Kv::U32(hparams.num_key_value_heads as u32)),
+        ("llama.rope.freq_base", Kv::F32(hparams.rope_theta as f32)), // llama.cpp writes this as FLOAT32
         ("llama.attention.layer_norm_rms_epsilon", Kv::F32(hparams.rms_norm_eps)),
-        ("llama.rope.freq_base", Kv::U32(hparams.rope_theta)),
+        ("general.file_type", Kv::U32(outtype.file_type())),
         ("llama.vocab_size", Kv::U32(hparams.vocab_size as u32)),
+        ("llama.rope.dimension_count", Kv::U32(head_dim as u32)),
+        ("general.quantization_version", Kv::U32(2)),
     ];
-    kv.push(("tokenizer.ggml.pre", tok_arrays[0].clone()));
+    // tokenizer.* in llama.cpp's order; a BPE tokenizer carries no scores array (only SentencePiece vocabularies do), so
+    // tok_arrays[3] (scores) is deliberately not written here.
     kv.push(("tokenizer.ggml.model", tok_arrays[1].clone()));
+    kv.push(("tokenizer.ggml.pre", tok_arrays[0].clone()));
     kv.push(("tokenizer.ggml.tokens", tok_arrays[2].clone()));
-    kv.push(("tokenizer.ggml.scores", tok_arrays[3].clone()));
     kv.push(("tokenizer.ggml.token_type", tok_arrays[4].clone()));
     kv.push(("tokenizer.ggml.bos_token_id", Kv::U32(bos_id)));
     kv.push(("tokenizer.ggml.eos_token_id", Kv::U32(eos_id)));
@@ -485,7 +576,6 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         kv.push(("tokenizer.chat_template", Kv::Str(chat)));
     }
 
-    let mapped = mapped_tensors(&tensors)?;
     let specs: Vec<TensorSpec> = mapped.iter().map(|m| TensorSpec {
         name: m.name.clone(),
         shape: m.shape.clone(),

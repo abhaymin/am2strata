@@ -1,13 +1,12 @@
 //! Step 6, part C — reference check against llama.cpp's `convert_hf_to_gguf.py`.
 //!
 //! - [`save_tiny_checkpoint`]: writes the tiny HF folder (config.json + tokenizer*.json + F32 safetensors shards) that
-//!   BOTH our converter and the reviewer's `convert_hf_to_gguf.py` read, plus `tests/fixtures/NEEDED-convert.md`. It is
-//!   deterministic (`TinyLlama::default`, seed 0x5EED), so it can be regenerated any time; the files are committed.
-//! - [`converted_matches_llama_convert_hf_to_gguf`]: runs our converter on that same folder and, only when the reviewer
-//!   has committed `tiny-llama.f32.gguf` (see `NEEDED-convert.md`), compares tensor names/shapes/types, every tensor's
-//!   bytes (the q/k rotary permute is included — a mismatched permute changes those bytes), and the full metadata. Each
-//!   comparison is **skipped with a clear message** when that reference file is absent, so nothing in `cargo test` needs
-//!   Python or llama.cpp.
+//!   BOTH our converter and the reviewer's `convert_hf_to_gguf.py` read. It is deterministic (`TinyLlama::default`, seed
+//!   0x5EED), so it can be regenerated any time; the files are committed.
+//! - [`converted_matches_llama_convert_hf_to_gguf`]: runs our converter on that same folder and compares tensor names/
+//!   shapes/types, every tensor's bytes (the q/k rotary permute is included — a mismatched permute changes those bytes),
+//!   and the full metadata against llama.cpp's committed `tiny-llama.f32.gguf`. It is **skipped with a clear message**
+//!   only when that reference file is absent, so nothing in `cargo test` needs Python or llama.cpp.
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -23,7 +22,8 @@ const REF_GGUF: &str = "tiny-llama.f32.gguf";
 fn fixtures() -> PathBuf { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures") }
 
 /// Write the shared tiny HF checkpoint folder deterministically, so our converter and llama.cpp read byte-identical
-/// inputs, plus `NEEDED-convert.md` telling the reviewer how to produce the reference GGUF from it. Returns its path.
+/// inputs. Returns its path (the committed `tiny-llama.f32.gguf` was produced from this same folder by
+/// `convert_hf_to_gguf.py`).
 fn write_tiny_checkpoint() -> PathBuf {
     let fx = fixtures();
     std::fs::create_dir_all(&fx).ok();
@@ -32,23 +32,6 @@ fn write_tiny_checkpoint() -> PathBuf {
     std::fs::remove_dir_all(&hf).ok();
     Fixture::default().write(&hf).expect("tiny fixture writes a HF checkpoint");
 
-    let needed = concat!(
-        "# tiny-llama.f32.gguf reference\n",
-        "\n",
-        "`convert_hf_to_gguf.py`'s output for the tiny Llama folder committed in `tests/fixtures/tiny-llama-hf/`. The test\n",
-        "runs our converter on that same folder and, when this file is present, compares tensor names/shapes/types, every\n",
-        "tensor's bytes (this includes the q/k rotary permute), and the full metadata. Until it exists the test skips.\n",
-        "\n",
-        "Produce and commit it (run from the repository root; this `convert_hf_to_gguf.py` needs its `conversion` module\n",
-        "and `gguf-py`, which live alongside it in this llama.cpp source):\n",
-        "\n",
-        "    python .agent/ref/llama.cpp/convert_hf_to_gguf.py \\\n",
-        "        tests/fixtures/tiny-llama-hf --outtype f32 --outfile tests/fixtures/tiny-llama.f32.gguf\n",
-        "\n",
-        "(The tiny HF folder is written deterministically by the `save_tiny_checkpoint` test: `TinyLlama::default()`,\n",
-        "seed 0x5EED — vocab 32, hidden 16, 2 layers, tie_word_embeddings=false.)\n",
-    );
-    std::fs::write(fx.join("NEEDED-convert.md"), needed).ok();
     hf
 }
 
@@ -68,14 +51,14 @@ fn save_tiny_checkpoint() {
 }
 
 // Byte-for-byte (per tensor) plus names/shapes/types and metadata, against `convert_hf_to_gguf.py`'s committed output.
-// Skips the whole comparison when the reference GGUF is absent (`tests/fixtures/NEEDED-convert.md` says how to make it).
+// Skips the whole comparison when the reference GGUF is absent (see write_tiny_checkpoint for how to make it).
 #[test]
 fn converted_matches_llama_convert_hf_to_gguf() {
     let hf = write_tiny_checkpoint();
     let ref_path = fixtures().join(REF_GGUF);
     if !ref_path.exists() {
-        eprintln!("[skip] {REF_GGUF} is not present under tests/fixtures/ (see its NEEDED-convert.md). Generated it locally with \
-                  `convert_hf_to_gguf.py` and commit it to run the llama.cpp reference comparison.");
+        eprintln!("[skip] {REF_GGUF} is not present under tests/fixtures/; generate it locally with \
+                  `convert_hf_to_gguf.py` on the tiny HF folder and commit it to run the llama.cpp comparison.");
         return;
     }
 
