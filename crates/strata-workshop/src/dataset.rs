@@ -294,6 +294,72 @@ pub fn filter(record: &Record, rules: &Rules) -> Option<&'static str> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// read_jsonl — load chat records, reporting bad lines instead of panicking
+// ---------------------------------------------------------------------------
+
+/// Load a JSONL dataset into [`Record`]s. Each line is either `{"messages":[{role,content},...]}` or
+/// `{"prompt","completion"}` (expanded into a user + assistant pair). Malformed lines are collected with their line
+/// number and a human-readable reason rather than aborting the read.
+pub fn read_jsonl(path: &std::path::Path) -> anyhow::Result<(Vec<Record>, Vec<(usize, String)>)> {
+    let text = std::fs::read_to_string(path)?;
+    let mut records = Vec::new();
+    let mut bad: Vec<(usize, String)> = Vec::new();
+
+    for (i, line) in text.lines().enumerate() {
+        let lineno = i + 1;
+        if line.trim().is_empty() {
+            continue; // ignore blank lines, the usual JSONL convention.
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                bad.push((lineno, format!("invalid JSON: {e}")));
+                continue;
+            }
+        };
+
+        match parse_line(&value) {
+            Ok(Some(record)) => records.push(record),
+            Ok(None) => {}
+            Err(why) => bad.push((lineno, why.to_string())),
+        }
+    }
+
+    Ok((records, bad))
+}
+
+/// Parse one decoded JSON object into a [`Record`], or return a reason string if the line's schema is unusable.
+fn parse_line(value: &serde_json::Value) -> anyhow::Result<Option<Record>> {
+    let obj = value.as_object().ok_or_else(|| anyhow::anyhow!("record is not a JSON object"))?;
+
+    // `{"messages":[...]}` form.
+    if let Some(msgs) = obj.get("messages").and_then(|m| m.as_array()) {
+        let mut messages = Vec::with_capacity(msgs.len());
+        for (mi, m) in msgs.iter().enumerate() {
+            let role = m.get("role").and_then(|r| r.as_str()).ok_or_else(|| anyhow::anyhow!("message #{mi} missing string 'role'"))?;
+            let content = m.get("content").and_then(|c| c.as_str()).ok_or_else(|| anyhow::anyhow!("message #{mi} missing string 'content'"))?;
+            messages.push((role.to_string(), content.to_string()));
+        }
+        return Ok(Some(Record { messages }));
+    }
+
+    // `{"prompt","completion"}` form.
+    if let (Some(prompt), Some(completion)) = (obj.get("prompt"), obj.get("completion")) {
+        if let (Some(p), Some(c)) = (prompt.as_str(), completion.as_str()) {
+            return Ok(Some(Record {
+                messages: vec![
+                    ("user".to_string(), p.to_string()),
+                    ("assistant".to_string(), c.to_string()),
+                ],
+            }));
+        }
+        return Err(anyhow::anyhow!("record has prompt/completion but they are not strings"));
+    }
+
+    Err(anyhow::anyhow!("record is missing both 'messages' and 'prompt'/'completion'"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +499,34 @@ mod tests {
         let rules = Rules::default();
         let r = rec(&[("user", "What is the capital of France?"), ("assistant", "What is the capital of France?")]);
         assert_eq!(filter(&r, &rules), Some("answer_equals_question"));
+    }
+
+    #[test]
+    fn reads_jsonl_mixed_good_and_bad() {
+        use std::io::Write;
+        let mut f = std::fs::File::create(std::env::temp_dir().join("strata-dataset-test.jsonl")).unwrap();
+        writeln!(f, r#"{{"messages":[{{"role":"user","content":"hi"}},{{"role":"assistant","content":"hello there"}}]}}"#).unwrap();
+        writeln!(f, r#"{{"prompt":"q1","completion":"a1"}}"#).unwrap();
+        writeln!(f, "{{ not valid json").unwrap();
+        writeln!(f, r#"{{"messages":[{{"role":"user"}}]}}"#).unwrap(); // missing content
+        writeln!(f, r#"{{"unknown":"schema"}}"#).unwrap();
+        f.flush().unwrap();
+        let path = std::env::temp_dir().join("strata-dataset-test.jsonl");
+
+        let (records, bad) = read_jsonl(&path).expect("should not panic");
+
+        // Two good records: one messages-form, one prompt/completion-form.
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].messages, vec![("user".to_string(), "hi".to_string()), ("assistant".to_string(), "hello there".to_string())]);
+        assert_eq!(records[1].messages, vec![("user".to_string(), "q1".to_string()), ("assistant".to_string(), "a1".to_string())]);
+
+        // Three bad lines, reported with their line numbers and a reason.
+        assert_eq!(bad.len(), 3);
+        let nums: Vec<usize> = bad.iter().map(|(n, _)| *n).collect();
+        assert!(nums.contains(&3) && nums.contains(&4) && nums.contains(&5), "line numbers: {nums:?}");
+        assert!(bad.iter().all(|(_, why)| !why.is_empty()));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
