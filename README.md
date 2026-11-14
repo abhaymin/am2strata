@@ -6,9 +6,6 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/abhaymin)
 
-Free and open source (MIT). Built on [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors,
-and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
-
 | Chat | Canvas: an HTML page, live | Python, run in a sandbox |
 | --- | --- | --- |
 | ![A question and its answer, streamed at 68 tok/s](docs/media/screenshot-chat.webp) | ![A digital clock the model wrote, running in the canvas](docs/media/screenshot-canvas.webp) | ![Python from the chat run in the sandbox: no network, home folders hidden](docs/media/screenshot-python.webp) |
@@ -24,13 +21,13 @@ banner's background was made with am2Strata's media engine (Z-Image Turbo, Apach
 the app, tools for every app, request routing) · [the full tour](https://youtu.be/OIHOplZPTmE) (10 min) ·
 [Peace and Harmony](https://youtu.be/37CjQ2mGrWo), a music video whose song, words and pictures am2Strata made.
 
-am2Strata is a new edition of [PolyStrata](https://github.com/VecSzn/PolyStrata), written in Rust: the server, the
-tokenizer, chat templates, output parsing, the Hugging Face downloader, the launcher and every test. PolyStrata's
-C++/CUDA engines still do the inference. am2Strata uses PolyStrata's run configs and models as they are, so either
-server can run on the same machine (one at a time).
+am2Strata is a local AI server written in Rust: the server, the tokenizer, chat templates, output parsing, the
+Hugging Face downloader, the Workshop and the launcher. On NVIDIA cards, inference runs in native C++/CUDA engines;
+a Rust engine covers the CPU and, through wgpu, other GPUs.
 
-It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
-support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and settings.
+It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures the engines
+support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and
+settings. It is free and open source (MIT); see [Credits](#credits).
 
 ![am2Strata v0.1.8 at a glance, in nine cards. Four API families: OpenAI, Anthropic, Responses and Gemini. Web app: chat with a live canvas, monitor, settings. Workshop: Hugging Face to GGUF, quantize, merge a LoRA adapter, training data. Sandbox VM (Linux with KVM): computer use in its own Debian VM. Computer tab (Linux): watch and take control of the agent's desktop. Security: HTTPS and wss, API keys with limits, usage per key. One live channel: a single WebSocket for pushes and requests. Media (build from source): songs, voices, images, video, speech to text. Install and verify: one line on six platforms, doctor and regression commands.](docs/media/infographic.webp)
 
@@ -129,9 +126,9 @@ Hermes, OpenClaw, Continue, Cline, Kilo Code, Zed and VS Code get the exact bloc
 
 ### Requirements
 
-- Linux and an NVIDIA GPU, with PolyStrata's engines built (`strata`, `strata-poly`, `strata-vision`) and its run
-  configs (`strata-*.json`). By default am2Strata looks in `~/Development/PolyStrata`, and for models in
-  `~/Development/Strata-data`.
+- Linux and an NVIDIA GPU, with the C++/CUDA engines built (`strata`, `strata-poly`, `strata-vision`) and the run
+  configs (`strata-*.json`) beside them. By default am2Strata looks for both in `~/Development/PolyStrata`, and for
+  models in `~/Development/Strata-data`.
 - Rust (stable). Optional: `ffmpeg` (video from API clients), `poppler-utils` (PDFs), `bubblewrap` (to run Python
   code from the chat in a sandbox).
 
@@ -141,7 +138,7 @@ Step by step, with ready run configs for Tiel Coder, MiniCPM-V 4.7 and Qwen3.8 F
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). In short:
 
 ```bash
-deploy/build-engines.sh --install                 # PolyStrata's engines, for RTX 30/50 cards
+deploy/build-engines.sh --install                 # the C++/CUDA engines, for RTX 30/50 cards
 deploy/pull-models.sh tiel                        # or minicpm, orca, all
 deploy/install.sh --host 0.0.0.0 --new-key        # configs in place, a new API key; --service to start at boot
 target/release/am2strata-run serve --port 8000 --model tiel
@@ -183,13 +180,13 @@ cargo build --release --manifest-path crates/strata-media/Cargo.toml --features 
 
 ## Packing tools
 
-PolyStrata's model-preparation tools are ported too (crate `strata-pack`), writing the same files byte for byte:
+The model-preparation tools for the `strata` engine are in Rust too (crate `strata-pack`):
 
 ```bash
-am2strata-run iq-pack --gguf <model>-00001-of-0000N.gguf --out <pack> --compat-bf16   # tools/iq_pack.py
-am2strata-run mtp-fetch fetch --out <mtp>                                             # tools/mtp_fetch.py
-am2strata-run mtp-pack --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf          # tools/mtp_pack.py
-am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                        # tools/mtp_rt.py
+am2strata-run iq-pack --gguf <model>-00001-of-0000N.gguf --out <pack> --compat-bf16   # a native pack from a GGUF
+am2strata-run mtp-fetch fetch --out <mtp>                                             # the MTP draft tensors
+am2strata-run mtp-pack --src <mtp> --experts q2_0 --out <mtp>/mtp-q2_0.gguf          # the draft block as a GGUF
+am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                        # the draft runtime files
 ```
 
 ## Web app
@@ -217,27 +214,27 @@ am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                  
 
 ## What works
 
-`am2strata` runs every model of a PolyStrata folder (each `strata-*.json`) behind one address and switches
-between them, driving PolyStrata's own C++/CUDA engines (`strata` for Orca / Qwen3.8, `strata-poly` for Tiel Coder,
+`am2strata` runs every model that has a run config (a `strata-*.json` file) behind one address and switches
+between them, driving the native C++/CUDA engines (`strata` for Orca / Qwen3.8, `strata-poly` for Tiel Coder,
 MiniCPM-V and the others) over their line protocol.
 
 | Area | State | Checked against |
 | --- | --- | --- |
-| Tokenizer, chat template, request normalization (OpenAI and Anthropic), quoted special tokens, prompt ids | done | Golden files recorded from PolyStrata's Python: 12 template cases, 16 tokenizer cases and 30 whole requests per model, all identical |
+| Tokenizer, chat template, request normalization (OpenAI and Anthropic), quoted special tokens, prompt ids | done | Golden files recorded from the reference Python implementation: 12 template cases, 16 tokenizer cases and 30 whole requests per model, all identical |
 | Output parsing: reasoning, tool calls, streamed tool arguments, quoted `</think>`, calls in code or reasoning | done | 164 recorded parser runs, all identical |
 | Tool-call formats GLM, Gemma 4, DeepSeek V4 (DSML), LFM2; gemma4 and deepseek-v3 tokenizers; per-format stop tokens and prompt rules | done | recorded parser runs; synthetic tokenizers recorded from the Python tokenizer (no such model installed here) |
 | OpenAI Responses `/v1/responses` (stateless, typed SSE events, namespace and custom tools, encrypted reasoning replay) | done | mock engine; live: Orca |
 | Thinking budgets (with answer room), `tool_choice` forcing a call, preserve_thinking, reasoning_close_retry, reasoning_loop_recovery, repeat stop | done | mock engine; live: budget and forced call on Orca |
 | MCP tools (stdio and Streamable HTTP servers from the run config, `/mcp`, tool rounds for the web app's `strata_mcp`) | done | mock MCP server |
 | Monitor (`/metrics`: request history, totals, live tok/s, GPU/CPU/RAM/disk series), `/metrics/prometheus`, `/v1/status` | done | mock engine; live |
-| Hugging Face pull (`am2strata-run pull`: token optional, split shards, mmproj, resumable, SHA-256 checked; tokenizer extracted in Rust; run config written when an engine runs the architecture; new models listed without a restart) | done | live: LFM2-8B-A1B (lfm2moe) pulled, loaded in 9 s, 340 tok/s; extractor byte-identical to PolyStrata's on Tiel and MiniCPM-V |
-| Shared chat settings (`/settings`), run-config view (`/config`), config `sampling` block (merged key by key, as PolyStrata) | done | mock engine |
+| Hugging Face pull (`am2strata-run pull`: token optional, split shards, mmproj, resumable, SHA-256 checked; tokenizer extracted in Rust; run config written when an engine runs the architecture; new models listed without a restart) | done | live: LFM2-8B-A1B (lfm2moe) pulled, loaded in 9 s, 340 tok/s; extractor byte-identical to the reference one on Tiel and MiniCPM-V |
+| Shared chat settings (`/settings`), run-config view (`/config`), config `sampling` block (merged key by key) | done | mock engine |
 | OpenAI `/v1/chat/completions` (stream and not, tools, images), `/v1/models` | done | live: Orca, Tiel Q6, MiniCPM-V |
 | Anthropic `/v1/messages` (stream and not, thinking, tool_use), `/v1/messages/count_tokens` | done | live |
 | Images (image encoder process, cache, `GENI`), complex documents | done | live: invoice and purchase order fields exact |
 | Video | as frames: video parts are cut into frames with ffmpeg when installed; frames sent as images always work | live (frames); ffmpeg path needs `sudo apt install ffmpeg` |
 | Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
-| Web app (am2Strata's `web/`, PolyStrata's app rebranded; MIT notice in `web/LICENSE-PolyStrata.txt`) | done: chat, model picker, settings, monitor polling | live in a browser |
+| Web app (`web/`) | done: chat, model picker, settings, monitor polling | live in a browser |
 | Stop strings, model-card default sampling, `fit_max_tokens` | done | live |
 | Workshop: convert (HF Llama-family to GGUF), quantize (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0), merge LoRA (PEFT and Unsloth, rsLoRA, MoE expert adapters), install | done | byte for byte against llama.cpp's converter and `llama-quantize --pure` on fixture models; merge against a PyTorch reference |
 | Workshop: training data from documents (Q&A, chats, more-like-these; dedupe, judge pass, dataset card, review and edit) | done | mock server; live: 6 of 6 grounded pairs from a doc page on Tiel Coder Q8 |
@@ -251,10 +248,9 @@ MiniCPM-V and the others) over their line protocol.
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
 
 Live numbers on the RTX 5060 Ti 16 GB (warm, greedy, thinking off): Tiel Coder Q6 104-106 tok/s median through
-this server (PolyStrata: ~98, same expert placement: 3,713 experts in VRAM); Orca's engine came up with the same
-expert cache as under PolyStrata (3,985 slots, 8.27 GB).
+this server, with 3,713 experts in VRAM; Orca's engine came up with an expert cache of 3,985 slots (8.27 GB).
 
-GPU builds: the PolyStrata engines on the developer's PC are compiled for sm_86 and sm_120 (RTX 30 and RTX 50
+GPU builds: the C++/CUDA engines on the developer's PC are compiled for sm_86 and sm_120 (RTX 30 and RTX 50
 cards). Only the RTX 5060 Ti has been tested; an RTX 3060 should run the same build, but it has not been tried.
 am2Strata refuses an engine that is not compiled for the card, and says how to rebuild it.
 
@@ -275,9 +271,9 @@ am2Strata day to day, as a user service that starts at boot.
 | ONNX Runtime (for Chatterbox) | 1.23.2, Ubuntu's `libonnxruntime1.23` |
 
 How it runs there:
-- **Server:** `am2strata --host 0.0.0.0 --port 8000 --models-dir <the PolyStrata folder> --api-monitor`, behind an
+- **Server:** `am2strata --host 0.0.0.0 --port 8000 --models-dir <the folder with the run configs> --api-monitor`, behind an
   API key, so other machines on the network can use it.
-- **Default model:** Cyber-Tiel Coder 35B-A3B UD-Q8_K_XL through PolyStrata's `strata-poly` engine, its layers split
+- **Default model:** Cyber-Tiel Coder 35B-A3B UD-Q8_K_XL through the `strata-poly` engine, its layers split
   across both cards.
 - **Media engine:** built with `--features cuda,onnx`.
 
@@ -302,8 +298,8 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
   (`crates/strata-media`); the release downloads do not hold the media engine (its audio and video codecs have
   their own terms, see NOTICE). Images and video need an NVIDIA card (the `cuda` feature); speech to text and text
   to speech also run on the CPU, slowly for speech out. Tested on Linux only.
-- **Parallel slots and replicas:** PolyStrata's opt-in batch slots and replicas are not ported. am2Strata runs one
-  request at a time on a model, and the others wait in its queue.
+- **Parallel slots and replicas:** not supported yet. am2Strata runs one request at a time on a model, and the
+  others wait in its queue.
 - **Training in the Workshop:** LoRA training in Rust works on a small test model only. For now, train with Unsloth
   on a dataset made in the Workshop and merge the adapter there.
 - **Outside Linux:** the Computer tab's desktop and the sandbox VM are Linux-only (the VM needs an x86_64 PC with
@@ -314,18 +310,18 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
 
 ```sh
 cargo run -q --release --bin am2strata-run -- test                          # the whole test suite (no GPU)
-cargo run -q --release --bin am2strata-run -- serve --take-over --port 8000 # foreground, in place of PolyStrata's service
-cargo run -q --release --bin am2strata-run -- temp-service --port 8000      # temporary user service; PolyStrata's returns when it stops
+cargo run -q --release --bin am2strata-run -- serve --take-over --port 8000 # foreground; a running strata-orca service is stopped meanwhile
+cargo run -q --release --bin am2strata-run -- temp-service --port 8000      # temporary user service; a stopped strata-orca service returns after it
 cargo run -q --release --bin am2strata-run -- stop-temp-service
-cargo run -q --release --bin am2strata-run -- install --port 8000           # boot service in place of strata-orca (same configs, models)
-cargo run -q --release --bin am2strata-run -- uninstall                     # strata-orca back as the boot service
+cargo run -q --release --bin am2strata-run -- install --port 8000           # the boot service (takes the place of a strata-orca unit, if there is one)
+cargo run -q --release --bin am2strata-run -- uninstall                     # remove it (a strata-orca unit is enabled again)
 cargo run -q --release --bin am2strata-run -- pull LiquidAI/LFM2-8B-A1B-GGUF               # list its quantizations
 cargo run -q --release --bin am2strata-run -- pull LiquidAI/LFM2-8B-A1B-GGUF --quant Q4_K_M  # download + run config
 # live GPU tests against a running server
 STRATA_LIVE_URL=http://127.0.0.1:8000 STRATA_LIVE_KEY=... cargo test -p am2strata --release --test live -- --ignored --test-threads=1
 ```
 
-Golden files are recorded from PolyStrata with:
+Golden files are recorded from the reference Python implementation (a PolyStrata checkout) with:
 
 ```sh
 ~/Development/PolyStrata/.venv/bin/python tools/reference-polystrata/make_golden.py
@@ -338,6 +334,16 @@ The engine protocol is written down in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 am2Strata is free and open source. If it is useful to you, you can support its development through
 [GitHub Sponsors](https://github.com/sponsors/abhaymin). Thank you.
 
+## Credits
+
+am2Strata includes and derives from code of [Strata](https://github.com/Niko1221/Strata) and
+[PolyStrata](https://github.com/VecSzn/PolyStrata), both MIT (Copyright (c) 2026 Niko1221 and the Strata
+contributors): parts of the server, the tools and the web app, and the C++/CUDA engines, which are built from
+PolyStrata's source. Their licence text is in [web/LICENSE-PolyStrata.txt](web/LICENSE-PolyStrata.txt).
+
+The other third-party work that am2Strata bundles, links or ports (Mermaid, the Outfit font, mold, the ggml
+quantizers, ACE-Step, Chatterbox, Parler-TTS and more) is listed with its licences in [NOTICE](NOTICE).
+
 ## License
 
-MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Parts are derived from PolyStrata (MIT, Niko1221 and the Strata contributors).
+MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE).

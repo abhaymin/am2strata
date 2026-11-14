@@ -2,9 +2,9 @@
 //!
 //!   cargo run -q --release --bin am2strata-run -- serve --port 8001          in the foreground
 //!   cargo run -q --release --bin am2strata-run -- serve --take-over --port 8000
-//!                                       stop the PolyStrata service while it runs (the GPU fits one engine)
+//!                                       stop the strata-orca service while it runs (the GPU fits one engine)
 //!   cargo run -q --release --bin am2strata-run -- temp-service --port 8000
-//!                                       a temporary user service in place of PolyStrata's, which comes back when
+//!                                       a temporary user service in place of strata-orca, which comes back when
 //!                                       it stops (however it stops: a crash, stop-temp-service, a reboot)
 //!   cargo run -q --release --bin am2strata-run -- stop-temp-service
 //!   cargo run -q --release --bin am2strata-run -- install --port 8000
@@ -52,16 +52,16 @@ enum Cmd {
     Serve {
         #[command(flatten)]
         s: ServerArgs,
-        /// stop the PolyStrata service while this runs, start it again after
+        /// stop the strata-orca service while this runs, start it again after
         #[arg(long)]
         take_over: bool,
     },
-    /// run as the temporary user service am2strata in place of PolyStrata's (restored when it stops)
+    /// run as the temporary user service am2strata in place of strata-orca (restored when it stops)
     TempService {
         #[command(flatten)]
         s: ServerArgs,
     },
-    /// stop the temporary service; PolyStrata's starts again
+    /// stop the temporary service; strata-orca starts again
     StopTempService,
     /// make am2Strata the service that starts at boot, in place of strata-orca
     Install {
@@ -95,7 +95,7 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
-    /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next): PolyStrata's tools/iq_pack.py
+    /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next)
     IqPack {
         /// the model's shard 1
         #[arg(long)]
@@ -116,7 +116,7 @@ enum Cmd {
         #[arg(long)]
         experts_bin: bool,
     },
-    /// the MTP tensors from the Qwen3.8 Flash Next BF16 checkpoint by range requests: PolyStrata's tools/mtp_fetch.py
+    /// the MTP tensors from the Qwen3.8 Flash Next BF16 checkpoint by range requests
     MtpFetch {
         /// inventory (headers only), fetch (the tensors, resumable) or verify (against the pinned SHA-256; exit 3 when bad)
         #[arg(value_parser = ["inventory", "fetch", "verify"])]
@@ -127,7 +127,7 @@ enum Cmd {
         #[arg(long)]
         only: Option<String>,
     },
-    /// the MTP draft block as a GGUF from the fetched tensors: PolyStrata's tools/mtp_pack.py
+    /// the MTP draft block as a GGUF from the fetched tensors
     MtpPack {
         /// the folder mtp-fetch wrote
         #[arg(long)]
@@ -332,7 +332,7 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
-    /// what upstream (PolyStrata, Strata) changed since am2Strata's ports: tools/upstream.json against GitHub, read-only
+    /// what the upstream repositories listed in tools/upstream.json changed since the code taken from them: against GitHub, read-only
     UpstreamCheck {
         /// the manifest (default: tools/upstream.json in this checkout)
         #[arg(long)]
@@ -394,7 +394,7 @@ struct PullArgs {
     /// where the model files and packs go (the folder the installed models use)
     #[arg(long, default_value = "~/Development/Strata-data")]
     data_dir: String,
-    /// the PolyStrata folder: engines, and where the run config is written (both servers list it)
+    /// the folder with the engines, and where the run config is written
     #[arg(long, default_value = "~/Development/PolyStrata")]
     models_dir: String,
     /// the context to configure (default: the model's own, from its GGUF)
@@ -432,7 +432,7 @@ struct AgentArgs {
     /// music, mcp:<server> (sent as the x-strata-tools header by Claude Code, Codex and OpenCode)
     #[arg(long)]
     tools: Option<String>,
-    /// the PolyStrata folder, for this PC's address and key
+    /// the folder with the run configs, for this PC's address and key
     #[arg(long, default_value = "~/Development/PolyStrata")]
     models_dir: String,
     /// print what would run or be written, and stop
@@ -445,7 +445,7 @@ struct AgentArgs {
 
 #[derive(Args, Clone)]
 struct ServerArgs {
-    /// the PolyStrata folder whose models and run configs are served
+    /// the folder with the engines and the run configs of the models to serve
     #[arg(long, default_value = "~/Development/PolyStrata")]
     models_dir: String,
     /// model loaded at start (id or a unique part of it)

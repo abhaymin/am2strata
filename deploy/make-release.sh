@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A download for people who should not have to build anything: the server, its tools, the web app and PolyStrata's engines.
+# A download for people who should not have to build anything: the server, its tools, the web app and the C++/CUDA engines.
 # It leaves out the media engine (its codecs have their own terms, see NOTICE) and every run config (they hold API keys).
 #   deploy/make-release.sh [--strata-home DIR]     -> dist/am2strata-<version>-linux-x86_64.tar.gz and its .sha256
 set -euo pipefail

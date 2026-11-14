@@ -1,8 +1,8 @@
-//! am2Strata: a new edition of the PolyStrata server, written in Rust.
+//! am2Strata: a local AI server, written in Rust.
 //!
-//! Serves every installed model (the `strata-*.json` run configs of a PolyStrata folder) through one address,
+//! Serves every installed model (the `strata-*.json` run configs of the models folder) through one address,
 //! switching between them on request, with the OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs,
-//! pictures and video frames, tool calls, and PolyStrata's web app. It drives the existing C++/CUDA engines over
+//! pictures and video frames, tool calls, and the web app. It drives the C++/CUDA engines over
 //! their line protocol; prompts and token ids match PolyStrata's Python server exactly (golden tests).
 
 mod agents;
@@ -66,9 +66,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
-#[command(name = "am2strata", version, about = "am2Strata: every installed PolyStrata model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
+#[command(name = "am2strata", version, about = "am2Strata: every installed model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
 struct Args {
-    /// folder with the strata-<model>.json run configs (a PolyStrata folder)
+    /// folder with the strata-<model>.json run configs and the engines
     #[arg(long, default_value = "~/Development/PolyStrata")]
     models_dir: String,
     /// the model loaded at start and after an unload (id or a unique part of it; default: the first config's)

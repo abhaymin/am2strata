@@ -4,7 +4,7 @@
 #   deploy/install.sh [--strata-home DIR] [--strata-data DIR] [--port N] [--host ADDR]
 #                     [--api-key KEY | --new-key] [--model ID] [--service] [--force]
 #
-# --strata-home  PolyStrata's folder: its engines (engine/, engine-poly/) and the run configs (default ~/Development/PolyStrata)
+# --strata-home  the folder with the engines (engine/, engine-poly/) and the run configs (default ~/Development/PolyStrata)
 # --strata-data  where models and packs live (default ~/Development/Strata-data)
 # --host         127.0.0.1 (default: this machine only) or 0.0.0.0 (your network: set an API key too)
 # --api-key KEY  clients must send "Authorization: Bearer KEY"; --new-key makes a random one and prints it
@@ -39,7 +39,7 @@ command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,memory.total --f
   || warn "nvidia-smi not found: the engines need an NVIDIA GPU and its driver"
 for t in pdftotext ffmpeg bwrap; do command -v $t >/dev/null || warn "optional: $t is missing (sudo apt install $( [ $t = pdftotext ] && echo poppler-utils || ([ $t = bwrap ] && echo bubblewrap || echo $t)))"; done
 [ -x "$STRATA_HOME/engine-poly/strata-poly" ] || [ -x "$STRATA_HOME/engine/strata" ] \
-  || warn "no PolyStrata engines in $STRATA_HOME (engine/strata, engine-poly/strata-poly): see deploy/build-engines.sh"
+  || warn "no engines in $STRATA_HOME (engine/strata, engine-poly/strata-poly): see deploy/build-engines.sh"
 
 say "building am2Strata (release)"
 (cd "$ROOT" && cargo build --release --bins)

@@ -1,6 +1,6 @@
 [package]
 name = "strata-tokenizer"
-description = "Byte-level BPE tokenizer for PolyStrata tokenizer directories (port of tools/strata_tokenizer.py)"
+description = "Byte-level BPE tokenizer for the tokenizer directories extracted from GGUF files"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

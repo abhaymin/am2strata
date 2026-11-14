@@ -1,6 +1,6 @@
 [package]
 name = "strata-protocol"
-description = "Formatting and parsing of the PolyStrata engine line protocol"
+description = "Formatting and parsing of the engine line protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

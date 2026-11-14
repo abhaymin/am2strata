@@ -1,6 +1,6 @@
 [package]
 name = "am2strata"
-description = "am2Strata: OpenAI/Anthropic-compatible server for the PolyStrata engines"
+description = "am2Strata: a local AI server with OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs and a web app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

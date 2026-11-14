@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build PolyStrata's engines (strata, strata-poly, strata-vision) from its source, for RTX 30 and RTX 50 cards.
+# Build the C++/CUDA engines (strata, strata-poly, strata-vision) from the PolyStrata source, for RTX 30 and RTX 50 cards.
 #
 #   deploy/build-engines.sh [--strata-home DIR] [--archs "86;120"] [--jobs N] [--install]
 #

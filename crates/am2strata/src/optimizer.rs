@@ -289,7 +289,7 @@ pub async fn run(mgr: std::sync::Arc<crate::manager::Manager>, id: String, objec
         let k = knobs(&entry.cfg.exe, &entry.cfg.args, &facts);
         if k.is_empty() {
             return Err(anyhow!("its run config passes none of the settings the optimizer tunes (-t, -ub, -b, --resident-experts; \
-                                 for Strata's engines also --threads, --window, --prompt-batch, --expert-swaps)"));
+                                 for the strata and strata-poly engines also --threads, --window, --prompt-batch, --expert-swaps)"));
         }
         set(|j| { j["state"] = json!("running"); j["settings"] = json!(k.iter().map(|k| &k.flag).collect::<Vec<_>>()); });
         let prompts = prompts();
