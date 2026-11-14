@@ -17,6 +17,7 @@ pub mod checkpoint;
 pub mod convert;
 pub mod lora;
 pub mod merge;
+pub mod quantize_gguf;
 pub mod safetensors_io;
 pub mod train;
 pub mod testmodel;
