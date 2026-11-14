@@ -145,7 +145,7 @@ pub fn foreign_origin(state: &AppState, headers: &HeaderMap) -> bool {
 
 pub fn not_own_page(what: &str) -> Response {
     error(StatusCode::FORBIDDEN, "permission_error",
-          format!("{what} only from PolyStrata's own page (or an origin in the config's trusted_origins)"))
+          format!("{what} only from am2Strata's own page (or an origin in the config's trusted_origins)"))
 }
 
 /// The priority and client of a request, for the queue: high for this server's own page (a person waiting), normal

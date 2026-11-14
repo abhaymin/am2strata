@@ -604,12 +604,26 @@ async fn accept_loop(listener: tokio::net::TcpListener, app: axum::Router, resol
                 }
                 Err(_) => return,
             };
-            let svc = app.layer(axum::Extension(OverTls)).layer(axum::Extension(axum::extract::ConnectInfo(addr)));
+            let svc = app.layer(axum::Extension(OverTls)).layer(axum::Extension(axum::extract::ConnectInfo(addr)))
+                .layer(axum::middleware::from_fn(host_from_authority));
             let svc = hyper_util::service::TowerToHyperService::new(svc);
             let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), svc).await;
         });
     }
+}
+
+/// HTTP/2 has no Host header: the name the client asked for is the request's `:authority`. Browsers speak HTTP/2 over
+/// HTTPS, so without this every check that reads Host (is this page ours? is this name ours?) saw an empty name, and
+/// the web app's own writes (starting the VM, saving a setting) were refused as another site's. The header is set
+/// from the authority, so the rest of the server reads one thing on HTTP/1.1 and HTTP/2 alike.
+pub async fn host_from_authority(mut req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if !req.headers().contains_key(axum::http::header::HOST) {
+        if let Some(v) = req.uri().authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()) {
+            req.headers_mut().insert(axum::http::header::HOST, v);
+        }
+    }
+    next.run(req).await
 }
 
 /// HSTS on responses that went out over TLS, never on plain HTTP (the header is meaningless there, and it would tell a
