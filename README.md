@@ -1,6 +1,6 @@
 # am2Strata
 
-![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows; OpenAI, Anthropic and Gemini APIs, coding agents in one command, voice cloning](docs/media/banner.webp)
+![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows (x64 and Arm); OpenAI, Anthropic and Gemini APIs, API keys with usage, HTTPS and one live WebSocket; a Workshop for GGUF conversion, quantizing, LoRA merging and training data; a sandbox VM for computer use; coding agents, songs, voices, images and video](docs/media/banner.webp)
 
 [![Release](https://img.shields.io/github/v/release/abhaymin/am2strata)](https://github.com/abhaymin/am2strata/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -17,7 +17,7 @@ and [PolyStrata](https://github.com/VecSzn/PolyStrata) (both MIT).
 | **Songs** | | |
 | ![Media Generation › Song: a festive Hindi Diwali song, 3 minutes, 3 takes](docs/media/screenshot-songs.webp) | | |
 
-<sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
+<sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3; the Workshop and Computer tabs are newer and not pictured yet) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
 banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
 **Watch:** [what's new in v0.1.4](https://youtu.be/HP4ztKaqOyo) (4 min: songs that sing their lyrics, MCP servers from
@@ -31,6 +31,22 @@ server can run on the same machine (one at a time).
 
 It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the other architectures PolyStrata's engines
 support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and settings.
+
+**New in v0.1.8** ([release notes](docs/releases/v0.1.8.md)):
+
+| | |
+| --- | --- |
+| **Workshop** | Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result, all in Rust. Generate training data from your documents with the loaded model, then review and edit it. |
+| **Sandbox VM** | Computer use in its own small Debian virtual machine that am2Strata runs itself: the agent is root inside and can install anything, and your PC is untouched. Ad filtering (Pi-hole and AdGuard lists) and VPNs (Tailscale, NetBird, Mullvad, WireGuard, OpenVPN) inside it. Linux with KVM. |
+| **Computer tab** | Watch the desktop the agent works on, take control with your own mouse and keyboard, copy and paste across. |
+| **HTTPS and wss** | A self-signed, your own, or a Tailscale certificate, from Settings or one command. Plain HTTP keeps working beside it. |
+| **API keys and usage** | Make keys while the server runs, with tool sets, expiry, limits and allowed models; see requests and tokens per key and per model. |
+| **Live channel** | One WebSocket (`/v1/live`) that pushes status, queue and job changes, and carries any API request with streamed answers. |
+| **Six platforms** | Downloads and installers for Linux, macOS and Windows on x64 and Arm, plus `am2strata-run doctor`. |
+| **Regression suite** | A contract for every route, recorded response shapes, and `am2strata-run regression` to check a running server after an update. |
+
+Guides: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) (install, HTTPS, the Workshop, the sandbox VM, API keys, the live
+channel) and [docs/REGRESSION.md](docs/REGRESSION.md).
 
 Plans and where each stands: [docs/LEDGER.md](docs/LEDGER.md).
 
@@ -184,11 +200,17 @@ am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                  
     exports to Markdown, PNG, PDF, and GIF for animated flows.
   - **Python:** runs on the server in a bubblewrap sandbox (no network, home folders hidden), only when you click Run.
   - **Links:** links in answers open in the canvas, with an address bar.
-- **Monitor:** speed, GPU, VRAM, RAM, the context and the requests, live.
+- **Monitor:** speed, GPU, VRAM, RAM, the context and the requests, live (pushed over the live channel).
+- **Workshop:** merge an adapter, convert to GGUF, quantize, install; generate training data from documents and
+  review it record by record. Jobs show their progress and keep running if you leave the tab.
+- **Computer:** the desktop computer use works on, live, with Take control, copy and paste; and the sandbox VM's
+  panel: start, pause, save, its apps, a terminal, ad filtering and settings.
 - **API calls:** every request's input, output, reasoning and timings.
 - **Settings:**
   - models: switch, unload, download from Hugging Face with or without a token;
   - the model's run config, chat defaults, server and access, MCP tools, connect;
+  - secure connection (HTTPS and wss), clients and API keys with their usage;
+  - computer and browser use: presets, modes (including the sandbox VM), allowed apps and sites;
   - appearance: light, dark or system theme, and an accent colour.
 
 ## What works
@@ -215,6 +237,15 @@ MiniCPM-V and the others) over their line protocol.
 | Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
 | Web app (am2Strata's `web/`, PolyStrata's app rebranded; MIT notice in `web/LICENSE-PolyStrata.txt`) | done: chat, model picker, settings, monitor polling | live in a browser |
 | Stop strings, model-card default sampling, `fit_max_tokens` | done | live |
+| Workshop: convert (HF Llama-family to GGUF), quantize (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0), merge LoRA (PEFT and Unsloth, rsLoRA, MoE expert adapters), install | done | byte for byte against llama.cpp's converter and `llama-quantize --pure` on fixture models; merge against a PyTorch reference |
+| Workshop: training data from documents (Q&A, chats, more-like-these; dedupe, judge pass, dataset card, review and edit) | done | mock server; live: 6 of 6 grounded pairs from a doc page on Tiel Coder Q8 |
+| Sandbox VM for computer use (Debian 13 under QEMU/KVM; app catalog, ad filter, VPN tools; pause and save when idle) | done, Linux x86_64 | a real VM on the test PC: boot 11 s, restore under 1 s, about 0.9 GB idle; sign-ins inside it are not tested |
+| Computer tab (live desktop, take control, clipboard) | done, Linux | integration test over WebSocket; a browser by hand |
+| HTTPS and wss (self-signed, own certificate, Tailscale), HSTS only when plain HTTP redirects | done | integration tests; live with a Tailscale certificate |
+| API keys made at run time, with usage per key and per model | done | integration tests; live |
+| Live channel `/v1/live` (pushes, requests over the socket, cancel) | done; the chat itself still streams over HTTP | integration tests over ws and wss; live |
+| Installers and downloads for six platforms; `am2strata-run doctor` | done | built, installed, run and removed on GitHub's runners for each platform |
+| Regression suite (route contracts, response shapes, bug classes) and `am2strata-run regression` | done | CI; 20 of 20 checks against the live server |
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
 
 Live numbers on the RTX 5060 Ti 16 GB (warm, greedy, thinking off): Tiel Coder Q6 104-106 tok/s median through
@@ -271,6 +302,11 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
   to speech also run on the CPU, slowly for speech out. Tested on Linux only.
 - **Parallel slots and replicas:** PolyStrata's opt-in batch slots and replicas are not ported. am2Strata runs one
   request at a time on a model, and the others wait in its queue.
+- **Training in the Workshop:** LoRA training in Rust works on a small test model only. For now, train with Unsloth
+  on a dataset made in the Workshop and merge the adapter there.
+- **Outside Linux:** the Computer tab's desktop and the sandbox VM are Linux-only (the VM needs an x86_64 PC with
+  KVM). On Linux arm64, Intel Macs and Windows Arm64 the Rust engine runs on the CPU only.
+- **Chat over the live channel:** the socket can carry chat requests, but the web app's chat still uses HTTP streaming.
 
 ## Use
 
