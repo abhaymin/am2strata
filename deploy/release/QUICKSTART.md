@@ -53,7 +53,7 @@ read.
 | | Linux x86_64 | Linux arm64 | macOS Apple silicon | macOS Intel | Windows x64 | Windows Arm64 |
 |---|---|---|---|---|---|---|
 | Server, web app, APIs, coding agents, HTTPS | yes | yes | yes | yes | yes | yes |
-| Rust engine (CPU, or any GPU through wgpu) | yes | yes | yes | yes | yes | yes |
+| Rust engine | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU |
 | Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
 | PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
 | Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
@@ -71,6 +71,7 @@ command that installs what is missing.
 - **Speed:** this engine runs on the CPU, so choose a small model. A 3B model answers at a readable pace. A 35B model such as
   Cyber-Tiel runs at about 4 words a second on a 16-thread desktop CPU, and bigger ones are slower still.
 - **Your GPU:** add `--devices vulkan:discrete=8` to the model's run config to try weights on any GPU. This is new and less tested.
+  Not in the Linux arm64, macOS Intel and Windows Arm64 downloads, which run on the CPU only.
 - **Fast on NVIDIA:** the Linux NVIDIA download runs large models at 60-160 tokens a second with PolyStrata's engines.
 - **PDFs in chats:** the Windows download carries Poppler. On Linux and macOS install poppler (`sudo apt install
   poppler-utils`, `brew install poppler`), or run the installer with `--with-deps`.

@@ -5,7 +5,7 @@ rem   am2strata pull ^<repo^> [^<quant^>]  download a model from Hugging Face; n
 rem   am2strata agent list^|start^|setup^|reset^|show ^<agent^>  coding agents on this server or another (--url)
 rem   am2strata agentrun ^<agent^> [options] [agent args]  run one, as unsloth start ^<agent^> does
 rem   am2strata doctor                 what this PC is ready for, and what is missing
-rem   am2strata tls^|workshop^|computer ^<action^> ...  HTTPS, the Workshop and the Computer tab on the running server
+rem   am2strata tls^|workshop^|computer^|keys ^<action^> ...  HTTPS, the Workshop, the Computer tab and API keys on the running server
 rem   am2strata --version
 setlocal
 set "HERE=%~dp0"
@@ -18,6 +18,7 @@ if /i "%~1"=="doctor" goto doctor
 if /i "%~1"=="tls" goto run
 if /i "%~1"=="workshop" goto run
 if /i "%~1"=="computer" goto run
+if /i "%~1"=="keys" goto run
 if /i "%~1"=="--version" goto version
 if /i "%~1"=="-V" goto version
 if /i "%~1"=="version" goto version

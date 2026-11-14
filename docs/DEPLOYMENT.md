@@ -495,7 +495,12 @@ its profile folder. This is your own session, used by your choice; am2Strata doe
 
 Six downloads are built for every release (`.github/workflows/release.yml`): Linux x86_64 and arm64, macOS Apple
 silicon and Intel, Windows x64 and Arm64. Each holds the server, `am2strata-run`, the Workshop (`am2strata-workshop`),
-the Rust engine (`am2strata-hybrid`: CPU, or any GPU through wgpu) and the web app. The installers pick the right one.
+the Rust engine (`am2strata-hybrid`) and the web app. The installers pick the right one.
+
+The engine runs models on the CPU everywhere. On Linux x86_64, macOS Apple silicon and Windows x64 it can also put
+weights on any GPU through wgpu (`--devices`). The Linux arm64, macOS Intel and Windows Arm64 downloads are built
+without that: the GPU kernels' build needs a prebuilt LLVM (tracel-llvm 20.1.4-7) that is not published for macOS x64
+or Windows Arm64 and does not unpack on Linux arm64.
 
 ```bash
 curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh       # Linux, macOS
@@ -549,7 +554,7 @@ PolyStrata's engines.
 | | Linux x86_64 | Linux arm64 | macOS Apple silicon | macOS Intel | Windows x64 | Windows Arm64 |
 |---|---|---|---|---|---|---|
 | Server, web app, APIs, coding agents, HTTPS | yes | yes | yes | yes | yes | yes |
-| Rust engine (CPU, or any GPU through wgpu) | yes | yes | yes | yes | yes | yes |
+| Rust engine | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU |
 | Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
 | PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
 | Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
@@ -582,8 +587,10 @@ To add what is missing:
   sudo apt-get install -y ffmpeg xvfb xdotool xclip qemu-system-x86 qemu-utils ovmf
 ```
 
-`--with-deps` runs exactly that command after you confirm it. Access to `/dev/kvm` (the sandbox VM) is not a package:
-`sudo usermod -aG kvm $USER`, then sign in again. The Windows downloads carry Poppler; the other optional features
+`--with-deps` runs exactly that command after you confirm it. The sandbox VM's line checks the same things as the
+Computer tab ("What this PC needs", above): `qemu-system-x86`, `qemu-utils`, `ovmf`, `openssh-client` and access to
+`/dev/kvm`. That access is not a package: `sudo usermod -aG kvm $USER`, then sign in again. The VM's Debian image is
+downloaded from the tab, or with `am2strata vm download`. The Windows downloads carry Poppler; the other optional features
 there are ffmpeg (`winget install -e --id Gyan.FFmpeg`) and a browser, and the rest is Linux only.
 
 **Checked on every pull request** that touches the installers (`.github/workflows/install-check.yml`): each of the six

@@ -67,12 +67,16 @@ jobs:
       fail-fast: false      # one platform's failure does not hide another's
       matrix:
         include:
-          - { os: ubuntu-22.04, label: linux-x86_64 }
-          - { os: ubuntu-22.04-arm, label: linux-arm64 }
-          - { os: macos-15, label: macos-arm64 }
-          - { os: macos-15-intel, label: macos-x86_64 }
-          - { os: windows-2022, label: windows-x86_64 }
-          - { os: windows-11-arm, label: windows-arm64 }
+          # engine: the Rust engine's features. `gpu` (weights on any GPU through wgpu) pulls in CubeCL's CPU runtime, whose
+          # build downloads a prebuilt LLVM from tracel-ai/tracel-llvm v20.1.4-7. That release has no macOS x64 and no
+          # Windows Arm64 bundle, and its Linux Arm64 bundle does not unpack where the build expects it. So those three
+          # get the engine without `gpu`: it runs models on the CPU, and --devices is refused there.
+          - { os: ubuntu-22.04, label: linux-x86_64, engine: "--features gpu" }
+          - { os: ubuntu-22.04-arm, label: linux-arm64, engine: "" }
+          - { os: macos-15, label: macos-arm64, engine: "--features gpu" }
+          - { os: macos-15-intel, label: macos-x86_64, engine: "" }
+          - { os: windows-2022, label: windows-x86_64, engine: "--features gpu" }
+          - { os: windows-11-arm, label: windows-arm64, engine: "" }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -86,7 +90,7 @@ jobs:
           # pull requests read the cache and do not add to it
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release --locked -p am2strata -p strata-workshop --bin am2strata --bin am2strata-run --bin am2strata-workshop
-      - run: cargo build --release --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu
+      - run: cargo build --release --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features ${{ matrix.engine }}
       - run: bash deploy/package-portable.sh ${{ matrix.label }}
       - name: Install, run, uninstall (Linux, macOS)
         if: runner.os != 'Windows'

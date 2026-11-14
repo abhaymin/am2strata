@@ -77,7 +77,7 @@ Options go after `sh -s --`: `curl -fsSL .../install.sh | sh -s -- --service`. I
 | | Linux x86_64 | Linux arm64 | macOS Apple silicon | macOS Intel | Windows x64 | Windows Arm64 |
 |---|---|---|---|---|---|---|
 | Server, web app, APIs, coding agents, HTTPS | yes | yes | yes | yes | yes | yes |
-| Rust engine (CPU, or any GPU through wgpu) | yes | yes | yes | yes | yes | yes |
+| Rust engine | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU |
 | Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
 | PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
 | Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
@@ -91,8 +91,8 @@ Options go after `sh -s --`: `curl -fsSL .../install.sh | sh -s -- --service`. I
 On Windows on Arm, a release without an Arm64 download installs the x64 one, which Windows runs emulated.
 
 You can also take the archive for your system from [Releases](https://github.com/abhaymin/am2strata/releases);
-`QUICKSTART.md` inside takes a few minutes. These downloads run models on the CPU, or on any GPU through wgpu, so they
-suit small models. The build from source below is the fast path, for NVIDIA cards.
+`QUICKSTART.md` inside takes a few minutes. These downloads run models on the CPU, or (see the table) on any GPU
+through wgpu, so they suit small models. The build from source below is the fast path, for NVIDIA cards.
 
 ### Coding agents
 

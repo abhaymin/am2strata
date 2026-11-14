@@ -106,3 +106,4 @@ if ((Test-Path "$Other\app") -or (Test-Path "$Other\bin")) { Die "-Uninstall -Di
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Other
 
 Step "ok: $Label"
+exit 0   # not the last program's exit code (the launcher's "no model yet" is 1)

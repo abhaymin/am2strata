@@ -142,7 +142,7 @@ pub fn report(host: &Host) -> Vec<Feature> {
         not_here("Computer tab (sandbox desktop)", "Linux only (it is a virtual X display)")
     });
     out.push(if linux && host.arch == "x86_64" {
-        let mut f = feature("Sandbox VM", host, &[QEMU, QEMU_IMG, OVMF, SSH, SSH_KEYGEN], "QEMU, OVMF, ssh and /dev/kvm ready");
+        let mut f = feature("Sandbox VM", host, &[QEMU, QEMU_IMG, OVMF, SSH, SSH_KEYGEN], "QEMU, OVMF, ssh and /dev/kvm ready (its Debian image: the Computer tab's Download, or am2strata-run vm download)");
         if !host.kvm {
             f.state = State::Missing;
             f.note.clear();
