@@ -9,6 +9,14 @@
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
 //!     for the architecture and refuses one no engine runs), so it appears in the model list
+//!   - datagen: `"recipe"` (qa | chat | instruct), `"sources"` (documents: files or folders; qa and chat), `"seeds"`? (a
+//!     JSONL of example chats; instruct), `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?,
+//!     `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`? — training data written by the
+//!     loaded model, through this server's own chat API (its address and key reach the command in its environment,
+//!     never on its command line)
+//! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
+//! - `GET /v1/workshop/dataset?path=…&offset=&limit=` pages through a dataset's records (with its card);
+//!   `POST /v1/workshop/dataset` `{"path", "remove": [i, …], "replace": {"i": record}}` edits it in place.
 //! - `GET /v1/workshop/jobs` lists jobs, `GET /v1/workshop/jobs/{id}` one (with its log), `DELETE` cancels.
 //! - `GET /v1/workshop/files` lists the models and adapters the Workshop may use, for its pickers.
 //!
@@ -27,7 +35,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 4] = ["convert", "quantize", "merge", "strata"];
+const KINDS: [&str; 5] = ["convert", "quantize", "merge", "strata", "datagen"];
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -44,6 +52,8 @@ pub struct Job {
     pub error: Option<String>,
     pub result: Option<Value>,
     pub pid: Option<u32>,
+    /// the last progress event (datagen): {"done", "total", "message"}
+    pub progress: Option<Value>,
 }
 
 impl Job {
@@ -51,7 +61,7 @@ impl Job {
         let mut v = json!({"id": self.id, "kind": self.kind, "state": self.state, "request": self.request,
                            "output": self.output.display().to_string(), "queued_at": self.queued_at,
                            "started_at": self.started_at, "finished_at": self.finished_at, "error": self.error,
-                           "result": self.result});
+                           "result": self.result, "progress": self.progress});
         if with_log {
             v["log"] = json!(self.log);
         } else {
@@ -70,6 +80,8 @@ pub struct Workshop {
     next: Mutex<u64>,
     /// jobs run one at a time, in order
     gate: tokio::sync::Mutex<()>,
+    /// this server's own address and key, for jobs that call its API (datagen)
+    server: Mutex<Option<(String, Option<String>)>>,
 }
 
 static WORKSHOP: std::sync::OnceLock<Arc<Workshop>> = std::sync::OnceLock::new();
@@ -111,7 +123,33 @@ impl Workshop {
         }).collect();
         let (models_dir, packs_dir) = (models_dir.to_path_buf(), data_dir.join("packs"));
         WORKSHOP.get_or_init(|| Arc::new(Workshop { roots, out_dir, models_dir, packs_dir, jobs: Mutex::new(vec![]), next: Mutex::new(1),
-                                                    gate: tokio::sync::Mutex::new(()) })).clone()
+                                                    gate: tokio::sync::Mutex::new(()), server: Mutex::new(None) })).clone()
+    }
+
+    /// Where this server answers (bound to `host`:`port`), so a datagen job can use its chat API.
+    pub fn set_server(&self, host: &str, port: u16, key: Option<String>) {
+        let h = match host {
+            "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+            h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
+            h => h.to_string(),
+        };
+        *self.server.lock().unwrap() = Some((format!("http://{h}:{port}"), key));
+    }
+
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.out_dir.join("uploads")
+    }
+
+    /// A new file in the Workshop folder: `dir/name`, or `name-2`, `name-3`, … when it is taken.
+    fn fresh(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).ok();
+        let mut p = dir.join(format!("{stem}{ext}"));
+        let mut n = 2;
+        while p.exists() {
+            p = dir.join(format!("{stem}-{n}{ext}"));
+            n += 1;
+        }
+        p
     }
 
     pub fn roots(&self) -> &[PathBuf] {
@@ -168,7 +206,7 @@ impl Workshop {
 
     /// Check a request and turn it into the command's arguments and its output path.
     pub fn plan(&self, req: &Value) -> Result<(String, Vec<String>, PathBuf), String> {
-        let kind = req["kind"].as_str().ok_or("\"kind\" is convert, quantize or merge")?;
+        let kind = req["kind"].as_str().ok_or_else(|| format!("\"kind\" is one of {}", KINDS.join(", ")))?;
         let s = |k: &str| req[k].as_str().filter(|v| !v.is_empty());
         std::fs::create_dir_all(&self.out_dir).ok();
         match kind {
@@ -235,6 +273,61 @@ impl Workshop {
                 }
                 Ok((kind.into(), vec![input.display().to_string(), id, s("display_name").unwrap_or("").to_string()], cfg))
             }
+            "datagen" => {
+                let recipe = s("recipe").unwrap_or("qa");
+                if !["qa", "chat", "instruct"].contains(&recipe) {
+                    return Err("\"recipe\" is qa, chat or instruct".into());
+                }
+                let mut sources = vec![];
+                for v in req["sources"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                    let p = v.as_str().filter(|p| !p.is_empty()).ok_or("\"sources\" is a list of paths")?;
+                    sources.push(self.allowed(p, true)?);
+                }
+                let seeds = s("seeds").map(|p| self.allowed(p, true)).transpose()?;
+                if recipe != "instruct" && sources.is_empty() {
+                    return Err(format!("{recipe} needs \"sources\": documents (files or folders) to write the data from"));
+                }
+                if recipe == "instruct" && seeds.is_none() {
+                    return Err("instruct needs \"seeds\": a JSONL of example chats to write more like".into());
+                }
+                let num = |k: &str, lo: f64, hi: f64| -> Result<Option<String>, String> {
+                    match &req[k] {
+                        Value::Null => Ok(None),
+                        v => v.as_f64().filter(|n| (lo..=hi).contains(n)).map(|n| Some(n.to_string()))
+                            .ok_or_else(|| format!("\"{k}\" is a number from {lo} to {hi}")),
+                    }
+                };
+                let output = match s("output") {
+                    Some(o) if !o.ends_with(".jsonl") => return Err("\"output\" is a .jsonl file".into()),
+                    Some(o) => self.allowed(o, false)?,
+                    None => {
+                        let from = sources.first().or(seeds.as_ref()).and_then(|p| p.file_stem()).and_then(|x| x.to_str()).unwrap_or("data");
+                        Self::fresh(&self.out_dir.join("datasets"), &format!("{from}-{recipe}"), ".jsonl")
+                    }
+                };
+                let mut args = vec!["datagen".into(), "--recipe".into(), recipe.into(), "--out".into(), output.display().to_string()];
+                for p in &sources {
+                    args.extend(["--source".into(), p.display().to_string()]);
+                }
+                if let Some(p) = &seeds {
+                    args.extend(["--seeds".into(), p.display().to_string()]);
+                }
+                for (k, flag, lo, hi) in [("count", "--count", 1.0, 100_000.0), ("per_chunk", "--per-chunk", 1.0, 20.0),
+                                          ("chunk_chars", "--chunk-chars", 500.0, 20_000.0), ("temperature", "--temperature", 0.0, 2.0),
+                                          ("min_score", "--min-score", 0.0, 5.0)] {
+                    if let Some(v) = num(k, lo, hi)? {
+                        // integers for the integer flags (a JSON 100.0 is 100)
+                        let v = if k == "temperature" { v } else { (v.parse::<f64>().unwrap_or(0.0) as u64).to_string() };
+                        args.extend([flag.into(), v]);
+                    }
+                }
+                for k in ["topic", "language"] {
+                    if let Some(v) = s(k) {
+                        args.extend([format!("--{k}"), v.chars().take(200).collect()]);
+                    }
+                }
+                Ok((kind.into(), args, output))
+            }
             other => Err(format!("unknown kind {other:?}: {}", KINDS.join(", "))),
         }
     }
@@ -246,7 +339,7 @@ impl Workshop {
         };
         let id = { let mut n = self.next.lock().unwrap(); let id = *n; *n += 1; id };
         let job = Job { id, kind, args, request: req, output, state: "queued", queued_at: now(), started_at: None,
-                        finished_at: None, log: vec![], error: None, result: None, pid: None };
+                        finished_at: None, log: vec![], error: None, result: None, pid: None, progress: None };
         self.jobs.lock().unwrap().push(job.clone());
         let me = self.clone();
         tokio::spawn(async move { me.run(id, exe).await });
@@ -296,6 +389,16 @@ impl Workshop {
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.arg("--json").args(&job.args).stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
+        // the server's address and key for a job that uses its API: in the environment, never on the command line
+        cmd.env_remove("AM2STRATA_URL").env_remove("AM2STRATA_API_KEY");
+        if job.kind == "datagen" {
+            if let Some((url, key)) = self.server.lock().unwrap().clone() {
+                cmd.env("AM2STRATA_URL", url);
+                if let Some(k) = key {
+                    cmd.env("AM2STRATA_API_KEY", k);
+                }
+            }
+        }
         // its own process group, so cancelling stops everything the job started (not only the command)
         #[cfg(unix)]
         cmd.process_group(0);
@@ -330,6 +433,12 @@ impl Workshop {
                     Some("start") => j.log.push(ev["what"].as_str().unwrap_or("").to_string()),
                     Some("log") => j.log.push(ev["message"].as_str().unwrap_or("").to_string()),
                     Some("done") => j.result = Some(ev.clone()),
+                    Some("progress") => {
+                        if let Some(m) = ev["message"].as_str().filter(|m| !m.is_empty()) {
+                            j.log.push(format!("[{}/{}] {m}", ev["done"], ev["total"]));
+                        }
+                        j.progress = Some(json!({"done": ev["done"], "total": ev["total"], "message": ev["message"]}));
+                    }
                     Some("error") => j.error = ev["message"].as_str().map(str::to_string),
                     _ => j.log.push(l.clone()),
                 });
@@ -427,7 +536,19 @@ impl Workshop {
         for r in &self.roots {
             walk(r, 2, &mut gguf, &mut hf, &mut adapters);
         }
-        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+        let listing = |d: &Path, want: &dyn Fn(&Path) -> bool| -> Vec<Value> {
+            let mut v: Vec<(u64, Value)> = std::fs::read_dir(d).into_iter().flatten().flatten().filter(|e| e.path().is_file() && want(&e.path()))
+                .map(|e| {
+                    let m = e.metadata().ok();
+                    let t = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+                    (t, json!({"path": e.path().display().to_string(), "bytes": m.map(|m| m.len()).unwrap_or(0), "modified": t}))
+                }).collect();
+            v.sort_by(|a, b| b.0.cmp(&a.0));
+            v.into_iter().map(|x| x.1).collect()
+        };
+        let datasets = listing(&self.out_dir.join("datasets"), &|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"));
+        let uploads = listing(&self.uploads_dir(), &|_| true);
+        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
                "output_folder": self.out_dir.display().to_string(), "installed": exe().is_some()})
     }
 }
@@ -485,4 +606,132 @@ pub async fn job_delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(i
 pub async fn files_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
     Json(w.files()).into_response()
+}
+
+/// A file name made safe: letters, digits, `.`, `-` and `_` only, no leading dot, at most 120 characters.
+fn safe_name(n: &str) -> Option<String> {
+    let base = n.rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base.chars().map(|c| if c.is_ascii_alphanumeric() || "._-".contains(c) { c } else { '_' }).collect();
+    let s = s.trim_start_matches('.').chars().take(120).collect::<String>();
+    (!s.is_empty() && s.chars().any(|c| c.is_ascii_alphanumeric())).then_some(s)
+}
+
+/// `POST /v1/workshop/uploads?name=…`: the body is the file; it is saved into the uploads folder (a new name when taken).
+pub async fn upload_post(State(s): State<AppState>, headers: HeaderMap, axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+                         body: axum::body::Bytes) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("files can be uploaded to the Workshop");
+    }
+    let Some(name) = q.get("name").and_then(|n| safe_name(n)) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "give the file's name: ?name=notes.pdf");
+    };
+    if body.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "the file is empty");
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+        _ => (name.clone(), String::new()),
+    };
+    let path = Workshop::fresh(&w.uploads_dir(), &stem, &ext);
+    match tokio::fs::write(&path, &body).await {
+        Ok(()) => Json(json!({"path": path.display().to_string(), "bytes": body.len()})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{}: {e}", path.display())),
+    }
+}
+
+impl Workshop {
+    /// A dataset the Workshop may read: a .jsonl inside its folders.
+    fn dataset_path(&self, p: &str) -> Result<PathBuf, String> {
+        if !p.ends_with(".jsonl") {
+            return Err("a dataset is a .jsonl file".into());
+        }
+        self.allowed(p, true)
+    }
+
+    /// True while a job is writing `p`.
+    fn busy(&self, p: &Path) -> bool {
+        self.jobs.lock().unwrap().iter().any(|j| matches!(j.state, "queued" | "running") && j.output == p)
+    }
+}
+
+/// `GET /v1/workshop/dataset?path=…&offset=0&limit=50`: a page of records, the total, and the dataset's card.
+pub async fn dataset_get(State(s): State<AppState>, headers: HeaderMap,
+                         axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    let path = match w.dataset_path(q.get("path").map(String::as_str).unwrap_or("")) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    let offset: usize = q.get("offset").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50).clamp(1, 500);
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("{}: {e}", path.display())),
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let records: Vec<Value> = lines.iter().enumerate().skip(offset).take(limit)
+        .map(|(i, l)| json!({"i": i, "record": serde_json::from_str::<Value>(l).unwrap_or_else(|_| json!({"unparsable": l}))}))
+        .collect();
+    // the card beside it, as strata-workshop's datagen names it (`x.jsonl` → `x.card.md`)
+    let card_path = path.with_file_name(format!("{}.card.md", path.file_stem().and_then(|x| x.to_str()).unwrap_or("dataset")));
+    let card = tokio::fs::read_to_string(&card_path).await.ok();
+    Json(json!({"path": path.display().to_string(), "total": lines.len(), "offset": offset, "records": records, "card": card,
+                "writing": w.busy(&path)})).into_response()
+}
+
+/// `POST /v1/workshop/dataset` `{"path", "remove": [i, …], "replace": {"i": record, …}}`: edits the dataset in place
+/// (written to a new file, then moved over the old one).
+pub async fn dataset_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("datasets can be edited");
+    }
+    let bad = |m: String| error(StatusCode::BAD_REQUEST, "invalid_request_error", m);
+    let path = match w.dataset_path(req["path"].as_str().unwrap_or("")) { Ok(p) => p, Err(e) => return bad(e) };
+    if w.busy(&path) {
+        return error(StatusCode::CONFLICT, "invalid_request_error", "a job is still writing this dataset");
+    }
+    let text = match tokio::fs::read_to_string(&path).await { Ok(t) => t, Err(e) => return bad(format!("{}: {e}", path.display())) };
+    let mut lines: Vec<Option<String>> = text.lines().filter(|l| !l.trim().is_empty()).map(|l| Some(l.to_string())).collect();
+    if let Some(m) = req["replace"].as_object() {
+        for (k, rec) in m {
+            let Some(i) = k.parse::<usize>().ok().filter(|i| *i < lines.len()) else { return bad(format!("no record {k}")) };
+            let ok = rec["messages"].as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|m| m["role"].is_string() && m["content"].is_string()));
+            if !ok {
+                return bad(format!("record {k}: a record is {{\"messages\": [{{\"role\", \"content\"}}, …]}}"));
+            }
+            lines[i] = Some(rec.to_string());
+        }
+    }
+    for v in req["remove"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let Some(i) = v.as_u64().map(|i| i as usize).filter(|i| *i < lines.len()) else { return bad(format!("no record {v}")) };
+        lines[i] = None;
+    }
+    let kept: Vec<String> = lines.into_iter().flatten().collect();
+    let tmp = path.with_extension("jsonl.tmp");
+    let body = if kept.is_empty() { String::new() } else { kept.join("\n") + "\n" };
+    if let Err(e) = tokio::fs::write(&tmp, body).await {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string());
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &path).await {
+        tokio::fs::remove_file(&tmp).await.ok();
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string());
+    }
+    Json(json!({"path": path.display().to_string(), "total": kept.len()})).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_name;
+
+    #[test]
+    fn upload_names_are_made_safe() {
+        assert_eq!(safe_name("notes.pdf").as_deref(), Some("notes.pdf"));
+        assert_eq!(safe_name("../../etc/passwd").as_deref(), Some("passwd"));
+        assert_eq!(safe_name("C:\\x\\my file (1).md").as_deref(), Some("my_file__1_.md"));
+        assert_eq!(safe_name(".bashrc").as_deref(), Some("bashrc"));
+        assert_eq!(safe_name("..."), None);
+        assert_eq!(safe_name(""), None);
+    }
 }

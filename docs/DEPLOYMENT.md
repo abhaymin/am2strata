@@ -278,17 +278,20 @@ Three ways to get a certificate:
 `tls renew` gets a fresh certificate; `tls off` turns HTTPS off. `--port` and `--http` set the port and what plain
 HTTP does.
 
-**Plain HTTP once HTTPS is on** (`"http"`): `local-only` (the default) keeps answering this PC's own tools on
-127.0.0.1 and sends every other device to HTTPS (a 308 redirect, so the method and body are kept); `redirect` sends
-everyone except `/health`; `keep` changes nothing (not recommended).
+**Plain HTTP once HTTPS is on** (`"http"`): `keep` (the default) changes nothing: the site and the API answer on
+`http://` and `ws://` (port 8000) and on `https://` and `wss://` (port 8001) alike. `local-only` keeps answering this
+PC's own tools on 127.0.0.1 and sends every other device to HTTPS (a 308 redirect, so the method and body are kept);
+`redirect` sends everyone except `/health`.
 
-**HSTS** (`Strict-Transport-Security: max-age=31536000`) is sent on HTTPS responses only. Browsers apply it to a
-trusted name (the Tailscale one), not to bare IP addresses or certificates they do not trust.
+**HSTS** is on only with `redirect` (or `"hsts": true`): it then sends `Strict-Transport-Security: max-age=31536000`
+on HTTPS responses. A browser applies HSTS to the whole name, every port, so while plain HTTP is kept, HTTPS sends
+`max-age=0` instead; that also clears a pin a browser was given before, so `http://` works in it again. Browsers
+apply HSTS only to a trusted name (the Tailscale one), not to bare IP addresses or certificates they do not trust.
 
 The run config block, if you prefer to write it:
 
 ```json
-"tls": { "mode": "tailscale", "https_port": 8001, "http": "local-only" }
+"tls": { "mode": "tailscale", "https_port": 8001, "http": "keep" }
 ```
 
 `mode` is `self-signed`, `tailscale` or `files` (with `"cert"` and `"key"` paths); a mistake in this block stops
@@ -297,6 +300,40 @@ the server at start with the reason, so it never runs on plain HTTP by surprise.
 
 **Alternative:** `tailscale serve --https=443 http://127.0.0.1:8000` puts Tailscale's own HTTPS in front of
 am2Strata without changing it.
+
+## The Workshop: training data, convert, quantize
+
+The **Workshop** tab (and `am2strata-run workshop …` in a terminal) makes models on this PC, all in Rust. Jobs run
+one at a time, as the separate `am2strata-workshop` command, and keep going if you leave the tab. Only the server's own
+API key can use the Workshop. It reads and writes only inside the models folder, `<data>/workshop`, and any folders listed
+in the run config's `"workshop": {"dirs": [...]}`.
+
+**Training data** is written by the model you have loaded, through this server's own chat API:
+
+- **Recipes:**
+  - *qa* writes questions and answers from documents;
+  - *chat* writes multi-turn chats about them;
+  - *instruct* writes more examples like a JSONL of your own.
+- **Documents:** text, Markdown, code, HTML and PDF (PDF needs `pdftotext`, from poppler-utils). **Add files…** uploads
+  them into `<data>/workshop/uploads`.
+- **Quality check:** a judge pass scores each answer 1 to 5 against its source passage and drops low scores. Duplicates
+  and near-duplicates (MinHash) are dropped too.
+- **Output:** `<data>/workshop/datasets/<name>-<recipe>.jsonl` in the `messages` format Unsloth and the trainer read, with
+  a `.card.md` beside it saying what it was made from and what was dropped.
+- **Review:** page through the records under the form, fix an answer with **Edit**, and remove bad ones with **Delete selected**.
+
+```bash
+am2strata-run workshop upload ~/docs/manual.pdf
+am2strata-run workshop datagen --source ~/Development/Strata-data/workshop/uploads/manual.pdf --count 200 --min-score 4 --wait
+am2strata-run workshop dataset ~/Development/Strata-data/workshop/datasets/manual-qa.jsonl --limit 5
+```
+
+A small or base model may not write the JSON the recipe asks for. The job then fails, saying so, and leaves no empty
+file. An instruction-tuned model of 7B or more works best. The judge roughly doubles the time.
+
+**Models:** merge a LoRA adapter (PEFT or Unsloth) into its base, convert a Hugging Face Llama-family model to GGUF
+(byte for byte as llama.cpp's converter), quantize it (as `llama-quantize --pure`), and install it so it appears in the
+model list.
 
 ## The Computer tab: see and use the desktop
 

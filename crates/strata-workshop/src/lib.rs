@@ -16,6 +16,7 @@ pub const QLORA_READY: bool = false;
 pub mod checkpoint;
 pub mod convert;
 pub mod dataset;
+pub mod datagen;
 pub mod lora;
 pub mod merge;
 pub mod quantize_gguf;
