@@ -363,7 +363,7 @@ pub fn resolve_key(p: &Provider, store: &KeyStore) -> Result<(&'static str, Stri
         return Ok(("settings", k));
     }
     match p.key.as_deref() {
-        None => Err(format!("{}: no key (set one in Settings › Remote models, or \"key\": \"env:NAME\" / \"file:PATH\")", p.name)),
+        None => Err(format!("{}: no key (set one on the remote models page, or \"key\": \"env:NAME\" / \"file:PATH\")", p.name)),
         Some(k) if k.starts_with("env:") => match std::env::var(&k[4..]) {
             Ok(v) if !v.trim().is_empty() => Ok(("env", v.trim().to_string())),
             _ => Err(format!("{}: the environment variable {} is not set", p.name, &k[4..])),
