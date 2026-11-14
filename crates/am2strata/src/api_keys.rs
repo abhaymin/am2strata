@@ -184,30 +184,37 @@ fn new_key() -> String {
     k
 }
 
-/// A file only this account reads: written beside it and moved into place.
+/// A file only this account reads: written beside it under a name of its own and moved into place. Each write has
+/// its own temporary name (so two writers never share one), and a write that fails is tried once more from the start
+/// (the folder made again): a test run saw the move fail with "No such file" once in several hundred runs, with no
+/// second writer found, so the error also says which step failed.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let mut f = o.open(&tmp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // a file left from before keeps its old mode otherwise
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, path)
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let once = || -> std::io::Result<()> {
+        use std::io::Write;
+        let step = |what: &str, e: std::io::Error| std::io::Error::new(e.kind(), format!("{what}: {e}"));
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d).map_err(|e| step("making the folder", e))?;
+        }
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let mut f = o.open(&tmp).map_err(|e| step("opening the temporary file", e))?;
+        let written = f.write_all(bytes).and_then(|_| f.sync_all()).map_err(|e| step("writing", e));
+        drop(f);
+        let moved = written.and_then(|_| std::fs::rename(&tmp, path).map_err(|e| step("moving it into place", e)));
+        if moved.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        moved
+    };
+    once().or_else(|_| once())
 }
 
 fn check_name(name: &str) -> Result<String, String> {
@@ -893,7 +900,13 @@ fn form_fields(body: &[u8], boundary: &str, name: &str) -> Vec<String> {
     let want = format!("name=\"{name}\"");
     let mut out = vec![];
     let mut rest = body;
-    while let Some(at) = find(rest, delim.as_bytes()) {
+    let mut first = true;
+    loop {
+        // a delimiter is a line of its own: at the very start of the body, or after a line break (the same text
+        // inside a part's content, not at a line's start, is content)
+        let at = if first && rest.starts_with(delim.as_bytes()) { Some(0) } else { find(rest, format!("\r\n{delim}").as_bytes()).map(|i| i + 2) };
+        first = false;
+        let Some(at) = at else { break };
         rest = &rest[at + delim.len()..];
         if rest.starts_with(b"--") {
             break; // the closing delimiter
@@ -1314,6 +1327,11 @@ mod tests {
             --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsecret-model\r\n\
             --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nother\r\n--XX--\r\n";
         assert_eq!(asked_models("/v1/audio/transcriptions", &h, body).unwrap(), vec!["secret-model".to_string(), "other".to_string()]);
+        // the delimiter's text in the middle of a line of a file is content, not a new part
+        let tricky = b"--XX\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\n\
+            x --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nallowed-model\r\n\
+            --XX\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nreal\r\n--XX--\r\n";
+        assert_eq!(asked_models("/v1/audio/transcriptions", &h, tricky).unwrap(), vec!["real".to_string()]);
         let mut nob = HeaderMap::new();
         nob.insert("content-type", "multipart/form-data".parse().unwrap());
         assert!(asked_models("/v1/audio/transcriptions", &nob, body).is_err(), "no boundary: refused, not guessed");

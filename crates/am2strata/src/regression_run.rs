@@ -24,12 +24,10 @@ pub struct Options {
 
 /// Whether `url` is this PC (localhost or a loopback address): its certificate is the one made here.
 pub fn is_this_pc(url: &str) -> bool {
-    let rest = url.split("://").nth(1).unwrap_or(url);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority),
-    };
+    // parsed as the HTTP client parses it, so what is judged here is the host that is really contacted (a URL such
+    // as https://localhost:8001@evil.example names evil.example, with "localhost" as a user name)
+    let Ok(u) = reqwest::Url::parse(url) else { return false };
+    let host = u.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
     host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
@@ -583,7 +581,8 @@ mod this_pc_tests {
         for u in ["https://localhost:8001", "https://127.0.0.1:8001/", "https://[::1]:8001/x", "http://LOCALHOST"] {
             assert!(is_this_pc(u), "{u}");
         }
-        for u in ["https://pc.tail.ts.net:8001", "https://192.168.1.5:8001", "https://localhost.evil.example", "https://example.com/127.0.0.1"] {
+        for u in ["https://pc.tail.ts.net:8001", "https://192.168.1.5:8001", "https://localhost.evil.example", "https://example.com/127.0.0.1",
+                  "https://localhost:8001@evil.example", "https://127.0.0.1@evil.example/", "https://evil.example#@localhost", "not a url"] {
             assert!(!is_this_pc(u), "{u}");
         }
     }

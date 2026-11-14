@@ -819,11 +819,11 @@ function followMetrics() {
 live.on("metrics", (m) => { lastMetrics = m; metricsFailures = 0; render(m); showAlerts(m.alerts || []); });
 document.addEventListener("visibilitychange", () => { if (!document.hidden) poll(); });
 async function poll() {
+  if (document.hidden) return;   // a tab in the background fetches nothing: it catches up when shown (visibilitychange)
   followMetrics();
   // pushed (above) while the live channel delivers; fetched as before while it does not (not connected yet, a
   // reconnect, an older server, a proxy without WebSockets)
-  // a tab in the background fetches nothing either way: it catches up when it is shown again (visibilitychange)
-  const pushed = live.has("metrics") || document.hidden;
+  const pushed = live.has("metrics");
   if (!pushed) try {
     const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
