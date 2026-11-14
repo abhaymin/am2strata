@@ -37,13 +37,9 @@ fn same_as_llama_cpp(hf: &str, reference: &str) {
         assert_eq!((o.ggml_type, &o.dims), (r.ggml_type, &r.dims), "{}: type/shape", r.name);
         assert!(bytes_of(&out, &ours, o) == bytes_of(&reference, &theirs, r), "{}: bytes differ from llama.cpp", r.name);
     }
-    // llama.cpp also guesses general.basename/finetune/version/type from the folder name (gguf-py's
-    // get_model_id_components): not ported yet (a task for the agent), so those four are compared only when we write them
-    const GUESSED: [&str; 4] = ["general.basename", "general.finetune", "general.version", "general.type"];
+    // Every metadata key llama.cpp wrote must match ours exactly now that general.basename / .finetune / .version are
+    // ported from gguf-py's get_model_id_components (the previous "guessed"-exception no longer applies).
     for (k, v) in &theirs.metadata {
-        if GUESSED.contains(&k.as_str()) && ours.metadata.get(k).is_none() {
-            continue;
-        }
         assert_eq!(ours.metadata.get(k), Some(v), "metadata {k}");
     }
     let _ = std::fs::remove_file(&out);

@@ -64,17 +64,18 @@ fn same_tensors(a: &Path, b: &Path) {
     assert_eq!(da, db, "tensor names/types/shapes/bytes differ between the two GGUFs");
 }
 
-/// Metadata equal by value (numbers compared ignoring int/float), ignoring the two folder-derived fields that differ
-/// between a converter's naming and llama.cpp's, so the comparison pins the quantization rather than general.name.
+/// Metadata equal by value (numbers compared ignoring int/float), ignoring the folder-derived fields that differ between a
+/// converter's naming and llama.cpp's, so the comparison pins the quantization rather than general.name. That set now also
+/// covers `general.basename` / `.finetune` / `.version`: this test converts a throwaway temp folder (whose id parses out its
+/// own basename/version) while the references were made from `tiny-llama-256-hf`, so those naming fields cannot match here —
+/// they are only asserted to match when converting that exact folder, as in `convert_f16.rs`. The comparison ignores them on
+/// both sides (filtered counts, not raw length) before matching the remaining keys.
 fn metadata_almost_equal(a: &Gguf, b: &Gguf) -> bool {
-    if a.metadata.len() != b.metadata.len() { return false; }
-    const SKIP: [&str; 2] = ["general.name", "general.size_label"];
-    let filtered = |g: &Gguf| g.metadata.iter().filter(|(k, _)| !SKIP.contains(&k.as_str())).count();
-    if filtered(a) != filtered(b) { return false; }
-    a.metadata.iter().all(|(k, v)| {
-        if SKIP.contains(&k.as_str()) { return true; }
-        b.metadata.get(k).is_some_and(|w| values_equal(v, w))
-    })
+    let skip = |k: &str| matches!(k, "general.name" | "general.size_label" | "general.basename" | "general.finetune" | "general.version");
+    if a.metadata.iter().filter(|(k, _)| !skip(k)).count() != b.metadata.iter().filter(|(k, _)| !skip(k)).count() {
+        return false;
+    }
+    a.metadata.iter().all(|(k, v)| skip(k) || b.metadata.get(k).is_some_and(|w| values_equal(v, w)))
 }
 
 /// The name -> (dims, ggml type, bytes) map for one GGUF file, keyed by tensor name so converter/reference order drift
