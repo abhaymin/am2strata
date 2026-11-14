@@ -299,9 +299,10 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
   their own terms, see NOTICE). Images and video need an NVIDIA card (the `cuda` feature); speech to text and text
   to speech also run on the CPU, slowly for speech out. Tested on Linux only.
 - **Parallel slots and replicas:** not supported yet. am2Strata runs one request at a time on a model, and the
-  others wait in its queue.
-- **Training in the Workshop:** LoRA training in Rust works on a small test model only. For now, train with Unsloth
-  on a dataset made in the Workshop and merge the adapter there.
+  others wait in its queue (a paired cluster worker can take one).
+- **Training in the Workshop:** LoRA training of Llama-family models (Llama, Mistral, Qwen) works from the command
+  line on the CPU (`am2strata-workshop train`, with `profile` and `autopilot` to fit the machine, and `soup.yaml`
+  import). Not yet: a Train card in the Workshop tab, GPU training, QLoRA (4-bit base) and MoE expert adapters.
 - **Outside Linux:** the Computer tab's desktop and the sandbox VM are Linux-only (the VM needs an x86_64 PC with
   KVM). On Linux arm64, Intel Macs and Windows Arm64 the Rust engine runs on the CPU only.
 
