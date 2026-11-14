@@ -67,3 +67,15 @@ CPU, with Python from the Soup virtual environment (torch 2.11.0, transformers 5
   so the adapter is not a no-op) on `tiny-llama-gqa-hf`, and PEFT's logits of base + adapter under that name in the JSON.
 
 The files are transformers' and PEFT's own output; the models' weights are random numbers (no licence applies to them).
+
+## soup/init-chat.yaml, soup/init-moe.yaml, soup/fetch-llama-3.1-8b-lora.yaml
+
+Real configs written by Soup's own CLI (`soup-cli` 0.73.3, <https://github.com/MakazhanAlpamys/Soup>, Apache-2.0,
+Copyright 2026 Makazhan Alpamys), copied unchanged, for the `soup.yaml` import test (`tests/soup_import.rs`):
+
+    soup init --template chat --output init-chat.yaml
+    soup init --template moe --output init-moe.yaml
+    soup fetch examples llama-3.1-8b-lora --output fetch-llama-3.1-8b-lora.yaml
+
+They are Soup's templates (its `templates/` catalog), under Soup's Apache-2.0 licence; nothing else of Soup is in this
+repository. The base models and data files they name are not here and are never fetched: the tests only parse them.
