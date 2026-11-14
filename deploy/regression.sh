@@ -32,7 +32,13 @@ THREADS="${AM2STRATA_TEST_THREADS:-4}"
 
 if [ "$UPDATE" = 1 ]; then
   OUT="$(mktemp -d "${TMPDIR:-/tmp}/am2strata-golden.XXXXXX")"
-  UPDATE_GOLDEN=1 GOLDEN_OUT="$OUT" cargo test -p am2strata --test regression_shapes -- --test-threads="$THREADS" --nocapture 2>&1 | grep '^golden ' || true
+  LOG="$OUT/cargo-test.log"
+  if ! UPDATE_GOLDEN=1 GOLDEN_OUT="$OUT" cargo test -p am2strata --test regression_shapes -- --test-threads="$THREADS" --nocapture > "$LOG" 2>&1; then
+    tail -n 30 "$LOG"
+    echo "The run failed (its full output: $LOG); no shapes were refreshed." >&2
+    exit 1
+  fi
+  grep '^golden ' "$LOG" || true
   echo
   echo "The shapes as they are now: $OUT"
   echo "Compare:  diff -ru crates/am2strata/tests/golden $OUT"

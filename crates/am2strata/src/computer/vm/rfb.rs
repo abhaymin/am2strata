@@ -92,7 +92,7 @@ impl Rfb {
         let n = read_exact(&mut s, 1).map_err(|x| e("security", x))?[0] as usize;
         if n == 0 {
             let len = be32(&read_exact(&mut s, 4).map_err(|x| e("security", x))?) as usize;
-            let why = read_exact(&mut s, len.min(4096)).unwrap_or_default();
+            let why = read_exact(&mut s, len.min(4096)).map_err(|x| e("the refusal's reason", x))?;
             return Err(format!("the VM's screen refused the connection: {}", String::from_utf8_lossy(&why)));
         }
         let types = read_exact(&mut s, n).map_err(|x| e("security", x))?;

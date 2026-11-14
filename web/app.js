@@ -125,14 +125,17 @@ const live = (() => {
   const pending = new Map();    // request id -> {ok, fail, onEvent}
   let ws = null, ready = false, refused = false, allowed = [], tries = 0, timer = null, seq = 0;
   const address = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${location.pathname.replace(/[^/]*$/, "")}v1/live`;
+  let everLive = false;
   function show() {
     const el = $("live-ind");
     if (!el) return;                                // an older index.html (cached): no indicator
     el.dataset.state = ready ? "on" : refused ? "off" : "wait";
-    $("live-text").textContent = ready ? "Live" : refused ? "Not live" : "Reconnecting";
+    if (ready) everLive = true;
+    const waiting = everLive ? "Reconnecting" : "Connecting";
+    $("live-text").textContent = ready ? "Live" : refused ? "Not live" : waiting;
     el.title = ready ? `Live: connected (${location.protocol === "https:" ? "wss" : "ws"}); updates are pushed, nothing is polled`
       : refused ? "Not live: the server refused the API key (Settings › Server and access). The page polls instead."
-      : "Reconnecting to the server… The page polls meanwhile.";
+      : `${waiting} to the server… The page polls meanwhile.`;
   }
   const sendNow = (o) => ws && ws.readyState === 1 && ready && (ws.send(JSON.stringify(o)), true);
   function subscribe(topic) {
@@ -819,7 +822,8 @@ async function poll() {
   followMetrics();
   // pushed (above) while the live channel delivers; fetched as before while it does not (not connected yet, a
   // reconnect, an older server, a proxy without WebSockets)
-  const pushed = live.has("metrics") || (document.hidden && live.connected);
+  // a tab in the background fetches nothing either way: it catches up when it is shown again (visibilitychange)
+  const pushed = live.has("metrics") || document.hidden;
   if (!pushed) try {
     const r = await fetch(`metrics?page=${reqPage}&per=${reqPer}`, {headers: headers()});
     if (r.status === 401) {
