@@ -593,12 +593,13 @@ async fn main() -> Result<()> {
         .layer(axum::extract::DefaultBodyLimit::max(256 << 20))
         // a handler that panics is answered with a JSON error, never a dropped connection
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_answer))
+        // HTTPS: HSTS on TLS responses; plain HTTP from elsewhere than this PC sent to HTTPS (server_tls.rs). Inside
+        // check_host, so a redirect only ever names a host this server answers to (no open redirect via a forged Host)
+        .layer(axum::middleware::from_fn(server_tls::security_headers))
+        .layer(axum::middleware::from_fn(server_tls::http_policy))
         .layer(axum::middleware::from_fn_with_state(hosts, check_host))
         // a TLS peer's pin (cluster_tls.rs): set only for the cluster listener's requests, removed from all others
         .layer(axum::middleware::from_fn(cluster_tls::peer_header))
-        // HTTPS: HSTS on TLS responses; plain HTTP from elsewhere than this PC sent to HTTPS (server_tls.rs)
-        .layer(axum::middleware::from_fn(server_tls::security_headers))
-        .layer(axum::middleware::from_fn(server_tls::http_policy))
         .with_state(state);
     // a worker: the encrypted listener for its paired masters (the same app)
     cluster.serve_tls(app.clone(), host.clone(), port);

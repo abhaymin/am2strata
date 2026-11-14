@@ -248,7 +248,10 @@ pub fn save_uploaded(data_dir: &Path, cert_pem: &str, key_pem: &str) -> Result<(
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let (tc, tk) = (dir.join("upload-check-cert.pem"), dir.join("upload-check-key.pem"));
     std::fs::write(&tc, cert_pem).map_err(|e| e.to_string())?;
-    write_private(&tk, key_pem.as_bytes()).map_err(|e| e.to_string())?;
+    if let Err(e) = write_private(&tk, key_pem.as_bytes()) {
+        let _ = std::fs::remove_file(&tc);
+        return Err(e.to_string());
+    }
     let checked = load_pem(&tc, &tk).and_then(|ck| {
         ck.keys_match().map_err(|_| "the key does not belong to the certificate".to_string())
     });
@@ -630,8 +633,9 @@ pub fn plain_http_answer(p: &Policy, peer: Option<std::net::IpAddr>, host: &str,
 }
 
 fn strip_port(host: &str) -> &str {
-    if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().map(|h| &host[..h.len() + 2]).unwrap_or(host);
+    // an IPv6 literal keeps its brackets; a malformed one (no closing bracket) is returned as it is, never sliced past
+    if host.starts_with('[') {
+        return match host.find(']') { Some(i) => &host[..=i], None => host };
     }
     match host.rsplit_once(':') {
         Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => h,
@@ -700,6 +704,10 @@ mod tests {
         // an IPv6 host keeps its brackets
         let r = plain_http_answer(&p(HttpMode::Redirect), lan, "[fd7a::1]:8000", "/").unwrap();
         assert_eq!(r.headers()["location"], "https://[fd7a::1]:8001/");
+        // an untrusted, malformed Host never panics
+        assert_eq!(strip_port("[fd7a::1"), "[fd7a::1");
+        assert_eq!(strip_port("["), "[");
+        assert_eq!(strip_port("example.com:8000"), "example.com");
     }
 
     #[test]

@@ -131,3 +131,24 @@ fn a_wrong_tls_block_stops_the_start_instead_of_running_plain() {
     assert!(err.contains("unknown mode"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_forged_host_is_refused_not_redirected() {
+    // the redirect names the request's host, so the host check must come first: no open redirect to another site
+    let port = free_port();
+    let s = Server::start(&[Model { extra: json!({"tls": {"https_port": port, "http": "redirect"}}), ..Model::default() }], &[ids("hi")], json!({}));
+    wait_https(&s.dir, port);
+    let c = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let r = c.get(format!("{}/v1/models", s.base)).header("host", "evil.example").send().unwrap();
+    assert_eq!(r.status(), 421, "a host this server does not answer to is refused");
+    assert!(r.headers().get("location").is_none());
+    // its own name is redirected to HTTPS on the same name
+    let r = c.get(format!("{}/v1/models", s.base)).header("host", format!("localhost:{}", s.port)).send().unwrap();
+    assert_eq!(r.status(), 308);
+    assert_eq!(r.headers()["location"], format!("https://localhost:{port}/v1/models").as_str());
+    // a malformed Host does not crash the server (hyper may refuse it before am2Strata sees it: either is fine)
+    if let Ok(r) = c.get(format!("{}/v1/models", s.base)).header("host", "[fd7a::1").send() {
+        assert!(r.headers().get("location").is_none_or(|l| !l.to_str().unwrap().contains("fd7a")), "no redirect to it");
+    }
+    assert_eq!(reqwest::blocking::get(format!("{}/health", s.base)).unwrap().status(), 200, "still serving");
+}
