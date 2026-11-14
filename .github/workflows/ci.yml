@@ -94,8 +94,9 @@ jobs:
             crates/strata-hybrid
           # pull requests read the cache and do not add to it
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # checked for compilation, not run (the tests run on Linux above, and everywhere in release.yml): the OS-specific
-      # code is all gated on `target_os` / `unix` / `windows`.
+      # everything is checked for compilation here (the OS-specific code is gated on `target_os` / `unix` / `windows`);
+      # the whole suite runs on Linux above and on every platform in release.yml, and on macOS and Windows the fast
+      # regression targets also run below.
       - run: cargo check --locked --workspace --tests
       - run: cargo check --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features ${{ matrix.engine }}
       # Compiling is not enough: the first full release test run after these tests were written failed on macOS and

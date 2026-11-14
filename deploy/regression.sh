@@ -32,7 +32,8 @@ THREADS="${AM2STRATA_TEST_THREADS:-4}"
 
 if [ "$UPDATE" = 1 ]; then
   OUT="$(mktemp -d "${TMPDIR:-/tmp}/am2strata-golden.XXXXXX")"
-  LOG="$OUT/cargo-test.log"
+  # the test run's own output is kept beside the shapes' folder, not in it (the diff below compares that folder)
+  LOG="$OUT.log"
   if ! UPDATE_GOLDEN=1 GOLDEN_OUT="$OUT" cargo test -p am2strata --test regression_shapes -- --test-threads="$THREADS" --nocapture > "$LOG" 2>&1; then
     tail -n 30 "$LOG"
     echo "The run failed (its full output: $LOG); no shapes were refreshed." >&2
