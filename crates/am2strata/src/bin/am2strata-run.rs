@@ -204,6 +204,48 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    /// API keys of the running server, and their usage:
+    /// create --name X [--tools web,memory] [--expires 30d] | list | revoke <id> | usage [--days 30] [--key <id>]
+    Keys {
+        action: String,
+        /// revoke: the key's id (from `keys list`)
+        id: Option<String>,
+        /// create: the key's name (an app, a user, a machine)
+        #[arg(long)]
+        name: Option<String>,
+        /// create: its tool sets, comma separated (memory, web, image, video, speech, music, browser, code, mcp:<server>, mcp:*)
+        #[arg(long)]
+        tools: Option<String>,
+        /// create: how long it works (30d, 12h, 90m; default: until revoked)
+        #[arg(long)]
+        expires: Option<String>,
+        /// create: its memory space (default: one of its own)
+        #[arg(long)]
+        memory: Option<String>,
+        /// create: model API requests it may send in a day
+        #[arg(long)]
+        requests_per_day: Option<u64>,
+        /// create: tokens it may use in a day
+        #[arg(long)]
+        tokens_per_day: Option<u64>,
+        /// create: the only models it may ask for, comma separated (default: every model)
+        #[arg(long)]
+        models: Option<String>,
+        /// usage: how many days back (today included)
+        #[arg(long, default_value_t = 30)]
+        days: u64,
+        /// usage: one key only (its id, "owner", or "client:<name>")
+        #[arg(long)]
+        key: Option<String>,
+        /// the server (default: this PC's, from its run configs; or AM2STRATA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// its own API key (default: from the run configs; or AM2STRATA_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// HTTPS on the running server, applied at once and kept in its run config:
     /// status | self-signed | tailscale | load --cert <pem> --key <pem> | renew | off
     Tls {
@@ -723,6 +765,10 @@ fn main() -> ExitCode {
             vm_cmd(&action, &args, kind, root, &lists, yes, !no_wait, url, api_key, &models_dir),
         Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir, dg } =>
             workshop_cmd(&action, first, second, out, ty, outtype, pre_tokenizer, (name, display_name, overwrite), wait, url, api_key, &models_dir, dg),
+        Cmd::Keys { action, id, name, tools, expires, memory, requests_per_day, tokens_per_day, models, days, key, url, api_key, models_dir } =>
+            keys_cmd(&action, id, serde_json::json!({"name": name, "tools": tools, "expires_in": expires, "memory": memory, "models": models,
+                                                     "limits": {"requests_per_day": requests_per_day, "tokens_per_day": tokens_per_day}}),
+                     days, key, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
@@ -1277,6 +1323,98 @@ fn print_tls(j: &serde_json::Value) {
     }
     if let Some(e) = j["last_error"].as_str() { println!("last error: {e}"); }
     if let Some(p) = j["saved"].as_str() { println!("kept in {p}"); }
+}
+
+/// `am2strata-run keys ...`: the server's /api/keys and /api/usage, as Settings › Clients uses them.
+#[allow(clippy::too_many_arguments)]
+fn keys_cmd(action: &str, id: Option<String>, spec: serde_json::Value, days: u64, of: Option<String>,
+            url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(60)).build().unwrap();
+    let send = |rb: reqwest::blocking::RequestBuilder| -> Result<serde_json::Value, String> {
+        let rb = match &key { Some(k) => rb.bearer_auth(k), None => rb };
+        let r = rb.send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        let ok = r.status().is_success();
+        let j: serde_json::Value = r.json().unwrap_or_default();
+        if ok { Ok(j) } else { Err(j["error"]["message"].as_str().unwrap_or("failed").to_string()) }
+    };
+    let n = |v: &serde_json::Value| v.as_u64().unwrap_or(0);
+    let list_of = |v: &serde_json::Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default();
+    let result = (|| -> Result<(), String> {
+        match action {
+            "create" => {
+                if spec["name"].is_null() {
+                    return Err("create needs --name".into());
+                }
+                let j = send(client.post(format!("{url}/api/keys")).json(&spec))?;
+                println!("{}", j["key"].as_str().unwrap_or(""));
+                eprintln!("key {} ({}) made. It is shown this once and kept nowhere: copy it now.", j["id"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or(""));
+                let tools = list_of(&j["tools"]);
+                eprintln!("  tools: {}{}", if tools.is_empty() { "none" } else { &tools },
+                          j["expires_at"].as_u64().map(|e| format!("; expires in {} days", (e.saturating_sub(now_s()) + 43200) / 86400)).unwrap_or_default());
+            }
+            "list" => {
+                let j = send(client.get(format!("{url}/api/keys")))?;
+                let keys = j["keys"].as_array().cloned().unwrap_or_default();
+                if keys.is_empty() {
+                    println!("no keys yet: am2strata-run keys create --name <name>");
+                }
+                for k in &keys {
+                    let tools = list_of(&k["tools"]);
+                    println!("{}  {:<8}  {:<24}  {}…  today {} req / {} tok, 30 days {} req / {} tok  tools: {}  models: {}",
+                             k["id"].as_str().unwrap_or(""), k["status"].as_str().unwrap_or(""), k["name"].as_str().unwrap_or(""),
+                             k["prefix"].as_str().unwrap_or(""),
+                             n(&k["usage"]["today"]["requests"]), n(&k["usage"]["today"]["total_tokens"]),
+                             n(&k["usage"]["days_30"]["requests"]), n(&k["usage"]["days_30"]["total_tokens"]),
+                             if tools.is_empty() { "none" } else { &tools },
+                             { let m = list_of(&k["usage"]["models"]); if m.is_empty() { "-".to_string() } else { m } });
+                }
+            }
+            "revoke" => {
+                let id = id.clone().ok_or("revoke <id> (from `keys list`)")?;
+                let j = send(client.delete(format!("{url}/api/keys/{id}")))?;
+                println!("key {} ({}) is revoked: it stopped working now", j["id"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or(""));
+            }
+            "usage" => {
+                let mut rb = client.get(format!("{url}/api/usage")).query(&[("days", days.to_string())]);
+                if let Some(k) = &of {
+                    rb = rb.query(&[("key", k)]);
+                }
+                let j = send(rb)?;
+                let row = |name: &str, c: &serde_json::Value| println!("  {name:<32} {:>8} req  {:>11} prompt  {:>11} completion  {:>10} cached  {:>5} media  {:>5} errors",
+                    n(&c["requests"]), n(&c["prompt_tokens"]), n(&c["completion_tokens"]), n(&c["cached_tokens"]), n(&c["media_jobs"]), n(&c["errors"]));
+                println!("{} to {} (UTC)", j["from"].as_str().unwrap_or(""), j["to"].as_str().unwrap_or(""));
+                row("total", &j["totals"]);
+                println!("by key:");
+                for k in j["by_key"].as_array().into_iter().flatten() {
+                    row(&format!("{} [{}]", k["name"].as_str().unwrap_or(""), k["key"].as_str().unwrap_or("")), k);
+                    for m in k["models"].as_array().into_iter().flatten() {
+                        row(&format!("    {}", m["model"].as_str().unwrap_or("")), m);
+                    }
+                }
+                println!("by model:");
+                for m in j["by_model"].as_array().into_iter().flatten() {
+                    row(m["model"].as_str().unwrap_or(""), m);
+                }
+                println!("by day:");
+                for d in j["by_day"].as_array().into_iter().flatten().filter(|d| n(&d["requests"]) > 0) {
+                    row(d["day"].as_str().unwrap_or(""), d);
+                }
+            }
+            other => return Err(format!("unknown action {other:?} (create, list, revoke, usage)")),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => { eprintln!("keys: {e}"); ExitCode::from(1) }
+    }
+}
+
+fn now_s() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// This PC's server from its run configs: the address (127.0.0.1 and the port) and the key.
