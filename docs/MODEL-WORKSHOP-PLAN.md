@@ -180,3 +180,71 @@ Each step commits on `agent/model-workshop` with the tests that gate it before t
   test breaks CI and the owner's rule.
 - **Scope.** ONNX (smallest), data-generation, remote Unsloth, HF downloads — each is real but secondary; keep them as clearly-limited steps so
   nothing half-done looks like a finished feature.
+
+## 4. Training (after Soup, in Rust)
+
+Owner's requirement: *the Workshop should also do what the Soup project does, rebuilt in Rust, so models can be
+generated when resources are limited.* Soup (<https://github.com/MakazhanAlpamys/Soup>, Apache-2.0) is a Python
+fine-tuning CLI; it is the reference for **behaviour and config shape** only (`soup.yaml`, `soup train`, `soup profile`,
+`soup autopilot`, `--find-lr`). Nothing of Soup runs and none of its code is used: the trainer is candle and our own code,
+and no Python runs at any point (two test fixtures were *made* once with Python; see `tests/fixtures/README.md`).
+
+Steps 3–4 of the build order above were first proved on a toy model (`lora.rs`, `train.rs`, `checkpoint.rs`: no rotary
+embeddings, two fixed layers). Milestone 1 replaces the toy with a real model and adds what Soup has around training.
+
+### Milestone 1 (done): the trainer as a library and a command, on the CPU
+
+| piece | file | what it is | its gate |
+|---|---|---|---|
+| forward pass | `model.rs` | Llama, Mistral, Qwen2 (biases), Qwen3 (q/k norms, `head_dim`) from an HF folder in F32/F16/BF16: RMSNorm, RoPE, grouped-query attention, SwiGLU, tied or untied head; LoRA (rank, alpha, dropout, rsLoRA) on any of the seven projections | `tests/model_parity.rs`: logits equal transformers' within 1e-5 on seven tiny models (worst 7.2e-6; the gate is 1e-3), and PEFT's with a PEFT adapter |
+| data | `chatdata.rs` | chat JSONL through the model's own chat template (`strata-template`) and `tokenizer.json`; only assistant tokens are scored; alpaca, sharegpt, prompt/completion rows read as Soup reads them | `tests/finetune.rs` |
+| training | `finetune.rs` | batch 1 with true gradient accumulation, the crate's AdamW, warm-up + cosine, clipping, held-out split, checkpoints with exact resume, PEFT adapter output, the LR range test | `tests/finetune.rs`: the loss falls; a stopped run resumes to a bit-identical adapter; train → merge → the merged model's logits equal base + LoRA |
+| limited resources | `model.rs`, `finetune.rs` | 16-bit base; LoRA in the top N blocks; the activation cache, filled one frozen block at a time; a one-node attention softmax | `tests/limited_resources.rs` |
+| profile, autopilot | `profile.rs` | memory part by part and a rough time, against this machine; settings that fit, each with its reason | `tests/profile.rs`: hand-computed numbers for the tiny model and Llama-2-7B |
+| Soup import | `soup.rs` | `soup.yaml` → settings; everything unsupported refused by its dotted name | `tests/soup_import.rs`: three configs written by Soup's own CLI |
+| command | `bin/am2strata-workshop.rs` | `train`, `find-lr`, `profile`, `autopilot`, with the `--json` events and SIGTERM = checkpoint and stop | `tests/train_cli.rs` |
+
+Three things learned while building it, kept here because each would have been a silent failure:
+
+- **candle's `softmax_last_dim` has no backward pass** and cuts the graph without an error: with it the q and k adapters
+  get no gradient at all and the loss still falls (through v, o and the MLP). The parity test on gradients caught it.
+  The attention softmax is now one custom node with a closed-form backward (`MaskedSoftmax`), checked against the plain
+  differentiable version; it also keeps one `[heads, seq, seq]` tensor instead of five.
+- **A 16-bit base needs its own graph node.** candle's CPU `matmul` does F16 but not BF16, and its graph keeps both
+  operands of a product alive: widening a weight to f32 for the product would hold f16 *and* f32 of every trained block
+  until the backward pass — more than f32 alone. `FrozenLinear` computes the product outside the graph and keeps only
+  the 16-bit weight, widening it again for the gradient. On BF16 weights its gradients equal the f32 path's bit for bit.
+- **candle's `matmul` backward computes a gradient for both operands**, needed or not: through it every frozen f32
+  weight on the path got a full-size gradient each step (a 12-block 27 M model peaked at 542 MB instead of 228 MB, and
+  took 29 s instead of 12.8 s). Every frozen product goes through `FrozenLinear`, in f32 too
+  (`model::tests::regress_frozen_weights_get_no_gradient`).
+- **The cache must not need the memory it saves.** Filling the activation cache by loading the whole model would peak
+  where the plain run peaks. It is filled with the embeddings, then one frozen block at a time (states waiting on disk
+  between blocks), so the frozen part is never in memory together.
+
+### Not done (said in the command's output too)
+
+- **QLoRA** — a 4-bit base with the backward pass through dequantised weights. candle has no quantised product with a
+  backward pass; doing it properly means our own custom node over `strata-pack`'s dequantisers (like `FrozenLinear`,
+  dequantising per product). `--base-dtype 4bit` and Soup's `quantization: 4bit` are refused by name; `QLORA_READY` stays
+  false. The 16-bit base, top-N blocks and the cache are what cuts memory today.
+- **Expert adapters of mixture-of-experts models** — `merge` folds them, training does not make them; a MoE config is
+  refused by name.
+- **GPU runs, several GPUs** — the trainer runs on the CPU. The two custom nodes hand over CPU buffers; a GPU run needs
+  their CUDA side (and would use the card's native 16-bit products instead of widening).
+- **Vision and audio towers**, full fine-tuning (rank 0), DoRA, other optimizers and schedulers, preference and
+  reinforcement objectives (DPO, GRPO, …): refused by name when a `soup.yaml` asks for them.
+- **Gradient checkpointing**: the activations of the trained blocks are all kept for the backward pass; `--train-layers`
+  is the lever instead.
+
+### Next milestones
+
+1. **Server job kind + the Workshop "Train" card + GPU.** `"train"` in `/v1/workshop/jobs` (the same `am2strata-workshop
+   train --json` command, paths confined as the other kinds), the profile shown before the job is queued, loss and
+   rate plotted from the progress events, cancel = SIGTERM, resume; a GPU run through the queue (the text model stopped
+   and reloaded like the media jobs), with the CUDA side of the two custom nodes.
+2. **Diagnose / eval report** (Soup's `diagnose`): after training, compare base and adapter on held-out prompts —
+   forgetting, refusals, format, repetition — and write a report card.
+3. **Sweeps** (Soup's `sweep`): a grid or random search over rank, rate and trained blocks, each run a queued job, with
+   the activation cache shared between runs that freeze the same blocks.
+4. **QLoRA proper**, then expert adapters for MoE models.

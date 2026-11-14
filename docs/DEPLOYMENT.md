@@ -489,6 +489,68 @@ file. An instruction-tuned model of 7B or more works best. The judge roughly dou
 (byte for byte as llama.cpp's converter), quantize it (as `llama-quantize --pure`), and install it so it appears in the
 model list.
 
+### Training a LoRA adapter (after Soup, in Rust)
+
+`am2strata-workshop train` fine-tunes a LoRA adapter on chat data, on the CPU, with no Python. It does what the
+[Soup](https://github.com/MakazhanAlpamys/Soup) CLI does for this case (`soup train`, `soup profile`, `soup autopilot`,
+`--find-lr`, and it reads `soup.yaml`), rebuilt on candle so a model can be made where resources are limited. It is a
+command for now: the Workshop tab's "Train" card and the server job come next.
+
+- **Models:** Hugging Face folders (`config.json`, safetensors in F32, F16 or BF16, `tokenizer.json` with a chat template)
+  of Llama, Mistral, Qwen2 and Qwen3 dense decoders. Its forward pass gives transformers' logits within 1e-5.
+- **Data:** chat JSONL in the `messages` format the Workshop's training-data job writes (also Soup's `alpaca`,
+  `sharegpt` and `prompt`/`completion` rows). Each conversation goes through the model's own chat template. Only the
+  assistant's tokens count in the loss.
+- **Output:** `adapter_model.safetensors` + `adapter_config.json` in PEFT's format (the Workshop's merge, PEFT and
+  Unsloth read it), `training_report.json`, and `checkpoint-<step>/` folders.
+
+```
+am2strata-workshop profile   --model ~/models/Qwen2.5-0.5B-Instruct --data chat.jsonl          # what it needs, before anything runs
+am2strata-workshop autopilot --model ~/models/Qwen2.5-0.5B-Instruct --data chat.jsonl --time-budget 4h
+am2strata-workshop find-lr   --model ~/models/Qwen2.5-0.5B-Instruct --data chat.jsonl          # the learning-rate range test
+am2strata-workshop train     --model ~/models/Qwen2.5-0.5B-Instruct --data chat.jsonl --out ~/adapters/mine \
+                             --rank 16 --targets q_proj,v_proj --base-dtype bf16 --train-layers 8 --cache-activations ~/adapters/mine/act
+am2strata-workshop train     --soup soup.yaml          # a Soup config; what it sets that is not supported is named and refused
+am2strata-workshop merge     ~/models/Qwen2.5-0.5B-Instruct ~/adapters/mine --out ~/models/mine-merged
+```
+
+`train` refuses up front when the estimate says the run will not fit in the free memory (`--force` runs it anyway).
+Stopping it with SIGTERM (`kill PID`, which is what the server sends) writes a checkpoint after the current step;
+Ctrl-C just ends it. The same
+command with `--resume auto` then continues, and takes exactly the steps an uninterrupted run would. `--threads N` sets
+the CPU threads. With `--json` it speaks the Workshop's event protocol: `progress` events carry `step`, `total`, `loss`,
+`lr` and `eta`.
+
+`autopilot` prints a plan and the `train` command for it. Each setting (rank, trained blocks, sequence length, base
+dtype, accumulation, epochs, rate) comes with a one-line reason. `--soup-relax` lets a Soup config that asks for a
+4-bit base (Soup's default) or an 8-bit optimizer run with a bf16 base and AdamW instead, and says so.
+
+**When memory is short.** These are measured on this PC's CPU: a random 12-block Llama of 27 M parameters (`cargo run
+--release -p strata-workshop --example write-tiny-chat-hf -- DIR 12 384 1536 64`), 56 conversations to train on,
+rank 8 on q/v, 64 tokens, 3 epochs = 42 steps, 6 threads. Peak RSS is what the OS reports; the estimate is `profile`'s.
+
+| mode | what it saves | peak RSS | estimate | time | loss after 42 steps |
+|---|---|---|---|---|---|
+| f32 base, every block | — | 228 MB | 222 MB | 12.8 s | 3.010 |
+| `--base-dtype bf16` | half the base's bytes; same gradients (bit for bit on BF16 files) | 180 MB | 171 MB | 12.9 s | 3.012 |
+| `--base-dtype f16` | the same memory as bf16 | 180 MB | 171 MB | 25.9 s | 3.010 |
+| `--train-layers 2` (top 2 of 12) | the 10 blocks below keep nothing for a backward pass | 228 MB | 131 MB | 5.7 s | 3.854 |
+| `--train-layers 2 --cache-activations` | the 10 frozen blocks are never in memory together, and run once per conversation, not once per epoch | 54 MB | 38 MB | 3.3 s | 3.854 |
+| the same, cache already full | the frozen blocks are not loaded at all | 54 MB | 38 MB | 2.4 s | 3.854 |
+| `--base-dtype f16` + top 2 + cache | both | 47 MB | 31 MB | 22.0 s (11.7 s with a full cache) | 3.854 |
+
+The cache took 2 MB on disk here (one hidden state per conversation). With and without it the loss curve is identical,
+step for step, and so is the adapter. Fewer trained blocks learn less from the same steps (3.85 against 3.01 here),
+which is the price of the memory. The RSS of the runs that load the whole model includes the model file's mapped pages
+while it loads (page cache the system takes back when it needs it). That is the gap to the estimate in the
+`--train-layers 2` row. On this CPU an f16 base runs about twice as slow as bf16 (candle widens f16 slowly), so use
+bf16. For the same reason the time estimate is rough: a matrix-product benchmark of this CPU scaled by a measured share.
+
+**Not done** (the command says so too): a 4-bit base (QLoRA; `--base-dtype 4bit` is refused), training expert
+adapters of mixture-of-experts models, GPU or multi-GPU runs, vision and audio towers, full fine-tuning, DoRA,
+preference objectives (DPO and the like). Next: the server's train job and the Workshop "Train" card with GPU runs
+through the queue, then a post-training report (Soup's `diagnose`) and sweeps.
+
 ## The Computer tab: see and use the desktop
 
 With computer use on in sandbox mode (Settings › Computer and browser use), the **Computer** tab shows the private
