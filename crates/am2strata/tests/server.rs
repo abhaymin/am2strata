@@ -3085,3 +3085,20 @@ fn a_big_qwen_image_decodes_on_the_cpu() {
     assert_eq!(g[g.len() - 1]["request"]["placement"]["advanced"]["vae"]["kind"], "cpu");
     assert_ne!(g[g.len() - 2]["request"]["placement"]["advanced"]["vae"]["kind"], "cpu");
 }
+
+/// Found on the Mac worker (2026-11-15): with the Rust engine stuck on its GPU path, a chat got only keep-alives for
+/// 900 s although the engine's stall watchdog was set to 300 s. The engine-level test passed; this checks the whole way
+/// through the server: a stalled engine ends the chat with an error that says so, streamed and not.
+#[test]
+fn a_stalled_engine_ends_the_chat_with_an_error() {
+    for chatter in [false, true] {
+        let m = Model { extra: json!({"engine_stall_s": 3}), ..Model::default() };
+        let s = Server::start(&[m], &[ids("never")], json!({"stall": true, "chatter": chatter}));
+        let t0 = Instant::now();
+        let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user("hi")], "max_tokens": 16}));
+        let took = t0.elapsed();
+        assert!(took < Duration::from_secs(30), "chatter={chatter}: the chat took {took:?}; the watchdog is 3 s");
+        assert_ne!(c, 200, "chatter={chatter}: a stalled engine is an error, not an answer: {r}");
+        assert!(r.to_string().to_lowercase().contains("stall"), "chatter={chatter}: the error says it stalled: {r}");
+    }
+}
