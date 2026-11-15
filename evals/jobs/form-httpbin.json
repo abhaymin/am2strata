@@ -1,0 +1,20 @@
+{
+  "name": "form-httpbin",
+  "about": "a form in a browser: fill an order and send it",
+  "prompt": "Using the browser, open https://httpbin.org/forms/post and fill the order form: customer name Ada Lovelace, telephone 555-0100, e-mail ada@example.com, pizza size Large, toppings Bacon and Onion. Submit it, then report exactly what the page returned.",
+  "request": {
+    "strata_browser": "server"
+  },
+  "max_tokens": 8000,
+  "timeout_s": 1200,
+  "check": {
+    "kind": "regex",
+    "all": [
+      "Ada Lovelace",
+      "\"size\":\\s*\"large\"",
+      "bacon",
+      "onion",
+      "555-0100"
+    ]
+  }
+}

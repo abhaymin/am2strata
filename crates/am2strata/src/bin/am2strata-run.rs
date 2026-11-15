@@ -28,6 +28,8 @@ mod agents;
 mod regression_run;
 #[path = "../doctor.rs"]
 mod doctor;
+#[path = "../eval_run.rs"]
+mod eval_run;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -186,6 +188,31 @@ enum Cmd {
         action: String,
         /// screenshot: the file; paste/type: the text; open: the app
         arg: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// agent jobs with locked checkers (docs/GAPS-PLAN.md A18): run [--jobs a,b] [--model m] [--tries 3] [--unlocked] |
+    /// selftest (each checker on its known-good answer) | lock (after reviewing the jobs) | list. Jobs are evals/jobs/*.json; reports go to evals/results/.
+    Eval {
+        action: String,
+        #[arg(long, value_delimiter = ',')]
+        jobs: Vec<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 1)]
+        tries: u32,
+        /// run jobs that changed since the lock (a trial: the report says so)
+        #[arg(long)]
+        unlocked: bool,
+        /// the eval folder (default: evals/ in the repository)
+        #[arg(long)]
+        dir: Option<String>,
+        #[arg(long)]
+        quiet: bool,
         #[arg(long)]
         url: Option<String>,
         #[arg(long)]
@@ -902,6 +929,24 @@ fn main() -> ExitCode {
             if regression_run::run(regression_run::Options { url, key, full, json, insecure }) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
+        Cmd::Eval { action, jobs, model, tries, unlocked, dir, quiet, url, api_key, models_dir } => {
+            let dir = dir.map(|d| expand_path(Path::new(&d))).unwrap_or_else(|| root().join("evals"));
+            let (local_url, local_key) = local_server(&models_dir);
+            let srv = eval_run::Server { url: url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string(),
+                                         key: api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key) };
+            let r = match action.as_str() {
+                "lock" => eval_run::lock(&dir).map(|m| println!("{m}")),
+                "selftest" => eval_run::selftest(&srv, &dir).and_then(|ok| if ok { Ok(()) } else { Err("a checker failed on its known-good answer".into()) }),
+                "list" => eval_run::load_jobs(&dir).map(|js| {
+                    let open = eval_run::unlocked(&dir, &js);
+                    for j in &js { println!("{:<22} {:<12} {}{}", j["name"].as_str().unwrap_or(""), j["check"]["kind"].as_str().unwrap_or(""),
+                                            j["about"].as_str().unwrap_or(""), if open.iter().any(|n| j["name"] == n.as_str()) { "  [not locked]" } else { "" }); }
+                }),
+                "run" => eval_run::run(&srv, &eval_run::Opts { dir, jobs, model, tries: tries.max(1), unlocked, quiet }).map(|rep| println!("{}", eval_run::table(&rep))),
+                other => Err(format!("unknown action {other:?}: run, selftest, lock or list")),
+            };
+            done(r)
+        }
         Cmd::Browser { action, args, target, session, kind, selector, fields, next, pages, dataset, key, format, out, junit, full, json, url, api_key, models_dir } =>
             browser_cmd(&action, &args, BrowserOpts { target, session, kind, selector, fields, next, pages, dataset, key, format, out, junit, full, json }, url, api_key, &models_dir),
         Cmd::Vm { action, args, kind, root, lists, yes, no_wait, url, api_key, models_dir } =>

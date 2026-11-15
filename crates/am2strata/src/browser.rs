@@ -1124,7 +1124,9 @@ impl Browsers {
         match name {
             "browser_open" => {
                 let url = args["url"].as_str().ok_or("give the url")?.trim();
-                let url = if url.contains("://") { url.to_string() } else { format!("https://{url}") };
+                // an address with a scheme stays as it is (data:, about:, blob: have no "//"); a bare host gets https://
+                let has_scheme = url.contains("://") || ["data:", "about:", "blob:"].iter().any(|p| url.to_lowercase().starts_with(p));
+                let url = if has_scheme { url.to_string() } else { format!("https://{url}") };
                 if !allowed_host(&url, self.settings.private_urls).await {
                     return Err(format!("{url} is not a public web address; the browser does not open this PC's or the LAN's pages"));
                 }

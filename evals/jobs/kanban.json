@@ -1,0 +1,56 @@
+{
+  "name": "kanban",
+  "about": "a small web app: a kanban board you can add cards to",
+  "prompt": "Write a kanban board as one self-contained HTML file: inline CSS and JavaScript, no external files or libraries. Three columns titled To do, Doing and Done. A text box with the placeholder \"New card\" and an Add button add a card with that text to the To do column. Cards can be dragged between columns. Answer with only the file, in one ```html block.",
+  "request": {},
+  "max_tokens": 16000,
+  "timeout_s": 1800,
+  "check": {
+    "kind": "html_browser",
+    "steps": [
+      {
+        "open": "$PAGE"
+      },
+      {
+        "expect": [
+          {
+            "text": "To do"
+          },
+          {
+            "text": "Doing"
+          },
+          {
+            "text": "Done"
+          },
+          {
+            "console_errors": 0
+          },
+          {
+            "failed_requests": 0
+          }
+        ]
+      },
+      {
+        "fill": [
+          {
+            "field": "New card",
+            "value": "Write the report"
+          }
+        ]
+      },
+      {
+        "click": "Add"
+      },
+      {
+        "expect": [
+          {
+            "text": "Write the report"
+          },
+          {
+            "console_errors": 0
+          }
+        ]
+      }
+    ]
+  }
+}

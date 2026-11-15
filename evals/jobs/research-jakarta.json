@@ -1,0 +1,16 @@
+{
+  "name": "research-jakarta",
+  "about": "a fact from the web: one number from one Wikipedia table",
+  "prompt": "According to the Wikipedia article \"List of largest cities\", what is the UN 2025 population estimate for Jakarta? Give the exact number.",
+  "request": {
+    "strata_web": true
+  },
+  "max_tokens": 8000,
+  "timeout_s": 900,
+  "check": {
+    "kind": "regex",
+    "all": [
+      "41[,.  ]?913[,.  ]?860"
+    ]
+  }
+}
