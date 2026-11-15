@@ -120,7 +120,7 @@ pub async fn load_source(src: &str) -> Result<Vec<u8>> {
 }
 
 pub fn ffmpeg_available() -> bool {
-    Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
+    Command::new(crate::server_tls::program("ffmpeg")).arg("-version").output().is_ok_and(|o| o.status.success())
 }
 
 fn video_source(part: &Value) -> Option<String> {
@@ -144,13 +144,13 @@ async fn frames(video: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
     let dir = tempdir()?;
     let input = dir.join("in.video");
     std::fs::write(&input, video)?;
-    let probe = Command::new("ffprobe")
+    let probe = Command::new(crate::server_tls::program("ffprobe"))
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"])
         .arg(&input)
         .output()?;
     let duration: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
     let fps = if duration > 0.0 { n as f64 / duration } else { 1.0 };
-    let status = Command::new("ffmpeg")
+    let status = Command::new(crate::server_tls::program("ffmpeg"))
         .args(["-v", "error", "-i"])
         .arg(&input)
         .args(["-vf", &format!("fps={fps:.6},scale='min(1280,iw)':-2"), "-frames:v", &n.to_string(), "-q:v", "3"])
