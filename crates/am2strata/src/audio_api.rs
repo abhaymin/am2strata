@@ -254,15 +254,30 @@ async fn transcribe(s: AppState, headers: HeaderMap, req: Request, translate: bo
 /// A chat's audio attachment as text: the speech-to-text model on the CPU (no GPU turn, so the answer's text model
 /// stays loaded). Returns the text and the audio's length in seconds.
 pub async fn transcribe_for_chat(s: &AppState, b64: &str) -> Result<(String, f64), String> {
+    transcribe_as(s, b64, None, false).await
+}
+
+/// A transcript for a check (check_media's words heard): in the take's own language, and with the most accurate
+/// Whisper here (large-v3-turbo when it is downloaded) — the small default heard a word-perfect German take as 0.43.
+pub async fn transcribe_for_check(s: &AppState, b64: &str, language: &str) -> Result<(String, f64), String> {
+    transcribe_as(s, b64, Some(language).filter(|l| !l.is_empty()), true).await
+}
+
+async fn transcribe_as(s: &AppState, b64: &str, language: Option<&str>, accurate: bool) -> Result<(String, f64), String> {
     if !s.media.available() {
         return Err("the media engine is not built".into());
     }
-    let model = s.media.stt_model();
+    let mut model = s.media.stt_model();
+    if accurate && model != crate::image_gen::DEFAULT_STT_MODEL && audio_model(s, crate::image_gen::DEFAULT_STT_MODEL, "stt").await.is_ok() {
+        model = crate::image_gen::DEFAULT_STT_MODEL.to_string();
+    }
     let m = audio_model(s, &model, "stt").await.map_err(|_| format!("{model} is not downloaded (Settings > Models > Media models > Audio)"))?;
     let mon = s.mgr.monitor.clone();
     let id = mon.media_begin("speech-to-text", &model);
     let _row = crate::monitor::MediaRow::new(&mon, id);
-    let r = s.media.call(json!({"op": "transcribe", "model": model, "audio": b64, "translate": false, "device": "cpu"}), |_| {}).await;
+    let mut cmd = json!({"op": "transcribe", "model": model, "audio": b64, "translate": false, "device": "cpu"});
+    if let Some(l) = language { cmd["language"] = json!(l); }
+    let r = s.media.call(cmd, |_| {}).await;
     if mem_available_gb() < m["size_gb"].as_f64().unwrap_or(1.0) * 2.0 + 2.0 {
         let _ = s.media.call(json!({"op": "unload_audio"}), |_| {}).await;
     }
