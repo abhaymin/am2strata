@@ -3866,8 +3866,15 @@ const PROD_EXAMPLE = JSON.stringify({name: "Evening set", crossfade_s: 2, parts:
 $("dub-json").value = DUB_EXAMPLE;
 $("prod-json").value = PROD_EXAMPLE;
 const dubFiles = { takes: [], stem: null };
-$("dub-takes").onchange = async () => { dubFiles.takes = await Promise.all([...$("dub-takes").files].map(asDataUrl)); };
-$("dub-stems").onchange = async () => { const f = $("dub-stems").files[0]; dubFiles.stem = f ? await asDataUrl(f) : null; };
+$("dub-takes").onchange = async () => {
+  try { dubFiles.takes = await Promise.all([...$("dub-takes").files].map(asDataUrl)); }
+  catch (e) { dubFiles.takes = []; toast("error", "Takes not read", String(e.message || e), 8000); }
+};
+$("dub-stems").onchange = async () => {
+  const f = $("dub-stems").files[0];
+  try { dubFiles.stem = f ? await asDataUrl(f) : null; }
+  catch (e) { dubFiles.stem = null; toast("error", "Stems not read", String(e.message || e), 8000); }
+};
 $("dub-form").onsubmit = async (ev) => {
   ev.preventDefault();
   $("dub-go").disabled = true;
