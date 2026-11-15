@@ -51,11 +51,14 @@ fn meminfo_kb(text: &str, key: &str) -> Option<u64> {
     text.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok()
 }
 
+/// /proc/meminfo reports kB (KiB): MiB is that / 1024.
+fn kb_to_mib(kb: u64) -> u64 { kb / 1024 }
+
 /// Total or available RAM in MiB on Linux (as today: /proc/meminfo). 0 when it cannot read the file.
 #[cfg(target_os = "linux")]
 fn linux_mem(key: &str) -> u64 {
     std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|t| meminfo_kb(&t, key).map(|kb| kb / 1048576))
+        .and_then(|t| meminfo_kb(&t, key).map(kb_to_mib))
         .unwrap_or(0)
 }
 
@@ -64,7 +67,7 @@ fn macos_total_mib() -> u64 {
     let mut v: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     if unsafe { libc::sysctlbyname(c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut libc::c_void, &mut len, std::ptr::null_mut(), 0) == 0 } {
-        v
+        v / (1024 * 1024) // hw.memsize is in bytes
     } else {
         0
     }
@@ -98,7 +101,7 @@ fn global_memory() -> Option<(u64, u64)> {
         let mut info: MEMORYSTATUSEX = std::mem::zeroed();
         info.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
         if GlobalMemoryStatusEx(&mut info) == 0 { return None; }
-        Some((info.ullTotalPhys, info.llAvailPhys))
+        Some((info.ullTotalPhys, info.ullAvailPhys))
     }
 }
 
@@ -248,6 +251,24 @@ mod tests {
         let avail = available_mib();
         assert!(total > 0, "total_mib() was 0: the memory source is missing on this OS");
         assert!(avail <= total, "available {avail} MiB is more than total {total} MiB");
+    }
+
+    #[test]
+    fn units_are_mib_and_gib() {
+        // 16 GiB of RAM as /proc/meminfo writes it: 16777216 kB
+        assert_eq!(kb_to_mib(16_777_216), 16_384);
+        // and the GiB view the callers use is MiB / 1024
+        assert_eq!(16_384f64 / 1024.0, 16.0);
+    }
+
+    // on the machine the test runs on, total RAM is a plausible size in MiB (between 512 MiB and 16 TiB): catches
+    // bytes, kB or GiB passed off as MiB on any OS
+    #[test]
+    fn total_is_a_plausible_number_of_mib() {
+        let t = total_mib();
+        assert!((512..16 * 1024 * 1024).contains(&t), "total_mib() = {t}: not MiB?");
+        let gib = total_gb();
+        assert!(gib > 0.5 && gib < 16384.0, "the GiB view is {gib}");
     }
 
     #[test]
