@@ -59,10 +59,13 @@ struct Script {
     /// "die_once": the first answer of the first engine sends one token and the engine exits (a crash, an
     /// out-of-memory kill); a file beside the script makes the engine started after it answer normally
     die_once: Option<std::path::PathBuf>,
+    /// "stall": each GEN is answered by emitting nothing at all, so the server's engine_stall_s watchdog ends it
+    /// (findings item 2)
+    stall: bool,
 }
 
 fn script() -> Script {
-    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO, die_once: None };
+    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO, die_once: None, stall: false };
     if let Ok(path) = std::env::var("MOCK_SCRIPT") {
         if let Ok(v) = std::fs::read_to_string(path).map(|t| serde_json::from_str::<serde_json::Value>(&t)) {
             let v = v.unwrap_or_default();
@@ -80,6 +83,9 @@ fn script() -> Script {
             }
             if v.get("die_once") == Some(&serde_json::Value::Bool(true)) {
                 s.die_once = Some(std::path::PathBuf::from(format!("{}.died", std::env::var("MOCK_SCRIPT").unwrap_or_default())));
+            }
+            if v.get("stall") == Some(&serde_json::Value::Bool(true)) {
+                s.stall = true;
             }
         }
     }
@@ -149,6 +155,11 @@ fn main() {
             }
             Some("GEN") | Some("GENI") => {
                 stop.store(false, Ordering::SeqCst);
+                // findings item 2 (watchdog test): answer the request by emitting nothing at all, so the server's
+                // engine_stall_s watchdog ends it with a clear error that names the model and the stall.
+                if script.stall {
+                    loop { std::thread::sleep(Duration::from_secs(3600)); }
+                }
                 let max_new: usize = f.get(1).and_then(|n| n.parse().ok()).unwrap_or(1);
                 let n_prompt = f.last().map(|ids| ids.split(',').count()).unwrap_or(0);
                 say(&format!("PP {n_prompt} {n_prompt} 1.0 1000.0"));

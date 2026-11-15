@@ -199,7 +199,10 @@ pub fn scan(dir: &Path) -> Vec<ModelEntry> {
             continue;
         }
         match RunConfig::load(&p) {
-            Ok(cfg) if cfg.exe.exists() || cfg.exe.is_relative() => out.push(ModelEntry { id: cfg.model_name.clone(), path: p, cfg }),
+            // a config `pull` marked unavailable (no engine on this machine) is listed even though its exe is missing, so
+            // the server shows it as unavailable with a reason instead of failing at load "no installed model" (item 3)
+            Ok(cfg) if cfg.exe.exists() || cfg.exe.is_relative() || cfg.engine_available == Some(false) =>
+                out.push(ModelEntry { id: cfg.model_name.clone(), path: p, cfg }),
             Ok(_) | Err(_) => tracing::debug!(path = %p.display(), "not a usable run config"),
         }
     }
@@ -694,7 +697,12 @@ impl Manager {
                     "default": m.id == self.default_id,
                     "status": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "available" },
                     "tuned": crate::optimizer::view(&m.path),
-                    "problem": Value::Null,
+                    // a config `pull` marked unavailable shows its reason here (findings item 3); an empty model list is
+                    // not one the server missed, so it stays null and this stays distinguishable from a real problem
+                    "engine_available": m.cfg.engine_available.unwrap_or(true),
+                    "problem": if m.cfg.engine_available == Some(false) {
+                        json!(m.cfg.engine_unavailable_reason.clone().unwrap_or_else(|| "no engine runs this model on this machine".into()))
+                    } else { Value::Null },
                 })
             })
             .collect();

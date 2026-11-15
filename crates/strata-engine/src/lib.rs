@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use strata_protocol::{Done, Event, Gen, Images, Sampling};
 pub use vision::{Vision, VisionConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29,6 +29,10 @@ pub enum Error {
     StartTimeout(Duration),
     #[error("the engine refused the request: {0}")]
     Refused(String),
+    /// A request produced no token and no progress for `engine_stall_s` (findings item 2, a watchdog over any engine):
+    /// ended here so a stuck model never keeps a chat on life support. `{0}` names the stalled model/engine.
+    #[error("the engine stalled: {0} made no token and no progress for {1:?}; the server ended it")]
+    Stalled(String, Duration),
     #[error("engine I/O: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -65,6 +69,13 @@ pub struct RunConfig {
     /// the model family for the model card's sampling ("qwen4exp", "qwen35moe"); read from the GGUF when absent
     #[serde(default)]
     pub arch: Option<String>,
+    /// set by `pull` when no engine runs this architecture on this machine: the server lists the model unavailable with
+    /// `engine_unavailable_reason`, instead of loading it and failing "no installed model" (findings item 3)
+    #[serde(default)]
+    pub engine_available: Option<bool>,
+    /// why an `engine_available: false` config cannot run here today
+    #[serde(default)]
+    pub engine_unavailable_reason: Option<String>,
     #[serde(flatten)]
     pub rest: BTreeMap<String, serde_json::Value>,
 }
@@ -264,6 +275,10 @@ struct Inner {
 pub struct Engine {
     inner: Arc<Inner>,
     child: Mutex<Child>,
+    /// how long a request may make no token and no progress before the watchdog ends it (findings item 2)
+    pub stall_timeout: Duration,
+    /// the model/engine that stalled, to name in the watchdog error
+    pub engine_label: String,
     pub info: Vec<String>,
 }
 
@@ -314,10 +329,16 @@ impl Engine {
             }
         };
         tokio::time::timeout(ready_timeout, ready).await.map_err(|_| Error::StartTimeout(ready_timeout))??;
-        tracing::info!(?info, "engine ready");
+        // a request that makes no token and no progress for this long is stuck (findings item 2): end it. The config's
+        // "engine_stall_s" overrides the default 300 s.
+        let stall_timeout = cfg.rest.get("engine_stall_s").and_then(|v| v.as_u64()).map(Duration::from_secs).unwrap_or_else(|| Duration::from_secs(300));
+        let engine_label = cfg.family().or(Some(cfg.model_name.clone())).unwrap_or_else(|| cfg.exe.display().to_string());
+        tracing::info!(?info, stall_s = stall_timeout.as_secs_f64(), "engine ready");
         Ok(Self {
             inner: Arc::new(Inner { broken: Default::default(), stdin: Mutex::new(stdin), events: Mutex::new(rx), turn: Mutex::new(()) }),
             child: Mutex::new(child),
+            stall_timeout,
+            engine_label,
             info,
         })
     }
@@ -328,6 +349,9 @@ impl Engine {
                           images: Option<Images>) -> mpsc::Receiver<Result<GenEvent>> {
         let (out, rx) = mpsc::channel(256);
         let inner = self.inner.clone();
+        // owned copies taken before the spawn, so the watchdog and its label outlive this method's `self` borrow
+        let stall = self.stall_timeout;
+        let label = self.engine_label.clone();
         tokio::spawn(async move {
             let _turn = inner.turn.lock().await;
             let line = Gen { max_new, sampling: &sampling, turn_at, ids: &ids, images: images.as_ref() }.line();
@@ -341,39 +365,57 @@ impl Engine {
             }
             let mut events = inner.events.lock().await;
             let mut stopped = false;
+            // findings item 2, a watchdog over any engine: a request that makes no token and no progress for `stall` is
+            // stuck. The reset point (`last_activity`) advances only on the next token or progress line — other lines do
+            // not count as progress — so a chat that only keep-alives ends here instead of running forever.
+            let mut last_activity = Instant::now();
             loop {
-                let ev = match events.recv().await {
-                    Some(Some(ev)) => ev,
-                    Some(None) | None => {
+                let wait = stall.saturating_sub(last_activity.elapsed());
+                match tokio::time::timeout(wait.max(Duration::from_millis(200)), events.recv()).await {
+                    Err(_) => {
+                        inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = out.send(Err(Error::Stalled(label.clone(), stall))).await;
+                        // the engine is stuck: quit it now so it does not keep running on life support, then end.
+                        let mut stdin = inner.stdin.lock().await;
+                        let _ = stdin.write_all(strata_protocol::QUIT.as_bytes()).await;
+                        let _ = stdin.flush().await;
+                        return;
+                    }
+                    Ok(Some(Some(ev))) => {
+                        if matches!(ev, Event::Token(_) | Event::Progress { .. }) {
+                            last_activity = Instant::now();
+                        }
+                        let forward = match ev {
+                            Event::Token(t) => Some(GenEvent::Token(t)),
+                            Event::Progress { done, total, .. } => Some(GenEvent::Progress { done, total }),
+                            Event::Done(d) => {
+                                if !stopped {
+                                    let _ = out.send(Ok(GenEvent::Done(d))).await;
+                                }
+                                return;
+                            }
+                            Event::Err(msg) => {
+                                if !stopped {
+                                    let _ = out.send(Err(Error::Refused(msg))).await;
+                                }
+                                return;
+                            }
+                            _ => None,
+                        };
+                        if let Some(fwd) = forward {
+                            if !stopped && out.send(Ok(fwd)).await.is_err() {
+                                // the client went away: stop the engine and keep reading until DONE
+                                stopped = true;
+                                let mut stdin = inner.stdin.lock().await;
+                                let _ = stdin.write_all(strata_protocol::STOP.as_bytes()).await;
+                                let _ = stdin.flush().await;
+                            }
+                        }
+                    }
+                    Ok(Some(None)) | Ok(None) => {
                         inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = out.send(Err(Error::Died)).await;
                         return;
-                    }
-                };
-                let forward = match ev {
-                    Event::Token(t) => Some(GenEvent::Token(t)),
-                    Event::Progress { done, total, .. } => Some(GenEvent::Progress { done, total }),
-                    Event::Done(d) => {
-                        if !stopped {
-                            let _ = out.send(Ok(GenEvent::Done(d))).await;
-                        }
-                        return;
-                    }
-                    Event::Err(msg) => {
-                        if !stopped {
-                            let _ = out.send(Err(Error::Refused(msg))).await;
-                        }
-                        return;
-                    }
-                    _ => None,
-                };
-                if let Some(ev) = forward {
-                    if !stopped && out.send(Ok(ev)).await.is_err() {
-                        // the client went away: stop the engine and keep reading until DONE
-                        stopped = true;
-                        let mut stdin = inner.stdin.lock().await;
-                        let _ = stdin.write_all(strata_protocol::STOP.as_bytes()).await;
-                        let _ = stdin.flush().await;
                     }
                 }
             }

@@ -23,6 +23,22 @@ fn bundled_engine() -> Option<PathBuf> {
     exe.exists().then_some(exe)
 }
 
+/// The friendly name of this machine's operating system, for the "no engine on this ..." message (findings item 3).
+pub fn friendly_os() -> &'static str {
+    match std::env::consts::OS { "macos" => "Mac", _ => std::env::consts::OS }
+}
+
+/// When no engine here can run `arch`, the plain reason. None means an engine runs it: the Rust engine covers
+/// HYBRID_ARCHS (and, on a release without strata-poly, RUST_FALLBACK_ARCHS); otherwise strata-poly does when it is
+/// installed. This is what makes a pulled architecture show as unavailable with a reason instead of failing at load.
+pub fn no_engine(arch: &str, models_dir: &Path) -> Option<String> {
+    let rust_runs = HYBRID_ARCHS.iter().any(|(a, _)| *a == arch)
+        || (bundled_engine().is_some() && RUST_FALLBACK_ARCHS.iter().any(|(a, _)| *a == arch));
+    if rust_runs { return None; }
+    let poly_installed = models_dir.join("engine-poly").join(format!("strata-poly{}", std::env::consts::EXE_SUFFIX)).exists();
+    (!poly_installed).then(|| format!("{arch} has no engine on this {} yet", friendly_os()))
+}
+
 pub struct Plan {
     pub id: String,
     pub display: String,
@@ -103,6 +119,22 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
     supported(&arch)?;
     let pack = packs.join(id);
     extract_tokenizer(g, &pack).map_err(|e| e.to_string())?;
+    // findings item 3: no engine here runs this architecture. Still write the config `pull` was asked to (the files are
+    // already downloaded), marked unavailable with the reason, so the server lists the model as unavailable rather than
+    // loading it and failing "no installed model". The exe points where strata-poly would be; nothing about it runs here.
+    if let Some(reason) = no_engine(&arch, models_dir) {
+        let cfg = json!({
+            "exe": models_dir.join("engine-poly").join("strata-poly"),
+            "args": vec![json!("--model"), json!(model), json!("--max-context"), json!(context.unwrap_or(32768).to_string())],
+            "cwd": models_dir, "tokenizer": pack.join("tokenizer"),
+            "model_name": id, "display_name": display,
+            "log": models_dir.join(format!("strata-{id}.log")), "pulled_by": "am2strata",
+            "engine_available": false, "engine_unavailable_reason": reason,
+        });
+        let path = models_dir.join(format!("strata-{id}.json"));
+        std::fs::write(&path, pretty1(&cfg)).map_err(|e| format!("{}: {e}", path.display()))?;
+        return Ok(Written { config: path, tokenizer: pack.join("tokenizer") });
+    }
     let poly = models_dir.join("engine-poly");
     if POLY_ARCHS.iter().any(|(a, _)| *a == arch) {
         if let Some(m) = mixed_gate_up(model) {
@@ -233,6 +265,48 @@ mod tests {
         std::fs::write(path, b).unwrap();
     }
 
+    /// A tiny GGUF whose architecture is `lfm2moe` (no engine here runs it, so `pull` marks the config unavailable) and
+    /// which carries a SentencePiece (llama) tokenizer: the string "general.architecture", the token model and a tokens
+    /// array. Value types are the GGUF codes strata-gguf reads (string 8, array of string 9).
+    fn tiny_lfm2moe_gguf(path: &Path) {
+        let mut b = Vec::new();
+        b.extend(b"GGUF");
+        b.extend(3u32.to_le_bytes());
+        b.extend(1u64.to_le_bytes());       // num tensors
+        b.extend(4u64.to_le_bytes());       // num metadata entries
+        let s = |b: &mut Vec<u8>, t: &str| { b.extend((t.len() as u64).to_le_bytes()); b.extend(t.as_bytes()) };
+        s(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        s(&mut b, "lfm2moe");
+        s(&mut b, "tokenizer.ggml.model");
+        b.extend(8u32.to_le_bytes());
+        s(&mut b, "llama");
+        // tokenizer tokens (array of string, element type 8) and their scores (array of F32, element type 6): the latter is
+        // required for a SentencePiece/spm tokenizer (strata-gguf::extract_tokenizer), one score per token. GGUF arrays put
+        // the element type (u32) before the count (u64).
+        s(&mut b, "tokenizer.ggml.tokens");
+        b.extend(9u32.to_le_bytes());
+        let toks = ["<s>", "</s>", "unk"];
+        b.extend(8u32.to_le_bytes());
+        b.extend((toks.len() as u64).to_le_bytes());
+        for t in &toks { s(&mut b, t); }
+        s(&mut b, "tokenizer.ggml.scores");
+        b.extend(9u32.to_le_bytes());
+        b.extend(6u32.to_le_bytes());
+        b.extend((toks.len() as u64).to_le_bytes());
+        for _ in &toks { b.extend([0u8, 0, 0, 0]); }
+        let mut off = 0u64;
+        s(&mut b, "token_embd.weight");
+        b.extend(1u32.to_le_bytes());
+        b.extend(4u64.to_le_bytes());
+        b.extend(4u64.to_le_bytes());
+        b.extend(off.to_le_bytes());
+        off += 32;
+        while b.len() % 32 != 0 { b.push(0); }
+        b.extend(vec![0u8; off as usize]);
+        std::fs::write(path, b).unwrap();
+    }
+
     #[test]
     fn experts_with_mixed_gate_and_up_types_are_found() {
         let d = std::env::temp_dir().join(format!("am2-mixed-{}", std::process::id()));
@@ -244,6 +318,37 @@ mod tests {
         tiny_gguf(&mixed, &[("blk.0.ffn_gate_exps.weight", 0), ("blk.0.ffn_up_exps.weight", 0),
                             ("blk.1.ffn_gate_exps.weight", 0), ("blk.1.ffn_up_exps.weight", 1)]);
         assert_eq!(mixed_gate_up(&mixed).as_deref(), Some("blk.1: F32 and F16"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An empty models folder has neither the Rust engine beside this program nor strata-poly installed here, so the
+    /// Rust engine's architectures are available but a poly-only one is not (findings item 3).
+    #[test]
+    fn no_engine_reports_the_reason_when_none_is_here() {
+        let dir = std::env::temp_dir().join(format!("am2-no-engine-{}", std::process::id()));
+        assert!(no_engine("llama", &dir).is_none(), "the Rust engine runs llama directly");
+        let why = no_engine("lfm2moe", &dir).expect("lfm2moe needs strata-poly, not installed in an empty folder");
+        assert!(why.contains("lfm2moe"), "reason names the architecture: {why}");
+        assert!(why.contains("has no engine"), "reason is plain: {why}");
+    }
+
+    #[test]
+    fn write_marks_a_config_unavailable_when_no_engine_is_here() {
+        let d = std::env::temp_dir().join(format!("am2-write-unavail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("packs")).unwrap();
+        let models_dir = d.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let tiny = d.join("lfm.gguf");
+        // general.architecture lfm2moe (no engine here runs it), plus a SentencePiece tokenizer so `write` can extract a pack:
+        // llama needs no merges. Without the tokens array extract_tokenizer fails before the unavailable branch is reached.
+        tiny_lfm2moe_gguf(&tiny);
+        let g = inspect(&tiny).unwrap();
+        let written = write(&models_dir, &d.join("packs"), &tiny, &g, None, Some(8192), "mock-lfm2moe", "Mock LFM2").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(written.config.clone()).unwrap()).unwrap();
+        assert_eq!(cfg["engine_available"], json!(false), "the config is marked unavailable");
+        assert!(cfg["engine_unavailable_reason"].as_str().unwrap().contains("lfm2moe"), "reason shown: {:?}", cfg["engine_unavailable_reason"]);
+        assert!(written.config.exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -123,6 +123,13 @@ fn works<R: Runtime>(dev: R::Device) -> Option<ComputeClient<R>> {
     r.ok().flatten()
 }
 
+/// What the wgpu runtime's name is on this platform (findings item 2): Metal on macOS/iOS, where wgpu uses it, else
+/// Vulkan. Device names are "{backend}:{subtype}", so `--list-devices` suggests exactly what "--devices" should take.
+#[cfg(feature = "wgpu")]
+fn wgpu_backend() -> &'static str {
+    match std::env::consts::OS { "macos" | "ios" => "metal", _ => "vulkan" }
+}
+
 /// Every device a runtime here can use.
 pub fn list() -> Vec<DeviceInfo> {
     let mut out = Vec::new();
@@ -143,10 +150,12 @@ pub fn list() -> Vec<DeviceInfo> {
     #[cfg(feature = "wgpu")]
     {
         use cubecl::wgpu::WgpuDevice;
-        for (n, d, what) in [("vulkan:discrete", WgpuDevice::DiscreteGpu(0), "a discrete GPU (Vulkan)"),
-                             ("vulkan:integrated", WgpuDevice::IntegratedGpu(0), "an integrated GPU (Vulkan)")] {
+        let backend = wgpu_backend();
+        let kind = |s: &str| format!("{backend}:{s}");
+        for (n, d, what) in [(kind("discrete"), WgpuDevice::DiscreteGpu(0), "a discrete GPU"),
+                             (kind("integrated"), WgpuDevice::IntegratedGpu(0), "an integrated GPU")] {
             if works::<cubecl::wgpu::WgpuRuntime>(d).is_some() {
-                out.push(DeviceInfo { name: n.into(), backend: "vulkan", detail: what.into() });
+                out.push(DeviceInfo { name: n, backend, detail: what.into() });
             }
         }
     }
@@ -165,7 +174,8 @@ impl Gpu {
             #[cfg(feature = "hip")]
             "hip" | "rocm" => works::<cubecl::hip::HipRuntime>(cubecl::hip::AmdDevice { index: i }).map(Client::Hip),
             #[cfg(feature = "wgpu")]
-            "vulkan" | "wgpu" => {
+            // "metal" is what macOS names it (see wgpu_backend); "vulkan"/"wgpu" stay accepted for older configs.
+            "metal" | "vulkan" | "wgpu" => {
                 use cubecl::wgpu::WgpuDevice;
                 let d = match idx {
                     "integrated" | "igpu" => WgpuDevice::IntegratedGpu(0),
@@ -175,7 +185,7 @@ impl Gpu {
                 works::<cubecl::wgpu::WgpuRuntime>(d).map(Client::Wgpu)
             }
             "cpu" => works::<cubecl::cpu::CpuRuntime>(cubecl::cpu::CpuDevice).map(Client::Cpu),
-            _ => return Err(format!("unknown device {name:?}: cuda:N, hip:N, vulkan:discrete, vulkan:integrated or cpu")),
+            _ => return Err(format!("unknown device {name:?}: cuda:N, hip:N, metal:discrete, metal:integrated (vulkan still accepted) or cpu")),
         };
         client.map(|client| Gpu { client, name: name.to_string() }).ok_or_else(|| format!("{name} is not usable here"))
     }

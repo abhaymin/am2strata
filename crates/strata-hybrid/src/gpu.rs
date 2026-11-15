@@ -70,8 +70,15 @@ fn put(gpus: &[strata_gpu::Gpu], d: usize, q: &mut QMat, left: &mut u64) -> Resu
     Ok(true)
 }
 
-/// Place the model's matrices on the devices; -> a summary for the engine's INFO line.
-pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>) -> Result<String, String> {
+/// Given what placement did, whether no matrix (dense/attention or expert) landed on any of the requested devices.
+pub fn nothing_placed(dense_on_device: usize, experts_on_device: usize) -> bool {
+    dense_on_device == 0 && experts_on_device == 0
+}
+
+/// Place the model's matrices on the devices; -> (a summary for the engine's INFO line, how many dense/attention
+/// matrices were placed on a device, how many experts). Findings item 2: the caller uses the counts to know whether
+/// `--devices` actually put anything where it was asked.
+pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>) -> Result<(String, usize, usize), String> {
     let gpus: Vec<strata_gpu::Gpu> = devices.iter().map(|(n, _)| strata_gpu::Gpu::open(n)).collect::<Result<_, _>>()?;
     let ne = m.profile_experts;
     let n_layers = m.layers.len();
@@ -130,5 +137,18 @@ pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>
     let _ = DEVICES.set(gpus);
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let per: Vec<String> = devices.iter().zip(&placed).map(|((n, _), (k, b))| format!("{n}:{k}:{:.2}GiB", gib(*b))).collect();
-    Ok(format!("devices={} experts_on_devices={n_experts_on} cpu_matrices={cpu_n} cpu_gib={:.2}", per.join(","), gib(cpu_bytes)))
+    let dense_on_device = placed.iter().map(|(k, _)| *k).sum();
+    Ok((format!("devices={} experts_on_devices={n_experts_on} cpu_matrices={cpu_n} cpu_gib={:.2}", per.join(","), gib(cpu_bytes)),
+        dense_on_device, n_experts_on))
+}
+
+/// findings item 2: the decision the startup path makes after placement. `--devices` asked the GPU to take weights but
+/// nothing landed on any requested device (dense and experts), so it falls back to the CPU. Pure, so a test covers it
+/// without hardware; the default strata-hybrid features build this module and run it.
+#[cfg(feature = "gpu")]
+#[test]
+fn nothing_placed_on_any_device_is_a_cpu_run() {
+    assert!(nothing_placed(0, 0), "--devices requested a GPU but placed no dense matrix and no expert on it");
+    assert!(!nothing_placed(1, 0), "dense or attention weights on a device are a real GPU placement");
+    assert!(!nothing_placed(0, 2), "experts on a device count as placed too");
 }
