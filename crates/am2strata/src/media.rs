@@ -234,13 +234,7 @@ pub fn pdftools_available() -> bool {
 /// A PDF -> (its text, page by page, and up to `max_images` page images as JPEG; none when `images` is false).
 pub async fn pdf_pages(pdf: &[u8], images: bool, max_images: usize) -> Result<(Vec<String>, Vec<Vec<u8>>)> {
     if !pdftools_available() {
-        bail!("this server cannot read PDF files: install {}", if cfg!(windows) {
-            "Poppler for Windows: the release download carries it in poppler\\bin; otherwise winget install oschwartz10612.Poppler and put its bin folder on PATH"
-        } else if cfg!(target_os = "macos") {
-            "poppler (brew install poppler)"
-        } else {
-            "poppler-utils (sudo apt install poppler-utils)"
-        });
+        bail!("this server cannot read PDF files: {}", crate::doctor::install_hint(std::env::consts::OS, "poppler-utils", "poppler", "oschwartz10612.Poppler"));
     }
     if !pdf.starts_with(b"%PDF") {
         bail!("the document is not a PDF file");

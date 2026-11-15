@@ -37,6 +37,7 @@ mod manager;
 mod hub_api;
 mod mcp_api;
 mod mem;
+mod doctor;
 mod mcp;
 mod memory;
 mod media;
@@ -421,8 +422,10 @@ async fn main() -> Result<()> {
     for g in &mgr.hw.gpus {
         tracing::info!("GPU {}: {} ({} MiB, sm_{})", g.index, g.name, g.vram_mib, g.arch);
     }
-    tracing::info!("RAM {} MiB, {} CPUs; video frames {}", mgr.hw.ram_mib, mgr.hw.cpus,
-                   if media::ffmpeg_available() { "with ffmpeg" } else { "need ffmpeg (sudo apt install ffmpeg)" });
+    let video = if media::ffmpeg_available() { "with ffmpeg".to_string() } else {
+        format!("need ffmpeg ({})", crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg"))
+    };
+    tracing::info!("RAM {} MiB, {} CPUs; video frames {}", mgr.hw.ram_mib, mgr.hw.cpus, video);
     if !args.lazy {
         mgr.load(&default).await.with_context(|| format!("loading {default}"))?;
     }

@@ -55,6 +55,8 @@ ego-tree = "0.6.3"
 # browser computer use: Chrome's DevTools protocol, pure Rust
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 libc = "0.2"
+# cross-platform network interfaces: the LAN addresses a self-signed certificate lists (server_tls.rs, item 4)
+if-addrs = "0.13"
 # an edit's default size: the dimensions of the uploaded image
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
@@ -69,3 +71,8 @@ regex = "1"
 # the Computer tab: frames from the sandbox's own X display and the operator's input into it (pure-Rust X client)
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["xtest"] }
+
+# Windows RAM: GlobalMemoryStatusEx in item 1. windows-sys 0.61 is already pulled by other crates, so this takes no
+# new entry out of the lock file (as Cargo.lock shows after a build).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }

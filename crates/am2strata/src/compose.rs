@@ -239,7 +239,8 @@ pub async fn thumbnails(State(s): State<AppState>, headers: HeaderMap, Json(req)
 /// with crossfades, burn in the captions and cards, and mux the audio to one MP4. Returns the file bytes and its meta.
 pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>, Value), String> {
     if !crate::media::ffmpeg_available() {
-        return Err("this server cannot make a video: install ffmpeg (sudo apt install ffmpeg)".into());
+        return Err(format!("this server cannot make a video: install ffmpeg ({})",
+            crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")).into());
     }
     let (w, h) = parse_size(req["size"].as_str().unwrap_or("1920x1080")).ok_or_else(|| {
         format!("error: size {} does not work; use 1920x1080 or 1080x1920", req["size"].as_str().unwrap_or(""))
@@ -396,7 +397,8 @@ fn drawtext_escape(s: &str) -> String {
 /// ffmpeg's drawtext (the heavy type with a dark stroke, like thumbs.py). Returns the JPEG bytes.
 pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8>, Value), String> {
     if !crate::media::ffmpeg_available() {
-        return Err("this server cannot make a thumbnail: install ffmpeg (sudo apt install ffmpeg)".into());
+        return Err(format!("this server cannot make a thumbnail: install ffmpeg ({})",
+            crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")).into());
     }
     let (w, h) = (THUMB_W, THUMB_H);
     let image = source_bytes(s, "image", &req["image"]).await?;

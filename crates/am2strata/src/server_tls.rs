@@ -145,16 +145,9 @@ pub fn local_names() -> Vec<String> {
             v.push(h);
         }
     }
-    // the LAN addresses: the source address of a route out (no packet is sent by connect on UDP)
-    for target in ["192.0.2.1:9", "[2001:db8::1]:9"] {
-        if let Ok(s) = std::net::UdpSocket::bind(if target.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" }) {
-            if s.connect(target).is_ok() {
-                if let Ok(a) = s.local_addr() {
-                    v.push(a.ip().to_string());
-                }
-            }
-        }
-    }
+    // the LAN addresses: every non-loopback one (an interface list, so a second card or a Wi-Fi/Tailscale default route
+    // is included — a single "route out" address would miss them and a browser on the LAN would warn by name)
+    for ip in lan_ip_addresses() { v.push(ip); }
     if let Some(ts) = tailscale_self() {
         v.extend(ts.ips);
         if let Some(n) = ts.dns_name {
@@ -166,6 +159,45 @@ pub fn local_names() -> Vec<String> {
     v
 }
 
+/// Every network interface's addresses: all of them, not only the source address a route out would pick (that misses a
+/// second card or a Wi-Fi/Tailscale default route). Cross-platform via if-addrs; empty if none can be read.
+pub fn interface_addresses() -> Vec<if_addrs::Interface> {
+    if_addrs::get_if_addrs().unwrap_or_default()
+}
+
+/// The non-loopback IPv4/IPv6 addresses this PC answers on (its LAN, plus Tailscale's): kept by local_names for the certificate so a browser anywhere it answers trusts it.
+pub fn lan_ip_addresses() -> Vec<String> {
+    interface_addresses().into_iter().filter(|a| !a.is_loopback()).map(|a| a.ip().to_string()).collect()
+}
+
+/// Where Tailscale's CLI lives on macOS (Apple-silicon Homebrew, Intel Homebrew, and the app itself), used when a launchd agent's PATH holds none of them; on other OSes these paths simply do not exist and are skipped.
+const TAILSCALE_HOMES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Tailscale.app/Contents/MacOS"];
+
+/// Find `tailscale` in `dirs`, then the macOS homes, checking each in order (a directory name may carry an extension on
+/// Windows). Pure: a test passes any list and gets back the first path that exists, or None.
+pub fn tailscale_in(dirs: &[PathBuf], homes: &[PathBuf]) -> Option<PathBuf> {
+    let name = if cfg!(windows) { "tailscale.exe" } else { "tailscale" };
+    for d in dirs.iter().chain(homes.iter()) {
+        let p = d.join(name);
+        if p.is_file() { return Some(p); }
+    }
+    None
+}
+
+/// The tailscale binary on this session's PATH, then the macOS homes: found even when launched by a launchd agent whose
+/// PATH has no /opt/homebrew/bin (install.sh's service sets one; this finds it regardless). None when not installed.
+pub fn tailscale_path() -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    let homes: Vec<PathBuf> = TAILSCALE_HOMES.iter().map(PathBuf::from).collect();
+    tailscale_in(&dirs, &homes)
+}
+
+/// `tailscale` resolved to the path we found it at (else its name, which still goes through PATH): a launchd agent's
+/// empty PATH otherwise could not run it.
+fn tailscale_cmd() -> std::process::Command {
+    std::process::Command::new(tailscale_path().unwrap_or_else(|| PathBuf::from("tailscale")))
+}
+
 /// This PC as Tailscale sees it, when tailscale runs and is logged in.
 #[derive(Debug, Clone, Default)]
 pub struct TailscaleSelf {
@@ -174,7 +206,7 @@ pub struct TailscaleSelf {
 }
 
 pub fn tailscale_self() -> Option<TailscaleSelf> {
-    let o = std::process::Command::new("tailscale").args(["status", "--json"]).output().ok()?;
+    let o = tailscale_cmd().args(["status", "--json"]).output().ok()?;
     if !o.status.success() {
         return None;
     }
@@ -234,7 +266,7 @@ pub fn tailscale_cert(dir: &Path) -> Result<(PathBuf, PathBuf, String), String> 
     let name = me.dns_name.ok_or("tailscale has no MagicDNS name for this PC: turn on MagicDNS in the tailnet admin")?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
-    let o = std::process::Command::new("tailscale")
+    let o = tailscale_cmd()
         .arg("cert").arg("--cert-file").arg(&cert).arg("--key-file").arg(&key).arg(&name).output()
         .map_err(|e| format!("tailscale cert: {e}"))?;
     if !o.status.success() {
@@ -395,11 +427,15 @@ pub struct Policy {
     pub https_port: u16,
     pub http: HttpMode,
     pub hsts: HeaderValue,
+    /// The certificate's own name when it has one (a Tailscale cert's tailnet name): the plain-HTTP redirect prefers a
+    /// host this certificate actually covers, so the redirected URL does not fail TLS verification. None keeps the
+    /// request's host (self-signed lists every address this PC answers to).
+    pub cert_dns_name: Option<String>,
 }
 
 impl Policy {
     pub fn new(cfg: &Config) -> Policy {
-        Policy { https_port: cfg.https_port, http: cfg.http, hsts: HeaderValue::from_str(&cfg.hsts_value()).unwrap() }
+        Policy { https_port: cfg.https_port, http: cfg.http, hsts: HeaderValue::from_str(&cfg.hsts_value()).unwrap(), cert_dns_name: None }
     }
 }
 
@@ -510,7 +546,9 @@ impl Runtime {
             inner.watching = true;
             watch(inner.resolver.clone().unwrap(), inner.source.clone().unwrap(), self.data_dir.clone());
         }
-        *self.policy.write().unwrap() = Some(Policy::new(&cfg));
+        let mut pol = Policy::new(&cfg);
+        pol.cert_dns_name = src.tailnet_name.clone();   // a Tailscale (or uploaded) certificate's name: the redirect names a host it covers
+        *self.policy.write().unwrap() = Some(pol);
         let name = src.tailnet_name.clone().unwrap_or_else(|| "localhost".into());
         tracing::info!("https: on at https://{name}:{}/ (certificate SHA-256 {fp}; {:?}); plain HTTP on {}: {:?}",
                        cfg.https_port, cfg.mode, self.api_port, cfg.http);
@@ -648,10 +686,14 @@ pub fn plain_http_answer(p: &Policy, peer: Option<std::net::IpAddr>, host: &str,
     if !redirect {
         return None;
     }
-    let name = strip_port(host);
-    let name = if name.is_empty() { "localhost" } else { name };
+    let mut name = strip_port(host);
+    name = if name.is_empty() { "localhost" } else { name };
+    // When the certificate has one name it answers (a Tailscale cert, or an uploaded one), redirect to a host that name
+    // covers — otherwise https://<the request's IP> does not verify. Keep the request's own host when it is that name;
+    // self-signed lists every address here (cert_dns_name None), so its host keeps working as before.
+    let target = p.cert_dns_name.as_deref().filter(|dns| !name.eq_ignore_ascii_case(*dns)).unwrap_or(name);
     let port = if p.https_port == 443 { String::new() } else { format!(":{}", p.https_port) };
-    let to = format!("https://{name}{port}{path_and_query}");
+    let to = format!("https://{target}{port}{path_and_query}");
     let mut r = (StatusCode::PERMANENT_REDIRECT, format!("this server answers over HTTPS: {to}\n")).into_response();
     if let Ok(v) = HeaderValue::from_str(&to) {
         r.headers_mut().insert(axum::http::header::LOCATION, v);
@@ -724,7 +766,7 @@ mod tests {
 
     #[test]
     fn plain_http_policy() {
-        let p = |http| Policy { https_port: 8001, http, hsts: HeaderValue::from_static("max-age=1") };
+        let p = |http| Policy { https_port: 8001, http, hsts: HeaderValue::from_static("max-age=1"), cert_dns_name: None };
         let lo: Option<std::net::IpAddr> = Some("127.0.0.1".parse().unwrap());
         let lan: Option<std::net::IpAddr> = Some("192.168.8.105".parse().unwrap());
         // local-only: this PC's tools keep plain HTTP; the LAN is sent to HTTPS on the same name
@@ -764,5 +806,63 @@ mod tests {
         let (c3, k3) = ensure_self_signed(&d, &more).unwrap();
         assert_ne!(fingerprint(&first), fingerprint(&load_pem(&c3, &k3).unwrap()), "new names, new certificate");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // The tailscale binary is found on PATH first, then the macOS homes (Homebrew before the app): so a launchd agent's
+    // empty PATH still runs it, and a test can check the order without touching the real filesystem (item 3).
+    #[test]
+    fn tailscale_prefers_path_before_the_macos_homes() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+        let base = root.join(format!("am2-tailscale-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        let path_dir = base.join("pathbin");   // as if it were on this session's PATH
+        let brew_dir = base.join("homebrewbin"); // as if it were /opt/homebrew/bin
+        let app_dir = base.join("appmacos");     // as if it were /Applications/Tailscale.app/Contents/MacOS
+        for d in [&path_dir, &brew_dir, &app_dir] { std::fs::create_dir_all(d).unwrap(); }
+        std::fs::write(brew_dir.join("tailscale"), b"").unwrap();
+        std::fs::write(app_dir.join("tailscale"), b"").unwrap();
+
+        let homes = [brew_dir.clone(), app_dir.clone()]; // documented order: Homebrew before the app
+        assert_eq!(tailscale_in(&[] as &[std::path::PathBuf], &homes).unwrap().parent().unwrap(), brew_dir.as_path(), "Homebrew's folder is tried before the app");
+
+        std::fs::write(path_dir.join("tailscale"), b"").unwrap();
+        let dirs = vec![path_dir.clone()];
+        assert_eq!(tailscale_in(&dirs, &homes).unwrap().parent().unwrap(), path_dir.as_path(), "a PATH entry beats every macOS home");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // A cross-platform interface list reports a non-loopback address on this machine whenever one exists (item 4): so the
+    // self-signed certificate gets every LAN name, and nothing here panics when there is none (a container without one).
+    #[test]
+    fn lan_addresses_include_a_non_loopback_when_one_exists() {
+        if interface_addresses().iter().any(|a| !a.is_loopback()) {
+            let lan = lan_ip_addresses();
+            assert!(!lan.is_empty(), "a non-loopback interface exists, so the list should name it");
+            for ip in &lan {
+                assert!(ip.parse::<std::net::IpAddr>().is_ok_and(|i| !i.is_loopback()), "{ip} is loopback and should not be listed");
+            }
+        }
+    }
+
+    // With a certificate that answers one name (Tailscale), the plain-HTTP redirect names that host, not an IP the cert
+    // does not cover; without it (self-signed) the request's own host is kept. Redirecting to a name the cert lacks is
+    // exactly the macOS "tls" bug this fixes (item 5).
+    #[test]
+    fn plain_http_redirect_names_the_certificate_host_when_it_is_not_the_request_host() {
+        let lan: Option<std::net::IpAddr> = Some("192.168.8.105".parse().unwrap());
+        let ts = Policy { https_port: 8001, http: HttpMode::Redirect, hsts: HeaderValue::from_static("x"), cert_dns_name: Some("macm4.tailnet.ts.net".into()) };
+        let r = plain_http_answer(&ts, lan, "100.100.111.100:8000", "/v1/models?x=1").unwrap();
+        assert_eq!(r.headers()["location"], "https://macm4.tailnet.ts.net:8001/v1/models?x=1", "an IP request redirects to the cert's name");
+
+        let ss = Policy { https_port: 8001, http: HttpMode::Redirect, hsts: HeaderValue::from_static("x"), cert_dns_name: None };
+        let r = plain_http_answer(&ss, lan, "100.100.111.100:8000", "/v1/models").unwrap();
+        assert_eq!(r.headers()["location"], "https://100.100.111.100:8001/v1/models", "self-signed keeps the request's host");
+
+        // and when the request already is the certificate's name, it stays that name (no needless change)
+        let r = plain_http_answer(&ts, lan, "macm4.tailnet.ts.net:8000", "/").unwrap();
+        assert_eq!(r.headers()["location"], "https://macm4.tailnet.ts.net:8001/");
     }
 }

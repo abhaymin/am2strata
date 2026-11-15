@@ -38,11 +38,12 @@ impl CodeRun {
         CodeRun { enabled, needs_key: false, timeout: Duration::from_secs(secs), python }
     }
 
-    fn why_off(&self, rest_off: bool) -> &'static str {
-        if self.needs_key { "the server listens beyond this PC without an API key (set \"api_key\" in the run config)" }
-        else if rest_off { "switched off in the config (\"code_run\": false)" }
-        else if !Path::new(BWRAP).exists() { "needs bubblewrap for its sandbox: sudo apt install bubblewrap" }
-        else { "needs python3 on this PC" }
+    fn why_off(&self, rest_off: bool) -> String {
+        if self.needs_key { "the server listens beyond this PC without an API key (set \"api_key\" in the run config)".to_string() }
+        else if rest_off { "switched off in the config (\"code_run\": false)".to_string() }
+        else if !Path::new(BWRAP).exists() {
+            format!("needs bubblewrap for its sandbox: {}", crate::doctor::install_hint(std::env::consts::OS, "bubblewrap", "", ""))
+        } else { "needs python3 on this PC".to_string() }
     }
 }
 
