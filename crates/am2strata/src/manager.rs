@@ -299,7 +299,8 @@ impl Manager {
         Self {
             models: std::sync::RwLock::new(models),
             models_dir,
-            hw: Hardware::detect(),
+            // RAM from mem.rs on every OS (Hardware::detect reads only Linux's /proc/meminfo: 0 on macOS/Windows)
+            hw: { let mut h = Hardware::detect(); let m = crate::mem::total_mib(); if m > 0 { h.ram_mib = m; } h },
             default_id,
             current: RwLock::new(None),
             queue: crate::queue::Queue::new(queue_max_wait),

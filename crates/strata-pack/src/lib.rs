@@ -16,3 +16,4 @@ pub mod num;
 pub mod quantize;
 pub mod quants;
 pub mod stack_experts;
+pub mod sysmem;

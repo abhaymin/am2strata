@@ -527,6 +527,36 @@ fn numbers_from_requests_are_clamped_not_trusted() {
     }
 }
 
+/// PR #59 follow-up (2026-11-15, found on a Mac worker): RAM is read in one place, strata-pack's sysmem.rs (Linux, macOS,
+/// Windows), used by the server's mem.rs and the Rust engine. A second reader of /proc/meminfo (strata-engine's Hardware::detect, then monitor.rs) left macOS at "RAM 0
+/// MiB" after mem.rs was fixed. Only these files may read /proc/meminfo: mem.rs itself, the Linux-only sandbox VM, and
+/// strata-engine's detect (whose ram_mib the server overwrites from mem.rs).
+#[test]
+fn pr59_ram_is_read_only_through_mem_rs() {
+    let needle = format!("/proc/{}", "meminfo");
+    let allowed = ["strata-pack/src/sysmem.rs", "src/computer/vm/mod.rs", "strata-engine/src/hardware.rs"];
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut stack = vec![root.join("src"), root.join("../strata-engine/src"), root.join("../strata-hybrid/src"), root.join("../strata-pack/src")];
+    let mut found = Vec::new();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); continue; }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue; }
+            let shown = p.to_string_lossy().replace('\\', "/");
+            if allowed.iter().any(|a| shown.ends_with(a)) { continue; }
+            for (n, line) in std::fs::read_to_string(&p).unwrap_or_default().lines().enumerate() {
+                if line.split("//").next().unwrap_or("").contains(needle.as_str()) {
+                    found.push(format!("{}:{}", shown, n + 1));
+                }
+            }
+        }
+    }
+    assert!(found.is_empty(), "read RAM through crate::mem (total_mib/available_mib) instead:\n  {}", found.join("\n  "));
+    let manager = std::fs::read_to_string(root.join("src/manager.rs")).unwrap();
+    assert!(manager.contains("crate::mem::total_mib()"), "the server's Hardware.ram_mib must come from mem.rs");
+}
+
 /// PR #14 (commits 87d401e, c978932): tests never change this process's environment (`std::env::set_var` while
 /// other test threads read it is undefined behaviour, and was the flaky agents test); a server is given its
 /// environment through the harness (`extra.env`).
