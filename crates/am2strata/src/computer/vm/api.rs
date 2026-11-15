@@ -70,7 +70,32 @@ pub async fn action_post(State(s): State<AppState>, headers: HeaderMap, Json(req
             }
             started(vm.task("reset", |vm, _| vm.reset().map(|_| "the VM was deleted; the next start makes a new one".into())))
         }
-        other => bad(format!("unknown action {other:?}: start, stop, pause, shutdown, setup, download, reset")),
+        "snapshot" => {
+            let label = req["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("manual-{}", chrono_like_now()));
+            match tokio::task::spawn_blocking(move || vm.snapshot(&label)).await.unwrap_or_else(|e| Err(e.to_string())) {
+                Ok(n) => Json(json!({"ok": true, "snapshot": n})).into_response(),
+                Err(e) => bad(e),
+            }
+        }
+        "snapshots" => match tokio::task::spawn_blocking(move || vm.snapshots()).await.unwrap_or_else(|e| Err(e.to_string())) {
+            Ok(l) => Json(json!({"snapshots": l})).into_response(),
+            Err(e) => bad(e),
+        },
+        "delete_snapshot" => {
+            let Some(name) = req["name"].as_str().map(str::to_string) else { return bad("give the snapshot's name".into()) };
+            match tokio::task::spawn_blocking(move || vm.delete_snapshot(&name)).await.unwrap_or_else(|e| Err(e.to_string())) {
+                Ok(()) => Json(json!({"ok": true})).into_response(),
+                Err(e) => bad(e),
+            }
+        }
+        "rollback" => {
+            let Some(name) = req["name"].as_str().map(str::to_string) else { return bad("give the snapshot to roll back to".into()) };
+            if req["confirm"] != true {
+                return bad("rolling back loses every change made in the VM since that snapshot: send \"confirm\": true".into());
+            }
+            started(vm.task("roll back", move |vm, log| vm.rollback(&name, log).map(|_| format!("back at {name}"))))
+        }
+        other => bad(format!("unknown action {other:?}: start, stop, pause, shutdown, setup, download, reset, snapshot, snapshots, delete_snapshot, rollback")),
     }
 }
 
@@ -157,4 +182,10 @@ pub async fn exec_post(State(s): State<AppState>, headers: HeaderMap, Json(req):
         Ok((code, output)) => Json(json!({"code": code, "output": output})).into_response(),
         Err(e) => bad(e),
     }
+}
+
+/// "2026-11-15T10-20-30" for a snapshot made without a name.
+fn chrono_like_now() -> String {
+    let s = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{}", s)
 }

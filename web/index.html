@@ -572,6 +572,15 @@
         <div class="cv-vm__task" id="vm-task" hidden><b id="vm-task-what"></b> <span class="muted small" id="vm-task-state"></span>
           <pre class="cv-vm__log" id="vm-task-log"></pre></div>
         <div class="cv-vm__more" id="vm-panel" hidden>
+          <div class="st-card st-card--inner"><b>Snapshots</b>
+            <p class="muted small">Copies of the VM's disk. A job in the VM takes one before it starts, so anything it breaks can be undone. Rolling back restarts the VM.</p>
+            <div class="cv-bar">
+              <select class="st-input" id="vm-snaps" aria-label="Snapshots" style="width:auto"><option value="">No snapshots yet</option></select>
+              <button type="button" class="st-btn st-btn--secondary" id="vm-snap">Snapshot now</button>
+              <button type="button" class="st-btn st-btn--secondary" id="vm-rollback">Roll back to it</button>
+              <button type="button" class="st-btn st-btn--secondary" id="vm-snap-del">Delete it</button>
+            </div>
+          </div>
           <div class="st-card st-card--inner"><b>Apps</b>
             <p class="muted small">Inside the VM: nothing here touches this PC. Bitwarden and browsers: you sign in yourself.</p>
             <div class="cv-vm__apps" id="vm-apps"><p class="muted small">Start the VM to see what is installed.</p></div>

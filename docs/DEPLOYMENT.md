@@ -643,6 +643,23 @@ am2strata-run vm settings memory_mb=4096 cpus=4
 am2strata-run vm stop
 ```
 
+### Snapshots and rollback
+
+A job in the VM takes a snapshot of the VM's disk before its first step. The model is told the snapshot's name, so
+anything the job breaks can be undone. The newest 8 job snapshots are kept; snapshots you name yourself are never
+deleted by themselves.
+
+```bash
+am2strata-run vm snapshots                   # the list
+am2strata-run vm snapshot before-upgrade     # one of your own, now
+am2strata-run vm rollback before-upgrade --yes
+am2strata-run vm delete-snapshot before-upgrade
+```
+
+The same controls are on the Computer tab, under Apps, terminal, settings › Snapshots. A snapshot made while the VM
+runs is crash-consistent, like a power cut at that moment. Rolling back stops the VM, drops its saved memory, puts the
+disk back and boots it again.
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your

@@ -148,6 +148,31 @@ pub struct Vm {
 
 static VM: std::sync::OnceLock<Arc<Vm>> = std::sync::OnceLock::new();
 
+/// Job snapshots kept (the newest); snapshots the operator names are never deleted by themselves.
+const JOB_SNAPSHOTS: usize = 8;
+
+/// A snapshot name from a label: letters, digits, - and _, at most 48.
+pub fn snapshot_name(label: &str) -> Result<String, String> {
+    let n: String = label.trim().chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).take(48).collect();
+    if n.trim_matches('-').is_empty() { Err("give the snapshot a name (letters, digits, - and _)".into()) } else { Ok(n) }
+}
+
+/// `qemu-img snapshot -l` output: ID, TAG, VM SIZE, DATE, VM CLOCK (, ICOUNT) per line after the header.
+pub fn parse_snapshot_list(text: &str) -> Vec<Value> {
+    text.lines().skip_while(|l| !l.trim_start().starts_with("ID")).skip(1).filter_map(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        if f.len() < 5 { return None; }
+        // ID TAG VM_SIZE(value unit) DATE TIME CLOCK
+        let date_i = f.iter().position(|x| x.len() == 10 && x.as_bytes().get(4) == Some(&b'-'))?;
+        Some(json!({"id": f[0], "name": f[1], "date": format!("{} {}", f[date_i], f.get(date_i + 1).copied().unwrap_or(""))}))
+    }).collect()
+}
+
+fn qemu_img(args: &[&str], disk: &Path) -> Result<(), String> {
+    let out = Command::new("qemu-img").args(args).arg(disk).output().map_err(|e| format!("qemu-img: {e}"))?;
+    if out.status.success() { Ok(()) } else { Err(format!("qemu-img {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())) }
+}
+
 pub fn get() -> Option<Arc<Vm>> {
     VM.get().cloned()
 }
@@ -785,6 +810,81 @@ impl Vm {
         Ok(rfb)
     }
 
+    // ----------------------------------------------------------------------------------------- snapshots
+
+    /// Snapshots of the VM's disk (`qemu-img snapshot -l`, readable while it runs): name, date and size, newest last.
+    pub fn snapshots(&self) -> Result<Vec<Value>, String> {
+        let disk = self.vm_dir().join("disk.qcow2");
+        if !disk.exists() { return Ok(Vec::new()); }
+        let out = Command::new("qemu-img").args(["snapshot", "-l", "-U"]).arg(&disk).output().map_err(|e| format!("qemu-img: {e}"))?;
+        if !out.status.success() { return Err(String::from_utf8_lossy(&out.stderr).trim().to_string()); }
+        Ok(parse_snapshot_list(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// Take a snapshot of the disk now (running: through QMP, crash-consistent like a power cut; off or saved: with
+    /// qemu-img). Job snapshots (`job-…`) beyond the newest JOB_SNAPSHOTS are deleted.
+    pub fn snapshot(&self, label: &str) -> Result<String, String> {
+        let name = snapshot_name(label)?;
+        let disk = self.vm_dir().join("disk.qcow2");
+        if !disk.exists() { return Err("the VM has no disk yet: start it once first".into()); }
+        if self.alive() {
+            let dev = self.disk_device()?;
+            self.qmp(|q| q.cmd("blockdev-snapshot-internal-sync", Some(json!({"device": dev, "name": name}))))?;
+        } else {
+            qemu_img(&["snapshot", "-c", &name], &disk)?;
+        }
+        let jobs: Vec<String> = self.snapshots()?.into_iter().filter_map(|s| s["name"].as_str().map(str::to_string)).filter(|n| n.starts_with("job-")).collect();
+        for old in jobs.iter().take(jobs.len().saturating_sub(JOB_SNAPSHOTS)) {
+            let _ = self.delete_snapshot(old);
+        }
+        Ok(name)
+    }
+
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), String> {
+        let disk = self.vm_dir().join("disk.qcow2");
+        if self.alive() {
+            let dev = self.disk_device()?;
+            self.qmp(|q| q.cmd("blockdev-snapshot-delete-internal-sync", Some(json!({"device": dev, "name": name}))))?;
+            Ok(())
+        } else {
+            qemu_img(&["snapshot", "-d", name], &disk)
+        }
+    }
+
+    /// Put the disk back as it was in snapshot `name`: the VM is stopped (its saved memory dropped, it would not match
+    /// the disk), the disk reverted, and it boots again.
+    pub fn rollback(&self, name: &str, log: &dyn Fn(String)) -> Result<(), String> {
+        if !self.snapshots()?.iter().any(|s| s["name"] == name) {
+            return Err(format!("there is no snapshot {name:?} (the list: snapshots)"));
+        }
+        {
+            let _op = self.op.lock().unwrap();
+            if self.alive() {
+                log("stopping the VM".into());
+                let _ = self.qmp(|q| q.cmd("quit", None));
+            }
+            self.kill_running();
+            *self.screen.lock().unwrap() = None;
+            if let Some(mut t) = self.tunnel.lock().unwrap().take() { let _ = t.kill(); let _ = t.wait(); }
+            if let Some((mut t, _)) = self.cdp.lock().unwrap().take() { let _ = t.kill(); let _ = t.wait(); }
+            let _ = std::fs::remove_file(self.vm_dir().join("state.bin"));
+            let _ = std::fs::remove_file(self.vm_dir().join("state.fingerprint"));
+            qemu_img(&["snapshot", "-a", name], &self.vm_dir().join("disk.qcow2"))?;
+            self.set_phase(Phase::Off);
+            log(format!("the disk is back at {name}; starting"));
+        }
+        self.start(log)
+    }
+
+    /// The QMP device name of the VM's disk (the drive whose file is disk.qcow2).
+    fn disk_device(&self) -> Result<String, String> {
+        let blocks = self.qmp(|q| q.cmd("query-block", None))?;
+        blocks.as_array().into_iter().flatten()
+            .find(|b| b["inserted"]["file"].as_str().is_some_and(|f| f.ends_with("disk.qcow2")))
+            .and_then(|b| b["device"].as_str().filter(|d| !d.is_empty()).or(b["qdev"].as_str()).map(str::to_string))
+            .ok_or_else(|| "the VM's disk was not found in query-block".to_string())
+    }
+
     // ------------------------------------------------------------------------------------------- browser
 
     /// The VM's Chromium as a DevTools endpoint on this PC (`http://127.0.0.1:<port>`), for browser use inside the VM: the
@@ -1050,6 +1150,19 @@ impl Vm {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn snapshot_lists_and_names_parse() {
+        let out = "Snapshot list:\nID        TAG                     VM_SIZE                DATE        VM_CLOCK     ICOUNT\n1         job-1794-abc                0 B 2026-11-15 11:02:03  0000:00:00.000          0\n2         manual-x                    0 B 2026-11-15 11:10:44  0000:00:00.000          0\n";
+        let l = parse_snapshot_list(out);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0]["name"], "job-1794-abc");
+        assert_eq!(l[1]["date"], "2026-11-15 11:10:44");
+        assert!(parse_snapshot_list("").is_empty());
+        assert_eq!(snapshot_name(" before upgrade! ").unwrap(), "before-upgrade-");
+        assert!(snapshot_name("   ").is_err());
+        assert!(snapshot_name("../x").unwrap().chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
     use super::*;
 
     /// Regression (docs/REGRESSION.md), found by the regression suite: the VM's socket folder was one per account,

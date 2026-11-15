@@ -4506,7 +4506,33 @@ $("vm-reset").onclick = () => {
 $("vm-more").onclick = () => {
   const open = $("vm-panel").hidden;
   $("vm-panel").hidden = !open; $("vm-more").setAttribute("aria-expanded", String(open));
-  if (open) vmLoadApps();
+  if (open) { vmLoadApps(); vmLoadSnaps(); }
+};
+// snapshots of the VM's disk (vm/mod.rs): a job in the VM takes one first; roll back undoes what it changed
+async function vmLoadSnaps() {
+  try {
+    const r = await vmFetch("api/vm", {method: "POST", body: JSON.stringify({action: "snapshots"})});
+    const list = (r.snapshots || []).slice().reverse();
+    $("vm-snaps").innerHTML = list.length ? list.map((x) => `<option value="${esc(x.name)}">${esc(x.name)} · ${esc(x.date)}</option>`).join("")
+                                          : `<option value="">No snapshots yet</option>`;
+  } catch (e) { cvErr(e.message); }
+}
+$("vm-snap").onclick = async () => {
+  const name = prompt("Name for the snapshot (letters, digits, - and _):", "before-change");
+  if (name === null) return;
+  try { await vmFetch("api/vm", {method: "POST", body: JSON.stringify({action: "snapshot", name})}); } catch (e) { cvErr(e.message); }
+  vmLoadSnaps();
+};
+$("vm-rollback").onclick = () => {
+  const n = $("vm-snaps").value;
+  if (!n) return;
+  if (confirm(`Roll the VM back to ${n}? Every change made in it since then is lost, and the VM restarts.`)) vmAction({action: "rollback", name: n, confirm: true});
+};
+$("vm-snap-del").onclick = async () => {
+  const n = $("vm-snaps").value;
+  if (!n || !confirm(`Delete the snapshot ${n}? It cannot be brought back.`)) return;
+  try { await vmFetch("api/vm", {method: "POST", body: JSON.stringify({action: "delete_snapshot", name: n})}); } catch (e) { cvErr(e.message); }
+  vmLoadSnaps();
 };
 $("vm-save").onclick = async () => {
   const body = {};
