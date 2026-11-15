@@ -142,11 +142,23 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
          }
      }
      // the browser (computer use): only for a request that asks, never for another web page
-    if (req.get("strata_browser") == Some(&Value::Bool(true)) || has("browser")) && !structured && !forced && !crate::foreign_origin(s, headers) {
-        if let Some(b) = s.mgr.browser.get().filter(|b| b.available()) {
+    // strata_browser: true (the config's browser), or "server" / "mine" / "sandbox" (browser_api.rs)
+    let browser_flag = req.get("strata_browser").is_some_and(|v| v == &Value::Bool(true) || v.as_str().is_some_and(|t| !t.is_empty()));
+    if (browser_flag || has("browser")) && !structured && !forced && !crate::foreign_origin(s, headers) {
+        if let Some(b) = s.mgr.browser.get().filter(|b| b.available() || crate::browser_api::target_of(&req["strata_browser"]) == "sandbox") {
             let vision = match s.mgr.current().await { Some(l) => l.vision.is_some(), None => false };
             let own = own_names(prep);
-            let extra: Vec<Value> = crate::browser::Browsers::tools(vision, b.user_session(), b.settings.upload_dir.is_some()).into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+            let mut tools = b.tools_for(vision);
+            let label = match crate::browser_api::target_of(&req["strata_browser"]).as_str() {
+                "sandbox" | "vm" => Some("Chromium on the sandbox VM's desktop (its own logins)"),
+                "mine" | "user" | "chrome" => Some("the user's own Chrome, with their logins"),
+                "server" | "headless" => Some("a browser on the server (no logins of the user's)"),
+                _ => None,
+            };
+            if let (Some(l), Some(o)) = (label, tools.iter_mut().find(|t| t["name"] == "browser_open")) {
+                o["description"] = json!(format!("Open a web page in {l}. Returns its title, address and the start of its text."));
+            }
+            let extra: Vec<Value> = tools.into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
             if !extra.is_empty() {
                 add(prep, &mut offered, extra);
             }

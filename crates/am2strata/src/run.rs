@@ -970,7 +970,12 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         }
                         None => json!({"ok": false, "text": "error: media jobs are not available", "chars": 0, "truncated": false, "ms": 0}),
                     }
-                } else if let (true, None, Some(b)) = (crate::browser::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.browser.get()) {
+                } else if let (true, None, Some(picked)) = (crate::browser::TOOL_NAMES.contains(&c.name.as_str()), &route,
+                        match mgr.browser.get() { Some(_) => Some(crate::browser_api::pick(&mgr, &crate::browser_api::target_of(&req["strata_browser"])).await), None => None }) {
+                  match picked {
+                   Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": 0}),
+                   Ok(b) => {
+                    let b = &b;
                     let t0 = std::time::Instant::now();
                     let page_of = conv.clone().unwrap_or_else(|| "chat".to_string());
                     // a risky step (a password, a form sent, a publishing click, an upload) waits for the user's yes
@@ -1058,6 +1063,8 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": ms(t0)}),
                         }
                     }
+                   }
+                  }
                 } else if let (true, None, Some(comp)) = (crate::computer::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.computer.get()) {
                     // classify the step and check it against the active preset before it runs: a refused step is not executed
                     // and its result names the rule; an "ask" waits for approval through the browser's own path. The desktop
