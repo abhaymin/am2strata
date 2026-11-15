@@ -13,6 +13,7 @@ mod server_tls;
 mod machine;
 mod optimizer;
 mod clients;
+mod experts;
 mod gemini;
 mod anthropic;
 mod browser;
@@ -509,6 +510,12 @@ async fn main() -> Result<()> {
     state.media_jobs.resume(unfinished);
     let _ = mgr.media_jobs.set(state.media_jobs.clone());
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
+    // the specialist models the main model consults (ask_expert); a bad entry is skipped with a warning above
+    let experts = crate::experts::Experts::from_config(&first.cfg.rest);
+    if !experts.is_empty() {
+        tracing::info!("ask_expert: {} expert(s) configured", experts.len());
+    }
+    let _ = mgr.experts.set(Arc::new(experts));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // the sandbox VM (computer/vm): made before computer use, whose "vm" mode drives it; it starts only when used
     #[cfg(target_os = "linux")]

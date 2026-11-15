@@ -1,7 +1,8 @@
 //! The tools this server runs itself, for every API (OpenAI chat, Anthropic messages, Responses): the config's MCP
 //! servers (`"strata_mcp": true`, this server's own page only), the memory tools (a request with memory, when the
-//! settings allow them), the media tools (`"strata_media": true`) and web search (`"strata_web": true`), or, with no
-//! flag at all, the sets of the key's client profile (clients.rs; `x-strata-tools` narrows them for one request).
+//! settings allow them), the media tools (`"strata_media": true`), web search (`"strata_web": true`) and asking an expert
+//! (`"strata_experts": true` or a profile with "experts"), or, with no flag at all, the sets of the key's client profile
+//! (clients.rs; `x-strata-tools` narrows them for one request).
 //! They are added to the request's tool list;
 //! the model's calls to them are run in run::start_mcp's loop and the rest of the turn goes on. The request's own
 //! tools win a name clash, and a forced tool_choice is left alone.
@@ -196,6 +197,19 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
             let extra: Vec<Value> = w.tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
             if !extra.is_empty() {
                 add(prep, &mut offered, extra);
+            }
+        }
+    }
+    // ask_expert: the main model sends a sub-question to a specialist model that answers in this turn; only when at least one
+    // expert is configured (and a request asks with "strata_experts": true, or the key's profile has the set "experts")
+    if (req.get("strata_experts") == Some(&Value::Bool(true)) || has("experts")) && !structured && !forced {
+        if let Some(e) = s.mgr.experts.get() {
+            if !e.is_empty() {
+                let own = own_names(prep);
+                let extra: Vec<Value> = e.tools().into_iter().filter(|t| !own.iter().any(|o| t["name"] == o.as_str())).collect();
+                if !extra.is_empty() {
+                    add(prep, &mut offered, extra);
+                }
             }
         }
     }

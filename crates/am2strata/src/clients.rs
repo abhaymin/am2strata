@@ -10,7 +10,7 @@
 //! }
 //! ```
 //! - `tools`: memory, web, image, video, speech, music, browser (the browser on this PC), code (run_python in the
-//!   sandbox), and MCP servers by name (`mcp:search`) or every address
+//!   sandbox) and experts (an `ask_expert` specialist model), plus MCP servers by name (`mcp:search`) or every address
 //!   server (`mcp:*`). A program (stdio) MCP server runs on this PC, so a profile gets it only by name, never by `*`.
 //! - `memory`: the profile's memory space (default: the profile's name); two profiles naming the same space share it.
 //! - `default` (no key): what the main key gets; without it, the main key gets only what its requests ask for.
@@ -24,7 +24,7 @@
 use serde_json::Value;
 use std::collections::BTreeSet;
 
-pub const SETS: [&str; 8] = ["memory", "web", "image", "video", "speech", "music", "browser", "code"];
+pub const SETS: [&str; 9] = ["memory", "web", "image", "video", "speech", "music", "browser", "code", "experts"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Profile {

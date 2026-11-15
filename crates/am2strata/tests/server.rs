@@ -2029,6 +2029,67 @@ fn a_chat_searches_the_web_and_reads_a_page_when_it_opts_in() {
     assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("web_search"));
 }
 
+/// A tiny OpenAI-compatible expert server for the ask_expert tests: answers any request with one line and records the JSON it
+/// was sent, so a test can assert the original request went to the expert together with the question.
+fn fake_math_expert() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let bodies_g = bodies.clone();
+    std::thread::spawn(move || {
+        for c in l.incoming().flatten() {
+            let mut c = c;
+            let mut buf = [0u8; 8192];
+            let n = std::io::Read::read(&mut c, &mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let split = req.find("\r\n\r\n").map(|i| i + 4).unwrap_or(req.len());
+            bodies_g.lock().unwrap().push(req[split..].to_string());
+            let resp = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"43"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let _ = std::io::Write::write_all(&mut c, format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp}", resp.len()).as_bytes());
+        }
+    });
+    (port, bodies)
+}
+
+#[test]
+fn a_chat_asks_an_expert_and_the_answer_comes_back_in_the_turn() {
+    let (port, bodies) = fake_math_expert();
+    let ask = "\n\n<tool_call>\n<function=ask_expert>\n<parameter=expert>\nmath\n</parameter>\n<parameter=question>\nWhat is 7 times 6 plus 1?\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"experts": [{"name":"math","about":"checks arithmetic and algebra step by step",
+        "url": format!("http://127.0.0.1:{port}/v1"),"model":"qwen-math"}]}), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Let me ask.\n</think>{ask}")), ids("Final answer:\n</think>\n\nIt is 43."),
+                                  ids("Plain.\n</think>\n\nNo tools.")], json!({}));
+    let original = "Walk me through seven times six plus one, then give the total.";
+    // with the flag: offered, called, and its answer comes back in the same turn
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [user(original)], "max_tokens": 200, "strata_experts": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "It is 43.");
+    // offered in the first generated prompt
+    assert!(prompt_text(&s.gen_lines()[0]).contains("ask_expert"), "offered with strata_experts: {}", prompt_text(&s.gen_lines()[0]));
+    // the expert's answer went back to the model (wrapped with its name and model)
+    assert!(prompt_text(&s.gen_lines()[1]).contains("Answer from the math expert (qwen-math):"));
+    // the mock received both the original request and the question, together
+    let body = bodies.lock().unwrap().last().unwrap().clone();
+    assert!(body.contains(original), "the original request went to the expert: {body}");
+    assert!(body.contains("What is 7 times 6 plus 1?"), "the question went with it: {body}");
+    // without the flag, and a profile without "experts", it is not offered
+    s.post("/v1/chat/completions", &json!({"messages": [user(original)]}));
+    assert!(!prompt_text(s.gen_lines().last().unwrap()).contains("ask_expert"), "not offered without strata_experts: {}", prompt_text(s.gen_lines().last().unwrap()));
+}
+
+#[test]
+fn a_client_profile_with_experts_gets_the_tool_without_a_flag() {
+    let (port, _) = fake_math_expert();
+    let ask = "\n\n<tool_call>\n<function=ask_expert>\n<parameter=expert>\nmath\n</parameter>\n<parameter=question>\n2 plus 2?\n</parameter>\n</function>\n</tool_call>";
+    let m = Model { extra: json!({"experts": [{"name":"math","about":"checks arithmetic and algebra step by step",
+        "url": format!("http://127.0.0.1:{port}/v1"),"model":"qwen-math"}],
+        "clients": {"default": {"tools": ["experts"]}} }), ..Model::default() };
+    let s = Server::start(&[m], &[ids(&format!("Ask.\n</think>{ask}")), ids("It is 4.\n</think>")], json!({}));
+    let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("What is 2 plus 2?")]}));
+    assert_eq!(c, 200);
+    assert!(prompt_text(&s.gen_lines()[0]).contains("ask_expert"), "a profile with 'experts' offers it without a flag");
+}
+
 const LAPTOP: &str = "laptop-key-0123456789";
 const PHONE: &str = "phone-key-0123456789";
 
