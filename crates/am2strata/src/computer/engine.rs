@@ -245,6 +245,8 @@ fn error_result(text: String, ms: u64) -> Value {
                 return error_result("error: the shell and installs are only in the sandbox VM mode (Settings › Computer and browser use › Mode: Sandbox VM)".into(), 0);
             };
             let (name, args, t0) = (name.to_string(), args.clone(), Instant::now());
+            // the owner's protected list is read before the closure moves `self`-owned data in, so the shell can refuse it.
+            let protect = self.config.computer.protect.clone();
             let r = tokio::task::spawn_blocking(move || -> Result<String, String> {
                 vm.ensure()?;
                 if name == "computer_ads" {
@@ -254,6 +256,9 @@ fn error_result(text: String, ms: u64) -> Value {
                 }
                 if name == "computer_shell" {
                     let cmd = args["command"].as_str().filter(|c| !c.trim().is_empty()).ok_or("give \"command\"")?;
+                    if let Some(p) = crate::computer::rules::protected_hit(cmd, &protect) {
+                        return Err(format!("refused: this command would change the protected \"{p}\" (computer.protect). Work on a copy in the sandbox, and hand back a script the owner can run on the real one"));
+                    }
                     let secs = args["timeout_s"].as_u64().unwrap_or(300).clamp(1, 3600);
                     let (code, out) = vm.sh(cmd, args["root"].as_bool().unwrap_or(false), None, Duration::from_secs(secs), &|_| {})?;
                     let out = if out.len() > 20_000 { format!("…{}", &out[out.len() - 20_000..]) } else { out };

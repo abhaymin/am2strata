@@ -50,6 +50,10 @@ pub struct ComputerUse {
     pub mode: Mode,
     /// the apps the sandbox desktop may open (Strict requires a non-empty list)
     pub apps: Vec<String>,
+    /// things the agent must not stop, remove or overwrite inside the shell: container names, service names, paths. When a
+    /// destructive command's text names one of them, the VM's shell tool refuses it and tells the model to work on a copy;
+    /// empty means nothing is protected (off by default). See `rules::protected_hit`.
+    pub protect: Vec<String>,
     /// downloads to a folder auto-accept (`false`) or ask the user each time (`true`, the default when on)
     pub download_ask: Option<bool>,
     /// browser/site allow + block lists; empty means none configured (off by default)
@@ -63,7 +67,7 @@ pub struct ComputerUse {
 
 impl Default for ComputerUse {
     fn default() -> Self {
-        ComputerUse { use_: false, mode: Mode::DEFAULT, apps: Vec::new(), download_ask: None, site_allow: Vec::new(),
+        ComputerUse { use_: false, mode: Mode::DEFAULT, apps: Vec::new(), protect: Vec::new(), download_ask: None, site_allow: Vec::new(),
                       site_block: Vec::new(), display_size: None, max_steps: DEFAULT_MAX_STEPS }
     }
 }
@@ -125,6 +129,7 @@ impl Config {
                 use_: c.get("use").and_then(Value::as_bool).unwrap_or(false),
                 mode: if let Some(m) = c.get("mode").and_then(Value::as_str) { Mode::parse(m) } else { Mode::DEFAULT },
                 apps: names_array(c.get("apps")),
+                protect: names_array(c.get("protect")),
                 download_ask: c.get("download_ask").and_then(Value::as_bool),
                  site_allow: names_array(c.get("site_allow")),
                  site_block: names_array(c.get("site_block")),
@@ -163,6 +168,9 @@ impl Config {
         }
         if !self.computer.site_block.is_empty() {
             computer["site_block"] = json!(self.computer.site_block.clone());
+        }
+        if !self.computer.protect.is_empty() {
+            computer["protect"] = json!(self.computer.protect.clone());
         }
         if let Some(d) = &self.computer.display_size {
             computer["display_size"] = json!(d);
@@ -249,6 +257,20 @@ mod tests {
         let c2 = Config { computer: ComputerUse { use_: true, mode: Mode::Sandbox, download_ask: Some(true), ..Default::default() },
                           browser: BrowserUse::default(), rules: RulesConfig { preset: Preset::Strict, ..Default::default() } };
         assert_eq!(Config::from_config(&rest(c2.to_value()), Path::new("/tmp")), c2);
+    }
+
+    #[test]
+    fn protect_lists_parse_and_round_trip() {
+        let c = Config::from_config(&rest(json!({"computer": {"protect": ["prod-db", "/srv/prod"]}})), Path::new("/tmp"));
+        assert_eq!(c.computer.protect, vec!["prod-db".to_string(), "/srv/prod".to_string()]);
+        // writing it back and reading again gives the same list (no entry lost or changed)
+        let round = Config::from_config(&rest(c.to_value()), Path::new("/tmp"));
+        assert_eq!(round.computer.protect, c.computer.protect);
+
+        // empty by default, and stays absent from the written value when nothing is protected
+        let d = Config::default();
+        assert!(d.computer.protect.is_empty());
+        assert!(!d.to_value()["computer"].get("protect").is_some(), "nothing protected means no \"protect\" key");
     }
 
     #[test]

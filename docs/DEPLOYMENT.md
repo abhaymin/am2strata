@@ -660,6 +660,21 @@ The same controls are on the Computer tab, under Apps, terminal, settings › Sn
 runs is crash-consistent, like a power cut at that moment. Rolling back stops the VM, drops its saved memory, puts the
 disk back and boots it again.
 
+### Protected things
+
+The agent works on a copy inside the VM, but its `computer_shell` can still run a destructive command aimed at something
+real — removing a file, stopping a service, overwriting a path. List what it must never stop, remove or overwrite:
+container names, service names, paths. In the run config (`strata-<model>.json`):
+
+```json
+"computer": { "use": true, "mode": "vm", "protect": ["prod-db", "/srv/prod"] }
+```
+
+When a command runs and one of those names appears in it — `docker rm -f prod-db`, `systemctl restart nginx-prod`,
+`sed -i … /srv/prod/app.conf`, `echo x > /srv/prod/f` — the VM's shell refuses it with a message telling the model to do
+the work on a copy and hand back a script for the owner to run on the real thing, instead of changing it. Nothing is
+listed by default, so this only bites what you put there (`computer.protect`).
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your

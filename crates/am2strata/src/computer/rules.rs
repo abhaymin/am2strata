@@ -265,6 +265,51 @@ pub fn time_allowed(started_at: Instant, now: Instant, max_seconds: u64) -> bool
     now.duration_since(started_at) <= Duration::from_secs(max_seconds)
 }
 
+/// If this shell command is destructive to something on the owner's protected list (`computer.protect`) and names one of
+/// them, return that entry — so the VM's shell tool can refuse before running it (`engine.rs`), telling the model to work on a
+/// copy. A command is destructive when it has a word that removes or changes state (`rm`, `rmdir`, `mv`, `dd`, `mkfs`,
+/// `truncate`, `shred`, `chmod`, `chown`, `kill`, `pkill`, `killall`), an in-place edit (`sed -i`), a `>` output redirection,
+/// or a `docker` / `podman` / `systemctl` subcommand that stops or removes something; and only then when the text contains a
+/// non-empty protected entry. Empty list → None (nothing is protected by default).
+pub fn protected_hit(command: &str, protect: &[String]) -> Option<String> {
+    if is_destructive(command) && protect.iter().any(|e| !e.trim().is_empty() && command.contains(e.as_str())) {
+        protect.iter().find(|e| !e.trim().is_empty() && command.contains(e.as_str())).cloned()
+    } else {
+        None
+    }
+}
+
+/// Whether `command` would change or remove something on disk / in a service (before we know what is protected).
+fn is_destructive(command: &str) -> bool {
+    let h = command.to_lowercase();
+    let tokens: Vec<&str> = h.split_whitespace().collect();
+    // removing / changing words, matched whole-word so "address" does not count as "dd".
+    for w in ["rm", "rmdir", "mv", "dd", "mkfs", "truncate", "shred", "chmod", "chown", "kill", "pkill", "killall"] {
+        if word_at(&h, w) { return true; }
+    }
+    // an in-place edit: a `sed` with a `-i` flag somewhere later on the command.
+    let mut saw_sed = false;
+    for tok in &tokens {
+        if *tok == "sed" { saw_sed = true; }
+        else if saw_sed && tok.starts_with('-') && tok[1..].contains('i') { return true; }
+    }
+    // a `>` output redirection onto a file.
+    if h.contains('>') { return true; }
+    follow_kill(&tokens, &["docker", "podman"], &["rm", "stop", "kill", "restart", "down", "prune"])
+        || follow_kill(&tokens, &["systemctl"], &["stop", "restart", "disable", "mask"])
+}
+
+/// True when one of `bins` appears and, later in the command, one of `verbs` appears as a token (docker/podman/systemctl that
+/// stop or remove something). The binary itself is not also treated as a verb.
+fn follow_kill(tokens: &[&str], bins: &[&str], verbs: &[&str]) -> bool {
+    let mut seen = false;
+    for tok in tokens {
+        if !seen && bins.contains(tok) { seen = true; continue; }
+        if seen && verbs.contains(tok) { return true; }
+    }
+    false
+}
+
 /// Classify a tool call into an Intent (best-effort from the arguments), and whether it is risky by its label. This is
 /// where password/payment field detection happens; pure and unit-tested with a mock, no OS needed.
 pub fn classify(tool: &str, args: &Value) -> Option<Intent> {
@@ -454,5 +499,62 @@ mod tests {
         assert_eq!(click_verb("Delete this"), "delete");
         assert_eq!(click_verb("Buy now"), "buy");
         assert_eq!(click_verb("Next"), "click");
+    }
+
+    // --- protected things (computer.protect) ---------------------------------------------------------
+
+    #[test]
+    fn refuses_destructive_command_that_names_a_protected_thing() {
+        let prod_db = vec!["prod-db".into()];
+        assert_eq!(
+            protected_hit("docker rm -f prod-db", &prod_db),
+            Some("prod-db".to_string()),
+            "removing a named container is refused"
+        );
+
+        let nginx = vec!["nginx-prod".into()];
+        assert_eq!(
+            protected_hit("systemctl restart nginx-prod", &nginx),
+            Some("nginx-prod".to_string()),
+            "restarting a named service is refused"
+        );
+
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(
+            protected_hit("sed -i s/a/b/ /srv/prod/app.conf", &srv),
+            Some("/srv/prod".to_string()),
+            "an in-place edit of a protected file is refused"
+        );
+        assert_eq!(
+            protected_hit("echo x > /srv/prod/f", &srv),
+            Some("/srv/prod".to_string()),
+            "a `>` redirection onto a protected path is refused"
+        );
+    }
+
+    #[test]
+    fn does_not_refuse_reads_or_other_paths() {
+        // reading a protected file is not destructive
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(protected_hit("cat /srv/prod/app.conf", &srv), None);
+        // destructive, but names a different thing than what is protected
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(protected_hit("rm -rf /tmp/copy", &srv), None);
+    }
+
+    #[test]
+    fn nothing_is_protected_by_default() {
+        // even a plainly destructive command refuses to name something when the list is empty
+        assert_eq!(protected_hit("rm -rf everything", &[]), None);
+        let srv = vec![String::new()];  // an empty entry counts as "nothing listed"
+        assert_eq!(protected_hit("rm -rf /srv/prod/f", &srv), None);
+    }
+
+    #[test]
+    fn other_destructive_forms_are_recognised() {
+        for c in ["truncate -s 0 /data", "shred file", "chmod 777 /etc/x", "dd if=/dev/zero of=/data",
+                  "mkfs.ext4 /dev/sdb1", "mv a b", "pkill node", "podman stop web"] {
+            assert!(is_destructive(c), "expected destructive: {c}");
+        }
     }
 }
