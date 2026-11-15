@@ -510,6 +510,7 @@ async fn main() -> Result<()> {
                            media: Arc::new(image_gen::Media::new(&expand(&args.data_dir), &first.cfg.rest)),
                            media_jobs: Arc::new(media_jobs::Jobs::new()) };
     // media jobs kept across restarts; the ones the server stopped in run again
+    let _ = media::ENGINE.set(state.media.clone()); // MP4/H.264 frames without ffmpeg (media.rs rust_frames)
     let unfinished = state.media_jobs.open(expand(&args.data_dir).join("media-jobs"));
     state.media_jobs.bind(state.clone());
     let _ = mgr.code.set(state.code_run.clone());

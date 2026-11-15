@@ -22,7 +22,7 @@ is missing, why it matters, and the check that closes it. The order at the end i
 | A11 | Engine | Families `gemma4`, `glm4moe`, `deepseek4`; vision through the Rust engine; embeddings and rerank. | ENGINE-PLAN | Each family token-identical to llama.cpp at temperature 0 |
 | A12 | Songs | One seed in four still misses lyrics; a better judge than Whisper for Malayalam and other Indian languages. | ACESTEP-RUST-PLAN 6b | Lyrics heard ≥ 80% on 4 of 4 seeds |
 | A13 | Knowledge cache | Parts A-C and E. | KNOWLEDGE-CACHE | Per the plan |
-| A14 | Video checks | `check_media`'s video checks (frame jumps, frozen stretches) and video-as-frames in chat need ffmpeg, which this PC does not have. Under the all-Rust rule, the frames should come from a Rust decoder. | media_check.rs; README "Video" row | A video check runs on a PC without ffmpeg |
+| A14 | Video checks | `check_media`'s video checks (frame jumps, frozen stretches) and video-as-frames in chat need ffmpeg, which this PC does not have. Under the all-Rust rule, the frames should come from a Rust decoder. | media_check.rs; README "Video" row | A video check runs on a PC without ffmpeg | **Done (2026-11-16):** the media engine reads MP4/H.264 frames itself (openh264 + mp4, already in its build); the media check and chat video use it when ffmpeg is missing.
 | A15 | Browser use, next steps | Upload support for the sandbox target (its files live in the VM); a recorder that turns a chat's browser steps into a site test; schedules for site tests; datasets shown in chat answers. | BROWSER-USE.md | Each with a live test like browser_live_tests.rs |
 | A16 | Hardware | A reboot test with both GPUs; Coral TPU driver; the AMD NPU (detected, unused). | V2-PLAN | Per the plan |
 

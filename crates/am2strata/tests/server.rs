@@ -235,18 +235,12 @@ fn refusals_are_400s() {
 
 #[test]
 fn video_without_ffmpeg_says_how_to_fix_it() {
-    if strata_serve_has_ffmpeg() {
-        return; // the frames path is covered by the live tests
-    }
-    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    // no ffmpeg and no media engine to decode MP4 itself: the refusal says how to fix it
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"no_media": true, "env": {"AM2_TEST_NO_FFMPEG": "1"}}));
     let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
         {"type": "text", "text": "Describe"}, {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}]}]}));
     assert_eq!(c, 400);
     assert!(r["error"]["message"].as_str().unwrap().contains("ffmpeg"));
-}
-
-fn strata_serve_has_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success())
 }
 
 #[test]
@@ -3132,4 +3126,19 @@ fn a_worker_model_is_asked_through_the_cluster_as_an_expert() {
     let p1 = prompt_text(&master.gen_lines()[1]);
     assert!(p1.contains("Answer from the small expert (mock-b) (on worker macm4)"), "the worker's answer came back: {p1}");
     assert!(p1.contains("Hi from the small expert on macm4."), "with the worker's own text: {p1}");
+}
+
+/// GAPS-PLAN A14: with no ffmpeg (forced here with AM2_TEST_NO_FFMPEG, as on a PC without it), a media check of a
+/// video reads its frames from the media engine's own MP4/H.264 decoder and runs the video checks, and a chat video is
+/// turned into frames the same way.
+#[test]
+fn video_frames_come_from_the_media_engine_without_ffmpeg() {
+    let s = Server::start(&[Model::default()], &[ids("I see a video.")], json!({"env": {"AM2_TEST_NO_FFMPEG": "1"}}));
+    let mp4 = "data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDE=";
+    let (c, r) = s.post("/v1/media/check", &json!({"video": mp4}));
+    assert_eq!(c, 200, "{r}");
+    assert!(r["video"]["jumps"].is_object() && r["video"]["near_static"].is_object(), "the video checks ran: {r}");
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "What is in this video?"}, {"type": "video_url", "video_url": {"url": mp4}}]}], "max_tokens": 16}));
+    assert_eq!(c, 200, "a chat video becomes frames without ffmpeg: {r}");
 }

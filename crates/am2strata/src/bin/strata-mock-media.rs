@@ -59,6 +59,17 @@ fn main() {
                 }
                 emit(serde_json::json!({"event": "done", "ms": 5, "seed": r["seed"]}));
             }
+            // the MP4/H.264 frames op (am2strata-media's video_frames): `max` tiny frames, 4 fps, the file must exist
+            "video_frames" => {
+                let path = cmd["file"].as_str().unwrap_or("");
+                if !std::path::Path::new(path).is_file() {
+                    emit(serde_json::json!({"event": "error", "message": format!("{path}: the file was not found")}));
+                } else {
+                    let n = cmd["max"].as_u64().unwrap_or(4).min(4) as usize;
+                    let frames: Vec<_> = (0..n).map(|i| serde_json::json!({"t": i as f64 * 0.25, "png": PNG})).collect();
+                    emit(serde_json::json!({"event": "frames", "fps": 4.0, "duration_s": n as f64 * 0.25, "width": 1, "height": 1, "frames": frames}));
+                }
+            }
             "transcribe" => {
                 let n = cmd["audio"].as_str().unwrap_or("").len();
                 let text = if cmd["translate"] == true { "Hello in English." } else { "Hello world." };
