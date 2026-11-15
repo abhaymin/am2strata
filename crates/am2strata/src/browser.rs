@@ -998,11 +998,16 @@ impl Browsers {
         let limit = self.settings.step_timeout;
         // a session that is already gone answers at once: reconnect before the step instead of waiting for it to time out
         if let Some(page) = self.current(conv).await {
-            if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(2), page.evaluate("1")).await {
-                if dead_session(&e.to_string()) {
+            match tokio::time::timeout(Duration::from_secs(2), page.evaluate("1")).await {
+                Ok(Err(e)) if dead_session(&e.to_string()) => {
                     tracing::warn!(error = %e, "browser: the tab's session is gone; reconnecting");
-                    self.reconnect(conv).await;
+                    self.reconnect(conv, &e.to_string()).await;
                 }
+                Err(_) if !self.browser_answers().await => {
+                    tracing::warn!("browser: the browser does not answer; starting it again");
+                    self.reconnect(conv, "the browser does not answer").await;
+                }
+                _ => {}
             }
         }
         let mut r = tokio::time::timeout(limit, self.step(conv, name, args)).await;
@@ -1012,7 +1017,7 @@ impl Browsers {
         if let Ok(Err(e)) = &r {
             if dead_session(e) || (e.contains("timed out") && !self.answers(conv).await) {
                 tracing::warn!(error = %e, "browser: the tab's session is gone; reconnecting");
-                self.reconnect(conv).await;
+                self.reconnect(conv, e).await;
                 r = tokio::time::timeout(limit, self.step(conv, name, args)).await;
             }
         }
@@ -1066,6 +1071,13 @@ impl Browsers {
         tokio::time::timeout(Duration::from_secs(3), page.evaluate(js)).await.ok()?.ok()?.into_value::<Option<String>>().ok()?
     }
 
+    /// Does the browser itself still answer (its version, within 3 s)? A browser that went away only times out.
+    async fn browser_answers(&self) -> bool {
+        let guard = self.run.lock().await;
+        let Some(run) = guard.as_ref() else { return false };
+        tokio::time::timeout(Duration::from_secs(3), run.browser.version()).await.is_ok_and(|r| r.is_ok())
+    }
+
     /// Does this job's tab still answer a script (within 3 s)?
     async fn answers(&self, conv: &str) -> bool {
         let Some(page) = self.current(conv).await else { return false };
@@ -1074,8 +1086,8 @@ impl Browsers {
 
     /// A tab whose DevTools session died: in the user's own browser the whole connection is dropped (the next step
     /// attaches again, with fresh sessions to the same tabs); in the server's browser just that tab is replaced.
-    async fn reconnect(&self, conv: &str) {
-        if self.settings.connect.is_some() {
+    async fn reconnect(&self, conv: &str, why: &str) {
+        if self.settings.connect.is_some() || dead_connection(why) || !self.browser_answers().await {
             self.close().await;
         } else {
             self.drop_tab(conv).await;
@@ -1301,7 +1313,8 @@ impl Browsers {
         if let Some(mut r) = self.run.lock().await.take() {
             match r.child {
                 Some(mut child) => {
-                    let _ = r.browser.close().await;
+                    // a connection that is already gone never answers: do not wait on it
+                    let _ = tokio::time::timeout(Duration::from_secs(5), r.browser.close()).await;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1322,7 +1335,12 @@ impl Browsers {
 
 /// An error that means the DevTools session to the tab is gone (not a problem with the page itself).
 fn dead_session(e: &str) -> bool {
-    e.contains("Session with given id not found") || e.contains("-32001") || e.contains("No target with given id")
+    e.contains("Session with given id not found") || e.contains("-32001") || e.contains("No target with given id") || dead_connection(e)
+}
+
+/// An error that means the DevTools connection itself is gone (its handler ended): every send fails until it is made again.
+fn dead_connection(e: &str) -> bool {
+    e.contains("receiver is gone") || e.contains("channel closed") || e.contains("connection closed") || e.contains("Connection reset")
 }
 
 /// The WebSocket debugger URL of a running Chrome from its HTTP endpoint (`http://host:port` -> /json/version).
