@@ -210,6 +210,7 @@ am2strata-run mtp-rt --gguf <mtp>/mtp-q2_0.gguf --out <mtp>/rt                  
   - the model's run config, chat defaults, server and access, MCP tools, connect;
   - secure connection (HTTPS and wss), clients and API keys with their usage;
   - computer and browser use: presets, modes (including the sandbox VM), allowed apps and sites;
+  - browser use for every API and MCP client: forms, scraping into datasets, maps, site tests ([docs/BROWSER-USE.md](docs/BROWSER-USE.md));
   - appearance: light, dark or system theme, and an accent colour.
 
 ## What works

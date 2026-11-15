@@ -193,6 +193,50 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
+    /// browser use from a terminal (the Browser tab): status | open <url> | read | elements | click <text|e12> | type <text> |
+    /// key <keys> | fill <json> | extract --kind table|items|links|meta [--selector] [--fields json] [--next] [--pages] [--dataset] [--key] |
+    /// check <json checks> | console | shot <file.jpg> [--full] | tool <name> <json args> | datasets | dataset <name> [--format csv|json|jsonl] [--out f] |
+    /// delete-dataset <name> | test <suite.json|saved name> [--junit report.xml] | save-test <name> <suite.json> | mcp (how to connect an agent)
+    Browser {
+        action: String,
+        args: Vec<String>,
+        /// server, mine or sandbox (default: the config's browser)
+        #[arg(long)]
+        target: Option<String>,
+        /// the session (tab) to act in; the Browser tab uses "main"
+        #[arg(long, default_value = "main")]
+        session: String,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        selector: Option<String>,
+        #[arg(long)]
+        fields: Option<String>,
+        #[arg(long)]
+        next: Option<String>,
+        #[arg(long)]
+        pages: Option<u32>,
+        #[arg(long)]
+        dataset: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        key: Vec<String>,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        out: Option<String>,
+        #[arg(long)]
+        junit: Option<String>,
+        #[arg(long)]
+        full: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
     /// the sandbox VM (a Debian virtual machine am2Strata runs; anything may be installed in it):
     /// status | start | stop | pause | shutdown | setup | download | reset --yes | apps | install <app> |
     /// install --kind apt|flatpak|deb|appimage <target> | remove … | open <app> | exec [--root] <command> |
@@ -858,6 +902,8 @@ fn main() -> ExitCode {
             if regression_run::run(regression_run::Options { url, key, full, json, insecure }) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Cmd::Computer { action, arg, url, api_key, models_dir } => computer_cmd(&action, arg, url, api_key, &models_dir),
+        Cmd::Browser { action, args, target, session, kind, selector, fields, next, pages, dataset, key, format, out, junit, full, json, url, api_key, models_dir } =>
+            browser_cmd(&action, &args, BrowserOpts { target, session, kind, selector, fields, next, pages, dataset, key, format, out, junit, full, json }, url, api_key, &models_dir),
         Cmd::Vm { action, args, kind, root, lists, yes, no_wait, url, api_key, models_dir } =>
             vm_cmd(&action, &args, kind, root, &lists, yes, !no_wait, url, api_key, &models_dir),
         Cmd::Workshop { action, first, second, out, ty, outtype, pre_tokenizer, name, display_name, overwrite, wait, url, api_key, models_dir, dg } =>
@@ -1293,6 +1339,143 @@ fn vm_cmd(action: &str, args: &[String], kind: Option<String>, root: bool, lists
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => { eprintln!("vm: {e}"); ExitCode::from(1) }
+    }
+}
+
+struct BrowserOpts { target: Option<String>, session: String, kind: Option<String>, selector: Option<String>, fields: Option<String>,
+                     next: Option<String>, pages: Option<u32>, dataset: Option<String>, key: Vec<String>, format: Option<String>,
+                     out: Option<String>, junit: Option<String>, full: bool, json: bool }
+
+/// `am2strata-run browser …`: the Browser tab's API (browser_api.rs) from a terminal or a CI job.
+fn browser_cmd(action: &str, args: &[String], o: BrowserOpts, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
+    use serde_json::{json, Value};
+    let (local_url, local_key) = local_server(models_dir);
+    let url = url.or_else(|| std::env::var("AM2STRATA_URL").ok()).unwrap_or(local_url).trim_end_matches('/').to_string();
+    let key = api_key.or_else(|| std::env::var("AM2STRATA_API_KEY").ok()).or(local_key);
+    let client = reqwest::blocking::Client::builder().timeout(Duration::from_secs(1800)).build().unwrap();
+    let auth = |rb: reqwest::blocking::RequestBuilder| match &key { Some(k) => rb.bearer_auth(k), None => rb };
+    let send = |rb: reqwest::blocking::RequestBuilder| -> Result<reqwest::blocking::Response, String> {
+        let r = auth(rb).send().map_err(|e| format!("{url} does not answer ({e}); is the server running?"))?;
+        if r.status().is_success() { return Ok(r); }
+        let j: Value = r.json().unwrap_or_default();
+        Err(j["error"]["message"].as_str().unwrap_or("failed").to_string())
+    };
+    let arg = |i: usize, what: &str| args.get(i).cloned().ok_or_else(|| format!("browser {action} needs {what}"));
+    let parse = |t: &str, what: &str| -> Result<Value, String> {
+        let text = if std::path::Path::new(t).is_file() { std::fs::read_to_string(t).map_err(|e| e.to_string())? } else { t.to_string() };
+        serde_json::from_str(&text).map_err(|e| format!("{what} is not valid JSON: {e}"))
+    };
+    let step = |tool: &str, a: Value| -> Result<Value, String> {
+        let r = send(client.post(format!("{url}/api/browser/step")).json(&json!({"target": o.target, "session": o.session, "tool": tool, "args": a})))?;
+        r.json::<Value>().map_err(|e| e.to_string())
+    };
+    let result = (|| -> Result<bool, String> {
+        let r = match action {
+            "status" => {
+                let j: Value = send(client.get(format!("{url}/api/browser")))?.json().map_err(|e| e.to_string())?;
+                if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap()); return Ok(true); }
+                for t in j["targets"].as_array().into_iter().flatten() {
+                    println!("{:8} {:4} {}{}", t["id"].as_str().unwrap_or(""), if t["available"] == true { "on" } else { "off" },
+                             t["about"].as_str().unwrap_or(""), t["why"].as_str().map(|w| format!(" ({w})")).unwrap_or_default());
+                }
+                for w in j["waiting"].as_array().into_iter().flatten() { println!("waiting for you: {} (id {})", w["what"].as_str().unwrap_or(""), w["id"].as_str().unwrap_or("")); }
+                println!("{} dataset(s), {} saved test(s)", j["datasets"].as_array().map(|a| a.len()).unwrap_or(0), j["tests"].as_array().map(|a| a.len()).unwrap_or(0));
+                return Ok(true);
+            }
+            "open" => step("browser_open", json!({"url": arg(0, "an address")?}))?,
+            "read" => step("browser_read", json!({}))?,
+            "elements" => step("browser_elements", json!({"kind": args.first().map(String::as_str).unwrap_or("all")}))?,
+            "click" => {
+                let t = arg(0, "the text of a link or button, or an element number like e12")?;
+                let is_ref = t.len() > 1 && t.starts_with('e') && t[1..].chars().all(|c| c.is_ascii_digit());
+                step("browser_click", if is_ref { json!({"ref": t}) } else { json!({"text": t}) })?
+            }
+            "type" => step("browser_type", json!({"text": arg(0, "the text")?, "selector": o.selector}))?,
+            "key" => step("browser_key", json!({"keys": arg(0, "the keys, e.g. Enter or Ctrl+A")?}))?,
+            "fill" => step("browser_fill", json!({"fields": parse(&arg(0, "the fields as JSON (or a file)")?, "the fields")?}))?,
+            "extract" => {
+                let mut a = json!({"kind": o.kind.clone().unwrap_or_else(|| "table".into())});
+                if let Some(v) = &o.selector { a["selector"] = json!(v); }
+                if let Some(v) = &o.fields { a["fields"] = parse(v, "--fields")?; }
+                if let Some(v) = &o.next { a["next"] = json!(v); }
+                if let Some(v) = o.pages { a["pages"] = json!(v); }
+                if let Some(v) = &o.dataset { a["dataset"] = json!(v); }
+                if !o.key.is_empty() { a["key"] = json!(o.key); }
+                step("browser_extract", a)?
+            }
+            "check" => step("browser_check", json!({"checks": parse(&arg(0, "the checks as JSON (or a file)")?, "the checks")?}))?,
+            "console" => step("browser_console", json!({}))?,
+            "shot" | "screenshot" => {
+                let file = arg(0, "a file name (e.g. page.jpg)")?;
+                let j = step("browser_screenshot", json!({"full": o.full, "selector": o.selector}))?;
+                let data = j["image"].as_str().and_then(|i| i.split(',').nth(1)).ok_or_else(|| j["text"].as_str().unwrap_or("no picture").to_string())?;
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| e.to_string())?;
+                std::fs::write(&file, &bytes).map_err(|e| format!("{file}: {e}"))?;
+                println!("saved {file} ({} KB)", bytes.len() / 1024);
+                return Ok(true);
+            }
+            "tool" => step(&arg(0, "the tool's name")?, args.get(1).map(|a| parse(a, "the arguments")).transpose()?.unwrap_or(json!({})))?,
+            "datasets" => {
+                let j: Value = send(client.get(format!("{url}/api/datasets")))?.json().map_err(|e| e.to_string())?;
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    println!("{:24} {:>7} rows  {}", d["name"].as_str().unwrap_or(""), d["rows"], d["columns"].as_array().map(|c| c.iter().filter_map(|x| x.as_str()).take(8).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+                }
+                return Ok(true);
+            }
+            "dataset" => {
+                let name = arg(0, "the dataset's name")?;
+                let f = o.format.clone().unwrap_or_else(|| "csv".into());
+                let body = send(client.get(format!("{url}/api/datasets/{name}?format={f}")))?.text().map_err(|e| e.to_string())?;
+                match &o.out { Some(p) => { std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?; println!("saved {p}"); } None => print!("{body}") }
+                return Ok(true);
+            }
+            "delete-dataset" => {
+                let name = arg(0, "the dataset's name")?;
+                let j: Value = send(client.delete(format!("{url}/api/datasets/{name}")))?.json().map_err(|e| e.to_string())?;
+                println!("{}", if j["deleted"] == true { "deleted" } else { "there was no such dataset" });
+                return Ok(true);
+            }
+            "save-test" => {
+                let (name, suite) = (arg(0, "the test's name")?, parse(&arg(1, "the suite (a JSON file)")?, "the suite")?);
+                send(client.put(format!("{url}/api/browser/tests/{name}")).json(&suite))?;
+                println!("saved test {name}");
+                return Ok(true);
+            }
+            "test" => {
+                let which = arg(0, "a suite file or a saved test's name")?;
+                let body = if std::path::Path::new(&which).is_file() { json!({"suite": parse(&which, "the suite")?}) } else { json!({"name": which}) };
+                let t = o.target.clone().map(|t| format!("?target={t}")).unwrap_or_default();
+                let rep: Value = send(client.post(format!("{url}/api/browser/test{t}")).json(&body))?.json().map_err(|e| e.to_string())?;
+                if let Some(path) = &o.junit {
+                    let sep = if t.is_empty() { "?" } else { "&" };
+                    let x = send(client.post(format!("{url}/api/browser/test{t}{sep}format=junit")).json(&body))?.text().map_err(|e| e.to_string())?;
+                    std::fs::write(path, x).map_err(|e| format!("{path}: {e}"))?;
+                }
+                if o.json { println!("{}", serde_json::to_string_pretty(&rep).unwrap()); } else {
+                    for s in rep["steps"].as_array().into_iter().flatten() {
+                        println!("{} {:>3}. {} ({} ms){}", if s["ok"] == true { "✓" } else { "✗" }, s["n"], s["step"], s["ms"],
+                                 s["error"].as_str().map(|e| format!("\n       {e}")).unwrap_or_default());
+                        if s["checks"].is_array() && s["ok"] != true { println!("{}", s["text"].as_str().unwrap_or("")); }
+                    }
+                    println!("{}: {} passed, {} failed, {} not run, {:.1} s", if rep["ok"] == true { "PASS" } else { "FAIL" },
+                             rep["passed"], rep["failed"], rep["skipped"], rep["ms"].as_f64().unwrap_or(0.0) / 1000.0);
+                }
+                return Ok(rep["ok"] == true);
+            }
+            "mcp" => {
+                println!("MCP (Streamable HTTP): {url}/v1/mcp/browser   (?target=server|mine|sandbox)\n\nClaude Code:\n  claude mcp add --transport http am2strata-browser {url}/v1/mcp/browser --header \"Authorization: Bearer <key>\"\n\nIn a chat request: \"strata_browser\": true (or \"server\", \"mine\", \"sandbox\").");
+                return Ok(true);
+            }
+            other => return Err(format!("unknown action {other:?}: status, open, read, elements, click, type, key, fill, extract, check, console, shot, tool, datasets, dataset, delete-dataset, test, save-test, mcp")),
+        };
+        if o.json { println!("{}", serde_json::to_string_pretty(&r).unwrap()); } else { println!("{}", r["text"].as_str().unwrap_or("")); }
+        Ok(r["ok"] == true)
+    })();
+    match result {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => ExitCode::FAILURE,
+        Err(e) => { eprintln!("{e}"); ExitCode::FAILURE }
     }
 }
 
