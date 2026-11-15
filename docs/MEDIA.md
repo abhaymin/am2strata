@@ -180,4 +180,10 @@ With `"strata_media": true`, the model gets these tools:
 
 ## Video without ffmpeg
 
-MP4 files with H.264 video, which is what phones and most tools make, are decoded by the media engine itself (`openh264` and `mp4`, already part of its build). The media check's video checks and videos sent in a chat both work on a PC without ffmpeg. Other formats (WebM, MOV with other codecs, AVI) still need ffmpeg, and the error names the format. With ffmpeg installed, it is used as before for every format.
+MP4 files with H.264 video, which is what phones and most tools make, are decoded by the media engine itself (`openh264` and `mp4`, already part of its build). The media check's video checks and videos sent in a chat both work on a PC without ffmpeg. Other formats (WebM, MOV with other codecs, AVI) still need ffmpeg, and the error names the format.
+
+**B-frames:** H.264 with B-frames, x264's default and common in files made with ffmpeg, can't be read by the built-in decoder (OpenH264). For those:
+- a chat gets the video's keyframes only, and says so;
+- the media check, which needs every frame, says plainly to install ffmpeg or re-encode without B-frames (`ffmpeg -bf 0`).
+
+Videos made without B-frames (OpenH264, many phone and screen recorders) decode in full. With ffmpeg installed, it is used as before for every format.

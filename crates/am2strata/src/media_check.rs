@@ -342,7 +342,7 @@ pub async fn video_grey_frames_any(data: &[u8], fps_override: Option<f64>) -> Re
     if crate::media::ffmpeg_available() {
         return video_grey_frames(data, fps_override);
     }
-    let (pngs, fps, _) = crate::media::rust_frames(data, 0.0, RUST_MAX_FRAMES, VIDEO_W * 2).await.map_err(|e| format!("{e:#}"))?;
+    let (pngs, fps, _, _) = crate::media::rust_frames(data, 0.0, RUST_MAX_FRAMES, VIDEO_W * 2).await.map_err(|e| format!("{e:#}"))?;
     let mut gray = Vec::with_capacity(pngs.len());
     for p in &pngs {
         let img = image::load_from_memory(p).map_err(|e| format!("a frame: {e}"))?;
