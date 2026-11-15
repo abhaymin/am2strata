@@ -281,6 +281,12 @@ pub fn protected_hit(command: &str, protect: &[String]) -> Option<String> {
     if destructive && selects_in_bulk(command) {
         return Some(format!("{} (it acts on everything)", listed[0]));
     }
+    // a path glob (rm /srv/*) reaches a protected path only when its fixed part and that path overlap
+    if destructive {
+        if let Some(e) = glob_reaches(command, &listed) {
+            return Some(format!("{e} (the pattern covers it)"));
+        }
+    }
 
     // otherwise refuse only when a specific protected entry is actually named, by path or as a redirection target.
     for e in &listed {
@@ -318,8 +324,11 @@ fn has_destructive_verb(command: &str) -> bool {
 fn selects_in_bulk(command: &str) -> bool {
     let h = command.to_lowercase();
     if h.contains("$(") || h.contains('`') { return true; }   // expands to many things at runtime
-    if h.contains('*') || h.contains('?') { return true; }     // a glob matches every match, not one thing
     let tokens: Vec<&str> = h.split_whitespace().collect();
+    // a glob in a service / container / process command acts on every match (systemctl stop 'web*', pkill 'node*');
+    // a glob on a file path is judged against the protected paths instead (glob_reaches)
+    let service = tokens.iter().any(|t| ["docker", "podman", "systemctl", "kill", "pkill", "killall"].contains(t));
+    if service && (h.contains('*') || h.contains('?')) { return true; }
     if tokens.windows(2).any(|w| w[0] == "compose" && w[1] == "down") { return true; }  // docker compose down tears the stack
     if tokens.iter().any(|t| *t == "-a" || *t == "--all" || *t == "prune") { return true; }
     let mut saw_kill = false;
@@ -328,6 +337,20 @@ fn selects_in_bulk(command: &str) -> bool {
         if saw_kill && *t == "-1" { return true; }  // kill -1 / kill -9 -1 → all processes
     }
     false
+}
+
+/// The protected entry a file-path glob can reach: a word with `*` or `?` whose fixed part (before the first wildcard,
+/// quotes removed) and a protected entry overlap — one a prefix of the other. `rm -rf /srv/*` reaches `/srv/prod`;
+/// `rm -rf build/*` and `rm /tmp/x?.log` reach nothing protected.
+fn glob_reaches<'a>(command: &str, listed: &[&'a str]) -> Option<&'a str> {
+    for w in command.split_whitespace() {
+        let w = w.trim_matches(|c| c == '\'' || c == '"');
+        let Some(cut) = w.find(|c| c == '*' || c == '?') else { continue };
+        let fixed = &w[..cut];
+        if fixed.is_empty() { return listed.first().copied(); } // a bare `*`: whatever is here
+        if let Some(e) = listed.iter().find(|e| e.starts_with(fixed) || fixed.starts_with(*e)) { return Some(e); }
+    }
+    None
 }
 
 /// The filenames a `>`/`>>` redirection writes to (the word after the operator, or in a `>file` token), skipping a leading fd
@@ -614,6 +637,17 @@ mod tests {
     }
 
     #[test]
+    fn path_globs_are_refused_only_when_they_reach_a_protected_path() {
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(protected_hit("rm -rf /srv/*", &srv), Some("/srv/prod (the pattern covers it)".to_string()));
+        assert_eq!(protected_hit("rm -rf '/srv/pr*'", &srv), Some("/srv/prod (the pattern covers it)".to_string()));
+        assert_eq!(protected_hit("rm -rf build/*", &srv), None);
+        assert_eq!(protected_hit("rm /tmp/x?.log", &srv), None);
+        // a service glob still acts on everything
+        assert!(protected_hit("systemctl stop 'web*'", &vec!["web-prod".into()]).is_some());
+    }
+
+    #[test]
     fn refuses_bulk_commands_that_act_on_everything() {
         // the field-test hole: a command that selects in bulk names no protected entry, so it must still be refused.
         let prod_db = vec!["prod-db".into()];
@@ -627,7 +661,7 @@ mod tests {
         assert_eq!(protected_hit("kill -9 -1", &nginx), Some("nginx-prod (it acts on everything)".to_string()));
 
         let srv = vec!["/srv/prod".into()];
-        assert_eq!(protected_hit("rm -rf /srv/*", &srv), Some("/srv/prod (it acts on everything)".to_string()));
+        assert_eq!(protected_hit("rm -rf /srv/*", &srv), Some("/srv/prod (the pattern covers it)".to_string()));
 
         // but with nothing listed, a bulk command names no entry to refuse.
         assert_eq!(protected_hit("docker stop $(docker ps -q)", &[]), None);
