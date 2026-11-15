@@ -1,7 +1,7 @@
 //! `am2strata-run cluster | tune | clients | memory …` against a running test server (docs/GAPS-PLAN B). The CLI is an
 //! exact copy of what a user runs: the binary run with --url/--api-key, one test Server per case. It covers the four
 //! CLI columns' contract: memory add/list/forget round-trip; clients new shows a key once and never its value, list
-//! shows the name and revoke marks it revoked; cluster status says "no workers" on a single machine and `pair` refuses
+//! shows the name, edit changes a running key's tools (and that change takes effect for the key), and revoke marks it revoked; cluster status says "no workers" on a single machine and `pair` refuses
 //! a wrong code (and takes a worker for the right one); tune reports an unknown model as the server's error.
 
 mod common;
@@ -73,6 +73,37 @@ fn clients_new_shows_a_key_once_then_list_and_revoke() {
     let (_, lout2, _) = run(&s, "clients", &["list"]);
     assert!(find_line(&lout2, "laptop").unwrap_or_default().split_whitespace().any(|w| w == "revoked"),
         "the key is now revoked: {lout2:?}");
+}
+
+/// clients edit changes a running key's tools with the CLI and the change takes effect for that key (api_keys.rs).
+#[test]
+fn clients_edit_changes_the_tools_and_uses_them() {
+    let s = Server::start(&[Model::default()], &[ids("Hi.\n</think>\n\nhello")], json!({}));
+
+    // make a key with one tool set (memory); keep its value and id for the steps that follow.
+    let (c, made) = s.post("/api/keys", &json!({"name": "editor", "tools": ["memory"]}));
+    assert_eq!(c, 201, "{made}");
+    let key = made["key"].as_str().unwrap().to_string();
+    let id = made["id"].as_str().unwrap().to_string();
+
+    // edit its tools with the CLI: web instead of memory. It prints the updated record (a URL banner goes to stderr, as always);
+    // stdout never carries the key's value.
+    let (ok, out, _) = run(&s, "clients", &["edit", "--tools", "web", "--", &id]);
+    assert!(ok && !out.is_empty(), "edit printed the updated record: {out:?}");
+    assert!(out.contains("editor") && out.contains("web") && !out.contains("memory"), "the CLI shows the updated tools: {out:?}");
+    assert!(!out.contains(&key), "the printed record never carries a key's value: {out:?}");
+
+    // the list shows the new set now and no longer the old one (first column is the id, like the existing clients test).
+    let (_, lout, _) = run(&s, "clients", &["list"]);
+    assert!(find_line(&lout, "editor").unwrap_or_default().contains("web"), "the list shows the new tools: {lout:?}");
+
+    // use the key on a chat with strata_web left out; its profile now offers web_search (and no longer remember).
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base))
+        .bearer_auth(&key).json(&json!({"messages": [{"role": "user", "content": "hi"}]})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200, "the edited key still answers: {}", r.text().unwrap());
+    let prompt = tokenizer().decode(&line_ids(s.gen_lines().last().unwrap())).unwrap_or_default();
+    assert!(prompt.contains("web_search"), "the profile offers the new set (web): {prompt}");
+    assert!(!prompt.contains("remember"), "the old tool set is gone: {prompt}");
 }
 
 /// cluster status on a single machine says "no workers"; pair refuses a wrong code and exits non-zero. (cluster.rs)
