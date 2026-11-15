@@ -68,3 +68,25 @@ fn tools_cards_post_the_media_actions() {
         assert!(js.contains(url), "app.js calls {url}");
     }
 }
+
+/// Settings › Clients: editing a key reuses the New-key form's fields and saves with POST /api/keys/{id}.
+#[test]
+fn editing_a_key_reuses_the_new_form_and_saves_with_post() {
+    // the edit opens the same fields as "New key", filled with this key's values.
+    for id in ["key-name", "key-tools", "key-expires", "key-req-day", "key-tok-day", "key-models"] {
+        let js = web_asset("api-keys.js");
+        assert!(js.contains(format!("el(\"{id}\")").as_str()), "the edit fills #{id} like the New key form");
+    }
+
+    // ... and saves with POST to this key's id. The list also gains an Edit button (active keys only) whose click opens it.
+    let js = web_asset("api-keys.js");
+    assert!(js.contains("api/keys/${"), "the edit builds api/keys/{{id}}");
+    assert!(js.contains("\"POST\""), "the edit posts to save the changed fields");
+    assert!(js.contains("data-key-edit"), "each active key row shows an Edit button that opens the form");
+
+    // index.html has those same fields in the Clients section (reused for editing, no separate form needed).
+    let html = web_asset("index.html");
+    for id in ["key-name", "key-tools", "key-expires", "key-req-day", "key-tok-day", "key-models"] {
+        assert!(html.contains(format!("id=\"{id}\"").as_str()), "the reused edit form has #{id}");
+    }
+}
