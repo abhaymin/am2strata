@@ -228,5 +228,6 @@
     statusTimer = setInterval(refreshStatus, 4000);
     schedule();
   };
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", wire); else wire();
+  const start = () => { wire(); if (!el("view-browser").hidden) window.browserTab(true); };   // opened straight on #browser
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start); else start();
 })();

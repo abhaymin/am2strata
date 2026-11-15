@@ -573,6 +573,7 @@ async fn extract(b: &Browsers, page: &Page, args: &Value) -> Result<Step, String
         let v = eval_json(page, &js, 15).await?;
         if let Some(e) = v["error"].as_str() { return Err(e.to_string()); }
         let got = v["rows"].as_array().cloned().unwrap_or_default();
+        if p == 0 { if let Some(n) = v["note"].as_str().filter(|n| !n.is_empty()) { notes.push(n.to_string()); } }
         read_pages += 1;
         if p > 0 && got.first() == last_first.as_ref() && !got.is_empty() {
             notes.push(format!("page {} showed the same rows as the one before: stopped", p + 1));
@@ -650,19 +651,40 @@ const EXTRACT_JS: &str = r#"(() => { const A = __ARGS__;
   let scope = document;
   if (A.kind !== 'items' && A.selector) { try { scope = document.querySelector(A.selector); } catch (x) { return JSON.stringify({error: 'the selector is not valid CSS'}); }
     if (!scope) return JSON.stringify({error: 'nothing on the page matches the selector'}); }
-  const rows = [];
+  const rows = []; let note = '';
   if (A.kind === 'table') {
     const tables = scope.tagName === 'TABLE' ? [scope] : [...scope.querySelectorAll('table')];
-    const t = tables[A.index || 0]; if (!t) return JSON.stringify({error: 'there is no table ' + (A.index || 0) + ' (the page has ' + tables.length + ')'});
-    const trs = [...t.rows]; if (!trs.length) return JSON.stringify({rows: []});
-    let head = t.tHead && t.tHead.rows.length ? t.tHead.rows[t.tHead.rows.length - 1] : (trs[0].querySelector('th') ? trs[0] : null);
-    const names = head ? [...head.cells].map((c, i) => txt(c) || ('col' + (i + 1))) : [...trs[0].cells].map((c, i) => 'col' + (i + 1));
+    // no index: the biggest table (rows x columns), not a layout box or an infobox that comes first
+    let pickI = A.index;
+    if (pickI == null) { let best = -1; tables.forEach((x, i) => { const n = x.rows.length * Math.max(1, ...[...x.rows].slice(0, 3).map(r => r.cells.length)); if (n > best) { best = n; pickI = i; } }); }
+    const t = tables[pickI || 0]; if (!t) return JSON.stringify({error: 'there is no table ' + (pickI || 0) + ' (the page has ' + tables.length + ')'});
+    note = 'table ' + (pickI || 0) + ' of ' + tables.length + (A.index == null && tables.length > 1 ? ' (the biggest; give index for another)' : '');
+    const trs = [...t.rows]; if (!trs.length) return JSON.stringify({rows: [], note});
+    // lay the rows out on a grid: a merged cell (colspan / rowspan) fills every column and row it covers
+    const grid = (rows) => { const out = [], carry = [];
+      for (const tr of rows) { const line = [], cells = [...tr.cells]; let c = 0, k = 0;
+        while (k < cells.length || carry.slice(c).some(x => x && x.left > 0)) {
+          if (carry[c] && carry[c].left > 0) { line[c] = carry[c].v; carry[c].left--; c++; continue; }
+          if (k >= cells.length) { c++; if (c > 300) break; continue; }
+          const cell = cells[k++], cs = Math.min(50, Math.max(1, cell.colSpan || 1)), rs = Math.min(500, Math.max(1, cell.rowSpan || 1)), v = {cell};
+          for (let j = 0; j < cs; j++) { line[c + j] = v; carry[c + j] = rs > 1 ? {left: rs - 1, v} : null; }
+          c += cs; }
+        out.push(line); }
+      return out; };
+    // the header: the <thead>'s rows, else the leading rows made only of <th>
+    let nh = t.tHead ? t.tHead.rows.length : 0;
+    if (!nh) { while (nh < trs.length && trs[nh].cells.length && [...trs[nh].cells].every(c => c.tagName === 'TH')) nh++; }
+    const g = grid(trs), width = Math.max(...g.map(l => l.length));
+    const names = [];
+    for (let c = 0; c < width; c++) { const parts = [];
+      for (let r = 0; r < nh; r++) { const v = g[r][c]; const x = v ? txt(v.cell).replace(/\[[\w\s]*\]/g, '').trim() : ''; if (x && parts[parts.length - 1] !== x) parts.push(x); }
+      names.push(parts.join(' ') || ('col' + (c + 1))); }
     const seen = {}; names.forEach((n, i) => { if (seen[n]) names[i] = n + '_' + (++seen[n]); else seen[n] = 1; });
-    for (const tr of trs) { if (tr === head || (t.tHead && t.tHead.contains(tr))) continue;
-      const cells = [...tr.cells]; if (!cells.length || cells.every(c => c.tagName === 'TH') && tr === trs[0]) continue;
-      const o = {}; cells.forEach((c, i) => { const n = names[i] || ('col' + (i + 1)); o[n] = txt(c);
-        const as = c.querySelectorAll('a[href]'); if (as.length === 1) o[n + '_link'] = abs(as[0].getAttribute('href')); });
-      rows.push(o); }
+    for (let r = nh; r < g.length; r++) { const line = g[r]; if (!line.length) continue;
+      const o = {}; let any = false;
+      for (let c = 0; c < width; c++) { const v = line[c]; if (!v) continue; const n = names[c]; const x = txt(v.cell); o[n] = x; if (x) any = true;
+        const as = v.cell.querySelectorAll("a[href]:not([href^='#'])"); if (as.length === 1) o[n + '_link'] = abs(as[0].getAttribute('href')); }
+      if (any) rows.push(o); }
   } else if (A.kind === 'items') {
     let items; try { items = document.querySelectorAll(A.selector); } catch (x) { return JSON.stringify({error: 'the selector is not valid CSS'}); }
     for (const it of items) { const o = {};
@@ -684,7 +706,7 @@ const EXTRACT_JS: &str = r#"(() => { const A = __ARGS__;
     o.h1 = [...document.querySelectorAll('h1')].map(txt).filter(Boolean).slice(0, 5);
     rows.push(o);
   } else return JSON.stringify({error: 'kind is table, items, links or meta'});
-  return JSON.stringify({rows}); })()"#;
+  return JSON.stringify({rows, note}); })()"#;
 
 // -------------------------------------------------------------------------------------------- elements
 

@@ -19,6 +19,10 @@ const FORM: &str = r#"<!doctype html><title>Survey</title><form id=f action="/se
 <button type=submit>Submit</button></form>
 <script>window.changes=0;document.querySelectorAll('input,select,textarea').forEach(e=>e.addEventListener('change',()=>window.changes++))</script>"#;
 
+const MERGED: &str = r#"<!doctype html><title>Cities</title><table><tr><th>x</th></tr></table><table>
+<thead><tr><th rowspan=2>City</th><th rowspan=2>Country</th><th colspan=2>Population[a]</th></tr><tr><th>2018</th><th>2025</th></tr></thead>
+<tbody><tr><td><a href="/tokyo">Tokyo</a></td><td rowspan=2>Japan</td><td>37</td><td>36</td></tr><tr><td>Osaka</td><td>19</td><td>18</td></tr></tbody></table>"#;
+
 const MAP: &str = r#"<!doctype html><title>Map</title><body style="margin:0"><div id=m style="width:1280px;height:800px;background:#9cf"></div>
 <script>window.log=[];const m=document.getElementById('m');let down=null;
 m.addEventListener('mousedown',e=>{down=[e.clientX,e.clientY]});
@@ -35,7 +39,7 @@ fn table(page: u32) -> String {
     let rows: String = (1..=2).map(|i| { let n = (page - 1) * 2 + i; format!("<tr><td><a href=\"/item/{n}\">Book {n}</a></td><td>{}.00</td></tr>", n * 10) }).collect();
     let items: String = (1..=2).map(|i| { let n = (page - 1) * 2 + i; format!("<div class=card><h3>Card {n}</h3><span class=price>{n}</span><a href=\"/c/{n}\">more</a></div>") }).collect();
     let next = if page < 2 { "<a class=next href=\"/table?p=2\">Next</a>" } else { "" };
-    format!("<!doctype html><title>Books p{page}</title><table><thead><tr><th>Title</th><th>Price</th></tr></thead><tbody>{rows}</tbody></table>{items}{next}")
+    format!("<!doctype html><title>Books p{page}</title><table class=layout><tr><td>menu</td></tr></table><table><thead><tr><th>Title</th><th>Price</th></tr></thead><tbody>{rows}</tbody></table>{items}{next}")
 }
 
 async fn serve() -> String {
@@ -43,6 +47,7 @@ async fn serve() -> String {
     let app = axum::Router::new()
         .route("/form", get(|| async { Html(FORM) }))
         .route("/sent", get(|| async { Html("<title>Thanks</title>sent") }))
+        .route("/merged", get(|| async { Html(MERGED) }))
         .route("/map", get(|| async { Html(MAP) }))
         .route("/errors", get(|| async { Html(ERRORS) }))
         .route("/table", get(|q: axum::extract::Query<HashMap<String, String>>| async move {
@@ -119,6 +124,7 @@ async fn the_browser_tools_work_on_real_pages() {
     // ---- scraping: a table, items with fields, two pages through "Next", into a keyed dataset (again: replaced, not copied)
     b.call(c, "browser_open", &json!({"url": format!("{base}/table")})).await.unwrap();
     let t = b.call(c, "browser_extract", &json!({"kind": "table"})).await.unwrap().text;
+    assert!(t.contains("table 1 of 2 (the biggest"), "{t}");
     assert!(t.starts_with("2 row(s)") && t.contains("\"Title\": \"Book 1\"") && t.contains("\"Title_link\": \"") && t.contains("/item/1"), "{t}");
     let args = json!({"kind": "items", "selector": ".card", "fields": {"name": "h3", "price": ".price", "url": "a@href"}, "next": "Next", "pages": 5,
                       "dataset": "cards", "key": ["url"]});
@@ -134,6 +140,11 @@ async fn the_browser_tools_work_on_real_pages() {
     assert!(meta.contains("\"title\": \"Books p2\""), "{meta}");
     let s = b.call(c, "browser_save", &json!({"dataset": "notes", "rows": [{"a": 1}, "x"]})).await.unwrap().text;
     assert!(s.contains("1 added") && s.contains("1 skipped"), "{s}");
+
+    // merged header cells name their columns, and a row-spanning cell fills the rows under it
+    b.call(c, "browser_open", &json!({"url": format!("{base}/merged")})).await.unwrap();
+    let t = b.call(c, "browser_extract", &json!({"kind": "table"})).await.unwrap().text;
+    assert!(t.contains("\"Population 2025\": \"18\"") && t.contains("\"City_link\": \"") && t.matches("\"Country\": \"Japan\"").count() == 2, "{t}");
 
     // ---- a map: drag pans, the wheel zooms both ways, double and right clicks, keys with modifiers
     b.call(c, "browser_open", &json!({"url": format!("{base}/map")})).await.unwrap();
