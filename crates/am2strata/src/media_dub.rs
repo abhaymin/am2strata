@@ -329,7 +329,10 @@ fn parse_req(req: &Value) -> Result<DubReq, String> {
         let txt = l.get("text").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let spk = l.get("speaker").and_then(Value::as_str).unwrap_or("").to_string();
         if txt.is_empty() { return Err(format!("dub: line {} text is empty", i + 1)); }
-        lines.push(json!({"speaker": spk, "text": txt,
+        // every request line is a narration line (its slot is where the take goes): without "kind" here, line_slots found
+        // no slot and the dub came back as silence with an empty report
+        let kind = l.get("kind").and_then(Value::as_str).unwrap_or("line").to_string();
+        lines.push(json!({"speaker": spk, "text": txt, "kind": kind,
             "t0": l.get("t0").or_else(|| l.get("at")).and_then(Value::as_f64).unwrap_or(0.0),
              "dur": l.get("dur").or_else(|| l.get("length")).and_then(Value::as_f64).unwrap_or(0.0)}));
     }
@@ -633,5 +636,15 @@ mod tests {
         assert!(!kept.is_empty(), "keeps the loud end");
         assert!(kept.iter().map(|&s| s.abs()).fold(0f32, f32::max) > 0.9, "the largest-magnitude (negative) sample survives");
         assert!(kept.len() < x.len() / 2, "only the loud end remains ({}/{} frames: early quiet is cleared)", kept.len(), x.len());
+    }
+
+    /// the endpoint's own parsing keeps every line a narration slot (a request without "kind" was dubbed into silence)
+    #[test]
+    fn request_lines_keep_their_slots() {
+        let d = parse_req(&json!({"lines": [{"speaker": "Laura", "text": "Hallo", "t0": 1.5, "dur": 2.0},
+                                            {"text": "Zwei", "at": 4.0, "length": 1.0}]})).unwrap();
+        assert_eq!(line_slots(&d.lines), vec![(1.5, 2.0), (4.0, 1.0)]);
+        let d = parse_req(&json!({"lines": [{"text": "a", "kind": "pause", "t0": 0.0, "dur": 1.0}]})).unwrap();
+        assert!(line_slots(&d.lines).is_empty(), "an explicit other kind is kept");
     }
 }
