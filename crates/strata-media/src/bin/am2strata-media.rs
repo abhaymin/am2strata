@@ -944,20 +944,61 @@ fn video_frames(cmd: &Value) -> Result<Value> {
         (0..max).map(|k| ((k as f64 * (total - 1) as f64 / (max - 1) as f64).round() as usize).min(total - 1)).collect()
     };
 
-    // feed the SPS/PPS once, then decode each sample; keep the ones selected above.
-    let (mut out_w, mut out_h) = (0u32, 0u32);
-    let mut dec = Decoder::new().map_err(|e| anyhow!("opening the H.264 decoder: {e}"))?;
     let mut init = Vec::new();
     init.extend_from_slice(&[0, 0, 0, 1]);
     init.extend_from_slice(&sps);
     init.extend_from_slice(&[0, 0, 0, 1]);
     init.extend_from_slice(&pps);
-    dec.decode(&init).map_err(|e| anyhow!("reading the video's parameters: {e}"))?;
+    let new_decoder = || -> Result<Decoder> {
+        let mut d = Decoder::new().map_err(|e| anyhow!("opening the H.264 decoder: {e}"))?;
+        d.decode(&init).map_err(|e| anyhow!("reading the video's parameters: {e}"))?;
+        Ok(d)
+    };
+    let mut samples = Vec::with_capacity(total);
+    for i in 0..total {
+        samples.push(reader.read_sample(vid, (i + 1) as u32).map_err(|e| anyhow!("read sample {}: {e}", i))?.ok_or_else(|| anyhow!("no sample {i}"))?);
+    }
+    // B-frames (x264's default): frames shown in another order than stored, which the OpenH264 decoder cannot read. A
+    // composition offset on any sample marks them. Then only the keyframes (each self-contained) can be read here.
+    let bframes = samples.iter().any(|s| s.rendering_offset != 0);
+    let all_needed = every_s <= 0.0 && max >= total;
+    if bframes && all_needed {
+        bail!("this MP4's H.264 uses B-frames (x264's default), which the built-in decoder cannot read: install ffmpeg, \
+               or re-encode the video without B-frames (ffmpeg -bf 0, or x264 --bframes 0)");
+    }
+    let keep: Vec<usize> = if bframes {
+        let keys: Vec<usize> = (0..total).filter(|&i| samples[i].is_sync).collect();
+        let kept: Vec<usize> = if every_s > 0.0 {
+            let mut v = Vec::new();
+            let mut last = -1.0;
+            for &i in &keys {
+                let t = i as f64 / fps;
+                if last < 0.0 || t - last >= every_s { v.push(i); last = t; if v.len() >= max { break; } }
+            }
+            v
+        } else if keys.len() <= max {
+            keys.clone()
+        } else {
+            let mut v: Vec<usize> = (0..max).map(|k| keys[(k as f64 * (keys.len() - 1) as f64 / (max - 1).max(1) as f64).round() as usize]).collect();
+            v.dedup();
+            v
+        };
+        kept
+    } else {
+        keep
+    };
 
     let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    let (mut out_w, mut out_h) = (0u32, 0u32);
     let mut frames = Vec::new();
+    let mut dec = new_decoder()?;
     for i in 0..total {
-        let s = reader.read_sample(vid, (i + 1) as u32).map_err(|e| anyhow!("read sample {}: {e}", i))?.ok_or_else(|| anyhow!("no sample {i}"))?;
+        if bframes && !keep.contains(&i) { continue; }
+        if bframes {
+            // each keyframe decoded on its own: a fresh decoder, its parameters, the one frame
+            dec = new_decoder()?;
+        }
+        let s = &samples[i];
         let Some(y) = dec.decode(&nals_to_packet(&sample_to_nals(&s.bytes))).map_err(|e| anyhow!("decode frame {}: {e}", i))? else { continue };
         if !keep.contains(&i) { continue; }
         // dimensions_uv() is the chroma plane (half the res for I420); full res is twice that.
@@ -971,7 +1012,15 @@ fn video_frames(cmd: &Value) -> Result<Value> {
         frames.push(json!({"t": i as f64 / fps, "png": b64(png)}));
     }
 
-    Ok(json!({"event": "frames", "fps": (fps * 1000.0).round() / 1000.0, "duration_s": (duration * 1000.0).round() / 1000.0, "width": out_w, "height": out_h, "frames": frames}))
+    if frames.is_empty() {
+        bail!("no frame of this MP4 could be decoded here: install ffmpeg");
+    }
+    let mut out = json!({"event": "frames", "fps": (fps * 1000.0).round() / 1000.0, "duration_s": (duration * 1000.0).round() / 1000.0, "width": out_w, "height": out_h, "frames": frames});
+    if bframes {
+        out["keyframes_only"] = json!(true);
+        out["note"] = json!("this video uses B-frames, which the built-in decoder cannot read: only its keyframes are shown (install ffmpeg for every frame)");
+    }
+    Ok(out)
 }
 
 fn main() {
@@ -1129,7 +1178,11 @@ mod video_tests {
     const H: usize = 64;
 
     /// Build a short H.264 clip (first frame black, last white) and mux it into an MP4 with the mp4 crate's writer.
-    fn make_clip() -> Vec<u8> {
+    fn make_clip() -> Vec<u8> { make_clip_with(false) }
+
+    /// The same clip, with `bframes` marking every sample after the first with a composition offset (as a B-frame file
+    /// has), with the first sample the only keyframe.
+    fn make_clip_with(bframes: bool) -> Vec<u8> {
         use openh264::encoder::{Encoder, EncoderConfig, FrameRate};
         use openh264::formats::{RgbSliceU8, YUVBuffer};
 
@@ -1159,7 +1212,8 @@ mod video_tests {
             w.add_track(&tc).expect("track");
             let fd = timescale / 10;
             for (i, nals) in samples.iter().enumerate() {
-                let s = mp4::Mp4Sample { start_time: i as u64 * fd as u64, duration: fd as u32, rendering_offset: 0, is_sync: i == 0,
+                let s = mp4::Mp4Sample { start_time: i as u64 * fd as u64, duration: fd as u32,
+                    rendering_offset: if bframes && i > 0 { fd as i32 } else { 0 }, is_sync: i == 0,
                     bytes: mp4::Bytes::from(nals_to_sample(nals)) };
                 w.write_sample(1, &s).expect("sample");
             }
@@ -1175,6 +1229,23 @@ mod video_tests {
         let n = img.width() as usize * img.height() as usize;
         (0..n).map(|i| 0.299 * px[i * 3] as f64 + 0.587 * px[i * 3 + 1] as f64 + 0.114 * px[i * 3 + 2] as f64)
             .sum::<f64>() / n as f64
+    }
+
+    /// A B-frame MP4 (composition offsets): asking for every frame is refused with a message that says why and what to
+    /// do; asking for a few frames gives the keyframes, marked keyframes_only.
+    #[test]
+    fn a_b_frame_mp4_gives_keyframes_or_a_clear_refusal() {
+        let dir = format!("{}/../target-media", env!("CARGO_MANIFEST_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = format!("{dir}/video-bframes-test-{}.mp4", std::process::id());
+        std::fs::write(&file, make_clip_with(true)).unwrap();
+        let e = video_frames(&json!({"op": "video_frames", "file": file, "every_s": 0.0, "max": 100, "width": 64})).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("B-frames") && msg.contains("ffmpeg"), "{msg}");
+        let r = video_frames(&json!({"op": "video_frames", "file": file, "every_s": 0.0, "max": 3, "width": 64})).unwrap();
+        assert_eq!(r["keyframes_only"], json!(true), "{r}");
+        assert_eq!(r["frames"].as_array().unwrap().len(), 1, "the one keyframe: {r}");
+        let _ = std::fs::remove_file(&file);
     }
 
     /// Encode a synthetic H.264 clip to an MP4, read it back with the video_frames op, and check the frame count, fps,

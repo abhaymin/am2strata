@@ -125,7 +125,7 @@ pub static ENGINE: std::sync::OnceLock<std::sync::Arc<crate::image_gen::Media>> 
 /// Frames from the media engine's own MP4/H.264 decoder (`video_frames`), no ffmpeg: `max` frames spread evenly
 /// (every_s 0) or one every `every_s` seconds, each scaled to `width`. -> (PNG bytes per frame, fps, duration in s).
 /// Other formats come back as the engine's error, which names them and says they need ffmpeg.
-pub async fn rust_frames(video: &[u8], every_s: f64, max: usize, width: usize) -> Result<(Vec<Vec<u8>>, f64, f64)> {
+pub async fn rust_frames(video: &[u8], every_s: f64, max: usize, width: usize) -> Result<(Vec<Vec<u8>>, f64, f64, Option<String>)> {
     let Some(engine) = ENGINE.get() else { bail!("this server cannot decode video: no media engine and no ffmpeg") };
     let dir = tempdir()?;
     let input = dir.join("in.mp4");
@@ -142,7 +142,7 @@ pub async fn rust_frames(video: &[u8], every_s: f64, max: usize, width: usize) -
     if out.is_empty() {
         bail!("the video gave no frames");
     }
-    Ok((out, v["fps"].as_f64().unwrap_or(0.0), v["duration_s"].as_f64().unwrap_or(0.0)))
+    Ok((out, v["fps"].as_f64().unwrap_or(0.0), v["duration_s"].as_f64().unwrap_or(0.0), v["note"].as_str().map(str::to_owned)))
 }
 
 pub fn ffmpeg_available() -> bool {
@@ -224,16 +224,18 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
                 Some(src) => {
                     let data = load_source(&src).await?;
                     // ffmpeg when installed (any format); else the media engine's own MP4/H.264 decoder
-                    let (fs, mime) = if ffmpeg {
-                        (frames(&data, n).await?, "image/jpeg")
+                    let (fs, mime, note) = if ffmpeg {
+                        (frames(&data, n).await?, "image/jpeg", None)
                     } else {
-                        (rust_frames(&data, 0.0, n, 1280).await
+                        let r = rust_frames(&data, 0.0, n, 1280).await
                             .map_err(|e| anyhow::anyhow!("this server cannot decode this video without ffmpeg: {e:#}. Install ffmpeg ({}), \
                                                           or send the video's frames as images in one message",
-                                crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")))?.0, "image/png")
+                                crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")))?;
+                        (r.0, "image/png", r.3)
                     };
                     videos += 1;
-                    out.push(json!({"type": "text", "text": format!("[A video, as {} frames in order:]\n", fs.len())}));
+                    let how = note.map(|n| format!(" ({n})")).unwrap_or_default();
+                    out.push(json!({"type": "text", "text": format!("[A video, as {} frames in order{how}:]\n", fs.len())}));
                     for f in fs {
                         let url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(f));
                         out.push(json!({"type": "image_url", "image_url": {"url": url}}));
