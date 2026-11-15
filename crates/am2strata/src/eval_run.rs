@@ -233,16 +233,23 @@ pub fn run(srv: &Server, o: &Opts) -> Result<Value, String> {
         let v = srv.json("GET", "/v1/models", None, 30)?;
         v["data"][0]["id"].as_str().ok_or("the server lists no model")?.to_string()
     } };
-    let vm_ok = srv.json("GET", "/api/vm", None, 30).is_ok_and(|v| v["available"] != false);
+    // a VM job needs the VM and computer use on in the VM mode (else the model has no VM tools: skipped, not failed)
+    let vm_ok = srv.json("GET", "/api/vm", None, 30).is_ok_and(|v| v["available"] != false)
+        && srv.json("GET", "/api/computer/status", None, 30).is_ok_and(|c| c["on"] == true && c["mode"] == "vm");
     let mut rows = Vec::new();
     for j in &jobs {
         let name = j["name"].as_str().unwrap();
-        if j["needs"] == "vm" && !vm_ok { eprintln!("{name}: skipped (needs the sandbox VM)"); rows.push(json!({"job": name, "skipped": "needs the sandbox VM"})); continue; }
+        if j["needs"] == "vm" && !vm_ok { eprintln!("{name}: skipped (needs the sandbox VM with computer use on, mode vm)"); rows.push(json!({"job": name, "skipped": "needs the sandbox VM with computer use on (mode vm)"})); continue; }
         for t in 1..=o.tries {
             eprintln!("{name} (try {t}/{}) on {model}", o.tries);
             if let Some(s) = j["setup"]["vm"].as_str() {
-                if let Err(e) = srv.json("POST", "/api/vm/exec", Some(&json!({"command": s, "root": true, "timeout_s": 900})), 960) {
-                    rows.push(json!({"job": name, "try": t, "pass": false, "score": 0.0, "notes": [format!("setup failed: {e}")]})); continue;
+                // the setup must succeed (its exit code, not only the HTTP call), else the try is not a test of the model
+                let r = srv.json("POST", "/api/vm/exec", Some(&json!({"command": s, "root": true, "timeout_s": 900})), 960);
+                let failed = match &r { Err(e) => Some(e.clone()), Ok(v) if v["code"] != 0 => Some(format!("exit {}: {}", v["code"],
+                    v["output"].as_str().unwrap_or("").chars().rev().take(200).collect::<String>().chars().rev().collect::<String>())), Ok(_) => None };
+                if let Some(e) = failed {
+                    eprintln!("  setup failed: {e}");
+                    rows.push(json!({"job": name, "try": t, "skipped": format!("its setup failed: {e}")})); continue;
                 }
             }
             if let Some(ds) = j["check"]["kind"].as_str().filter(|k| *k == "dataset").and(j["check"]["name"].as_str()) {
