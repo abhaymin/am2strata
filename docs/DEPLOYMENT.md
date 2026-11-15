@@ -715,7 +715,10 @@ last message of the chat), so it sees the whole job and not only the planner's b
   unique and 1-32 of `[a-z0-9_-]`; an entry that fails validation, or a name used twice, is skipped with a warning at start.
 - **`url`:** the base of an OpenAI-compatible server. This server POSTs `{url}/chat/completions` (non-streaming), sending
   the expert a system message ("You are the <name> expert. <about>. ...") and a user message with "The user's original
-  request: ..." followed by "The question for you: ..." plus any `context`.
+  request: ..." followed by "The question for you: ..." plus any `context`. If an expert's `url` is *this* server itself —
+  a loopback address (127.0.0.1 / localhost / ::1) on this PC's own listen port — calling it would wait for the chat's own
+  GPU turn and hang until the timeout, so `ask_expert` refuses it at call time with a clear error ("the <name> expert is this
+  server itself; point it at another server or a remote model") rather than contacting it.
 - **`model`:** what runs at that endpoint; it is named in the answer that comes back ("Answer from the <name> expert
   (<model>): ...").
 - **`key_env`, `max_tokens`, `timeout_s`:** optional. If the expert needs a key, name the environment variable that holds
