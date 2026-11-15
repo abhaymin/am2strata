@@ -24,6 +24,11 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # RgbImage for chain_hold.rs (mold uses the same image 0.25)
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Video decode (A14): demux MP4 with mp4, decode H.264 with openh264, in Rust without ffmpeg. Both were already pulled in
+# transitively through mold's "mp4" feature; listing them direct at the same pinned versions keeps one copy and needs no
+# new crate to be fetched (strata-media uses them itself now).
+openh264 = "0.9.9"
+mp4 = "0.14.0"
 anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 base64 = "0.22"
