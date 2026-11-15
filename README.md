@@ -3,6 +3,7 @@
 ![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows (x64 and Arm); OpenAI, Anthropic and Gemini APIs, API keys with usage, HTTPS and one live WebSocket; a Workshop for GGUF conversion, quantizing, LoRA merging and training data; a sandbox VM for computer use; coding agents, songs, voices, images and video](docs/media/banner.webp)
 
 [![Release](https://img.shields.io/github/v/release/abhaymin/am2strata)](https://github.com/abhaymin/am2strata/releases/latest)
+[![GitHub stars](https://img.shields.io/github/stars/abhaymin/am2strata?style=flat&logo=github&label=Stars)](https://github.com/abhaymin/am2strata/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/abhaymin)
 
