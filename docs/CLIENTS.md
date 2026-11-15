@@ -11,8 +11,13 @@ Anthropic-compatible.
 - **Client keys** open the model APIs only (chat, messages, responses, Gemini, media, `/v1/memory`, `/v1/mcp/browser`
   when the profile has `browser`). They never open the settings.
 - **Making keys at run time:** Settings › Clients or `am2strata-run keys create --name laptop --tools web,memory
-  --expires 30d`. Each has usage counts per day and per model (`am2strata-run keys usage`, `GET /v1/usage` for a
-  client's own). A key can carry limits: `--requests-per-day`, `--tokens-per-day`, and models.
+   --expires 30d`. Each has usage counts per day and per model (`am2strata-run keys usage`, `GET /v1/usage` for a
+   client's own). A key can carry limits: `--requests-per-day`, `--tokens-per-day`, and models.
+- **Editing a generated key:** Settings › Clients shows an **Edit** on each working key; it opens the same fields as the
+   "New key" form, filled with this key's values, and saves only what changed (`POST /api/keys/{id}`) — the change takes
+   effect at once. From a terminal: `am2strata-run clients edit <id> [--name laptop] [--tools web,memory] [--expires 30d |
+   never]`, which prints the updated record (never the key). A taken name or bad field is reported; generated keys from a
+   profile's name can't be retaken. Profiles from the run config are read-only — edit them there.
 
 ## Profiles in the run config
 
@@ -49,6 +54,8 @@ Anthropic-compatible.
 
 Memory is on by default for API calls in the `api` space; `"strata_memory": false` turns it off for one request.
 
-## Not done yet
+## Profiles from the run config stay read-only
 
-Profiles are edited in the run config; Settings › Clients shows them but doesn't edit them yet (GAPS-PLAN A8).
+Settings › Clients shows each profile but does not edit it. A profile's keys and tools come from the `"clients"` block in
+the run config, so they are edited there and take effect on the server's next start. Generated keys (made at run time),
+by contrast, are edited live as above. This is the half of GAPS-PLAN A8 that was left: editing profiles from Settings.
