@@ -86,11 +86,9 @@ fn sample(logits: &[f32], s: &mut Sampling) -> u32 {
     idx[p.len() - 1] as u32
 }
 
-/// MemAvailable from /proc/meminfo, in bytes (0 when unknown).
+/// Free RAM in bytes (0 when unknown), on Linux, macOS and Windows (strata_pack::sysmem).
 fn mem_available() -> u64 {
-    std::fs::read_to_string("/proc/meminfo").ok()
-        .and_then(|t| t.lines().find(|l| l.starts_with("MemAvailable:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok()))
-        .map(|kb| kb * 1024).unwrap_or(0)
+    strata_pack::sysmem::available_mib() * 1024 * 1024
 }
 
 fn main() {

@@ -11,3 +11,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Windows RAM (sysmem.rs): GlobalMemoryStatusEx
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
