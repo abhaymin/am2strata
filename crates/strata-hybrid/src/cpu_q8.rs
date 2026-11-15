@@ -146,6 +146,115 @@ fn q6k(row: &[u8], x: &Q8K) -> f32 {
     s
 }
 
+/// Q4_K for several inputs: each block's nibbles and scales unpacked once, then dotted with every input. Each input's
+/// sums are taken in exactly `q4k`'s order, so every result equals `q4k`'s bit for bit.
+#[inline(always)]
+fn q4k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    out.iter_mut().for_each(|o| *o = 0.0);
+    let mut vals = [[0i8; 32]; 8];
+    let mut ds = [0f32; 8];
+    let mut ms = [0f32; 8];
+    for (bi, b) in row.chunks_exact(144).enumerate() {
+        let (d, dmin) = (h(b, 0), h(b, 2));
+        let sc = &b[4..16];
+        let qs = &b[16..144];
+        for c in 0..4 {
+            for l in 0..32 {
+                let v = qs[c * 32 + l];
+                vals[2 * c][l] = (v & 0x0f) as i8;
+                vals[2 * c + 1][l] = (v >> 4) as i8;
+            }
+        }
+        for g in 0..8 {
+            let j = g % 4;
+            let (scale, min) = if g < 4 {
+                (sc[j] & 0x3f, sc[4 + j] & 0x3f)
+            } else {
+                ((sc[8 + j] & 0x0f) | ((sc[j] >> 2) & 0x30), (sc[8 + j] >> 4) | ((sc[4 + j] >> 2) & 0x30))
+            };
+            ds[g] = d * scale as f32;
+            ms[g] = dmin * min as f32;
+        }
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let xq = &x.q[bi * 256..bi * 256 + 256];
+            let mut acc = 0f32;
+            for c in 0..4 {
+                for g in [2 * c, 2 * c + 1] {
+                    let p = dot32(&vals[g], &xq[g * 32..g * 32 + 32]);
+                    acc += ds[g] * p as f32 - ms[g] * x.sum32[bi * 8 + g] as f32;
+                }
+            }
+            *o += acc * x.d[bi];
+        }
+    }
+}
+
+/// Q6_K for several inputs, unpacked once per block; each result equals `q6k`'s bit for bit.
+#[inline(always)]
+fn q6k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    out.iter_mut().for_each(|o| *o = 0.0);
+    let mut vals = [[0i8; 32]; 8];
+    for (bi, b) in row.chunks_exact(210).enumerate() {
+        let (ql, qh, sc) = (&b[0..128], &b[128..192], &b[192..208]);
+        let d = h(b, 208);
+        for hh in 0..2 {
+            for k in 0..4 {
+                let g = hh * 4 + k;
+                for l in 0..32 {
+                    let lo = (ql[hh * 64 + (k % 2) * 32 + l] >> (4 * (k / 2))) & 0x0f;
+                    let hi = (qh[hh * 32 + l] >> (2 * k)) & 0x03;
+                    vals[g][l] = (lo | (hi << 4)) as i8 - 32;
+                }
+            }
+        }
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let xq = &x.q[bi * 256..bi * 256 + 256];
+            let mut acc = 0i32;
+            for g in 0..8 {
+                let xs32 = &xq[g * 32..g * 32 + 32];
+                acc += sc[2 * g] as i8 as i32 * dot16(&vals[g][0..16], &xs32[0..16]);
+                acc += sc[2 * g + 1] as i8 as i32 * dot16(&vals[g][16..32], &xs32[16..32]);
+            }
+            *o += d * x.d[bi] * acc as f32;
+        }
+    }
+}
+
+#[inline(always)]
+fn body_many(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    match t {
+        Fast::Q4K => q4k_many(row, xs, out),
+        Fast::Q6K => q6k_many(row, xs, out),
+        _ => unreachable!("cpu_q8 handles Q4_K and Q6_K"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn row_dot_many_avx2(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    body_many(t, row, xs, out)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn row_dot_many_dotprod(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    body_many(t, row, xs, out)
+}
+
+/// One weight row dotted with several inputs (a prompt chunk): out[i] = row_dot(t, row, &xs[i]), the row unpacked once.
+#[inline]
+pub fn row_dot_many(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    debug_assert_eq!(xs.len(), out.len());
+    match path() {
+        Path::Baseline => body_many(t, row, xs, out),
+        // SAFETY: path() returns these only when the CPU has the features
+        #[cfg(target_arch = "x86_64")]
+        Path::Avx2 => unsafe { row_dot_many_avx2(t, row, xs, out) },
+        #[cfg(target_arch = "aarch64")]
+        Path::DotProd => unsafe { row_dot_many_dotprod(t, row, xs, out) },
+    }
+}
+
 #[inline(always)]
 fn body(t: Fast, row: &[u8], x: &Q8K) -> f32 {
     match t {
@@ -219,6 +328,31 @@ mod tests {
         *seed ^= *seed >> 7;
         *seed ^= *seed << 17;
         *seed
+    }
+
+    /// Several inputs at once give exactly what one at a time gives (each input's sums in the same order).
+    #[test]
+    fn many_inputs_equal_one_at_a_time_exactly() {
+        let mut seed = 0x0DDB_A11C_0FFE_E123u64;
+        for (ty, bb) in [("Q4_K", 144usize), ("Q6_K", 210usize)] {
+            let t = Fast::of(ty).unwrap();
+            let blocks = 3;
+            let mut row: Vec<u8> = (0..blocks * bb).map(|_| rng(&mut seed) as u8).collect();
+            for b in 0..blocks {
+                let o = b * bb;
+                let mut set = |at: usize, v: f32| row[o + at..o + at + 2].copy_from_slice(&strata_pack::num::f32_to_f16(v).to_le_bytes());
+                if ty == "Q4_K" { set(0, 0.02); set(2, 0.01); } else { set(208, 0.015); }
+            }
+            let xs: Vec<Q8K> = (0..7).map(|_| {
+                let x: Vec<f32> = (0..blocks * 256).map(|_| (rng(&mut seed) % 4001) as f32 / 1000.0 - 2.0).collect();
+                Q8K::quantize(&x).unwrap()
+            }).collect();
+            let mut many = vec![0f32; xs.len()];
+            row_dot_many(t, &row, &xs, &mut many);
+            for (i, x) in xs.iter().enumerate() {
+                assert_eq!(many[i].to_bits(), row_dot(t, &row, x).to_bits(), "{ty} input {i}");
+            }
+        }
     }
 
     /// The quantized activations are exactly Vdt::Q8K's (q * d equals round_trip's values).
