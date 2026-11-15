@@ -180,6 +180,7 @@ cargo build --release --manifest-path crates/strata-media/Cargo.toml --features 
 - Clone only a voice whose speaker has agreed to it.
 
 - **From the command line,** `am2strata-run media` wraps these endpoints — `image/video/speak/song`, `dub/check/produce/job` (one example per action in [docs/MEDIA.md](docs/MEDIA.md)). It writes the file to `--out`, prints a transcript, and finds the server from `--url`/`AM2STRATA_URL` and the key from `--api-key`/`AM2STRATA_API_KEY`.
+- **Managing this PC:** `am2strata-run cluster status` / `pair <url> <code>` joins a worker to the cluster; `am2strata-run tune <model>` runs the optimizer (it starts, follows its progress and prints the result); `am2strata-run clients new` / `list` / `revoke` edits client profiles and their keys (a key is printed once and kept nowhere); `am2strata-run memory list` / `add` / `forget` stores facts. Each reads the server from `--url`/`AM2STRATA_URL` and the key from `--api-key`/`AM2STRATA_API_KEY`, prints the answer on stdout, and exits non-zero on a server error.
 
 ## Packing tools
 

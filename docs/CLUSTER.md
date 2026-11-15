@@ -104,6 +104,14 @@ curl -s http://127.0.0.1:8000/api/cluster/pair \
 # {"paired":"macm4","url":"http://…:8000","node_id":"…","encrypted":true}
 ```
 
+The same from a terminal (read the worker's 6-digit code from its Settings › Cluster, or `am2strata-run cluster status`):
+
+```bash
+am2strata-run cluster pair http://<worker address>:8000 <the 6-digit code>
+# paired macm4
+# node_id …, encrypted
+```
+
 What happens:
 1. The master sends the code and its own pin.
 2. The worker checks the code in constant time. Five wrong codes lock pairing for 10 minutes.
@@ -117,6 +125,16 @@ What happens:
 ```bash
 curl -s http://127.0.0.1:8000/api/cluster -H "Authorization: Bearer $AM2STRATA_API_KEY" -H "Origin: http://127.0.0.1:8000"
 ```
+
+On a terminal (the same `--url`/`--api-key`, or from this PC's own run config):
+
+```bash
+am2strata-run cluster status
+# <this node> (master)
+# - macm4: ready=true TLS 1.3, pinned certificates :: models[<worker's model>] loaded=<it>
+```
+
+On a single machine it prints `no workers`; on a worker it also prints its pairing code and its masters.
 
 Each worker shows:
 - `"transport": "TLS 1.3, pinned certificates"`;
@@ -155,8 +173,14 @@ am2strata-run tls self-signed --http local-only   # or self-signed: compare its 
 
 ### Remove a worker
 
-On the master, open Settings › Cluster and press **Remove**, or send `DELETE /api/cluster/workers/<name>`. The master
-tells the worker to forget it, and the key it was given stops working at once. To pair again, use a new code.
+On the master, open Settings › Cluster and press **Remove**, or send `DELETE /api/cluster/workers/<name>`:
+
+```bash
+am2strata-run cluster forget macm4
+# macm4 forgotten, told it to forget us
+```
+
+The master tells the worker to forget it, and the key it was given stops working at once. To pair again, use a new code.
 
 ## Small models on a worker as experts
 

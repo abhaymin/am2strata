@@ -36,10 +36,10 @@ The rule since 2026-11-14 is that every big feature has both.
 | Media check (`/v1/media/check`) | done | done | A Check card; `am2strata-run media check <file>` |
 | Productions (`/v1/media/productions`) | done | done | A Productions card with parts and progress; `am2strata-run media produce plan.json` |
 | Images, video, speech, songs | yes | done | `am2strata-run media image/video/speak/song` |
-| Clusters | Settings › Cluster | none | `am2strata-run cluster status/pair/join/forget` |
-| Optimizer (Tune) | Settings › Models | none | `am2strata-run tune <model>` |
-| Client profiles | read-only | none | Editing (A8); `am2strata-run clients` |
-| Memory (`/v1/memory`) | in chat | none | `am2strata-run memory list/add/forget` |
+| Clusters | Settings › Cluster | done | A card in Settings; `am2strata-run cluster status` / `pair` — see CLUSTER.md |
+| Optimizer (Tune) | Settings › Models | done | `am2strata-run tune <model>`: start it, follow progress and print the result |
+| Client profiles | read-only | done | Edit with `am2strata-run clients new` / `revoke`; `clients list` shows keys but never their values |
+| Memory (`/v1/memory`) | in chat | done | `am2strata-run memory list/add/forget` |
 
 ## C. Missing or out-of-date documentation
 
