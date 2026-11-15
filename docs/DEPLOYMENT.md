@@ -731,6 +731,9 @@ structured response_format or a forced tool_choice. An error (an unknown expert,
 comes back as a clear tool error naming the expert; the turn goes on. The answer itself is cut at 20,000 characters with a
 note saying so.
 
+
+An expert can also be a paired cluster worker's model: `{"name", "about", "worker": "<worker name>", "model"}` in place of `url`. It's reached over the pinned cluster link, with no key in the config (docs/CLUSTER.md, "Small models on a worker as experts").
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your

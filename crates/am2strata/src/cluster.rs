@@ -66,7 +66,7 @@ pub struct Worker {
     pub tls_url: Option<String>,
     pub pin: Option<String>,
     /// the HTTP client for it: pinned mutual TLS, or plain HTTP for a run-config worker
-    client: reqwest::Client,
+    pub(crate) client: reqwest::Client,
     /// the worker's node id, when it was paired (not for run-config workers)
     pub node_id: Option<String>,
     /// paired from the app (kept in cluster-workers.json), not from the run config
@@ -96,10 +96,20 @@ impl Worker {
         Arc::new(Worker { name, url, key, tls_url, pin, client, node_id, paired, seen: Mutex::new(seen), stop: AtomicBool::new(false) })
     }
 
-    /// Where its requests go: the TLS listener when paired with one, else its url.
-    fn base(&self) -> &str {
+    /// Where its requests go: the TLS listener when paired with one, else its url. Exposed so an ask_expert worker-form
+    /// expert can POST to {base}/v1/chat/completions over this worker's own (pinned mutual-TLS) client.
+    pub fn base(&self) -> &str {
         self.tls_url.as_deref().unwrap_or(&self.url)
     }
+
+    /// The key the pairing gave for this master: the request to a worker-form expert is authorized with it, never a config key.
+    pub fn auth_key(&self) -> &str { &self.key }
+
+    /// Last time the poller heard from it (within STALE): an ask_expert worker-form expert is offered only while ready.
+    pub fn is_ready(&self) -> bool { self.ready() }
+
+    /// Whether the worker's model list carries `model`: the expert is offered only while it does.
+    pub fn has_model(&self, model: &str) -> bool { self.has(model) }
 
     fn ready(&self) -> bool {
         self.seen.lock().unwrap().at.is_some_and(|t| t.elapsed() < STALE)
@@ -307,6 +317,21 @@ impl Cluster {
 
     pub fn workers(&self) -> Vec<Arc<Worker>> {
         self.workers.read().unwrap().clone()
+    }
+
+    /// The paired worker of a given name, if any: an ask_expert worker-form expert looks one up at call time.
+    pub fn worker_by_name(&self, name: &str) -> Option<Arc<Worker>> {
+        self.workers.read().unwrap().iter().find(|w| w.name == name).cloned()
+    }
+
+    /// A worker added by tests (an ask_expert worker-form expert's paired worker): `models` is what it lists, `ready` whether
+    /// the poller has just heard from it. Its client and pairing key are plain; only readiness and models matter here.
+    #[cfg(test)]
+    pub(crate) fn add_test_worker(&self, name: &str, models: &[&str], ready: bool) {
+        let w = Worker::new(name.into(), "http://x".into(), "k".into(), None, false);
+        *w.seen.lock().unwrap() = Seen { models: models.iter().map(|m| m.to_string()).collect(), current: None, waiting: 0,
+                                         running: false, at: ready.then(Instant::now), error: None, routed: 0 };
+        self.workers.write().unwrap().push(w);
     }
 
     /// Start: poll the workers; announce (a worker) or browse (a master) by mDNS; a worker logs its pairing code.

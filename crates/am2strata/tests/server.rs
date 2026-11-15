@@ -3102,3 +3102,34 @@ fn a_stalled_engine_ends_the_chat_with_an_error() {
         assert!(r.to_string().to_lowercase().contains("stall"), "chatter={chatter}: the error says it stalled: {r}");
     }
 }
+
+/// Cluster experts (CLUSTER-PLAN "Several brains"): an expert can be a paired worker's model ({"name","about","worker",
+/// "model"}), reached over that worker's pinned-TLS client with the key pairing gave. It is offered only while the worker is
+/// ready and lists the model; its answer, naming the worker, comes back into the turn.
+#[test]
+fn a_worker_model_is_asked_through_the_cluster_as_an_expert() {
+    let tp = free_port();
+    let worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker", "name": "macm4", "tls_port": tp}}),
+                                         ..Model::default() }],
+                               &[ids("Ok on macm4.\n</think>\n\nHi from the small expert on macm4.")], json!({}));
+    let ask = "\n\n<tool_call>\n<function=ask_expert>\n<parameter=expert>\nsmall\n</parameter>\n<parameter=question>\nWhat time is it?\n</parameter>\n</function>\n</tool_call>";
+    let master = Server::start(&[Model { extra: json!({"experts": [{"name": "small", "about": "a small model that macm4 keeps",
+                                                                     "worker": "macm4", "model": "mock-b"}]}), ..Model::default() }],
+                               &[ids(&format!("Let me ask the expert.\n</think>{ask}")), ids("Done.\n</think>\n\nAll handled.")], json!({}));
+    let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
+    let (c, p) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": &code}));
+    assert_eq!((c, p["encrypted"].as_bool()), (200, Some(true)), "paired over the pinned TLS listener: {p}");
+    let t0 = Instant::now();
+    while master.get("/api/cluster", true).1["workers"][0]["ready"] != true {
+        assert!(t0.elapsed() < Duration::from_secs(30), "worker not ready: {}", master.get("/api/cluster", true).1);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (c, r) = master.post("/v1/chat/completions", &json!({"messages": [user("What time is it?")], "max_tokens": 200, "strata_experts": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"].as_str(), Some("All handled."), "the master answered the turn: {r}");
+    let p0 = prompt_text(&master.gen_lines()[0]);
+    assert!(p0.contains("ask_expert") && p0.contains("(on worker macm4)"), "offered, naming the worker: {p0}");
+    let p1 = prompt_text(&master.gen_lines()[1]);
+    assert!(p1.contains("Answer from the small expert (mock-b) (on worker macm4)"), "the worker's answer came back: {p1}");
+    assert!(p1.contains("Hi from the small expert on macm4."), "with the worker's own text: {p1}");
+}

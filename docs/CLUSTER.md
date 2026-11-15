@@ -158,6 +158,26 @@ am2strata-run tls self-signed --http local-only   # or self-signed: compare its 
 On the master, open Settings › Cluster and press **Remove**, or send `DELETE /api/cluster/workers/<name>`. The master
 tells the worker to forget it, and the key it was given stops working at once. To pair again, use a new code.
 
+## Small models on a worker as experts
+
+A worker can keep small models of its own, and the main model on the master can consult them in the same turn through
+`ask_expert`. Name the worker and its model in the master's run config, instead of a URL and a key:
+
+```json
+"experts": [
+  {"name": "mac-small", "about": "a quick small model for short checks", "worker": "macm4", "model": "ministral-3-3b-instruct-2512-q4_k_m"}
+]
+```
+
+- **What you need:** the worker paired with this master (steps 3-4), and the model installed on the worker. No other
+  key: the call goes over the pinned TLS cluster link, with the key pairing gave.
+- **When it's offered:** only while the worker is ready and lists that model. The tool description names the worker.
+- **What comes back:** the answer is labelled "(on worker macm4)", and the records show it too.
+- **Asking for it:** a request opts in with `"strata_experts": true`, or through a client profile with the set
+  `experts`.
+- **Speed:** a worker's CPU model is slow next to the master's GPU model (see Speed below). Use it for short
+  sub-questions.
+
 ## Ports
 
 | Port | On | What |
