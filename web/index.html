@@ -37,6 +37,8 @@
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-layers"/></svg>Workshop</button>
     <button class="st-tab" role="tab" id="tab-btn-computer" aria-controls="view-computer" aria-selected="false" data-tab="computer">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-eye"/></svg>Computer</button>
+    <button class="st-tab" role="tab" id="tab-btn-browser" aria-controls="view-browser" aria-selected="false" data-tab="browser">
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-globe"/></svg>Browser</button>
     <button class="st-tab" role="tab" id="tab-btn-settings" aria-controls="view-settings" aria-selected="false" data-tab="settings">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>Settings</button>
     <button class="st-tab" role="tab" id="tab-btn-calls" aria-controls="view-calls" aria-selected="false" data-tab="calls">
@@ -1073,6 +1075,83 @@
     </section>
 
   <!-- ============================ API calls ============================ -->
+  <section class="view view--browser" id="view-browser" role="tabpanel" aria-labelledby="tab-btn-browser" hidden>
+    <div class="bv">
+      <div class="cv-bar">
+        <select class="st-input" id="bv-target" aria-label="Which browser" style="width:auto"></select>
+        <button type="button" class="st-btn st-btn--secondary" id="bv-back" title="Back">&larr;</button>
+        <button type="button" class="st-btn st-btn--secondary" id="bv-fwd" title="Forward">&rarr;</button>
+        <form id="bv-go" class="bv-url"><input class="st-input" id="bv-url" placeholder="Address, e.g. example.com" aria-label="Address" autocomplete="off">
+          <button class="st-btn st-btn--primary" type="submit">Open</button></form>
+        <label class="small bv-live"><input type="checkbox" id="bv-live" checked> Live</label>
+      </div>
+      <div class="msg-warn small" id="bv-wait" hidden></div>
+      <div class="bv-main">
+        <div class="bv-left">
+          <div class="bv-screen" id="bv-screen" tabindex="0" title="Click, scroll and type here to use the page">
+            <img id="bv-img" alt="The page the browser shows" hidden><div class="muted bv-empty" id="bv-empty">Open an address to start. Chats with "Use a browser" and MCP clients drive the same browsers.</div></div>
+          <div class="muted small" id="bv-here"></div>
+          <pre class="bv-out" id="bv-out" aria-live="polite"></pre>
+        </div>
+        <div class="bv-side">
+          <div class="st-tabs bv-tabs" role="tablist" aria-label="Browser tools">
+            <button class="st-tab" role="tab" aria-selected="true" data-bv="tools">Tools</button>
+            <button class="st-tab" role="tab" aria-selected="false" data-bv="data">Datasets</button>
+            <button class="st-tab" role="tab" aria-selected="false" data-bv="tests">Tests</button>
+            <button class="st-tab" role="tab" aria-selected="false" data-bv="connect">Connect</button>
+          </div>
+          <div class="bv-pane" data-pane="tools">
+            <div class="cv-bar"><button type="button" class="st-btn st-btn--secondary" data-step="browser_read">Read page</button>
+              <button type="button" class="st-btn st-btn--secondary" data-step="browser_elements">Elements</button>
+              <button type="button" class="st-btn st-btn--secondary" data-step="browser_console">Console</button>
+              <button type="button" class="st-btn st-btn--secondary" data-step="browser_screenshot" data-args='{"full":true}'>Full screenshot</button></div>
+            <h4>Extract data</h4>
+            <div class="cv-vm__grid">
+              <label class="small">Kind<select class="st-input" id="bx-kind"><option>table</option><option>items</option><option>links</option><option>meta</option></select></label>
+              <label class="small">Selector (CSS)<input class="st-input" id="bx-sel" placeholder="items: .product"></label>
+              <label class="small">Next page (CSS or text)<input class="st-input" id="bx-next" placeholder="Next"></label>
+              <label class="small">Pages<input class="st-input" id="bx-pages" type="number" min="1" max="50" value="1"></label>
+              <label class="small">Save to dataset<input class="st-input" id="bx-ds" placeholder="(optional) books"></label>
+              <label class="small">Key fields<input class="st-input" id="bx-key" placeholder="url"></label>
+            </div>
+            <label class="small">Fields (JSON, items only)<textarea class="st-input" id="bx-fields" rows="2" placeholder='{"name": "h3", "price": ".price", "url": "a@href"}'></textarea></label>
+            <button type="button" class="st-btn st-btn--primary" id="bx-run">Extract</button>
+            <h4>Check this page</h4>
+            <textarea class="st-input" id="bc-checks" rows="3">[{"status": 200}, {"console_errors": 0}, {"failed_requests": 0}, {"broken_links": 30}]</textarea>
+            <button type="button" class="st-btn st-btn--primary" id="bc-run">Run checks</button>
+            <h4>Fill a form</h4>
+            <textarea class="st-input" id="bf-fields" rows="3" placeholder='[{"field": "Email", "value": "me@example.com"}, {"field": "Country", "value": "India"}]'></textarea>
+            <button type="button" class="st-btn st-btn--primary" id="bf-run">Fill (does not send)</button>
+          </div>
+          <div class="bv-pane" data-pane="data" hidden>
+            <div class="cv-bar"><span class="muted small">Records that jobs scraped, surveyed or cataloged.</span><span class="cv-spacer"></span>
+              <button type="button" class="st-btn st-btn--secondary" id="bd-refresh">Refresh</button></div>
+            <div id="bd-list"></div>
+            <div id="bd-view"></div>
+          </div>
+          <div class="bv-pane" data-pane="tests" hidden>
+            <div class="cv-bar"><select class="st-input" id="bt-pick" aria-label="Saved tests" style="width:auto"><option value="">New test…</option></select>
+              <input class="st-input" id="bt-name" placeholder="name" style="width:9rem">
+              <button type="button" class="st-btn st-btn--secondary" id="bt-save">Save</button>
+              <button type="button" class="st-btn st-btn--secondary" id="bt-del">Delete</button>
+              <button type="button" class="st-btn st-btn--primary" id="bt-run">Run</button></div>
+            <textarea class="st-input bv-code" id="bt-suite" rows="12" spellcheck="false"></textarea>
+            <div id="bt-report"></div>
+          </div>
+          <div class="bv-pane" data-pane="connect" hidden>
+            <p class="small">Any MCP client or coding agent gets these browser tools from this server, with nothing to set up on its side.
+              Risky steps (passwords, sending a form, publishing) wait for your yes on this tab.</p>
+            <pre class="bv-code small" id="bv-mcp"></pre>
+            <p class="small">In a chat request (OpenAI, Anthropic or Responses API): <code>"strata_browser": true</code>, or
+              <code>"server"</code>, <code>"mine"</code> or <code>"sandbox"</code> to pick the browser. The steps and screenshots come back in the answer.</p>
+            <label class="small">This web app's chats use<select class="st-input" id="bv-chat-target" style="width:auto">
+              <option value="">the config's browser</option><option value="server">the server's</option><option value="mine">my Chrome</option><option value="sandbox">the sandbox VM's</option></select></label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section class="view view--calls" id="view-calls" role="tabpanel" aria-labelledby="tab-btn-calls" hidden>
     <div class="calls">
       <div class="calls-side">
@@ -1198,5 +1277,6 @@
   <button type="button" class="viewer-open" id="viewer-open" hidden>Open large</button>
 <script src="web/app.js"></script>
 <script src="web/api-keys.js"></script>
+<script src="web/browser.js"></script>
 </body>
 </html>

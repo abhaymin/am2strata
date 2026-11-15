@@ -16,6 +16,9 @@ mod clients;
 mod gemini;
 mod anthropic;
 mod browser;
+mod datasets;
+mod browser_api;
+mod browser_test;
 mod computer;
 mod api_monitor;
 mod api_keys;
@@ -548,6 +551,15 @@ async fn main() -> Result<()> {
         .route("/api/models/{id}/optimise", post(web::optimise))
         .route("/api/models/{id}/tuned", post(web::set_tuned))
         .route("/api/tools/approve", post(browser::approve))
+        .route("/api/browser", get(browser_api::status))
+        .route("/api/browser/step", post(browser_api::step))
+        .route("/api/browser/view", get(browser_api::view))
+        .route("/api/browser/approvals", get(browser_api::approvals_get))
+        .route("/api/browser/test", post(browser_api::test_run))
+        .route("/api/browser/tests/{name}", get(browser_api::test_get).put(browser_api::test_put).delete(browser_api::test_delete))
+        .route("/api/datasets", get(browser_api::datasets_list).post(browser_api::datasets_post))
+        .route("/api/datasets/{name}", get(browser_api::dataset_get).delete(browser_api::dataset_delete))
+        .route("/v1/mcp/browser", post(browser_api::mcp))
         .route("/api/cache/snapshots/clear", post(web::clear_snapshots))
         .route("/api/models/{id}", axum::routing::delete(model_remove::remove))
         .route("/api/models/{id}/removal", get(model_remove::removal))

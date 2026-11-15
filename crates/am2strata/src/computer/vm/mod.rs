@@ -133,6 +133,8 @@ pub struct Vm {
     /// lifecycle steps (start, stop, pause, …) one at a time
     op: Mutex<()>,
     tunnel: Mutex<Option<Child>>,
+    /// the SSH tunnel to the VM's Chromium DevTools port, and the local port it listens on (browser use in the VM)
+    cdp: Mutex<Option<(Child, u16)>>,
     screen: Mutex<Option<Arc<rfb::Rfb>>>,
     last_used: Mutex<Instant>,
     /// open Computer-tab viewers: a watched VM is not paused
@@ -247,7 +249,7 @@ impl Vm {
         let vm = Arc::new(Vm {
             phase: Mutex::new(if dir.join("vm/state.bin").exists() { Phase::Saved } else { Phase::Off }),
             dir, rt, cfg: Mutex::new(cfg), run: Mutex::new(None), op: Mutex::new(()),
-            tunnel: Mutex::new(None), screen: Mutex::new(None), last_used: Mutex::new(Instant::now()),
+            tunnel: Mutex::new(None), cdp: Mutex::new(None), screen: Mutex::new(None), last_used: Mutex::new(Instant::now()),
             viewers: AtomicUsize::new(0), tasks: Mutex::new(vec![]), next_task: Mutex::new(1), busy: Mutex::new(false),
             cpu_sample: Mutex::new(None), last_error: Mutex::new(None),
         });
@@ -781,6 +783,54 @@ impl Vm {
         };
         *self.screen.lock().unwrap() = Some(rfb.clone());
         Ok(rfb)
+    }
+
+    // ------------------------------------------------------------------------------------------- browser
+
+    /// The VM's Chromium as a DevTools endpoint on this PC (`http://127.0.0.1:<port>`), for browser use inside the VM: the
+    /// VM is started if needed, Chromium installed (from the catalog) and started on the VM's desktop with its DevTools
+    /// port 9223 on the VM's loopback only, and an SSH tunnel brings that port here. The job's pages show on the
+    /// Computer tab's desktop, and the logins are the VM's own.
+    pub fn browser_endpoint(&self) -> Result<String, String> {
+        const PORT: u16 = 9223;
+        self.ensure()?;
+        let probe = format!("timeout 2 bash -c '</dev/tcp/127.0.0.1/{PORT}' 2>/dev/null && echo up || true");
+        let up = |vm: &Vm| vm.sh_ok(&probe, false).map(|o| o.contains("up")).unwrap_or(false);
+        if !up(self) {
+            if !self.sh_ok("command -v chromium >/dev/null && echo yes || true", false)?.contains("yes") {
+                let app = guest::app("chromium").ok_or("the catalog has no chromium")?;
+                let (code, out) = self.sh(&guest::app_script(app, true), true, None, Duration::from_secs(900), &|_| {})?;
+                if code != 0 { return Err(format!("installing Chromium in the VM failed: {}", out.lines().last().unwrap_or(""))); }
+            }
+            self.launch(&format!("chromium --no-first-run --no-default-browser-check --password-store=basic --remote-debugging-address=127.0.0.1 \
+                                  --remote-debugging-port={PORT} --user-data-dir=$HOME/.am2-browser about:blank"))?;
+            let t0 = Instant::now();
+            while !up(self) {
+                if t0.elapsed() > Duration::from_secs(30) { return Err("Chromium in the VM did not open its DevTools port in 30 s".into()); }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        let mut cdp = self.cdp.lock().unwrap();
+        if let Some((child, port)) = cdp.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) && std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], *port).into(), Duration::from_secs(1)).is_ok() {
+                return Ok(format!("http://127.0.0.1:{port}"));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        *cdp = None;
+        let local = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map_err(|e| e.to_string())?.port();
+        let child = self.ssh_base(self.port()?)
+            .args(["-N", "-o", "ExitOnForwardFailure=yes", "-L"]).arg(format!("127.0.0.1:{local}:127.0.0.1:{PORT}"))
+            .arg(format!("{}@127.0.0.1", guest::USER)).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().map_err(|e| format!("ssh tunnel to the VM's browser: {e}"))?;
+        let t0 = Instant::now();
+        while std::net::TcpStream::connect_timeout(&([127, 0, 0, 1], local).into(), Duration::from_millis(300)).is_err() {
+            if t0.elapsed() > Duration::from_secs(10) { return Err("the tunnel to the VM's browser did not open".into()); }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        *cdp = Some((child, local));
+        Ok(format!("http://127.0.0.1:{local}"))
     }
 
     // ---------------------------------------------------------------------------------------------- apps

@@ -48,7 +48,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
-pub const TOOL_NAMES: [&str; 10] = ["browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back", "browser_read", "browser_upload", "browser_tabs", "browser_select", "browser_wait"];
+pub const TOOL_NAMES: [&str; 21] = ["browser_open", "browser_click", "browser_type", "browser_scroll", "browser_back", "browser_read", "browser_upload", "browser_tabs", "browser_select", "browser_wait",
+    // more.rs: elements by number, forms, scraping, maps, keys, site checks, records, screenshots, diagnostics, scripts
+    "browser_elements", "browser_fill", "browser_extract", "browser_mouse", "browser_key", "browser_check", "browser_save",
+    "browser_screenshot", "browser_console", "browser_script", "browser_forward"];
+
+#[path = "browser_more.rs"]
+pub mod more;
+#[cfg(test)]
+#[path = "browser_live_tests.rs"]
+mod live_tests;
 
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
@@ -144,7 +153,15 @@ async fn click_control(page: &Page, args: &Value, click: bool) -> Result<Control
         .map_err(|e| e.to_string())?
         .into_value::<Value>()
         .map_err(|e| e.to_string())?;
+    // the lookup answers JSON.stringify(...): parse it (read as a bare string, every control looked "not found", so a
+    // publishing or form-sending click was never asked about)
+    let v = as_json(v);
     Ok(Control { label: v["label"].as_str().unwrap_or("").to_string(), aria: v["aria"].as_str().unwrap_or("").to_string(), submit: v["submit"].as_bool().unwrap_or(false), found: v["found"].as_bool().unwrap_or(false) })
+}
+
+/// A page script's answer: scripts here answer `JSON.stringify(...)`, so a string holding JSON is parsed.
+fn as_json(v: Value) -> Value {
+    match v { Value::String(t) => serde_json::from_str(&t).unwrap_or(Value::String(t)), o => o }
 }
 
 /// The control a `browser_click` hits (the element itself when it is a link/button/control, else its nearest one).
@@ -174,6 +191,10 @@ fn click_has_target(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> bool 
 
 fn click_selector_js(x: Option<f64>, y: Option<f64>, text: Option<&str>) -> String {
     const SEL: &str = "a,button,input[type=submit],[role=button],[onclick]";
+    // a `ref` from browser_elements arrives as the text "#ref:e12" (normalize_args): that element itself
+    if let Some(r) = text.and_then(|t| t.strip_prefix("#ref:")) {
+        return format!("document.querySelector('[data-am2ref=\"{}\"]')", r.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>());
+    }
     match (x, y) {
         (Some(x), Some(y)) => format!("document.elementFromPoint({x}, {y})"),
         _ => {
@@ -222,7 +243,8 @@ fn wait_js(text: &str) -> String {
 
 const CONTROL_LOOKUP: &str = r#"(() => { const e = AT; if (!e) return JSON.stringify({found:false,label:'',aria:'',submit:false});
     // the clickable control: this element if it is one, else its nearest button/link/[role=button]
-    const b = (e.matches('a,button,input[type=submit],[role=button],input')) ? e : e.closest('a,button,input[type=submit],[role=button]');
+    const C = 'a,button,input,select,textarea,summary,label,[role=button],[role=link],[role=tab],[role=menuitem],[role=option],[role=checkbox],[role=radio],[role=switch],[onclick],[data-am2ref]';
+    const b = e.matches(C) ? e : e.closest(C);
     if (!b) return JSON.stringify({found:false,label:'',aria:'',submit:false});
     const label = ((b.innerText || '') + (b.value != null ? b.value : '')).trim().slice(0, 60);
     const aria = (b.getAttribute('aria-label') || '').trim();
@@ -257,6 +279,13 @@ pub struct Settings {
     /// the most one step may take (`"browser": {"step_timeout_s": N}`, default 45): past it the page's loading is
     /// stopped, and a tab that still does not answer is closed and a fresh one opened
     pub step_timeout: Duration,
+    /// the server's data folder: datasets (`<data>/datasets`) and site tests live there
+    pub data_dir: PathBuf,
+    /// `browser_script` (run a JavaScript expression on the page) is offered only with `"browser": {"allow_script": true}`,
+    /// and each call still asks unless auto_approve
+    pub allow_script: bool,
+    /// a label for the browser in the tools' descriptions ("the sandbox VM's browser"), None for the usual wording
+    pub label: Option<String>,
 }
 
 /// Chrome for Testing's folder and file for this system's chrome-headless-shell (what the installers fetch).
@@ -319,7 +348,8 @@ impl Settings {
                      download_ask: comp["download_ask"].as_bool().unwrap_or(true),
                      site_allow: names_array(comp.get("site_allow")),
                      site_block: names_array(comp.get("site_block")),
-                     step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)) }
+                     step_timeout: Duration::from_secs_f64(c["step_timeout_s"].as_f64().unwrap_or(45.0).clamp(2.0, 600.0)),
+                     data_dir: data_dir.to_path_buf(), allow_script: c["allow_script"].as_bool().unwrap_or(false), label: None }
     }
 
     /// Whether a started or attached browser carries the user's own logins (so the tool descriptions, and the risk
@@ -536,12 +566,15 @@ pub struct Browsers {
     last: std::sync::Mutex<HashMap<String, (String, u64, usize)>>,
     /// per conversation+site: one-time "allow this job to publish" grants (the job memory)
     jobs: std::sync::Mutex<JobMemory>,
+    /// per tab (its target id): console messages, script errors, failed requests and the page's HTTP status, for site checks
+    pub(crate) diag: Arc<std::sync::Mutex<HashMap<String, more::Diag>>>,
 }
 
 /// The same step asked this many times in a row on a page it did not change is not run again.
 const REPEATS: usize = 3;
 
 /// A step's result for the model and the client: its text, and a JPEG screenshot (base64).
+#[derive(Debug)]
 pub struct Step {
     pub text: String,
     pub screenshot: Option<String>,
@@ -575,7 +608,7 @@ fn allowed_host(url: &str, private: bool) -> futures::future::BoxFuture<'static,
 impl Browsers {
     pub fn new(settings: Settings) -> Browsers {
         Browsers { settings, run: Mutex::new(None), last: std::sync::Mutex::new(HashMap::new()), jobs: std::sync::Mutex::new(JobMemory::default()),
-                   downloads: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+                   downloads: Arc::new(std::sync::Mutex::new(HashMap::new())), diag: Arc::new(std::sync::Mutex::new(HashMap::new())) }
     }
 
     /// This conversation+site is allowed to keep going (the one-time "allow this job to publish").
@@ -634,7 +667,29 @@ impl Browsers {
             json!({"name": "browser_wait", "description": format!("Wait until a piece of text is on the page (up to 30 s) before returning.{shot}"),
                    "parameters": {"type": "object", "properties": {                        "for": {"type": "string", "description": "the text to wait for"}}}}),
         ]);
+        // browser_click/browser_type also take a `ref` from browser_elements
+        for t in tools.iter_mut() {
+            if t["name"] == "browser_click" || t["name"] == "browser_type" {
+                t["parameters"]["properties"]["ref"] = json!({"type": "string", "description": "an element's number from browser_elements (e.g. \"e12\")"});
+            }
+        }
+        tools.extend(more::tools(vision, false));
         tools
+    }
+
+    /// The tools for this browser: the usual ones, `browser_script` only when the config allows it, and the label of a
+    /// browser that is not the server's own (the sandbox VM's) in browser_open's description.
+    pub fn tools_for(&self, vision: bool) -> Vec<Value> {
+        let mut t = Self::tools(vision, self.user_session(), self.settings.upload_dir.is_some());
+        if !self.settings.allow_script {
+            t.retain(|t| t["name"] != "browser_script");
+        }
+        if let Some(label) = &self.settings.label {
+            if let Some(o) = t.iter_mut().find(|t| t["name"] == "browser_open") {
+                o["description"] = json!(format!("Open a web page in {label}. Returns its title, address and the start of its text."));
+            }
+        }
+        t
     }
 
     async fn ensure(&self) -> Result<(), String> {
@@ -782,6 +837,7 @@ impl Browsers {
                 }
             });
         }
+        more::watch(&page, self.diag.clone()).await;
         // a new tab for this conversation is the one the tools act on until browser_tabs closes or switches it
         let id = format!("tab-{}", uuid::Uuid::new_v4().simple());
         run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted }));
@@ -876,7 +932,13 @@ impl Browsers {
 
     /// A risky step (password, form sent, publishing click, upload) with what it would do; None for an ordinary step.
     pub async fn risk(&self, conv: &str, name: &str, args: &Value) -> Option<Risk> {
+        let args = &more::normalize_args(name, args);
         let page = self.page(conv).await.ok()?;
+        if more::NAMES.contains(&name) {
+            let (what, publishing) = more::risk(self, &page, name, args).await?;
+            let url = page.url().await.ok().flatten().unwrap_or_default();
+            return Some(Risk { what, publishing, site: site_of(&url), url });
+        }
         let (what, publishing) = match name {
             "browser_type" => {
                 let sel = args["selector"].as_str().unwrap_or("");
@@ -915,6 +977,7 @@ impl Browsers {
     /// seen on a train-times site) is stopped; if the tab still does not answer it is closed and a fresh one opened,
     /// and the model is told, with the address it was on, so the next step works.
     pub async fn call(&self, conv: &str, name: &str, args: &Value) -> Result<Step, String> {
+        let args = &more::normalize_args(name, args);
         // the repeat guard: the same step again on the page it left, the third time in a row, is not run (a model typed
         // the same search into a field over and over for 16 minutes); it is told what the page and the field hold
         let key = format!("{name} {args}");
@@ -984,6 +1047,12 @@ impl Browsers {
         tokio::time::timeout(Duration::from_secs(3), page.evaluate(js)).await.ok()?.ok()?.into_value::<Option<String>>().ok()?
     }
 
+    /// End a session (a site test's run): its tab closes and its step memory goes.
+    pub async fn close_session(&self, conv: &str) {
+        self.drop_tab(conv).await;
+        self.last.lock().unwrap().remove(conv);
+    }
+
     /// Close conversation `conv`'s tab without waiting on a page that does not answer.
     async fn drop_tab(&self, conv: &str) {
         let mut guard = self.run.lock().await;
@@ -1000,6 +1069,9 @@ impl Browsers {
 
     async fn step(&self, conv: &str, name: &str, args: &Value) -> Result<Step, String> {
         let page = self.page(conv).await?;
+        if more::NAMES.contains(&name) {
+            return more::step(self, conv, &page, name, args).await;
+        }
         let mut typed: Option<String> = None; // a browser_type step: what the field holds after it
         let settle = || async { tokio::time::sleep(Duration::from_millis(600)).await };
         match name {
@@ -1152,6 +1224,7 @@ impl Browsers {
                 let js = select_js(sel, value);
                 let r = tokio::time::timeout(Duration::from_secs(5), page.evaluate(js)).await.map_err(|_| "the page did not answer the select")?
                     .map_err(|e| e.to_string())?.into_value::<Value>().map_err(|e| e.to_string())?;
+                let r = as_json(r);
                 if !r["ok"].as_bool().unwrap_or(false) {
                     return Err(format!("{} on this select", r["msg"].as_str().unwrap_or("cannot select that")));
                 }
