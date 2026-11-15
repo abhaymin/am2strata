@@ -3860,7 +3860,8 @@ function valOf(c) {
   for (const [k, x] of Object.entries(c)) if (!["ok", "note", "error"].includes(k) && x != null && typeof x !== "object") return `${fmt(x, 2)}`;
   return "–";
 }
-const DUB_EXAMPLE = JSON.stringify({language: "de", lines: [{speaker: "laura", text: "Hallo …", t0: 22.2, dur: 4.1}], takes: ["data:audio/wav;base64,…"], stems: "data:audio/wav;base64,…"});
+// no placeholder audio in the example: the takes and stems come from the pickers below (a placeholder data URL cannot be read)
+const DUB_EXAMPLE = JSON.stringify({language: "de", lines: [{speaker: "laura", text: "Hallo, willkommen.", t0: 0.5, dur: 2.5}]}, null, 1);
 const PROD_EXAMPLE = JSON.stringify({name: "Evening set", crossfade_s: 2, parts: [{speak: {text: "Welcome to the evening set.", voice: "laura"}}]});
 $("dub-json").value = DUB_EXAMPLE;
 $("prod-json").value = PROD_EXAMPLE;
@@ -3876,8 +3877,9 @@ $("dub-form").onsubmit = async (ev) => {
     let req;
     try { req = JSON.parse($("dub-json").value); } catch (e) { throw new Error(`the request is not valid JSON: ${e.message}`); }
     if (!Array.isArray(req.lines)) throw new Error('the request needs "lines"');
-    for (const u of dubFiles.takes) { (req.takes = req.takes || []).push(u); }
-    if (dubFiles.stem) req.stems = req.stems || dubFiles.stem;
+    // files picked here are the takes and stems (in place of any in the JSON)
+    if (dubFiles.takes.length) req.takes = dubFiles.takes;
+    if (dubFiles.stem) req.stems = dubFiles.stem;
     const r = await fetch("v1/media/dub", {method: "POST", headers: headers(true), body: JSON.stringify(req)});
     const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
