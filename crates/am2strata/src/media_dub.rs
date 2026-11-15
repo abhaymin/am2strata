@@ -10,7 +10,7 @@
 //!   long first take does not get re-measured on top of itself), cap the pauses INSIDE the take at 0.25 s (task 5's
 //!   `check_media` pause definition) before fitting, and keep the shortest take when none fit within the 12% ceiling;
 //! - **mix**: place each take at its beat time in a full-length soundtrack of the original length — a take longer than
-//!   its window (slot + the gap before the next beat) is sped up with ffmpeg's atempo to fit, and only when even the
+//!   its window (slot + the gap before the next beat) is sped up to fit (a time-stretch in Rust: same pitch, no ffmpeg), and only when even the
 //!   2x ceiling does not help it is cut (faded out over its last 0.3 s); every change is reported;
 //! - **hear**: fill `words_heard` from each take with task 5's `check_media`, the Unicode-aware share of the expected
 //!   words heard (Hindi nukta/chandrabindu folded so Whisper's spelling still matches).
@@ -25,7 +25,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine as _;
 use serde_json::{json, Value};
-use std::process::Command;
 use std::sync::Arc;
 
 pub const TOOL_NAMES: [&str; 1] = ["dub_narration"];
@@ -227,13 +226,13 @@ fn fit_for_window(take_dur: f64, window_s: f64) -> Option<f64> {
 /// cut over its last 0.3 s; a missing take keeps silence (music only). Returns the mixed mono samples and the report.
 pub fn render_mix(beats: &[(f64, f64)], stems: Option<Vec<u8>>, takes: &[Option<Take>]) -> (Vec<f32>, Vec<(usize, LineAction)>) {
     let timeline = beats.iter().map(|(t0, dur)| max_f(*t0 + dur, 0.0)).fold(0.0f64, max_f);
-    let stem_s = stems.as_ref().and_then(|b| read_wav(b).ok()).map(|(_, s)| s.len() as f64 / SR as f64).unwrap_or(0.0);
+    // the stems at the narration rate whatever rate they came in (a 44.1 kHz music bed would otherwise drift)
+    let stem = stems.as_ref().and_then(|b| read_wav(b).ok()).map(|(rate, s)| resample(&s, rate));
+    let stem_s = stem.as_ref().map(|s| s.len() as f64 / SR as f64).unwrap_or(0.0);
     let out_len = (max_f(stem_s, timeline) * SR as f64 + 0.5) as usize;
     let mut mix: Vec<f32> = vec![0f32; out_len];
-    if let Some(b) = stems {
-        if let Ok((_, s)) = read_wav(&b) {
-            for (i, &v) in s.iter().enumerate() { if i < out_len { mix[i] += v; } }
-        }
+    if let Some(s) = stem {
+        for (i, &v) in s.iter().enumerate() { if i < out_len { mix[i] += v; } }
     }
     let mut report = Vec::new();
     for (li, ((t0, dur), take)) in beats.iter().zip(takes).enumerate() {
@@ -243,12 +242,12 @@ pub fn render_mix(beats: &[(f64, f64)], stems: Option<Vec<u8>>, takes: &[Option<
         match take {
             None => report.push((li + 1, LineAction::Silent)),
             Some(tk) => {
-                let raw = resample(&tk.samples, SR);           // at the narration rate when it was already 48 kHz
+                let raw = tk.samples.clone();                   // already at the narration rate (build() resamples each take)
                 let dur_s = raw.len() as f64 / SR as f64;
                 let (placed, action): (Vec<f32>, Option<LineAction>) = if dur_s <= window_s {
                     (raw.clone(), None)                      // fits the window as-is, left untouched
                 } else if let Some(ratio) = fit_for_window(dur_s, window_s) {   // sped up to fit
-                    match apply_tempo(&wav_encode(&raw), ratio) {
+                    match apply_tempo(&raw, ratio) {
                         Ok(a) => (a[..a.len().min(win)].to_vec(), Some(LineAction::SpeedUp(ratio))),
                         Err(_) => (trim_to(&raw, win), None),  // could not speed it: fall through to the cut below
                     }
@@ -287,23 +286,54 @@ fn place(mix: &mut [f32], start: usize, src: &[f32]) {
     }
 }
 
-/// Speed `x` up by `tempo` with ffmpeg's atempo, re-sampled back to the narration rate (dub.py's apply_tempo).
-pub fn apply_tempo(data: &[u8], tempo: f64) -> Result<Vec<f32>, String> {
-    if !crate::media::ffmpeg_available() { return Err("this server cannot change speed: install ffmpeg".into()); }
-    let dir = std::env::temp_dir().join(format!("strata-dub-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{e:#}"))?;
-    let tmp = dir.join("_tmp.wav");
-    let out = tmp.join("fast.wav");
-    std::fs::write(&tmp, data).map_err(|e| format!("{e:#}"))?;
-    let status = Command::new("ffmpeg").args(["-y", "-loglevel", "error", "-i"]).arg(&tmp)
-        .args(["-af", &format!("atempo={:.5}", tempo)]).arg(&out).status().map_err(|e| format!("{e:#}"))?;
-    if !status.success() { let _ = std::fs::remove_dir_all(&dir); return Err("ffmpeg atemper did not run".into()); }
-    let bytes = std::fs::read(&out).map_err(|e| format!("{e:#}"))?;
-    let _ = std::fs::remove_dir_all(&dir);
-    read_wav(&bytes).map(|(_, s)| s)
+/// Speed `x` (at the narration rate) up by `tempo` without changing its pitch: WSOLA, a waveform-similarity overlap-add
+/// time-stretch in Rust (no ffmpeg). 40 ms Hann frames at a 20 ms output hop; each next frame is taken from near its
+/// nominal place in the input where it best continues the frame before (a ±10 ms search), so voiced sound stays smooth.
+pub fn apply_tempo(x: &[f32], tempo: f64) -> Result<Vec<f32>, String> {
+    if !(tempo.is_finite() && tempo > 0.0) { return Err(format!("a speed of {tempo} is not a speed")); }
+    if (tempo - 1.0).abs() < 1e-6 || x.len() < 4096 { return Ok(x.to_vec()); }
+    let n = (SR as usize * 40) / 1000;            // frame
+    let hs = n / 2;                               // output hop
+    let tol = (SR as usize * 10) / 1000;          // search either side
+    let win: Vec<f32> = (0..n).map(|i| (0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos()) as f32).collect();
+    let out_len = (x.len() as f64 / tempo).round() as usize;
+    let mut out = vec![0f32; out_len + n];
+    let mut norm = vec![0f32; out_len + n];
+    let at = |p: isize| -> f32 { if p >= 0 && (p as usize) < x.len() { x[p as usize] } else { 0.0 } };
+    let mut prev: isize = 0;                      // where the last frame was taken from
+    let mut k = 0usize;
+    loop {
+        let o = k * hs;
+        if o >= out_len { break; }
+        let nominal = (o as f64 * tempo).round() as isize;
+        let pos = if k == 0 { 0 } else {
+            // the natural continuation of the previous frame, compared with candidates around the nominal place
+            let cont = prev + hs as isize;
+            let mut best = (f32::MIN, nominal);
+            let step = 2;
+            let mut d = -(tol as isize);
+            while d <= tol as isize {
+                let c = nominal + d;
+                let mut corr = 0f32;
+                let mut i = 0;
+                while i < hs { corr += at(cont + i as isize) * at(c + i as isize); i += 2; }
+                if corr > best.0 { best = (corr, c); }
+                d += step;
+            }
+            best.1
+        };
+        for i in 0..n {
+            out[o + i] += at(pos + i as isize) * win[i];
+            norm[o + i] += win[i];
+        }
+        prev = pos;
+        k += 1;
+    }
+    for (v, w) in out.iter_mut().zip(&norm) { if *w > 1e-3 { *v /= *w; } }
+    out.truncate(out_len);
+    Ok(out)
 }
 
-fn wav_encode(x: &[f32]) -> Vec<u8> { write_wav(x) }
 
 // ------------------------------------------------------------------------- hear: reuse check_media for words_heard
 /// Share of the expected words heard in the transcript, via task 5's Unicode-aware matcher (Hindi folded). None when the
@@ -365,7 +395,9 @@ async fn build(s: &AppState, req: &Value, hear: bool) -> Result<Value, String> {
     if let Some(urls) = &d.takes {
         for (i, url) in urls.iter().enumerate() {
             let b = load_audio(s, url).await?;
-            let (_, samples) = read_wav(&b)?;
+            // at the narration rate: a 24 kHz take (the server's own speech) would otherwise play at twice the speed
+            let (rate, samples) = read_wav(&b)?;
+            let samples = resample(&samples, rate);
             takes.push(Some(Take { speaker: d.lines[i].get("speaker").and_then(Value::as_str).unwrap_or("").to_string(), samples }));
         }
     }
@@ -375,7 +407,9 @@ async fn build(s: &AppState, req: &Value, hear: bool) -> Result<Value, String> {
 
     // words_heard per take with check_media (reused), when asked and a transcript is given
     let mut report_actions: Vec<Value> = Vec::new();
-    for (n, a) in actions.iter().enumerate() {
+    for a in actions.iter() {
+        // the line this action is about (actions list only the lines that changed, so their order is not the line number)
+        let n = a.0 - 1;
         let heard_rate = if hear {
             match (takes.get(n).and_then(|t| t.as_ref()), &d.heard, s.mgr.media_check.get()) {
                 (Some(tk), Some(transcripts), Some(check)) if n < transcripts.len() && !transcripts[n].is_empty() => {
@@ -551,8 +585,7 @@ mod tests {
 
     #[test]
     fn mix_speds_up_a_take_that_fits_within_the_ceiling() {
-        // 20 s in a 12 s window needs 1.67x (<= 2x) -> SPEED UP with ffmpeg's atempo; skipped without ffmpeg
-        if !crate::media::ffmpeg_available() { eprintln!("dub: skip speed-up test, no ffmpeg"); return; }
+        // 20 s in a 12 s window needs 1.67x (<= 2x) -> SPEED UP (the Rust time-stretch: no ffmpeg needed)
         let lines = vec![json!({"kind":"line","t0":0.0,"dur":11.8})];
         let slots = beats_from(&lines);
         let win = 12.0;
@@ -564,12 +597,40 @@ mod tests {
     }
 
     #[test]
-    fn atempo_speeds_up_to_the_ratio() {
-        if !crate::media::ffmpeg_available() { eprintln!("dub: skip atempo test, no ffmpeg"); return; }
-        let x = tone(220.0, 2.0, 0.8);
-        let fast = apply_tempo(&wav_encode(&x), 1.087).expect("atempo runs");
-        let ratio = fast.len() as f64 / x.len() as f64;
-        assert!((ratio - 1.0 / 1.087).abs() < 0.02, "atempo 1.087 shrinks 2.0 s to ~1.839 s (got {})", fast.len() as f64 / SR as f64);
+    fn tempo_speeds_up_to_the_ratio_and_keeps_the_pitch() {
+        // zero crossings per second: the pitch of a tone
+        let pitch = |x: &[f32]| x.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count() as f64 / 2.0 / (x.len() as f64 / SR as f64);
+        for tempo in [1.087, 1.5, 2.0] {
+            let x = tone(220.0, 2.0, 0.8);
+            let fast = apply_tempo(&x, tempo).expect("the stretch runs");
+            let ratio = fast.len() as f64 / x.len() as f64;
+            assert!((ratio - 1.0 / tempo).abs() < 0.01, "x{tempo} shrinks 2.0 s to {:.3} s (got {:.3})", 2.0 / tempo, fast.len() as f64 / SR as f64);
+            let p = pitch(&fast);
+            assert!((p - 220.0).abs() < 6.0, "x{tempo} keeps a 220 Hz tone at 220 Hz (got {p:.1}); a plain resample would give {:.0}", 220.0 * tempo);
+            let peak = fast.iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak > 0.6 && peak < 0.85, "the level is kept (peak {peak})");
+        }
+        assert!(apply_tempo(&tone(220.0, 1.0, 0.5), f64::NAN).is_err());
+    }
+
+    #[test]
+    fn a_take_at_another_rate_keeps_its_length() {
+        // a 2 s take recorded at 24 kHz (the server's own speech) is 2 s at the narration rate, not 1 s
+        let x: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        assert_eq!(resample(&x, 24_000).len(), 96_000);
+        assert_eq!(resample(&x, SR).len(), 48_000);
+    }
+
+    #[test]
+    fn the_report_names_the_line_that_changed() {
+        // three lines; only the third is too long for its window: the report says line 3, not line 1
+        let lines = vec![json!({"kind":"line","t0":0.0,"dur":2.0}), json!({"kind":"line","t0":2.2,"dur":2.0}), json!({"kind":"line","t0":4.4,"dur":1.0})];
+        let slots = beats_from(&lines);
+        let fits = |d: f64| take("laura", d, &tone(220.0, d, 0.5));
+        let (_, report) = render_mix(&slots, None, &[fits(1.5), fits(1.8), fits(1.8)]);
+        assert_eq!(report.len(), 1, "{report:?}");
+        assert_eq!(report[0].0, 3);
+        assert!(matches!(report[0].1, LineAction::SpeedUp(_)));
     }
 
     // -------------------------------------------------------------- translate: validation + slots

@@ -443,10 +443,10 @@ async fn video_source(req: &Value) -> Option<Result<Vec<u8>, String>> {
 }
 
 /// A chat's audio attachment or the request's `audio` → its Whisper transcript, when no `heard_text` was given.
-async fn words_from(s: &AppState, audio: Option<&[u8]>, heard: &str) -> String {
+async fn words_from(s: &AppState, audio: Option<&[u8]>, heard: &str, lang: &str) -> String {
     if !heard.trim().is_empty() { return heard.to_string(); }
     let Some(a) = audio else { return String::new() };
-    match crate::audio_api::transcribe_for_chat(s, &base64::engine::general_purpose::STANDARD.encode(a)).await {
+    match crate::audio_api::transcribe_for_check(s, &base64::engine::general_purpose::STANDARD.encode(a), lang).await {
         Ok((text, _)) => text,
         Err(e) => { tracing::info!("check_media: Whisper did not transcribe the audio: {e}"); String::new() }
     }
@@ -456,7 +456,7 @@ async fn words_from(s: &AppState, audio: Option<&[u8]>, heard: &str) -> String {
 async fn run_check(s: &AppState, audio: Option<Vec<u8>>, gray: Option<&[Vec<u8>]>, req: &Value) -> Result<Value, String> {
     let expected = req["expected_text"].as_str().unwrap_or("").to_string();
     let lang = req.get("language").or_else(|| req.get("lang")).and_then(Value::as_str).unwrap_or("en").to_lowercase();
-    let heard = words_from(s, audio.as_deref(), req["heard_text"].as_str().unwrap_or("")).await;
+    let heard = words_from(s, audio.as_deref(), req["heard_text"].as_str().unwrap_or(""), &lang).await;
     let o = Opts::from_value(req);
     Ok(check(audio.as_deref(), gray, &expected, &heard, &lang, &o))
 }
