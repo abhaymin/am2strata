@@ -10,7 +10,7 @@ Model: Ministral 3B Instruct 2512, Q4_K_M (2.1 GB; its weights are Q4_K and Q6_K
 | Linux PC, Ryzen 7 7840HS, 8 threads, beside a running server | before: rows dequantized to f32, f32 dot | 2.52 | 2.49 | |
 | same | integer Q4_K/Q6_K × Q8_K kernels, AVX2 build (`cpu_q8.rs`) | **12.73** | **12.48** | the 16 generated tokens are identical to before |
 | Mac mini M4, 10 CPUs (in the server, 754-token prompt) | before | 4.94 | 4.77 | |
-| same | integer kernels, dot-product build | to be measured | | |
+| same | integer kernels, dot-product build (#64) | **16.80** | **14.98** | answer normal; engine alone with 10 threads: 17.70 / 18.29, with 4: 15.46 / 15.30 |
 
 ## What changed
 - **`cpu_q8.rs`: the activations are quantized to Q8_K once per matrix product,** with the same rule the f32 path
@@ -26,8 +26,22 @@ Model: Ministral 3B Instruct 2512, Q4_K_M (2.1 GB; its weights are Q4_K and Q6_K
 
   The compiler vectorizes the fixed-size loops, so no hand-written intrinsics differ between platforms.
 
+## Batched prompt reading
+
+The prompt goes through the model in chunks of 32 (`Model::forward_batch`, `QMat::matmul`). Each weight row is read
+once per chunk, while attention still runs token by token, in order, at each token's own position. Every value is
+the one the one-token path computes:
+- **Test:** `matmul_equals_matvec_exactly` checks this for Q4_K, Q6_K, Q8_0, F32 and Q5_0.
+- **Benchmark:** the generated tokens are identical.
+
+`AM2_PROMPT_BATCH=1` turns batching off, for comparison. Models whose layers aren't plain attention + dense
+feed-forward, and the `--graph` GPU path, still read token by token.
+
+| Machine | How the 256-token prompt is read | Prompt tok/s | Tokens |
+|---|---|---|---|
+| Linux PC, 8 threads, **busy** (the live server's coding agent was running) | one token at a time | 3.78 | |
+| same, same minute | chunks of 32 | **11.21** (3.0x) | identical |
+
 ## Next
-- **Batched prompt reading:** each weight row read once per chunk of prompt tokens, not once per token. Today the
-  prompt is still read one token at a time, which is why prompt and generation speeds are equal.
 - **Q5_K, Q8_0 and Q4_0 the same way.**
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).

@@ -95,6 +95,40 @@ impl QMat {
         });
     }
 
+    /// Y = W X for several inputs (a prompt chunk): each weight row is read once for all of them. Every product is
+    /// the same function of the same row and the same rounded input as `matvec`'s, so the values are identical.
+    pub fn matmul(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n = xs.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            return xs.iter().map(|x| self.mul(x)).collect();
+        }
+        let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) else {
+            return xs.iter().map(|x| self.mul(x)).collect();
+        };
+        let int8 = crate::cpu_q8::handles(fast) && self.vdt == Vdt::Q8K;
+        let q8: Vec<crate::cpu_q8::Q8K> = if int8 { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize(x)).collect() } else { Vec::new() };
+        if int8 && q8.len() != n {
+            return xs.iter().map(|x| self.mul(x)).collect();
+        }
+        let rounded: Vec<Vec<f32>> = if int8 { Vec::new() } else { xs.iter().map(|x| self.vdt.round_trip(x)).collect() };
+        let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
+        let mut flat = vec![0f32; self.rows * n];
+        flat.par_chunks_mut(chunk * n).enumerate().for_each(|(ci, ys)| {
+            for (k, yr) in ys.chunks_mut(n).enumerate() {
+                let r = ci * chunk + k;
+                let row = &self.data[r * self.row_bytes..(r + 1) * self.row_bytes];
+                for t in 0..n {
+                    yr[t] = if int8 { crate::cpu_q8::row_dot(fast, row, &q8[t]) } else { crate::cpu_dot::row_dot(fast, row, &rounded[t]) };
+                }
+            }
+        });
+        (0..n).map(|t| (0..self.rows).map(|r| flat[r * n + t]).collect()).collect()
+    }
+
     /// The same matrix stored differently (a pack's copy of a float tensor).
     /// The GGUF type name of the stored encoding.
     pub fn ty(&self) -> &str {
@@ -358,6 +392,21 @@ pub struct Dense {
 }
 
 impl Dense {
+    /// `forward` for several inputs, each matrix applied to all of them at once.
+    fn forward_batch(&self, hs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let mut mid = self.up.matmul(hs);
+        match &self.gate {
+            Some(g) => {
+                let gv = g.matmul(hs);
+                for (m, g) in mid.iter_mut().zip(&gv) {
+                    m.iter_mut().zip(g).for_each(|(u, g)| *u *= act(self.act, *g));
+                }
+            }
+            None => mid.iter_mut().for_each(|m| m.iter_mut().for_each(|v| *v = act(self.act, *v))),
+        }
+        self.down.matmul(&mid)
+    }
+
     fn forward(&self, h: &[f32]) -> Vec<f32> {
         let (mut mid, gate) = match &self.gate {
             Some(g) => {
@@ -873,6 +922,50 @@ impl Model {
         self.output.mul(&h)
     }
 
+    /// Whether a prompt can go through `forward_batch`: plain attention (no QSA) and dense feed-forward layers only.
+    pub fn batchable(&self) -> bool {
+        self.hc == 0 && self.layers.iter().all(|l| l.parts.iter().all(|(_, b)| match b {
+            Block::Attn(a) => a.qsa.is_none(),
+            Block::Dense(_) => true,
+            _ => false,
+        }))
+    }
+
+    /// Several prompt tokens at once (a chunk): each matrix is applied to all of them together (`QMat::matmul`), the
+    /// attention runs token by token in order with each token's own position, so every value is the one `forward`
+    /// computes. -> the logits after the last token. Only for `batchable` models.
+    pub fn forward_batch(&self, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+        debug_assert!(self.batchable());
+        let base = st.pos;
+        let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize)).collect();
+        for (l, layer) in self.layers.iter().enumerate() {
+            for (pi, (norm, block)) in layer.parts.iter().enumerate() {
+                let hs: Vec<Vec<f32>> = xs.iter().map(|x| rms_norm(x, norm, self.eps)).collect();
+                let outs: Vec<Vec<f32>> = match block {
+                    Block::Attn(a) => {
+                        let (q, k, v) = (a.q.matmul(&hs), a.k.matmul(&hs), a.v.matmul(&hs));
+                        let mut atts = Vec::with_capacity(tokens.len());
+                        for (i, ((qv, kv), vv)) in q.into_iter().zip(k).zip(v).enumerate() {
+                            st.pos = base + i;
+                            atts.push(self.attend(l * 2 + pi, a, qv, kv, vv, None, st));
+                        }
+                        let mut o = a.o.matmul(&atts);
+                        o.iter_mut().for_each(|y| add_bias(y, &a.o_b));
+                        o
+                    }
+                    Block::Dense(b) => b.forward_batch(&hs),
+                    _ => unreachable!("forward_batch is for batchable models"),
+                };
+                for (x, out) in xs.iter_mut().zip(&outs) {
+                    x.iter_mut().zip(out).for_each(|(a, b)| *a += b);
+                }
+            }
+        }
+        st.pos = base + tokens.len();
+        let h = rms_norm(xs.last().expect("a token"), &self.out_norm, self.eps);
+        self.output.mul(&h)
+    }
+
     /// The same with hyper-connections: the residual is `hc` streams, mixed down for each block and given its output
     /// by per-stream weights.
     fn forward_hc(&self, st: &mut State, token: u32) -> Vec<f32> {
@@ -1147,15 +1240,25 @@ impl Model {
     }
 
     fn attention(&self, slot: usize, a: &Attn, h: &[f32], st: &mut State) -> Vec<f32> {
-        let hd = a.head_dim;
-        let pos = st.pos;
         let top = a.qsa.as_ref().and_then(|q| self.qsa_cells(slot, q, h, st));
-        let (mut qv, mut kv, mut vv) = {
+        let (qv, kv, vv) = {
             let mut v = QMat::mul_many(&[&a.q, &a.k, &a.v], h);
             let vv = v.pop().unwrap();
             let kv = v.pop().unwrap();
             (v.pop().unwrap(), kv, vv)
         };
+        let att = self.attend(slot, a, qv, kv, vv, top, st);
+        let mut out = a.o.mul(&att);
+        add_bias(&mut out, &a.o_b);
+        out
+    }
+
+    /// The attention after the q/k/v projections, at position st.pos: biases, norms, RoPE, the cache, the heads; the
+    /// result before the output projection. Shared by the one-token and the prompt-chunk paths.
+    fn attend(&self, slot: usize, a: &Attn, mut qv: Vec<f32>, mut kv: Vec<f32>, mut vv: Vec<f32>, top: Option<Vec<usize>>,
+              st: &mut State) -> Vec<f32> {
+        let hd = a.head_dim;
+        let pos = st.pos;
         // [query | gate] per head
         let gate: Option<Vec<f32>> = a.gated.then(|| {
             let g = qv.chunks_exact(hd * 2).flat_map(|c| c[hd..].iter().copied()).collect();
@@ -1211,9 +1314,7 @@ impl Model {
         if let Some(g) = &gate {
             att.iter_mut().zip(g).for_each(|(o, g)| *o *= sigmoid(*g));
         }
-        let mut out = a.o.mul(&att);
-        add_bias(&mut out, &a.o_b);
-        out
+        att
     }
 
     fn mla(&self, slot: usize, m: &Mla, h: &[f32], st: &mut State) -> Vec<f32> {
@@ -1461,6 +1562,41 @@ fn qmat(mm: &'static memmap2::Mmap, g: &Gguf, t: &TensorInfo) -> Result<QMat, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prompt chunk's products equal one-at-a-time's exactly (forward_batch's tokens depend on it), for the integer
+    /// K-quant path, the f32 fast path and the dequantizing fallback.
+    #[test]
+    fn matmul_equals_matvec_exactly() {
+        let mut seed = 0x51_7CC1_B727_220Au64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        for ty in ["Q4_K", "Q6_K", "Q8_0", "F32", "Q5_0"] {
+            let (rows, cols) = (37, 512);
+            let rb = QMat::row_bytes(ty, cols);
+            let mut data: Vec<u8> = (0..rows * rb).map(|_| next() as u8).collect();
+            // keep the scales finite: f16 0.01 where each type keeps them
+            let (be, bb) = strata_gguf::block_geometry(ty).unwrap_or((1, 4));
+            let (be, bb) = (be as usize, bb as usize);
+            if ty == "F32" {
+                for c in data.chunks_exact_mut(4) { c.copy_from_slice(&((next() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()); }
+            } else {
+                let f = strata_pack::num::f32_to_f16(0.01).to_le_bytes();
+                for b in data.chunks_exact_mut(bb) {
+                    match ty { "Q4_K" => { b[0..2].copy_from_slice(&f); b[2..4].copy_from_slice(&f); }
+                               "Q6_K" => b[208..210].copy_from_slice(&f),
+                               _ => b[0..2].copy_from_slice(&f) }
+                }
+            }
+            let _ = be;
+            let q = QMat { data: Box::leak(data.into_boxed_slice()), ty: ty.into(), vdt: Vdt::of(ty), rows, cols, row_bytes: rb,
+                           #[cfg(feature = "gpu")] gpu: None };
+            let xs: Vec<Vec<f32>> = (0..5).map(|_| (0..cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect();
+            let batched = q.matmul(&xs);
+            for (t, x) in xs.iter().enumerate() {
+                assert_eq!(batched[t], q.mul(x), "{ty}: input {t}");
+            }
+            assert!(q.matmul(&[]).is_empty(), "{ty}: an empty chunk is an empty answer");
+        }
+    }
 
     #[test]
     fn activation_rounding_as_ggml() {
