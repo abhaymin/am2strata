@@ -371,7 +371,12 @@ impl Engine {
             let mut last_activity = Instant::now();
             loop {
                 let wait = stall.saturating_sub(last_activity.elapsed());
-                match tokio::time::timeout(wait.max(Duration::from_millis(200)), events.recv()).await {
+                // the deadline is checked directly too: lines that are not progress, arriving faster than the 200 ms
+                // floor below, would otherwise keep the timeout from ever firing
+                let got = if wait.is_zero() { Err(()) } else {
+                    tokio::time::timeout(wait.max(Duration::from_millis(200)), events.recv()).await.map_err(|_| ())
+                };
+                match got {
                     Err(_) => {
                         inner.broken.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = out.send(Err(Error::Stalled(label.clone(), stall))).await;

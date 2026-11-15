@@ -62,10 +62,13 @@ struct Script {
     /// "stall": each GEN is answered by emitting nothing at all, so the server's engine_stall_s watchdog ends it
     /// (findings item 2)
     stall: bool,
+    /// with "stall": keep sending INFO lines (not tokens, not progress) every 50 ms instead of silence, as an engine
+    /// that keeps talking but makes no progress would
+    chatter: bool,
 }
 
 fn script() -> Script {
-    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO, die_once: None, stall: false };
+    let mut s = Script { replies: vec![vec![0]], finish: "stop".into(), delay: Duration::ZERO, die_once: None, stall: false, chatter: false };
     if let Ok(path) = std::env::var("MOCK_SCRIPT") {
         if let Ok(v) = std::fs::read_to_string(path).map(|t| serde_json::from_str::<serde_json::Value>(&t)) {
             let v = v.unwrap_or_default();
@@ -86,6 +89,9 @@ fn script() -> Script {
             }
             if v.get("stall") == Some(&serde_json::Value::Bool(true)) {
                 s.stall = true;
+            }
+            if v.get("chatter") == Some(&serde_json::Value::Bool(true)) {
+                s.chatter = true;
             }
         }
     }
@@ -158,7 +164,10 @@ fn main() {
                 // findings item 2 (watchdog test): answer the request by emitting nothing at all, so the server's
                 // engine_stall_s watchdog ends it with a clear error that names the model and the stall.
                 if script.stall {
-                    loop { std::thread::sleep(Duration::from_secs(3600)); }
+                    loop {
+                        if script.chatter { say("INFO keepalive=1"); std::thread::sleep(Duration::from_millis(50)); }
+                        else { std::thread::sleep(Duration::from_secs(3600)); }
+                    }
                 }
                 let max_new: usize = f.get(1).and_then(|n| n.parse().ok()).unwrap_or(1);
                 let n_prompt = f.last().map(|ids| ids.split(',').count()).unwrap_or(0);

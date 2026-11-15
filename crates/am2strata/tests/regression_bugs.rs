@@ -769,8 +769,19 @@ fn the_fixture_gates_and_unit_regressions_still_exist() {
 /// script reaches it through the config's "env" (Engine::start applies cfg.env) — so this test never calls set_var.
 #[test]
 fn engine_ended_with_a_stall_error_it_makes_no_progress() {
-    let dir = TempDir::new("stall");
-    std::fs::write(dir.0.join("script.json"), r#"{"stall": true}"#).unwrap();
+    stall_case("stall", r#"{"stall": true}"#);
+}
+
+/// The same, for an engine that keeps sending lines that are not progress (INFO every 50 ms, faster than the watchdog's
+/// 200 ms wait floor): the deadline must still fire (review of PR #62).
+#[test]
+fn an_engine_that_only_chatters_is_still_ended_as_stalled() {
+    stall_case("chatter", r#"{"stall": true, "chatter": true}"#);
+}
+
+fn stall_case(name: &str, script: &str) {
+    let dir = TempDir::new(name);
+    std::fs::write(dir.0.join("script.json"), script).unwrap();
     let exe = env!("CARGO_BIN_EXE_strata-mock-engine");
     let mut cfg = RunConfig {
         exe: exe.into(), args: ["--serve".into(), "--model".into(), dir.0.join("m.gguf").to_string_lossy().into()].to_vec(),
