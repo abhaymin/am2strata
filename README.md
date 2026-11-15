@@ -12,10 +12,10 @@
 | ![A question and its answer, streamed at 68 tok/s](docs/media/screenshot-chat.webp) | ![A digital clock the model wrote, running in the canvas](docs/media/screenshot-canvas.webp) | ![Python from the chat run in the sandbox: no network, home folders hidden](docs/media/screenshot-python.webp) |
 | **Flows and the whiteboard** | **Monitor: the history, in pages** | **Coding agents** |
 | ![A Mermaid flow, and shapes drawn on the whiteboard](docs/media/screenshot-whiteboard.webp) | ![The Monitor's request history in pages: songs with their players and how much of the lyrics was heard, a video clip and an image](docs/media/screenshot-monitor.webp) | ![Settings › Connect: the coding agents and what each supports](docs/media/screenshot-agents.webp) |
-| **Songs** | | |
-| ![Media Generation › Song: a festive Hindi Diwali song, 3 minutes, 3 takes](docs/media/screenshot-songs.webp) | | |
+| **Songs** | **Cluster: a Mac mini as a worker** | |
+| ![Media Generation › Song: a festive Hindi Diwali song, 3 minutes, 3 takes](docs/media/screenshot-songs.webp) | ![Settings › Cluster: a Mac mini M4 paired as a worker, answering, encrypted (setup: docs/CLUSTER.md)](docs/media/screenshot-cluster.webp) | |
 
-<sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3; the Workshop and Computer tabs are newer and not pictured yet) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
+<sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3; Cluster 2026-11-15 with a Mac mini M4 worker; the Workshop and Computer tabs are newer and not pictured yet) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
 banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
 **Watch:** [what's new in v0.1.4](https://youtu.be/HP4ztKaqOyo) (4 min: songs that sing their lyrics, MCP servers from
