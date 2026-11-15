@@ -675,6 +675,22 @@ When a command runs and one of those names appears in it — `docker rm -f prod-
 the work on a copy and hand back a script for the owner to run on the real thing, instead of changing it. Nothing is
 listed by default, so this only bites what you put there (`computer.protect`).
 
+## Web search that does not break (`web_search`, `fetch_url`)
+
+`web_search(query)` tries several backends in turn and only falls back to telling the model to fetch a page when every
+one is no good. In order it tries SearXNG (when the run config names one — `"web_search": {"searxng_url": "http://..."}`),
+DuckDuckGo's HTML page, DuckDuckGo lite, Brave (only when you set a key — `"web_search": {"brave_key": "..."}`, sent as
+the `X-Subscription-Token` header) and Wikipedia (always). A backend that is blocked (DuckDuckGo's "unusual traffic" /
+captcha page with no results on it) or that fails is left alone for ten minutes; if every one is left alone they are all tried
+again at once. The reply says which backend answered — "(results from duckduckgo_lite; duckduckgo was blocked)" — and, when
+none answers, gives every reason and points the model at a page to read instead: "... Use fetch_url on a site you know
+(for example https://en.wikipedia.org/wiki/<topic>) instead." — never an empty result with no reason. `fetch_url(url)`
+reads a page's main text, like any media source (public addresses only).
+
+- **Order:** the default is SearXNG, DuckDuckGo, DuckDuckGo lite, Brave, Wikipedia. `"web_search": {"backends": ["brave", "wikipedia"]}`
+  in the run config overrides it (any subset of `searxng`, `duckduckgo`, `duckduckgo_lite`, `brave`, `wikipedia`). SearXNG is
+  still tried only when its URL is set and Brave only when its key is.
+
 ## The browser tool: your own Chrome
 
 "Use a browser" (the chat's `strata_browser`) normally drives a fresh headless Chrome on the server, with none of your
