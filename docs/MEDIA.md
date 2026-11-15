@@ -5,6 +5,24 @@ Every media feature is two things at once: an HTTP endpoint any client can call,
 does the work. A GPU job holds the GPU's turn: by default the text model stops for it and loads again with the next
 chat. All endpoints take the API key (the owner's or a client key).
 
+## From the command line
+
+`am2strata-run media <action>` is a thin client of the endpoints above, writing or printing the answer it returns. Give `--out` where the action returns a file; only that answer goes to stdout, so the commands pipe cleanly (the `[am2strata] media <action>: <url>` line goes to stderr). One per action:
+
+```bash
+am2strata-run media image "a lighthouse at dusk, oil painting" --size 1024x1024 --model z-image-turbo:q8 --out shot.png
+am2strata-run media video "waves on a quiet beach at night" --frames 49 --size 1280x704 --format mp4 --out clip.mp4
+am2strata-run media speak "Welcome to the evening set." --voice laura --out intro.wav
+am2strata-run media transcribe take.wav --model whisper-base            # its text on stdout (or --format srt|vtt|text)
+am2strata-run media song "warm acoustic ballad, female vocal" --lyrics words.txt --seconds 180 --out song.wav
+am2strata-run media check take.wav --expect "Welcome to the evening set."   # prints each finding; exit 1 when any is not ok
+am2strata-run media dub dub-request.json --out soundtrack.wav
+am2strata-run media produce plan.json --out set.wav                     # posts the plan, polls step N of M, then downloads it
+am2strata-run media job mj-1234 --out set.wav                           # its status; with --out also /content
+```
+
+- **Where they point:** pass `--url <server>` and `--api-key <key>`, or export `AM2STRATA_URL` and `AM2STRATA_API_KEY`. With neither, the command uses this PC's local server (from its run configs) and that server's key — the one listed in Settings › Clients. For another am2Strata (a sandbox, a second PC), set `AM2STRATA_URL` to the address it is serving at (its `serve --host/--port`, or what `am2strata agent list` shows for it) and `AM2STRATA_API_KEY` to a key issued for that server.
+
 ## Images
 
 `POST /v1/images/generations`, OpenAI's images API:

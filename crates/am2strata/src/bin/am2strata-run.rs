@@ -30,6 +30,8 @@ mod regression_run;
 mod doctor;
 #[path = "../eval_run.rs"]
 mod eval_run;
+#[path = "../bin_media.rs"]
+mod bin_media;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -422,6 +424,28 @@ enum Cmd {
         /// the manifest (default: tools/upstream.json in this checkout)
         #[arg(long)]
         manifest: Option<PathBuf>,
+    },
+    /// media generation from a terminal (docs/GAPS-PLAN B; docs/MEDIA.md has every example):
+    /// image "prompt" [--size WxH] [--model M] [--n N] --out file.png | video "prompt" [--frames N] [--size WxH] [--format mp4|gif|apng] [--model M] --out file |
+    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
+    /// song "prompt" [--lyrics file.txt] [--seconds N] --out file.wav | check <file> [--expect "text"] [--language xx] (prints each finding; exit 1 when any is not ok) |
+    /// dub <request.json> [--out file.wav] | produce <plan.json> [--out file.wav] (posts the plan, polls step N of M every 3 s, then downloads the content) |
+    /// job <id> [--out file] (the job status; with --out also its /content)
+    Media {
+        action: String,
+        /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job
+        #[arg(last = true)]
+        first: Option<String>,
+        #[command(flatten)]
+        m: bin_media::MediaOpts,
+        /// server, mine or sandbox (default: the config's; or AM2STRATA_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// its own API key (default: from the run configs; or AM2STRATA_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
     },
     /// download an image (later: video, voice) model for the media engine into <data-dir>/media, e.g. z-image-turbo:q8
     MediaPull {
@@ -961,6 +985,8 @@ fn main() -> ExitCode {
                      days, key, url, api_key, &models_dir),
         Cmd::Tls { action, cert, key, port, http, url, api_key, models_dir } => tls_cmd(&action, cert, key, port, http, url, api_key, &models_dir),
         Cmd::Live { topics, cert, url, api_key, models_dir } => live_cmd(&topics, cert, url, api_key, &models_dir),
+        Cmd::Media { action, first, m, url, api_key, models_dir } =>
+            bin_media::media_cmd(&action, first, &m, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
