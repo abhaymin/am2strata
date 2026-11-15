@@ -192,7 +192,10 @@ pub async fn serve(me: Identity, pins: Box<dyn Fn() -> Vec<String> + Send + Sync
                 }
             };
             let peer = tls.get_ref().1.peer_certificates().and_then(|c| c.first()).map(|c| pin_of(c));
-            let svc = app.layer(axum::Extension(Peer(peer))).layer(axum::Extension(axum::extract::ConnectInfo(addr)));
+            // OverTls: this connection is TLS, so the plain-HTTP policy (tls.http "local-only" or "redirect") must not
+            // redirect it to the HTTPS port, whose certificate is not the pinned one (a paired master then fails)
+            let svc = app.layer(axum::Extension(Peer(peer))).layer(axum::Extension(crate::server_tls::OverTls))
+                .layer(axum::Extension(axum::extract::ConnectInfo(addr)));
             let svc = hyper_util::service::TowerToHyperService::new(svc);
             let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
                 .serve_connection(hyper_util::rt::TokioIo::new(tls), svc).await;

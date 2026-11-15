@@ -237,6 +237,7 @@ MiniCPM-V and the others) over their line protocol.
 | Video | as frames: video parts are cut into frames with ffmpeg when installed; frames sent as images always work | live (frames); ffmpeg path needs `sudo apt install ffmpeg` |
 | Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
 | Web app (`web/`) | done: chat, model picker, settings, monitor polling | live in a browser |
+| Clusters: workers paired by a 6-digit code, mutual TLS 1.3 with pinned certificates, whole requests routed to a worker ([setup guide](docs/CLUSTER.md)) | done (routing; one model split across machines is not built) | two servers on one machine; live: a Mac mini M4 worker paired with the Linux PC over Tailscale |
 | Stop strings, model-card default sampling, `fit_max_tokens` | done | live |
 | Workshop: convert (HF Llama-family to GGUF), quantize (Q8_0, Q6_K, Q5_K, Q4_K, Q4_0), merge LoRA (PEFT and Unsloth, rsLoRA, MoE expert adapters), install | done | byte for byte against llama.cpp's converter and `llama-quantize --pure` on fixture models; merge against a PyTorch reference |
 | Workshop: training data from documents (Q&A, chats, more-like-these; dedupe, judge pass, dataset card, review and edit) | done | mock server; live: 6 of 6 grounded pairs from a doc page on Tiel Coder Q8 |
