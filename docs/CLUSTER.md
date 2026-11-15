@@ -6,6 +6,8 @@ cluster does and does not do today. The design and the work still to come are in
 
 ![A cluster in four steps: install on both, make a worker, pair on the master, use it](media/cluster-setup.svg)
 
+![Settings › Cluster on the master: the Mac mini worker macm4, answering, encrypted, its model loaded](media/screenshot-cluster.webp)
+
 ## What a cluster does today
 
 - **Routing whole requests.** A chat goes to a worker in two cases:
