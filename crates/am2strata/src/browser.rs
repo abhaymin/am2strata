@@ -996,7 +996,26 @@ impl Browsers {
                                 or answer from what you have", field.map(|f| format!(" The field now contains: {f:?}.")).unwrap_or_default()));
         }
         let limit = self.settings.step_timeout;
-        let r = tokio::time::timeout(limit, self.step(conv, name, args)).await;
+        // a session that is already gone answers at once: reconnect before the step instead of waiting for it to time out
+        if let Some(page) = self.current(conv).await {
+            if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(2), page.evaluate("1")).await {
+                if dead_session(&e.to_string()) {
+                    tracing::warn!(error = %e, "browser: the tab's session is gone; reconnecting");
+                    self.reconnect(conv).await;
+                }
+            }
+        }
+        let mut r = tokio::time::timeout(limit, self.step(conv, name, args)).await;
+        // the DevTools session to the tab can die under us (the tab was driven from elsewhere, or Chrome swapped its
+        // renderer): every later step then fails with "Session with given id not found" or times out. Let go of it
+        // and try once more on a fresh session (a tab of the user's own browser is re-attached, not closed).
+        if let Ok(Err(e)) = &r {
+            if dead_session(e) || (e.contains("timed out") && !self.answers(conv).await) {
+                tracing::warn!(error = %e, "browser: the tab's session is gone; reconnecting");
+                self.reconnect(conv).await;
+                r = tokio::time::timeout(limit, self.step(conv, name, args)).await;
+            }
+        }
         if let Ok(Ok(_)) = &r {
             let after = self.page_hash(conv).await.unwrap_or(0);
             // a step that changed nothing counts toward the guard; one that changed the page starts it again
@@ -1045,6 +1064,22 @@ impl Browsers {
         let js = format!("(() => {{ const e = {sel} ? document.querySelector({sel}) : document.activeElement; \
                           return e ? String(e.value !== undefined ? e.value : e.innerText || '') : null; }})()");
         tokio::time::timeout(Duration::from_secs(3), page.evaluate(js)).await.ok()?.ok()?.into_value::<Option<String>>().ok()?
+    }
+
+    /// Does this job's tab still answer a script (within 3 s)?
+    async fn answers(&self, conv: &str) -> bool {
+        let Some(page) = self.current(conv).await else { return false };
+        tokio::time::timeout(Duration::from_secs(3), page.evaluate("1+1")).await.is_ok_and(|r| r.is_ok())
+    }
+
+    /// A tab whose DevTools session died: in the user's own browser the whole connection is dropped (the next step
+    /// attaches again, with fresh sessions to the same tabs); in the server's browser just that tab is replaced.
+    async fn reconnect(&self, conv: &str) {
+        if self.settings.connect.is_some() {
+            self.close().await;
+        } else {
+            self.drop_tab(conv).await;
+        }
     }
 
     /// End a session (a site test's run): its tab closes and its step memory goes.
@@ -1283,6 +1318,11 @@ impl Browsers {
             }
         }
     }
+}
+
+/// An error that means the DevTools session to the tab is gone (not a problem with the page itself).
+fn dead_session(e: &str) -> bool {
+    e.contains("Session with given id not found") || e.contains("-32001") || e.contains("No target with given id")
 }
 
 /// The WebSocket debugger URL of a running Chrome from its HTTP endpoint (`http://host:port` -> /json/version).
