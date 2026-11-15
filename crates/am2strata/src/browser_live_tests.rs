@@ -87,6 +87,7 @@ async fn eval(b: &Browsers, conv: &str, js: &str) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_browser_tools_work_on_real_pages() {
+    let _ = tracing_subscriber::fmt().with_env_filter("am2strata=debug").with_test_writer().try_init();
     let data = tmp();
     let Some(b) = browsers(&data) else { return };
     let base = serve().await;
@@ -188,6 +189,16 @@ async fn the_browser_tools_work_on_real_pages() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let back = b.call(c, "browser_open", &json!({"url": format!("{base}/table")})).await;
     assert!(back.as_ref().is_ok_and(|s| s.text.contains("Books p1")), "the step after a lost session works: {:?}", back.map(|s| s.text));
+
+    // ---- the whole DevTools connection dies (the browser went away under us): the next step starts a fresh one
+    {
+        let mut run = b.run.lock().await;
+        if let Some(child) = run.as_mut().unwrap().child.as_mut() { let _ = child.kill(); }
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let back = tokio::time::timeout(Duration::from_secs(150), b.call(c, "browser_open", &json!({"url": format!("{base}/table")}))).await
+        .expect("the step after a lost connection hangs");
+    assert!(back.as_ref().is_ok_and(|s| s.text.contains("Books p1")), "the step after a lost connection works: {:?}", back.map(|s| s.text));
 
     // ---- a site test with no model, and its JUnit report
     let suite = json!({"name": "shop", "base": base, "steps": [
