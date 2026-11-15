@@ -42,3 +42,29 @@ fn compute_keys_is_declared_once() {
     let count = js.lines().filter(|l| l.trim_start().starts_with(pattern)).count();
     assert_eq!(count, 1, "COMPUTE_KEYS must be declared once");
 }
+
+/// Read one web asset from the repo root (the crate is two levels below `web/`), like the checks above.
+fn web_asset(path: &str) -> String {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("../../web/{path}"));
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+}
+
+/// The Tools tab is a fifth kind in Media Generation, its three cards built like the Speech to text card.
+#[test]
+fn tools_tab_has_the_three_media_cards() {
+    let html = web_asset("index.html");
+    assert!(html.contains(r#"id="tools-forms""#), "the Tools tab has a #tools-forms container");
+    for id in ["check-form", "dub-form", "prod-form"] {
+        assert!(html.contains(format!(r#"id="{id}""#).as_str()), "the Tools tab has an #{id} form");
+    }
+    assert!(html.contains(r#"data-kind="tools""#), "a data-kind=\"tools\" button shows the Tools tab");
+}
+
+/// The Tools cards talk to the media endpoints: each posts its action, and productions follow /jobs part by part.
+#[test]
+fn tools_cards_post_the_media_actions() {
+    let js = web_asset("app.js");
+    for url in ["v1/media/check", "v1/media/dub", "v1/media/productions", "v1/media/jobs/"] {
+        assert!(js.contains(url), "app.js calls {url}");
+    }
+}

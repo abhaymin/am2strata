@@ -97,6 +97,7 @@ song and `compose_music` an instrumental.
 - **Following the job:** `GET /api/jobs/{id}` (or `/v1/media/jobs/{id}`) follows it part by part.
   `/v1/media/jobs/{id}/content` is the WAV, and the job's meta holds the chapters.
 - **Not yet:** video parts, MP3 output, and chapters inside the file (GAPS-PLAN A3).
+- **In the web app:** the Media Generation › Tools tab has a Productions card — paste a plan and it makes the parts part by part, showing the progress and then playing one saved file.
 
 ## Composing a video, and thumbnails
 
@@ -131,6 +132,7 @@ so the picture does not move:
 - **`source_lines`:** when given, the translation is checked against it: a line for every line, with the same speakers.
 - **The answer:** the full-length soundtrack as a WAV data URL, plus a report entry for every line that was sped up,
   cut or kept silent. Each entry gives the real line number, and `words_heard` when a transcript was given.
+- **In the web app:** the Tools tab has a Dub card — paste a request (or pick takes and stems), it dubs the narration in place and plays or saves the whole soundtrack.
 
 ## Checking a take or a video
 
@@ -155,6 +157,7 @@ so the picture does not move:
 - **Each check** answers with its number, ok or not, and the threshold it used.
 - **Without `heard_text`,** the take is transcribed in its own language with the most accurate Whisper on the server.
 - **Video checks need ffmpeg** (GAPS-PLAN A14).
+- **In the web app:** the Tools tab has a Check card — drop a take or a video, give the expected words if you have them, and it shows each check's result as pass or fail.
 
 ## Media from a chat
 

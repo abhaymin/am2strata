@@ -539,6 +539,13 @@ body.resizing iframe { pointer-events: none; }
 .rec-on { color: var(--st-danger, #e5484d) !important; }
 #stt-rec.rec-on { border-color: currentColor; }
 .img-results audio { width: 100%; }
+.check-row { display:flex; align-items:center; gap:8px; padding:6px 0; border-top:1px solid var(--st-separator, rgba(127,127,127,.2)); }
+.check-name { flex:1 1 auto; min-width:0; }
+.check-value { flex:none; min-width:5rem; text-align:right; color:var(--st-ink-muted); }
+.check-mark { flex:none; min-width:4.5rem; text-align:right; font-weight:600; }
+.check-row.pass .check-mark { color:var(--st-accent,#3DD68C); }
+.check-row.fail .check-mark { color:var(--st-danger,#e5484d); }
+.check-overall { font-weight:600; padding:8px 0 2px; }
 
 /* a media job a chat's tool queued */
 .media-job { margin: 8px 0 12px; }
