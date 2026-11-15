@@ -28,6 +28,7 @@ Anthropic-compatible.
 |---|---|
 | `memory` | `remember`, `recall`, `forget`, and relevant facts added to the prompt |
 | `web` | `web_search`, `fetch_url` (and agents' own web search requests answered by the server) |
+| `experts` | `ask_expert` — a specialist model this server calls in the turn, named in the run config's `"experts"` |
 | `image`, `video`, `speech`, `music` | The media tools for that kind (MEDIA.md) |
 | `browser` | The browser tools (BROWSER-USE.md) |
 | `code` | `run_python` in the sandbox |

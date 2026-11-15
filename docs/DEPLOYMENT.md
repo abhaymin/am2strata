@@ -689,7 +689,47 @@ reads a page's main text, like any media source (public addresses only).
 
 - **Order:** the default is SearXNG, DuckDuckGo, DuckDuckGo lite, Brave, Wikipedia. `"web_search": {"backends": ["brave", "wikipedia"]}`
   in the run config overrides it (any subset of `searxng`, `duckduckgo`, `duckduckgo_lite`, `brave`, `wikipedia`). SearXNG is
-  still tried only when its URL is set and Brave only when its key is.
+   still tried only when its URL is set and Brave only when its key is.
+
+## Asking an expert (`ask_expert`)
+
+`ask_expert(expert, question, context?)` lets the main model send one sub-question to a specialist model that answers
+within the same turn — the result comes back and the chat continues with it, like a web search or a media tool. Unlike
+those, an expert is not among this PC's default tools: you name them in the run config, each as an OpenAI-compatible
+endpoint (another am2Strata, a cluster node, or llama-server). The specialist also gets the user's original request (the
+last message of the chat), so it sees the whole job and not only the planner's brief.
+
+```json
+"experts": [{
+  "name": "math",
+  "about": "checks arithmetic and algebra step by step",
+  "url": "http://127.0.0.1:8081/v1",
+  "model": "qwen-math",
+  "key_env": "MATH_KEY",
+  "max_tokens": 1024,
+  "timeout_s": 120
+}]
+```
+
+- **`name`, `about`:** shown to the main model so it can tell which expert to ask and what each one does. Names must be
+  unique and 1-32 of `[a-z0-9_-]`; an entry that fails validation, or a name used twice, is skipped with a warning at start.
+- **`url`:** the base of an OpenAI-compatible server. This server POSTs `{url}/chat/completions` (non-streaming), sending
+  the expert a system message ("You are the <name> expert. <about>. ...") and a user message with "The user's original
+  request: ..." followed by "The question for you: ..." plus any `context`. If an expert's `url` is *this* server itself —
+  a loopback address (127.0.0.1 / localhost / ::1) on this PC's own listen port — calling it would wait for the chat's own
+  GPU turn and hang until the timeout, so `ask_expert` refuses it at call time with a clear error ("the <name> expert is this
+  server itself; point it at another server or a remote model") rather than contacting it.
+- **`model`:** what runs at that endpoint; it is named in the answer that comes back ("Answer from the <name> expert
+  (<model>): ...").
+- **`key_env`, `max_tokens`, `timeout_s`:** optional. If the expert needs a key, name the environment variable that holds
+  it (`key_env`); it is read at call time, sent only as the `Authorization` header, and never stored, logged or returned.
+  `max_tokens` (default 1024) caps the answer's length and `timeout_s` (default 120) how long to wait.
+
+The set is offered when a request sends `"strata_experts": true`, or — with no flag at all — when the key's client profile
+has the set `experts` in its `tools`. It is offered only when at least one expert is configured, and never with a
+structured response_format or a forced tool_choice. An error (an unknown expert, no answer, a timeout, a non-200 status)
+comes back as a clear tool error naming the expert; the turn goes on. The answer itself is cut at 20,000 characters with a
+note saying so.
 
 ## The browser tool: your own Chrome
 

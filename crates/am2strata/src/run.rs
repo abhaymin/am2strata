@@ -906,6 +906,7 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                     "server": route.as_ref().map(|(_, s, _)| s.name.clone()).or_else(|| crate::memory::TOOL_NAMES.contains(&c.name.as_str()).then(|| "memory".to_string()))
                         .or_else(|| crate::media_jobs::TOOL_NAMES.contains(&c.name.as_str()).then(|| "media".to_string()))
                         .or_else(|| crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()).then(|| "web".to_string()))
+                        .or_else(|| crate::experts::TOOL_NAMES.contains(&c.name.as_str()).then(|| "experts".to_string()))
                         .or_else(|| crate::code_run::TOOL_NAMES.contains(&c.name.as_str()).then(|| "sandbox".to_string()))
                         .or_else(|| crate::browser::TOOL_NAMES.contains(&c.name.as_str()).then(|| "browser".to_string())),
                     "tool": route.as_ref().map(|(_, _, t)| t["name"].clone()).unwrap_or(json!(c.name)),
@@ -1104,6 +1105,14 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                             r = w.call(&c.name, &args) => r,
                             _ = tx.closed() => return,
                         },
+                    }
+                } else if let (true, None, Some(e)) = (crate::experts::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.experts.get()) {
+                    // the user's original request for this chat (the last user message), sent to the expert with the question
+                    let original_request = crate::memory::content_text(
+                        &prep.messages.iter().rev().find(|m| m["role"] == "user").map(|m| m["content"].clone()).unwrap_or(Value::Null));
+                    tokio::select! {
+                        r = e.call(&args, &original_request) => r,
+                        _ = tx.closed() => return,
                     }
                 } else if let Some(h) = &hub {
                     tokio::select! {
