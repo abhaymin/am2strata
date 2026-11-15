@@ -1,0 +1,30 @@
+{
+  "name": "threejs-pagoda",
+  "about": "a 3D scene: a pagoda in three.js with an orbiting camera",
+  "prompt": "Write a 3D pagoda with three.js as one HTML file. Import three.js as an ES module from https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js. The pagoda has at least three tiers, each with a roof; add lights, and a camera that slowly orbits it. The canvas fills the window. Answer with only the file, in one ```html block.",
+  "request": {},
+  "max_tokens": 16000,
+  "timeout_s": 1800,
+  "check": {
+    "kind": "html_browser",
+    "steps": [
+      {
+        "open": "$PAGE"
+      },
+      {
+        "expect": [
+          {
+            "selector": "canvas",
+            "visible": true
+          },
+          {
+            "console_errors": 0
+          },
+          {
+            "failed_requests": 0
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "fix-nginx",
+  "about": "fix a broken service in the sandbox VM, from its shell",
+  "needs": "vm",
+  "prompt": "The web server nginx in the sandbox VM does not start. Find out why and fix it, so it serves its default page on port 80. Work in the VM with the computer_shell tool.",
+  "request": {
+    "strata_computer": true
+  },
+  "max_tokens": 12000,
+  "timeout_s": 1800,
+  "setup": {
+    "vm": "set -e; (dpkg -s nginx >/dev/null 2>&1 || DEBIAN_FRONTEND=noninteractive apt-get install -y nginx >/dev/null); cp -n /etc/nginx/sites-available/default /root/default.orig || true; cp /root/default.orig /etc/nginx/sites-available/default; sed -i '0,/listen 80 default_server;/s//listen 80 default_server/' /etc/nginx/sites-available/default; systemctl restart nginx || true"
+  },
+  "check": {
+    "kind": "vm_shell",
+    "script": "systemctl is-active --quiet nginx && curl -fsS http://127.0.0.1/ | grep -qi nginx"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "scrape-cities",
+  "about": "collect records: a Wikipedia table into a keyed dataset",
+  "prompt": "Using the browser, open https://en.wikipedia.org/wiki/List_of_largest_cities and save the main table of cities into a dataset named eval-cities, one record per city, keyed by the city's name.",
+  "request": {
+    "strata_browser": "server"
+  },
+  "max_tokens": 8000,
+  "timeout_s": 1200,
+  "check": {
+    "kind": "dataset",
+    "name": "eval-cities",
+    "min_rows": 70,
+    "columns": [
+      "city",
+      "country"
+    ]
+  }
+}

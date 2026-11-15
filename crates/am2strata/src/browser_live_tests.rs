@@ -147,6 +147,10 @@ async fn the_browser_tools_work_on_real_pages() {
     let t = b.call(c, "browser_extract", &json!({"kind": "table"})).await.unwrap().text;
     assert!(t.contains("\"Population 2025\": \"18\"") && t.contains("\"City_link\": \"") && t.matches("\"Country\": \"Japan\"").count() == 2, "{t}");
 
+    // a data: page opens as itself (not "https://data:…")
+    let d = b.call(c, "browser_open", &json!({"url": "data:text/html,<title>Inline</title><p>made here</p>"})).await.unwrap().text;
+    assert!(d.contains("made here"), "{d}");
+
     // ---- a map: drag pans, the wheel zooms both ways, double and right clicks, keys with modifiers
     b.call(c, "browser_open", &json!({"url": format!("{base}/map")})).await.unwrap();
     b.call(c, "browser_mouse", &json!({"action": "drag", "x": 600, "y": 400, "to_x": 500, "to_y": 450})).await.unwrap();

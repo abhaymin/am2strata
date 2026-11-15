@@ -1,0 +1,8 @@
+{
+  "fix-nginx": "e8b2b8851665c5e9e95d569e17aff100e09fa2b6c0b701023689c4ca4a3de357",
+  "form-httpbin": "1bb570df313543bb7e71411823dad7f225d52e9ef30ced69e3108525b222f50c",
+  "kanban": "23b8815e2fdec15ec920cad0df30560a03aea88ca89e33e97cc18b4253cb1db2",
+  "research-jakarta": "bd7a49f8121ec8d5fa1ac9a0482e42414af2b9e1af52898b3ce6d6d64cd4d4cf",
+  "scrape-cities": "35c9fe83d5d762f2f7650ca67ea52eaf4d88cfec9b21b2e227b0cdd7f6bd7fa0",
+  "threejs-pagoda": "ba4e9f481598e612f8a7ab6c6137292d5b1bc66ffd4df16e4679504910382f31"
+}
