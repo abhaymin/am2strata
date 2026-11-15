@@ -10,7 +10,7 @@ chat. All endpoints take the API key (the owner's or a client key).
 `POST /v1/images/generations`, OpenAI's images API:
 
 ```json
-{"prompt": "a lighthouse at dusk, oil painting", "size": "1024x1024", "n": 1, "model": "flux-2-klein",
+{"prompt": "a lighthouse at dusk, oil painting", "size": "1024x1024", "n": 1, "model": "z-image-turbo:q8",
  "steps": 8, "guidance": 3.5, "seed": 7, "negative_prompt": "", "response_format": "b64_json"}
 ```
 
@@ -25,8 +25,8 @@ model that takes edits (Qwen Image 2.1).
 `POST /v1/videos/generations`:
 
 ```json
-{"prompt": "waves on a quiet beach at night", "model": "wan2.1-t2v-1.3b", "size": "832x480",
- "frames": 33, "fps": 16, "steps": 30, "seed": 1, "format": "mp4"}
+{"prompt": "waves on a quiet beach at night", "model": "wan22-ti2v-5b:q8", "size": "1280x704",
+ "frames": 49, "fps": 24, "steps": 30, "seed": 1, "format": "mp4"}
 ```
 
 - **Frame counts** are rounded to what the model takes: Wan 4n+1, LTX 8n+1.
