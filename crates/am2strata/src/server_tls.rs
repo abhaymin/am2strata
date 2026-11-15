@@ -170,26 +170,43 @@ pub fn lan_ip_addresses() -> Vec<String> {
     interface_addresses().into_iter().filter(|a| !a.is_loopback()).map(|a| a.ip().to_string()).collect()
 }
 
-/// Where Tailscale's CLI lives on macOS (Apple-silicon Homebrew, Intel Homebrew, and the app itself), used when a launchd agent's PATH holds none of them; on other OSes these paths simply do not exist and are skipped.
+/// Where command-line tools live on macOS when a launchd agent's PATH holds none of them: Apple-silicon Homebrew, Intel
+/// Homebrew. Tailscale's app keeps its CLI in its own bundle too. On other OSes these paths do not exist and are skipped.
+const TOOL_HOMES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin"];
 const TAILSCALE_HOMES: &[&str] = &["/opt/homebrew/bin", "/usr/local/bin", "/Applications/Tailscale.app/Contents/MacOS"];
 
-/// Find `tailscale` in `dirs`, then the macOS homes, checking each in order (a directory name may carry an extension on
-/// Windows). Pure: a test passes any list and gets back the first path that exists, or None.
+/// Find the program `name` in `dirs`, then `homes`, in order (with ".exe" on Windows). Pure: a test passes any lists and
+/// gets back the first path that exists, or None.
+pub fn program_in(name: &str, dirs: &[PathBuf], homes: &[PathBuf]) -> Option<PathBuf> {
+    let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    dirs.iter().chain(homes.iter()).map(|d| d.join(&file)).find(|p| p.is_file())
+}
+
+/// Find `tailscale` in `dirs`, then `homes` (kept for its tests and callers).
 pub fn tailscale_in(dirs: &[PathBuf], homes: &[PathBuf]) -> Option<PathBuf> {
-    let name = if cfg!(windows) { "tailscale.exe" } else { "tailscale" };
-    for d in dirs.iter().chain(homes.iter()) {
-        let p = d.join(name);
-        if p.is_file() { return Some(p); }
-    }
-    None
+    program_in("tailscale", dirs, homes)
+}
+
+fn path_dirs() -> Vec<PathBuf> {
+    std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default()
 }
 
 /// The tailscale binary on this session's PATH, then the macOS homes: found even when launched by a launchd agent whose
-/// PATH has no /opt/homebrew/bin (install.sh's service sets one; this finds it regardless). None when not installed.
+/// PATH has no /opt/homebrew/bin. None when not installed.
 pub fn tailscale_path() -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
     let homes: Vec<PathBuf> = TAILSCALE_HOMES.iter().map(PathBuf::from).collect();
-    tailscale_in(&dirs, &homes)
+    tailscale_in(&path_dirs(), &homes)
+}
+
+/// The program to run for a tool such as ffmpeg, ffprobe or tailscale: its full path when found on PATH or in the macOS
+/// Homebrew homes, else its bare name (which still goes through PATH and fails the usual way). Every outside tool the
+/// server runs on macOS goes through this, because a launchd agent's PATH has no /opt/homebrew/bin.
+pub fn program(name: &str) -> PathBuf {
+    if name == "tailscale" {
+        return tailscale_path().unwrap_or_else(|| PathBuf::from(name));
+    }
+    let homes: Vec<PathBuf> = TOOL_HOMES.iter().map(PathBuf::from).collect();
+    program_in(name, &path_dirs(), &homes).unwrap_or_else(|| PathBuf::from(name))
 }
 
 /// `tailscale` resolved to the path we found it at (else its name, which still goes through PATH): a launchd agent's
@@ -810,6 +827,24 @@ mod tests {
 
     // The tailscale binary is found on PATH first, then the macOS homes (Homebrew before the app): so a launchd agent's
     // empty PATH still runs it, and a test can check the order without touching the real filesystem (item 3).
+    // ffmpeg under a launchd agent: not on PATH, but in a Homebrew home, is found there (2026-11-15, the Mac worker said
+    // "video frames need ffmpeg" while /opt/homebrew/bin/ffmpeg was installed)
+    #[test]
+    fn a_tool_missing_from_path_is_found_in_a_homebrew_home() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target")
+            .join(format!("am2-program-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let (path_dir, brew) = (base.join("path"), base.join("brew"));
+        std::fs::create_dir_all(&path_dir).unwrap();
+        std::fs::create_dir_all(&brew).unwrap();
+        let exe = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+        std::fs::write(brew.join(exe), b"").unwrap();
+        assert_eq!(program_in("ffmpeg", &[path_dir.clone()], &[brew.clone()]), Some(brew.join(exe)));
+        std::fs::write(path_dir.join(exe), b"").unwrap();
+        assert_eq!(program_in("ffmpeg", &[path_dir.clone()], &[brew.clone()]), Some(path_dir.join(exe)), "PATH wins");
+        assert_eq!(program_in("ffprobe", &[path_dir], &[brew]), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn tailscale_prefers_path_before_the_macos_homes() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");

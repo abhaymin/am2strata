@@ -309,7 +309,7 @@ impl Hosts {
             }
         }
         // its Tailscale name (MagicDNS)
-        if let Ok(o) = std::process::Command::new("tailscale").args(["status", "--json"]).output() {
+        if let Ok(o) = std::process::Command::new(crate::server_tls::program("tailscale")).args(["status", "--json"]).output() {
             if let Some(name) = serde_json::from_slice::<serde_json::Value>(&o.stdout).ok()
                 .and_then(|j| j["Self"]["DNSName"].as_str().map(|d| d.trim_end_matches('.').to_lowercase())).filter(|d| !d.is_empty()) {
                 v.push(name);

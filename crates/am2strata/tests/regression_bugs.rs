@@ -557,6 +557,29 @@ fn pr59_ram_is_read_only_through_mem_rs() {
     assert!(manager.contains("crate::mem::total_mib()"), "the server's Hardware.ram_mib must come from mem.rs");
 }
 
+/// 2026-11-15, the Mac worker: under a launchd agent (PATH without /opt/homebrew/bin) the server could not find
+/// tailscale (its own name was then refused with 421) or ffmpeg. Every run of these tools goes through
+/// server_tls::program, which also looks in the Homebrew homes.
+#[test]
+fn tools_run_through_program_so_a_launchd_agent_finds_them() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut stack = vec![root];
+    let mut found = Vec::new();
+    let needles: Vec<String> = ["ffmpeg", "ffprobe", "tailscale"].iter().map(|t| format!("Command::new(\"{t}\")")).collect();
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); continue; }
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue; }
+            for (n, line) in std::fs::read_to_string(&p).unwrap_or_default().lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if needles.iter().any(|x| code.contains(x.as_str())) { found.push(format!("{}:{}", p.display(), n + 1)); }
+            }
+        }
+    }
+    assert!(found.is_empty(), "run these through crate::server_tls::program(...):\n  {}", found.join("\n  "));
+}
+
 /// PR #14 (commits 87d401e, c978932): tests never change this process's environment (`std::env::set_var` while
 /// other test threads read it is undefined behaviour, and was the flaky agents test); a server is given its
 /// environment through the harness (`extra.env`).

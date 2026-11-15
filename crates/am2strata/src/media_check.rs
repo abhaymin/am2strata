@@ -343,14 +343,14 @@ pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<
     std::fs::write(&in_file, data).map_err(|e| format!("{e:#}"))?;
     // probe fps from ffprobe (fall back to the override, then 24)
     let mut fps = fps_override.unwrap_or(24.0);
-    if let Ok(p) = std::process::Command::new("ffprobe").args(["-v", "error", "-select_streams", "v:0",
+    if let Ok(p) = std::process::Command::new(crate::server_tls::program("ffprobe")).args(["-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=r_frame_rate"]).arg(&in_file).output() {
         // r_frame_rate is a fraction like 30000/1001 (29.97): divide it, not just take the top number. A degenerate
         // 0/0 refuses here so the caller keeps its override/fallback instead of dividing by zero.
         let s = String::from_utf8_lossy(&p.stdout).trim().to_string();
         if let Some(rate) = rate_from_r_frame_rate(s.split('=').last().unwrap_or(&s)) { fps = rate; }
     }
-    let cmd = std::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&in_file)
+    let cmd = std::process::Command::new(crate::server_tls::program("ffmpeg")).args(["-v", "error", "-i"]).arg(&in_file)
         .args(["-vf", &format!("format=gray,scale={}:{}", VIDEO_W, VIDEO_H), "-f", "rawvideo", "-"])
         .stdout(std::process::Stdio::piped()).spawn()
         .map_err(|e| format!("ffmpeg could not run: {e:#}"))?;

@@ -155,7 +155,7 @@ pub fn thumbnail_lines(lines: &[(String, String)], tag: Option<&str>) -> BTreeMa
 
 /// Run ffmpeg once with the given arguments; why it failed, in words (its stderr trimmed).
 async fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
-    let out = TokioCommand::new("ffmpeg").args(args).stdout(Stdio::null()).stderr(Stdio::piped())
+    let out = TokioCommand::new(crate::server_tls::program("ffmpeg")).args(args).stdout(Stdio::null()).stderr(Stdio::piped())
         .kill_on_drop(true).output().await.map_err(|e| format!("ffmpeg could not start: {e}"))?;
     if !out.status.success() {
         return Err(format!("ffmpeg failed: {}", String::from_utf8_lossy(&out.stderr).trim().replace('\n', " ")));
@@ -167,7 +167,7 @@ async fn run_ffmpeg(args: &[&str]) -> Result<(), String> {
 async fn duration_of(dir: &std::path::PathBuf, name: &str, bytes: &[u8]) -> Result<f64, String> {
     let in_ = dir.join(name);
     std::fs::write(&in_, bytes).map_err(|e| format!("could not write the input: {e}"))?;
-    let probe = TokioCommand::new("ffprobe")
+    let probe = TokioCommand::new(crate::server_tls::program("ffprobe"))
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1"]).arg(&in_).output().await
         .map_err(|e| format!("ffprobe could not start: {e}"))?;
     String::from_utf8_lossy(&probe.stdout).trim().parse::<f64>().ok().filter(|d| *d > 0.0)
@@ -600,7 +600,7 @@ mod tests {
         ]).await.unwrap();
 
         assert!(out.is_file(), "the MP4 was written");
-        let probe = TokioCommand::new("ffprobe").args(["-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1"])
+        let probe = TokioCommand::new(crate::server_tls::program("ffprobe")).args(["-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1"])
             .arg(&out).output().await.unwrap();
         let len: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
         assert!((len - 3.0).abs() < 0.25, "the video plays for about three seconds: {len}");
