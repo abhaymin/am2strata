@@ -7,7 +7,7 @@
 use super::*;
 use axum::response::Html;
 
-const FORM: &str = r#"<!doctype html><title>Survey</title><form id=f action="/sent">
+const FORM: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Survey</title><form id=f action="/sent">
 <label for=n>Your name</label><input id=n name=name>
 <label>Email <input type=email name=email placeholder="you@example.com"></label>
 <label for=pw>Password</label><input id=pw type=password name=pw>
@@ -19,11 +19,11 @@ const FORM: &str = r#"<!doctype html><title>Survey</title><form id=f action="/se
 <button type=submit>Submit</button></form>
 <script>window.changes=0;document.querySelectorAll('input,select,textarea').forEach(e=>e.addEventListener('change',()=>window.changes++))</script>"#;
 
-const MERGED: &str = r#"<!doctype html><title>Cities</title><table><tr><th>x</th></tr></table><table>
+const MERGED: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Cities</title><table><tr><th>x</th></tr></table><table>
 <thead><tr><th rowspan=2>City</th><th rowspan=2>Country</th><th colspan=2>Population[a]</th></tr><tr><th>2018</th><th>2025</th></tr></thead>
 <tbody><tr><td><a href="/tokyo">Tokyo</a></td><td rowspan=2>Japan</td><td>37</td><td>36</td></tr><tr><td>Osaka</td><td>19</td><td>18</td></tr></tbody></table>"#;
 
-const MAP: &str = r#"<!doctype html><title>Map</title><body style="margin:0"><div id=m style="width:1280px;height:800px;background:#9cf"></div>
+const MAP: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Map</title><body style="margin:0"><div id=m style="width:1280px;height:800px;background:#9cf"></div>
 <script>window.log=[];const m=document.getElementById('m');let down=null;
 m.addEventListener('mousedown',e=>{down=[e.clientX,e.clientY]});
 m.addEventListener('mouseup',e=>{const dx=down?e.clientX-down[0]:0,dy=down?e.clientY-down[1]:0;if(dx||dy)log.push('drag '+dx+','+dy);down=null});
@@ -32,14 +32,14 @@ m.addEventListener('dblclick',e=>log.push('dbl'));
 m.addEventListener('contextmenu',e=>{e.preventDefault();log.push('right')});
 document.addEventListener('keydown',e=>log.push('key '+e.key+(e.ctrlKey?' ctrl':'')));</script>"#;
 
-const ERRORS: &str = r#"<!doctype html><title>Broken</title><h1>Oops page</h1><img src="/missing.png"><a href="/gone">dead</a><a href="/table">ok</a>
+const ERRORS: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Broken</title><h1>Oops page</h1><img src="/missing.png"><a href="/gone">dead</a><a href="/table">ok</a>
 <script>console.error('boom from the page'); setTimeout(()=>{ throw new Error('late failure') }, 10)</script>"#;
 
 fn table(page: u32) -> String {
     let rows: String = (1..=2).map(|i| { let n = (page - 1) * 2 + i; format!("<tr><td><a href=\"/item/{n}\">Book {n}</a></td><td>{}.00</td></tr>", n * 10) }).collect();
     let items: String = (1..=2).map(|i| { let n = (page - 1) * 2 + i; format!("<div class=card><h3>Card {n}</h3><span class=price>{n}</span><a href=\"/c/{n}\">more</a></div>") }).collect();
     let next = if page < 2 { "<a class=next href=\"/table?p=2\">Next</a>" } else { "" };
-    format!("<!doctype html><title>Books p{page}</title><table class=layout><tr><td>menu</td></tr></table><table><thead><tr><th>Title</th><th>Price</th></tr></thead><tbody>{rows}</tbody></table>{items}{next}")
+    format!("<!doctype html><link rel=icon href=data:,><title>Books p{page}</title><table class=layout><tr><td>menu</td></tr></table><table><thead><tr><th>Title</th><th>Price</th></tr></thead><tbody>{rows}</tbody></table>{items}{next}")
 }
 
 async fn serve() -> String {
@@ -168,6 +168,7 @@ async fn the_browser_tools_work_on_real_pages() {
     assert!(r.contains("✓ status 200") && r.contains("✗ console errors ≤ 0: 2 error(s)") && r.contains("✗ failed requests ≤ 0: 1 failed"), "{r}");
     assert!(r.contains("✗ broken links: 1 of 2 broken: 404") && r.contains("/gone"), "{r}");
     let con = b.call(c, "browser_console", &json!({})).await.unwrap().text;
+    assert!(!con.contains("/sent") && !con.contains("/gone 404"), "only this page's log: {con}");
     assert!(con.contains("HTTP 200") && con.contains("late failure") && con.contains("[error] boom from the page") && con.contains("404: ") && con.contains("missing.png"), "{con}");
     let sh = b.call(c, "browser_screenshot", &json!({"full": true})).await.unwrap();
     assert!(sh.screenshot.is_some_and(|s| s.len() > 1000));

@@ -90,8 +90,14 @@ pub async fn watch(page: &Page, store: Arc<std::sync::Mutex<HashMap<String, Diag
                         if d.requests.len() > 2000 { d.requests.clear(); }
                         d.requests.insert(e.request_id.inner().clone(), e.request.url.clone());
                         if e.r#type == Some(net::ResourceType::Document) && e.frame_id.as_ref().map(|f| f.inner() == &id).unwrap_or(true) {
+                            // a new page: its checks are about it, not what earlier pages logged
                             d.nav_started = Some(Instant::now());
                             d.load_ms = None;
+                            d.console.clear();
+                            d.errors.clear();
+                            d.failed.clear();
+                            d.http_errors.clear();
+                            d.doc = None;
                         }
                     }
                 }).is_none(),
