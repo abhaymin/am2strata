@@ -121,8 +121,13 @@ impl QMat {
             for (k, yr) in ys.chunks_mut(n).enumerate() {
                 let r = ci * chunk + k;
                 let row = &self.data[r * self.row_bytes..(r + 1) * self.row_bytes];
-                for t in 0..n {
-                    yr[t] = if int8 { crate::cpu_q8::row_dot(fast, row, &q8[t]) } else { crate::cpu_dot::row_dot(fast, row, &rounded[t]) };
+                if int8 {
+                    // the row unpacked once for the whole chunk (cpu_q8::row_dot_many): the same values as row_dot
+                    crate::cpu_q8::row_dot_many(fast, row, &q8, yr);
+                } else {
+                    for t in 0..n {
+                        yr[t] = crate::cpu_dot::row_dot(fast, row, &rounded[t]);
+                    }
                 }
             }
         });

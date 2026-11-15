@@ -42,6 +42,26 @@ feed-forward, and the `--graph` GPU path, still read token by token.
 | Linux PC, 8 threads, **busy** (the live server's coding agent was running) | one token at a time | 3.78 | |
 | same, same minute | chunks of 32 | **11.21** (3.0x) | identical |
 
+### Mac M4 with batching (#65)
+
+| How the prompt is read | Engine, 256 tokens, 10 threads | Server, 754-token chat |
+|---|---|---|
+| one token at a time | 17.87 tok/s | 16.80 tok/s (before #65) |
+| chunks of 32 | **25.19** (1.41x) | **23.67** |
+
+The M4's unified memory is fast, so it gains less from saving reads than the PC does: there the work is arithmetic.
+
+### Unpacking each weight block once per chunk
+
+`cpu_q8::row_dot_many` unpacks each block's nibbles and scales once for all the chunk's tokens. Before, they were unpacked
+again for every token. Each token's sums keep the same order, so the results are bit-identical (unit test
+`many_inputs_equal_one_at_a_time_exactly`; the generated tokens are identical).
+
+| Linux PC, 8 threads, **busy** (an agent run on the live server), 256-token prompt, alternated twice | Prompt tok/s |
+|---|---|
+| main (#65) | 6.97, 6.98 |
+| unpack once | **8.67, 11.25** |
+
 ## Next
 - **Q5_K, Q8_0 and Q4_0 the same way.**
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).
