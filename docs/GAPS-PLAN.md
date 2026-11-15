@@ -65,16 +65,37 @@ and **long video**, **clusters**, **Tune**, **client profiles** (tools by key), 
 the **regression suite**. Browser use is the strongest next demo, and am2Strata's own publishing job (tools/yt_publish.py)
 is real footage for it.
 
-## Proposed order
+## E. Judged against a field test: "Is this how Local AI reaches Frontier Capabilities?" (Codacus, 2026-11-15)
 
-1. **Housekeeping (small, this week):** bring the ledger and the README status table up to date; v0.1.9 release
-   notes (browser use, the dub and session fixes); `docs/MEDIA.md` and `docs/CLIENTS.md` (C).
-2. **CLI and UI parity for media (B):** `am2strata-run media …` for dub, check, produce, image, video, speak, song; Dub,
-   Check and Productions cards. Each with a contract row and an integration test, as browser use has.
-3. **Video without ffmpeg (A14):** frames from a Rust decoder, so the video checks and video in chat work everywhere.
-4. **Train from the tab, then on the GPU (A1).**
-5. **A browser-use demo video (D)**, then v0.1.9.
-6. Then by the owner's priority: Settings › Clients editing (A8), video productions (A3), native voices (A5), device
+The video built a team of small expert models on one RTX 3060 (Qwen 4B planning; T-Max, 3D coders and others as
+experts). It tested the team on real jobs with checkers written and locked before any run: a kanban app, a three.js
+pagoda, fixing a broken server in a sandbox without touching production, and a research report. What it found, and what
+that means for am2Strata:
+
+| Finding | am2Strata today | Judgement |
+|---|---|---|
+| Specialists win one checkable lane. A 15B DNA model came within a point of the frontier, and a big model consulting it gained 11 points. | The specialists are media models (Whisper, Parler, ACE-Step, image/video) and tools (browser, search, code). No language-model expert can be consulted. | **New A17:** an `ask_expert` server tool. The main model sends a sub-question to a specialist model (OCR, math, terminal, a domain model) loaded on the CPU or the second card, and the answer comes back into the turn. The expert also gets **the user's original request**, not just the planner's brief: the video's team failed because its experts only saw a short brief. |
+| The planner is the weak link. A 4B planner made its experts worse; a **35B-A3B MoE with experts in system RAM** planned well enough, on the same card. | The default model is Tiel Coder 35B-A3B Q8, with experts streamed and resident in RAM: the setup the video ends up recommending. | Keep a 35B-A3B MoE as the default planner and say so plainly (README, site, Add a model). The optimizer's advice (OPTIMIZER-PLAN) should prefer "the biggest MoE that fits with experts in RAM" over a small dense model for agent work. |
+| Long jobs fail by accumulation. 20-35 steps, and one wrong command ends the run. Small models score about 27% on Terminal-Bench against about 85% for the frontier. | Seen here too: am2Strata's local model failed an upload task, reported a Save that had not stuck, and changed nothing for 16 minutes in a repeat loop (now guarded). Risky steps ask first; the sandbox VM is separate. | **New A19:** make long jobs safe by design. (1) Sandbox first: computer jobs run in the VM, and a fix for the real machine comes back as a script to approve. (2) A VM snapshot before each job and one-click rollback (today the VM only saves and restores its last state). (3) Verify after acting: a step that changes something reads its result back (as yt_publish.py now does), built into the tool loop. (4) A guard that refuses destructive commands aimed at anything outside the sandbox. |
+| Locked checkers before any run are what made the results honest. | Route contracts, golden shapes, live browser tests, and site tests (JUnit). Nothing measures **agent jobs** end to end per model. | **New A18:** `am2strata-run eval`: real jobs with locked checkers (an app, a 3D scene, a broken service in the VM, a research question, a browser job), run against each local model and the planner and expert mixes, with pass rate, time and tokens. It decides the default model and the expert set by measurement, and it is the before-and-after check for training (A1). |
+| Facts don't fit a small model: "give your team search". The video's research job scored 0 for every model because the search engines blocked its local search server. | `web_search` is SearXNG if configured, else DuckDuckGo's HTML page: one fallback, which is exactly what gets blocked. | **New A20:** search that does not break. Several backends in turn (SearXNG, DuckDuckGo, Brave/Bing with a key, and **the browser target as the last resort**, reading a results page like a person), rate limits backed off, and a "search is blocked" answer instead of an empty result. |
+| A bad habit can be removed with a few hours of RL on a 12 GB card; a weight edit fixed one narrow bug but not a habit spread over a long job. | The Workshop trainer is CPU only and LoRA only. | Raises **A1 (GPU training)**. Training at home is the practical way to give a planner the missing skill, and the eval (A18) is how to check it. RL from checker rewards is the natural next step after LoRA. |
+| Local is slow: the 35B took about 30 minutes where the cloud model took 3. | Tok/s is measured and tuned (optimizer, resident experts); clusters spread jobs. | No new item. Report time-to-done in the eval (A18), so speed is judged per job and not only in tok/s. |
+
+## Proposed order (revised after E)
+
+1. **Housekeeping (small):** the ledger and the README status table up to date; v0.1.9 release notes; `docs/MEDIA.md`
+   and `docs/CLIENTS.md` (C); state the 35B-A3B planner recommendation (E).
+2. **Agent eval with locked checkers (A18).** Measure first: it decides the rest and guards against changes that feel
+   better but aren't.
+3. **Safe long jobs (A19):** a VM snapshot and rollback per job; verify-after-act in the tool loop; sandbox-first with a
+   script for the real machine; the destructive-command guard.
+4. **Search that does not break (A20)**, with the browser as the last backend.
+5. **`ask_expert` (A17)**, with the original request passed to the expert; judged by the eval (with and without experts).
+6. **CLI and UI parity for media (B)**, then **video without ffmpeg (A14)**.
+7. **Training from the tab, on the GPU, then RL from checker rewards (A1)**, judged by the eval.
+8. **A browser-use demo video (D)**, then v0.1.9.
+9. Then by the owner's priority: Settings › Clients editing (A8), video productions (A3), native voices (A5), device
    lanes (A6), the MCP timeout (A7), computer use on macOS/Windows (A2), clusters on a second PC (A9). Engine families
    (A11), songs (A12), long video quality (A4), the knowledge cache (A13) and hardware (A16) continue in their own plans.
 
