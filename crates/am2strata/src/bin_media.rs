@@ -83,7 +83,11 @@ pub fn out_names(out: &str, n: u32) -> Vec<String> {
     let ext = base.extension().and_then(|e| e.to_str()).map(str::to_string);
     let mut v = vec![out.to_string()];
     for i in 2..=n {
-        match &ext { Some(e) => v.push(format!("{stem}-{i}.{e}")), None => v.push(format!("{out}-{i}")) }
+        match &ext {
+            // in the same folder as `out` (pics/cat.png -> pics/cat-2.png), not the current one
+            Some(e) => v.push(base.with_file_name(format!("{stem}-{i}.{e}")).to_string_lossy().into_owned()),
+            None => v.push(format!("{out}-{i}")),
+        }
     }
     v
 }
@@ -401,7 +405,12 @@ fn cmd_produce(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<r
         std::thread::sleep(Duration::from_secs(3));
         let s = send(client.get(format!("{url}/v1/media/jobs/{id}")))?;
         let j: Value = s.json().map_err(|e| e.to_string())?;
-        match j["state"].as_str() { Some("done") | Some("error") => break, _ => {} }
+        match j["state"].as_str() {
+            Some("done") => break,
+            // a failed production has nothing to download: say why and exit non-zero
+            Some("error") => return Err(format!("production {id} failed: {}", j["error"].as_str().unwrap_or("no reason given"))),
+            _ => {}
+        }
         if let Some(meta) = j["meta"].as_object() {
             if let (Some(p), Some(t)) = (meta.get("part").and_then(|x| x.as_u64()), meta.get("parts").and_then(|x| x.as_u64())) {
                 let here = format!("{p} of {t}");
@@ -424,6 +433,13 @@ fn require_out(out: &Option<String>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_images_go_in_the_same_folder_as_the_first() {
+        assert_eq!(out_names("pics/cat.png", 3), vec!["pics/cat.png", "pics/cat-2.png", "pics/cat-3.png"]);
+        assert_eq!(out_names("cat.png", 2), vec!["cat.png", "cat-2.png"]);
+        assert_eq!(out_names("pics/cat", 2), vec!["pics/cat", "pics/cat-2"]);
+    }
 
     #[test]
     fn image_request_only_sends_what_is_given() {
