@@ -2952,6 +2952,40 @@ fn a_paired_worker_is_reached_only_over_pinned_tls() {
     assert_eq!(master.get("/api/cluster", true).1["workers"][0]["ready"], false);
 }
 
+/// Found on a Mac worker (2026-11-15): with the worker's own HTTPS on and plain HTTP limited ("tls": {"http":
+/// "redirect"} or "local-only"), its plain-HTTP policy also redirected the master's requests on the encrypted cluster
+/// listener to the HTTPS port, whose certificate is not the pinned one, so the master refused the worker ("the worker's
+/// certificate is not the one paired"). The cluster listener is TLS: the policy must leave it alone.
+#[test]
+fn a_worker_with_its_own_https_and_plain_http_redirected_stays_reachable_by_its_master() {
+    let (tp, hp) = (free_port(), free_port());
+    let mut worker = Server::start(&[Model { id: "mock-b", extra: json!({"cluster": {"role": "worker", "tls_port": tp}}), ..Model::default() }],
+                                   &[ids("Ok.\n</think>\n\nFrom the worker, behind its own HTTPS.")], json!({}));
+    let master = Server::start(&[Model::default()], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
+    let code = worker.get("/api/cluster", true).1["pairing_code"].as_str().unwrap().to_string();
+    let (c, p) = master.post("/api/cluster/pair", &json!({"url": worker.base, "code": code}));
+    assert_eq!((c, p["encrypted"].as_bool()), (200, Some(true)), "{p}");
+    // then, as on the Mac, the worker turns on its own HTTPS and redirects all plain HTTP (local callers too)
+    let path = worker.dir.join("strata-mock-b.json");
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    cfg["tls"] = json!({"mode": "self-signed", "https_port": hp, "http": "redirect"});
+    std::fs::write(&path, serde_json::to_vec_pretty(&cfg).unwrap()).unwrap();
+    worker.restart();
+    let r = reqwest::blocking::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
+        .get(format!("{}/v1/models", worker.base)).send().unwrap();
+    assert_eq!(r.status().as_u16(), 308, "plain HTTP is redirected now");
+    // the master still reaches it over the pinned cluster listener, and a chat goes through
+    let t0 = Instant::now();
+    loop {
+        let (_, cl) = master.get("/api/cluster", true);
+        if cl["workers"][0]["ready"] == true && cl["workers"][0]["error"].is_null() { break; }
+        assert!(t0.elapsed() < Duration::from_secs(45), "worker not ready: {cl}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
+    assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the worker, behind its own HTTPS.")), "{v}");
+}
+
 /// The added time of TLS on one short chat through a master (mock engines; run by hand:
 /// cargo test --release -p am2strata --test server cluster_tls_latency -- --ignored --nocapture).
 #[test]
