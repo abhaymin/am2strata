@@ -96,7 +96,7 @@ Options go after `sh -s --`: `curl -fsSL .../install.sh | sh -s -- --service`. I
 | Rust engine | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU | CPU, or any GPU (wgpu) | CPU |
 | Workshop (convert, quantize, merge, training data) | yes | yes | yes | yes | yes | yes |
 | PDFs in chats | needs `poppler-utils` | needs `poppler-utils` | needs `poppler` | needs `poppler` | included | included (x64 Poppler, emulated) |
-| Video from API clients | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` | needs `ffmpeg` |
+| Video from API clients | MP4/H.264 built in; other formats need `ffmpeg` | MP4/H.264 built in; others need `ffmpeg` | MP4/H.264 built in; others need `ffmpeg` | MP4/H.264 built in; others need `ffmpeg` | MP4/H.264 built in; others need `ffmpeg` | MP4/H.264 built in; others need `ffmpeg` |
 | Browser tool | Chrome or Chromium, else fetched | an installed Chromium | Chrome, Edge or Chromium, else fetched | Chrome, Edge or Chromium, else fetched | Edge or Chrome | Edge or Chrome |
 | Python in the canvas | needs `bubblewrap` | needs `bubblewrap` | no | no | no | no |
 | Computer tab (sandbox desktop) | needs `xvfb xdotool xclip` | needs `xvfb xdotool xclip` | no | no | no | no |
@@ -237,7 +237,7 @@ MiniCPM-V and the others) over their line protocol.
 | OpenAI `/v1/chat/completions` (stream and not, tools, images), `/v1/models` | done | live: Orca, Tiel Q6, MiniCPM-V |
 | Anthropic `/v1/messages` (stream and not, thinking, tool_use), `/v1/messages/count_tokens` | done | live |
 | Images (image encoder process, cache, `GENI`), complex documents | done | live: invoice and purchase order fields exact |
-| Video | as frames: video parts are cut into frames with ffmpeg when installed; frames sent as images always work | live (frames); ffmpeg path needs `sudo apt install ffmpeg` |
+| Video | as frames: MP4/H.264 is decoded by the media engine itself (no ffmpeg); other formats use ffmpeg when installed; frames sent as images always work | mock engine (the Rust path), the engine's own decode test; live (frames) |
 | Model switching (`/api/models/load`, `/unload`, web picker) | done | live: Orca, MiniCPM-V, Tiel Q6 |
 | Web app (`web/`) | done: chat, model picker, settings, monitor polling | live in a browser |
 | Clusters: workers paired by a 6-digit code, mutual TLS 1.3 with pinned certificates, whole requests routed to a worker ([setup guide](docs/CLUSTER.md)) | done (routing; one model split across machines is not built) | two servers on one machine; live: a Mac mini M4 worker paired with the Linux PC over Tailscale |

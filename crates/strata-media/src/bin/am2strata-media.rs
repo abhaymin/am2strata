@@ -15,6 +15,8 @@
 //!   -> {"op":"transcribe","model":"whisper-large-v3-turbo","audio":"<base64 file>","language"?,"translate"?,"device"?}
 //!                                                         <- {"event":"segment","start":..,"end":..,"text":..} ...
 //!                                                         <- {"event":"transcript","text":..,"language":..,"segments":[..],"duration":..}
+//!   -> {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>}  (MP4/H.264 in Rust, no ffmpeg)
+//!                                                         <- {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
 //!      a chatterbox-* model (the onnx feature) also takes "voice_audio" (base64 clip of the voice), "language",
 //!      "exaggeration", "temperature", "threads"; a named voice is a clip Parler made once (audio/voices/<name>.wav)
@@ -32,7 +34,8 @@ use base64::Engine as _;
 use mold_inference::engine::{InferenceEngine, LoadStrategy};
 use mold_inference::progress::ProgressEvent;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Cursor, Write};
+use openh264::decoder::Decoder;
 use std::sync::{Arc, Mutex};
 
 #[path = "../audio.rs"]
@@ -816,6 +819,161 @@ fn chain(st: &mut State, req: &Value) -> Result<()> {
     Ok(())
 }
 
+// --------------------------------------------------------------- video (A14): MP4/H.264 in Rust, no ffmpeg
+
+/// A length-prefixed sample payload back into its individual (raw) NAL payloads, each one carrying its own length.
+fn sample_to_nals(b: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 4 <= b.len() {
+        let len = u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
+        i += 4;
+        if i + len > b.len() { break; }
+        out.push(b[i..i + len].to_vec());
+        i += len;
+    }
+    out
+}
+
+/// One frame's NAL payloads into a single MP4 sample payload: each NAL carried by its own big-endian 4-byte length.
+fn nals_to_sample(nals: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in nals {
+        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+/// The start-coded Annex-B output of one encoded frame into its raw NAL payloads: a start code before each NAL, and an
+/// empty leading unit (before the first start code) dropped so the SPS/PPS come through intact.
+fn annex_to_nals(a: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut i = 0;
+    while i < a.len() {
+        if i + 2 < a.len() && a[i] == 0 && a[i + 1] == 0 && (a[i + 2] == 1 || (i + 3 < a.len() && a[i + 2] == 0 && a[i + 3] == 1)) {
+            let u = std::mem::take(&mut cur);
+            if !u.is_empty() { out.push(u); }
+            i += if a[i + 2] == 1 { 3 } else { 4 };
+        } else {
+            cur.push(a[i]);
+            i += 1;
+        }
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+/// Start-code-prefix every NAL so openh264's decoder reads them as separate units (Annex-B framing).
+fn nals_to_packet(nals: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in nals {
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(n);
+    }
+    out
+}
+
+/// Encode an RGB frame as PNG, scaled to `width` keeping the aspect (never larger than the original).
+fn rgb_to_png(rgb: &[u8], ow: usize, oh: usize, width: usize) -> Result<Vec<u8>> {
+    let img = image::RgbImage::from_raw(ow as u32, oh as u32, rgb.to_vec()).context("the decoded frame was the wrong size")?;
+    let want = (width.min(ow)).max(1) as u32;
+    let have = ((oh as f64 * want as f64 / ow as f64).round() as u32).max(1);
+    let scaled = image::imageops::resize(&img, want, have, image::imageops::FilterType::CatmullRom);
+    let mut buf = Cursor::new(Vec::new());
+    scaled.write_to(&mut buf, image::ImageFormat::Png).context("encoding the frame as PNG")?;
+    Ok(buf.into_inner())
+}
+
+/// {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>} ->
+/// {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}. Anything that is not an
+/// MP4/H.264 answers with {"event":"error","message":"... needs ffmpeg ...", naming the format}.
+fn video_frames(cmd: &Value) -> Result<Value> {
+    let path = cmd["file"].as_str().ok_or_else(|| anyhow!("video_frames: no \"file\""))?;
+    if !std::path::Path::new(path).is_file() {
+        bail!("{path}: the file was not found");
+    }
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let bytes = std::fs::read(path).with_context(|| format!("reading {path}"))?;
+    let mut reader = mp4::Mp4Reader::read_header(Cursor::new(&bytes), bytes.len() as u64)
+        .map_err(|_| anyhow!("{ext:?}: not an MP4 file — that needs ffmpeg (only .mp4 with H.264 decodes in Rust here)"))?;
+
+    // the first video track: its fps and how many frames, plus the SPS/PPS (an H.264 sequence parameter set starts with
+    // 0x67; anything else is not read here), all copied out so the borrow of `reader` ends before samples are read.
+    let mut info = None;
+    for (&id, t) in reader.tracks() {
+        if t.track_type().is_ok_and(|ty| ty == mp4::TrackType::Video) {
+            let sps = t.sequence_parameter_set()?.to_vec();
+            let pps = t.picture_parameter_set()?.to_vec();
+            info = Some((id, t.frame_rate(), t.sample_count(), sps, pps));
+            break;
+        }
+    }
+    let Some((vid, mut fps, total, sps, pps)) = info else {
+        bail!("{ext:?}: the file has no video stream — that needs ffmpeg (only .mp4 with H.264 decodes in Rust here)");
+    };
+    if sps.first() != Some(&0x67) {
+        bail!("{ext:?}: a non-H.264 ({}) video — install ffmpeg (only .mp4 with H.264 decodes in Rust here)",
+            if sps.first() == Some(&0x42) { "HEVC/H.265" } else { "something else" });
+    }
+
+    fps = fps.max(0.001);
+    let duration = reader.duration().as_secs_f64();
+    let total = total as usize;
+    let max = cmd["max"].as_u64().map(|n| n as usize).unwrap_or(total).min(total).max(1);
+    let width = cmd["width"].as_u64().map(|w| w as usize).unwrap_or(720).max(1);
+    let every_s = cmd["every_s"].as_f64().unwrap_or(0.0);
+
+    // which frames to keep: spaced by `every_s` (>0), else evenly spread up to `max`.
+    let keep: Vec<usize> = if every_s > 0.0 {
+        let mut v = Vec::new();
+        let mut last = -1.0;
+        for i in 0..total {
+            let t = i as f64 / fps;
+            if last < 0.0 || t - last >= every_s {
+                v.push(i);
+                last = t;
+                if v.len() >= max { break; }
+            }
+        }
+        v
+    } else if total <= max {
+        (0..total).collect()
+    } else {
+        (0..max).map(|k| ((k as f64 * (total - 1) as f64 / (max - 1) as f64).round() as usize).min(total - 1)).collect()
+    };
+
+    // feed the SPS/PPS once, then decode each sample; keep the ones selected above.
+    let (mut out_w, mut out_h) = (0u32, 0u32);
+    let mut dec = Decoder::new().map_err(|e| anyhow!("opening the H.264 decoder: {e}"))?;
+    let mut init = Vec::new();
+    init.extend_from_slice(&[0, 0, 0, 1]);
+    init.extend_from_slice(&sps);
+    init.extend_from_slice(&[0, 0, 0, 1]);
+    init.extend_from_slice(&pps);
+    dec.decode(&init).map_err(|e| anyhow!("reading the video's parameters: {e}"))?;
+
+    let b64 = |b: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(b);
+    let mut frames = Vec::new();
+    for i in 0..total {
+        let s = reader.read_sample(vid, (i + 1) as u32).map_err(|e| anyhow!("read sample {}: {e}", i))?.ok_or_else(|| anyhow!("no sample {i}"))?;
+        let Some(y) = dec.decode(&nals_to_packet(&sample_to_nals(&s.bytes))).map_err(|e| anyhow!("decode frame {}: {e}", i))? else { continue };
+        if !keep.contains(&i) { continue; }
+        // dimensions_uv() is the chroma plane (half the res for I420); full res is twice that.
+        let (ow, oh) = (y.dimensions_uv().0 * 2, y.dimensions_uv().1 * 2);
+        let mut rgb = vec![0u8; ow * oh * 3];
+        y.write_rgb8(&mut rgb);
+        let want = (width.min(ow)).max(1) as u32;
+        let have = ((oh as f64 * want as f64 / ow as f64).round() as u32).max(1);
+        let png = rgb_to_png(&rgb, ow, oh, width)?;
+        if frames.is_empty() { out_w = want; out_h = have; }
+        frames.push(json!({"t": i as f64 / fps, "png": b64(png)}));
+    }
+
+    Ok(json!({"event": "frames", "fps": (fps * 1000.0).round() / 1000.0, "duration_s": (duration * 1000.0).round() / 1000.0, "width": out_w, "height": out_h, "frames": frames}))
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio");
     let mut st = State { config: mold_core::Config::load_or_default(), engine: None, model: None, placement: None, whisper: None, parler: None,
@@ -869,6 +1027,7 @@ fn main() {
                     let r = transcribe(&mut st, &cmd)?;
                     emit(r)
                 }
+                "video_frames" => emit(video_frames(&cmd)?),
                 "speak" => {
                     let r = speak(&mut st, &cmd)?;
                     emit(r)
@@ -959,5 +1118,89 @@ mod continue_tests {
         assert!((a.dim(1).unwrap() as f64 / 48_000.0 - 3.5).abs() < 0.01, "resampled to 48 kHz");
         let end = sounding_end(&a).unwrap() as f64 / 48_000.0;
         assert!((end - 2.0).abs() <= 0.25, "sound ends at {end} s");
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    const W: usize = 64;
+    const H: usize = 64;
+
+    /// Build a short H.264 clip (first frame black, last white) and mux it into an MP4 with the mp4 crate's writer.
+    fn make_clip() -> Vec<u8> {
+        use openh264::encoder::{Encoder, EncoderConfig, FrameRate};
+        use openh264::formats::{RgbSliceU8, YUVBuffer};
+
+        let vals: [u8; 5] = [0, 64, 128, 192, 255];
+        let cfg = EncoderConfig::new().max_frame_rate(FrameRate::from_hz(10.0)).num_threads(1u16);
+        let mut enc = Encoder::with_api_config(openh264::OpenH264API::from_source(), cfg).expect("encoder");
+
+        let mut samples: Vec<Vec<Vec<u8>>> = Vec::new();
+        for v in vals {
+            let rgb = vec![v; W * H * 3];
+            let yuv = YUVBuffer::from_rgb8_source(RgbSliceU8::new(&rgb, (W, H)));
+            let bits = enc.encode(&yuv).expect("encode frame");
+            samples.push(annex_to_nals(&bits.to_vec()));
+        }
+
+        let sps = samples[0][0].clone();
+        let pps = samples[0][1].clone();
+        let timescale: u32 = 1000;
+        let mut clip: Vec<u8> = Vec::new();
+        {
+            let wc = mp4::Mp4Config { major_brand: mp4::FourCC { value: *b"mp41" }, minor_version: 0,
+                compatible_brands: vec![mp4::FourCC { value: *b"mp41" }, mp4::FourCC { value: *b"iso5" }], timescale };
+            let mut w = mp4::Mp4Writer::write_start(Cursor::new(&mut clip), &wc).expect("mux start");
+            let tc = mp4::TrackConfig { track_type: mp4::TrackType::Video, timescale, language: "eng".into(),
+                media_conf: mp4::MediaConfig::AvcConfig(mp4::AvcConfig { width: W as u16, height: H as u16,
+                    seq_param_set: sps, pic_param_set: pps }) };
+            w.add_track(&tc).expect("track");
+            let fd = timescale / 10;
+            for (i, nals) in samples.iter().enumerate() {
+                let s = mp4::Mp4Sample { start_time: i as u64 * fd as u64, duration: fd as u32, rendering_offset: 0, is_sync: i == 0,
+                    bytes: mp4::Bytes::from(nals_to_sample(nals)) };
+                w.write_sample(1, &s).expect("sample");
+            }
+            w.write_end().expect("mux end");
+        }
+        clip
+    }
+
+    /// Mean luma (ITU-R 601) of a decoded PNG.
+    fn mean_luma(png: &[u8]) -> f64 {
+        let img = image::load_from_memory(png).unwrap().to_rgb8();
+        let px = img.as_raw();
+        let n = img.width() as usize * img.height() as usize;
+        (0..n).map(|i| 0.299 * px[i * 3] as f64 + 0.587 * px[i * 3 + 1] as f64 + 0.114 * px[i * 3 + 2] as f64)
+            .sum::<f64>() / n as f64
+    }
+
+    /// Encode a synthetic H.264 clip to an MP4, read it back with the video_frames op, and check the frame count, fps,
+    /// duration and that the first frame is dark while the last is bright.
+    #[test]
+    fn video_frames_reads_an_mp4_without_ffmpeg() {
+        let dir = format!("{}/../target-media", env!("CARGO_MANIFEST_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = format!("{dir}/video-frame-test-{}.mp4", std::process::id());
+        std::fs::write(&file, make_clip()).unwrap();
+
+        let r = video_frames(&json!({"op": "video_frames", "file": file, "every_s": 0.0, "max": 5, "width": 64})).unwrap();
+        assert_eq!(r["event"], json!("frames"), "{r}");
+        let frames = r["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), 5, "every frame is kept");
+
+        let fps = r["fps"].as_f64().unwrap();
+        assert!((fps - 10.0).abs() < 0.5, "fps read from the track: {fps}");
+        let dur = r["duration_s"].as_f64().unwrap();
+        assert!((dur - 0.5).abs() < 0.2, "about half a second: {dur}");
+
+        let first = base64::engine::general_purpose::STANDARD.decode(frames[0]["png"].as_str().unwrap()).unwrap();
+        let last = base64::engine::general_purpose::STANDARD.decode(frames[4]["png"].as_str().unwrap()).unwrap();
+        assert!(mean_luma(&first) < 20.0, "the first frame is dark: {}", mean_luma(&first));
+        assert!(mean_luma(&last) > 200.0, "the last frame is bright: {}", mean_luma(&last));
+
+        let _ = std::fs::remove_file(&file);
     }
 }

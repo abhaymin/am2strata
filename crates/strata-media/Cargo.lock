@@ -3635,6 +3635,8 @@ dependencies = [
  "image",
  "mold-ai-core",
  "mold-ai-inference",
+ "mp4",
+ "openh264",
  "ort",
  "serde",
  "serde_json",

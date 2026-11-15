@@ -119,7 +119,37 @@ pub async fn load_source(src: &str) -> Result<Vec<u8>> {
     bail!("an image must be a data: URL, an http(s) URL or a local file path")
 }
 
+/// The media engine, for reading MP4/H.264 frames in Rust when ffmpeg is not installed (main.rs sets it at start).
+pub static ENGINE: std::sync::OnceLock<std::sync::Arc<crate::image_gen::Media>> = std::sync::OnceLock::new();
+
+/// Frames from the media engine's own MP4/H.264 decoder (`video_frames`), no ffmpeg: `max` frames spread evenly
+/// (every_s 0) or one every `every_s` seconds, each scaled to `width`. -> (PNG bytes per frame, fps, duration in s).
+/// Other formats come back as the engine's error, which names them and says they need ffmpeg.
+pub async fn rust_frames(video: &[u8], every_s: f64, max: usize, width: usize) -> Result<(Vec<Vec<u8>>, f64, f64)> {
+    let Some(engine) = ENGINE.get() else { bail!("this server cannot decode video: no media engine and no ffmpeg") };
+    let dir = tempdir()?;
+    let input = dir.join("in.mp4");
+    std::fs::write(&input, video)?;
+    let r = engine.call(json!({"op": "video_frames", "file": input.to_string_lossy(), "every_s": every_s, "max": max, "width": width}),
+                        |_| {}).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let v = r?;
+    let mut out = Vec::new();
+    for f in v["frames"].as_array().into_iter().flatten() {
+        let png = base64::engine::general_purpose::STANDARD.decode(f["png"].as_str().unwrap_or("")).map_err(|e| anyhow::anyhow!("a frame: {e}"))?;
+        out.push(png);
+    }
+    if out.is_empty() {
+        bail!("the video gave no frames");
+    }
+    Ok((out, v["fps"].as_f64().unwrap_or(0.0), v["duration_s"].as_f64().unwrap_or(0.0)))
+}
+
 pub fn ffmpeg_available() -> bool {
+    // tests on a machine that has ffmpeg check the path without it (set only through the test server's environment)
+    if std::env::var_os("AM2_TEST_NO_FFMPEG").is_some() {
+        return false;
+    }
     Command::new(crate::server_tls::program("ffmpeg")).arg("-version").output().is_ok_and(|o| o.status.success())
 }
 
@@ -187,20 +217,25 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
         if !parts.iter().any(|p| video_source(p).is_some()) {
             continue;
         }
-        if !ffmpeg_available() {
-            bail!("this server cannot decode video: install ffmpeg (sudo apt install ffmpeg), or send the video's \
-                   frames as images in one message");
-        }
+        let ffmpeg = ffmpeg_available();
         let mut out = Vec::with_capacity(parts.len() + n);
         for p in parts.drain(..) {
             match video_source(&p) {
                 Some(src) => {
                     let data = load_source(&src).await?;
-                    let fs = frames(&data, n).await?;
+                    // ffmpeg when installed (any format); else the media engine's own MP4/H.264 decoder
+                    let (fs, mime) = if ffmpeg {
+                        (frames(&data, n).await?, "image/jpeg")
+                    } else {
+                        (rust_frames(&data, 0.0, n, 1280).await
+                            .map_err(|e| anyhow::anyhow!("this server cannot decode this video without ffmpeg: {e:#}. Install ffmpeg ({}), \
+                                                          or send the video's frames as images in one message",
+                                crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")))?.0, "image/png")
+                    };
                     videos += 1;
                     out.push(json!({"type": "text", "text": format!("[A video, as {} frames in order:]\n", fs.len())}));
                     for f in fs {
-                        let url = format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(f));
+                        let url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(f));
                         out.push(json!({"type": "image_url", "image_url": {"url": url}}));
                     }
                 }

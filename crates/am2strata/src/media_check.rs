@@ -333,6 +333,25 @@ pub fn rate_from_r_frame_rate(s: &str) -> Option<f64> {
     }
 }
 
+/// The most frames a check reads without ffmpeg (every frame of about 2 minutes at 25 fps).
+const RUST_MAX_FRAMES: usize = 3000;
+
+/// `video_grey_frames` with ffmpeg when installed, else every frame from the media engine's MP4/H.264 decoder,
+/// greyed and scaled to VIDEO_W x VIDEO_H the same way.
+pub async fn video_grey_frames_any(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<Vec<u8>>, f64), String> {
+    if crate::media::ffmpeg_available() {
+        return video_grey_frames(data, fps_override);
+    }
+    let (pngs, fps, _) = crate::media::rust_frames(data, 0.0, RUST_MAX_FRAMES, VIDEO_W * 2).await.map_err(|e| format!("{e:#}"))?;
+    let mut gray = Vec::with_capacity(pngs.len());
+    for p in &pngs {
+        let img = image::load_from_memory(p).map_err(|e| format!("a frame: {e}"))?;
+        let g = img.resize_exact(VIDEO_W as u32, VIDEO_H as u32, image::imageops::FilterType::Triangle).to_luma8();
+        gray.push(g.into_raw());
+    }
+    Ok((gray, fps_override.filter(|f| *f > 0.0).unwrap_or(if fps > 0.0 { fps } else { 24.0 })))
+}
+
 /// Decode a video's frames to 160x90 grey raw bytes with ffmpeg; returns the frames and their fps.
 pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<Vec<u8>>, f64), String> {
     if !crate::media::ffmpeg_available() { return Err(format!("this server cannot read video: install ffmpeg ({})",
@@ -475,7 +494,7 @@ pub async fn check_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(
     let mut gray: Option<Vec<Vec<u8>>> = None;
     if let Some(src) = video_source(&req).await {
         match src {
-            Ok(b) => match video_grey_frames(&b, req["fps"].as_f64()) {
+            Ok(b) => match video_grey_frames_any(&b, req["fps"].as_f64()).await {
                 Ok((g, fps)) => { gray = Some(g); req["fps"] = json!(fps); }
                 Err(e) => return Json(json!({"audio": null, "video": {"note": e}})).into_response(),
             },

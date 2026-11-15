@@ -177,3 +177,7 @@ With `"strata_media": true`, the model gets these tools:
 - **Follow a job** with `GET /v1/media/jobs/{id}`, and get the file at `/content`.
 - **Jobs are kept on disk** and survive a restart. `POST /api/jobs {"tool", "arguments"}` makes one again.
 - **`GET /api/media/capabilities`** says what this PC can make and how long it takes.
+
+## Video without ffmpeg
+
+MP4 files with H.264 video, which is what phones and most tools make, are decoded by the media engine itself (`openh264` and `mp4`, already part of its build). The media check's video checks and videos sent in a chat both work on a PC without ffmpeg. Other formats (WebM, MOV with other codecs, AVI) still need ffmpeg, and the error names the format. With ffmpeg installed, it is used as before for every format.
