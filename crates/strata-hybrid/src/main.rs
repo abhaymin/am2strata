@@ -183,6 +183,17 @@ fn main() {
         }
         m.forward(st, t)
     };
+    // prompt tokens per chunk: 32 for models whose layers forward_batch handles, on the CPU path (not --graph);
+    // AM2_PROMPT_BATCH=1 reads the prompt one token at a time (for comparisons)
+    #[cfg(feature = "gpu")]
+    let on_graph = graph.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let on_graph = false;
+    let batch: usize = if m.batchable() && !on_graph {
+        std::env::var("AM2_PROMPT_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(32).max(1)
+    } else {
+        1
+    };
     let packed = match &pk {
         Some(p) => format!(" pack={} pack_floats={from_pack} pack_native={}", p.dir.display(), p.n_native()),
         None => String::new(),
@@ -254,11 +265,23 @@ fn main() {
         let tp = Instant::now();
         let mut logits = Vec::new();
         let todo = &ids[reused..];
-        for (i, &t) in todo.iter().enumerate() {
-            logits = forward(&mut st, t);
-            history.push(t);
-            if (i + 1) % 16 == 0 || i + 1 == todo.len() {
-                out(&format!("PP {} {} {}", reused + i + 1, ids.len(), tp.elapsed().as_millis()));
+        if batch > 1 {
+            // the prompt in chunks: each weight row read once per chunk, the same values as token by token
+            let mut i = 0;
+            while i < todo.len() {
+                let end = (i + batch).min(todo.len());
+                logits = m.forward_batch(&mut st, &todo[i..end]);
+                history.extend_from_slice(&todo[i..end]);
+                i = end;
+                out(&format!("PP {} {} {}", reused + i, ids.len(), tp.elapsed().as_millis()));
+            }
+        } else {
+            for (i, &t) in todo.iter().enumerate() {
+                logits = forward(&mut st, t);
+                history.push(t);
+                if (i + 1) % 16 == 0 || i + 1 == todo.len() {
+                    out(&format!("PP {} {} {}", reused + i + 1, ids.len(), tp.elapsed().as_millis()));
+                }
             }
         }
         let prompt_ms = tp.elapsed().as_millis();
