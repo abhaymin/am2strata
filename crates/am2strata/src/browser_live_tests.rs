@@ -178,6 +178,17 @@ async fn the_browser_tools_work_on_real_pages() {
     let f = b.call(c, "browser_forward", &json!({})).await.unwrap().text;
     assert!(f.contains("/errors"), "{f}");
 
+    // ---- a tab whose DevTools session dies (driven from elsewhere): the next step reconnects by itself
+    let page = b.current(c).await.unwrap();
+    let sid = page.session_id().clone();
+    {
+        let run = b.run.lock().await;
+        let _ = run.as_ref().unwrap().browser.execute(chromiumoxide::cdp::browser_protocol::target::DetachFromTargetParams::builder().session_id(sid).build()).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let back = b.call(c, "browser_open", &json!({"url": format!("{base}/table")})).await;
+    assert!(back.as_ref().is_ok_and(|s| s.text.contains("Books p1")), "the step after a lost session works: {:?}", back.map(|s| s.text));
+
     // ---- a site test with no model, and its JUnit report
     let suite = json!({"name": "shop", "base": base, "steps": [
         {"open": "/table"}, {"expect": [{"status": 200}, {"text": "Book 1"}, {"console_errors": 0}]},
