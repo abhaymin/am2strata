@@ -627,7 +627,7 @@ $("media-kinds").addEventListener("click", (e) => {
   for (const x of $("media-kinds").children) x.setAttribute("aria-selected", String(x === b));
   const k = b.dataset.kind;
   $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
-  $("song-form").hidden = k !== "song";
+  $("song-form").hidden = k !== "song"; $("tools-forms").hidden = k !== "tools";
 });
 $("vid-model").addEventListener("change", fillVideoSizes);
 $("vid-form").onsubmit = async (ev) => {
@@ -3800,6 +3800,176 @@ $("stt-form").onsubmit = async (ev) => {
 };
 $("stt-copy").onclick = () => copyText($("stt-text").value, $("stt-copy"));
 $("stt-chat").onclick = () => { $("input").value = $("stt-text").value; showTab("chat"); autosize(); $("input").focus(); };
+// Tools: media check, dubbing, productions (GAPS-PLAN B — every big feature has a web screen too). The checks read the
+// server's own shape from media_check.rs; the takes/stems of a dub and each production follow /v1/media/jobs/{id}.
+const _checkData = { url: null };
+$("check-file").onchange = async () => {
+  const f = $("check-file").files[0];
+  if (!f) return;
+  _checkData.url = await asDataUrl(f);
+  $("check-go").disabled = false;
+  $("check-hint").textContent = `${f.name} (${bytes(f.size)}) — sent as audio, or video when it is one`;
+};
+$("check-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  if (!_checkData.url) return;
+  $("check-go").disabled = true;
+  const t0 = performance.now();
+  $("check-hint").textContent = "Checking…";
+  try {
+    const body = { expected_text: $("check-words").value.trim(), language: $("check-lang").value };
+    if (_checkData.url.startsWith("data:video")) body.video = _checkData.url; else body.audio = _checkData.url;
+    const r = await fetch("v1/media/check", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    $("check-out").innerHTML = renderChecks(j);
+    $("check-out").hidden = false;
+    $("check-hint").textContent = `Done in ${((performance.now() - t0) / 1000).toFixed(0)} s`;
+  } catch (e) {
+    $("check-hint").textContent = "";
+    toast("error", "No check", String(e.message || e), 8000);
+  }
+  $("check-go").disabled = false;
+};
+const CHECK_VALS = ["seconds", "ratio", "peak_ratio", "rate", "count", "grey_levels"];
+function renderChecks(j) {
+  const problems = [], notes = [];
+  const row = (name, value, ok) => {
+    if (ok === false) problems.push(name);
+    return `<div class="check-row ${ok === true ? "pass" : ok === false ? "fail" : ""}">` +
+      `<span class="check-name">${esc(name)}</span><span class="check-value">${esc(value)}</span>` +
+      `<span class="check-mark">${ok === true ? "✓ pass" : ok === false ? "✗ fail" : "— n/a"}</span></div>`;
+  };
+  let html = "";
+  for (const family of ["audio", "video"]) {
+    const obj = j[family];
+    if (obj == null || obj === "") continue;
+    if (typeof obj === "string") { notes.push(`${family}: ${obj}`); continue; }   // a read error, e.g. ffmpeg missing
+    for (const [name, check] of Object.entries(obj)) {
+      if (name === "note" || name === "error") continue;
+      html += row(`${family}.${name}`, valOf(check), check && check.ok);
+    }
+  }
+  html += `<div class="check-overall">${problems.length ? `${problems.length} check(s) not ok` : "All checks passed."}</div>`;
+  for (const n of notes) html += `<div class="msg-error small">${esc(n)}</div>`;
+  return html;
+}
+function valOf(c) {
+  const v = CHECK_VALS.find((k) => c[k] != null);
+  if (v) return `${fmt(c[v], v === "count" ? 0 : 2)}`;
+  for (const [k, x] of Object.entries(c)) if (!["ok", "note", "error"].includes(k) && x != null && typeof x !== "object") return `${fmt(x, 2)}`;
+  return "–";
+}
+const DUB_EXAMPLE = JSON.stringify({language: "de", lines: [{speaker: "laura", text: "Hallo …", t0: 22.2, dur: 4.1}], takes: ["data:audio/wav;base64,…"], stems: "data:audio/wav;base64,…"});
+const PROD_EXAMPLE = JSON.stringify({name: "Evening set", crossfade_s: 2, parts: [{speak: {text: "Welcome to the evening set.", voice: "laura"}}]});
+$("dub-json").value = DUB_EXAMPLE;
+$("prod-json").value = PROD_EXAMPLE;
+const dubFiles = { takes: [], stem: null };
+$("dub-takes").onchange = async () => { dubFiles.takes = await Promise.all([...$("dub-takes").files].map(asDataUrl)); };
+$("dub-stems").onchange = async () => { const f = $("dub-stems").files[0]; dubFiles.stem = f ? await asDataUrl(f) : null; };
+$("dub-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  $("dub-go").disabled = true;
+  const t0 = performance.now();
+  $("dub-hint").textContent = "Dubbing… (this takes some seconds)";
+  try {
+    let req;
+    try { req = JSON.parse($("dub-json").value); } catch (e) { throw new Error(`the request is not valid JSON: ${e.message}`); }
+    if (!Array.isArray(req.lines)) throw new Error('the request needs "lines"');
+    for (const u of dubFiles.takes) { (req.takes = req.takes || []).push(u); }
+    if (dubFiles.stem) req.stems = req.stems || dubFiles.stem;
+    const r = await fetch("v1/media/dub", {method: "POST", headers: headers(true), body: JSON.stringify(req)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    $("dub-out").innerHTML = showDub(j, t0);
+    $("dub-out").hidden = false;
+  } catch (e) {
+    $("dub-out").innerHTML = `<div class="msg-error">${esc(String(e.message || e))}</div>`;
+    $("dub-out").hidden = false;
+    toast("error", "No dub", String(e.message || e), 8000);
+  }
+  $("dub-hint").textContent = "";
+  $("dub-go").disabled = false;
+};
+function showDub(j, t0) {
+  const s = j.soundtrack, rep = j.report || {};
+  let html = "";
+  if (typeof s === "string") {
+    html += `<audio controls autoplay src="${esc(s)}"></audio>` +
+      `<div class="row-actions"><a class="st-btn st-btn--secondary" href="${esc(s)}" download="am2strata-dub.wav">Save</a>` +
+      `<span class="muted small">${fmt(j.seconds, 1)} s · ${rep.lines || 0} line(s), made in ${((performance.now() - t0) / 1000).toFixed(0)} s</span></div>`;
+  }
+  const actions = rep.actions || [];
+  if (actions.length) {
+    html += `<div class="check-row-list">`;
+    for (const a of actions) html += `<div class="check-row"><span class="check-name">line ${esc(a.line)}</span><span class="check-value">${esc(a.action || "")}${a.note ? ` · ${esc(a.note)}` : ""}</span></div>`;
+    html += `</div>`;
+  }
+  return html;
+}
+$("prod-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  $("prod-go").disabled = true;
+  $("prod-hint").textContent = "Queuing…";
+  try {
+    let plan;
+    try { plan = JSON.parse($("prod-json").value); } catch (e) { throw new Error(`the plan is not valid JSON: ${e.message}`); }
+    if (!Array.isArray(plan.parts)) throw new Error('the plan needs "parts"');
+    const r = await fetch("v1/media/productions", {method: "POST", headers: headers(true), body: JSON.stringify(plan)});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    pollProd(j.id);
+  } catch (e) {
+    $("prod-out").innerHTML = `<div class="msg-error">${esc(String(e.message || e))}</div>`;
+    $("prod-out").hidden = false;
+    $("prod-hint").textContent = "";
+    toast("error", "No production", String(e.message || e), 8000);
+  }
+  $("prod-go").disabled = false;
+};
+function pollProd(id) {
+  const el = $("prod-out");
+  let timer = null, done = false, active = false;
+  const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+  $("prod-prog").hidden = false;
+  const go = async () => {
+    if (active || done) return; active = true;
+    try {
+      const r = await fetch(`v1/media/jobs/${encodeURIComponent(id)}`, {headers: headers()});
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+      const meta = j.meta || {};
+      if (typeof meta.part === "number" && typeof meta.parts === "number") {
+        $("prod-bar").style.width = `${Math.round(100 * meta.part / meta.parts)}%`;
+        $("prod-hint").textContent = `Producing · part ${meta.part} of ${meta.parts}${meta.now ? ` · ${esc(String(meta.now))}` : ""}`;
+      }
+      if (j.state === "done") {
+        const c = await fetch(`v1/media/jobs/${encodeURIComponent(id)}/content`, {headers: headers()});
+        if (!c.ok) throw new Error(`HTTP ${c.status}`);
+        const mime = j.mime || c.headers.get("content-type") || "audio/wav";
+        const url = URL.createObjectURL(new Blob([await c.arrayBuffer()], {type: mime}));
+        el.innerHTML = ((mime.startsWith("video/") ? `<video controls autoplay src="${esc(url)}"></video>` : `<audio controls autoplay src="${esc(url)}"></audio>`) +
+          `<div class="row-actions"><a class="st-btn st-btn--secondary" href="${esc(url)}" download="am2strata-production${mime.startsWith("video/") ? ".mp4" : ".wav"}">Save</a>` +
+          `<span class="muted small">${fmt(j.seconds || 0, 1)} s · ${esc(mime)}</span></div>`);
+        el.hidden = false;
+        $("prod-hint").textContent = "Done.";
+        done = true; stop(); return;
+      }
+      if (j.state === "error") {
+        el.innerHTML = `<div class="msg-error">production ${esc(id)} failed: ${esc(String(j.error || "no reason given"))}</div>`;
+        el.hidden = false;
+        $("prod-hint").textContent = "";
+        done = true; stop(); return;
+      }
+    } catch (e) {
+      el.innerHTML = `<div class="msg-error">${esc(String(e.message || e))}</div>`;
+      el.hidden = false;
+      done = true; stop();
+    } finally { active = false; }
+  };
+  go();
+  timer = setInterval(go, 3000);
+}
 $("tts-voice").onchange = () => { $("tts-desc").hidden = $("tts-voice").value !== "custom"; };
 $("tts-form").onsubmit = async (ev) => {
   ev.preventDefault();
