@@ -308,8 +308,10 @@ pub async fn test_run(State(s): State<AppState>, headers: HeaderMap, Query(q): Q
 
 /// POST /v1/mcp/browser: this server as an MCP server of the browser tools (JSON-RPC over Streamable HTTP, JSON answers).
 pub async fn mcp(State(s): State<AppState>, headers: HeaderMap, Query(q): Query<HashMap<String, String>>, body: String) -> Response {
-    if !authorized(&s, &headers) {
-        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required (Authorization: Bearer <key>)");
+    // the owner's key, or a client profile's key whose tools include "browser" (clients.rs)
+    let profile_ok = crate::api_access(&s, &headers).flatten().is_some_and(|p| p.has("browser"));
+    if !authorized(&s, &headers) && !profile_ok {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required (Authorization: Bearer <key>; a client key needs the browser tools)");
     }
     if crate::foreign_origin(&s, &headers) {
         return crate::not_own_page("the browser tools can be used");

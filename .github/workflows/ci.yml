@@ -34,7 +34,10 @@ jobs:
             crates/strata-hybrid
           # pull requests read the cache and do not add to it
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # the live browser tests (browser_live_tests.rs) drive the runner's own Chrome
       - run: cargo test --locked --workspace
+        env:
+          AM2_TEST_CHROME: /usr/bin/google-chrome
       - run: cargo test --locked --manifest-path crates/strata-hybrid/Cargo.toml --no-default-features --features gpu --bin am2strata-hybrid
 
   # The regression suite by name (docs/REGRESSION.md): the route contract table and its guard, the golden response

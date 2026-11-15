@@ -3,6 +3,7 @@
 //! the installer's `<data>/browser`, else a Chrome on PATH; with none here the tests say so and pass (CI installs one:
 //! .github/workflows/ci.yml).
 
+// This whole file is test-only: browser.rs includes it under #[cfg(test)], so the local pages below are no route of the server.
 use super::*;
 use axum::response::Html;
 

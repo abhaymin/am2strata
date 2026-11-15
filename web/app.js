@@ -81,9 +81,9 @@ function refreshMedia() {
   try { if (health.image_generation) loadMediaModels(); } catch (e) { /* still starting */ }
 }
 function showTab(name) {
-  tab = ["chat", "images", "monitor", "workshop", "computer", "settings", "calls"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "monitor", "workshop", "computer", "browser", "settings", "calls"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
-  for (const v of ["chat", "images", "monitor", "workshop", "computer", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "monitor", "workshop", "computer", "browser", "settings", "calls"]) $(`view-${v}`).hidden = v !== tab;
   // after app.js has finished loading (the Computer code is further down the file)
   queueMicrotask(() => { if (tab === "computer") { vmShow(); cvConnect(); } else { cvDisconnect(); vmShow(); } });
   if (tab === "images") { $("img-prompt").focus(); refreshMedia(); }
@@ -92,6 +92,7 @@ function showTab(name) {
   if (tab === "settings") { showSection(section); refreshMedia(); }
   if (tab === "calls") refreshCalls();
   if (tab === "workshop") loadWorkshop();
+  if (window.browserTab) window.browserTab(tab === "browser");
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -2335,7 +2336,10 @@ async function streamInto(m, el, signal) {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   if (settings.web === true) body.strata_web = true;                         // web_search / fetch_url, run by this server
-  if (settings.browser === true) body.strata_browser = true;                 // a browser on the server (computer use)
+  if (settings.browser === true) {
+    let t = ""; try { t = localStorage.getItem("am2-browser-chat-target") || ""; } catch (e) { /* storage off */ }
+    body.strata_browser = t || true;
+  }                 // a browser on the server (computer use)
   if (store.get("memory-web", true)) body.strata_memory = true;              // Settings > Memory
   if (store.get("media-chat", true) && (media.models || []).some((x) => x.downloaded && x.kind !== "3d")) body.strata_media = true;  // Settings > Models
 

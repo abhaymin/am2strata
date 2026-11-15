@@ -301,6 +301,22 @@ const ROUTES: &[Row] = &[
     row("GET", "/metrics/prometheus", Owner),
     row("GET", "/v1/status", Owner),
     // --------------------------------------------------------------------------------- the sandbox VM (Linux only)
+    // ---------------------------------------------------------------------------------------------- browser use
+    row("GET", "/api/browser", Owner).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")).note("targets, waiting steps, datasets and tests: nothing is started"),
+    row("POST", "/api/browser/step", Owner).json(r#"{"tool": "nope"}"#).ok(400).note("an unknown tool: no browser is started"),
+    row("GET", "/api/browser/view", Owner).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")).note("no session open: {open: false}"),
+    row("GET", "/api/browser/approvals", Owner).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")),
+    row("POST", "/api/browser/test", Owner).json(r#"{}"#).ok(400).note("no suite given"),
+    row("GET", "/api/browser/tests/{name}", Owner).at("/api/browser/tests/nope").ok(404).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")),
+    row("PUT", "/api/browser/tests/{name}", Owner).at("/api/browser/tests/nope").json(r#"{"steps": [{"dance": 1}]}"#).ok(400)
+        .note("a step that is no step is refused before anything is saved"),
+    row("DELETE", "/api/browser/tests/{name}", Owner).at("/api/browser/tests/nope"),
+    row("GET", "/api/datasets", Owner).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")),
+    row("POST", "/api/datasets", Owner).json(r#"{"name": "../x", "rows": []}"#).ok(400).note("a name outside the folder is refused"),
+    row("GET", "/api/datasets/{name}", Owner).at("/api/datasets/nope").ok(404).foreign(Foreign::Status(403, "the browser, its datasets and tests: this server's own page only (another site must not read what was collected)")),
+    row("DELETE", "/api/datasets/{name}", Owner).at("/api/datasets/nope"),
+    row("POST", "/v1/mcp/browser", Owner).json(r#"{"jsonrpc": "2.0", "id": 1, "method": "ping"}"#).malformed(200)
+        .note("MCP over HTTP: a broken body is a JSON-RPC parse error (200); a client key needs the browser tools"),
     row("GET", "/api/vm", Owner).note("status only: nothing in this table ever starts the VM"),
     row("POST", "/api/vm", Owner).json(r#"{"action": "nope"}"#).ok(400).note("an unknown action: the VM is not started"),
     row("POST", "/api/vm/settings", Owner).json(r#"{"gpu": true}"#).ok(400).note("an unknown setting: nothing is changed"),
