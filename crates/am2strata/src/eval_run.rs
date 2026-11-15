@@ -233,11 +233,13 @@ pub fn run(srv: &Server, o: &Opts) -> Result<Value, String> {
         let v = srv.json("GET", "/v1/models", None, 30)?;
         v["data"][0]["id"].as_str().ok_or("the server lists no model")?.to_string()
     } };
-    let vm_ok = srv.json("GET", "/api/vm", None, 30).is_ok_and(|v| v["available"] != false);
+    // a VM job needs the VM and computer use on in the VM mode (else the model has no VM tools: skipped, not failed)
+    let vm_ok = srv.json("GET", "/api/vm", None, 30).is_ok_and(|v| v["available"] != false)
+        && srv.json("GET", "/api/computer/status", None, 30).is_ok_and(|c| c["on"] == true && c["mode"] == "vm");
     let mut rows = Vec::new();
     for j in &jobs {
         let name = j["name"].as_str().unwrap();
-        if j["needs"] == "vm" && !vm_ok { eprintln!("{name}: skipped (needs the sandbox VM)"); rows.push(json!({"job": name, "skipped": "needs the sandbox VM"})); continue; }
+        if j["needs"] == "vm" && !vm_ok { eprintln!("{name}: skipped (needs the sandbox VM with computer use on, mode vm)"); rows.push(json!({"job": name, "skipped": "needs the sandbox VM with computer use on (mode vm)"})); continue; }
         for t in 1..=o.tries {
             eprintln!("{name} (try {t}/{}) on {model}", o.tries);
             if let Some(s) = j["setup"]["vm"].as_str() {
