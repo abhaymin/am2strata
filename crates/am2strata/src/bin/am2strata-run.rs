@@ -32,6 +32,8 @@ mod doctor;
 mod eval_run;
 #[path = "../bin_media.rs"]
 mod bin_media;
+#[path = "../bin_ops.rs"]
+mod bin_ops;
 
 use clap::{Args, Parser, Subcommand};
 use std::io::{Read, Write};
@@ -442,6 +444,72 @@ enum Cmd {
         #[arg(long)]
         url: Option<String>,
         /// its own API key (default: from the run configs; or AM2STRATA_API_KEY)
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// a cluster from a terminal (Settings › Cluster): status | pair <url> <code> | forget <name> — as the server's own
+    /// /api/cluster API. status shows this node, each paired worker and, on a worker, its pairing code; pair takes the
+    /// worker by its 6-digit code; forget stops using a worker (and tells it to forget us).
+    Cluster {
+        action: String,
+        #[arg(last = true)]
+        values: Vec<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// tune a model with the optimizer (Settings › Models "Tune"), from a terminal — start it, follow its progress and
+    /// print the result. The run config is never changed; chats wait while it runs.
+    Tune {
+        model: String,
+        #[arg(long, default_value = "decode")]
+        objective: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// client profiles and their keys (Settings › Clients), from a terminal: list | new <name> [--tools a,b] [--expires 30d]
+    /// | revoke <id>. A key is shown once and kept nowhere.
+    Clients {
+        action: String,
+        #[arg(last = true)]
+        values: Vec<String>,
+        #[arg(long)]
+        tools: Option<String>,
+        #[arg(long)]
+        expires: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        api_key: Option<String>,
+        #[arg(long, default_value = "~/Development/PolyStrata")]
+        models_dir: String,
+    },
+    /// memory facts (in chat), from a terminal — list [--query q] | add "<text>" | forget <id>, as the server's /v1/memory.
+    Memory {
+        action: String,
+        #[arg(last = true)]
+        values: Vec<String>,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        url: Option<String>,
         #[arg(long)]
         api_key: Option<String>,
         #[arg(long, default_value = "~/Development/PolyStrata")]
@@ -994,6 +1062,14 @@ fn main() -> ExitCode {
         Cmd::Live { topics, cert, url, api_key, models_dir } => live_cmd(&topics, cert, url, api_key, &models_dir),
         Cmd::Media { action, first, m, url, api_key, models_dir } =>
             bin_media::media_cmd(&action, first, &m, url, api_key, &models_dir),
+        Cmd::Cluster { action, values, json, url, api_key, models_dir } =>
+            bin_ops::cluster_cmd(bin_ops::ClusterOpts { action, values, json }, url, api_key, &models_dir),
+        Cmd::Tune { model, objective, json, url, api_key, models_dir } =>
+            bin_ops::tune_cmd(bin_ops::TuneOpts { model, objective, json }, url, api_key, &models_dir),
+        Cmd::Clients { action, values, tools, expires, json, url, api_key, models_dir } =>
+            bin_ops::clients_cmd(bin_ops::ClientsOpts { action, values, tools, expires, json }, url, api_key, &models_dir),
+        Cmd::Memory { action, values, query, json, url, api_key, models_dir } =>
+            bin_ops::memory_cmd(bin_ops::MemoryOpts { action, values, query, json }, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),
         Cmd::GgufStackExperts { input, out } => done(strata_pack::stack_experts::run(&strata_pack::stack_experts::Options {
             input: expand_path(&input), output: expand_path(&out) })),
