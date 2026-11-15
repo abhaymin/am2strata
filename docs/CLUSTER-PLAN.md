@@ -190,6 +190,25 @@ order of the work. Each step is measured on real machines before the next starts
    6. **Then layer splitting** (whole layers on a worker) as a second mode, for models where it costs fewer round
       trips. Then the same tier in the Rust engine on the master.
 
+   **Both sides know where every part of a model is (owner, 2026-11-15).**
+   - The master's engine and each worker share one placement map: for each model, which layers and experts sit in
+     which machine's VRAM, RAM or disk.
+   - A request is planned with that map, so the work for each part goes where that part already is, and nothing is
+     loaded twice.
+   - Each worker reports its map with its health every few seconds. The master's Settings › Cluster and Monitor show
+     it.
+
+   **Several brains: small models on the workers as experts (owner, 2026-11-15).**
+   - A worker also keeps one or more small models of its own: for example an 8B MoE with 1B active, a math model or a
+     coder.
+   - The main model consults them in the same turn through `ask_expert`, and they get the user's original request.
+   - **Cluster-aware experts:** an expert names a paired worker and its model (`{"name": "mac-small", "worker": "macm4",
+     "model": "..."}`), instead of a URL and a key.
+     - The call goes over the pinned-TLS cluster channel, with the key that pairing gave.
+     - The expert is offered only while that worker is ready.
+     - The choice of models follows the worker's measured speed. On the Mac: the GPU test decides whether its CPU or
+       its GPU runs them.
+
 5. **Long context across machines (phase 3).** The KV of each node's layers stays on that node (it comes free with
    phase 2). Sequence splitting (ring attention) for contexts beyond what layer splitting gives is kept for later,
    measured first.
