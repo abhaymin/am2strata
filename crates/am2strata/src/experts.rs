@@ -142,7 +142,7 @@ impl Experts {
     /// The key an expert's requests are authorized with: read from the environment variable `key_env` names (empty -> none).
     /// It is never stored in this struct, logged or returned.
     fn key_for(&self, env_name: &str) -> Option<String> {
-        std::env::var(env_name).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        key_from(|n| std::env::var(n).ok(), env_name)
     }
 
     /// A tool call to an expert -> the result for the model and the client: {"ok","text","chars","truncated","ms"}. An error
@@ -199,6 +199,13 @@ impl Experts {
         let content = body_for(&body);
         Ok(content)
     }
+}
+
+/// The trimmed, non-empty value of `env_name` as `lookup` returns, or None when the variable is empty/whitespace only.
+/// Extracted as a plain function so both key_for and the unit test can pass a lookup closure and never touch the shared
+/// environment (parallel tests would set/remove the same variable).
+fn key_from(lookup: impl Fn(&str) -> Option<String>, env_name: &str) -> Option<String> {
+    lookup(env_name).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// The expert's answer, "Answer from the <name> expert (<model>):\n<text>", cut at ANSWER_CHARS with a note saying so. Cuts
@@ -317,14 +324,13 @@ mod tests {
     }
 
     #[test]
-    fn the_key_comes_from_the_named_environment_variable_and_is_not_stored() {
-        let e = Experts::from_config(&rest(json!([{"name":"math","about":"x","url":"http://x/v1","model":"m","key_env":"AM2_EXPERT_KEY_TEST"}])));
-        std::env::set_var("AM2_EXPERT_KEY_TEST", "  secret-one-two-three  ");
-        assert_eq!(e.key_for("AM2_EXPERT_KEY_TEST").as_deref(), Some("secret-one-two-three"), "read from the env var, trimmed");
+    fn the_key_lookup_trims_and_treats_empty_as_none() {
+        let e = Experts::from_config(&rest(json!([{"name":"math","about":"x","url":"http://x/v1","model":"m"}])));
+        // key_from reads via a lookup closure, so this never sets or removes anything in the shared environment (parallel-safe)
+        assert_eq!(key_from(|_| Some("  secret-one-two-three  ".to_string()), "AM2_EXPERT_KEY_TEST").as_deref(), Some("secret-one-two-three"), "the value is trimmed");
+        assert_eq!(key_from(|_| Some("   ".to_string()), "AM2_EXPERT_KEY_TEST").as_deref(), None, "whitespace only -> none");
+        // the env-var path (read-only): a missing variable reads as none
         assert_eq!(e.key_for("AM2_EXPERT_KEY_MISSING").as_deref(), None, "unset -> none");
-        std::env::remove_var("AM2_EXPERT_KEY_TEST");
-        // the secret lives only in the environment: it is never held by the struct itself
-        assert!(!format!("{:?}", e).contains("secret-one-two-three"));
     }
 
     #[test]

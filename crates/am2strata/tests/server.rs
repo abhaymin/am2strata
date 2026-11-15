@@ -2099,16 +2099,14 @@ fn a_client_profile_with_experts_gets_the_tool_without_a_flag() {
 /// `Authorization: Bearer <value>` header — never stored, logged or returned. With no key_env there is no such header.
 #[test]
 fn an_expert_key_is_sent_as_bearer_when_named() {
-    const AM2_STRATA_EXPERT_AUTH_ROUND1: &str = "AM2_STRATA_EXPERT_AUTH_ROUND1";
-    std::env::set_var(AM2_STRATA_EXPERT_AUTH_ROUND1, "  super-secret-key-xyz  ");
     let (port, requests) = fake_math_expert();
-    let ask = "\n\n<tool_call>\n<function=ask_expert>\n<parameter=expert>\nmath\n</parameter>\n<parameter=question>\n2 plus 2?\n</parameter>\n</function>\n</tool_call>";
+    let ask = "\n\n<tool_call>\n<function=ask_expert>\n<parameter=expert>\nmath\n</parameter>\n<parameter=question>\n2 plus 2?\n</parameter>\n</tool_call>";
     let m = Model { extra: json!({"experts": [{"name":"math","about":"x",
-        "url": format!("http://127.0.0.1:{port}/v1"),"model":"qwen-math","key_env": AM2_STRATA_EXPERT_AUTH_ROUND1}]}), ..Model::default() };
-    let s = Server::start(&[m], &[ids(&format!("Ask.\n</think>{ask}")), ids("4.\n</think>")], json!({}));
+        "url": format!("http://127.0.0.1:{port}/v1"),"model":"qwen-math","key_env":"AM2_STRATA_EXPERT_AUTH_ROUND1"}]}), ..Model::default() };
+    // the server is a separate process: give it the key through the env extra (tests/common/mod.rs applies extra["env"] to the child)
+    let s = Server::start(&[m], &[ids(&format!("Ask.\n</think>{ask}")), ids("4.\n</think>")], json!({"env": {"AM2_STRATA_EXPERT_AUTH_ROUND1": "  super-secret-key-xyz  "}}));
     let (c, _) = s.post("/v1/chat/completions", &json!({"messages": [user("What is 2 plus 2?")], "strata_experts": true}));
     assert_eq!(c, 200, "the expert answered");
-    std::env::remove_var(AM2_STRATA_EXPERT_AUTH_ROUND1);
     let req = requests.lock().unwrap().last().unwrap().clone();
     // the wire lowercases the header name; check case-insensitively that the key is sent only as a Bearer token (value exact)
     assert!(req.to_ascii_lowercase().contains("bearer super-secret-key-xyz"), "the key goes only as a Bearer header: {req}");
