@@ -1,13 +1,17 @@
 //! Specialist models the main model consults in the same turn: one server tool, `ask_expert(expert, question, context?)`.
 //! The request carries the user's original request (the last user message of the chat) as well as the sub-question, so an
-//! expert sees the whole job and not only the planner's brief. Each expert is an OpenAI-compatible endpoint (`experts` in
-//! the run config), another am2Strata, a cluster node or llama-server; its key, when it has one, comes from the environment
-//! variable `key_env` names and is never read into the struct, logged or returned. Offered only when a request asks
-//! (`"strata_experts": true`) or the key's client profile has the set "experts", and only when at least one expert is
-//! configured; never with a structured response_format or a forced tool_choice.
+//! expert sees the whole job and not only the planner's brief. Each expert is one of two forms (`experts` in the run config):
+//! an OpenAI-compatible endpoint (another am2Strata, a cluster node or llama-server) as `{"url","model"}` — its key, when it
+//! has one, comes from the environment variable `key_env` names and is never read into the struct, logged or returned; or a
+//! paired cluster worker's model as `{"worker","model"}`, reached over that worker's pinned mutual-TLS client with the key
+//! pairing gave (no new client, no config key read). A config entry must have exactly one of `url` or `worker`. A worker-form
+//! expert is offered only while that worker is paired, ready and lists the model; its call records name the worker. Offered
+//! only when a request asks ("strata_experts": true) or the key's client profile has the set "experts", and only when at
+//! least one expert is configured; never with a structured response_format or a forced tool_choice.
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const TOOL_NAMES: [&str; 1] = ["ask_expert"];
@@ -20,15 +24,18 @@ const MAX_NAME: usize = 32;
 const DEFAULT_MAX_TOKENS: u64 = 1024;
 const DEFAULT_TIMEOUT_S: u64 = 120;
 
-/// One configured specialist. `key` is not stored (it is read from the environment at call time).
+/// One configured specialist. A worker-form expert (a paired cluster worker's model) has no url and its key comes from the
+/// pairing, never stored here; a url-form expert reads its key from the environment variable `key_env` names at call time.
 #[derive(Debug)]
 struct Expert {
     name: String,
     about: String,
-    /// an OpenAI-compatible base URL (trailing slash trimmed); `{url}/chat/completions` is called.
+    /// an OpenAI-compatible base URL (trailing slash trimmed); `{url}/chat/completions` is called. Empty for a worker-form expert.
     url: String,
+    /// a paired cluster worker this expert names (the `{"worker","model"}` form). None for a url-form expert.
+    worker: Option<String>,
     model: String,
-    /// the environment variable that holds the key, if any; read at call time only.
+    /// the environment variable that holds the key, if any; read at call time only (url form).
     key_env: Option<String>,
     max_tokens: usize,
     timeout: Duration,
@@ -37,17 +44,40 @@ struct Expert {
 /// The configured specialists plus the server's own listen host+port (set at start from main.rs via `with_self_addr`):
 /// an expert whose url is a loopback address on our own port would be *us* — calling it waits for our chat's own GPU turn
 /// and hangs until the timeout — so that case can be refused before anything is sent.
-#[derive(Debug)]
+
 pub struct Experts {
     experts: Vec<Expert>,
     own_host: String,
     own_port: u16,
+    /// this node's cluster (set at start via `with_cluster`): a worker-form expert looks its worker up here at call time and
+    /// goes through that worker's pinned mutual-TLS client with the key pairing gave.
+    cluster: Option<Arc<crate::cluster::Cluster>>,
+}
+
+
+impl Expert {
+    /// Whether this expert can be offered now: a url-form expert always; a worker-form expert only while its paired worker is
+    /// ready and lists the model (the cluster status the master polls), so the tool description names only experts it can reach.
+    fn is_offered(&self, cluster: &Option<Arc<crate::cluster::Cluster>>) -> bool {
+        match &self.worker {
+            Some(w) => cluster.as_ref().is_some_and(|c| c.worker_by_name(w).is_some_and(|w| w.is_ready() && w.has_model(&self.model))),
+            None => true,
+        }
+    }
+}
+
+impl std::fmt::Debug for Experts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Experts").field("experts", &self.experts).field("own_host", &self.own_host)
+            .field("own_port", &self.own_port).field("cluster_set", &self.cluster.is_some()).finish()
+    }
 }
 
 impl Experts {
-    /// Build the specialists from the run config's `"experts": [{"name","about","url","model","key_env?","max_tokens?","timeout_s?"}]`.
-    /// Names must be unique and 1-32 of [a-z0-9_-]; an entry that fails, or a name used twice, is skipped with a warning. The
-    /// server's own listen address is not here; set it with `with_self_addr` so a call back at us is refused.
+    /// Build the specialists from the run config's `"experts": [...]`, two forms: a url `{"name","about","url","model",...}`
+    /// (an OpenAI-compatible endpoint) and a paired worker `{"name","about","worker","model",...}` (that worker's model). A
+    /// name is unique and 1-32 of [a-z0-9_-]; an entry with neither or both of url/worker, or no model, is skipped with a
+    /// warning. The server's own listen address is set with `with_self_addr`; the cluster with `with_cluster`.
     pub fn from_config(rest: &BTreeMap<String, Value>) -> Experts {
         let c = rest.get("experts").cloned().unwrap_or(Value::Null);
         let mut experts = Vec::new();
@@ -55,16 +85,23 @@ impl Experts {
         if let Some(list) = c.as_array() {
             for e in list {
                 let name = e.get("name").and_then(Value::as_str).unwrap_or("").trim().to_string();
-                let url = e.get("url").and_then(Value::as_str).unwrap_or("").trim().to_string();
                 let about = e.get("about").and_then(Value::as_str).unwrap_or("").trim().to_string();
                 let model = e.get("model").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let url = e.get("url").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let worker = e.get("worker").and_then(Value::as_str).unwrap_or("").trim().to_string();
                 let key_env = e.get("key_env").and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
                 if name.is_empty() || name.len() > MAX_NAME || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
                     tracing::warn!("ask_expert expert {name:?}: a name is 1-32 of [a-z0-9_-] (skipped)");
                     continue;
                 }
-                if url.is_empty() {
-                    tracing::warn!("ask_expert expert {name:?}: missing url (skipped)");
+                let has_url = !url.is_empty();
+                let has_worker = !worker.is_empty();
+                if has_url && has_worker {
+                    tracing::warn!("ask_expert expert {name:?}: a form needs exactly one of url or worker (skipped)");
+                    continue;
+                }
+                if !has_url && !has_worker {
+                    tracing::warn!("ask_expert expert {name:?}: missing url or worker (skipped)");
                     continue;
                 }
                 if model.is_empty() {
@@ -77,10 +114,10 @@ impl Experts {
                 }
                 let max_tokens = e.get("max_tokens").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(DEFAULT_MAX_TOKENS) as usize;
                 let timeout = Duration::from_secs(e.get("timeout_s").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(DEFAULT_TIMEOUT_S));
-                experts.push(Expert { name, about, url: url.trim_end_matches('/').to_string(), model, key_env, max_tokens, timeout });
+                experts.push(Expert { name, about, url: url.trim_end_matches('/').to_string(), worker: if has_worker { Some(worker) } else { None }, model, key_env, max_tokens, timeout });
             }
         }
-        Experts { experts, own_host: String::new(), own_port: 0 }
+        Experts { experts, own_host: String::new(), own_port: 0, cluster: None }
     }
 
     /// Set the host we listen on (usually "127.0.0.1") and the port (main.rs), so a loopback expert url on our own port is seen
@@ -91,15 +128,29 @@ impl Experts {
         self
     }
 
-    /// The one tool that asks an expert, its description naming each expert and what they do.
+    /// The node's cluster (main.rs), so a worker-form expert can reach its paired worker and go through that worker's pinned
+    /// mutual-TLS client at call time with the key pairing gave. Without it, a worker-form expert's worker is not found.
+    pub fn with_cluster(mut self, cluster: Arc<crate::cluster::Cluster>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    /// The one tool that asks an expert, its description naming each available expert and what they do. A worker-form expert is
+    /// named "(on worker X)" and offered only while that worker is paired, ready and lists the model (cluster status); if none
+    /// are available the set is not offered (an empty vector).
     pub fn tools(&self) -> Vec<Value> {
         let mut desc = String::from(
             "Ask a specialist model a sub-question; it answers in this same turn and also gets the user's original request so it \
              sees the whole job, not just the brief. Give it the name of an expert below and the question."
         );
+        let mut offered = false;
         for e in &self.experts {
-            desc.push_str(&format!("\nThe {} expert ({model}): {about}.", e.name, model = e.model, about = e.about));
+            if !e.is_offered(&self.cluster) { continue; }
+            offered = true;
+            let who = match &e.worker { Some(w) => format!(" (on worker {w})"), None => String::new() };
+            desc.push_str(&format!("\nThe {} expert ({model}){who}: {about}.", e.name, model = e.model, about = e.about));
         }
+        if !offered { return Vec::new(); }
         vec![json!({"name": "ask_expert", "description": desc,
             "parameters": {"type": "object", "properties": {
                 "expert": {"type": "string", "description": "which expert to ask (one of the names above)"},
@@ -161,43 +212,63 @@ impl Experts {
     async fn run(&self, args: &Value, original_request: &str) -> Result<(String, bool), String> {
         let name = args["expert"].as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or("name an expert")?;
         let e = self.experts.iter().find(|x| x.name == name).ok_or_else(|| format!("there is no expert named {name}"))?;
-        if self.points_at_self(e) {
-            return Err(format!("the {name} expert is this server itself ({}); point it at another server or a remote model", e.url));
-        }
         let question = args["question"].as_str().map(str::trim).filter(|q| !q.is_empty()).ok_or("give a question")?;
         let context = args.get("context").and_then(Value::as_str).map(|s| s.trim()).filter(|s| !s.is_empty());
-        let url = format!("{}/chat/completions", e.url);
-        let body = self.request(&e, &url, question, context, original_request).await?; // send / HTTP status / timeout
-        if body.trim().is_empty() {
+
+        // The request goes out over one of two clients: a paired cluster worker's — its base and the key pairing gave — or a
+        // fresh client for a url-form expert authorized by the `key_env` variable. Both build the same body; both send it.
+        let mut client = http_client()?;
+        let mut url = format!("{}/chat/completions", e.url);
+        let mut bearer: Option<String> = None;
+        let mut on_worker: Option<&str> = None;
+        if let Some(wname) = e.worker.as_deref() {
+            // a paired cluster worker: reach it over this node's cluster, with the key pairing gave (no new client, no config key)
+            let w = self.cluster.as_ref().and_then(|c| c.worker_by_name(wname))
+                .ok_or_else(|| format!("the {name} expert's worker {wname} is not answering"))?;
+            if !w.is_ready() {
+                return Err(format!("the {name} expert's worker {wname} is not answering"));
+            }
+            url = format!("{}/v1/chat/completions", w.base().trim_end_matches('/'));
+            client = w.client.clone();
+            bearer = Some(w.auth_key().to_string());
+            on_worker = Some(wname);
+        } else if self.points_at_self(e) {
+            return Err(format!("the {name} expert is this server itself ({}); point it at another server or a remote model", e.url));
+        } else {
+            bearer = match &e.key_env {
+                Some(env) => self.key_for(env).map(|k| k.to_string()),
+                None => None,
+            };
+        }
+        let raw = self.post(&client, &url, &name, &e.model, e.max_tokens, e.timeout, bearer.as_deref(), &question, context, original_request).await?;
+        let content = body_for(&raw);
+        if content.trim().is_empty() {
             return Err(format!("the {name} expert returned nothing"));
         }
-        Ok(answer_text(name, &e.model, &body))
+        Ok(answer_text(&name, &e.model, &content, on_worker))
     }
 
-    async fn request(&self, exp: &Expert, url: &str, question: &str, context: Option<&str>, original_request: &str) -> Result<String, String> {
-        let client = http_client()?;
-        let mut req = client.post(url)
-            .timeout(exp.timeout)
-            .json(&json!({"model": exp.model, "messages": self.messages(&exp.name, question, context, original_request), "max_tokens": exp.max_tokens}));
-        if let Some(env) = &exp.key_env {
-            if let Some(key) = self.key_for(env) {
-                req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"));
-            }
+    /// POST the built `url` (an OpenAI chat-completions path) with the same body any expert gets, authorized by `bearer` when
+    /// given (as `Bearer <value>`). Returns the raw completion body: call() parses and wraps it. Send / HTTP status / timeout
+    /// errors name the expert and go back as a tool error; the turn goes on.
+    async fn post(&self, client: &reqwest::Client, url: &str, name: &str, model: &str, max_tokens: usize, timeout: Duration,
+                   bearer: Option<&str>, question: &str, context: Option<&str>, original_request: &str) -> Result<String, String> {
+        let mut rq = client.post(url).timeout(timeout).json(&json!({"model": model, "messages": self.messages(name, question, context, original_request), "max_tokens": max_tokens}));
+        if let Some(k) = bearer {
+            rq = rq.header(reqwest::header::AUTHORIZATION, format!("Bearer {k}"));
         }
-        let resp = req.send().await.map_err(|e| {
+        let resp = rq.send().await.map_err(|e| {
             if e.is_timeout() {
-                format!("the {} expert did not answer within {} s", exp.name, exp.timeout.as_secs())
+                format!("the {name} expert did not answer within {} s", timeout.as_secs())
             } else {
-                format!("the {} expert: {e}", exp.name)
+                format!("the {name} expert: {e}")
             }
         })?;
         let status = resp.status();
         if !status.is_success() {
-            return Err(format!("the {} expert answered {}", exp.name, status));
+            return Err(format!("the {name} expert answered {}", status));
         }
-        let body = resp.text().await.map_err(|e| format!("the {} expert: {}", exp.name, e))?;
-        let content = body_for(&body);
-        Ok(content)
+        resp.text().await.map_err(|e| format!("the {name} expert: {e}"))
     }
 }
 
@@ -208,16 +279,17 @@ fn key_from(lookup: impl Fn(&str) -> Option<String>, env_name: &str) -> Option<S
     lookup(env_name).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
-/// The expert's answer, "Answer from the <name> expert (<model>):\n<text>", cut at ANSWER_CHARS with a note saying so. Cuts
-/// once here and reports `cut` back to call(), which no longer cuts again (a second cut would drop the note and part of the
-/// answer). Returns (wrapped text, whether it was cut).
-fn answer_text(name: &str, model: &str, body: &str) -> (String, bool) {
+/// The expert's answer, "Answer from the <name> expert (<model>):\n<text>" — for a worker-form expert, "(on worker X)" too, so
+/// the record of the call (the tool result in the chat and the monitor/API calls) names the worker. Cut at ANSWER_CHARS with a
+/// note saying so. Cuts once here and reports `cut` back to call(), which no longer cuts again. Returns (wrapped text, cut?).
+fn answer_text(name: &str, model: &str, body: &str, on_worker: Option<&str>) -> (String, bool) {
     let cut = body.chars().count() > ANSWER_CHARS;
     let shown = if cut { body.chars().take(ANSWER_CHARS).collect::<String>() } else { body.to_string() };
+    let who = match on_worker { Some(w) => format!(" (on worker {w})"), None => String::new() };
     if cut {
-        (format!("Answer from the {name} expert ({model}):\n{shown}\n\n(The answer was cut at {ANSWER_CHARS} characters; the expert may have said more.)"), true)
+        (format!("Answer from the {name} expert ({model}){who}:\n{shown}\n\n(The answer was cut at {ANSWER_CHARS} characters; the expert may have said more.)"), true)
     } else {
-        (format!("Answer from the {name} expert ({model}):\n{shown}"), false)
+        (format!("Answer from the {name} expert ({model}){who}:\n{shown}"), false)
     }
 }
 
@@ -360,7 +432,7 @@ mod tests {
     #[test]
     fn the_answer_is_cut_at_twenty_thousand_characters_with_a_note() {
         let body = "x".repeat(ANSWER_CHARS + 50);
-        let (text, truncated) = answer_text("math", "qwen-math", &body);
+        let (text, truncated) = answer_text("math", "qwen-math", &body, None);
         assert!(truncated, "it reports truncated");
         assert!(text.starts_with("Answer from the math expert (qwen-math):"));
         assert!(text.contains(&format!("The answer was cut at {ANSWER_CHARS} characters")), "it says it was cut: {text}");
@@ -370,7 +442,7 @@ mod tests {
 
     #[test]
     fn a_short_answer_is_not_cut_and_has_no_note() {
-        let (text, truncated) = answer_text("math", "qwen-math", "42");
+        let (text, truncated) = answer_text("math", "qwen-math", "42", None);
         assert!(!truncated, "a short answer is not truncated");
         assert_eq!(text, "Answer from the math expert (qwen-math):\n42");
         assert!(!text.contains("cut at"));
@@ -379,7 +451,7 @@ mod tests {
     #[test]
     fn a_25000_char_answer_is_cut_once_with_the_note_kept() {
         let body = "x".repeat(25_000);
-        let (text, truncated) = answer_text("math", "qwen-math", &body);
+        let (text, truncated) = answer_text("math", "qwen-math", &body, None);
         assert!(truncated, "it reports truncated");
         // exactly one cut of twenty thousand characters: the body line is precisely ANSWER_CHARS long, no more — a second
         // cut elsewhere would make it shorter; and the answer ends with the note (a double cut would have dropped it).
@@ -429,5 +501,82 @@ mod tests {
         let desc = tools[0]["description"].as_str().unwrap();
         assert!(desc.contains("The math expert (m): checks arithmetic and algebra step by step."));
         assert!(desc.contains("The ocr expert (n): reads text in a picture."));
+    }
+
+    #[test]
+    fn a_worker_form_expert_names_its_worker_not_a_url() {
+        let e = Experts::from_config(&rest(json!([{"name":"mac-small","about":"the mac's small model",
+            "worker":"macm4","model":"mock-b"}])));
+        assert_eq!(e.experts.len(), 1, "a worker-form expert is kept");
+        assert_eq!(e.experts[0].name, "mac-small");
+        assert_eq!(e.experts[0].worker.as_deref(), Some("macm4"), "it names the worker");
+        assert!(e.experts[0].url.is_empty(), "a worker-form expert has no url");
+        assert_eq!(e.experts[0].model, "mock-b");
+    }
+
+    #[test]
+    fn a_config_entry_needs_exactly_one_of_url_or_worker() {
+        // neither url nor worker: skipped with a warning
+        let none = Experts::from_config(&rest(json!([{"name":"math","about":"x","model":"m"}])));
+        assert!(none.is_empty(), "a form needs url or worker");
+        // both at once: skipped with a warning (a form has exactly one)
+        let both = Experts::from_config(&rest(json!([{"name":"math","about":"x","url":"http://x/v1","worker":"w","model":"m"}])));
+        assert!(both.is_empty(), "a form needs exactly one of url or worker");
+        // each form on its own is fine: one of each is kept
+        let one = Experts::from_config(&rest(json!([{"name":"urlform","about":"x","url":"http://x/v1","model":"m"},
+                                                    {"name":"workerform","about":"y","worker":"w","model":"n"}])));
+        assert_eq!(one.experts.len(), 2, "each form on its own is kept");
+    }
+
+    #[test]
+    fn a_worker_form_expert_that_is_not_ready_is_a_tool_error() {
+        // the paired worker exists but has not answered for the poll: a clear tool error, the turn goes on
+        let mut c = crate::cluster::Cluster::empty();
+        c.add_test_worker("macm4", &["mock-b"], false);
+        let e = Experts::from_config(&rest(json!([{"name":"small","about":"x","worker":"macm4","model":"mock-b"}])))
+            .with_cluster(Arc::new(c));
+        let r = futures::executor::block_on(e.call(&json!({"expert":"small","question":"2+2?"}), "the request"));
+        assert_eq!(r["ok"], false, "{r:?}");
+        assert!(r["text"].as_str().unwrap().contains("the small expert's worker macm4 is not answering"), "{r:?}");
+
+        // the worker's name is unknown to this node: the same clear error (nothing was sent)
+        let mut c = crate::cluster::Cluster::empty();
+        c.add_test_worker("other", &["mock-b"], true);
+        let e2 = Experts::from_config(&rest(json!([{"name":"small","about":"x","worker":"macm4","model":"mock-b"}])))
+            .with_cluster(Arc::new(c));
+        let r2 = futures::executor::block_on(e2.call(&json!({"expert":"small","question":"2+2?"}), "the request"));
+        assert_eq!(r2["ok"], false, "{r2:?}");
+        assert!(r2["text"].as_str().unwrap().contains("is not answering"), "{r2:?}");
+        assert_eq!(r2["chars"].as_u64(), Some(0), "nothing was fetched from an unreachable worker");
+    }
+
+    #[test]
+    fn a_worker_expert_is_offered_with_its_worker_only_while_ready() {
+        // the paired worker ready and listing the model: offered, labelled "(on worker macm4)"
+        let mut c = crate::cluster::Cluster::empty();
+        c.add_test_worker("macm4", &["mock-b"], true);
+        let e = Experts::from_config(&rest(json!([{"name":"small","about":"the mac's small model","worker":"macm4","model":"mock-b"}])))
+            .with_cluster(Arc::new(c));
+        let tools = e.tools();
+        let desc = tools[0]["description"].as_str().unwrap();
+        assert!(desc.contains("The small expert (mock-b) (on worker macm4): the mac's small model."), "offered with its worker: {desc}");
+
+        // the same worker, not ready: the expert is no longer offered at all
+        let mut c = crate::cluster::Cluster::empty();
+        c.add_test_worker("macm4", &["mock-b"], false);
+        let e2 = Experts::from_config(&rest(json!([{"name":"small","about":"x","worker":"macm4","model":"mock-b"}])))
+            .with_cluster(Arc::new(c));
+        assert!(e2.tools().is_empty(), "not offered while the worker is not ready");
+    }
+
+    #[test]
+    fn a_worker_form_answer_names_the_worker() {
+        // the recorded answer of a worker-form expert says which worker answered, so Monitor/API calls name it
+        let (text, truncated) = answer_text("small", "mock-b", "Hi from macm4.", Some("macm4"));
+        assert!(!truncated);
+        assert_eq!(text, "Answer from the small expert (mock-b) (on worker macm4):\nHi from macm4.");
+        // a url-form expert keeps the plain form (no worker)
+        let (plain, _) = answer_text("small", "mock-b", "Hi", None);
+        assert_eq!(plain, "Answer from the small expert (mock-b):\nHi");
     }
 }

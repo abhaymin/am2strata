@@ -520,7 +520,10 @@ async fn main() -> Result<()> {
     let _ = mgr.web.set(Arc::new(web_tools::WebTools::from_config(&first.cfg.rest)));
     // the specialist models the main model consults (ask_expert); a bad entry is skipped with a warning above. Our own listen
     // address lets call() refuse an expert whose url points back at us (it would wait for this chat's own GPU turn and hang).
-    let experts = crate::experts::Experts::from_config(&first.cfg.rest).with_self_addr(&host, port);
+    // The cluster lets a worker-form expert reach its paired worker over that worker's pinned mutual-TLS client at call time.
+    let experts = crate::experts::Experts::from_config(&first.cfg.rest)
+        .with_self_addr(&host, port)
+        .with_cluster(cluster.clone());
     if !experts.is_empty() {
         tracing::info!("ask_expert: {} expert(s) configured", experts.len());
     }
