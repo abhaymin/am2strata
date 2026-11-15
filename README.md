@@ -246,6 +246,9 @@ MiniCPM-V and the others) over their line protocol.
 | Live channel `/v1/live` (pushes, requests over the socket, cancel) | done; the web app's chat streams over it (HTTP when not connected) | integration tests over ws and wss; live |
 | Installers and downloads for six platforms; `am2strata-run doctor` | done | built, installed, run and removed on GitHub's runners for each platform |
 | Regression suite (route contracts, response shapes, bug classes) and `am2strata-run regression` | done | CI; 20 of 20 checks against the live server |
+| Browser use for every client: forms, scraping into datasets, maps, site checks and tests; targets server, own Chrome, sandbox VM; Browser tab, CLI, `/v1/mcp/browser` ([docs/BROWSER-USE.md](docs/BROWSER-USE.md)) | done (after v0.1.8) | live tests on a real Chrome in CI; used by am2Strata to publish its own videos |
+| Media: images, video (chained past one clip), speech, songs, productions, dubbing, checks ([docs/MEDIA.md](docs/MEDIA.md)) | done; video productions, MP3 and the video checks without ffmpeg are not ([GAPS-PLAN](docs/GAPS-PLAN.md)) | live on the RTX 5060 Ti |
+| Client profiles: a key picks the tools ([docs/CLIENTS.md](docs/CLIENTS.md)) | done; editing in Settings is not | integration tests |
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
 
 Live numbers on the RTX 5060 Ti 16 GB (warm, greedy, thinking off): Tiel Coder Q6 104-106 tok/s median through
