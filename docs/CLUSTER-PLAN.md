@@ -132,6 +132,83 @@ order of the work. Each step is measured on real machines before the next starts
    - MoE models (Tiel, Orca, the Qwen3 MoEs) can also split their experts: each node holds a share of the experts,
      and a token's router sends it to the nodes holding the experts it picked. This suits Strata's expert placement
      and is measured against plain layer splitting.
+   **Phase 2, revised: memory across machines (owner, 2026-11-15).** The owner's rule: the same logic as one
+   machine (the hottest experts in VRAM, the next in RAM, the rest read from the NVMe), with a new tier, **another
+   machine's memory, over the network**. It is live resource sharing, not a demo.
+
+   **Measured first (2026-11-15, the Linux PC and a Mac mini M4 worker):**
+
+   | | |
+   |---|---|
+   | Round trip on the LAN, direct (the PC on 2.5 GbE) | **0.33 ms** (0.24-0.43) |
+   | Round trip through Tailscale | ~1.7 ms, so the expert traffic uses the direct LAN address, still inside the pinned TLS |
+   | This PC's memory | 59 GB RAM + 2 x 16 GB VRAM |
+   | Models bigger than that, which read experts from the NVMe today | the 80 GB and 71 GB IQ3_XXS MoEs |
+   | The Mac's free memory for experts | about 11 of its 16 GB |
+
+   **Where a remote tier pays, and where it doesn't:**
+   - **It pays where an expert would otherwise come from the NVMe.** A remote expert costs one round trip (about
+     0.33 ms) plus the worker's compute. That is cheaper than reading the expert from the NVMe for each token.
+   - **It is slower for a model that fits.** For a model that already fits in this PC's VRAM and RAM (Tiel 35B, 37 GB),
+     every remote layer adds a round trip. So it is used only when an expert would otherwise be read from the NVMe.
+   - **The first target is the 80 GB MoE.** With the Mac's 11 GB beside this PC's ~75 GB usable, the whole model fits
+     in memory across the two machines.
+
+   **The steps** (each gated by measurement and by token-for-token parity, as every engine change is):
+   0. **Measure the rest:**
+      - the link's bandwidth;
+      - the Mac's expert compute for each weight format (IQ3_XXS, Q4_K, Q8_0), on its CPU and its GPU;
+      - for the 80 GB model on this PC: today's speed and the share of time spent waiting on the NVMe.
+
+      **Rule:** an expert goes remote only when the round trip plus the remote compute beats reading it from the
+      NVMe.
+   1. **An expert host on the worker** (Rust, `am2strata-hybrid --serve-experts`).
+      - The worker's am2Strata starts it when its master asks.
+      - The master sends each assigned expert's tensors once over the pinned-TLS channel. The worker keeps them in RAM,
+        cached on its disk by the model's hash.
+      - It answers batched requests: {layer, the tokens' hidden states, each token's experts and weights} → their
+        weighted sum.
+      - **Gate:** its answers equal the master's own computation of the same experts, within the engine parity
+        tolerance.
+   2. **Placement across tiers:**
+      - The master's engine fills VRAM → RAM → each worker's free memory (from its report) → NVMe, by the expert
+        profile.
+      - Remote memory takes the next-hottest experts after RAM, not the coldest, because it beats the NVMe.
+      - **Needs first:** the worker reporting its real free memory. macOS reads 0 today, and that fix is queued.
+   3. **The engine on the master:**
+      - Per layer, the routed experts held remotely go out as one request per worker, while the local experts compute.
+        Their result is added in.
+      - A prompt batch makes one round trip per layer for all its tokens.
+      - **Gates:** teacher-forced token-for-token parity with and without the remote tier; decode and prompt speed
+        against the NVMe baseline.
+   4. **Failure:** a worker that stops answering mid-answer has its experts read from the NVMe again. No wrong token,
+      and the answer goes on. Tested by killing the host while it streams.
+   5. **Shown and documented:**
+      - Settings › Cluster shows what each worker holds (for example "11 GB of experts for the 80 GB model on macm4").
+      - Monitor shows the remote share and its latency.
+      - docs/CLUSTER.md gets the setup.
+   6. **Then layer splitting** (whole layers on a worker) as a second mode, for models where it costs fewer round
+      trips. Then the same tier in the Rust engine on the master.
+
+   **Both sides know where every part of a model is (owner, 2026-11-15).**
+   - The master's engine and each worker share one placement map: for each model, which layers and experts sit in
+     which machine's VRAM, RAM or disk.
+   - A request is planned with that map, so the work for each part goes where that part already is, and nothing is
+     loaded twice.
+   - Each worker reports its map with its health every few seconds. The master's Settings › Cluster and Monitor show
+     it.
+
+   **Several brains: small models on the workers as experts (owner, 2026-11-15).**
+   - A worker also keeps one or more small models of its own: for example an 8B MoE with 1B active, a math model or a
+     coder.
+   - The main model consults them in the same turn through `ask_expert`, and they get the user's original request.
+   - **Cluster-aware experts:** an expert names a paired worker and its model (`{"name": "mac-small", "worker": "macm4",
+     "model": "..."}`), instead of a URL and a key.
+     - The call goes over the pinned-TLS cluster channel, with the key that pairing gave.
+     - The expert is offered only while that worker is ready.
+     - The choice of models follows the worker's measured speed. On the Mac: the GPU test decides whether its CPU or
+       its GPU runs them.
+
 5. **Long context across machines (phase 3).** The KV of each node's layers stays on that node (it comes free with
    phase 2). Sequence splitting (ring attention) for contexts beyond what layer splitting gives is kept for later,
    measured first.
