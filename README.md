@@ -346,6 +346,12 @@ am2Strata includes and derives from code of [Strata](https://github.com/Niko1221
 contributors): parts of the server, the tools and the web app, and the C++/CUDA engines, which are built from
 PolyStrata's source. Their licence text is in [web/LICENSE-PolyStrata.txt](web/LICENSE-PolyStrata.txt).
 
+Thanks to [Unsloth](https://github.com/unslothai/unsloth) (Apache-2.0) for showing how one command can set up many
+coding agents on one local server: `unsloth start` with its many agent and model options is the model for
+`am2strata-run agent` / `agentrun` and Settings › Connect (written from scratch here; no Unsloth code is used).
+am2Strata also works as an endpoint for Unsloth Studio and `unsloth start`, and the Workshop merges Unsloth's LoRA
+adapters and writes training data in the `messages` format Unsloth reads.
+
 The other third-party work that am2Strata bundles, links or ports (Mermaid, the Outfit font, mold, the ggml
 quantizers, ACE-Step, Chatterbox, Parler-TTS and more) is listed with its licences in [NOTICE](NOTICE).
 

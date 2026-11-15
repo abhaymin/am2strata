@@ -36,6 +36,13 @@ It also carries, ported to Rust (crates/strata-media/src/acestep, parler_hf.rs):
   AI4Bharat) into candle's Parler model; their weights and Flan-T5's tokenizer (Apache-2.0, Google) are downloaded on
   request.
 
+The coding-agent setup (crates/am2strata/src/agents.rs: `am2strata-run agent` start/setup/reset and `agentrun`,
+Settings › Connect) is modelled on Unsloth's `unsloth start` (https://github.com/unslothai/unsloth, Apache-2.0,
+Copyright Unsloth AI): one command that runs any of several coding agents against a local server, set up for that run
+only, with options for the agent, the model and the server. It is written from scratch in Rust; no code of Unsloth is
+used. am2Strata answers the server checks the `unsloth` CLI makes (crates/am2strata/src/unsloth.rs), so Unsloth Studio
+and `unsloth start` can use it as their endpoint.
+
 The Workshop's trainer (crates/strata-workshop: model.rs, finetune.rs, profile.rs, soup.rs) is modelled on Soup
 (https://github.com/MakazhanAlpamys/Soup, Apache-2.0, Copyright 2026 Makazhan Alpamys): Soup is the reference for the
 `soup.yaml` config format the trainer imports and for the idea of `profile` (estimate memory and time before training),
