@@ -9,7 +9,10 @@ mod common;
 use common::regress::*;
 use common::*;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::Duration;
+use strata_engine::{Engine, GenEvent, RunConfig};
+use strata_protocol::Sampling;
 
 fn get(s: &Server, path: &str, key: Option<&str>) -> Answer {
     Req::new("GET", &s.base, path).key(key).send()
@@ -744,10 +747,129 @@ fn the_fixture_gates_and_unit_regressions_still_exist() {
                                                "fn regress_pr18_an_oversized_resize_or_rectangle_stops_the_reader"][..]),
         // PR #19: a key is told once and only its hash is kept
         ("am2strata/src/api_keys.rs", &["fn a_key_is_told_once_and_only_its_hash_is_kept"][..]),
+        // Mac findings item 2 (GPU put nothing on the device -> CPU run) and item 3 (no engine here -> config unavailable)
+        ("strata-hybrid/src/gpu.rs", &["fn nothing_placed_on_any_device_is_a_cpu_run"][..]),
+        ("strata-hub/src/config.rs", &["fn no_engine_reports_the_reason_when_none_is_here",
+                                       "fn write_marks_a_config_unavailable_when_no_engine_is_here"][..]),
     ] {
         let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         for t in tests {
             assert!(text.contains(t), "{file} no longer has `{t}`: a regression gate was removed or renamed (update this list if it moved)");
         }
     }
+}
+
+// =====================================================================================================================
+// Mac findings, items 2 and 3
+
+/// Item 2 (the engine stall watchdog): an engine that answers a request by producing neither a token nor progress for
+/// `engine_stall_s` seconds is ended with a clear error that names it and the stall — so a stuck model never keeps a
+/// chat on life support. Built against the mock engine, whose script (`stall: true`) writes nothing after `GEN`. The
+/// watchdog window is set to 2 s through the config's "engine_stall_s", read by the engine (not by env), and the mock's
+/// script reaches it through the config's "env" (Engine::start applies cfg.env) — so this test never calls set_var.
+#[test]
+fn engine_ended_with_a_stall_error_it_makes_no_progress() {
+    stall_case("stall", r#"{"stall": true}"#);
+}
+
+/// The same, for an engine that keeps sending lines that are not progress (INFO every 50 ms, faster than the watchdog's
+/// 200 ms wait floor): the deadline must still fire (review of PR #62).
+#[test]
+fn an_engine_that_only_chatters_is_still_ended_as_stalled() {
+    stall_case("chatter", r#"{"stall": true, "chatter": true}"#);
+}
+
+fn stall_case(name: &str, script: &str) {
+    let dir = TempDir::new(name);
+    std::fs::write(dir.0.join("script.json"), script).unwrap();
+    let exe = env!("CARGO_BIN_EXE_strata-mock-engine");
+    let mut cfg = RunConfig {
+        exe: exe.into(), args: ["--serve".into(), "--model".into(), dir.0.join("m.gguf").to_string_lossy().into()].to_vec(),
+        cwd: Some(dir.0.clone()), tokenizer: dir.0.join("tokenizer"), model_name: "mock-stall".into(), display_name: None,
+        log: Some(dir.0.join("stall.log")), lib_dirs: Vec::new(), env: Default::default(), gpu: None, port: None, host: None,
+        api_key: None, fit_max_tokens: false, vision: None, arch: None, engine_available: Some(true),
+        engine_unavailable_reason: None, rest: BTreeMap::new(),
+    };
+    cfg.env.insert("MOCK_SCRIPT".into(), dir.0.join("script.json").to_string_lossy().into_owned());
+    cfg.rest.insert("engine_stall_s".into(), json!(2));
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let engine = rt.block_on(Engine::start(&cfg, Duration::from_secs(30))).expect("the mock became READY");
+    assert_eq!(engine.engine_label, "mock-stall", "the watchdog names the model/engine that stalled");
+    let mut rx = rt.block_on(async { engine.generate(64, Sampling { temperature: Some(0.0), ..Default::default() }, None, vec![1, 2, 3], None).await });
+    // no token, no progress ever arrives: the watchdog ends it with a stall error (never GenEvent::Token / Done). The test is
+    // not `async`, so this recv runs on the block_on runtime above; the read resolves to Result<GenEvent, Error>.
+    let ev = rt.block_on(async { tokio::time::timeout(Duration::from_secs(10), rx.recv()).await }).expect("the stall error arrives");
+    match ev {
+        None => panic!("a stalled engine produced no token and no progress — it should have been ended, not answered"),
+        Some(r) => match r {
+            Ok(GenEvent::Done(_)) | Ok(GenEvent::Progress { .. }) | Ok(GenEvent::Token(_)) =>
+                panic!("a stalled engine produced no token and no progress — it should have been ended, not answered"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("mock-stall"), "the error names the engine: {msg}");
+                assert!(msg.to_ascii_lowercase().contains("stall"), "the error says it stalled: {msg}");
+            }
+        }
+    }
+    drop(engine); // kills the stalled mock; kill_on_drop reaps it
+}
+
+/// Item 3 (findings item 3): a run config `pull` wrote because no engine runs this architecture here is listed — marked
+/// unavailable with its reason — never silently dropped so the server later fails "no installed model". And the running
+/// server notices one added while it was up, without a restart: /api/models re-scans the models dir on every call.
+#[test]
+fn an_unavailable_pulled_model_is_listed_with_its_reason_and_seen_without_a_restart() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+
+    // a config `pull` marked unavailable: its exe (strata-poly) is not here, yet engine_available:false keeps it listed.
+    let why = "lfm2moe has no engine on this Mac yet";
+    let cfg = json!({
+        "exe": "/opt/no-strata-poly/strata-poly", "args": [json!("--model"), json!(s.dir.join("lfm.gguf"))],
+        "cwd": s.dir, "tokenizer": s.dir.join("tokenizer"), "model_name": "lfm2moe-q4", "display_name": "LFM2 Q4",
+        "log": s.dir.join("l.log"), "host": "127.0.0.1", "gpu": null, "port": null,
+        "engine_available": false, "engine_unavailable_reason": why,
+    });
+    std::fs::write(s.dir.join("strata-lfm2moe-q4.json"), serde_json::to_string(&cfg).unwrap()).unwrap();
+
+    // listed with its reason as the problem — not dropped, so no later "no installed model"
+    let (_, list) = s.get("/api/models", true);
+    let models = list["models"].as_array().expect("models");
+    let lfm = models.iter().find(|m| m["id"] == "lfm2moe-q4").expect("the unavailable model is listed, not filtered out");
+    assert_eq!(lfm["engine_available"], json!(false), "listed as unavailable");
+    assert_eq!(lfm["problem"], json!(why), "the reason shows as the problem");
+
+    // add ANOTHER one while running: /api/models rescans, so it appears without a restart.
+    let cfg2 = json!({
+        "exe": "/opt/no-strata-poly/strata-poly", "args": [json!("--model"), json!(s.dir.join("m.gguf"))],
+        "cwd": s.dir, "tokenizer": s.dir.join("tokenizer2"), "model_name": "gemma4-x", "display_name": "Gemma4 X",
+        "log": s.dir.join("l2.log"), "host": "127.0.0.1", "gpu": null, "port": null,
+        "engine_available": false, "engine_unavailable_reason": "gemma4 has no engine on this machine yet",
+    });
+    std::fs::write(s.dir.join("strata-gemma4-x.json"), serde_json::to_string(&cfg2).unwrap()).unwrap();
+    let (_, list2) = s.get("/api/models", true);
+    let models2 = list2["models"].as_array().expect("models");
+    assert!(models2.iter().any(|m| m["id"] == "gemma4-x"),
+            "a config added while running shows on /api/models without a restart");
+
+    // loading one is refused with its reason (it has no engine here), never started
+    let (c, r) = s.post("/api/models/load", &json!({"model": "lfm2moe-q4"}));
+    assert_ne!(c, 200, "an unavailable model is not loaded: {r}");
+    assert!(r.to_string().contains(why), "the refusal gives the reason: {r}");
+
+    // and after a restart it is never the default, though "aaa-…" sorts before every other model (on the Mac, LFM2
+    // sorted before Ministral): the default is the first model this machine can run
+    let cfg3 = json!({
+        "exe": "/opt/no-strata-poly/strata-poly", "args": [json!("--model"), json!(s.dir.join("a.gguf"))],
+        "cwd": s.dir, "tokenizer": s.dir.join("tokenizer3"), "model_name": "aaa-first-unavailable", "display_name": "AAA",
+        "log": s.dir.join("l3.log"), "host": "127.0.0.1", "gpu": null, "port": null,
+        "engine_available": false, "engine_unavailable_reason": "no engine here",
+    });
+    std::fs::write(s.dir.join("strata-aaa-first-unavailable.json"), serde_json::to_string(&cfg3).unwrap()).unwrap();
+    let mut s = s;
+    s.restart();
+    let (_, list3) = s.get("/api/models", true);
+    let def = list3["models"].as_array().unwrap().iter().find(|m| m["default"] == json!(true)).cloned().unwrap_or_default();
+    assert_ne!(def["id"], json!("aaa-first-unavailable"), "an unavailable model is never the default: {list3}");
+    assert_eq!(def["engine_available"], json!(true), "the default is one this machine can run: {def}");
 }

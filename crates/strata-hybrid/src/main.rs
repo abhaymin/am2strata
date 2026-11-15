@@ -150,8 +150,17 @@ fn main() {
     #[cfg(feature = "gpu")]
     if let Some(spec) = arg("--devices") {
         let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
-        let summary = gpu::place(&mut m, &devs, profile.as_ref()).unwrap_or_else(|e| fail(e));
+        let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref()).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} {summary}");
+        // findings item 2: --devices asked the GPU to take weights but nothing landed on it (the device opened and its
+        // self-check passed, yet no matrix fit or a kernel was absent). A chat then only keep-alives for minutes. So
+        // when nothing went on any requested device, fall back to the CPU and say so in the log line the server reads.
+        if gpu::nothing_placed(dense_on_device, experts_on_device) {
+            eprintln!("no matrices were placed on any requested device ({summary}); running the model on the CPU");
+            placement = format!("{placement} ran_on_cpu");
+        } else if dense_on_device == 0 {
+            eprintln!("no dense or attention matrix went on a device ({summary}); those compute on the CPU, experts where placed stayed on device");
+        }
     }
     #[cfg(not(feature = "gpu"))]
     if arg("--devices").is_some() {

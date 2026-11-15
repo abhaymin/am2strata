@@ -400,7 +400,12 @@ async fn main() -> Result<()> {
                 _ => hits.iter().find(|e| e.id == *m).map(|e| e.id.clone()).with_context(|| format!("{m:?} matches several models"))?,
             }
         }
-        None => models[0].id.clone(),
+        // the first model this machine can run (a config `pull` marked unavailable sorts in the list but never starts)
+        None => match models.iter().find(|e| manager::runnable(e).is_ok()) {
+            Some(e) => e.id.clone(),
+            None => bail!("no model in {} can run on this machine: {}", dir.display(),
+                models.iter().map(|e| manager::runnable(e).unwrap_err().to_string()).collect::<Vec<_>>().join("; ")),
+        },
     };
     let first = models.iter().find(|e| e.id == default).cloned().expect("default exists");
     if args.check {

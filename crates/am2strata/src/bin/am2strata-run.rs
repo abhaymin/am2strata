@@ -876,7 +876,14 @@ async fn pull_async(p: PullArgs) -> Result<(), String> {
     match strata_hub::pull::run(&spec, &mut on).await? {
         Outcome::Configured { id, config } => {
             say(format!("run config: {}", config.display()));
-            say(format!("ready: load it from the web app's model picker, or POST /api/models/load {{\"model\": \"{id}\"}}"));
+            // `pull` still downloads an architecture no engine here runs, and marks that config unavailable with the
+            // reason; say it plainly so the caller knows it must not be loaded until an engine is available.
+            match std::fs::read_to_string(&config).ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| v["engine_unavailable_reason"].as_str().map(str::to_owned)) {
+                Some(why) => say(format!("{why}")),
+                None => say(format!("ready: load it from the web app's model picker, or POST /api/models/load {{\"model\": \"{id}\"}}")),
+            }
         }
         Outcome::Downloaded { dir, why: Some(why) } => say(format!("downloaded, but no run config was written: {why}. The files stay in {}", dir.display())),
         Outcome::Downloaded { dir, why: None } => say(format!("downloaded to {}", dir.display())),
@@ -1964,13 +1971,26 @@ fn now_s() -> u64 {
 /// This PC's server from its run configs: the address (127.0.0.1 and the port) and the key.
 fn local_server(models_dir: &str) -> (String, Option<String>) {
     let dir = expand_path(Path::new(models_dir));
-    let mut configs: Vec<PathBuf> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("strata-") && n.ends_with(".json"))).collect();
-    configs.sort();
-    let cfg: serde_json::Value = configs.first().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let port = cfg["port"].as_u64().unwrap_or(8080);
-    (format!("http://127.0.0.1:{port}"), cfg["api_key"].as_str().filter(|k| !k.is_empty()).map(str::to_string))
+    // every run config the server scans here: an engine exe, or one `pull` marked unavailable (findings item 3). Sorted by
+    // model id so `.first()` is the default model the server loaded (`main.rs`: `models[0]`), not merely the first file on
+    // disk — the CLI was asking http://127.0.0.1:8080 after a port-less model was pulled first alphabetically (item 5).
+    let mut cfgs: Vec<strata_engine::RunConfig> = std::fs::read_dir(&dir).into_iter().flatten().flatten().map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("strata-") && n.ends_with(".json")))
+        .filter_map(|p| { let c = strata_engine::RunConfig::load(&p).ok()?;
+            if c.exe.exists() || c.exe.is_relative() || c.engine_available == Some(false) { Some(c) } else { None } }).collect();
+    cfgs.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+    // a config `pull` marked unavailable never runs, so it is never the server the CLI should dial
+    cfgs.retain(|c| c.engine_available != Some(false));
+    // dial the default model's port and key; a pulled/old config may name no port, so fall back to another that does, then
+    // to 8000 (the server itself defaults there), always dropping an empty key.
+    let pick = |c: &strata_engine::RunConfig| {
+        (format!("http://127.0.0.1:{}", c.port.unwrap_or(8000)), c.api_key.clone().filter(|k| !k.is_empty()))
+    };
+    if let Some(c) = cfgs.iter().find(|c| c.port.is_some() && c.api_key.as_deref().is_some()) { return pick(c); }
+    match cfgs.first() {
+        Some(c) => pick(c),
+        None => (format!("http://127.0.0.1:8000"), None),
+    }
 }
 
 /// The model the server has loaded (else its first), as /api/models or /v1/models says.
@@ -2183,5 +2203,26 @@ mod agentrun_tests {
         let a = agentrun_args(v("-m x opencode -- run --model y")).unwrap();
         assert_eq!((a.agent.as_deref(), a.model.as_deref(), a.rest.clone()), (Some("opencode"), Some("x"), v("run --model y")));
         assert!(agentrun_args(v("--model")).is_err() && agentrun_args(Vec::new()).is_err());
+    }
+
+    /// Findings item 5: the CLI's local server is the port and key of the model the server actually runs (its first scan by
+    /// id), not the first config file on disk — so `am2strata tls status` asks the right host after a port-less model was
+    /// pulled first alphabetically. Uses relative exes so neither engine file needs to exist, never sets any env var.
+    #[test]
+    fn the_local_server_uses_the_default_model_port_not_the_first_file() {
+        let dir = std::env::temp_dir().join(format!("am2-local-svc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // "lfm2moe" sorts before "ministral", has a key but no port; "ministral" is the server's default and names the port.
+        let no_port = serde_json::json!({ "exe": "strata-poly", "cwd": &dir, "tokenizer": dir.join("tok"),
+            "model_name": "lfm2moe-q4", "api_key": "key-lfm2" });
+        let with_port = serde_json::json!({ "exe": "strata-hybrid", "cwd": &dir, "tokenizer": dir.join("tok"),
+            "model_name": "ministral-3b", "port": 8000, "api_key": "key-ministral" });
+        std::fs::write(dir.join("strata-lfm2moe-q4.json"), serde_json::to_string(&no_port).unwrap()).unwrap();
+        std::fs::write(dir.join("strata-ministral-3b.json"), serde_json::to_string(&with_port).unwrap()).unwrap();
+        let (url, key) = local_server(dir.to_str().unwrap());
+        assert_eq!(url, "http://127.0.0.1:8000", "it dials the default model's port, not the port-less first file's 8080");
+        assert_eq!(key.as_deref(), Some("key-ministral"), "and the default model's key");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

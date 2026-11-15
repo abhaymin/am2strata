@@ -189,6 +189,16 @@ pub const VIDEO_JOB_GB: f64 = 24.0;
 const WARM_EVERY: Duration = Duration::from_secs(600);
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
+/// A model `pull` marked unavailable (no engine on this machine) is listed but never started: loading it is refused with
+/// the reason, instead of starting an engine that does not exist.
+pub fn runnable(e: &ModelEntry) -> Result<()> {
+    if e.cfg.engine_available == Some(false) {
+        return Err(anyhow!("{} cannot run on this machine: {}", e.id,
+            e.cfg.engine_unavailable_reason.as_deref().unwrap_or("no engine runs this model here")));
+    }
+    Ok(())
+}
+
 pub fn scan(dir: &Path) -> Vec<ModelEntry> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
@@ -199,7 +209,10 @@ pub fn scan(dir: &Path) -> Vec<ModelEntry> {
             continue;
         }
         match RunConfig::load(&p) {
-            Ok(cfg) if cfg.exe.exists() || cfg.exe.is_relative() => out.push(ModelEntry { id: cfg.model_name.clone(), path: p, cfg }),
+            // a config `pull` marked unavailable (no engine on this machine) is listed even though its exe is missing, so
+            // the server shows it as unavailable with a reason instead of failing at load "no installed model" (item 3)
+            Ok(cfg) if cfg.exe.exists() || cfg.exe.is_relative() || cfg.engine_available == Some(false) =>
+                out.push(ModelEntry { id: cfg.model_name.clone(), path: p, cfg }),
             Ok(_) | Err(_) => tracing::debug!(path = %p.display(), "not a usable run config"),
         }
     }
@@ -581,6 +594,7 @@ impl Manager {
     /// Loads a model (a switch from the web app or the API): in its place in the queue, after the jobs before it.
     pub async fn load(&self, id: &str) -> Result<Arc<Loaded>> {
         let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
                 return Ok(l);
@@ -594,6 +608,7 @@ impl Manager {
     /// Loads `id` (stopping the model in memory first) for the job that holds the turn.
     pub async fn load_locked(&self, id: &str) -> Result<Arc<Loaded>> {
         let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
                 self.queue.set_resident(crate::queue::Resident::Text(entry.id.clone()));
@@ -646,6 +661,7 @@ impl Manager {
     pub async fn trial(&self, id: &str, args: Vec<String>, prompts: &[(String, u32)])
                        -> Result<Vec<(Vec<u32>, strata_protocol::Done)>> {
         let mut entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         entry.cfg.args = args;
         if let Some(l) = self.current.write().await.take() {
             self.snapshots.save(&l, "before the optimizer").await;
@@ -694,7 +710,12 @@ impl Manager {
                     "default": m.id == self.default_id,
                     "status": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "available" },
                     "tuned": crate::optimizer::view(&m.path),
-                    "problem": Value::Null,
+                    // a config `pull` marked unavailable shows its reason here (findings item 3); an empty model list is
+                    // not one the server missed, so it stays null and this stays distinguishable from a real problem
+                    "engine_available": m.cfg.engine_available.unwrap_or(true),
+                    "problem": if m.cfg.engine_available == Some(false) {
+                        json!(m.cfg.engine_unavailable_reason.clone().unwrap_or_else(|| "no engine runs this model on this machine".into()))
+                    } else { Value::Null },
                 })
             })
             .collect();
