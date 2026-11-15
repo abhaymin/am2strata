@@ -8,6 +8,7 @@
 //! in RAM with the rest left to the SSD. The GPU tier (dense weights and hot experts in VRAM) comes next.
 
 mod cpu_dot;
+mod cpu_q8;
 mod model;
 #[cfg(feature = "gpu")]
 mod gpu;

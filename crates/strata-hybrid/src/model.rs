@@ -52,6 +52,7 @@ impl QMat {
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) {
         debug_assert_eq!(x.len(), self.cols);
         debug_assert_eq!(y.len(), self.rows);
+        let x_in = x;
         let xq = self.vdt.round_trip(x);
         #[cfg(feature = "gpu")]
         if let Some(g) = &self.gpu {
@@ -61,6 +62,18 @@ impl QMat {
         }
         let x = &xq[..];
         let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
+        // Q4_K / Q6_K with Q8_K activations: integer products (cpu_q8.rs), the same values as the f32 path below
+        if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty).filter(|f| crate::cpu_q8::handles(*f) && self.vdt == Vdt::Q8K) {
+            if let Some(xq8) = crate::cpu_q8::Q8K::quantize(&x_in) {
+                y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
+                    for (k, out) in ys.iter_mut().enumerate() {
+                        let r = ci * chunk + k;
+                        *out = crate::cpu_q8::row_dot(fast, &self.data[r * self.row_bytes..(r + 1) * self.row_bytes], &xq8);
+                    }
+                });
+                return;
+            }
+        }
         // the common encodings: multiplied as they are read (cpu_dot.rs)
         if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) {
             y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
