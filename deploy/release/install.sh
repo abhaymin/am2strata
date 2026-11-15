@@ -139,8 +139,16 @@ EOF
             fi ;;
         macos-*)
             mkdir -p "$HOME/Library/LaunchAgents"
-            plist="$HOME/Library/LaunchAgents/$AGENT.plist"
-            cat > "$plist" <<EOF
+             plist="$HOME/Library/LaunchAgents/$AGENT.plist"
+             # give the service Homebrew's folders (and the usual system ones) on its PATH: a launchd agent's PATH has
+             # neither /opt/homebrew/bin nor the Tailscale app, so `tailscale` and Homebrew tools would be missing. Keep a
+             # path the user added by editing the plist — a reinstall overwrites only when there is none to keep.
+             SERVICE_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+             if [ -f "$plist" ]; then
+                 OLDPATH=$(sed -n 's#.*<key>PATH</key><string>\(.*\)</string></dict>#\1#p' "$plist" 2>/dev/null | head -n 1)
+                 [ -n "$OLDPATH" ] && SERVICE_PATH=$OLDPATH
+             fi
+             cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- $MARK -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -148,7 +156,7 @@ EOF
 <dict>
     <key>Label</key><string>$AGENT</string>
     <key>ProgramArguments</key><array><string>$BIN/am2strata</string><string>serve</string></array>
-    <key>EnvironmentVariables</key><dict><key>AM2STRATA_DATA</key><string>$DIR</string></dict>
+    <key>EnvironmentVariables</key><dict><key>AM2STRATA_DATA</key><string>$DIR</string><key>PATH</key><string>$SERVICE_PATH</string></dict>
     <key>RunAtLoad</key><true/>
     <key>StandardOutPath</key><string>$DIR/service.log</string>
     <key>StandardErrorPath</key><string>$DIR/service.log</string>

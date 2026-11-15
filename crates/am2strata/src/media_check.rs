@@ -335,7 +335,8 @@ pub fn rate_from_r_frame_rate(s: &str) -> Option<f64> {
 
 /// Decode a video's frames to 160x90 grey raw bytes with ffmpeg; returns the frames and their fps.
 pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<Vec<u8>>, f64), String> {
-    if !crate::media::ffmpeg_available() { return Err("this server cannot read video: install ffmpeg (sudo apt install ffmpeg)".into()); }
+    if !crate::media::ffmpeg_available() { return Err(format!("this server cannot read video: install ffmpeg ({})",
+        crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")).into()); }
     let dir = std::env::temp_dir().join(format!("strata-check-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{e:#}"))?;
     let in_file = dir.join("in.video");

@@ -677,7 +677,13 @@ fn the_fixture_gates_and_unit_regressions_still_exist() {
                                               "fn an_overlap_as_long_as_a_chunk_still_finishes"][..]),
         // commit dae5323: computer.max_steps clamped, not truncated; PR #12: the plain-HTTP policy and HSTS values
         ("am2strata/src/computer/settings.rs", &["fn max_steps_is_clamped_not_truncated"][..]),
-        ("am2strata/src/server_tls.rs", &["fn plain_http_policy", "fn hsts_value"][..]),
+        ("am2strata/src/server_tls.rs", &["fn plain_http_policy", "fn hsts_value",
+            "fn tailscale_prefers_path_before_the_macos_homes", "fn lan_addresses_include_a_non_loopback_when_one_exists",
+            "fn plain_http_redirect_names_the_certificate_host_when_it_is_not_the_request_host"][..]),
+        // item: cross-platform memory (total_mib/available_mib and the /proc/meminfo parser), and the install hint for
+        // every OS (tested on Linux)
+        ("am2strata/src/mem.rs", &["fn total_is_positive_and_available_le_total", "fn meminfo_parses_a_fixed_string"][..]),
+        ("am2strata/src/doctor.rs", &["fn install_hint_is_one_sentence_per_os_tested_on_linux"][..]),
         // PR #16: upload names
         ("am2strata/src/workshop.rs", &["fn upload_names_are_made_safe"][..]),
         // PR #18 (commit 9812a60): the VM's RFB client refuses an oversized screen, at the handshake and at a resize

@@ -52,6 +52,10 @@ case "$LABEL" in
 esac
 [ -f "$SVC" ] || die "--service wrote no $SVC"
 grep -q "$BIN/am2strata" "$SVC" || die "the service does not start $BIN/am2strata"
+# item 6: a macOS launchd agent must get Homebrew on its PATH, so tailscale/ffmpeg renew under the service (CI runs this)
+case "$LABEL" in
+    macos-*) grep -q '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin' "$SVC" || die "the launchd plist has no Homebrew PATH; daily tailscale renewal and homebrew tools would be missing" ;;
+esac
 sh "$INSTALL" --from "$DIST" --no-browser --no-service
 [ ! -e "$SVC" ] || die "--no-service left $SVC"
 [ "$(cat "$DIR/data/settings-kept.txt")" = kept ] || die "an update lost the data"

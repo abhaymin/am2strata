@@ -183,6 +183,19 @@ pub fn install_command(manager: &str, pkgs: &[&str]) -> Option<String> {
     })
 }
 
+/// How to add one tool on the target OS, as a ready-to-type sentence: "sudo apt install ffmpeg" / "brew install ffmpeg"
+/// / "winget install Gyan.FFmpeg". `os` is `std::env::consts::OS`; a Linux-only tool (bubblewrap) passes "" for brew and
+/// winget, which makes the macOS and Windows words say it is not here. The names come from the Need entries above, so
+/// there is one copy of each package's per-OS name.
+pub fn install_hint(os: &str, pkg_linux: &str, pkg_brew: &str, pkg_winget: &str) -> String {
+    match os {
+        "linux" => format!("sudo apt install {pkg_linux}"),
+        "macos" if !pkg_brew.is_empty() => format!("brew install {pkg_brew}"),
+        "windows" if !pkg_winget.is_empty() => format!("winget install {pkg_winget}"),
+        _ => "not available on this OS (Linux only)".to_string(),
+    }
+}
+
 /// The report as text.
 pub fn render(host: &Host, features: &[Feature], version: &str) -> String {
     let mut s = format!("am2Strata {version} on {} {}\n\n", host.os, host.arch);
@@ -367,5 +380,20 @@ mod tests {
         assert_eq!(install_command("pacman", &["poppler"]).unwrap(), "sudo pacman -S --needed --noconfirm poppler");
         assert_eq!(install_command("winget", &["Gyan.FFmpeg"]).unwrap(), "winget install -e --id Gyan.FFmpeg");
         assert!(install_command("apt", &[]).is_none() && install_command("", &["x"]).is_none());
+    }
+
+    #[test]
+    fn install_hint_is_one_sentence_per_os_tested_on_linux() {
+        // ffmpeg: the same tool, one command per system (all three run here on Linux)
+        assert_eq!(install_hint("linux", "ffmpeg", "ffmpeg", "Gyan.FFmpeg"), "sudo apt install ffmpeg");
+        assert_eq!(install_hint("macos", "ffmpeg", "ffmpeg", "Gyan.FFmpeg"), "brew install ffmpeg");
+        assert_eq!(install_hint("windows", "ffmpeg", "ffmpeg", "Gyan.FFmpeg"), "winget install Gyan.FFmpeg");
+        // poppler: the package name itself differs per OS
+        assert_eq!(install_hint("linux", "poppler-utils", "poppler", "oschwartz10612.Poppler"), "sudo apt install poppler-utils");
+        assert_eq!(install_hint("macos", "poppler-utils", "poppler", "oschwartz10612.Poppler"), "brew install poppler");
+        assert_eq!(install_hint("windows", "poppler-utils", "poppler", "oschwartz10612.Poppler"), "winget install oschwartz10612.Poppler");
+        // bubblewrap is Linux-only: empty brew and winget say it is not here on the others
+        assert_eq!(install_hint("macos", "bubblewrap", "", ""), "not available on this OS (Linux only)");
+        assert_eq!(install_hint("windows", "bubblewrap", "", ""), "not available on this OS (Linux only)");
     }
 }

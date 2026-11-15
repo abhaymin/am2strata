@@ -830,12 +830,12 @@ mod sampler {
         Some((v.iter().take(8).sum::<u64>() - idle, idle))
     }
 
-    /// (used, total) bytes of RAM, as psutil counts them (total - available).
+    /// (used, total) bytes of RAM, as psutil counts them (total - available). From mem.rs on every OS.
     fn ram() -> Option<(u64, u64)> {
-        let info = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kb = |k: &str| info.lines().find(|l| l.starts_with(k))?.split_whitespace().nth(1)?.parse::<u64>().ok();
-        let (total, avail) = (kb("MemTotal:")?, kb("MemAvailable:")?);
-        Some(((total - avail) * 1024, total * 1024))
+        let total = crate::mem::total_mib();
+        if total == 0 { return None; }   // could not tell (was: /proc/meminfo missing off Linux)
+        let avail = crate::mem::available_mib();
+        Some((total.saturating_sub(avail) * 1_048_576, total * 1_048_576))
     }
 
     /// Sectors read and written by the whole disks (not their partitions).

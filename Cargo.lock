@@ -50,6 +50,7 @@ dependencies = [
  "ego-tree",
  "futures",
  "hyper-util",
+ "if-addrs",
  "image",
  "jsonschema",
  "libc",
@@ -81,6 +82,7 @@ dependencies = [
  "tungstenite 0.29.0",
  "uuid",
  "webpki-roots",
+ "windows-sys 0.61.2",
  "x11rb",
  "x509-parser",
 ]
