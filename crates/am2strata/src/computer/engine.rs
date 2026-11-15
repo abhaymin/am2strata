@@ -183,6 +183,35 @@ fn error_result(text: String, ms: u64) -> Value {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        // a job in the sandbox VM starts from a snapshot of its disk, so whatever the job breaks can be rolled back
+        // (Computer tab › Snapshots, `am2strata-run vm rollback <name>`); one per conversation
+        #[cfg(target_os = "linux")]
+        let snap_note = self.job_snapshot(conv).await;
+        #[cfg(not(target_os = "linux"))]
+        let snap_note: Option<String> = None;
+        let mut out = self.step_inner(conv, name, args, id, tx).await;
+        if let (Some(n), Some(t)) = (snap_note, out["text"].as_str().map(str::to_string)) {
+            out["text"] = json!(format!("{t}\n\n(Before this job the VM's disk was saved as snapshot {n}; the operator can roll back to it.)"));
+        }
+        out
+    }
+
+    /// The VM's snapshot for this conversation's job, taken the first time it acts in the VM (None after, or off the VM).
+    #[cfg(target_os = "linux")]
+    async fn job_snapshot(&self, conv: &str) -> Option<String> {
+        static DONE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+        let vm = self.vm()?;
+        if !DONE.get_or_init(Default::default).lock().unwrap().insert(conv.to_string()) { return None; }
+        let label = format!("job-{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                            conv.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<String>());
+        match tokio::task::spawn_blocking(move || vm.snapshot(&label)).await {
+            Ok(Ok(n)) => { tracing::info!(snapshot = %n, "computer use: the VM's disk saved before the job"); Some(n) }
+            Ok(Err(e)) => { tracing::warn!("computer use: no snapshot before the job: {e}"); None }
+            Err(_) => None,
+        }
+    }
+
+    async fn step_inner(&self, conv: &str, name: &str, args: &Value, id: &str, tx: &mpsc::Sender<RunEvent>) -> Value {
         // the sandbox VM's shell and installs: a separate machine where the agent is root, so they run without asking
         if name == "computer_shell" || name == "computer_install" || name == "computer_ads" {
             return self.vm_tool(name, args).await;

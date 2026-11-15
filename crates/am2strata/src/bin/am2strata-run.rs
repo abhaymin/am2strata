@@ -267,7 +267,8 @@ enum Cmd {
     /// the sandbox VM (a Debian virtual machine am2Strata runs; anything may be installed in it):
     /// status | start | stop | pause | shutdown | setup | download | reset --yes | apps | install <app> |
     /// install --kind apt|flatpak|deb|appimage <target> | remove … | open <app> | exec [--root] <command> |
-    /// settings key=value … | ads on|off [--lists pihole,adguard] [allowed.domain …]
+    /// settings key=value … | ads on|off [--lists pihole,adguard] [allowed.domain …] | snapshot [name] | snapshots |
+    /// rollback <name> --yes | delete-snapshot <name> (a job in the VM takes its own snapshot first)
     Vm {
         action: String,
         /// install/remove/open: a catalog app or the target; exec: the command; settings: key=value pairs
@@ -1313,6 +1314,29 @@ fn vm_cmd(action: &str, args: &[String], kind: Option<String>, root: bool, lists
     let joined = args.join(" ");
     let result = (|| -> Result<(), String> {
         match action {
+            "snapshot" => {
+                let mut body = serde_json::json!({"action": "snapshot"});
+                if let Some(n) = args.first() { body["name"] = serde_json::json!(n); }
+                let j = send(client.post(format!("{url}/api/vm")).json(&body))?;
+                println!("snapshot {}", j["snapshot"].as_str().unwrap_or("?"));
+                Ok(())
+            }
+            "snapshots" => {
+                let j = send(client.post(format!("{url}/api/vm")).json(&serde_json::json!({"action": "snapshots"})))?;
+                for s in j["snapshots"].as_array().into_iter().flatten() { println!("{:<40} {}", s["name"].as_str().unwrap_or(""), s["date"].as_str().unwrap_or("")); }
+                Ok(())
+            }
+            "delete-snapshot" => {
+                let name = args.first().ok_or("give the snapshot's name")?;
+                send(client.post(format!("{url}/api/vm")).json(&serde_json::json!({"action": "delete_snapshot", "name": name})))?;
+                println!("deleted {name}");
+                Ok(())
+            }
+            "rollback" => {
+                let name = args.first().ok_or("give the snapshot to roll back to (am2strata-run vm snapshots lists them)")?;
+                if !yes { return Err(format!("rolling back loses every change made in the VM since {name}: add --yes")); }
+                follow(send(client.post(format!("{url}/api/vm")).json(&serde_json::json!({"action": "rollback", "name": name, "confirm": true})))?)
+            }
             "status" => {
                 let j = send(client.get(format!("{url}/api/vm")))?;
                 println!("phase: {}", j["phase"].as_str().unwrap_or("?"));
