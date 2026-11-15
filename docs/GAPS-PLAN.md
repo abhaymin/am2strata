@@ -32,10 +32,10 @@ The rule since 2026-11-14 is that every big feature has both.
 
 | Feature | Web app | CLI | Missing |
 |---|---|---|---|
-| Dubbing (`/v1/media/dub`) | none | none | A Dub card in Media Generation; `am2strata-run media dub` |
-| Media check (`/v1/media/check`) | none | none | A Check card; `am2strata-run media check <file>` |
-| Productions (`/v1/media/productions`) | none | none | A Productions card with parts and progress; `am2strata-run media produce plan.json` |
-| Images, video, speech, songs | yes | only `media-pull` | `am2strata-run media image/video/speak/song` |
+| Dubbing (`/v1/media/dub`) | none | done | A Dub card in Media Generation; `am2strata-run media dub` |
+| Media check (`/v1/media/check`) | none | done | A Check card; `am2strata-run media check <file>` |
+| Productions (`/v1/media/productions`) | none | done | A Productions card with parts and progress; `am2strata-run media produce plan.json` |
+| Images, video, speech, songs | yes | done | `am2strata-run media image/video/speak/song` |
 | Clusters | Settings › Cluster | none | `am2strata-run cluster status/pair/join/forget` |
 | Optimizer (Tune) | Settings › Models | none | `am2strata-run tune <model>` |
 | Client profiles | read-only | none | Editing (A8); `am2strata-run clients` |

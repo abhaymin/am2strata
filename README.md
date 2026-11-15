@@ -179,6 +179,8 @@ cargo build --release --manifest-path crates/strata-media/Cargo.toml --features 
 - `voice` names one of the built-in voices (laura, jon, lea, gary). Their clips are made once with Parler.
 - Clone only a voice whose speaker has agreed to it.
 
+- **From the command line,** `am2strata-run media` wraps these endpoints — `image/video/speak/song`, `dub/check/produce/job` (one example per action in [docs/MEDIA.md](docs/MEDIA.md)). It writes the file to `--out`, prints a transcript, and finds the server from `--url`/`AM2STRATA_URL` and the key from `--api-key`/`AM2STRATA_API_KEY`.
+
 ## Packing tools
 
 The model-preparation tools for the `strata` engine are in Rust too (crate `strata-pack`):
