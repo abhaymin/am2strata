@@ -840,4 +840,25 @@ fn an_unavailable_pulled_model_is_listed_with_its_reason_and_seen_without_a_rest
     let models2 = list2["models"].as_array().expect("models");
     assert!(models2.iter().any(|m| m["id"] == "gemma4-x"),
             "a config added while running shows on /api/models without a restart");
+
+    // loading one is refused with its reason (it has no engine here), never started
+    let (c, r) = s.post("/api/models/load", &json!({"model": "lfm2moe-q4"}));
+    assert_ne!(c, 200, "an unavailable model is not loaded: {r}");
+    assert!(r.to_string().contains(why), "the refusal gives the reason: {r}");
+
+    // and after a restart it is never the default, though "aaa-…" sorts before every other model (on the Mac, LFM2
+    // sorted before Ministral): the default is the first model this machine can run
+    let cfg3 = json!({
+        "exe": "/opt/no-strata-poly/strata-poly", "args": [json!("--model"), json!(s.dir.join("a.gguf"))],
+        "cwd": s.dir, "tokenizer": s.dir.join("tokenizer3"), "model_name": "aaa-first-unavailable", "display_name": "AAA",
+        "log": s.dir.join("l3.log"), "host": "127.0.0.1", "gpu": null, "port": null,
+        "engine_available": false, "engine_unavailable_reason": "no engine here",
+    });
+    std::fs::write(s.dir.join("strata-aaa-first-unavailable.json"), serde_json::to_string(&cfg3).unwrap()).unwrap();
+    let mut s = s;
+    s.restart();
+    let (_, list3) = s.get("/api/models", true);
+    let def = list3["models"].as_array().unwrap().iter().find(|m| m["default"] == json!(true)).cloned().unwrap_or_default();
+    assert_ne!(def["id"], json!("aaa-first-unavailable"), "an unavailable model is never the default: {list3}");
+    assert_eq!(def["engine_available"], json!(true), "the default is one this machine can run: {def}");
 }

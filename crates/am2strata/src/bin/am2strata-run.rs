@@ -1979,6 +1979,8 @@ fn local_server(models_dir: &str) -> (String, Option<String>) {
         .filter_map(|p| { let c = strata_engine::RunConfig::load(&p).ok()?;
             if c.exe.exists() || c.exe.is_relative() || c.engine_available == Some(false) { Some(c) } else { None } }).collect();
     cfgs.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+    // a config `pull` marked unavailable never runs, so it is never the server the CLI should dial
+    cfgs.retain(|c| c.engine_available != Some(false));
     // dial the default model's port and key; a pulled/old config may name no port, so fall back to another that does, then
     // to 8000 (the server itself defaults there), always dropping an empty key.
     let pick = |c: &strata_engine::RunConfig| {

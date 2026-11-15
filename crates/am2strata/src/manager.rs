@@ -189,6 +189,16 @@ pub const VIDEO_JOB_GB: f64 = 24.0;
 const WARM_EVERY: Duration = Duration::from_secs(600);
 
 /// Every run config in `dir` that names an engine (strata-*.json), sorted by id.
+/// A model `pull` marked unavailable (no engine on this machine) is listed but never started: loading it is refused with
+/// the reason, instead of starting an engine that does not exist.
+pub fn runnable(e: &ModelEntry) -> Result<()> {
+    if e.cfg.engine_available == Some(false) {
+        return Err(anyhow!("{} cannot run on this machine: {}", e.id,
+            e.cfg.engine_unavailable_reason.as_deref().unwrap_or("no engine runs this model here")));
+    }
+    Ok(())
+}
+
 pub fn scan(dir: &Path) -> Vec<ModelEntry> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out };
@@ -584,6 +594,7 @@ impl Manager {
     /// Loads a model (a switch from the web app or the API): in its place in the queue, after the jobs before it.
     pub async fn load(&self, id: &str) -> Result<Arc<Loaded>> {
         let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
                 return Ok(l);
@@ -597,6 +608,7 @@ impl Manager {
     /// Loads `id` (stopping the model in memory first) for the job that holds the turn.
     pub async fn load_locked(&self, id: &str) -> Result<Arc<Loaded>> {
         let entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         if let Some(l) = self.current().await {
             if l.entry.id == entry.id {
                 self.queue.set_resident(crate::queue::Resident::Text(entry.id.clone()));
@@ -649,6 +661,7 @@ impl Manager {
     pub async fn trial(&self, id: &str, args: Vec<String>, prompts: &[(String, u32)])
                        -> Result<Vec<(Vec<u32>, strata_protocol::Done)>> {
         let mut entry = self.entry(id).ok_or_else(|| anyhow!("no installed model is named {id:?}"))?;
+        runnable(&entry)?;
         entry.cfg.args = args;
         if let Some(l) = self.current.write().await.take() {
             self.snapshots.save(&l, "before the optimizer").await;
