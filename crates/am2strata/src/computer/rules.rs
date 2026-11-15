@@ -265,22 +265,37 @@ pub fn time_allowed(started_at: Instant, now: Instant, max_seconds: u64) -> bool
     now.duration_since(started_at) <= Duration::from_secs(max_seconds)
 }
 
-/// If this shell command is destructive to something on the owner's protected list (`computer.protect`) and names one of
-/// them, return that entry — so the VM's shell tool can refuse before running it (`engine.rs`), telling the model to work on a
-/// copy. A command is destructive when it has a word that removes or changes state (`rm`, `rmdir`, `mv`, `dd`, `mkfs`,
-/// `truncate`, `shred`, `chmod`, `chown`, `kill`, `pkill`, `killall`), an in-place edit (`sed -i`), a `>` output redirection,
-/// or a `docker` / `podman` / `systemctl` subcommand that stops or removes something; and only then when the text contains a
-/// non-empty protected entry. Empty list → None (nothing is protected by default).
+/// If this shell command is destructive to something on the owner's protected list (`computer.protect`), return what it hit —
+/// so the VM's shell tool can refuse before running it (`engine.rs`), telling the model to work on a copy. It hits when it
+/// names a protected entry directly (a verb's object or a `>` redirection target), or, only when the list is non-empty, when
+/// a destructive command selects in bulk (acting on everything: `docker stop $(docker ps -q)`, `rm -rf /srv/*`,
+/// `systemctl stop '*'`) and names none. Names the entry that is named; for a bulk selector reports the first listed protected
+/// entry with "(it acts on everything)". Empty/blank list protects nothing (`nothing_is_protected_by_default`), so even a plainly
+/// destructive command refuses to refuse.
 pub fn protected_hit(command: &str, protect: &[String]) -> Option<String> {
-    if is_destructive(command) && protect.iter().any(|e| !e.trim().is_empty() && command.contains(e.as_str())) {
-        protect.iter().find(|e| !e.trim().is_empty() && command.contains(e.as_str())).cloned()
-    } else {
-        None
+    let listed: Vec<&str> = protect.iter().filter(|e| !e.trim().is_empty()).map(|e| e.as_str()).collect();
+    if listed.is_empty() { return None; }
+
+    let destructive = has_destructive_verb(command);
+    // a destructive command that selects in bulk acts on more than the named entries — refuse and say so.
+    if destructive && selects_in_bulk(command) {
+        return Some(format!("{} (it acts on everything)", listed[0]));
     }
+
+    // otherwise refuse only when a specific protected entry is actually named, by path or as a redirection target.
+    for e in &listed {
+        if command.contains(e) && (destructive || any_redirection_writes(command, e)) {
+            return Some(e.to_string());
+        }
+    }
+    None
 }
 
-/// Whether `command` would change or remove something on disk / in a service (before we know what is protected).
-fn is_destructive(command: &str) -> bool {
+/// Whether `command` runs something that removes or changes state on purpose — a remove/overwrite verb (`rm`, `rmdir`, `mv`,
+/// `dd`, `mkfs`, `truncate`, `shred`, `chmod`, `chown`, `kill`, `pkill`, `killall`), an in-place edit (`sed -i`), or a
+/// `docker` / `podman` / `systemctl` subcommand that stops, removes, disables or prunes. Redirection and bulk selection are
+/// judged against the protected list separately (in `protected_hit`), not here.
+fn has_destructive_verb(command: &str) -> bool {
     let h = command.to_lowercase();
     let tokens: Vec<&str> = h.split_whitespace().collect();
     // removing / changing words, matched whole-word so "address" does not count as "dd".
@@ -293,10 +308,50 @@ fn is_destructive(command: &str) -> bool {
         if *tok == "sed" { saw_sed = true; }
         else if saw_sed && tok.starts_with('-') && tok[1..].contains('i') { return true; }
     }
-    // a `>` output redirection onto a file.
-    if h.contains('>') { return true; }
     follow_kill(&tokens, &["docker", "podman"], &["rm", "stop", "kill", "restart", "down", "prune"])
         || follow_kill(&tokens, &["systemctl"], &["stop", "restart", "disable", "mask"])
+}
+
+/// Whether `command` selects everything at runtime rather than one named thing, so (with a destructive verb above) it hits more
+/// than the protected entries: command substitution (`$(…)` or backticks), a glob (`*`/`?`), `docker compose down`, a prune/all
+/// flag (`-a` / `--all` / `prune`), or a `kill -1` / `kill -9 -1` (all processes). Only meaningful with `has_destructive_verb`.
+fn selects_in_bulk(command: &str) -> bool {
+    let h = command.to_lowercase();
+    if h.contains("$(") || h.contains('`') { return true; }   // expands to many things at runtime
+    if h.contains('*') || h.contains('?') { return true; }     // a glob matches every match, not one thing
+    let tokens: Vec<&str> = h.split_whitespace().collect();
+    if tokens.windows(2).any(|w| w[0] == "compose" && w[1] == "down") { return true; }  // docker compose down tears the stack
+    if tokens.iter().any(|t| *t == "-a" || *t == "--all" || *t == "prune") { return true; }
+    let mut saw_kill = false;
+    for t in &tokens {
+        if *t == "kill" || *t == "pkill" || *t == "killall" { saw_kill = true; continue; }
+        if saw_kill && *t == "-1" { return true; }  // kill -1 / kill -9 -1 → all processes
+    }
+    false
+}
+
+/// The filenames a `>`/`>>` redirection writes to (the word after the operator, or in a `>file` token), skipping a leading fd
+/// (`2>`) and fd-dups (`2>&1`, `&>/dev/null`) so error/output pipes don't read as writing to a protected path.
+fn redirect_targets(command: &str) -> Vec<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut targets = Vec::new();
+    for (i, &tok) in tokens.iter().enumerate() {
+        if tok == ">" || tok == ">>" {                 // a redirection onto the next word
+            if let Some(&next) = tokens.get(i + 1) { if !next.is_empty() { targets.push(next.to_string()); } }
+            continue;
+        }
+        let stripped = tok.trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches('&');  // drop the "2"/"&" in "2>", "&>"
+        if stripped.starts_with('>') {                  // a redirection stuck to its target: ">file", ">>/x", "2>&1"
+            let target = stripped.trim_start_matches('>');
+            if !target.is_empty() && !target.starts_with('&') { targets.push(target.to_string()); }  // not a fd-dup like ">&1"
+        }
+    }
+    targets
+}
+
+/// Whether any `>` redirection in `command` writes to a file whose path contains the protected entry `entry`.
+fn any_redirection_writes(command: &str, entry: &str) -> bool {
+    redirect_targets(command).iter().any(|t| t.contains(entry))
 }
 
 /// True when one of `bins` appears and, later in the command, one of `verbs` appears as a token (docker/podman/systemctl that
@@ -554,7 +609,36 @@ mod tests {
     fn other_destructive_forms_are_recognised() {
         for c in ["truncate -s 0 /data", "shred file", "chmod 777 /etc/x", "dd if=/dev/zero of=/data",
                   "mkfs.ext4 /dev/sdb1", "mv a b", "pkill node", "podman stop web"] {
-            assert!(is_destructive(c), "expected destructive: {c}");
+            assert!(has_destructive_verb(c), "expected destructive: {c}");
         }
+    }
+
+    #[test]
+    fn refuses_bulk_commands_that_act_on_everything() {
+        // the field-test hole: a command that selects in bulk names no protected entry, so it must still be refused.
+        let prod_db = vec!["prod-db".into()];
+        assert_eq!(protected_hit("docker stop $(docker ps -q)", &prod_db), Some("prod-db (it acts on everything)".to_string()));
+        assert_eq!(protected_hit("docker rm -f $(docker ps -aq)", &prod_db), Some("prod-db (it acts on everything)".to_string()));
+        assert_eq!(protected_hit("docker system prune -a", &prod_db), Some("prod-db (it acts on everything)".to_string()));
+        assert_eq!(protected_hit("docker compose down", &prod_db), Some("prod-db (it acts on everything)".to_string()));
+
+        let nginx = vec!["nginx-prod".into()];
+        assert_eq!(protected_hit("systemctl stop '*'", &nginx), Some("nginx-prod (it acts on everything)".to_string()));
+        assert_eq!(protected_hit("kill -9 -1", &nginx), Some("nginx-prod (it acts on everything)".to_string()));
+
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(protected_hit("rm -rf /srv/*", &srv), Some("/srv/prod (it acts on everything)".to_string()));
+
+        // but with nothing listed, a bulk command names no entry to refuse.
+        assert_eq!(protected_hit("docker stop $(docker ps -q)", &[]), None);
+    }
+
+    #[test]
+    fn redirection_is_refused_only_onto_a_protected_target() {
+        // the false refusal: `>` is only destructive when its target names a protected entry, not for any `>`.
+        let srv = vec!["/srv/prod".into()];
+        assert_eq!(protected_hit("cat /srv/prod/app.conf 2>/dev/null", &srv), None, "stderr to /dev/null is fine");
+        assert_eq!(protected_hit("ls /srv/prod > /tmp/list", &srv), None, "a redirect onto /tmp is fine");
+        assert_eq!(protected_hit("echo x >> /srv/prod/f", &srv), Some("/srv/prod".to_string()), ">> into a protected path is refused");
     }
 }
