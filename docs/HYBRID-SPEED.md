@@ -37,7 +37,7 @@ the one the one-token path computes:
 `AM2_PROMPT_BATCH=1` turns batching off, for comparison. Models whose layers aren't plain attention + dense
 feed-forward, and the `--graph` GPU path, still read token by token.
 
-| Machine | Prompt (256 tokens) | Prompt tok/s | Tokens |
+| Machine | How the 256-token prompt is read | Prompt tok/s | Tokens |
 |---|---|---|---|
 | Linux PC, 8 threads, **busy** (the live server's coding agent was running) | one token at a time | 3.78 | |
 | same, same minute | chunks of 32 | **11.21** (3.0x) | identical |

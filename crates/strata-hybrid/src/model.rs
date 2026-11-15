@@ -99,6 +99,9 @@ impl QMat {
     /// the same function of the same row and the same rounded input as `matvec`'s, so the values are identical.
     pub fn matmul(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
         let n = xs.len();
+        if n == 0 {
+            return Vec::new();
+        }
         #[cfg(feature = "gpu")]
         if self.gpu.is_some() {
             return xs.iter().map(|x| self.mul(x)).collect();
@@ -1591,6 +1594,7 @@ mod tests {
             for (t, x) in xs.iter().enumerate() {
                 assert_eq!(batched[t], q.mul(x), "{ty}: input {t}");
             }
+            assert!(q.matmul(&[]).is_empty(), "{ty}: an empty chunk is an empty answer");
         }
     }
 
