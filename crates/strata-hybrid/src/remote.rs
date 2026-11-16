@@ -350,6 +350,11 @@ pub struct Remote {
     uses: AtomicU64,
 }
 
+/// How long a master waits for a hello or compute reply before falling back to its own memory.
+const REPLY_WAIT: Duration = Duration::from_secs(20);
+/// How long a master waits while the host loads the experts it was assigned.
+const ASSIGN_WAIT: Duration = Duration::from_secs(30 * 60);
+
 /// A request sent and not yet answered (the master computes its own experts meanwhile).
 pub struct Pending {
     t0: Instant,
@@ -365,7 +370,7 @@ impl Remote {
             .with_client_auth_cert(me.chain(), me.private_key()).map_err(|e| e.to_string())?;
         let tcp = TcpStream::connect(addr).map_err(|e| format!("--remote-experts {addr}: {e}"))?;
         let _ = tcp.set_nodelay(true);
-        let _ = tcp.set_read_timeout(Some(Duration::from_secs(20)));
+        let _ = tcp.set_read_timeout(Some(REPLY_WAIT));
         let cc = rustls::ClientConnection::new(Arc::new(cfg), ServerName::try_from("am2strata-node").map_err(|e| e.to_string())?.to_owned())
             .map_err(|e| e.to_string())?;
         let mut s = rustls::StreamOwned::new(cc, tcp);
@@ -388,7 +393,12 @@ impl Remote {
         let s = guard.as_mut().ok_or("not connected")?;
         let list: Vec<[usize; 2]> = experts.iter().map(|&(l, e)| [l, e]).collect();
         write_frame(s, &json!({"op": "assign", "experts": list}), &[]).map_err(|e| e.to_string())?;
-        let (h, _) = read_frame(s).map_err(|e| e.to_string())?;
+        // The host copies everything it takes into its own memory before it answers: tens of GiB from its disk
+        // can take minutes, far past the 20 s that suits a compute reply. Wait as long as it needs, then go back.
+        let _ = s.sock.set_read_timeout(Some(ASSIGN_WAIT));
+        let reply = read_frame(s);
+        let _ = s.sock.set_read_timeout(Some(REPLY_WAIT));
+        let (h, _) = reply.map_err(|e| format!("assign: {e} (the host took longer than {} s to load its share)", ASSIGN_WAIT.as_secs()))?;
         if h["ok"] != true {
             return Err(h["error"].as_str().unwrap_or("assign refused").to_string());
         }
