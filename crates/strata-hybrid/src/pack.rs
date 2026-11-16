@@ -361,7 +361,7 @@ pub fn copy_resident(model: &mut Model, res: &Residency) -> u64 {
 
 /// A copy in memory of our own, 64-byte aligned like the GGUF's tensor data, kept for the life of the process: it is
 /// never freed (deliberately; the engine loads one model per process), so calling `copy_resident` again would leak.
-fn owned(b: &[u8]) -> &'static [u8] {
+pub(crate) fn owned(b: &[u8]) -> &'static [u8] {
     if b.is_empty() {
         return &[];
     }

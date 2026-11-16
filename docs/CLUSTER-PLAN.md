@@ -190,6 +190,14 @@ order of the work. Each step is measured on real machines before the next starts
    6. **Then layer splitting** (whole layers on a worker) as a second mode, for models where it costs fewer round
       trips. Then the same tier in the Rust engine on the master.
 
+   **Built in the Rust engine (2026-11-16, owner: "Mac and PC combo, Mac to Mac and PC to PC"):** steps 1, 3 and 4 and
+   the engine half of step 2 (`crates/strata-hybrid/src/remote.rs`). The tier works in any direction: whichever machine
+   runs the model is the master, so the 16 GB Mac running a 17.5 GB model can use the PC's RAM instead of its SSD. The
+   gate is stricter than planned: identical tokens, because the integer kernels give the same bits on every CPU and the
+   master adds each expert's output in routing order. Measured in docs/HYBRID-SPEED.md. **Still to build (stage B):**
+   the servers starting the host and the master's flags from the pairing data (node-tls.json, the pins already
+   swapped), the worker's report of the memory it lends, and Settings › Cluster and Monitor showing the placement.
+
    **Step 0, measured (2026-11-16): on this PC a remote expert tier would not pay today.**
    - Orca (the 80 GB IQ3_XXS MoE, the first target), loaded on the live server, same 2,174-token chat twice:
      - prompt 266 tok/s, generation 67 tok/s; then, with the prompt cached, generation 85 tok/s;

@@ -20,6 +20,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 rayon = "1"
 memmap2 = "0.9"
 libc = "0.2"
+# remote.rs: mutual TLS with the cluster's node certificates (the same rustls as the server), its pins and node-tls.json
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+sha2 = "0.10"
+base64 = "0.22"
+rcgen = "0.13"
 
 [[bin]]
 name = "am2strata-hybrid"
