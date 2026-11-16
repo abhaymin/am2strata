@@ -167,12 +167,19 @@ fn main() {
     if arg("--devices").is_some() {
         fail("--devices: this am2strata-hybrid was built without the gpu feature".into());
     }
-    // --graph: a whole token on the device (dense attention models whose matrices are all on one device)
+    // a whole token on the device (dense attention models whose matrices are all on one device): asked with --graph, and
+    // taken by itself whenever --devices placed such a model, because the matrix-by-matrix path syncs with the device
+    // after every product (about 6x slower on a Mac M4's Metal); --no-graph keeps that path
     #[cfg(feature = "gpu")]
     let graph = if args.iter().any(|a| a == "--graph") {
         let g = graph::Graph::new(&m, max_ctx).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} graph=1");
         Some(g)
+    } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") {
+        match graph::Graph::new(&m, max_ctx) {
+            Ok(g) => { placement = format!("{placement} graph=auto"); Some(g) }
+            Err(why) => { eprintln!("matrix by matrix on the device ({why})"); None }
+        }
     } else {
         None
     };
