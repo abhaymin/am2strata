@@ -481,11 +481,13 @@ enum Cmd {
         models_dir: String,
     },
     /// client profiles and their keys (Settings › Clients), from a terminal: list | new <name> [--tools a,b] [--expires 30d]
-    /// | revoke <id>. A key is shown once and kept nowhere.
+    /// | edit <id> [--name n] [--tools a,b] [--expires 30d|never] | revoke <id>. A key is shown once and kept nowhere.
     Clients {
         action: String,
         #[arg(last = true)]
         values: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         tools: Option<String>,
         #[arg(long)]
@@ -1066,8 +1068,8 @@ fn main() -> ExitCode {
             bin_ops::cluster_cmd(bin_ops::ClusterOpts { action, values, json }, url, api_key, &models_dir),
         Cmd::Tune { model, objective, json, url, api_key, models_dir } =>
             bin_ops::tune_cmd(bin_ops::TuneOpts { model, objective, json }, url, api_key, &models_dir),
-        Cmd::Clients { action, values, tools, expires, json, url, api_key, models_dir } =>
-            bin_ops::clients_cmd(bin_ops::ClientsOpts { action, values, tools, expires, json }, url, api_key, &models_dir),
+        Cmd::Clients { action, values, name, tools, expires, json, url, api_key, models_dir } =>
+            bin_ops::clients_cmd(bin_ops::ClientsOpts { action, values, name, tools, expires, json }, url, api_key, &models_dir),
         Cmd::Memory { action, values, query, json, url, api_key, models_dir } =>
             bin_ops::memory_cmd(bin_ops::MemoryOpts { action, values, query, json }, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),

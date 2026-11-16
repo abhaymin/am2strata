@@ -4,6 +4,10 @@
   const el = (id) => document.getElementById(id);
   let keys = [];
   let toolSets = [];
+  // set while editing a key so the same New-key form saves its changed fields: id, original record and label.
+  let editing = false;
+  let editingId = "";
+  let origKey = null;
 
   async function api(path, opts = {}) {
     const r = await fetch(path, {...opts, headers: headers(Boolean(opts.body))});
@@ -33,10 +37,12 @@
     else if (k.expires_at) facts.push(`${k.status === "expired" ? "expired" : "expires"} ${day(k.expires_at)}`);
     const chips = (k.tools || []).map((t) => `<span class="chip">${esc(t)}</span>`).join("") || '<span class="muted small">no tools</span>';
     const models = (k.usage.models || []).map((m) => `<span class="chip">${esc(m)}</span>`).join("");
+    // a working key can be edited; a revoked one has no fields left to change.
+    const editBtn = k.status === "active" ? `<button type="button" class="st-btn st-btn--secondary" data-key-edit="${esc(k.id)}">Edit</button>` : "";
     return `<div class="mcp-server key-row${off ? " key-row--off" : ""}"><div class="mcp-server__head"><strong>${esc(k.name)}</strong>` +
       `<span class="st-badge${off ? " st-badge--error" : ""}">${esc(k.status)}</span>` +
       `<span class="mcp-server__btns"><button type="button" class="st-btn st-btn--secondary" data-key-usage="${esc(k.id)}">Usage</button>` +
-      `${k.status === "revoked" ? "" : `<button type="button" class="st-btn st-btn--danger" data-key-revoke="${esc(k.id)}">Revoke</button>`}</span></div>` +
+      `${editBtn}${k.status === "revoked" ? "" : `<button type="button" class="st-btn st-btn--danger" data-key-revoke="${esc(k.id)}">Revoke</button>`}</span></div>` +
       `<div class="muted small key-facts">${facts.join(" · ")}</div>` +
       `<div class="small key-facts">Today: ${use(k.usage.today)} · 30 days: ${use(k.usage.days_30)}${lim.length ? ` · limit: ${lim.join(", ")}` : ""}` +
       `${k.models ? ` · only ${k.models.map(esc).join(", ")}` : ""}</div>` +
@@ -96,10 +102,25 @@
     } catch (e) { el("usage-sum").textContent = ""; el("usage-models").innerHTML = `<div class="msg-error">${esc(e.message)}</div>`; }
   }
 
+  // a whole number above zero from a limit field, else null (no limit). Shared by make and edit.
+  const num = (id) => { const v = parseInt(el(id).value, 10); return v > 0 ? v : null; };
+
+  /// A key's expiry as the form's "In N" option ("1d", "7d" …), or "" when it has none: picked at or above how
+  /// many days are left so saving leaves an unchanged expiry alone.
+  const expOption = (expiresAt) => {
+    if (!expiresAt) return "";
+    const days = Math.round((expiresAt - Math.floor(Date.now() / 1000)) / 86400);
+    for (const d of [1, 7, 30, 90, 365]) if (days >= d * 0.6) return `${d}d`;
+    return "";
+  };
+  const sorted = (a) => (a || []).slice().sort();
+  const sameSet = (a, b) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
+
   if (el("key-form")) {
     el("key-form").onsubmit = async (e) => {
       e.preventDefault();
-      const num = (id) => { const v = parseInt(el(id).value, 10); return v > 0 ? v : null; };
+      if (editing) { await saveEditing(); return; }
+      // make a new key: the fields as the New key form has them.
       const body = {name: el("key-name").value.trim(),
                     tools: [...el("key-tools").querySelectorAll("input:checked")].map((c) => c.value),
                     limits: {requests_per_day: num("key-req-day"), tokens_per_day: num("key-tok-day")},
@@ -112,13 +133,65 @@
         el("key-once").hidden = false;
         el("key-once").scrollIntoView({block: "center"});
         el("key-form").reset();
+        setSubmitLabel();
         loadApiKeys();
       } catch (err) { toast("error", "The key was not made", err.message, 6000); }
     };
+
+    // Editing opens the same form filled with this key's values and saves only what changed (server apply()).
+    function openEdit(k) {
+      editing = true; editingId = k.id; origKey = k;
+      el("key-name").value = k.name;
+      [...el("key-tools").querySelectorAll("input")].forEach((c) => c.checked = (k.tools || []).includes(c.value));
+      el("key-expires").value = expOption(k.expires_at);
+      el("key-req-day").value = k.limits && k.limits.requests_per_day != null ? String(k.limits.requests_per_day) : "";
+      el("key-tok-day").value = k.limits && k.limits.tokens_per_day != null ? String(k.limits.tokens_per_day) : "";
+      el("key-models").value = (k.models || []).join(", ");
+      setSubmitLabel();
+      el("key-form").scrollIntoView({block: "center"});
+    }
+    async function saveEditing() {
+      const cur = { name: el("key-name").value.trim(),
+                    tools: [...el("key-tools").querySelectorAll("input:checked")].map((c) => c.value),
+                    expires: el("key-expires").value,
+                    req: num("key-req-day"), tok: num("key-tok-day"),
+                    models: el("key-models").value.split(",").map((m) => m.trim()).filter(Boolean) };
+      const o = origKey;
+      // only the fields that differ from what this key had, so editing one never resets the rest.
+      const body = {};
+      if (cur.name !== o.name) body.name = cur.name;
+      if (!sameSet(cur.tools, o.tools)) body.tools = cur.tools;
+      if (cur.expires !== expOption(o.expires_at)) {
+        if (cur.expires) body.expires_in = cur.expires; else body.expires_at = null;
+      }
+      const oLim = o.limits || {};
+      if ((cur.req || 0) !== (oLim.requests_per_day || 0) || (cur.tok || 0) !== (oLim.tokens_per_day || 0)) {
+        body.limits = { requests_per_day: cur.req, tokens_per_day: cur.tok }; // null clears a limit
+      }
+      if (!sameSet(cur.models, o.models)) body.models = cur.models;
+      if (Object.keys(body).length === 0) { toast("info", "Nothing to change", `${o.name} is already as saved.`); return; }
+      try {
+        const j = await api(`api/keys/${encodeURIComponent(editingId)}`, {method: "POST", body: JSON.stringify(body)});
+        toast("success", "Key updated", `${j.name} saved.`);
+        editing = false; editingId = ""; origKey = null;
+        el("key-form").reset();
+        setSubmitLabel();
+        loadApiKeys();
+      } catch (err) { toast("error", "The key was not updated", err.message, 6000); }
+    }
+    // back to the New-key form: a blank field set and its "Create key" label.
+    function setSubmitLabel() {
+      el("key-submit").textContent = editing ? "Save changes" : "Create key";
+    }
     el("key-once-copy").onclick = () => copyText(el("key-once-value").textContent);
     el("key-once-done").onclick = () => { el("key-once-value").textContent = ""; el("key-once").hidden = true; };
     el("keys-list").onclick = async (e) => {
-      const revoke = e.target.closest("[data-key-revoke]"), show = e.target.closest("[data-key-usage]");
+      const edit = e.target.closest("[data-key-edit]"), revoke = e.target.closest("[data-key-revoke]"), show = e.target.closest("[data-key-usage]");
+      if (edit) {
+        const k = keys.find((x) => x.id === edit.dataset.keyEdit);
+        if (k) openEdit(k);
+        return;
+      }
       if (show) {
         el("usage-key").value = show.dataset.keyUsage;
         await loadUsage();

@@ -197,18 +197,22 @@ fn tune_tok(s: &Value) -> String {
 /// `am2strata-run clients ...`: Settings › Clients through the running server. The actions:
 ///   list  every client profile (GET /api/clients) and every key with its tools, expiry and status (GET /api/keys)
 ///   new <name> [--tools a,b] [--expires 30d]  POST /api/keys — the new key is shown once and kept nowhere
+///   edit <id> [--name n] [--tools a,b] [--expires 30d|never]  POST /api/keys/{id} — change name, tools or expiry
 ///   revoke <id>  DELETE /api/keys/{id} (the key stops working at once; its usage stays)
 #[derive(Args)]
 pub struct ClientsOpts {
-    /// list | new <name> | revoke <id>
+    /// list | new <name> | edit <id> | revoke <id>
     pub action: String,
-    /// the rest for new (the name) or revoke (the key's id from `clients list`)
+    /// the rest for new (the name), edit (the key's id) or revoke (its id, from `clients list`)
     #[arg(last = true, trailing_var_arg = true, allow_hyphen_values = true)]
     pub values: Vec<String>,
-    /// new: the tool sets, comma separated (memory, web, image, video, speech, music, browser, code)
+    /// new, edit: the new name
+    #[arg(long)]
+    pub name: Option<String>,
+    /// new, edit: the tool sets, comma separated (memory, web, image, video, speech, music, browser, code)
     #[arg(long)]
     pub tools: Option<String>,
-    /// new: how long it works (30d, 12h, 90m); until revoked when omitted
+    /// new, edit: how long it works (30d, 12h, 90m); "never" to clear an expiry when editing; until revoked when omitted
     #[arg(long)]
     pub expires: Option<String>,
     /// print the raw server answers as JSON instead of a friendly rendering
@@ -224,8 +228,9 @@ pub fn clients_cmd(o: ClientsOpts, url: Option<String>, api_key: Option<String>,
         match o.action.as_str() {
             "list" => cmd_clients_list(&client, &send, &base, o.json)?,
             "new" => cmd_clients_new(&client, &send, &base, &o.values, o.tools.as_deref(), o.expires.as_deref())?,
+            "edit" => cmd_clients_edit(&client, &send, &base, &o.values, o.name.as_deref(), o.tools.as_deref(), o.expires.as_deref(), o.json)?,
             "revoke" => cmd_clients_revoke(&client, &send, &base, &o.values)?,
-            other => return Err(format!("unknown action {other:?}: list, new or revoke")),
+            other => return Err(format!("unknown action {other:?}: list, new, edit or revoke")),
         }
         Ok(())
     })();
@@ -273,6 +278,24 @@ fn cmd_clients_revoke(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> R
     let id = values.first().ok_or("revoke needs a key id (from `clients list`)")?.clone();
     let j = send(client.delete(format!("{base}/api/keys/{id}")))?;
     println!("key {} ({}) is revoked: it stopped working now", j["id"].as_str().unwrap_or(&id), j["name"].as_str().unwrap_or("?"));
+    Ok(())
+}
+
+fn cmd_clients_edit(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<Value, String>, base: &str, values: &[String], name: Option<&str>, tools: Option<&str>, expires: Option<&str>, json: bool) -> Result<(), String> {
+    let id = values.first().ok_or("edit needs a key id (from `clients list`)")?.clone();
+    // send only the fields given (a null clears), like new; "never" clears an expiry. The change takes effect at once.
+    let mut spec = json!({});
+    if let Some(n) = name { spec["name"] = json!(n); }
+    if let Some(t) = tools { spec["tools"] = json!(t.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()); }
+    if let Some(e) = expires {
+        if e.eq_ignore_ascii_case("never") { spec["expires_at"] = json!(null); } else { spec["expires_in"] = json!(e); }
+    }
+    let j = send(client.post(format!("{base}/api/keys/{id}")).json(&spec))?;
+    if json { println!("{}", serde_json::to_string_pretty(&j).map_err(|e| e.to_string())?); return Ok(()); }
+    // the updated record: id, name, tools and status — never a key's value (the store holds none of it).
+    let tools = j["tools"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let expiry = if let Some(e) = j["expires_at"].as_u64() { expires_at(e) } else { "until revoked".to_string() };
+    println!("  {}  {}  tools[{}]  {:<8} expires {}", j["id"].as_str().unwrap_or(&id), j["name"].as_str().unwrap_or("?"), tools, j["status"].as_str().unwrap_or(""), expiry);
     Ok(())
 }
 
