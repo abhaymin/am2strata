@@ -333,13 +333,213 @@ fn body_many(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn row_dot_many_avx2(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
-    body_many(t, row, xs, out)
+    match t {
+        Fast::Q4K => avx2::q4k_many(row, xs, out),
+        Fast::Q8_0 => avx2::q80_many(row, xs, out),
+        _ => body_many(t, row, xs, out),
+    }
+}
+
+/// Hand-written AVX2 for the most used types. The integer sums are exact, and the float arithmetic is the scalar
+/// kernels' in the same order, so every result equals the baseline build's bit for bit (tested).
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::{h, Q8K};
+    use std::arch::x86_64::*;
+
+    /// 32 products of unsigned w (at most 128) and signed x, as 8 i32 partial sums (exact: a pair is at most 32,512).
+    #[inline(always)]
+    unsafe fn madd(w: __m256i, x: *const i8) -> __m256i {
+        let xv = _mm256_loadu_si256(x as *const __m256i);
+        _mm256_madd_epi16(_mm256_maddubs_epi16(w, xv), _mm256_set1_epi16(1))
+    }
+
+    /// The 8 vectors' totals, in order.
+    #[inline(always)]
+    unsafe fn sums8(v: &[__m256i; 8]) -> [i32; 8] {
+        let (s01, s23) = (_mm256_hadd_epi32(v[0], v[1]), _mm256_hadd_epi32(v[2], v[3]));
+        let (s45, s67) = (_mm256_hadd_epi32(v[4], v[5]), _mm256_hadd_epi32(v[6], v[7]));
+        let (a, b) = (_mm256_hadd_epi32(s01, s23), _mm256_hadd_epi32(s45, s67));
+        let r = _mm256_add_epi32(_mm256_permute2x128_si256(a, b, 0x20), _mm256_permute2x128_si256(a, b, 0x31));
+        let mut out = [0i32; 8];
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, r);
+        out
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn q4k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        out.iter_mut().for_each(|o| *o = 0.0);
+        let m4 = _mm256_set1_epi8(0x0f);
+        let mut ds = [0f32; 8];
+        let mut ms = [0f32; 8];
+        let mut w = [_mm256_setzero_si256(); 8];
+        let mut p = [_mm256_setzero_si256(); 8];
+        for (bi, b) in row.chunks_exact(144).enumerate() {
+            let (d, dmin) = (h(b, 0), h(b, 2));
+            let sc = &b[4..16];
+            let qs = b[16..144].as_ptr();
+            for c in 0..4 {
+                let v = _mm256_loadu_si256(qs.add(c * 32) as *const __m256i);
+                w[2 * c] = _mm256_and_si256(v, m4);
+                w[2 * c + 1] = _mm256_and_si256(_mm256_srli_epi16(v, 4), m4);
+            }
+            for g in 0..8 {
+                let j = g % 4;
+                let (scale, min) = if g < 4 {
+                    (sc[j] & 0x3f, sc[4 + j] & 0x3f)
+                } else {
+                    ((sc[8 + j] & 0x0f) | ((sc[j] >> 2) & 0x30), (sc[8 + j] >> 4) | ((sc[4 + j] >> 2) & 0x30))
+                };
+                ds[g] = d * scale as f32;
+                ms[g] = dmin * min as f32;
+            }
+            for (x, o) in xs.iter().zip(out.iter_mut()) {
+                let xq = x.q.as_ptr().add(bi * 256);
+                for g in 0..8 {
+                    p[g] = madd(w[g], xq.add(g * 32));
+                }
+                let p = sums8(&p);
+                let mut acc = 0f32;
+                for g in 0..8 {
+                    acc += ds[g] * p[g] as f32 - ms[g] * x.sum32[bi * 8 + g] as f32;
+                }
+                *o += acc * x.d[bi];
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub unsafe fn q80_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        out.iter_mut().for_each(|o| *o = 0.0);
+        let nb = row.len() / 34;
+        let mut w = [_mm256_setzero_si256(); 8];
+        let mut aw = [_mm256_setzero_si256(); 8];
+        let mut p = [_mm256_setzero_si256(); 8];
+        let mut dw = [0f32; 8];
+        for gi in 0..nb.div_ceil(8) {
+            let n = (nb - gi * 8).min(8);
+            for k in 0..n {
+                let b = &row[(gi * 8 + k) * 34..(gi * 8 + k + 1) * 34];
+                dw[k] = h(b, 0);
+                w[k] = _mm256_loadu_si256(b[2..34].as_ptr() as *const __m256i);
+                aw[k] = _mm256_abs_epi8(w[k]);
+            }
+            for (x, o) in xs.iter().zip(out.iter_mut()) {
+                for k in 0..8 {
+                    p[k] = if k < n {
+                        let xv = _mm256_loadu_si256(x.q.as_ptr().add((gi * 8 + k) * 32) as *const __m256i);
+                        // w * x = |w| * (x with w's sign); |w| is at most 128 as unsigned
+                        _mm256_madd_epi16(_mm256_maddubs_epi16(aw[k], _mm256_sign_epi8(xv, w[k])), _mm256_set1_epi16(1))
+                    } else {
+                        _mm256_setzero_si256()
+                    };
+                }
+                let p = sums8(&p);
+                // in a register, not through memory: the same additions in the same order
+                let mut acc = *o;
+                for k in 0..n {
+                    acc += dw[k] * x.d[gi * 8 + k] * p[k] as f32;
+                }
+                *o = acc;
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn row_dot_many_dotprod(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
-    body_many(t, row, xs, out)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("AM2_NO_NEON").is_some()) {
+        return body_many(t, row, xs, out);
+    }
+    match t {
+        Fast::Q4K => neon::q4k_many(row, xs, out),
+        // Q8_0 with several inputs stays on the compiler's loop (M4: 39 vs 20 GMAC/s with eight); one input is NEON's
+        // (20 vs 16). Both are exact, so the results are the same either way.
+        Fast::Q8_0 if xs.len() == 1 => neon::q80_many(row, xs, out),
+        _ => body_many(t, row, xs, out),
+    }
+}
+
+/// Hand-written NEON with the dot-product instruction (sdot: 16 i8 products into 4 i32 lanes; Apple M1 and later,
+/// Graviton 2+) for the most used types. The integer sums are exact and the float arithmetic is the scalar kernels'
+/// in the same order, so every result equals the baseline build's bit for bit (the same test as AVX2's).
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::{h, Q8K};
+    use std::arch::aarch64::*;
+
+    /// acc + the 4-lane dot products of a and b (sdot; inline assembly, which is stable where the intrinsic may not be).
+    #[inline(always)]
+    unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut r = acc;
+        std::arch::asm!("sdot {r:v}.4s, {a:v}.16b, {b:v}.16b", r = inout(vreg) r, a = in(vreg) a, b = in(vreg) b,
+                        options(pure, nomem, nostack));
+        r
+    }
+
+    /// Σ w[i] x[i] over 32 values (w as two halves), exact in i32.
+    #[inline(always)]
+    unsafe fn dot32(w0: int8x16_t, w1: int8x16_t, x: *const i8) -> i32 {
+        let s = sdot(sdot(vdupq_n_s32(0), w0, vld1q_s8(x)), w1, vld1q_s8(x.add(16)));
+        vaddvq_s32(s)
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q4k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        out.iter_mut().for_each(|o| *o = 0.0);
+        let m4 = vdupq_n_u8(0x0f);
+        let mut ds = [0f32; 8];
+        let mut ms = [0f32; 8];
+        let mut w = [vdupq_n_s8(0); 16];
+        for (bi, b) in row.chunks_exact(144).enumerate() {
+            let (d, dmin) = (h(b, 0), h(b, 2));
+            let sc = &b[4..16];
+            let qs = b[16..144].as_ptr();
+            for c in 0..4 {
+                for half in 0..2 {
+                    let v = vld1q_u8(qs.add(c * 32 + half * 16));
+                    w[(2 * c) * 2 + half] = vreinterpretq_s8_u8(vandq_u8(v, m4));
+                    w[(2 * c + 1) * 2 + half] = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+                }
+            }
+            for g in 0..8 {
+                let j = g % 4;
+                let (scale, min) = if g < 4 {
+                    (sc[j] & 0x3f, sc[4 + j] & 0x3f)
+                } else {
+                    ((sc[8 + j] & 0x0f) | ((sc[j] >> 2) & 0x30), (sc[8 + j] >> 4) | ((sc[4 + j] >> 2) & 0x30))
+                };
+                ds[g] = d * scale as f32;
+                ms[g] = dmin * min as f32;
+            }
+            for (x, o) in xs.iter().zip(out.iter_mut()) {
+                let xq = x.q.as_ptr().add(bi * 256);
+                let mut acc = 0f32;
+                for g in 0..8 {
+                    let p = dot32(w[g * 2], w[g * 2 + 1], xq.add(g * 32));
+                    acc += ds[g] * p as f32 - ms[g] * x.sum32[bi * 8 + g] as f32;
+                }
+                *o += acc * x.d[bi];
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q80_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        let nb = row.len() / 34;
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let mut acc = 0f32;
+            for bi in 0..nb {
+                let b = row.as_ptr().add(bi * 34);
+                let d = h(&row[bi * 34..bi * 34 + 2], 0);
+                let p = dot32(vld1q_s8(b.add(2) as *const i8), vld1q_s8(b.add(18) as *const i8), x.q.as_ptr().add(bi * 32));
+                acc += d * x.d[bi] * p as f32;
+            }
+            *o = acc;
+        }
+    }
 }
 
 /// One weight row dotted with several inputs (a prompt chunk): out[i] = row_dot(t, row, &xs[i]), the row unpacked once.
@@ -375,13 +575,28 @@ pub fn row_dot_baseline(t: Fast, row: &[u8], x: &Q8K) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn row_dot_avx2(t: Fast, row: &[u8], x: &Q8K) -> f32 {
-    body(t, row, x)
+    // Q8_0 with one input stays on the compiler's vectorized loop (faster there: 11 vs 9 GMAC/s); both are exact
+    match t {
+        Fast::Q4K => {
+            let mut o = [0f32];
+            row_dot_many_avx2(t, row, std::slice::from_ref(x), &mut o);
+            o[0]
+        }
+        _ => body(t, row, x),
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn row_dot_dotprod(t: Fast, row: &[u8], x: &Q8K) -> f32 {
-    body(t, row, x)
+    match t {
+        Fast::Q4K | Fast::Q8_0 => {
+            let mut o = [0f32];
+            row_dot_many_dotprod(t, row, std::slice::from_ref(x), &mut o);
+            o[0]
+        }
+        _ => body(t, row, x),
+    }
 }
 
 /// Which build of the kernel this CPU runs, checked once.
@@ -453,6 +668,34 @@ mod tests {
             }
         }
         row
+    }
+
+    /// The build this CPU runs gives exactly the baseline build's results (the hand-written SIMD kernels included), one
+    /// input and many, on rows whose Q8_0 block count is not a multiple of 8.
+    #[test]
+    fn this_cpus_kernels_equal_the_baseline_exactly() {
+        let mut seed = 0xA5A5_1234_FEED_BEEFu64;
+        for ty in TYPES {
+            let t = Fast::of(ty).unwrap();
+            for blocks in [1usize, 3, 8] {
+                let mut row = random_row(ty, blocks, &mut seed, 0.017);
+                if ty == "Q8_0" {
+                    row.truncate(row.len() - 34 * 3); // 8 * blocks - 3 blocks of 32
+                }
+                let cols = if ty == "Q8_0" { row.len() / 34 * 32 } else { blocks * 256 };
+                let xs: Vec<Q8K> = (0..5).map(|_| {
+                    let x: Vec<f32> = (0..cols).map(|_| (rng(&mut seed) % 4001) as f32 / 1000.0 - 2.0).collect();
+                    Q8K::quantize_for(t, &x).unwrap()
+                }).collect();
+                let mut many = vec![0f32; xs.len()];
+                row_dot_many(t, &row, &xs, &mut many);
+                for (i, x) in xs.iter().enumerate() {
+                    let base = row_dot_baseline(t, &row, x);
+                    assert_eq!(row_dot(t, &row, x).to_bits(), base.to_bits(), "{ty} {blocks} one, input {i}, {:?}", path());
+                    assert_eq!(many[i].to_bits(), base.to_bits(), "{ty} {blocks} many, input {i}, {:?}", path());
+                }
+            }
+        }
     }
 
     #[test]

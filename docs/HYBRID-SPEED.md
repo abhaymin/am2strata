@@ -161,6 +161,33 @@ Kernel throughput, one thread (`cargo test --release -- --ignored kernel_speed`)
 (Q4_K 5.6 GB/s of weights), 8 inputs only 16-22 GMAC/s. The prompt is bound by that (chunks of 128-512 help MoE only a
 little: 22.6 -> 18.5 s of a 512-token GLM prompt), so the next step is explicit SIMD kernels.
 
+### Hand-written SIMD: AVX2 on x86, NEON sdot on Apple silicon
+
+Q4_K (most experts) and Q8_0 (MLA) get hand-written kernels: AVX2 maddubs on x86, the dot-product instruction (sdot) on
+aarch64. The integer sums are exact and the float arithmetic is the scalar kernels' in the same order, so they equal the
+baseline build bit for bit (test: `this_cpus_kernels_equal_the_baseline_exactly`, passing on both machines).
+
+| Single thread, GMAC/s (one input / eight) | PC, AVX2: before | after | Mac M4: before | after (NEON) |
+|---|---|---|---|---|
+| Q4_K | 10.0 / 15.9 | 17.0 / 32.3 | 15.9 / 19.7 | 33.5 / 64.9 |
+| Q8_0 | 11.3 / 21.3 | 11.3 / 23.8 | 16.1 / 38.9 | 20.1 / 38.9 |
+
+(Each machine keeps the compiler's loop where it is faster: one-input Q8_0 on x86, eight-input Q8_0 on the Mac.)
+
+**GLM-4.7-Flash on the 16 GB Mac** (17.5 GB model; `--resident-experts --expert-ram-gib 8` with the profile; no swapouts):
+
+| Threads | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| 4 | 13.81 | 7.26 |
+| 6 | 15.72 | 8.46 |
+| 8 | 16.52 | 8.93 |
+| 10 | 16.85 | 8.93 |
+
+From 7.0 / 5.9 this morning (the build before #78). llama.cpp `--no-repack` at 4 threads: 17.3 / 3.6. So past the memory
+limit the Mac now reads the prompt about as fast as llama.cpp and generates 2.5x faster. 8 threads is the sweet spot
+on the M4 (4 performance + 6 efficiency cores). These Mac runs had eight-input Q8_0 on NEON (since moved back to the
+loop), so MLA's prompt share there should drop on the next run.
+
 ## Next
 - **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).
