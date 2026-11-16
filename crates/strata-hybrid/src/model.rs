@@ -1956,6 +1956,20 @@ impl Model {
         out
     }
 
+    /// Whether this expert's matrices were placed on a GPU (the first tier): such an expert is never given to another
+    /// machine.
+    pub fn expert_on_device(&self, layer: usize, e: usize) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.moes().find(|m| m.layer == layer).is_some_and(|m| e < m.n_expert && m.up_exps.0[e].gpu.is_some())
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (layer, e);
+            false
+        }
+    }
+
     /// The MoE layers, in order.
     /// Every matrix the forward pass multiplies by, for placing on devices: the ones every token uses (the output
     /// projection first, then each layer's attention / SSM / dense / shared-expert / latent ones), and the routed
