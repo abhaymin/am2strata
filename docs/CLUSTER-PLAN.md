@@ -190,6 +190,21 @@ order of the work. Each step is measured on real machines before the next starts
    6. **Then layer splitting** (whole layers on a worker) as a second mode, for models where it costs fewer round
       trips. Then the same tier in the Rust engine on the master.
 
+   **Step 0, measured (2026-11-16): on this PC a remote expert tier would not pay today.**
+   - Orca (the 80 GB IQ3_XXS MoE, the first target), loaded on the live server, same 2,174-token chat twice:
+     - prompt 266 tok/s, generation 67 tok/s; then, with the prompt cached, generation 85 tok/s;
+     - the engine's own counters while generating: 98.2% of expert lookups hit the GPU cache, 37 GB of experts
+       resident in RAM, and **0 expert reads from the file**. Only the first request after loading read from storage,
+       while the cache warmed.
+   - This PC's 59 GB of RAM and 32 GB of VRAM hold almost all of an 80 GB model. So the NVMe is not the bottleneck
+     the remote tier was meant to replace, and every remote hop would only add latency.
+   - **When it would pay:** for a model clearly bigger than this PC's ~85-90 GB of RAM and VRAM, and with more remote
+     memory than the Mac's ~11 GB (that gives only ~10% more room).
+   - **Decision:** keep steps 1-6 as the design. Build them when such a model is wanted and a worker with the memory
+     for it is in the cluster (a 64 GB+ machine, for example).
+   - **The cluster pays today in other ways:** small models on workers as experts ("several brains", live since
+     2026-11-16) and whole requests routed to workers.
+
    **Media jobs on workers (owner, 2026-11-16): renders shared across machines.**
    - **The ask:** video rendering run by am2Strata across the cluster, with the Mac helping, before upload.
    - **Today:** a media job (image, video, compose, speech) runs on the machine that received it; only chats are routed
