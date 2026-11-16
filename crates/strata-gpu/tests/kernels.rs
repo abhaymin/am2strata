@@ -176,3 +176,42 @@ fn product_speed() {
         }
     }
 }
+
+/// A model's real sizes: the output projection of a 3B model is about 131072 x 3072 (Q6_K: ~330 MB), far above
+/// the small matrices above and above wgpu's default 128 MiB storage-binding limit. Found when Metal on a Mac M4 gave
+/// wrong tokens although every small kernel test passed. Rows from the start, the middle and the end are checked
+/// against the CPU, so a binding cut short or a grid that wraps shows as the rows it gets wrong.
+#[test]
+fn a_model_sized_matrix_matches_the_cpu_on_every_device() {
+    // STRATA_GPU_TEST_ONLY=<device> checks one device (a card that is full with a running model would only OOM)
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let (rows, cols) = (131072usize, 3072usize);
+    let mut rng = Rng(0x2545f4914f6cdd1d);
+    let ty = "Q6_K";
+    let w = weights(ty, rows, cols, &mut rng);
+    let row_bytes = w.len() / rows;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let pick: Vec<usize> = (0..16).chain(rows / 2..rows / 2 + 16).chain(rows - 16..rows).collect();
+    let want: Vec<(f32, f64)> = pick.iter().map(|&r| {
+        let mut row = vec![0f32; cols];
+        strata_pack::quants::dequantize_into(ty, &w[r * row_bytes..(r + 1) * row_bytes], &mut row).unwrap();
+        let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+        (s as f32, mag.max(1e-9))
+    }).collect();
+    eprintln!("a {rows} x {cols} {ty} matrix: {} MB", w.len() / 1_000_000);
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let up = match gpu.upload(ty, &w, rows, cols) { Ok(u) => u, Err(e) => { eprintln!("{}: upload refused: {e}", d.name); continue } };
+        let y = gpu.matvec(&up, &x);
+        let mut wrong = Vec::new();
+        for (k, &r) in pick.iter().enumerate() {
+            let e = (y[r] as f64 - want[k].0 as f64).abs() / want[k].1;
+            if !(e < 1e-3) { wrong.push(r); }
+        }
+        eprintln!("{}: {} of {} checked rows wrong{}", d.name, wrong.len(), pick.len(),
+                  if wrong.is_empty() { String::new() } else { format!(" (first: {:?})", &wrong[..wrong.len().min(6)]) });
+        assert!(wrong.is_empty(), "{}: a model-sized {ty} matrix gives wrong rows {:?}", d.name, &wrong[..wrong.len().min(10)]);
+    }
+}
