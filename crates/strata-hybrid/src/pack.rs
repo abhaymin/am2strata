@@ -264,6 +264,7 @@ fn wanted(_b: &[u8]) {
 
 // Not MADV_RANDOM: an expert is megabytes in one piece, and without readahead it is read 4 KiB per fault (measured
 // on GLM-4.7-Flash in 10 GiB: 5.8 M major faults instead of 0.2 M, generation 2.4 tok/s instead of 4.4).
+// macOS has no MADV_COLD equivalent: there the cold experts get no hint, and the page cache decides alone.
 fn cold(_b: &[u8]) {
     #[cfg(target_os = "linux")]
     advise(_b, libc::MADV_COLD);
@@ -358,7 +359,8 @@ pub fn copy_resident(model: &mut Model, res: &Residency) -> u64 {
     copied
 }
 
-/// A copy in memory of our own, 64-byte aligned like the GGUF's tensor data, kept for the life of the process.
+/// A copy in memory of our own, 64-byte aligned like the GGUF's tensor data, kept for the life of the process: it is
+/// never freed (deliberately; the engine loads one model per process), so calling `copy_resident` again would leak.
 fn owned(b: &[u8]) -> &'static [u8] {
     if b.is_empty() {
         return &[];

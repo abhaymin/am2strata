@@ -195,6 +195,6 @@ if __name__ == "__main__":
             svg = f(P)
             check(svg, P, f"{name}-{theme}")
             for d in ("site/assets", "docs/media"):
-                with open(os.path.join(root, d, f"{name}-{theme}.svg"), "w") as fh:
+                with open(os.path.join(root, d, f"{name}-{theme}.svg"), "w", encoding="utf-8") as fh:
                     fh.write(svg + "\n")
             print(f"{name}-{theme}.svg  ok")

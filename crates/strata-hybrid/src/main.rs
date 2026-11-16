@@ -94,6 +94,7 @@ fn mem_available() -> u64 {
 }
 
 /// Room left under this process's cgroup v2 memory limit (a container, or systemd's MemoryMax), when it has one.
+/// Linux cgroup v2 only: None on cgroup v1, macOS and Windows, where the system's free memory is used instead.
 fn cgroup_room() -> Option<u64> {
     let path = std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string))?;
     let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
@@ -202,6 +203,10 @@ fn main() {
         let g = graph::Graph::new(&m, max_ctx).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} graph=1");
         Some(g)
+    } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") && std::env::var_os("AM2_DEBUG_LAYERS").is_some() {
+        // the per-layer checksums live in Model::forward; the graph would print none of them (Kilo on #76)
+        eprintln!("AM2_DEBUG_LAYERS: matrix by matrix on the device, not the graph, so every layer's checksum is printed");
+        None
     } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") {
         match graph::Graph::new(&m, max_ctx) {
             Ok(g) => { placement = format!("{placement} graph=auto"); Some(g) }

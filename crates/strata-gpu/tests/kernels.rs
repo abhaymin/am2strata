@@ -201,9 +201,16 @@ fn a_model_sized_matrix_matches_the_cpu_on_every_device() {
         (s as f32, mag.max(1e-9))
     }).collect();
     eprintln!("a {rows} x {cols} {ty} matrix: {} MB", w.len() / 1_000_000);
+    // a device too small for the matrix is skipped, loudly; but a run that checks no device at all fails (Kilo on #76:
+    // otherwise the test passes on exactly the out-of-memory case it was written for)
+    let (mut checked, mut skipped) = (0usize, Vec::new());
     for d in &devices {
         let gpu = Gpu::open(&d.name).unwrap();
-        let up = match gpu.upload(ty, &w, rows, cols) { Ok(u) => u, Err(e) => { eprintln!("{}: upload refused: {e}", d.name); continue } };
+        let up = match gpu.upload(ty, &w, rows, cols) {
+            Ok(u) => u,
+            Err(e) => { eprintln!("SKIPPED {}: upload refused: {e}", d.name); skipped.push(format!("{}: {e}", d.name)); continue }
+        };
+        checked += 1;
         let y = gpu.matvec(&up, &x);
         let mut wrong = Vec::new();
         for (k, &r) in pick.iter().enumerate() {
@@ -214,6 +221,7 @@ fn a_model_sized_matrix_matches_the_cpu_on_every_device() {
                   if wrong.is_empty() { String::new() } else { format!(" (first: {:?})", &wrong[..wrong.len().min(6)]) });
         assert!(wrong.is_empty(), "{}: a model-sized {ty} matrix gives wrong rows {:?}", d.name, &wrong[..wrong.len().min(10)]);
     }
+    assert!(devices.is_empty() || checked > 0, "no device could take the {ty} matrix, so none was checked: {skipped:?}");
 }
 
 /// The engine's q/k/v and gate/up products go through `matvec_many`: one upload, the kernels launched back to back,

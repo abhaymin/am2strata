@@ -85,7 +85,7 @@ fn h(b: &[u8], at: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]))
 }
 
-/// Σ a[i] * b[i] over 32 values, exact in i32 (|a|, |b| <= 128: at most 2^19).
+/// Σ a[i] * b[i] over 32 values, exact in i32 (i8 magnitudes are at most 128, so |Σ| <= 32 * 128 * 128 = 2^19).
 #[inline(always)]
 fn dot32(a: &[i8; 32], b: &[i8]) -> i32 {
     let b: &[i8; 32] = b.try_into().unwrap();

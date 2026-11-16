@@ -492,6 +492,15 @@ enum Cmd {
         tools: Option<String>,
         #[arg(long)]
         expires: Option<String>,
+        /// new, edit: requests a day ("none" for no limit)
+        #[arg(long)]
+        requests_per_day: Option<String>,
+        /// new, edit: tokens a day ("none" for no limit)
+        #[arg(long)]
+        tokens_per_day: Option<String>,
+        /// new, edit: allowed models, comma separated ("all" for every model)
+        #[arg(long)]
+        models: Option<String>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
@@ -1068,8 +1077,8 @@ fn main() -> ExitCode {
             bin_ops::cluster_cmd(bin_ops::ClusterOpts { action, values, json }, url, api_key, &models_dir),
         Cmd::Tune { model, objective, json, url, api_key, models_dir } =>
             bin_ops::tune_cmd(bin_ops::TuneOpts { model, objective, json }, url, api_key, &models_dir),
-        Cmd::Clients { action, values, name, tools, expires, json, url, api_key, models_dir } =>
-            bin_ops::clients_cmd(bin_ops::ClientsOpts { action, values, name, tools, expires, json }, url, api_key, &models_dir),
+        Cmd::Clients { action, values, name, tools, expires, requests_per_day, tokens_per_day, models, json, url, api_key, models_dir } =>
+            bin_ops::clients_cmd(bin_ops::ClientsOpts { action, values, name, tools, expires, requests_per_day, tokens_per_day, models, json }, url, api_key, &models_dir),
         Cmd::Memory { action, values, query, json, url, api_key, models_dir } =>
             bin_ops::memory_cmd(bin_ops::MemoryOpts { action, values, query, json }, url, api_key, &models_dir),
         Cmd::MediaPull { model, data_dir } => media_pull(&model, &expand_path(&data_dir)),

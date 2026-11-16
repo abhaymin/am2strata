@@ -131,7 +131,7 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
 .slab { position: absolute; inset: 0; border-radius: 26px; transform-style: preserve-3d; border: 1.5px solid var(--c);
         background: linear-gradient(135deg, color-mix(in srgb, var(--c) 30%, transparent), color-mix(in srgb, var(--c) 8%, transparent));
         box-shadow: 0 0 40px -6px color-mix(in srgb, var(--c) 55%, transparent), inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent);
-        backdrop-filter: blur(3px); animation: bob 6s ease-in-out infinite; }
+        animation: bob 6s ease-in-out infinite; } /* no backdrop-filter: it would flatten the slab and the sparks' 3D rise */
 .slab.s1 { --c: var(--teal-ui); --z: 150px; transform: translateZ(var(--z)); animation-delay: 0s; }
 .slab.s2 { --c: var(--blue-ui); --z: 75px; transform: translateZ(var(--z)); animation-delay: -2s; }
 .slab.s3 { --c: var(--violet-ui); --z: 0px; transform: translateZ(var(--z)); animation-delay: -4s; }
@@ -256,7 +256,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .vid .play::after { content: ""; position: absolute; left: 23px; top: 17px; border-left: 17px solid #fff; border-top: 12px solid transparent; border-bottom: 12px solid transparent; }
 .vid:hover .play, .vid:focus .play { opacity: 1; transform: none; }
 .vid b { padding: 0 16px; font-size: 17px; line-height: 1.3; }
-.vid > span:last-child { padding: 0 16px; color: var(--muted); font-size: 15px; }
+.vid .desc { padding: 0 16px; color: var(--muted); font-size: 15px; }
 .vid.feature { grid-column: span 2; }
 @media (max-width: 620px) { .vid.feature { grid-column: auto; } }
 .vid .new { position: absolute; left: 10px; top: 10px; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
@@ -619,30 +619,30 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
     <h3 class="vh reveal">Demos and what's new</h3>
     <div class="vids">
       <a class="vid feature tilt reveal" href="https://www.youtube.com/watch?v=ByP6i4dtRdk" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/ByP6i4dtRdk.webp" alt="" loading="lazy" width="640" height="360"><span class="new">New</span><span class="dur">2:48</span><span class="play" aria-hidden="true"></span></span>
-        <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span>A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span class="desc">A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
-        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span>The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span class="desc">The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
-        <b>Run AI on Your Own PC: the 10-minute tour</b><span>Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Run AI on Your Own PC: the 10-minute tour</b><span class="desc">Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
-        <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span>Voices in eleven languages, code and pictures, all on one PC with no cloud.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span class="desc">Voices in eleven languages, code and pictures, all on one PC with no cloud.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
-        <b>Songs That Sing Your Lyrics (v0.1.4)</b><span>Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Songs That Sing Your Lyrics (v0.1.4)</b><span class="desc">Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
     <h3 class="vh reveal">Made with am2Strata</h3>
     <div class="vids">
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
-        <b>The Moon Woman Singing to Maven</b><span>A cinematic ballad sung across the empty space to Earth.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>The Moon Woman Singing to Maven</b><span class="desc">A cinematic ballad sung across the empty space to Earth.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
-        <b>Lofi for Coding: 1 Hour of Deep Focus</b><span>Twenty original instrumental tracks for programming and study.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Lofi for Coding: 1 Hour of Deep Focus</b><span class="desc">Twenty original instrumental tracks for programming and study.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
-        <b>Moonlight on the Sea</b><span>A slow, calm song to let the day go.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Moonlight on the Sea</b><span class="desc">A slow, calm song to let the day go.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
-        <b>Little Moon, Goodnight</b><span>A gentle lullaby for sleep.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Little Moon, Goodnight</b><span class="desc">A gentle lullaby for sleep.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
-        <b>Peace and Harmony</b><span>A calm song about kindness and living as one.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>Peace and Harmony</b><span class="desc">A calm song about kindness and living as one.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid short tilt reveal" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
-        <b>The Moon Woman Singing to Maven (Short)</b><span>The ballad's chorus, vertical.</span><span class="sr"> (opens in a new tab)</span></a>
+        <b>The Moon Woman Singing to Maven (Short)</b><span class="desc">The ballad's chorus, vertical.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
     <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">am2Strata on YouTube<span class="sr"> (opens in a new tab)</span></a>.</p>
     <aside class="adslot" id="ad-main" aria-label="Sponsored"><span class="adlbl">Sponsored</span></aside>
@@ -761,7 +761,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
     </div>
   </div>
   <button class="vw-btn vw-nav vw-prev" id="vw-prev" type="button" title="Previous (←)" aria-label="Previous image"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
-  <div class="vw-stage" id="vw-stage"><img id="vw-img" alt=""></div>
+  <div class="vw-stage" id="vw-stage"><img id="vw-img" alt="" draggable="false"></div>
   <button class="vw-btn vw-nav vw-next" id="vw-next" type="button" title="Next (→)" aria-label="Next image"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
   <div class="vw-bot">
     <button class="vw-btn" id="vw-out" type="button" title="Zoom out (−)" aria-label="Zoom out"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M8 11h6"/></svg></button>
@@ -891,8 +891,9 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
     const ns = Math.min(8, Math.max(.5, s * f)); tx = px - (px - tx) * ns / s; ty = py - (py - ty) * ns / s; s = ns; apply();
   };
   for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => {
-    opener = b; show(items.findIndex(x => x.dataset.view === b.dataset.view));
+    opener = b;
     if (!dlg.open) dlg.showModal();
+    show(items.findIndex(x => x.dataset.view === b.dataset.view));
     document.body.style.overflow = "hidden";
   });
   dlg.addEventListener("close", () => { document.body.style.overflow = ""; opener?.focus(); });
