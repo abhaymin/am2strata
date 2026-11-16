@@ -366,12 +366,44 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     x.iter().zip(w).map(|(v, g)| v * k * g).collect()
 }
 
+/// e^x with the same bits on every machine. `f32::exp` is the platform's libm (glibc, Apple's, Microsoft's), accurate to
+/// about an ulp but not identical across them, so an expert computed on a Mac and on a PC could differ in the last bit
+/// and flip a near-tie (the remote tier's B3 run on the Mac). This uses only IEEE-exact operations (+, *, rounding) in
+/// f64: x = k ln2 + r with |r| <= ln2 / 2, e^r by a degree-11 polynomial (relative error under 1e-14), times 2^k. The f32
+/// result is within an ulp of the true value, and the same everywhere.
+pub(crate) fn exp_f32(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    if x > 88.722_84 {
+        return f32::INFINITY;
+    }
+    if x < -103.972_08 {
+        return 0.0;
+    }
+    const LN2_HI: f64 = 6.931_471_803_691_238_164_90e-01;
+    const LN2_LO: f64 = 1.908_214_929_270_587_700_02e-10;
+    let x = x as f64;
+    let k = (x * std::f64::consts::LOG2_E).round_ties_even();
+    let r = (x - k * LN2_HI) - k * LN2_LO;
+    // 1/n! for n = 11 down to 0, Horner's rule
+    const C: [f64; 12] = [2.505_210_838_544_172e-8, 2.755_731_922_398_589e-7, 2.755_731_922_398_589_3e-6, 2.480_158_730_158_730_2e-5,
+                          1.984_126_984_126_984_1e-4, 1.388_888_888_888_888_9e-3, 8.333_333_333_333_333e-3, 4.166_666_666_666_666_4e-2,
+                          1.666_666_666_666_666_6e-1, 0.5, 1.0, 1.0];
+    let mut p = C[0];
+    for c in &C[1..] {
+        p = p * r + c;
+    }
+    let scale = f64::from_bits(((k as i64 + 1023) as u64) << 52);
+    (p * scale) as f32
+}
+
 fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
+    x / (1.0 + exp_f32(-x))
 }
 
 fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    1.0 / (1.0 + exp_f32(-x))
 }
 
 fn softplus(x: f32) -> f32 {
@@ -2068,6 +2100,30 @@ mod tests {
 
     /// A prompt chunk's products equal one-at-a-time's exactly (forward_batch's tokens depend on it), for the integer
     /// K-quant path, the f32 fast path and the dequantizing fallback.
+    /// exp_f32 is within an ulp of the true value and gives the same bits on every machine: the hash of its bits over a
+    /// sweep is a constant, so this test fails on any CPU or OS where a single bit differs (it runs on the Mac too).
+    #[test]
+    fn exp_is_accurate_and_the_same_everywhere() {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut worst = 0f64;
+        for i in 0..200_000 {
+            let x = -103.0f32 + i as f32 * (191.7 / 200_000.0);
+            let y = exp_f32(x);
+            h = (h ^ y.to_bits() as u64).wrapping_mul(0x0100_0000_01b3);
+            let t = (x as f64).exp();
+            if t.is_finite() && t > 1e-37 && t < 1e38 {
+                let ulp = (f32::from_bits((t as f32).to_bits() + 1) - (t as f32)) as f64;
+                worst = worst.max((y as f64 - t).abs() / ulp);
+            }
+        }
+        assert!(worst <= 1.0, "within an ulp: {worst}");
+        assert_eq!(exp_f32(0.0), 1.0);
+        assert_eq!(exp_f32(-200.0), 0.0);
+        assert!(exp_f32(100.0).is_infinite() && exp_f32(f32::NAN).is_nan());
+        assert_eq!(h, EXP_SWEEP_HASH, "exp_f32's bits changed on this machine: {h:#x}");
+    }
+    const EXP_SWEEP_HASH: u64 = 0xcf06_e9bd_8437_6dda; // measured on x86-64 Linux; must hold on every machine
+
     /// A rows x cols matrix of `ty` with random bytes and finite f16 scales where the type keeps them.
     fn random_qmat(ty: &str, rows: usize, cols: usize, next: &mut dyn FnMut() -> u64) -> QMat {
         let rb = QMat::row_bytes(ty, cols);
