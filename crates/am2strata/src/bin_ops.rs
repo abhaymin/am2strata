@@ -215,6 +215,15 @@ pub struct ClientsOpts {
     /// new, edit: how long it works (30d, 12h, 90m); "never" to clear an expiry when editing; until revoked when omitted
     #[arg(long)]
     pub expires: Option<String>,
+    /// new, edit: requests a day this key may make; "none" for no limit
+    #[arg(long)]
+    pub requests_per_day: Option<String>,
+    /// new, edit: tokens a day this key may use; "none" for no limit
+    #[arg(long)]
+    pub tokens_per_day: Option<String>,
+    /// new, edit: the models this key may use, comma separated; "all" for every model
+    #[arg(long)]
+    pub models: Option<String>,
     /// print the raw server answers as JSON instead of a friendly rendering
     #[arg(long)]
     pub json: bool,
@@ -227,8 +236,8 @@ pub fn clients_cmd(o: ClientsOpts, url: Option<String>, api_key: Option<String>,
     let r = (|| -> Result<(), String> {
         match o.action.as_str() {
             "list" => cmd_clients_list(&client, &send, &base, o.json)?,
-            "new" => cmd_clients_new(&client, &send, &base, &o.values, o.tools.as_deref(), o.expires.as_deref())?,
-            "edit" => cmd_clients_edit(&client, &send, &base, &o.values, o.name.as_deref(), o.tools.as_deref(), o.expires.as_deref(), o.json)?,
+            "new" => cmd_clients_new(&client, &send, &base, &o)?,
+            "edit" => cmd_clients_edit(&client, &send, &base, &o)?,
             "revoke" => cmd_clients_revoke(&client, &send, &base, &o.values)?,
             other => return Err(format!("unknown action {other:?}: list, new, edit or revoke")),
         }
@@ -262,12 +271,46 @@ fn cmd_clients_list(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Res
     Ok(())
 }
 
-fn cmd_clients_new(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<Value, String>, base: &str, values: &[String], tools: Option<&str>, expires: Option<&str>) -> Result<(), String> {
-    let name = values.first().ok_or("new needs a name")?.clone();
-    // send only the fields given (a null is dropped), like the workshop command; the server fills defaults.
-    let mut spec = json!({"name": name});
-    if let Some(t) = tools { spec["tools"] = json!(t.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()); }
-    if let Some(e) = expires { spec["expires_in"] = json!(e); }
+/// The fields `new` and `edit` share, checked before anything is sent (Kilo on #72): a name and a tool list are never
+/// empty; limits are whole numbers above zero or "none"; models a list or "all". The same rules and fields as the web form.
+fn key_spec(o: &ClientsOpts, name: Option<&str>) -> Result<Value, String> {
+    let mut spec = json!({});
+    if let Some(n) = name {
+        let n = n.trim();
+        if n.is_empty() { return Err("the name cannot be empty".into()); }
+        spec["name"] = json!(n);
+    }
+    if let Some(t) = &o.tools {
+        let list: Vec<&str> = t.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        if list.is_empty() { return Err("--tools needs at least one tool set (memory, web, image, video, speech, music, browser, code)".into()); }
+        spec["tools"] = json!(list);
+    }
+    let limit = |v: &str, what: &str| -> Result<Value, String> {
+        if v.eq_ignore_ascii_case("none") { return Ok(Value::Null); }
+        match v.trim().parse::<u64>() { Ok(n) if n > 0 => Ok(json!(n)), _ => Err(format!("--{what}: a positive whole number, or none (any case) for no limit")) }
+    };
+    let mut limits = serde_json::Map::new();
+    if let Some(v) = &o.requests_per_day { limits.insert("requests_per_day".into(), limit(v, "requests-per-day")?); }
+    if let Some(v) = &o.tokens_per_day { limits.insert("tokens_per_day".into(), limit(v, "tokens-per-day")?); }
+    if !limits.is_empty() { spec["limits"] = Value::Object(limits); }
+    if let Some(m) = &o.models {
+        let list: Vec<&str> = m.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        spec["models"] = if list.is_empty() || (list.len() == 1 && list[0].eq_ignore_ascii_case("all")) { Value::Null } else { json!(list) };
+    }
+    Ok(spec)
+}
+
+fn cmd_clients_new(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<Value, String>, base: &str, o: &ClientsOpts) -> Result<(), String> {
+    // the name: the word after `new`, or --name (not both, unless they agree)
+    let name = match (o.values.first(), o.name.as_deref()) {
+        (Some(a), Some(b)) if a != b => return Err(format!("two names given ({a:?} and --name {b:?}): give one")),
+        (Some(a), _) => a.clone(),
+        (None, Some(b)) => b.to_string(),
+        (None, None) => return Err("new needs a name: clients new <name> (or --name <name>)".into()),
+    };
+    // send only the fields given; the server fills defaults.
+    let mut spec = key_spec(o, Some(&name))?;
+    if let Some(e) = &o.expires { spec["expires_in"] = json!(e); }
     let j = send(client.post(format!("{base}/api/keys")).json(&spec))?;
     println!("{}", j["key"].as_str().unwrap_or("")); // the new key: stdout, so it can be copied
     eprintln!("key {} ({}) made — shown only this once and kept nowhere; copy it now", j["id"].as_str().unwrap_or(""), j["name"].as_str().unwrap_or("?"));
@@ -281,13 +324,15 @@ fn cmd_clients_revoke(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> R
     Ok(())
 }
 
-fn cmd_clients_edit(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<Value, String>, base: &str, values: &[String], name: Option<&str>, tools: Option<&str>, expires: Option<&str>, json: bool) -> Result<(), String> {
-    let id = values.first().ok_or("edit needs a key id (from `clients list`)")?.clone();
+fn cmd_clients_edit(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<Value, String>, base: &str, o: &ClientsOpts) -> Result<(), String> {
+    let id = o.values.first().ok_or("edit needs a key id (from `clients list`)")?.clone();
+    let json = o.json;
     // send only the fields given (a null clears), like new; "never" clears an expiry. The change takes effect at once.
-    let mut spec = json!({});
-    if let Some(n) = name { spec["name"] = json!(n); }
-    if let Some(t) = tools { spec["tools"] = json!(t.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>()); }
-    if let Some(e) = expires {
+    let mut spec = key_spec(o, o.name.as_deref())?;
+    if spec.as_object().is_some_and(|m| m.is_empty()) && o.expires.is_none() {
+        return Err("nothing to change: give --name, --tools, --expires, --requests-per-day, --tokens-per-day or --models".into());
+    }
+    if let Some(e) = o.expires.as_deref() {
         if e.eq_ignore_ascii_case("never") { spec["expires_at"] = json!(null); } else { spec["expires_in"] = json!(e); }
     }
     let j = send(client.post(format!("{base}/api/keys/{id}")).json(&spec))?;

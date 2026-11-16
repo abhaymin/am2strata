@@ -1610,9 +1610,14 @@ impl Model {
             }
         }
         self.prefetch_experts(m, (0..m.n_expert).filter(|&e| !users[e].is_empty()));
-        let xs: Vec<Vec<f32>> = match &m.latent {
-            Some((down, _)) => down.matmul(hs),
-            None => hs.to_vec(),
+        // the experts' inputs: the latent projection when there is one, else the hidden states directly (no extra allocation)
+        let projected;
+        let xs: &[Vec<f32>] = match &m.latent {
+            Some((down, _)) => {
+                projected = down.matmul(hs);
+                &projected
+            }
+            None => hs,
         };
         let mut outs: Vec<Vec<Vec<f32>>> = routes.iter().map(|(c, _)| vec![Vec::new(); c.len()]).collect();
         for (e, who) in users.iter().enumerate() {
@@ -1898,6 +1903,46 @@ mod tests {
 
     /// A prompt chunk's products equal one-at-a-time's exactly (forward_batch's tokens depend on it), for the integer
     /// K-quant path, the f32 fast path and the dequantizing fallback.
+    /// A rows x cols matrix of `ty` with random bytes and finite f16 scales where the type keeps them.
+    fn random_qmat(ty: &str, rows: usize, cols: usize, next: &mut dyn FnMut() -> u64) -> QMat {
+        let rb = QMat::row_bytes(ty, cols);
+        let mut data: Vec<u8> = (0..rows * rb).map(|_| next() as u8).collect();
+        let (_, bb) = strata_gguf::block_geometry(ty).unwrap_or((1, 4));
+        if ty == "F32" {
+            for c in data.chunks_exact_mut(4) { c.copy_from_slice(&((next() % 2001) as f32 / 1000.0 - 1.0).to_le_bytes()); }
+        } else {
+            let f = strata_pack::num::f32_to_f16(0.01).to_le_bytes();
+            for b in data.chunks_exact_mut(bb as usize) {
+                match ty { "Q4_K" | "Q5_K" => { b[0..2].copy_from_slice(&f); b[2..4].copy_from_slice(&f); }
+                           "Q6_K" => b[208..210].copy_from_slice(&f),
+                           _ => b[0..2].copy_from_slice(&f) }
+            }
+        }
+        QMat { data: Box::leak(data.into_boxed_slice()), ty: ty.into(), vdt: Vdt::of(ty), rows, cols, row_bytes: rb,
+               #[cfg(feature = "gpu")] gpu: None }
+    }
+
+    /// The fused pass (a MoE layer's experts, MLA's heads) gives exactly what one product at a time gives: mixed types,
+    /// sizes and inputs in one `mul_set`.
+    #[test]
+    fn mul_set_equals_one_by_one_exactly() {
+        let mut seed = 0x0F05_ED00_1234_5678u64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let shapes = [("Q4_K", 70, 512), ("Q5_K", 33, 256), ("Q6_K", 41, 512), ("Q8_0", 64, 192), ("F32", 9, 96)];
+        let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c)| random_qmat(ty, r, c, &mut next)).collect();
+        let xs: Vec<Vec<f32>> = mats.iter().map(|q| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect();
+        let jobs: Vec<(&QMat, &[f32])> = mats.iter().zip(&xs).map(|(q, x)| (q, &x[..])).collect();
+        let fused = QMat::mul_set(&jobs).expect("every type here has a CPU kernel");
+        assert_eq!(fused.len(), mats.len());
+        for ((q, x), y) in mats.iter().zip(&xs).zip(&fused) {
+            assert_eq!(y, &q.mul(x), "{}", q.ty);
+        }
+        // the same matrix twice with different inputs (an expert's up and gate share x; here they do not)
+        let jobs = [(&mats[0], &xs[0][..]), (&mats[0], &xs[0][..])];
+        let twice = QMat::mul_set(&jobs).unwrap();
+        assert_eq!(twice[0], twice[1]);
+    }
+
     #[test]
     fn matmul_equals_matvec_exactly() {
         let mut seed = 0x51_7CC1_B727_220Au64;

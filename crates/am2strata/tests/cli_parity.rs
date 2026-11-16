@@ -106,6 +106,40 @@ fn clients_edit_changes_the_tools_and_uses_them() {
     assert!(!prompt.contains("remember"), "the old tool set is gone: {prompt}");
 }
 
+/// clients new/edit set the same fields as the web form (daily limits, allowed models), clear them with none/all, and
+/// refuse an empty name or tool list before sending anything (Kilo on #72).
+#[test]
+fn clients_set_limits_and_models_and_refuse_empty_values() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    // new by --name, with limits and models
+    let (ok, _, nerr) = run(&s, "clients", &["new", "--name", "limited", "--requests-per-day", "50", "--tokens-per-day", "9000", "--models", "a,b"]);
+    assert!(ok, "new with --name and limits: {nerr}");
+    let (_, keys) = s.get("/api/keys", true);
+    let rec = keys["keys"].as_array().unwrap().iter().find(|k| k["name"] == "limited").cloned().unwrap_or_default();
+    assert_eq!(rec["limits"]["requests_per_day"], 50, "{rec}");
+    assert_eq!(rec["limits"]["tokens_per_day"], 9000, "{rec}");
+    assert_eq!(rec["models"], json!(["a", "b"]), "{rec}");
+    let id = rec["id"].as_str().unwrap().to_string();
+
+    // edit clears a limit and the model list
+    let (ok, _, eerr) = run(&s, "clients", &["edit", "--requests-per-day", "none", "--models", "all", "--", &id]);
+    assert!(ok, "edit clearing limits: {eerr}");
+    let (_, keys) = s.get("/api/keys", true);
+    let rec = keys["keys"].as_array().unwrap().iter().find(|k| k["id"] == id.as_str()).cloned().unwrap_or_default();
+    assert!(rec["limits"]["requests_per_day"].is_null() && rec["limits"]["tokens_per_day"] == 9000, "{rec}");
+    assert!(rec["models"].is_null(), "all models again: {rec}");
+
+    // refused before sending: an empty tool list, an empty name, a zero limit, two different names, nothing to change
+    for (args, want) in [(vec!["edit", "--tools", " , ", "--", id.as_str()], "at least one tool"),
+                         (vec!["edit", "--name", " ", "--", id.as_str()], "name cannot be empty"),
+                         (vec!["edit", "--tokens-per-day", "0", "--", id.as_str()], "positive whole number"),
+                         (vec!["new", "--name", "one", "--", "two"], "two names"),
+                         (vec!["edit", "--", id.as_str()], "nothing to change")] {
+        let (ok, _, err) = run(&s, "clients", &args);
+        assert!(!ok && err.contains(want), "{args:?} should be refused with {want:?}: {err}");
+    }
+}
+
 /// cluster status on a single machine says "no workers"; pair refuses a wrong code and exits non-zero. (cluster.rs)
 #[test]
 fn cluster_status_has_no_workers_and_pair_refuses_a_wrong_code() {

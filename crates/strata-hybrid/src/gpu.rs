@@ -45,6 +45,10 @@ pub(crate) fn device(d: usize) -> &'static strata_gpu::Gpu {
     &DEVICES.get().expect("devices opened")[d]
 }
 
+/// What each device's --devices budget has left after placement (bytes), in device order: what a graph's KV cache
+/// may still take (Kilo on #76: the cache must count against the budget, not come on top of it).
+pub static ROOM: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+
 /// The most one device holds. Past 11-12 GiB on a 16 GB card, CubeCL's memory manager panics on its stream thread
 /// ("Memory page 0 doesn't exist"), measured with Cyber-Tiel UD-Q8_K_XL.
 const MAX_PER_DEVICE: u64 = 11 << 30;
@@ -135,6 +139,7 @@ pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>
         }
     }
     let _ = DEVICES.set(gpus);
+    let _ = ROOM.set(left.clone());
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let per: Vec<String> = devices.iter().zip(&placed).map(|((n, _), (k, b))| format!("{n}:{k}:{:.2}GiB", gib(*b))).collect();
     let dense_on_device = placed.iter().map(|(k, _)| *k).sum();
