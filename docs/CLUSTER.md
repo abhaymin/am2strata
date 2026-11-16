@@ -4,7 +4,10 @@ Several machines working as one am2Strata. People and apps talk to one machine, 
 **workers**, answer for it. This page gives the exact steps, every key involved and where it is kept, and what a
 cluster does and does not do today. The design and the work still to come are in [CLUSTER-PLAN.md](CLUSTER-PLAN.md).
 
-![A cluster in four steps: install on both, make a worker, pair on the master, use it](media/cluster-setup.svg)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="media/cluster-setup-dark.svg">
+  <img alt="A cluster in four steps: install on both, make a worker, pair on the master, use it" src="media/cluster-setup-light.svg">
+</picture>
 
 ![Settings › Cluster on the master: the Mac mini worker macm4, answering, encrypted, its model loaded](media/screenshot-cluster.webp)
 

@@ -1,88 +1,41 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 760" width="1200" height="760" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
-  <title id="t">am2Strata cluster: pairing a worker with a master</title>
-  <desc id="d">Two machines. The master holds the main API key and talks to clients. The worker shows a 6-digit code; the master sends it once, they swap certificate pins and the worker mints a key for that master. After that the master reaches the worker only over mutual TLS 1.3 on the worker's cluster port.</desc>
-  <defs>
-    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2f6fde"/></marker>
-    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1d8a5b"/></marker>
-  </defs>
-  <rect width="1200" height="760" rx="22" fill="#f7f8fb"/>
-  <text x="48" y="64" font-size="30" font-weight="700" fill="#151a24">A cluster in four steps</text>
-  <text x="48" y="96" font-size="17" fill="#525b6b">One master that people and apps talk to; workers that answer for it. Keys are named, never shown.</text>
-
-  <!-- master -->
-  <rect x="48" y="130" width="420" height="300" rx="16" fill="#ffffff" stroke="#c9d1de" stroke-width="2"/>
-  <text x="72" y="168" font-size="22" font-weight="700" fill="#151a24">Master</text>
-  <text x="72" y="194" font-size="15" fill="#525b6b">e.g. the Linux PC with the big GPUs</text>
-  <text x="72" y="232" font-size="15" font-weight="600" fill="#151a24">It keeps</text>
-  <text x="72" y="258" font-size="15" fill="#2c3442">• its main API key  (run config "api_key")</text>
-  <text x="72" y="282" font-size="15" fill="#2c3442">• node-tls.json  (its certificate = its pin)</text>
-  <text x="72" y="306" font-size="15" fill="#2c3442">• cluster-workers.json: each worker's url,</text>
-  <text x="88" y="328" font-size="15" fill="#2c3442">pin and the key it was given (0600)</text>
-  <text x="72" y="366" font-size="15" font-weight="600" fill="#151a24">Clients use only the master</text>
-  <text x="72" y="390" font-size="15" fill="#2c3442">their keys are never sent on to a worker</text>
-
-  <!-- worker -->
-  <rect x="732" y="130" width="420" height="300" rx="16" fill="#ffffff" stroke="#c9d1de" stroke-width="2"/>
-  <text x="756" y="168" font-size="22" font-weight="700" fill="#151a24">Worker</text>
-  <text x="756" y="194" font-size="15" fill="#525b6b">e.g. a Mac mini; "cluster": {"role": "worker"}</text>
-  <text x="756" y="232" font-size="15" font-weight="600" fill="#151a24">It keeps</text>
-  <text x="756" y="258" font-size="15" fill="#2c3442">• its own main API key (never leaves it)</text>
-  <text x="756" y="282" font-size="15" fill="#2c3442">• node-key (ed25519) and node-tls.json</text>
-  <text x="756" y="306" font-size="15" fill="#2c3442">• cluster-masters.json: each master's pin</text>
-  <text x="772" y="328" font-size="15" fill="#2c3442">and only the HASH of its key (0600)</text>
-  <text x="756" y="366" font-size="15" font-weight="600" fill="#151a24">Ports</text>
-  <text x="756" y="390" font-size="15" fill="#2c3442">8000 API · 8443 cluster (TLS) · 8001 HTTPS</text>
-
-  <!-- arrows between -->
-  <line x1="480" y1="220" x2="720" y2="220" stroke="#2f6fde" stroke-width="3" marker-end="url(#ah)"/>
-  <text x="600" y="206" font-size="14" text-anchor="middle" fill="#2f6fde" font-weight="600">pair: code + master's pin</text>
-  <line x1="720" y1="268" x2="480" y2="268" stroke="#2f6fde" stroke-width="3" marker-end="url(#ah)"/>
-  <text x="600" y="292" font-size="14" text-anchor="middle" fill="#2f6fde" font-weight="600">a new key + worker's pin</text>
-  <line x1="480" y1="360" x2="720" y2="360" stroke="#1d8a5b" stroke-width="4" marker-start="url(#ag)" marker-end="url(#ag)"/>
-  <text x="600" y="346" font-size="14" text-anchor="middle" fill="#1d8a5b" font-weight="700">mutual TLS 1.3, pins checked</text>
-  <text x="600" y="384" font-size="13" text-anchor="middle" fill="#1d8a5b">chats, model list, queue</text>
-
-  <!-- steps -->
-  <g font-size="15" fill="#2c3442">
-    <rect x="48" y="462" width="258" height="250" rx="14" fill="#eaf1fd"/>
-    <circle cx="80" cy="494" r="17" fill="#2f6fde"/><text x="80" y="500" font-size="17" font-weight="700" fill="#fff" text-anchor="middle">1</text>
-    <text x="106" y="500" font-size="17" font-weight="700" fill="#151a24">Install on both</text>
-    <text x="68" y="534">The one-line installer,</text>
-    <text x="68" y="556">a model on each, and a</text>
-    <text x="68" y="578">main "api_key" in each</text>
-    <text x="68" y="600">run config (your own</text>
-    <text x="68" y="622">long random value).</text>
-
-    <rect x="326" y="462" width="258" height="250" rx="14" fill="#eaf1fd"/>
-    <circle cx="358" cy="494" r="17" fill="#2f6fde"/><text x="358" y="500" font-size="17" font-weight="700" fill="#fff" text-anchor="middle">2</text>
-    <text x="384" y="500" font-size="17" font-weight="700" fill="#151a24">Make a worker</text>
-    <text x="346" y="534">Add "cluster":</text>
-    <text x="346" y="556">{"role": "worker",</text>
-    <text x="346" y="578">"name": "macm4"}, start</text>
-    <text x="346" y="600">it with --host 0.0.0.0.</text>
-    <text x="346" y="622">It shows a 6-digit code</text>
-    <text x="346" y="644">(new every 10 minutes).</text>
-
-    <rect x="604" y="462" width="258" height="250" rx="14" fill="#eaf1fd"/>
-    <circle cx="636" cy="494" r="17" fill="#2f6fde"/><text x="636" y="500" font-size="17" font-weight="700" fill="#fff" text-anchor="middle">3</text>
-    <text x="662" y="500" font-size="17" font-weight="700" fill="#151a24">Pair on the master</text>
-    <text x="624" y="534">Settings › Cluster: the</text>
-    <text x="624" y="556">worker "wants to join";</text>
-    <text x="624" y="578">type its code, Pair.</text>
-    <text x="624" y="600">Over a VPN: pair by its</text>
-    <text x="624" y="622">address. 5 wrong codes</text>
-    <text x="624" y="644">lock pairing 10 minutes.</text>
-
-    <rect x="882" y="462" width="270" height="250" rx="14" fill="#e6f4ed"/>
-    <circle cx="914" cy="494" r="17" fill="#1d8a5b"/><text x="914" y="500" font-size="17" font-weight="700" fill="#fff" text-anchor="middle">4</text>
-    <text x="940" y="500" font-size="17" font-weight="700" fill="#151a24">Use it</text>
-    <text x="902" y="534">Ask the master for the</text>
-    <text x="902" y="556">worker's model: the answer</text>
-    <text x="902" y="578">carries x-strata-worker.</text>
-    <text x="902" y="600">The master also hands a</text>
-    <text x="902" y="622">worker overflow when it is</text>
-    <text x="902" y="644">busy and the worker has</text>
-    <text x="902" y="666">the same model idle.</text>
-  </g>
-  <text x="48" y="740" font-size="13" fill="#6a7383">Remove: Settings › Cluster › Remove (the worker forgets that master; its key stops working at once).</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800" font-family="Outfit, Inter, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">am2Strata cluster: pairing a worker with a master</title>
+<desc id="d">Two machines. The master holds the main API key and talks to clients; it keeps node-tls.json and cluster-workers.json. The worker keeps its own key, node-key and node-tls.json, and cluster-masters.json with only the hash of the key it gave. Steps: 1 install on both with a main api_key each; 2 make a worker with cluster role worker, started on 0.0.0.0, which shows a 6-digit code new every 10 minutes; 3 pair on the master in Settings, Cluster by typing the code (5 wrong codes lock pairing for 10 minutes); 4 use it: the master answers with the worker&#x27;s model and hands it overflow. After pairing, every connection is mutual TLS 1.3 with pinned certificates on port 8443. Remove a worker in Settings, Cluster, Remove.</desc>
+<rect width="1200" height="800" rx="28" fill="#eff1f5"/>
+<text x="48" y="64" font-size="30" font-weight="700" text-anchor="start" fill="#303246">A cluster in four steps</text>
+<text x="48" y="96" font-size="17" font-weight="400" text-anchor="start" fill="#42445b">One master that people and apps talk to; workers that answer for it. Keys are named here, never shown.</text>
+<g transform="translate(48 128)"><rect width="430" height="296" rx="16" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/>
+<text x="24" y="40" font-size="24" font-weight="700" text-anchor="start" fill="#303246">Master</text>
+<text x="24" y="66" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">e.g. the Linux PC with the big GPUs</text>
+<text x="24" y="104" font-size="16" font-weight="700" text-anchor="start" fill="#303246">It keeps</text>
+<text x="24" y="130" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• its main API key (run config &quot;api_key&quot;)</text>
+<text x="24" y="154" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• node-tls.json (its certificate = its pin)</text>
+<text x="24" y="178" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• cluster-workers.json: each worker&#x27;s url,</text>
+<text x="24" y="202" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">   pin and the key it was given (0600)</text>
+<text x="24" y="240" font-size="16" font-weight="700" text-anchor="start" fill="#303246">Clients use only the master</text>
+<text x="24" y="264" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">their keys are never sent on to a worker</text>
+</g>
+<g transform="translate(722 128)"><rect width="430" height="296" rx="16" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/>
+<text x="24" y="40" font-size="24" font-weight="700" text-anchor="start" fill="#303246">Worker</text>
+<text x="24" y="66" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">e.g. a Mac mini; &quot;cluster&quot;: {&quot;role&quot;: &quot;worker&quot;}</text>
+<text x="24" y="104" font-size="16" font-weight="700" text-anchor="start" fill="#303246">It keeps</text>
+<text x="24" y="130" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• its own main API key (never leaves it)</text>
+<text x="24" y="154" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• node-key (ed25519) and node-tls.json</text>
+<text x="24" y="178" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">• cluster-masters.json: each master&#x27;s pin</text>
+<text x="24" y="202" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">   and only the HASH of its key (0600)</text>
+<text x="24" y="240" font-size="16" font-weight="700" text-anchor="start" fill="#303246">Ports</text>
+<text x="24" y="264" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">8000 API · 8443 cluster (TLS) · 8001 HTTPS</text>
+</g>
+<line x1="488" y1="196" x2="704" y2="196" stroke="#1e66f5" stroke-width="3"/><path d="M700 188 L714 196 L700 204 z" fill="#1e66f5"/>
+<text x="600" y="184" font-size="14" font-weight="600" text-anchor="middle" fill="#073ca6">pair: code + master&#x27;s pin</text>
+<line x1="712" y1="262" x2="496" y2="262" stroke="#40a02b" stroke-width="3"/><path d="M500 254 L486 262 L500 270 z" fill="#40a02b"/>
+<text x="600" y="250" font-size="14" font-weight="600" text-anchor="middle" fill="#1f4e15">a new key + worker&#x27;s pin</text>
+<line x1="496" y1="330" x2="704" y2="330" stroke="#179299" stroke-width="5"/><path d="M700 320 L716 330 L700 340 z" fill="#179299"/><path d="M500 320 L484 330 L500 340 z" fill="#179299"/>
+<text x="600" y="316" font-size="14" font-weight="700" text-anchor="middle" fill="#0c4d50">mutual TLS 1.3, pins checked</text>
+<text x="600" y="358" font-size="14" font-weight="400" text-anchor="middle" fill="#42445b">chats, model list, queue</text>
+<g transform="translate(48 452)"><rect width="262" height="268" rx="14" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/><circle cx="34" cy="38" r="17" fill="#0c4d50"/><text x="34" y="44" font-size="17" font-weight="700" text-anchor="middle" fill="#ffffff">1</text><text x="62" y="44" font-size="19" font-weight="700" text-anchor="start" fill="#303246">Install on both</text><text x="20" y="84" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">The one-line installer,</text><text x="20" y="110" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">a model on each, and a</text><text x="20" y="136" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">main &quot;api_key&quot; in each</text><text x="20" y="162" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">run config (your own</text><text x="20" y="188" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">long random value).</text></g>
+<g transform="translate(326 452)"><rect width="262" height="268" rx="14" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/><circle cx="34" cy="38" r="17" fill="#073ca6"/><text x="34" y="44" font-size="17" font-weight="700" text-anchor="middle" fill="#ffffff">2</text><text x="62" y="44" font-size="19" font-weight="700" text-anchor="start" fill="#303246">Make a worker</text><text x="20" y="84" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">Add &quot;cluster&quot;:</text><text x="20" y="110" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">{&quot;role&quot;: &quot;worker&quot;,</text><text x="20" y="136" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">&quot;name&quot;: &quot;macm4&quot;}; start</text><text x="20" y="162" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">it with --host 0.0.0.0.</text><text x="20" y="188" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">It shows a 6-digit code</text><text x="20" y="214" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">(new every 10 minutes).</text></g>
+<g transform="translate(604 452)"><rect width="262" height="268" rx="14" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/><circle cx="34" cy="38" r="17" fill="#590fbb"/><text x="34" y="44" font-size="17" font-weight="700" text-anchor="middle" fill="#ffffff">3</text><text x="62" y="44" font-size="19" font-weight="700" text-anchor="start" fill="#303246">Pair on the master</text><text x="20" y="84" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">Settings › Cluster: the</text><text x="20" y="110" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">worker &quot;wants to join&quot;;</text><text x="20" y="136" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">type its code, Pair.</text><text x="20" y="162" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">Over a VPN: pair by its</text><text x="20" y="188" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">address. 5 wrong codes</text><text x="20" y="214" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">lock pairing 10 minutes.</text></g>
+<g transform="translate(882 452)"><rect width="262" height="268" rx="14" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/><circle cx="34" cy="38" r="17" fill="#801463"/><text x="34" y="44" font-size="17" font-weight="700" text-anchor="middle" fill="#ffffff">4</text><text x="62" y="44" font-size="19" font-weight="700" text-anchor="start" fill="#303246">Use it</text><text x="20" y="84" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">Ask the master for the</text><text x="20" y="110" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">worker&#x27;s model: the answer</text><text x="20" y="136" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">carries x-strata-worker.</text><text x="20" y="162" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">The master also hands a</text><text x="20" y="188" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">worker overflow when busy</text><text x="20" y="214" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">and it has the model idle.</text></g>
+<text x="48" y="764" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">Remove: Settings › Cluster › Remove (the worker forgets that master; its key stops working at once).</text>
 </svg>

@@ -30,7 +30,15 @@ It runs local MoE models (Qwen3.8 / Orca, Tiel Coder, MiniCPM-V, LFM2 and the ot
 support) behind OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, with a web app for chat, monitoring and
 settings. It is free and open source (MIT); see [Credits](#credits).
 
-![am2Strata v0.1.8 at a glance, in nine cards. Four API families: OpenAI, Anthropic, Responses and Gemini. Web app: chat with a live canvas, monitor, settings. Workshop: Hugging Face to GGUF, quantize, merge a LoRA adapter, training data. Sandbox VM (Linux with KVM): computer use in its own Debian VM. Computer tab (Linux): watch and take control of the agent's desktop. Security: HTTPS and wss, API keys with limits, usage per key. One live channel: a single WebSocket for pushes and requests. Media (build from source): songs, voices, images, video, speech to text. Install and verify: one line on six platforms, doctor and regression commands.](docs/media/infographic.webp)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/info-overview-dark.svg">
+  <img alt="am2Strata at a glance, in twelve cards: compatible APIs; bigger than RAM (hot experts in RAM, cold on the SSD, 2.5x llama.cpp's generation on a 16 GB Mac); cluster (pair a Mac or PC by code, small models on workers as experts); browser use; web app; Workshop; sandbox VM; Computer tab; coding agents; media; secure by default; install and verify on six platforms." src="docs/media/info-overview-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/info-tiers-dark.svg">
+  <img alt="Bigger than your RAM: the weights every token uses stay in GPU memory or RAM, hot experts are pinned in RAM, cold experts are read from the SSD when picked. Measured on a 16 GB Mac mini M4 with GLM-4.7-Flash (17.5 GB): 8.9 tokens per second against llama.cpp's 3.6, with no swapping." src="docs/media/info-tiers-light.svg">
+</picture>
 
 **New in v0.1.8** ([release notes](docs/releases/v0.1.8.md)):
 
