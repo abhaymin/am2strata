@@ -10,45 +10,62 @@
 <meta property="og:image" content="https://am2strata.am2.ai/assets/social.png">
 <meta property="og:url" content="https://am2strata.am2.ai/">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="theme-color" content="#070d1c">
+<meta name="theme-color" content="#1e1e2e">
 <!-- Ads: leave empty for house ads only; put the EthicalAds publisher id here to show paid, privacy-friendly ads
      (_headers already allows media.ethicalads.io and server.ethicalads.io). -->
 <meta name="am2-ads-publisher" content="">
+<script>try { const d = document.documentElement, t = localStorage.getItem("am2-theme"), m = localStorage.getItem("am2-motion");
+  if (t === "light" || t === "dark") d.dataset.theme = t;
+  d.dataset.motion = m === "on" || m === "off" ? m : (matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on");
+} catch (e) { document.documentElement.dataset.motion = matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on"; }</script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 @font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+/* Colours: Catppuccin Mocha (dark) and Latte (light). Text colours reach WCAG AAA, 7:1, on every background they sit
+   on (checked by tools/site/contrast.py); the bright Catppuccin hues (the -ui ones) are only for decoration. */
 :root {
-  --bg: #070d1c; --bg2: #0b1428; --card: #0f1a33; --card2: #13213f; --line: #20304f; --line2: #2c3f66;
-  --ink: #eef3f8; --muted: #a3b2c6; --faint: #6f7f96;
-  --teal: #5eead4; --cyan: #22d3ee; --blue: #60a5fa; --indigo: #818cf8; --violet: #a78bfa; --pink: #f0abfc;
-  --accent: var(--teal); --accent-ink: #042521;
+  --bg: #1e1e2e; --bg2: #181825; --card: #28283b; --card2: #2e2f44; --line: #45475a; --line2: #585b70; --crust: #11111b;
+  --ink: #cdd6f4; --muted: #b1b7cf; --faint: #b1b7cf;
+  --teal: #94e2d5; --cyan: #89dceb; --blue: #90b9fa; --indigo: #b4befe; --violet: #cca8f7; --pink: #f5c2e7;
+  --teal-ui: #94e2d5; --cyan-ui: #89dceb; --blue-ui: #89b4fa; --indigo-ui: #b4befe; --violet-ui: #cba6f7; --pink-ui: #f5c2e7;
+  --accent: var(--teal); --accent-ink: #11111b; --code-bg: #11111b; --code-ink: #cdd6f4; --scrim: rgba(30, 30, 46, .86);
   --shadow: 0 30px 60px -20px rgba(0, 0, 0, .55), 0 10px 24px -12px rgba(0, 0, 0, .5);
-  --glass: rgba(18, 31, 60, .55);
-  --grid: rgba(94, 234, 212, .09);
+  --glass: rgba(40, 40, 59, .78); --grid: rgba(148, 226, 213, .09); --sheen: rgba(255, 255, 255, .08);
   color-scheme: dark;
 }
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f7fb; --bg2: #ffffff; --card: #ffffff; --card2: #f7f9fd; --line: #dbe3ee; --line2: #c7d3e3;
-    --ink: #0c1626; --muted: #46566d; --faint: #6b7a90;
-    --teal: #0d9488; --cyan: #0891b2; --blue: #2563eb; --indigo: #4f46e5; --violet: #7c3aed; --pink: #c026d3;
-    --accent: #0f9f8f; --accent-ink: #ffffff;
-    --shadow: 0 30px 60px -24px rgba(16, 32, 64, .22), 0 10px 24px -14px rgba(16, 32, 64, .18);
-    --glass: rgba(255, 255, 255, .7);
-    --grid: rgba(13, 148, 136, .10);
-    color-scheme: light;
-  }
+@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
+  --bg: #eff1f5; --bg2: #e6e9ef; --card: #ffffff; --card2: #f7f8fb; --line: #bcc0cc; --line2: #9ca0b0; --crust: #dce0e8;
+  --ink: #303246; --muted: #42445b; --faint: #42445b;
+  --teal: #0c4d50; --cyan: #024b67; --blue: #073ca6; --indigo: #0323d5; --violet: #590fbb; --pink: #801463;
+  --teal-ui: #179299; --cyan-ui: #04a5e5; --blue-ui: #1e66f5; --indigo-ui: #7287fd; --violet-ui: #8839ef; --pink-ui: #ea76cb;
+  --accent: var(--teal); --accent-ink: #ffffff; --code-bg: #dce0e8; --code-ink: #303246; --scrim: rgba(239, 241, 245, .9);
+  --shadow: 0 30px 60px -24px rgba(76, 79, 105, .25), 0 10px 24px -14px rgba(76, 79, 105, .2);
+  --glass: rgba(255, 255, 255, .85); --grid: rgba(23, 146, 153, .12); --sheen: rgba(255, 255, 255, .5);
+  color-scheme: light;
+} }
+:root[data-theme="light"] {
+  --bg: #eff1f5; --bg2: #e6e9ef; --card: #ffffff; --card2: #f7f8fb; --line: #bcc0cc; --line2: #9ca0b0; --crust: #dce0e8;
+  --ink: #303246; --muted: #42445b; --faint: #42445b;
+  --teal: #0c4d50; --cyan: #024b67; --blue: #073ca6; --indigo: #0323d5; --violet: #590fbb; --pink: #801463;
+  --teal-ui: #179299; --cyan-ui: #04a5e5; --blue-ui: #1e66f5; --indigo-ui: #7287fd; --violet-ui: #8839ef; --pink-ui: #ea76cb;
+  --accent: var(--teal); --accent-ink: #ffffff; --code-bg: #dce0e8; --code-ink: #303246; --scrim: rgba(239, 241, 245, .9);
+  --shadow: 0 30px 60px -24px rgba(76, 79, 105, .25), 0 10px 24px -14px rgba(76, 79, 105, .2);
+  --glass: rgba(255, 255, 255, .85); --grid: rgba(23, 146, 153, .12); --sheen: rgba(255, 255, 255, .5);
+  color-scheme: light;
 }
-@media (prefers-color-scheme: light) { .hero .bgimg { opacity: .10; } .slab .lbl { text-shadow: none; } }
 * { box-sizing: border-box; }
-html { scroll-behavior: smooth; }
+html { scroll-behavior: smooth; scroll-padding-top: 84px; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
        -webkit-font-smoothing: antialiased; overflow-x: hidden; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+p a, .note a, footer a { text-decoration: underline; text-underline-offset: 3px; }
 img { max-width: 100%; display: block; }
 code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+.skip { position: absolute; left: 12px; top: -80px; z-index: 50; background: var(--accent); color: var(--accent-ink); padding: 12px 18px; border-radius: 10px; font-weight: 700; }
+.skip:focus { top: 12px; text-decoration: none; }
+.sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
 .grad { background: linear-gradient(100deg, var(--teal), var(--cyan) 35%, var(--indigo) 70%, var(--violet)); -webkit-background-clip: text;
         background-clip: text; color: transparent; }
@@ -57,17 +74,28 @@ code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monosp
 nav { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
       background: color-mix(in srgb, var(--bg) 72%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
 nav .wrap { display: flex; align-items: center; gap: 22px; height: 62px; }
-.brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; }
+.brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; min-height: 44px; }
 .brand:hover { text-decoration: none; }
 .brand svg { width: 28px; height: 28px; filter: drop-shadow(0 4px 12px rgba(94, 234, 212, .35)); }
-nav .links { margin-left: auto; display: flex; gap: 20px; font-size: 15px; }
+nav .links { margin-left: auto; display: flex; gap: 6px; font-size: 15px; align-items: center; }
+nav .links a { min-height: 44px; display: inline-flex; align-items: center; padding: 0 8px; border-radius: 8px; }
+.navbtn { font: inherit; font-size: 14px; min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+          padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--card); color: var(--ink); cursor: pointer; }
+.navbtn:hover { border-color: var(--accent); }
+.navbtn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ctrls { display: flex; gap: 6px; margin-left: 8px; }
+@media (max-width: 420px) { .ctrls { margin-left: 2px; gap: 4px; } nav .wrap { gap: 8px; } }
+@media (max-width: 760px) { .navbtn .t { display: none; } }
 nav .links a { color: var(--muted); }
 nav .links a:hover { color: var(--ink); text-decoration: none; }
-@media (max-width: 760px) { nav .links a.hide-sm { display: none; } nav .links { gap: 14px; } }
+@media (max-width: 760px) { nav .links a.hide-sm { display: none; } nav .links { gap: 0; } }
+@media (max-width: 420px) { nav .links a.hide-xs { display: none; } }
 
 /* hero */
 .hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); isolation: isolate; }
-.hero .bgimg { position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .22; z-index: -3; }
+.hero .bgimg { position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .16; z-index: -3; }
+.hero .scrim { position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, var(--scrim) 0%, var(--scrim) 52%, transparent 80%); }
+@media (max-width: 920px) { .hero .scrim { background: var(--scrim); } }
 .hero .glow { position: absolute; inset: -20% -10% auto auto; width: 70vw; height: 70vw; max-width: 900px; max-height: 900px; z-index: -2;
               background: radial-gradient(closest-side, rgba(94, 234, 212, .22), rgba(129, 140, 248, .12) 55%, transparent 72%); filter: blur(10px); }
 .hero .floor { position: absolute; left: -10%; right: -10%; bottom: -2px; height: 46%; z-index: -1; transform-origin: 50% 100%;
@@ -78,19 +106,19 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
 @keyframes floor { to { background-position: 0 54px, 0 0; } }
 .hero .wrap { display: grid; grid-template-columns: 1.05fr .95fr; align-items: center; gap: 30px; padding-top: 84px; padding-bottom: 92px; }
 @media (max-width: 920px) { .hero .wrap { grid-template-columns: 1fr; padding-top: 56px; } }
-.eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); padding: 5px 12px 5px 6px; border-radius: 99px;
+.eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; color: var(--ink); min-height: 44px; padding: 6px 14px 6px 8px; border-radius: 99px;
            border: 1px solid var(--line); background: var(--glass); backdrop-filter: blur(6px); margin-bottom: 22px; }
 .eyebrow b { background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 1px 9px; font-size: 12px; font-weight: 700; }
 .hero h1 { font-size: clamp(46px, 7.4vw, 88px); line-height: .98; margin: 0 0 20px; letter-spacing: -.03em; font-weight: 800; }
-.hero p.lead { font-size: clamp(19px, 2.2vw, 23px); color: var(--muted); max-width: 600px; margin: 0 0 32px; }
+.hero p.lead { font-size: clamp(19px, 2.2vw, 23px); color: var(--ink); max-width: 56ch; margin: 0 0 32px; }
 .cta { display: flex; flex-wrap: wrap; gap: 12px; }
 .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 600; border: 1px solid var(--line2);
        color: var(--ink); background: var(--glass); backdrop-filter: blur(8px); transition: transform .2s, border-color .2s, box-shadow .2s; }
 .btn:hover { text-decoration: none; border-color: var(--accent); transform: translateY(-2px); }
-.btn.primary { background: linear-gradient(135deg, var(--teal), var(--cyan)); color: var(--accent-ink); border-color: transparent;
-               box-shadow: 0 10px 30px -8px rgba(34, 211, 238, .55); }
+.btn.primary { background-color: var(--teal); background-image: linear-gradient(135deg, var(--teal), var(--cyan)); color: var(--accent-ink); border-color: transparent;
+               box-shadow: 0 10px 30px -8px color-mix(in srgb, var(--cyan-ui) 55%, transparent); }
 .badges { margin-top: 28px; display: flex; flex-wrap: wrap; gap: 8px; }
-.badge { font-size: 13px; padding: 4px 11px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--glass); }
+.badge { font-size: 14px; color: var(--ink) !important; padding: 4px 11px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--glass); }
 
 /* the 3D strata stack */
 .stage { perspective: 1100px; height: 460px; display: grid; place-items: center; }
@@ -104,19 +132,18 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
         background: linear-gradient(135deg, color-mix(in srgb, var(--c) 30%, transparent), color-mix(in srgb, var(--c) 8%, transparent));
         box-shadow: 0 0 40px -6px color-mix(in srgb, var(--c) 55%, transparent), inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent);
         backdrop-filter: blur(3px); animation: bob 6s ease-in-out infinite; }
-.slab.s1 { --c: var(--teal); --z: 150px; transform: translateZ(var(--z)); animation-delay: 0s; }
-.slab.s2 { --c: var(--blue); --z: 75px; transform: translateZ(var(--z)); animation-delay: -2s; }
-.slab.s3 { --c: var(--violet); --z: 0px; transform: translateZ(var(--z)); animation-delay: -4s; }
+.slab.s1 { --c: var(--teal-ui); --z: 150px; transform: translateZ(var(--z)); animation-delay: 0s; }
+.slab.s2 { --c: var(--blue-ui); --z: 75px; transform: translateZ(var(--z)); animation-delay: -2s; }
+.slab.s3 { --c: var(--violet-ui); --z: 0px; transform: translateZ(var(--z)); animation-delay: -4s; }
 @keyframes bob { 50% { transform: translateZ(calc(var(--z) + 12px)); } }
-.slab .lbl { position: absolute; left: 20px; bottom: 16px; font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: .02em;
-             text-shadow: 0 2px 10px rgba(0, 0, 0, .5); }
+.slab .lbl { position: absolute; left: 20px; bottom: 16px; font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: .02em; }
 .slab .lbl small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
 .slab .cells { position: absolute; right: 16px; top: 16px; display: grid; grid-template-columns: repeat(6, 16px); gap: 6px; }
 .slab .cells i { width: 16px; height: 16px; border-radius: 4px; background: color-mix(in srgb, var(--c) 22%, transparent);
                  border: 1px solid color-mix(in srgb, var(--c) 40%, transparent); }
 .slab .cells i.on { background: var(--c); box-shadow: 0 0 12px var(--c); animation: blink 3.2s ease-in-out infinite; }
 @keyframes blink { 50% { opacity: .45; } }
-.spark { position: absolute; width: 12px; height: 12px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 16px var(--teal), 0 0 4px #fff;
+.spark { position: absolute; width: 12px; height: 12px; border-radius: 50%; background: var(--teal-ui); box-shadow: 0 0 16px var(--teal-ui), 0 0 4px #fff;
          left: var(--x); top: var(--y); transform: translateZ(0); animation: rise 4.2s cubic-bezier(.45, 0, .2, 1) infinite; animation-delay: var(--d); opacity: 0; }
 @keyframes rise { 0% { transform: translateZ(4px); opacity: 0; } 12% { opacity: 1; } 80% { opacity: 1; } 100% { transform: translateZ(160px); opacity: 0; } }
 .stage-cap { text-align: center; font-size: 14px; color: var(--faint); margin-top: -18px; }
@@ -126,14 +153,14 @@ section { padding: 96px 0; position: relative; }
 section.alt { background: linear-gradient(180deg, var(--bg2), var(--bg)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .kicker { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700; color: var(--accent); margin: 0 0 10px; }
 h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; letter-spacing: -.02em; }
-.sub { color: var(--muted); max-width: 740px; margin: 0 0 44px; font-size: 18px; }
+.sub { color: var(--muted); max-width: 68ch; margin: 0 0 44px; font-size: 18px; }
 .note { font-size: 14px; color: var(--faint); margin-top: 20px; }
 
 /* 3D tilt surfaces */
 .tilt { transform-style: preserve-3d; transform: perspective(900px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) translateZ(0);
         transition: transform .35s cubic-bezier(.2, .7, .2, 1), box-shadow .35s, border-color .35s; will-change: transform; position: relative; }
 .tilt::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity .3s;
-               background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), rgba(255, 255, 255, .10), transparent 45%); }
+               background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), var(--sheen), transparent 45%); }
 .tilt:hover::after { opacity: 1; }
 .tilt:hover { box-shadow: 0 40px 70px -24px rgba(0, 0, 0, .6), 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
 
@@ -144,7 +171,7 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
              background: color-mix(in srgb, var(--c, var(--teal)) 16%, transparent); border: 1px solid color-mix(in srgb, var(--c, var(--teal)) 40%, transparent); }
 .card .ico svg { width: 22px; height: 22px; stroke: var(--c, var(--teal)); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .card h3 { margin: 0 0 8px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; transform: translateZ(20px); }
-.card .tag { font-size: 12px; font-weight: 600; color: var(--c, var(--accent)); border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
+.card .tag { font-size: 13px; font-weight: 600; color: var(--c, var(--accent)); border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
              border-radius: 99px; padding: 2px 9px; white-space: nowrap; }
 .card p { margin: 0; color: var(--muted); font-size: 16px; transform: translateZ(10px); }
 .card.new { border-color: color-mix(in srgb, var(--c, var(--teal)) 45%, var(--line)); }
@@ -167,13 +194,13 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 .stat .n { font-size: clamp(28px, 2.9vw, 40px); white-space: nowrap; font-weight: 800; line-height: 1; letter-spacing: -.02em; }
 .stat .l { color: var(--muted); font-size: 14px; margin-top: 8px; }
 .chart { padding: 24px; border-radius: 20px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
-.chart h4 { margin: 0 0 4px; font-size: 18px; }
-.chart .src { color: var(--faint); font-size: 13px; margin: 0 0 18px; }
+.chart h3 { margin: 0 0 4px; font-size: 18px; }
+.chart .src { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
 .row { display: grid; grid-template-columns: 150px 1fr 54px; align-items: center; gap: 12px; margin: 10px 0; font-size: 15px; }
 .row .t { height: 14px; border-radius: 99px; background: color-mix(in srgb, var(--line) 70%, transparent); overflow: hidden; }
 .row .f { height: 100%; width: 0; border-radius: 99px; background: color-mix(in srgb, var(--muted) 55%, transparent); transition: width 1.4s cubic-bezier(.2, .7, .2, 1); }
 .chart.in .f { width: var(--w); }
-.row.us .f { background: linear-gradient(90deg, var(--teal), var(--cyan)); box-shadow: 0 0 14px rgba(94, 234, 212, .45); }
+.row.us .f { background: linear-gradient(90deg, var(--teal-ui), var(--cyan-ui)); }
 .row.us { font-weight: 700; }
 .row .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .row.us .v { color: var(--accent); }
@@ -194,7 +221,17 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 figcaption { padding: 13px 16px; font-size: 15px; color: var(--muted); }
 figcaption b { color: var(--ink); font-weight: 600; }
 .info { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 22px; }
-.info .shot img { aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; background: #0b1326; }
+.info .shot img { aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; background: var(--bg); }
+
+/* text versions of pictures */
+.textver { margin: 0 0 26px; padding: 14px 18px; border: 1px solid var(--line2); border-radius: 14px; background: var(--card); max-width: 80ch; }
+.textver summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
+.textver p { color: var(--muted); }
+/* glossary */
+.gloss { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 4px 28px; margin: 0; }
+.gloss div { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.gloss dt { font-weight: 700; }
+.gloss dd { margin: 2px 0 0; color: var(--muted); }
 
 /* cluster */
 .pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 28px; }
@@ -213,7 +250,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .vid img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
 .vid:hover img { transform: scale(1.05); }
 .vid.short img { aspect-ratio: 9 / 16; max-height: 360px; object-position: center; }
-.vid .dur { position: absolute; right: 8px; bottom: 8px; background: rgba(0, 0, 0, .78); color: #fff; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
+.vid .dur { position: absolute; right: 8px; bottom: 8px; background: #11111b; color: #ffffff; font-size: 13px; padding: 1px 6px; border-radius: 6px; }
 .vid .play { position: absolute; inset: 0; margin: auto; width: 58px; height: 58px; border-radius: 50%; background: rgba(7, 13, 28, .6);
              border: 1px solid rgba(255, 255, 255, .3); backdrop-filter: blur(4px); opacity: 0; transform: scale(.85); transition: .25s; }
 .vid .play::after { content: ""; position: absolute; left: 23px; top: 17px; border-left: 17px solid #fff; border-top: 12px solid transparent; border-bottom: 12px solid transparent; }
@@ -222,18 +259,18 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .vid > span:last-child { padding: 0 16px; color: var(--muted); font-size: 15px; }
 .vid.feature { grid-column: span 2; }
 @media (max-width: 620px) { .vid.feature { grid-column: auto; } }
-.vid .new { position: absolute; left: 10px; top: 10px; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
-            background: var(--teal); color: #042521; border-radius: 99px; padding: 2px 9px; }
+.vid .new { position: absolute; left: 10px; top: 10px; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
+            background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 2px 9px; }
 
 /* install */
 .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
-.tab { padding: 8px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font: inherit; font-size: 15px; }
+.tab { min-height: 44px; padding: 8px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font: inherit; font-size: 15px; }
 .tab[aria-selected="true"] { color: var(--ink); border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
-.code { position: relative; background: #050a16; color: #d8e6f3; border: 1px solid var(--line2); border-radius: 16px; padding: 20px 64px 20px 20px;
+.code { position: relative; background: var(--code-bg); color: var(--code-ink); border: 1px solid var(--line2); border-radius: 16px; padding: 20px 64px 20px 20px;
         overflow-x: auto; white-space: pre; box-shadow: var(--shadow); }
-.code::before { content: "$ "; color: var(--teal); }
-.copy { position: absolute; top: 12px; right: 12px; font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2b3a58;
-        background: #111a2e; color: #d8e6f3; cursor: pointer; }
+.code::before { content: "$ "; color: var(--accent); }
+.copy { position: absolute; top: 6px; right: 8px; font: inherit; font-size: 14px; min-width: 64px; min-height: 44px; padding: 6px 12px; border-radius: 10px;
+        border: 1px solid var(--line2); background: var(--card); color: var(--ink); cursor: pointer; }
 .copy:hover { border-color: var(--teal); }
 .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; margin-top: 30px; }
 .steps .card p code { color: var(--ink); }
@@ -252,14 +289,14 @@ tr:last-child td { border-bottom: 0; }
 .pillar { padding: 24px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
 .pillar b { display: block; font-size: 19px; margin-bottom: 6px; }
 .pillar b::before { content: ""; display: block; width: 32px; height: 4px; border-radius: 4px; margin-bottom: 14px;
-                    background: linear-gradient(90deg, var(--teal), var(--indigo)); }
+                    background: linear-gradient(90deg, var(--teal-ui), var(--indigo-ui)); }
 .pillar span { color: var(--muted); font-size: 16px; }
 
 footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); background: var(--bg2); }
 /* ads: two quiet, labelled slots; fixed size, no motion, no pop-ups */
 .adslot { margin: 34px auto 0; max-width: 760px; min-height: 92px; border: 1px dashed var(--line2); border-radius: 16px; padding: 14px 16px;
           display: flex; align-items: center; gap: 14px; background: color-mix(in srgb, var(--card) 60%, transparent); position: relative; }
-.adslot .adlbl { position: absolute; top: -9px; left: 14px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+.adslot .adlbl { position: absolute; top: -10px; left: 14px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
                  background: var(--bg); padding: 0 6px; }
 .adslot.house a.house { display: flex; align-items: center; gap: 14px; color: var(--ink); width: 100%; }
 .adslot.house a.house:hover { text-decoration: none; }
@@ -270,14 +307,14 @@ footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top:
 .adslot .htxt span { color: var(--muted); font-size: 14px; }
 .adslot .hgo { margin-left: auto; flex: none; font-size: 14px; color: var(--accent); white-space: nowrap; }
 @media (max-width: 560px) { .adslot .hgo { display: none; } }
-.adline { font-size: 13px; color: var(--faint); margin-top: 18px; min-height: 20px; }
-.adline .adlbl2 { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
+.adline { font-size: 14px; color: var(--faint); margin-top: 18px; min-height: 20px; }
+.adline .adlbl2 { text-transform: uppercase; letter-spacing: .1em; font-size: 12px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
 /* EthicalAds' own markup, toned to the page */
 .adslot [data-ea-publisher] { width: 100%; }
 .adslot .ea-content { background: transparent !important; box-shadow: none !important; margin: 0 !important; }
 .adslot .ea-callout a { color: var(--faint) !important; }
 footer .cols { display: flex; flex-wrap: wrap; gap: 30px; justify-content: space-between; }
-footer p { margin: 6px 0; }
+footer p { margin: 6px 0; max-width: 68ch; }
 
 /* reveal on scroll */
 /* the rise uses `translate`, so it never fights a tilt's `transform` */
@@ -291,50 +328,62 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
 .vw-stage { position: absolute; inset: 64px 0 76px; overflow: hidden; touch-action: none; cursor: grab; }
 .vw-stage.drag { cursor: grabbing; }
 .vw-stage img { position: absolute; left: 50%; top: 50%; max-width: min(94vw, 1800px); max-height: calc(100vh - 160px); transform-origin: 0 0;
-                user-select: none; -webkit-user-drag: none; border-radius: 10px; box-shadow: 0 30px 80px rgba(0, 0, 0, .6); background: #0b1326; }
+                user-select: none; -webkit-user-drag: none; border-radius: 10px; box-shadow: 0 30px 80px rgba(0, 0, 0, .6); background: #1e1e2e; }
 .vw-top, .vw-bot { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 12px 16px; }
 .vw-top { top: 0; justify-content: space-between; }
 .vw-bot { bottom: 0; justify-content: center; flex-wrap: wrap; }
 .vw-cap { font-size: 16px; max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.vw-cap small { color: #a3b2c6; margin-left: 10px; }
-.vw-btn { font: inherit; font-size: 14px; color: #eef3f8; background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .18); border-radius: 10px;
+.vw-cap small { color: #c3c9de; margin-left: 10px; }
+.vw-btn { font: inherit; font-size: 15px; min-height: 44px; min-width: 44px; justify-content: center; color: #eef3f8; background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .18); border-radius: 10px;
           padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
 .vw-btn:hover { background: rgba(255, 255, 255, .16); text-decoration: none; }
 .vw-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; }
 .vw-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center; z-index: 2; }
 .vw-prev { left: 14px; } .vw-next { right: 14px; }
-.vw-zoom { min-width: 56px; text-align: center; color: #a3b2c6; font-variant-numeric: tabular-nums; }
+.vw-zoom { min-width: 56px; text-align: center; color: #c3c9de; font-variant-numeric: tabular-nums; }
 
+:root[data-motion="off"] *, :root[data-motion="off"] *::before, :root[data-motion="off"] *::after {
+  animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+:root[data-motion="off"] .reveal { opacity: 1; translate: none; }
+:root[data-motion="off"] .spark { display: none; }
+:root[data-motion="off"] .stack { transform: rotateX(58deg) rotateZ(-34deg); }
+/* the system's reduced-motion setting, unless the visitor chose "Play motion" */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
-  .reveal { opacity: 1; translate: none; }
-  .spark { display: none; }
+  :root:not([data-motion="on"]) *, :root:not([data-motion="on"]) *::before, :root:not([data-motion="on"]) *::after {
+    animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  :root:not([data-motion="on"]) .reveal { opacity: 1; translate: none; }
+  :root:not([data-motion="on"]) .spark { display: none; }
 }
 </style>
 <noscript><style>.reveal { opacity: 1; translate: none; } .row .f { width: var(--w); }</style></noscript>
 </head>
 <body>
+<a class="skip" href="#content">Skip to content</a>
 
-<nav>
+<nav aria-label="Main">
   <div class="wrap">
     <a class="brand" href="#top" aria-label="am2Strata home">
       <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0f1830"/><path d="M7 10h18M7 16h13M7 22h18" stroke="#5eead4" stroke-width="3" stroke-linecap="round"/></svg>
       am2Strata
     </a>
     <div class="links">
-      <a href="#features">Features</a>
+      <a class="hide-xs" href="#features">Features</a>
       <a class="hide-sm" href="#ram">Bigger than RAM</a>
       <a class="hide-sm" href="#cluster">Cluster</a>
       <a class="hide-sm" href="#screens">Screens</a>
       <a class="hide-sm" href="#videos">Videos</a>
       <a href="#install">Install</a>
-      <a href="https://github.com/abhaymin/am2strata">GitHub</a>
+      <a class="hide-xs" href="https://github.com/abhaymin/am2strata">GitHub</a>
+      <div class="ctrls">
+        <button class="navbtn" id="theme-btn" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg><span class="t" id="theme-t">Auto</span></button>
+        <button class="navbtn" id="motion-btn" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6v12M15 6v12"/></svg><span class="t" id="motion-t">Pause motion</span></button>
+      </div>
     </div>
   </div>
 </nav>
 
 <header class="hero" id="top">
-  <div class="bgimg" aria-hidden="true"></div><div class="glow" aria-hidden="true"></div><div class="floor" aria-hidden="true"></div>
+  <div class="bgimg" aria-hidden="true"></div><div class="glow" aria-hidden="true"></div><div class="floor" aria-hidden="true"></div><div class="scrim" aria-hidden="true"></div>
   <div class="wrap">
     <div>
       <a class="eyebrow" href="#ram"><b>New</b> Models bigger than your RAM, 2.5x llama.cpp on a 16 GB Mac</a>
@@ -370,6 +419,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   </div>
 </header>
 
+<main id="content">
 <section id="features">
   <div class="wrap">
     <p class="kicker reveal">What it does</p>
@@ -436,11 +486,11 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
       those close and leaves the rest on the SSD, so a model larger than your memory runs without swapping.</p>
     <div class="split">
       <div class="tiers">
-        <div class="tier tilt reveal" style="--c: var(--teal)"><div class="bar"></div><div><b>GPU memory and RAM</b>
+        <div class="tier tilt reveal" style="--c: var(--teal-ui)"><div class="bar"></div><div><b>GPU memory and RAM</b>
           <span>Attention, shared experts and the output head: the weights every token uses, always resident.</span></div></div>
-        <div class="tier tilt reveal" style="--c: var(--blue)"><div class="bar"></div><div><b>Hot experts, pinned in RAM</b>
+        <div class="tier tilt reveal" style="--c: var(--blue-ui)"><div class="bar"></div><div><b>Hot experts, pinned in RAM</b>
           <span>A learned profile ranks the experts; the hot ones are pinned so the OS cannot evict them. 98% of routing lands here.</span></div></div>
-        <div class="tier tilt reveal" style="--c: var(--violet)"><div class="bar"></div><div><b>Cold experts on the SSD</b>
+        <div class="tier tilt reveal" style="--c: var(--violet-ui)"><div class="bar"></div><div><b>Cold experts on the SSD</b>
           <span>Read only when the router picks them, all of a step's experts at once. Prompts are grouped by expert, so each is read once per chunk.</span></div></div>
         <p class="note reveal">Hand-written SIMD kernels (AVX2 on x86, NEON on Apple silicon) give exactly the same results as the
           plain ones; tokens are checked against llama.cpp.</p>
@@ -452,7 +502,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
           <div class="stat tilt reveal"><div class="n grad">17.5 GB</div><div class="l">model on a 16 GB Mac mini M4</div></div>
         </div>
         <div class="chart reveal" id="chart">
-          <h4>GLM-4.7-Flash on a 16 GB Mac mini M4</h4>
+          <h3>GLM-4.7-Flash on a 16 GB Mac mini M4</h3>
           <p class="src">512-token prompt, 64 generated tokens, tokens per second. am2Strata at 8-10 threads, llama.cpp measured at 4.</p>
           <div class="grp">Generation</div>
           <div class="row us"><span>am2Strata</span><div class="t"><div class="f" style="--w: 98.9%"></div></div><span class="v">8.9</span></div>
@@ -482,11 +532,21 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
       <div class="pair tilt reveal"><div class="n">03</div><b>Mutual TLS 1.3</b><span>From then on, only pinned, encrypted connections.</span></div>
       <div class="pair tilt reveal"><div class="n">04</div><b>Many brains</b><span>Workers answer requests and serve small models as experts.</span></div>
     </div>
+    <details class="textver reveal" id="cluster-text"><summary>What each machine keeps (the diagram as text)</summary>
+      <p><b>Master</b> (for example the Linux PC with the big GPUs): its main API key, its certificate (node-tls.json, which is its
+        pin), and cluster-workers.json with each worker's address, pin and the key it was given. Clients only ever talk to the
+        master; their keys are never sent on to a worker.</p>
+      <p><b>Worker</b> (for example a Mac mini): its own main API key, which never leaves it; its node key and certificate; and
+        cluster-masters.json with each master's pin and only the hash of the key it gave that master. Ports: 8000 for the API,
+        8443 for the cluster (TLS), 8001 for HTTPS.</p>
+      <p><b>Pairing:</b> the worker shows a 6-digit code, new every 10 minutes; five wrong codes lock pairing for 10 minutes. To
+        remove a worker: Settings › Cluster › Remove; its key stops working at once.</p>
+    </details>
     <div class="info">
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup.svg" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
-        <img src="assets/cluster-setup.svg" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+        <img src="assets/cluster-setup-dark.svg" data-themed="cluster-setup" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
-        <figcaption><b>Setup.</b> What each machine needs, and which keys exist (never shown).</figcaption></figure>
+        <figcaption><b>Setup.</b> What each machine needs, and which keys exist (never shown). <a href="#cluster-text">Read it as text</a>.</figcaption></figure>
       <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster.webp" data-cap="Settings › Cluster" data-sub="A Mac mini M4 paired as a worker">
         <img src="assets/cluster.webp" alt="Settings, Cluster: a Mac mini M4 paired as a worker, answering, encrypted" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
@@ -503,18 +563,18 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
       zoom in and move around.</p>
     <h3 class="vh reveal">Infographics</h3>
     <div class="info">
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-overview.svg" data-cap="What is in am2Strata" data-sub="Twelve parts at a glance">
-        <img src="assets/info-overview.svg" alt="am2Strata: twelve features at a glance" loading="lazy" width="1600" height="1060">
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-overview-dark.svg" data-themed="info-overview" data-cap="What is in am2Strata" data-sub="Twelve parts at a glance">
+        <img src="assets/info-overview-dark.svg" data-themed="info-overview" alt="am2Strata: twelve features at a glance" loading="lazy" width="1600" height="1060">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
-        <figcaption><b>Overview.</b> Twelve parts of am2Strata at a glance.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-tiers.svg" data-cap="Bigger than your RAM" data-sub="The three tiers, and the Mac measurement">
-        <img src="assets/info-tiers.svg" alt="How the engine keeps hot experts in RAM and cold ones on the SSD, with measured speeds" loading="lazy" width="1600" height="960">
+        <figcaption><b>Overview.</b> Twelve parts of am2Strata at a glance. <a href="#features">Read it as text</a>.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-tiers-dark.svg" data-themed="info-tiers" data-cap="Bigger than your RAM" data-sub="The three tiers, and the Mac measurement">
+        <img src="assets/info-tiers-dark.svg" data-themed="info-tiers" alt="How the engine keeps hot experts in RAM and cold ones on the SSD, with measured speeds" loading="lazy" width="1600" height="960">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
-        <figcaption><b>Bigger than RAM.</b> The three tiers and the 16 GB Mac measurement.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup.svg" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
-        <img src="assets/cluster-setup.svg" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
+        <figcaption><b>Bigger than RAM.</b> The three tiers and the 16 GB Mac measurement. <a href="#ram">Read it as text</a>.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+        <img src="assets/cluster-setup-dark.svg" data-themed="cluster-setup" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
-        <figcaption><b>Cluster setup.</b> Pairing a worker with the master.</figcaption></figure>
+        <figcaption><b>Cluster setup.</b> Pairing a worker with the master. <a href="#cluster">Read it as text</a>.</figcaption></figure>
     </div>
     <h3 class="vh reveal">The web app</h3>
     <div class="shots">
@@ -559,32 +619,32 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
     <h3 class="vh reveal">Demos and what's new</h3>
     <div class="vids">
       <a class="vid feature tilt reveal" href="https://www.youtube.com/watch?v=ByP6i4dtRdk" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/ByP6i4dtRdk.webp" alt="" loading="lazy" width="640" height="360"><span class="new">New</span><span class="dur">2:48</span><span class="play" aria-hidden="true"></span></span>
-        <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span>A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span></a>
+        <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span>A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
-        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span>The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span></a>
+        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span>The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
-        <b>Run AI on Your Own PC: the 10-minute tour</b><span>Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span></a>
+        <b>Run AI on Your Own PC: the 10-minute tour</b><span>Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
-        <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span>Voices in eleven languages, code and pictures, all on one PC with no cloud.</span></a>
+        <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span>Voices in eleven languages, code and pictures, all on one PC with no cloud.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
-        <b>Songs That Sing Your Lyrics (v0.1.4)</b><span>Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span></a>
+        <b>Songs That Sing Your Lyrics (v0.1.4)</b><span>Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
     <h3 class="vh reveal">Made with am2Strata</h3>
     <div class="vids">
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
-        <b>The Moon Woman Singing to Maven</b><span>A cinematic ballad sung across the empty space to Earth.</span></a>
+        <b>The Moon Woman Singing to Maven</b><span>A cinematic ballad sung across the empty space to Earth.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
-        <b>Lofi for Coding: 1 Hour of Deep Focus</b><span>Twenty original instrumental tracks for programming and study.</span></a>
+        <b>Lofi for Coding: 1 Hour of Deep Focus</b><span>Twenty original instrumental tracks for programming and study.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
-        <b>Moonlight on the Sea</b><span>A slow, calm song to let the day go.</span></a>
+        <b>Moonlight on the Sea</b><span>A slow, calm song to let the day go.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
-        <b>Little Moon, Goodnight</b><span>A gentle lullaby for sleep.</span></a>
+        <b>Little Moon, Goodnight</b><span>A gentle lullaby for sleep.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
-        <b>Peace and Harmony</b><span>A calm song about kindness and living as one.</span></a>
+        <b>Peace and Harmony</b><span>A calm song about kindness and living as one.</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vid short tilt reveal" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
-        <b>The Moon Woman Singing to Maven (Short)</b><span>The ballad's chorus, vertical.</span></a>
+        <b>The Moon Woman Singing to Maven (Short)</b><span>The ballad's chorus, vertical.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
-    <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">am2Strata on YouTube</a>.</p>
+    <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">am2Strata on YouTube<span class="sr"> (opens in a new tab)</span></a>.</p>
     <aside class="adslot" id="ad-main" aria-label="Sponsored"><span class="adlbl">Sponsored</span></aside>
   </div>
 </section>
@@ -644,10 +704,40 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   </div>
 </section>
 
+<section id="glossary">
+  <div class="wrap">
+    <p class="kicker">Glossary</p>
+    <h2>Words and abbreviations on this page</h2>
+    <dl class="gloss">
+      <div><dt>API</dt><dd>Application programming interface: the address and rules other programs use to talk to am2Strata.</dd></div>
+      <div><dt>AVX2, NEON</dt><dd>Instruction sets that let a processor do many small calculations at once: AVX2 on Intel and AMD, NEON on Arm chips such as Apple silicon.</dd></div>
+      <div><dt>CLI</dt><dd>Command-line interface: commands typed in a terminal.</dd></div>
+      <div><dt>Cluster</dt><dd>Several of your own computers working together, one acting as the master and the others as workers.</dd></div>
+      <div><dt>Expert</dt><dd>One of the many smaller parts of a mixture-of-experts model; each word uses only a few of them.</dd></div>
+      <div><dt>GGUF</dt><dd>A file format for AI models that run on your own computer.</dd></div>
+      <div><dt>GPU</dt><dd>Graphics processing unit: the graphics card, which also runs AI models fast.</dd></div>
+      <div><dt>HTTPS, TLS</dt><dd>Encrypted connections. Mutual TLS means both computers prove who they are to each other.</dd></div>
+      <div><dt>KVM</dt><dd>Kernel-based virtual machine: Linux's built-in way to run a separate computer inside your computer.</dd></div>
+      <div><dt>LoRA</dt><dd>A small add-on that changes how a model behaves, made by fine-tuning.</dd></div>
+      <div><dt>MCP</dt><dd>Model Context Protocol: a standard way for AI apps to use tools.</dd></div>
+      <div><dt>MIT</dt><dd>A short open-source licence: free to use, change and share.</dd></div>
+      <div><dt>Mixture of experts (MoE)</dt><dd>A model made of many experts; a router picks a few for each word.</dd></div>
+      <div><dt>RAM</dt><dd>Random-access memory: the computer's fast working memory.</dd></div>
+      <div><dt>SIMD</dt><dd>Single instruction, multiple data: doing the same calculation on many numbers at once.</dd></div>
+      <div><dt>SSD</dt><dd>Solid-state drive: the computer's storage disk.</dd></div>
+      <div><dt>Swap</dt><dd>Disk space the system uses as extra memory when RAM is full; much slower than RAM.</dd></div>
+      <div><dt>Tokens per second</dt><dd>How fast a model reads or writes text; a token is about three quarters of a word.</dd></div>
+      <div><dt>VM</dt><dd>Virtual machine: a separate computer running inside your computer.</dd></div>
+    </dl>
+  </div>
+</section>
+</main>
+
 <footer>
   <div class="wrap cols">
     <div>
-      <p><b>am2Strata</b> · free and open source (MIT)</p>
+      <p><b>am2Strata</b> · free and open source (MIT) · <a href="#glossary">Glossary</a></p>
+      <p>Designed to WCAG 2.2 AAA: 7:1 text contrast in both themes, keyboard use throughout, a pause for all motion.</p>
       <p><a href="https://github.com/abhaymin/am2strata">GitHub</a> · <a href="https://github.com/abhaymin/am2strata/releases/latest">Downloads</a>
         · <a href="https://github.com/abhaymin/am2strata/issues">Report an issue</a> · <a href="https://github.com/sponsors/abhaymin">Sponsor</a></p>
     </div>
@@ -665,7 +755,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   <div class="vw-top">
     <div class="vw-cap" id="vw-cap"></div>
     <div style="display:flex;gap:8px">
-      <a class="vw-btn" id="vw-open" href="#" target="_blank" rel="noopener" title="Open the full-size image"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg><span>Full size</span></a>
+      <a class="vw-btn" id="vw-open" href="#" target="_blank" rel="noopener" title="Open the full-size image"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg><span>Full size</span><span class="sr"> (opens in a new tab)</span></a>
       <a class="vw-btn" id="vw-dl" href="#" download title="Download"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg><span>Download</span></a>
       <button class="vw-btn" id="vw-close" type="button" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     </div>
@@ -684,8 +774,47 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
 
 <script>
 (() => {
-  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const root = document.documentElement;
+  const still = () => root.dataset.motion === "off";
   const fine = matchMedia("(pointer: fine)").matches;
+
+  // colour theme: Auto (the system's), Light (Catppuccin Latte) or Dark (Catppuccin Mocha); remembered on this device
+  const sysLight = matchMedia("(prefers-color-scheme: light)");
+  const themeBtn = document.getElementById("theme-btn"), themeT = document.getElementById("theme-t");
+  const effective = () => root.dataset.theme || (sysLight.matches ? "light" : "dark");
+  const applyTheme = () => {
+    const pref = root.dataset.theme || "auto", eff = effective();
+    themeT.textContent = pref[0].toUpperCase() + pref.slice(1);
+    themeBtn.setAttribute("aria-label", "Colour theme: " + themeT.textContent + (pref === "auto" ? " (follows your system, now " + eff + ")" : "") + ". Change theme");
+    document.querySelector('meta[name="theme-color"]').content = eff === "light" ? "#eff1f5" : "#1e1e2e";
+    for (const el of document.querySelectorAll("[data-themed]")) {
+      const src = "assets/" + el.dataset.themed + "-" + eff + ".svg";
+      if (el.tagName === "IMG") { if (el.getAttribute("src") !== src) el.setAttribute("src", src); } else el.dataset.view = src;
+    }
+  };
+  themeBtn.addEventListener("click", () => {
+    const next = { auto: "light", light: "dark", dark: "auto" }[root.dataset.theme || "auto"];
+    if (next === "auto") delete root.dataset.theme; else root.dataset.theme = next;
+    try { localStorage.setItem("am2-theme", next); } catch (e) {}
+    applyTheme();
+  });
+  sysLight.addEventListener("change", applyTheme);
+  applyTheme();
+
+  // motion: one control pauses every animation and the 3D tilt (WCAG 2.2.2 and 2.3.3)
+  const motionBtn = document.getElementById("motion-btn"), motionT = document.getElementById("motion-t");
+  const applyMotion = () => {
+    motionBtn.setAttribute("aria-pressed", String(still()));
+    motionT.textContent = still() ? "Play motion" : "Pause motion";
+    motionBtn.setAttribute("aria-label", still() ? "Play motion: animations and tilt are paused" : "Pause motion: stop animations and tilt");
+    if (still()) for (const el of document.querySelectorAll(".tilt")) { el.style.setProperty("--rx", "0deg"); el.style.setProperty("--ry", "0deg"); }
+  };
+  motionBtn.addEventListener("click", () => {
+    root.dataset.motion = still() ? "on" : "off";
+    try { localStorage.setItem("am2-motion", root.dataset.motion); } catch (e) {}
+    applyMotion();
+  });
+  applyMotion();
 
   // install tabs and copy
   for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => {
@@ -716,11 +845,12 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(sweep); } }, { passive: true });
   addEventListener("hashchange", () => setTimeout(sweep, 50));
   setTimeout(sweep, 400);
-  if (reduce) for (const el of document.querySelectorAll(".reveal")) show1(el);
+  if (still()) for (const el of document.querySelectorAll(".reveal")) show1(el);
 
   // 3D tilt on cards and screens (mouse and pen only)
-  if (fine && !reduce) for (const el of document.querySelectorAll(".tilt")) {
+  if (fine) for (const el of document.querySelectorAll(".tilt")) {
     el.addEventListener("pointermove", e => {
+      if (still()) return;
       const r = el.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
       el.style.setProperty("--ry", ((x - .5) * 10).toFixed(2) + "deg");
       el.style.setProperty("--rx", ((.5 - y) * 8).toFixed(2) + "deg");
@@ -732,7 +862,8 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
 
   // the hero's stack follows the pointer
   const stack = document.getElementById("stack");
-  if (fine && !reduce) addEventListener("pointermove", e => {
+  if (fine) addEventListener("pointermove", e => {
+    if (still()) return;
     const x = e.clientX / innerWidth - .5, y = e.clientY / innerHeight - .5;
     stack.style.setProperty("--tx", (x * 18).toFixed(2) + "deg");
     stack.style.setProperty("--ty", (y * -12).toFixed(2) + "deg");

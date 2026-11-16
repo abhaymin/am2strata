@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 960" width="1600" height="960" font-family="Outfit, Inter, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
+<title id="t">Bigger than your RAM: how am2Strata runs a model that does not fit</title>
+<desc id="d">Three tiers. The weights every token uses sit in GPU memory or RAM; the experts a learned profile ranks hot are pinned in RAM; the cold experts stay on the SSD and are read in parallel only when the router picks them. Measured on a Mac mini M4 with 16 GB running GLM-4.7-Flash (17.5 GB): am2Strata generates 8.9 tokens per second without swapping, llama.cpp 3.6 with plain mmap and 2.05 by default while writing about 98 GB of swap. Prompt: am2Strata 16.9, llama.cpp 17.3 (mmap) and 11.4 (default).</desc>
+<rect width="1600" height="960" rx="28" fill="#eff1f5"/>
+<text x="64" y="92" font-size="46" font-weight="700" text-anchor="start" fill="#303246">Bigger than your RAM</text>
+<text x="64" y="134" font-size="22" font-weight="400" text-anchor="start" fill="#42445b">A mixture-of-experts model uses only a few experts per token. am2Strata keeps those close and leaves the rest on the SSD.</text>
+<g transform="translate(64 190)">
+<g transform="translate(0 0)"><path d="M40 0 H600 L640 34 H80 Z" fill="#179299" opacity=".25"/><rect x="40" y="34" width="600" height="118" rx="14" fill="#ffffff" stroke="#179299" stroke-width="2.5"/><rect x="40" y="34" width="10" height="118" rx="4" fill="#179299"/><text x="72" y="74" font-size="26" font-weight="700" text-anchor="start" fill="#303246">GPU memory and RAM</text><text x="72" y="106" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">Attention, shared experts, the output head:</text><text x="72" y="132" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">the weights every token uses, always resident</text></g>
+<g transform="translate(0 176)"><path d="M40 0 H600 L640 34 H80 Z" fill="#1e66f5" opacity=".25"/><rect x="40" y="34" width="600" height="118" rx="14" fill="#ffffff" stroke="#1e66f5" stroke-width="2.5"/><rect x="40" y="34" width="10" height="118" rx="4" fill="#1e66f5"/><text x="72" y="74" font-size="26" font-weight="700" text-anchor="start" fill="#303246">Hot experts in RAM</text><text x="72" y="106" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">A learned profile ranks them; they are pinned so</text><text x="72" y="132" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">the OS cannot evict them (98% of routing hits here)</text></g>
+<g transform="translate(0 352)"><path d="M40 0 H600 L640 34 H80 Z" fill="#8839ef" opacity=".25"/><rect x="40" y="34" width="600" height="118" rx="14" fill="#ffffff" stroke="#8839ef" stroke-width="2.5"/><rect x="40" y="34" width="10" height="118" rx="4" fill="#8839ef"/><text x="72" y="74" font-size="26" font-weight="700" text-anchor="start" fill="#303246">Cold experts on the SSD</text><text x="72" y="106" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">Read only when the router picks them: all of a</text><text x="72" y="132" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">step&#x27;s experts at once, in parallel, megabytes each</text></g>
+<path d="M668 480 C 712 420, 712 250, 668 190" fill="none" stroke="#179299" stroke-width="3" stroke-dasharray="7 7"/>
+<path d="M660 198 L668 186 L678 196" fill="none" stroke="#179299" stroke-width="3"/>
+<text x="736" y="342" font-size="17" font-weight="400" text-anchor="middle" fill="#0c4d50" transform="rotate(-90 736 342)">promoted when they heat up</text>
+<text x="40" y="556" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">Prompts go in chunks: each chunk&#x27;s tokens are grouped by expert,</text>
+<text x="40" y="584" font-size="19" font-weight="400" text-anchor="start" fill="#42445b">so an expert is read once per chunk, not once per token.</text>
+</g>
+<g transform="translate(860 190)">
+<rect width="676" height="660" rx="22" fill="#ffffff" stroke="#bcc0cc" stroke-width="2"/>
+<text x="36" y="54" font-size="26" font-weight="700" text-anchor="start" fill="#303246">Measured: a 17.5 GB model on a 16 GB Mac</text>
+<text x="36" y="86" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">Mac mini M4, GLM-4.7-Flash (Q4_K_XL), 512-token prompt, 64 tokens</text>
+<text x="36" y="146" font-size="21" font-weight="600" text-anchor="start" fill="#303246">Generation, tokens per second</text>
+<text x="36" y="190" font-size="18" font-weight="700" text-anchor="start" fill="#303246">am2Strata</text>
+<rect x="230" y="170" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="170" width="297" height="30" rx="8" fill="#179299"/>
+<text x="546" y="192" font-size="18" font-weight="700" text-anchor="start" fill="#0c4d50">8.9</text>
+<text x="36" y="240" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">llama.cpp, mmap</text>
+<rect x="230" y="220" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="220" width="119" height="30" rx="8" fill="#42445b"/>
+<text x="546" y="242" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">3.6</text>
+<text x="36" y="290" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">llama.cpp, default</text>
+<rect x="230" y="270" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="270" width="68" height="30" rx="8" fill="#42445b"/>
+<text x="546" y="292" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">2.05</text>
+<text x="36" y="364" font-size="21" font-weight="600" text-anchor="start" fill="#303246">Prompt, tokens per second</text>
+<text x="36" y="408" font-size="18" font-weight="700" text-anchor="start" fill="#303246">am2Strata</text>
+<rect x="230" y="388" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="388" width="281" height="30" rx="8" fill="#179299"/>
+<text x="546" y="410" font-size="18" font-weight="700" text-anchor="start" fill="#0c4d50">16.9</text>
+<text x="36" y="458" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">llama.cpp, mmap</text>
+<rect x="230" y="438" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="438" width="288" height="30" rx="8" fill="#42445b"/>
+<text x="546" y="460" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">17.3</text>
+<text x="36" y="508" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">llama.cpp, default</text>
+<rect x="230" y="488" width="300" height="30" rx="8" fill="#ccd0da"/>
+<rect x="230" y="488" width="190" height="30" rx="8" fill="#42445b"/>
+<text x="546" y="510" font-size="18" font-weight="400" text-anchor="start" fill="#42445b">11.4</text>
+<line x1="36" y1="550" x2="640" y2="550" stroke="#bcc0cc" stroke-width="2"/>
+<text x="36" y="586" font-size="20" fill="#303246"><tspan font-weight="700" fill="#0c4d50">2.5x</tspan> llama.cpp's generation, no swapping</text>
+<text x="36" y="614" font-size="20" font-weight="400" text-anchor="start" fill="#303246">llama.cpp&#x27;s default swapped ~98 GB; Metal ran out of memory.</text>
+<text x="36" y="642" font-size="15" font-weight="400" text-anchor="start" fill="#42445b">am2Strata at 8-10 threads; llama.cpp measured at 4. Tokens checked against llama.cpp.</text>
+</g>
+<text x="64" y="920" font-size="16" font-weight="400" text-anchor="start" fill="#42445b">am2Strata · free and open source (MIT) · github.com/abhaymin/am2strata · numbers in docs/HYBRID-SPEED.md</text>
+</svg>
