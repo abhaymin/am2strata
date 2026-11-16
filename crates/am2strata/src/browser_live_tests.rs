@@ -23,6 +23,12 @@ const MERGED: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Citie
 <thead><tr><th rowspan=2>City</th><th rowspan=2>Country</th><th colspan=2>Population[a]</th></tr><tr><th>2018</th><th>2025</th></tr></thead>
 <tbody><tr><td><a href="/tokyo">Tokyo</a></td><td rowspan=2>Japan</td><td>37</td><td>36</td></tr><tr><td>Osaka</td><td>19</td><td>18</td></tr></tbody></table>"#;
 
+// footnote marks two ways Wikipedia keeps them: a real <sup class=reference> element and plain text left on the cell.
+const FOOTNOTES: &str = r##"<!doctype html><link rel=icon href="data:,"><title>Largest cities</title><table>
+<thead><tr><th>City</th><th>Population<sup class="reference">[2]</sup></th></tr></thead>
+<tbody><tr><td>Tokyo<sup class="reference"><a href="#c1">[a]</a></sup></td><td>37,468,000<sup class="reference">[3]</sup></td></tr>
+<tr><td>Delhi[12]</td><td>C[1]</td></tr><tr><td>Osaka [capital]</td><td>arr[idx]</td></tr></tbody></table>"##;
+
 const MAP: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Map</title><body style="margin:0"><div id=m style="width:1280px;height:800px;background:#9cf"></div>
 <script>window.log=[];const m=document.getElementById('m');let down=null;
 m.addEventListener('mousedown',e=>{down=[e.clientX,e.clientY]});
@@ -48,6 +54,7 @@ async fn serve() -> String {
         .route("/form", get(|| async { Html(FORM) }))
         .route("/sent", get(|| async { Html("<title>Thanks</title>sent") }))
         .route("/merged", get(|| async { Html(MERGED) }))
+        .route("/footnotes", get(|| async { Html(FOOTNOTES) }))
         .route("/map", get(|| async { Html(MAP) }))
         .route("/errors", get(|| async { Html(ERRORS) }))
         .route("/table", get(|q: axum::extract::Query<HashMap<String, String>>| async move {
@@ -146,6 +153,16 @@ async fn the_browser_tools_work_on_real_pages() {
     b.call(c, "browser_open", &json!({"url": format!("{base}/merged")})).await.unwrap();
     let t = b.call(c, "browser_extract", &json!({"kind": "table"})).await.unwrap().text;
     assert!(t.contains("\"Population 2025\": \"18\"") && t.contains("\"City_link\": \"") && t.matches("\"Country\": \"Japan\"").count() == 2, "{t}");
+
+    // footnotes are dropped from cells and headers: a <sup class=reference> element and plain-text marks, but not C[1]
+    b.call(c, "browser_open", &json!({"url": format!("{base}/footnotes")})).await.unwrap();
+    let t = b.call(c, "browser_extract", &json!({"kind": "table"})).await.unwrap().text;
+    assert!(t.contains("table 0 of 1"), "{t}");
+    assert!(t.contains("\"City\": \"Tokyo\"") && t.contains("\"Population\": \"37,468,000\""), "{t}");
+    assert!(t.contains("\"City\": \"Delhi\"") && t.contains("\"Population\": \"C[1]\""), "{t}");
+    // a bracketed word that is not a footnote shape stays
+    assert!(t.contains("\"City\": \"Osaka [capital]\"") && t.contains("\"Population\": \"arr[idx]\""), "{t}");
+    assert!(!t.contains("Population[2]"), "the header mark fell off: {t}");
 
     // a data: page opens as itself (not "https://data:…")
     let d = b.call(c, "browser_open", &json!({"url": "data:text/html,<title>Inline</title><p>made here</p>"})).await.unwrap().text;
