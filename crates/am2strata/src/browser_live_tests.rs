@@ -27,7 +27,7 @@ const MERGED: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Citie
 const FOOTNOTES: &str = r##"<!doctype html><link rel=icon href="data:,"><title>Largest cities</title><table>
 <thead><tr><th>City</th><th>Population<sup class="reference">[2]</sup></th></tr></thead>
 <tbody><tr><td>Tokyo<sup class="reference"><a href="#c1">[a]</a></sup></td><td>37,468,000<sup class="reference">[3]</sup></td></tr>
-<tr><td>Delhi[12]</td><td>C[1]</td></tr></tbody></table>"##;
+<tr><td>Delhi[12]</td><td>C[1]</td></tr><tr><td>Osaka [capital]</td><td>arr[idx]</td></tr></tbody></table>"##;
 
 const MAP: &str = r#"<!doctype html><link rel=icon href="data:,"><title>Map</title><body style="margin:0"><div id=m style="width:1280px;height:800px;background:#9cf"></div>
 <script>window.log=[];const m=document.getElementById('m');let down=null;
@@ -160,6 +160,8 @@ async fn the_browser_tools_work_on_real_pages() {
     assert!(t.contains("table 0 of 1"), "{t}");
     assert!(t.contains("\"City\": \"Tokyo\"") && t.contains("\"Population\": \"37,468,000\""), "{t}");
     assert!(t.contains("\"City\": \"Delhi\"") && t.contains("\"Population\": \"C[1]\""), "{t}");
+    // a bracketed word that is not a footnote shape stays
+    assert!(t.contains("\"City\": \"Osaka [capital]\"") && t.contains("\"Population\": \"arr[idx]\""), "{t}");
     assert!(!t.contains("Population[2]"), "the header mark fell off: {t}");
 
     // a data: page opens as itself (not "https://data:…")

@@ -646,7 +646,7 @@ const EXTRACT_JS: &str = r#"(() => { const A = __ARGS__;
   const txt = e => e ? (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim() : '';
   // footnote marks are either real elements to drop from a clone or, rarely, plain text left behind. The text strip only
   // catches the footnote shapes at a value's end or before a space, so something like a formula's C[1] (a subscript) stays.
-  const FN_MARKERS = /\[(?:[0-9]{2,}|[a-z]+|[a-z]+\s[0-9]+|[a-z]+ [a-z]+)\](?=\s|$)/g;
+  const FN_MARKERS = /\[(?:[0-9]{2,}|[a-z]|[ivxl]{1,5}|(?:note|nb|n) ?[0-9]+|citation needed|clarification needed|better source needed|when\?|who\?)\](?=\s|$)/g;
   const cellTxt = cell => {
     if (!cell) return '';
     const c = cell.cloneNode(true); // a clone is not laid out, so innerText falls back to textContent (handled below)
@@ -922,7 +922,7 @@ mod tests {
         // cellTxt exists and is used where values and header names come from, and both ways a mark hides are handled
         assert!(js.contains("const cellTxt"));
         assert!(js.contains("cellTxt(v.cell)"));
-        assert!(js.contains(".reference") && js.contains("FN_MARKERS") && js.contains("[0-9]{2,}"), "{js}");
+        assert!(js.contains(".reference") && js.contains("FN_MARKERS") && js.contains("[0-9]{2,}") && !js.contains("|[a-z]+|"), "{js}");
         // the old header regex that left marks on cells is gone; every cell/name now goes through cellTxt
         assert!(!js.contains(r#"txt(v.cell).replace(/\[""#));
     }
