@@ -4,126 +4,291 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>am2Strata · a local AI server in Rust</title>
-<meta name="description" content="am2Strata is a free, open-source AI server you run on your own PC: OpenAI, Anthropic and Gemini-compatible APIs, a web app for chat, a Workshop for making models and training data, and computer use in its own sandbox VM.">
+<meta name="description" content="am2Strata is a free, open-source AI server you run on your own PC: compatible APIs, a web app, browser and computer use, a model Workshop, a cluster of your own machines, and an engine that runs models bigger than your RAM.">
 <meta property="og:title" content="am2Strata · a local AI server in Rust">
-<meta property="og:description" content="Run AI models on your own PC: compatible APIs, a web app, a model Workshop, computer use in a sandbox VM. Free and open source (MIT).">
+<meta property="og:description" content="Run AI models on your own PC, even ones bigger than its RAM. Compatible APIs, a web app, browser use, a cluster, a model Workshop. Free and open source (MIT).">
 <meta property="og:image" content="https://am2strata.am2.ai/assets/social.png">
 <meta property="og:url" content="https://am2strata.am2.ai/">
 <meta name="twitter:card" content="summary_large_image">
-<meta name="theme-color" content="#0a1020">
+<meta name="theme-color" content="#070d1c">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 @font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
 :root {
-  --bg: #0a1020; --bg2: #0f1830; --card: #121d38; --line: #23314f; --ink: #eef3f8; --muted: #a7b6c8; --accent: #5eead4;
-  --accent-ink: #062a26; --shadow: 0 18px 50px rgba(0, 0, 0, .35);
+  --bg: #070d1c; --bg2: #0b1428; --card: #0f1a33; --card2: #13213f; --line: #20304f; --line2: #2c3f66;
+  --ink: #eef3f8; --muted: #a3b2c6; --faint: #6f7f96;
+  --teal: #5eead4; --cyan: #22d3ee; --blue: #60a5fa; --indigo: #818cf8; --violet: #a78bfa; --pink: #f0abfc;
+  --accent: var(--teal); --accent-ink: #042521;
+  --shadow: 0 30px 60px -20px rgba(0, 0, 0, .55), 0 10px 24px -12px rgba(0, 0, 0, .5);
+  --glass: rgba(18, 31, 60, .55);
+  --grid: rgba(94, 234, 212, .09);
+  color-scheme: dark;
 }
 @media (prefers-color-scheme: light) {
-  :root { --bg: #f6f8fb; --bg2: #ffffff; --card: #ffffff; --line: #dde4ee; --ink: #0d1726; --muted: #4a5a70; --accent: #0f9f8f;
-          --accent-ink: #ffffff; --shadow: 0 14px 40px rgba(16, 32, 64, .10); }
+  :root {
+    --bg: #f4f7fb; --bg2: #ffffff; --card: #ffffff; --card2: #f7f9fd; --line: #dbe3ee; --line2: #c7d3e3;
+    --ink: #0c1626; --muted: #46566d; --faint: #6b7a90;
+    --teal: #0d9488; --cyan: #0891b2; --blue: #2563eb; --indigo: #4f46e5; --violet: #7c3aed; --pink: #c026d3;
+    --accent: #0f9f8f; --accent-ink: #ffffff;
+    --shadow: 0 30px 60px -24px rgba(16, 32, 64, .22), 0 10px 24px -14px rgba(16, 32, 64, .18);
+    --glass: rgba(255, 255, 255, .7);
+    --grid: rgba(13, 148, 136, .10);
+    color-scheme: light;
+  }
 }
+@media (prefers-color-scheme: light) { .hero .bgimg { opacity: .10; } .slab .lbl { text-shadow: none; } }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
+       -webkit-font-smoothing: antialiased; overflow-x: hidden; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 img { max-width: 100%; display: block; }
 code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; }
-.wrap { max-width: 1120px; margin: 0 auto; padding: 0 20px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
+.grad { background: linear-gradient(100deg, var(--teal), var(--cyan) 35%, var(--indigo) 70%, var(--violet)); -webkit-background-clip: text;
+        background-clip: text; color: transparent; }
 
 /* nav */
-nav { position: sticky; top: 0; z-index: 10; backdrop-filter: blur(10px); background: color-mix(in srgb, var(--bg) 82%, transparent);
-      border-bottom: 1px solid var(--line); }
-nav .wrap { display: flex; align-items: center; gap: 22px; height: 60px; }
+nav { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
+      background: color-mix(in srgb, var(--bg) 72%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
+nav .wrap { display: flex; align-items: center; gap: 22px; height: 62px; }
 .brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; }
-.brand svg { width: 26px; height: 26px; }
+.brand:hover { text-decoration: none; }
+.brand svg { width: 28px; height: 28px; filter: drop-shadow(0 4px 12px rgba(94, 234, 212, .35)); }
 nav .links { margin-left: auto; display: flex; gap: 20px; font-size: 15px; }
 nav .links a { color: var(--muted); }
 nav .links a:hover { color: var(--ink); text-decoration: none; }
-@media (max-width: 640px) { nav .links a.hide-sm { display: none; } }
+@media (max-width: 760px) { nav .links a.hide-sm { display: none; } nav .links { gap: 14px; } }
 
 /* hero */
-.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); }
-.hero::before { content: ""; position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .55; }
-.hero::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, var(--bg) 25%, color-mix(in srgb, var(--bg) 45%, transparent) 75%, transparent); }
-.hero .wrap { position: relative; z-index: 1; padding: 96px 20px 88px; }
-.hero h1 { font-size: clamp(44px, 8vw, 84px); line-height: 1; margin: 0 0 18px; letter-spacing: -.02em; }
-.hero p.lead { font-size: clamp(19px, 2.4vw, 24px); color: var(--muted); max-width: 640px; margin: 0 0 30px; }
+.hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); isolation: isolate; }
+.hero .bgimg { position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .22; z-index: -3; }
+.hero .glow { position: absolute; inset: -20% -10% auto auto; width: 70vw; height: 70vw; max-width: 900px; max-height: 900px; z-index: -2;
+              background: radial-gradient(closest-side, rgba(94, 234, 212, .22), rgba(129, 140, 248, .12) 55%, transparent 72%); filter: blur(10px); }
+.hero .floor { position: absolute; left: -10%; right: -10%; bottom: -2px; height: 46%; z-index: -1; transform-origin: 50% 100%;
+               transform: perspective(600px) rotateX(62deg); opacity: .9;
+               background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+               background-size: 54px 54px; mask-image: linear-gradient(to top, #000 10%, transparent 92%);
+               -webkit-mask-image: linear-gradient(to top, #000 10%, transparent 92%); animation: floor 9s linear infinite; }
+@keyframes floor { to { background-position: 0 54px, 0 0; } }
+.hero .wrap { display: grid; grid-template-columns: 1.05fr .95fr; align-items: center; gap: 30px; padding-top: 84px; padding-bottom: 92px; }
+@media (max-width: 920px) { .hero .wrap { grid-template-columns: 1fr; padding-top: 56px; } }
+.eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); padding: 5px 12px 5px 6px; border-radius: 99px;
+           border: 1px solid var(--line); background: var(--glass); backdrop-filter: blur(6px); margin-bottom: 22px; }
+.eyebrow b { background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 1px 9px; font-size: 12px; font-weight: 700; }
+.hero h1 { font-size: clamp(46px, 7.4vw, 88px); line-height: .98; margin: 0 0 20px; letter-spacing: -.03em; font-weight: 800; }
+.hero p.lead { font-size: clamp(19px, 2.2vw, 23px); color: var(--muted); max-width: 600px; margin: 0 0 32px; }
 .cta { display: flex; flex-wrap: wrap; gap: 12px; }
-.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 600; border: 1px solid var(--line);
-       color: var(--ink); background: var(--card); }
-.btn:hover { text-decoration: none; border-color: var(--accent); }
-.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-.badges { margin-top: 26px; display: flex; flex-wrap: wrap; gap: 8px; }
-.badge { font-size: 13px; padding: 4px 10px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted);
-         background: color-mix(in srgb, var(--card) 70%, transparent); }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 600; border: 1px solid var(--line2);
+       color: var(--ink); background: var(--glass); backdrop-filter: blur(8px); transition: transform .2s, border-color .2s, box-shadow .2s; }
+.btn:hover { text-decoration: none; border-color: var(--accent); transform: translateY(-2px); }
+.btn.primary { background: linear-gradient(135deg, var(--teal), var(--cyan)); color: var(--accent-ink); border-color: transparent;
+               box-shadow: 0 10px 30px -8px rgba(34, 211, 238, .55); }
+.badges { margin-top: 28px; display: flex; flex-wrap: wrap; gap: 8px; }
+.badge { font-size: 13px; padding: 4px 11px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--glass); }
 
-section { padding: 84px 0; }
-section.alt { background: var(--bg2); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-h2 { font-size: clamp(30px, 4vw, 42px); margin: 0 0 12px; letter-spacing: -.01em; }
-.sub { color: var(--muted); max-width: 720px; margin: 0 0 40px; }
+/* the 3D strata stack */
+.stage { perspective: 1100px; height: 460px; display: grid; place-items: center; }
+@media (max-width: 920px) { .stage { height: 380px; } }
+@media (max-width: 560px) { .stage { height: 300px; margin-top: 40px; } .stage .stack { width: min(270px, 70vw); height: 190px; }
+  .stage .slab .cells { grid-template-columns: repeat(6, 11px); gap: 4px; } .stage .slab .cells i { width: 11px; height: 11px; }
+  .stage .slab .lbl { font-size: 13px; } }
+.stack { position: relative; width: min(440px, 86vw); height: 300px; transform-style: preserve-3d;
+         transform: rotateX(calc(58deg + var(--ty, 0deg))) rotateZ(calc(-34deg + var(--tx, 0deg))); transition: transform .5s cubic-bezier(.2, .7, .2, 1); }
+.slab { position: absolute; inset: 0; border-radius: 26px; transform-style: preserve-3d; border: 1.5px solid var(--c);
+        background: linear-gradient(135deg, color-mix(in srgb, var(--c) 30%, transparent), color-mix(in srgb, var(--c) 8%, transparent));
+        box-shadow: 0 0 40px -6px color-mix(in srgb, var(--c) 55%, transparent), inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent);
+        backdrop-filter: blur(3px); animation: bob 6s ease-in-out infinite; }
+.slab.s1 { --c: var(--teal); --z: 150px; transform: translateZ(var(--z)); animation-delay: 0s; }
+.slab.s2 { --c: var(--blue); --z: 75px; transform: translateZ(var(--z)); animation-delay: -2s; }
+.slab.s3 { --c: var(--violet); --z: 0px; transform: translateZ(var(--z)); animation-delay: -4s; }
+@keyframes bob { 50% { transform: translateZ(calc(var(--z) + 12px)); } }
+.slab .lbl { position: absolute; left: 20px; bottom: 16px; font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: .02em;
+             text-shadow: 0 2px 10px rgba(0, 0, 0, .5); }
+.slab .lbl small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
+.slab .cells { position: absolute; right: 16px; top: 16px; display: grid; grid-template-columns: repeat(6, 16px); gap: 6px; }
+.slab .cells i { width: 16px; height: 16px; border-radius: 4px; background: color-mix(in srgb, var(--c) 22%, transparent);
+                 border: 1px solid color-mix(in srgb, var(--c) 40%, transparent); }
+.slab .cells i.on { background: var(--c); box-shadow: 0 0 12px var(--c); animation: blink 3.2s ease-in-out infinite; }
+@keyframes blink { 50% { opacity: .45; } }
+.spark { position: absolute; width: 12px; height: 12px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 16px var(--teal), 0 0 4px #fff;
+         left: var(--x); top: var(--y); transform: translateZ(0); animation: rise 4.2s cubic-bezier(.45, 0, .2, 1) infinite; animation-delay: var(--d); opacity: 0; }
+@keyframes rise { 0% { transform: translateZ(4px); opacity: 0; } 12% { opacity: 1; } 80% { opacity: 1; } 100% { transform: translateZ(160px); opacity: 0; } }
+.stage-cap { text-align: center; font-size: 14px; color: var(--faint); margin-top: -18px; }
+
+/* sections */
+section { padding: 96px 0; position: relative; }
+section.alt { background: linear-gradient(180deg, var(--bg2), var(--bg)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.kicker { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700; color: var(--accent); margin: 0 0 10px; }
+h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; letter-spacing: -.02em; }
+.sub { color: var(--muted); max-width: 740px; margin: 0 0 44px; font-size: 18px; }
+.note { font-size: 14px; color: var(--faint); margin-top: 20px; }
+
+/* 3D tilt surfaces */
+.tilt { transform-style: preserve-3d; transform: perspective(900px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) translateZ(0);
+        transition: transform .35s cubic-bezier(.2, .7, .2, 1), box-shadow .35s, border-color .35s; will-change: transform; position: relative; }
+.tilt::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity .3s;
+               background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), rgba(255, 255, 255, .10), transparent 45%); }
+.tilt:hover::after { opacity: 1; }
+.tilt:hover { box-shadow: 0 40px 70px -24px rgba(0, 0, 0, .6), 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
 
 /* features */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 24px; box-shadow: var(--shadow); }
-.card h3 { margin: 0 0 6px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.card .tag { font-size: 12px; font-weight: 600; color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+.card { background: linear-gradient(180deg, var(--card2), var(--card)); border: 1px solid var(--line); border-radius: 20px; padding: 26px; box-shadow: var(--shadow); }
+.card .ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px; transform: translateZ(30px);
+             background: color-mix(in srgb, var(--c, var(--teal)) 16%, transparent); border: 1px solid color-mix(in srgb, var(--c, var(--teal)) 40%, transparent); }
+.card .ico svg { width: 22px; height: 22px; stroke: var(--c, var(--teal)); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.card h3 { margin: 0 0 8px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; transform: translateZ(20px); }
+.card .tag { font-size: 12px; font-weight: 600; color: var(--c, var(--accent)); border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
              border-radius: 99px; padding: 2px 9px; white-space: nowrap; }
-.card p { margin: 0; color: var(--muted); font-size: 16px; }
+.card p { margin: 0; color: var(--muted); font-size: 16px; transform: translateZ(10px); }
+.card.new { border-color: color-mix(in srgb, var(--c, var(--teal)) 45%, var(--line)); }
+.card.new h3::after { content: "new"; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-ink);
+                      background: var(--c, var(--teal)); border-radius: 99px; padding: 1px 8px; margin-left: auto; }
+.card.new h3 .tag { margin-left: 0; }
 
-/* screens */
-.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
-figure { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; box-shadow: var(--shadow); }
-figure img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; }
-figcaption { padding: 12px 16px; font-size: 15px; color: var(--muted); }
+/* bigger than RAM */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
+@media (max-width: 920px) { .split { grid-template-columns: 1fr; } }
+.tiers { display: grid; gap: 14px; perspective: 900px; }
+.tier { display: grid; grid-template-columns: 10px 1fr; gap: 18px; padding: 20px 22px; border-radius: 18px; border: 1px solid var(--line);
+        background: linear-gradient(135deg, color-mix(in srgb, var(--c) 12%, var(--card)), var(--card)); box-shadow: var(--shadow); }
+.tier .bar { border-radius: 6px; background: linear-gradient(180deg, var(--c), color-mix(in srgb, var(--c) 40%, transparent)); box-shadow: 0 0 16px -2px var(--c); }
+.tier b { display: block; font-size: 19px; }
+.tier span { color: var(--muted); font-size: 16px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
+@media (max-width: 560px) { .stats { grid-template-columns: 1fr; } }
+.stat { padding: 20px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
+.stat .n { font-size: clamp(28px, 2.9vw, 40px); white-space: nowrap; font-weight: 800; line-height: 1; letter-spacing: -.02em; }
+.stat .l { color: var(--muted); font-size: 14px; margin-top: 8px; }
+.chart { padding: 24px; border-radius: 20px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
+.chart h4 { margin: 0 0 4px; font-size: 18px; }
+.chart .src { color: var(--faint); font-size: 13px; margin: 0 0 18px; }
+.row { display: grid; grid-template-columns: 150px 1fr 54px; align-items: center; gap: 12px; margin: 10px 0; font-size: 15px; }
+.row .t { height: 14px; border-radius: 99px; background: color-mix(in srgb, var(--line) 70%, transparent); overflow: hidden; }
+.row .f { height: 100%; width: 0; border-radius: 99px; background: color-mix(in srgb, var(--muted) 55%, transparent); transition: width 1.4s cubic-bezier(.2, .7, .2, 1); }
+.chart.in .f { width: var(--w); }
+.row.us .f { background: linear-gradient(90deg, var(--teal), var(--cyan)); box-shadow: 0 0 14px rgba(94, 234, 212, .45); }
+.row.us { font-weight: 700; }
+.row .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+.row.us .v { color: var(--accent); }
+.chart .grp { font-size: 14px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 18px 0 2px; }
+@media (max-width: 480px) { .row { grid-template-columns: 112px 1fr 46px; font-size: 14px; } }
+
+/* gallery (screens and infographics): every image opens in the viewer */
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 22px; }
+.shot { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow); }
+.shot button { all: unset; display: block; width: 100%; cursor: zoom-in; position: relative; }
+.shot button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.shot img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
+.shot:hover img { transform: scale(1.04); }
+.shot .zoom { position: absolute; right: 12px; top: 12px; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
+              background: rgba(7, 13, 28, .72); border: 1px solid rgba(255, 255, 255, .16); opacity: 0; transform: translateY(-4px); transition: .25s; }
+.shot .zoom svg { width: 18px; height: 18px; stroke: #fff; fill: none; stroke-width: 2; }
+.shot:hover .zoom, .shot button:focus-visible .zoom { opacity: 1; transform: none; }
+figcaption { padding: 13px 16px; font-size: 15px; color: var(--muted); }
 figcaption b { color: var(--ink); font-weight: 600; }
-.note { font-size: 14px; color: var(--muted); margin-top: 18px; }
+.info { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 22px; }
+.info .shot img { aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; background: #0b1326; }
+
+/* cluster */
+.pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 28px; }
+.pair { padding: 20px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); }
+.pair b { display: block; font-size: 18px; margin-bottom: 4px; }
+.pair span { color: var(--muted); font-size: 15px; }
+.pair .n { font-size: 13px; font-weight: 800; color: var(--accent); letter-spacing: .1em; }
 
 /* videos */
-.vh { font-size: 20px; margin: 28px 0 14px; }
-.vids { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 18px; }
-.vid { display: flex; flex-direction: column; gap: 6px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 16px;
-       overflow: hidden; box-shadow: var(--shadow); padding-bottom: 14px; }
-.vid:hover { text-decoration: none; border-color: var(--accent); }
-.vid .thumb { position: relative; display: block; }
-.vid img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; }
+.vh { font-size: 21px; margin: 32px 0 16px; }
+.vids { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+.vid { display: flex; flex-direction: column; gap: 6px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+       overflow: hidden; box-shadow: var(--shadow); padding-bottom: 16px; }
+.vid:hover { text-decoration: none; }
+.vid .thumb { position: relative; display: block; overflow: hidden; }
+.vid img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
+.vid:hover img { transform: scale(1.05); }
 .vid.short img { aspect-ratio: 9 / 16; max-height: 360px; object-position: center; }
-.vid .dur { position: absolute; right: 8px; bottom: 8px; background: rgba(0, 0, 0, .75); color: #fff; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
-.vid .play { position: absolute; inset: 0; margin: auto; width: 54px; height: 54px; border-radius: 50%; background: rgba(0, 0, 0, .55);
-             clip-path: none; opacity: .0; transition: opacity .15s; }
-.vid .play::after { content: ""; position: absolute; left: 21px; top: 16px; border-left: 16px solid #fff; border-top: 11px solid transparent; border-bottom: 11px solid transparent; }
-.vid:hover .play, .vid:focus .play { opacity: 1; }
+.vid .dur { position: absolute; right: 8px; bottom: 8px; background: rgba(0, 0, 0, .78); color: #fff; font-size: 12px; padding: 1px 6px; border-radius: 6px; }
+.vid .play { position: absolute; inset: 0; margin: auto; width: 58px; height: 58px; border-radius: 50%; background: rgba(7, 13, 28, .6);
+             border: 1px solid rgba(255, 255, 255, .3); backdrop-filter: blur(4px); opacity: 0; transform: scale(.85); transition: .25s; }
+.vid .play::after { content: ""; position: absolute; left: 23px; top: 17px; border-left: 17px solid #fff; border-top: 12px solid transparent; border-bottom: 12px solid transparent; }
+.vid:hover .play, .vid:focus .play { opacity: 1; transform: none; }
 .vid b { padding: 0 16px; font-size: 17px; line-height: 1.3; }
 .vid > span:last-child { padding: 0 16px; color: var(--muted); font-size: 15px; }
+.vid.feature { grid-column: span 2; }
+@media (max-width: 620px) { .vid.feature { grid-column: auto; } }
+.vid .new { position: absolute; left: 10px; top: 10px; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
+            background: var(--teal); color: #042521; border-radius: 99px; padding: 2px 9px; }
+
 /* install */
 .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
 .tab { padding: 8px 16px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font: inherit; font-size: 15px; }
-.tab[aria-selected="true"] { color: var(--ink); border-color: var(--accent); }
-.code { position: relative; background: #070c18; color: #d8e6f3; border: 1px solid var(--line); border-radius: 14px; padding: 18px 56px 18px 18px;
-        overflow-x: auto; white-space: pre; }
-.copy { position: absolute; top: 10px; right: 10px; font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2b3a58;
+.tab[aria-selected="true"] { color: var(--ink); border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+.code { position: relative; background: #050a16; color: #d8e6f3; border: 1px solid var(--line2); border-radius: 16px; padding: 20px 64px 20px 20px;
+        overflow-x: auto; white-space: pre; box-shadow: var(--shadow); }
+.code::before { content: "$ "; color: var(--teal); }
+.copy { position: absolute; top: 12px; right: 12px; font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 8px; border: 1px solid #2b3a58;
         background: #111a2e; color: #d8e6f3; cursor: pointer; }
-.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 18px; margin-top: 28px; }
+.copy:hover { border-color: var(--teal); }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; margin-top: 30px; }
 .steps .card p code { color: var(--ink); }
 
 /* platforms */
-.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 16px; background: var(--card); }
-table { border-collapse: collapse; width: 100%; min-width: 720px; font-size: 15px; }
-th, td { padding: 12px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+.table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 18px; background: var(--card); box-shadow: var(--shadow); }
+table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 15px; }
+th, td { padding: 13px 15px; text-align: left; border-bottom: 1px solid var(--line); }
 th { color: var(--muted); font-weight: 600; }
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 5%, transparent); }
 tr:last-child td { border-bottom: 0; }
 .yes { color: var(--accent); font-weight: 600; }
 
 /* principles */
-.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
-.pillar { padding: 22px; border-left: 3px solid var(--accent); background: var(--card); border-radius: 0 14px 14px 0; }
-.pillar b { display: block; font-size: 19px; margin-bottom: 4px; }
+.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
+.pillar { padding: 24px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
+.pillar b { display: block; font-size: 19px; margin-bottom: 6px; }
+.pillar b::before { content: ""; display: block; width: 32px; height: 4px; border-radius: 4px; margin-bottom: 14px;
+                    background: linear-gradient(90deg, var(--teal), var(--indigo)); }
 .pillar span { color: var(--muted); font-size: 16px; }
 
-footer { padding: 48px 0 60px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); }
+footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); background: var(--bg2); }
 footer .cols { display: flex; flex-wrap: wrap; gap: 30px; justify-content: space-between; }
 footer p { margin: 6px 0; }
+
+/* reveal on scroll */
+/* the rise uses `translate`, so it never fights a tilt's `transform` */
+.reveal { opacity: 0; translate: 0 26px; transition: opacity .7s ease, translate .7s cubic-bezier(.2, .7, .2, 1), transform .35s cubic-bezier(.2, .7, .2, 1), box-shadow .35s; }
+.reveal.in { opacity: 1; translate: 0 0; }
+
+/* the viewer */
+dialog.viewer { width: 100vw; height: 100vh; max-width: 100vw; max-height: 100vh; margin: 0; padding: 0; border: 0; background: rgba(3, 7, 16, .94);
+                color: #eef3f8; overflow: hidden; }
+dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(6px); }
+.vw-stage { position: absolute; inset: 64px 0 76px; overflow: hidden; touch-action: none; cursor: grab; }
+.vw-stage.drag { cursor: grabbing; }
+.vw-stage img { position: absolute; left: 50%; top: 50%; max-width: min(94vw, 1800px); max-height: calc(100vh - 160px); transform-origin: 0 0;
+                user-select: none; -webkit-user-drag: none; border-radius: 10px; box-shadow: 0 30px 80px rgba(0, 0, 0, .6); background: #0b1326; }
+.vw-top, .vw-bot { position: absolute; left: 0; right: 0; display: flex; align-items: center; gap: 10px; padding: 12px 16px; }
+.vw-top { top: 0; justify-content: space-between; }
+.vw-bot { bottom: 0; justify-content: center; flex-wrap: wrap; }
+.vw-cap { font-size: 16px; max-width: 70vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vw-cap small { color: #a3b2c6; margin-left: 10px; }
+.vw-btn { font: inherit; font-size: 14px; color: #eef3f8; background: rgba(255, 255, 255, .08); border: 1px solid rgba(255, 255, 255, .18); border-radius: 10px;
+          padding: 8px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; text-decoration: none; }
+.vw-btn:hover { background: rgba(255, 255, 255, .16); text-decoration: none; }
+.vw-btn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; }
+.vw-nav { position: absolute; top: 50%; transform: translateY(-50%); width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center; z-index: 2; }
+.vw-prev { left: 14px; } .vw-next { right: 14px; }
+.vw-zoom { min-width: 56px; text-align: center; color: #a3b2c6; font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+  .reveal { opacity: 1; translate: none; }
+  .spark { display: none; }
+}
 </style>
+<noscript><style>.reveal { opacity: 1; translate: none; } .row .f { width: var(--w); }</style></noscript>
 </head>
 <body>
 
@@ -135,6 +300,8 @@ footer p { margin: 6px 0; }
     </a>
     <div class="links">
       <a href="#features">Features</a>
+      <a class="hide-sm" href="#ram">Bigger than RAM</a>
+      <a class="hide-sm" href="#cluster">Cluster</a>
       <a class="hide-sm" href="#screens">Screens</a>
       <a class="hide-sm" href="#videos">Videos</a>
       <a href="#install">Install</a>
@@ -144,121 +311,265 @@ footer p { margin: 6px 0; }
 </nav>
 
 <header class="hero" id="top">
+  <div class="bgimg" aria-hidden="true"></div><div class="glow" aria-hidden="true"></div><div class="floor" aria-hidden="true"></div>
   <div class="wrap">
-    <h1>am2Strata</h1>
-    <p class="lead">An AI server you run on your own PC. Chat with local models, plug in the apps you already use, make your own
-      models, and let an agent work in a sandbox computer of its own.</p>
-    <div class="cta">
-      <a class="btn primary" href="#install">Install in one line</a>
-      <a class="btn" href="https://github.com/abhaymin/am2strata">View on GitHub</a>
-      <a class="btn" href="https://github.com/abhaymin/am2strata/releases/latest">Downloads</a>
+    <div>
+      <a class="eyebrow" href="#ram"><b>New</b> Models bigger than your RAM, 2.5x llama.cpp on a 16 GB Mac</a>
+      <h1>Your own AI server, <span class="grad">in layers.</span></h1>
+      <p class="lead">am2Strata runs AI models on your own PC, even ones bigger than its memory. Chat with them, plug in the apps
+        and coding agents you already use, let an agent use a browser or a sandbox computer, and pair your other machines into
+        one cluster.</p>
+      <div class="cta">
+        <a class="btn primary" href="#install">Install in one line</a>
+        <a class="btn" href="https://github.com/abhaymin/am2strata">View on GitHub</a>
+        <a class="btn" href="#videos">Watch the demos</a>
+      </div>
+      <div class="badges">
+        <span class="badge">Free and open source · MIT</span>
+        <span class="badge">Written in Rust</span>
+        <span class="badge">Linux · macOS · Windows · x64 and Arm</span>
+      </div>
     </div>
-    <div class="badges">
-      <span class="badge">Free and open source · MIT</span>
-      <span class="badge">Written in Rust</span>
-      <span class="badge">Linux · macOS · Windows · x64 and Arm</span>
+    <div>
+      <div class="stage" id="stage" aria-hidden="true">
+        <div class="stack" id="stack">
+          <div class="slab s3"><div class="cells"><i></i><i></i><i class="on"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i class="on"></i><i></i></div>
+            <div class="lbl">SSD<small>cold experts, read on demand</small></div>
+            <span class="spark" style="--x:58%;--y:22%;--d:0s"></span><span class="spark" style="--x:74%;--y:46%;--d:1.4s"></span><span class="spark" style="--x:66%;--y:30%;--d:2.8s"></span></div>
+          <div class="slab s2"><div class="cells"><i class="on"></i><i></i><i class="on"></i><i></i><i class="on"></i><i></i><i></i><i class="on"></i><i></i><i class="on"></i><i></i><i></i></div>
+            <div class="lbl">RAM<small>hot experts, pinned</small></div></div>
+          <div class="slab s1"><div class="cells"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i></div>
+            <div class="lbl">GPU and RAM<small>what every token uses</small></div></div>
+        </div>
+      </div>
+      <p class="stage-cap">Strata: each layer of memory holds what it is fast enough for.</p>
     </div>
   </div>
 </header>
 
 <section id="features">
   <div class="wrap">
-    <h2>What it does</h2>
-    <p class="sub">One server on your machine, one address for every app. Your models, your data and your keys stay with you.</p>
+    <p class="kicker reveal">What it does</p>
+    <h2 class="reveal">One server on your machine, one address for every app.</h2>
+    <p class="sub reveal">Your models, your data and your keys stay with you.</p>
     <div class="grid">
-      <div class="card"><h3>Compatible APIs <span class="tag">any OS</span></h3>
-        <p>OpenAI, Anthropic, Responses and Gemini-compatible endpoints, streaming and tools included, so existing apps and
-          coding agents connect with just a base URL and a key.</p></div>
-      <div class="card"><h3>Web app <span class="tag">any OS</span></h3>
+      <div class="card tilt new reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h12M3 17h18"/></svg></div>
+        <h3>Bigger than RAM <span class="tag">Rust engine</span></h3>
+        <p>The weights every token uses stay in GPU memory or RAM, the hot experts are pinned in RAM, and cold experts are read
+          from the SSD only when they are picked. A 17.5 GB model runs on a 16 GB Mac at 2.5x llama.cpp's speed.</p></div>
+      <div class="card tilt new reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
+        <h3>Browser use <span class="tag">any OS</span></h3>
+        <p>The model drives a real browser: it scrapes tables into datasets, fills forms and asks you before it sends anything.
+          From the chat, the command line, or any coding agent through MCP.</p></div>
+      <div class="card tilt new reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h4"/></svg></div>
+        <h3>Cluster <span class="tag">mutual TLS</span></h3>
+        <p>Pair a Mac or another PC by a 6-digit code. Workers answer requests and serve small models as extra "brains" the main
+          model can ask, over mutual TLS 1.3 with pinned certificates.</p></div>
+      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></div>
+        <h3>Compatible APIs <span class="tag">any OS</span></h3>
+        <p>OpenAI, Anthropic, Responses and Gemini-compatible endpoints, streaming and tools included, so existing apps connect
+          with just a base URL and a key.</p></div>
+      <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></svg></div>
+        <h3>Coding agents <span class="tag">any OS</span></h3>
+        <p>Claude Code, Codex, opencode, Qwen Code, Aider, Goose, the Gemini CLI and more, connected to your own models in
+          one command.</p></div>
+      <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg></div>
+        <h3>Web app <span class="tag">any OS</span></h3>
         <p>Chat with a live canvas for HTML, diagrams and Python in a sandbox; a Monitor for speed, GPUs and the queue;
           settings for everything else.</p></div>
-      <div class="card"><h3>Workshop <span class="tag">any OS</span></h3>
-        <p>Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result. Fine-tune with
-          LoRA, sized to the machine you have.</p></div>
-      <div class="card"><h3>Training data <span class="tag">any OS</span></h3>
-        <p>Turn your documents into a chat dataset written by the model you have loaded, with near-duplicates dropped, an
-          optional judge pass and a dataset card. Review and edit it record by record.</p></div>
-      <div class="card"><h3>Sandbox VM <span class="tag">Linux · KVM</span></h3>
+      <div class="card tilt reveal" style="--c: var(--pink)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg></div>
+        <h3>Workshop <span class="tag">any OS</span></h3>
+        <p>Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result. Turn your documents
+          into training data and fine-tune, sized to your machine.</p></div>
+      <div class="card tilt reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M9 20h6M12 16v4M9 9l2 2 4-4"/></svg></div>
+        <h3>Sandbox VM <span class="tag">Linux · KVM</span></h3>
         <p>Computer use in its own small Debian virtual machine: the agent installs and runs what it needs inside, and your
           PC is untouched. It pauses when idle and resumes in about a second.</p></div>
-      <div class="card"><h3>Computer tab <span class="tag">Linux</span></h3>
+      <div class="card tilt reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6z"/></svg></div>
+        <h3>Computer tab <span class="tag">Linux</span></h3>
         <p>Watch the agent's desktop live, take control with your own mouse and keyboard, and copy and paste across. Rules
           you choose decide what it may do.</p></div>
-      <div class="card"><h3>Secure by default <span class="tag">any OS</span></h3>
+      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+        <h3>Secure by default <span class="tag">any OS</span></h3>
         <p>HTTPS and secure WebSockets with a self-signed, your own or a Tailscale certificate. API keys with limits and
           expiry, and usage per key and per model.</p></div>
-      <div class="card"><h3>One live connection <span class="tag">any OS</span></h3>
+      <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
+        <h3>Media <span class="tag">build from source</span></h3>
+        <p>Songs that sing their lyrics in 50+ languages, voices, images, video and speech to text, all on your own GPU.
+          Video frames are read without ffmpeg.</p></div>
+      <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h4l3 8 4-16 3 8h2"/></svg></div>
+        <h3>One live connection <span class="tag">any OS</span></h3>
         <p>The web app talks to the server over one WebSocket: answers stream over it, and status, the queue and jobs are
           pushed the moment they change.</p></div>
-      <div class="card"><h3>Media <span class="tag">build from source</span></h3>
-        <p>Songs that sing their lyrics in 50+ languages, voices, images, video and speech to text, all running on your own
-          GPU.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt" id="ram">
+  <div class="wrap">
+    <p class="kicker reveal">The engine</p>
+    <h2 class="reveal">Bigger than your RAM, and still fast.</h2>
+    <p class="sub reveal">A mixture-of-experts model uses only a few of its experts for each token. am2Strata's Rust engine keeps
+      those close and leaves the rest on the SSD, so a model larger than your memory runs without swapping.</p>
+    <div class="split">
+      <div class="tiers">
+        <div class="tier tilt reveal" style="--c: var(--teal)"><div class="bar"></div><div><b>GPU memory and RAM</b>
+          <span>Attention, shared experts and the output head: the weights every token uses, always resident.</span></div></div>
+        <div class="tier tilt reveal" style="--c: var(--blue)"><div class="bar"></div><div><b>Hot experts, pinned in RAM</b>
+          <span>A learned profile ranks the experts; the hot ones are pinned so the OS cannot evict them. 98% of routing lands here.</span></div></div>
+        <div class="tier tilt reveal" style="--c: var(--violet)"><div class="bar"></div><div><b>Cold experts on the SSD</b>
+          <span>Read only when the router picks them, all of a step's experts at once. Prompts are grouped by expert, so each is read once per chunk.</span></div></div>
+        <p class="note reveal">Hand-written SIMD kernels (AVX2 on x86, NEON on Apple silicon) give exactly the same results as the
+          plain ones; tokens are checked against llama.cpp.</p>
+      </div>
+      <div>
+        <div class="stats">
+          <div class="stat tilt reveal"><div class="n grad">2.5x</div><div class="l">llama.cpp's generation speed, past the memory limit</div></div>
+          <div class="stat tilt reveal"><div class="n grad">0 GB</div><div class="l">swap written (llama.cpp's default: about 98 GB)</div></div>
+          <div class="stat tilt reveal"><div class="n grad">17.5 GB</div><div class="l">model on a 16 GB Mac mini M4</div></div>
+        </div>
+        <div class="chart reveal" id="chart">
+          <h4>GLM-4.7-Flash on a 16 GB Mac mini M4</h4>
+          <p class="src">512-token prompt, 64 generated tokens, tokens per second. am2Strata at 8-10 threads, llama.cpp measured at 4.</p>
+          <div class="grp">Generation</div>
+          <div class="row us"><span>am2Strata</span><div class="t"><div class="f" style="--w: 98.9%"></div></div><span class="v">8.9</span></div>
+          <div class="row"><span>llama.cpp, mmap</span><div class="t"><div class="f" style="--w: 39.8%"></div></div><span class="v">3.6</span></div>
+          <div class="row"><span>llama.cpp, default</span><div class="t"><div class="f" style="--w: 22.8%"></div></div><span class="v">2.05</span></div>
+          <div class="grp">Prompt</div>
+          <div class="row us"><span>am2Strata</span><div class="t"><div class="f" style="--w: 93.6%"></div></div><span class="v">16.9</span></div>
+          <div class="row"><span>llama.cpp, mmap</span><div class="t"><div class="f" style="--w: 96.2%"></div></div><span class="v">17.3</span></div>
+          <div class="row"><span>llama.cpp, default</span><div class="t"><div class="f" style="--w: 63.3%"></div></div><span class="v">11.4</span></div>
+          <p class="note" style="margin-top:14px">llama.cpp's Metal path ran out of GPU memory on this model. Every number is in
+            <a href="https://github.com/abhaymin/am2strata/blob/main/docs/HYBRID-SPEED.md">docs/HYBRID-SPEED.md</a>.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="cluster">
+  <div class="wrap">
+    <p class="kicker reveal">Cluster</p>
+    <h2 class="reveal">Your machines, working as one.</h2>
+    <p class="sub reveal">A PC as the master, a Mac mini as a worker: paired once, then every request between them is encrypted
+      both ways. Apps keep talking to one address.</p>
+    <div class="pairs">
+      <div class="pair tilt reveal"><div class="n">01</div><b>Show a code</b><span>The worker shows a 6-digit pairing code.</span></div>
+      <div class="pair tilt reveal"><div class="n">02</div><b>Pair once</b><span>The master sends it; the two swap certificate pins.</span></div>
+      <div class="pair tilt reveal"><div class="n">03</div><b>Mutual TLS 1.3</b><span>From then on, only pinned, encrypted connections.</span></div>
+      <div class="pair tilt reveal"><div class="n">04</div><b>Many brains</b><span>Workers answer requests and serve small models as experts.</span></div>
+    </div>
+    <div class="info">
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup.svg" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+        <img src="assets/cluster-setup.svg" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Setup.</b> What each machine needs, and which keys exist (never shown).</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster.webp" data-cap="Settings › Cluster" data-sub="A Mac mini M4 paired as a worker">
+        <img src="assets/cluster.webp" alt="Settings, Cluster: a Mac mini M4 paired as a worker, answering, encrypted" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Live.</b> The Mac mini answering as a worker, encrypted.</figcaption></figure>
     </div>
   </div>
 </section>
 
 <section class="alt" id="screens">
   <div class="wrap">
-    <h2>See it</h2>
-    <p class="sub">Real screenshots of the web app, running on one PC, with a Mac mini as its cluster worker.</p>
-    <div class="shots">
-      <figure><img src="assets/chat.webp" alt="A question and its answer, streamed at 68 tokens per second" loading="lazy" width="1200" height="675">
-        <figcaption><b>Chat.</b> Answers stream as they are written, with the model's thinking alongside.</figcaption></figure>
-      <figure><img src="assets/canvas.webp" alt="A digital clock the model wrote, running in the canvas" loading="lazy" width="1200" height="675">
-        <figcaption><b>Canvas.</b> An HTML page the model wrote, running live beside the chat.</figcaption></figure>
-      <figure><img src="assets/python.webp" alt="Python from the chat run in a sandbox with no network" loading="lazy" width="1200" height="675">
-        <figcaption><b>Python, sandboxed.</b> Code from the chat runs with no network and your home folder hidden.</figcaption></figure>
-      <figure><img src="assets/whiteboard.webp" alt="A Mermaid flow and shapes drawn on the whiteboard" loading="lazy" width="1200" height="675">
-        <figcaption><b>Flows and whiteboard.</b> Diagrams open by themselves when an answer has one.</figcaption></figure>
-      <figure><img src="assets/monitor.webp" alt="The Monitor's request history" loading="lazy" width="1200" height="675">
-        <figcaption><b>Monitor.</b> Every request, with speed, GPU, memory and what came back.</figcaption></figure>
-      <figure><img src="assets/agents.webp" alt="Settings, Connect: the coding agents and what each supports" loading="lazy" width="1200" height="675">
-        <figcaption><b>Coding agents.</b> Connect the agents you use to your own models in one command.</figcaption></figure>
-      <figure><img src="assets/cluster.webp" alt="Settings, Cluster: a Mac mini M4 paired as a worker, answering, encrypted" loading="lazy" width="1200" height="675">
-        <figcaption><b>Cluster.</b> A Mac mini paired as a worker by a 6-digit code; the two machines talk over mutual TLS.</figcaption></figure>
+    <p class="kicker reveal">See it</p>
+    <h2 class="reveal">Real screens, one PC.</h2>
+    <p class="sub reveal">Screenshots of the web app and infographics of how it works. Select any of them to view it full screen,
+      zoom in and move around.</p>
+    <h3 class="vh reveal">Infographics</h3>
+    <div class="info">
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-overview.svg" data-cap="What is in am2Strata" data-sub="Twelve parts at a glance">
+        <img src="assets/info-overview.svg" alt="am2Strata: twelve features at a glance" loading="lazy" width="1600" height="1060">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Overview.</b> Twelve parts of am2Strata at a glance.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-tiers.svg" data-cap="Bigger than your RAM" data-sub="The three tiers, and the Mac measurement">
+        <img src="assets/info-tiers.svg" alt="How the engine keeps hot experts in RAM and cold ones on the SSD, with measured speeds" loading="lazy" width="1600" height="960">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Bigger than RAM.</b> The three tiers and the 16 GB Mac measurement.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup.svg" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+        <img src="assets/cluster-setup.svg" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Cluster setup.</b> Pairing a worker with the master.</figcaption></figure>
     </div>
-    <p class="note">The Workshop and Computer tabs are newer than these screenshots.</p>
+    <h3 class="vh reveal">The web app</h3>
+    <div class="shots">
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/browser.webp" data-cap="Browser use" data-sub="Wikipedia's largest cities, saved as a dataset">
+        <img src="assets/browser.webp" alt="The chat asking the browser to save Wikipedia's list of largest cities as a dataset" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Browser use.</b> A Wikipedia table saved as a dataset, from one sentence.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/chat.webp" data-cap="Chat" data-sub="Streamed at 68 tokens per second">
+        <img src="assets/chat.webp" alt="A question and its answer, streamed at 68 tokens per second" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Chat.</b> Answers stream as they are written, with the model's thinking alongside.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/canvas.webp" data-cap="Canvas" data-sub="An HTML page the model wrote, running live">
+        <img src="assets/canvas.webp" alt="A digital clock the model wrote, running in the canvas" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Canvas.</b> An HTML page the model wrote, running live beside the chat.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/python.webp" data-cap="Python, sandboxed" data-sub="No network, home folder hidden">
+        <img src="assets/python.webp" alt="Python from the chat run in a sandbox with no network" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Python, sandboxed.</b> Code from the chat runs with no network and your home folder hidden.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/whiteboard.webp" data-cap="Flows and whiteboard" data-sub="Diagrams open by themselves">
+        <img src="assets/whiteboard.webp" alt="A Mermaid flow and shapes drawn on the whiteboard" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Flows and whiteboard.</b> Diagrams open by themselves when an answer has one.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/monitor.webp" data-cap="Monitor" data-sub="Every request, with speed, GPU and memory">
+        <img src="assets/monitor.webp" alt="The Monitor's request history" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Monitor.</b> Every request, with speed, GPU, memory and what came back.</figcaption></figure>
+      <figure class="shot tilt reveal"><button type="button" data-view="assets/agents.webp" data-cap="Coding agents" data-sub="Settings › Connect">
+        <img src="assets/agents.webp" alt="Settings, Connect: the coding agents and what each supports" loading="lazy" width="1200" height="675">
+        <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
+        <figcaption><b>Coding agents.</b> Connect the agents you use to your own models in one command.</figcaption></figure>
+    </div>
+    <p class="note reveal">The Workshop and Computer tabs are newer than these screenshots.</p>
   </div>
 </section>
 
 <section id="videos">
   <div class="wrap">
-    <h2>Videos</h2>
-    <p class="sub">Demos recorded live on one PC, and music, pictures and voices made with am2Strata itself. They open on YouTube.</p>
-    <h3 class="vh">Demos and what's new</h3>
+    <p class="kicker reveal">Videos</p>
+    <h2 class="reveal">Recorded live, made with am2Strata.</h2>
+    <p class="sub reveal">Demos recorded on one PC, and music, pictures and voices made with am2Strata itself. They open on YouTube.</p>
+    <h3 class="vh reveal">Demos and what's new</h3>
     <div class="vids">
-      <a class="vid" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
-        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span>What's new since v0.1.4: the Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid feature tilt reveal" href="https://www.youtube.com/watch?v=ByP6i4dtRdk" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/ByP6i4dtRdk.webp" alt="" loading="lazy" width="640" height="360"><span class="new">New</span><span class="dur">2:48</span><span class="play" aria-hidden="true"></span></span>
+        <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span>A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span></a>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
+        <b>am2Strata v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span>The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span></a>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
         <b>Run AI on Your Own PC: the 10-minute tour</b><span>Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
         <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span>Voices in eleven languages, code and pictures, all on one PC with no cloud.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
         <b>Songs That Sing Your Lyrics (v0.1.4)</b><span>Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span></a>
     </div>
-    <h3 class="vh">Made with am2Strata</h3>
+    <h3 class="vh reveal">Made with am2Strata</h3>
     <div class="vids">
-      <a class="vid" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
         <b>The Moon Woman Singing to Maven</b><span>A cinematic ballad sung across the empty space to Earth.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
         <b>Lofi for Coding: 1 Hour of Deep Focus</b><span>Twenty original instrumental tracks for programming and study.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
         <b>Moonlight on the Sea</b><span>A slow, calm song to let the day go.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
         <b>Little Moon, Goodnight</b><span>A gentle lullaby for sleep.</span></a>
-      <a class="vid" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
         <b>Peace and Harmony</b><span>A calm song about kindness and living as one.</span></a>
-      <a class="vid short" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid short tilt reveal" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
         <b>The Moon Woman Singing to Maven (Short)</b><span>The ballad's chorus, vertical.</span></a>
     </div>
     <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">am2Strata on YouTube</a>.</p>
   </div>
 </section>
 
-<section id="install">
+<section class="alt" id="install">
   <div class="wrap">
-    <h2>Install in one line</h2>
-    <p class="sub">The installer picks the right download for your system and processor, checks its SHA-256, needs no admin
+    <p class="kicker reveal">Install</p>
+    <h2 class="reveal">One line, any of six platforms.</h2>
+    <p class="sub reveal">The installer picks the right download for your system and processor, checks its SHA-256, needs no admin
       rights, and keeps your models and settings when you update.</p>
     <div class="tabs" role="tablist">
       <button class="tab" role="tab" aria-selected="true" data-os="unix">Linux and macOS</button>
@@ -267,23 +578,26 @@ footer p { margin: 6px 0; }
     <div class="code" id="cmd-unix">curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh<button class="copy" type="button">Copy</button></div>
     <div class="code" id="cmd-win" hidden>irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex<button class="copy" type="button">Copy</button></div>
     <div class="steps">
-      <div class="card"><h3>1 · Get a model</h3><p>Pull a small one to start:<br><code>am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M</code></p></div>
-      <div class="card"><h3>2 · Start it</h3><p>Run <code>am2strata</code> and open <code>http://127.0.0.1:8000</code> in your browser.</p></div>
-      <div class="card"><h3>3 · Check your PC</h3><p><code>am2strata-run doctor</code> lists each optional feature and exactly what this machine still needs for it.</p></div>
+      <div class="card tilt reveal"><h3>1 · Get a model</h3><p>Pull a small one to start:<br><code>am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M</code></p></div>
+      <div class="card tilt reveal"><h3>2 · Start it</h3><p>Run <code>am2strata</code> and open <code>http://127.0.0.1:8000</code> in your browser.</p></div>
+      <div class="card tilt reveal"><h3>3 · Check your PC</h3><p><code>am2strata-run doctor</code> lists each optional feature and exactly what this machine still needs for it.</p></div>
     </div>
   </div>
 </section>
 
-<section class="alt" id="platforms">
+<section id="platforms">
   <div class="wrap">
-    <h2>Where it runs</h2>
-    <p class="sub">Six downloads. The server, the web app, the APIs and the Workshop work on all of them.</p>
-    <div class="table-wrap">
+    <p class="kicker reveal">Platforms</p>
+    <h2 class="reveal">Where it runs</h2>
+    <p class="sub reveal">Six downloads. The server, the web app, the APIs and the Workshop work on all of them.</p>
+    <div class="table-wrap reveal">
       <table>
         <thead><tr><th></th><th>Linux x64</th><th>Linux Arm</th><th>macOS Apple silicon</th><th>macOS Intel</th><th>Windows x64</th><th>Windows Arm</th></tr></thead>
         <tbody>
           <tr><td>Server, web app, APIs, Workshop</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
-          <tr><td>Rust engine</td><td>CPU or GPU</td><td>CPU</td><td>CPU or GPU</td><td>CPU</td><td>CPU or GPU</td><td>CPU</td></tr>
+          <tr><td>Rust engine</td><td>CPU (AVX2) or GPU</td><td>CPU</td><td>CPU (NEON) or GPU</td><td>CPU</td><td>CPU (AVX2) or GPU</td><td>CPU</td></tr>
+          <tr><td>Browser use</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
+          <tr><td>Cluster (master or worker)</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td><td class="yes">yes</td></tr>
           <tr><td>Computer tab</td><td class="yes">yes</td><td class="yes">yes</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
           <tr><td>Sandbox VM</td><td class="yes">yes (KVM)</td><td>–</td><td>–</td><td>–</td><td>–</td><td>–</td></tr>
           <tr><td>Start at sign-in</td><td>systemd</td><td>systemd</td><td>launchd</td><td>launchd</td><td>Startup</td><td>Startup</td></tr>
@@ -293,14 +607,15 @@ footer p { margin: 6px 0; }
   </div>
 </section>
 
-<section id="why">
+<section class="alt" id="why">
   <div class="wrap">
-    <h2>Built to stay yours</h2>
-    <div class="pillars">
-      <div class="pillar"><b>Local first</b><span>Models run on your hardware. Nothing leaves your PC unless you send it.</span></div>
-      <div class="pillar"><b>Light on the machine</b><span>Jobs queue for the GPU one at a time; the sandbox VM only gets CPU nothing else is using.</span></div>
-      <div class="pillar"><b>Open</b><span>MIT licensed and written in Rust, with a regression suite that checks every route on every change.</span></div>
-      <div class="pillar"><b>Your rules</b><span>An agent on your desktop asks before anything that sends, deletes, installs, buys or publishes.</span></div>
+    <p class="kicker reveal">Principles</p>
+    <h2 class="reveal">Built to stay yours</h2>
+    <div class="pillars" style="margin-top:34px">
+      <div class="pillar tilt reveal"><b>Local first</b><span>Models run on your hardware. Nothing leaves your PC unless you send it.</span></div>
+      <div class="pillar tilt reveal"><b>Light on the machine</b><span>Jobs queue for the GPU one at a time; the sandbox VM only gets CPU nothing else is using.</span></div>
+      <div class="pillar tilt reveal"><b>Open</b><span>MIT licensed and written in Rust, with a regression suite that checks every route on every change.</span></div>
+      <div class="pillar tilt reveal"><b>Your rules</b><span>An agent on your desktop asks before anything that sends, deletes, installs, buys or publishes.</span></div>
     </div>
   </div>
 </section>
@@ -321,7 +636,33 @@ footer p { margin: 6px 0; }
   </div>
 </footer>
 
+<dialog class="viewer" id="viewer" aria-label="Image viewer">
+  <div class="vw-top">
+    <div class="vw-cap" id="vw-cap"></div>
+    <div style="display:flex;gap:8px">
+      <a class="vw-btn" id="vw-open" href="#" target="_blank" rel="noopener" title="Open the full-size image"><svg viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9M19 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h5"/></svg><span>Full size</span></a>
+      <a class="vw-btn" id="vw-dl" href="#" download title="Download"><svg viewBox="0 0 24 24"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg><span>Download</span></a>
+      <button class="vw-btn" id="vw-close" type="button" title="Close (Esc)"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+  </div>
+  <button class="vw-btn vw-nav vw-prev" id="vw-prev" type="button" title="Previous (←)" aria-label="Previous image"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+  <div class="vw-stage" id="vw-stage"><img id="vw-img" alt=""></div>
+  <button class="vw-btn vw-nav vw-next" id="vw-next" type="button" title="Next (→)" aria-label="Next image"><svg viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>
+  <div class="vw-bot">
+    <button class="vw-btn" id="vw-out" type="button" title="Zoom out (−)" aria-label="Zoom out"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M8 11h6"/></svg></button>
+    <span class="vw-zoom" id="vw-zoom">100%</span>
+    <button class="vw-btn" id="vw-in" type="button" title="Zoom in (+)" aria-label="Zoom in"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></button>
+    <button class="vw-btn" id="vw-fit" type="button" title="Fit (0)">Fit</button>
+    <span class="vw-zoom" id="vw-pos"></span>
+  </div>
+</dialog>
+
 <script>
+(() => {
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const fine = matchMedia("(pointer: fine)").matches;
+
+  // install tabs and copy
   for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => {
     for (const o of document.querySelectorAll(".tab")) o.setAttribute("aria-selected", String(o === t));
     document.getElementById("cmd-unix").hidden = t.dataset.os !== "unix";
@@ -334,6 +675,96 @@ footer p { margin: 6px 0; }
     catch (e) { b.textContent = "Select and copy"; }
     setTimeout(() => (b.textContent = "Copy"), 1600);
   });
+
+  // reveal on scroll, and the chart's bars grow when they come into view
+  const show1 = el => {
+    if (el.classList.contains("in")) return;
+    el.classList.add("in");
+  };
+  const io = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) { show1(e.target); io.unobserve(e.target); } }),
+                                      { rootMargin: "0px 0px -8% 0px", threshold: .08 });
+  for (const el of document.querySelectorAll(".reveal")) io.observe(el);
+  // a safety net for jumps (anchors, restored scroll): whatever is on screen is shown
+  let queued = false;
+  const sweep = () => { queued = false; for (const el of document.querySelectorAll(".reveal:not(.in)")) {
+    const r = el.getBoundingClientRect(); if (r.top < innerHeight && r.bottom > 0) show1(el); } };
+  addEventListener("scroll", () => { if (!queued) { queued = true; requestAnimationFrame(sweep); } }, { passive: true });
+  addEventListener("hashchange", () => setTimeout(sweep, 50));
+  setTimeout(sweep, 400);
+  if (reduce) for (const el of document.querySelectorAll(".reveal")) show1(el);
+
+  // 3D tilt on cards and screens (mouse and pen only)
+  if (fine && !reduce) for (const el of document.querySelectorAll(".tilt")) {
+    el.addEventListener("pointermove", e => {
+      const r = el.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+      el.style.setProperty("--ry", ((x - .5) * 10).toFixed(2) + "deg");
+      el.style.setProperty("--rx", ((.5 - y) * 8).toFixed(2) + "deg");
+      el.style.setProperty("--mx", (x * 100).toFixed(1) + "%");
+      el.style.setProperty("--my", (y * 100).toFixed(1) + "%");
+    });
+    el.addEventListener("pointerleave", () => { el.style.setProperty("--rx", "0deg"); el.style.setProperty("--ry", "0deg"); });
+  }
+
+  // the hero's stack follows the pointer
+  const stack = document.getElementById("stack");
+  if (fine && !reduce) addEventListener("pointermove", e => {
+    const x = e.clientX / innerWidth - .5, y = e.clientY / innerHeight - .5;
+    stack.style.setProperty("--tx", (x * 18).toFixed(2) + "deg");
+    stack.style.setProperty("--ty", (y * -12).toFixed(2) + "deg");
+  }, { passive: true });
+
+  // the viewer: every [data-view] opens full screen, with zoom, pan and keys
+  const dlg = document.getElementById("viewer"), img = document.getElementById("vw-img"), stage = document.getElementById("vw-stage");
+  const cap = document.getElementById("vw-cap"), zl = document.getElementById("vw-zoom"), pos = document.getElementById("vw-pos");
+  const items = [...new Map([...document.querySelectorAll("[data-view]")].map(b => [b.dataset.view, b])).values()];
+  let i = 0, s = 1, tx = 0, ty = 0, base = { w: 0, h: 0 }, opener = null;
+  const apply = () => { img.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`; zl.textContent = Math.round(s * 100) + "%"; };
+  const fit = () => {
+    img.style.transform = "none"; const r = img.getBoundingClientRect(); base = { w: r.width, h: r.height };
+    s = 1; tx = -base.w / 2; ty = -base.h / 2; apply();
+  };
+  const show = k => {
+    i = (k + items.length) % items.length; const b = items[i];
+    cap.innerHTML = ""; cap.append(b.dataset.cap || ""); if (b.dataset.sub) { const sm = document.createElement("small"); sm.textContent = b.dataset.sub; cap.append(sm); }
+    pos.textContent = (i + 1) + " / " + items.length;
+    document.getElementById("vw-open").href = b.dataset.view; document.getElementById("vw-dl").href = b.dataset.view;
+    img.alt = b.querySelector("img")?.alt || ""; img.onload = fit; img.src = b.dataset.view; if (img.complete) fit();
+  };
+  const zoomAt = (f, cx, cy) => {
+    const r = stage.getBoundingClientRect(), px = (cx ?? r.left + r.width / 2) - r.left - r.width / 2, py = (cy ?? r.top + r.height / 2) - r.top - r.height / 2;
+    const ns = Math.min(8, Math.max(.5, s * f)); tx = px - (px - tx) * ns / s; ty = py - (py - ty) * ns / s; s = ns; apply();
+  };
+  for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => {
+    opener = b; show(items.findIndex(x => x.dataset.view === b.dataset.view));
+    if (!dlg.open) dlg.showModal();
+    document.body.style.overflow = "hidden";
+  });
+  dlg.addEventListener("close", () => { document.body.style.overflow = ""; opener?.focus(); });
+  document.getElementById("vw-close").onclick = () => dlg.close();
+  document.getElementById("vw-prev").onclick = () => show(i - 1);
+  document.getElementById("vw-next").onclick = () => show(i + 1);
+  document.getElementById("vw-in").onclick = () => zoomAt(1.4);
+  document.getElementById("vw-out").onclick = () => zoomAt(1 / 1.4);
+  document.getElementById("vw-fit").onclick = fit;
+  dlg.addEventListener("keydown", e => {
+    if (e.key === "ArrowLeft") show(i - 1); else if (e.key === "ArrowRight") show(i + 1);
+    else if (e.key === "+" || e.key === "=") zoomAt(1.4); else if (e.key === "-") zoomAt(1 / 1.4); else if (e.key === "0") fit();
+  });
+  stage.addEventListener("wheel", e => { e.preventDefault(); zoomAt(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.clientX, e.clientY); }, { passive: false });
+  stage.addEventListener("dblclick", e => s > 1.05 ? fit() : zoomAt(2.5, e.clientX, e.clientY));
+  // drag to pan; two fingers to pinch
+  const pts = new Map(); let last = null, pinch = null;
+  stage.addEventListener("pointerdown", e => { stage.setPointerCapture(e.pointerId); pts.set(e.pointerId, e); stage.classList.add("drag"); last = { x: e.clientX, y: e.clientY }; });
+  stage.addEventListener("pointermove", e => {
+    if (!pts.has(e.pointerId)) return; pts.set(e.pointerId, e);
+    if (pts.size === 2) { const [a, b] = [...pts.values()], d = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+      if (pinch) zoomAt(d / pinch, (a.clientX + b.clientX) / 2, (a.clientY + b.clientY) / 2); pinch = d; return; }
+    tx += e.clientX - last.x; ty += e.clientY - last.y; last = { x: e.clientX, y: e.clientY }; apply();
+  });
+  const up = e => { pts.delete(e.pointerId); pinch = null; if (!pts.size) stage.classList.remove("drag"); else { const p = [...pts.values()][0]; last = { x: p.clientX, y: p.clientY }; } };
+  stage.addEventListener("pointerup", up); stage.addEventListener("pointercancel", up);
+  addEventListener("resize", () => dlg.open && fit());
+})();
 </script>
 </body>
 </html>
