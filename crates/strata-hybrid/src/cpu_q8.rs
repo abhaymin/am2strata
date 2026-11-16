@@ -522,3 +522,34 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod speed {
+    use super::*;
+    /// Single-thread throughput of each kernel on a 1536 x 2048 matrix (cargo test --release -- --ignored kernel_speed --nocapture).
+    #[test]
+    #[ignore]
+    fn kernel_speed() {
+        let (rows, cols) = (1536usize, 2048usize);
+        for (ty, bb, per) in [("Q4_K", 144usize, 256usize), ("Q5_K", 176, 256), ("Q6_K", 210, 256), ("Q8_0", 34, 32)] {
+            let t = Fast::of(ty).unwrap();
+            let rb = cols / per * bb;
+            let mut seed = 7u64;
+            let data: Vec<u8> = (0..rows * rb).map(|_| { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1); (seed >> 33) as u8 }).collect();
+            let x: Vec<f32> = (0..cols).map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0).collect();
+            let xq = Q8K::quantize_for(t, &x).unwrap();
+            let xs: Vec<Q8K> = (0..8).map(|_| Q8K::quantize_for(t, &x).unwrap()).collect();
+            let t0 = std::time::Instant::now();
+            let mut s = 0f32;
+            for _ in 0..5 { for r in 0..rows { s += row_dot(t, &data[r * rb..(r + 1) * rb], &xq); } }
+            let one = t0.elapsed().as_secs_f64() / 5.0;
+            let t0 = std::time::Instant::now();
+            let mut out = vec![0f32; 8];
+            for _ in 0..2 { for r in 0..rows { row_dot_many(t, &data[r * rb..(r + 1) * rb], &xs, &mut out); s += out[0]; } }
+            let many = t0.elapsed().as_secs_f64() / 2.0;
+            let macs = (rows * cols) as f64;
+            println!("{ty}: one input {:.2} GMAC/s ({:.1} GB/s of weights), 8 inputs {:.2} GMAC/s  [{s:.0}] path {:?}",
+                     macs / one / 1e9, (rows * rb) as f64 / one / 1e9, 8.0 * macs / many / 1e9, path());
+        }
+    }
+}

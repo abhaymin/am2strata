@@ -149,6 +149,18 @@ What changed:
 - `AM2_TIMES=1` prints each request's time by block kind (`INFO times_ms=mla=...,moe=...`), and `tools/hybrid-bench.sh`
   passes engine flags after `--`.
 
+### One parallel pass per step for the experts and MLA's heads
+
+Generating a token was about 1,000 matrix-vector products, each its own parallel job (and the MoE layer's experts one
+after another). `QMat::mul_set` multiplies several matrices in one pass over all their rows (ggml's mul_mat_id idea):
+the chosen experts' up and gate with the shared expert's, then their downs; MLA's q_a with kv_a, and the 20 heads'
+absorbed k_b and v_b. Same row functions on the same inputs, so the tokens are identical (`AM2_NO_FUSED=1` for the old
+path). GLM-4.7-Flash in RAM, 64 tokens: 7.83 s -> 6.3-6.4 s (8.2 -> 10.0 tok/s).
+
+Kernel throughput, one thread (`cargo test --release -- --ignored kernel_speed`), this PC (AVX2): one input 10-15 GMAC/s
+(Q4_K 5.6 GB/s of weights), 8 inputs only 16-22 GMAC/s. The prompt is bound by that (chunks of 128-512 help MoE only a
+little: 22.6 -> 18.5 s of a 512-token GLM prompt), so the next step is explicit SIMD kernels.
+
 ## Next
-- **Q4_0 the same way; SIMD for the integer kernels** (MoE is now the largest share of a GLM prompt: 42 ms a token).
+- **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).
