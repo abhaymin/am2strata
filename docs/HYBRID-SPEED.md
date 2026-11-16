@@ -117,6 +117,15 @@ dropped first, 8 threads):
 | llama.cpp default (repacks into RAM) | killed: out of memory | |
 | llama.cpp `--no-repack` (plain mmap) | 31.2 | 13.4 |
 
+**Mac mini M4, 16 GB, this build** (4 threads): ours plain 9.32 / 5.67, with `--resident-experts --expert-ram-gib 8` and the
+profile 10.73 / 6.02 (no swapouts); llama.cpp `llama-completion -nr` (plain mmap, no repack) 17.31 / 3.58 (no swapouts).
+On macOS llama.cpp's mmap path reads the prompt 1.6x faster and we generate 1.7x faster. The time split there
+(`AM2_TIMES=1`): MLA 24.1 s, MoE 30.7 s of 57 s, so the attention needs the same work as the experts.
+
+Parity with llama.cpp (tools/reference-llamacpp/parity.sh, 32 steps of real text): 30 identical and 2 near-ties, worst
+logit difference 3.41 (the build before: 31 + 1, 4.19). On a synthetic prompt of consecutive ids the first token flips
+between builds; those are near-ties of a nearly flat distribution.
+
 The same model with everything in RAM: ours before 6.3 / 6.1, ours now 15.4 / 7.9, llama.cpp 76 / 18.3. So the tiers
 work (capped runs at 75-90% of in-RAM speed) and the remaining gap to llama.cpp is compute on this model, not reading.
 
