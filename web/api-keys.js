@@ -105,13 +105,19 @@
   // a whole number above zero from a limit field, else null (no limit). Shared by make and edit.
   const num = (id) => { const v = parseInt(el(id).value, 10); return v > 0 ? v : null; };
 
-  /// A key's expiry as the form's "In N" option ("1d", "7d" …), or "" when it has none: picked at or above how
-  /// many days are left so saving leaves an unchanged expiry alone.
-  const expOption = (expiresAt) => {
-    if (!expiresAt) return "";
-    const days = Math.round((expiresAt - Math.floor(Date.now() / 1000)) / 86400);
-    for (const d of [1, 7, 30, 90, 365]) if (days >= d * 0.6) return `${d}d`;
-    return "";
+  /// While a key that expires is edited, the expiry list gets a first option, "Unchanged (expires <date>)", selected:
+  /// the "In N days" options cannot stand for its real date, so the expiry changes only when another option is picked.
+  const KEEP = "keep";
+  const setKeepOption = (expiresAt) => {
+    const sel = el("key-expires");
+    const old = sel.querySelector(`option[value="${KEEP}"]`);
+    if (old) old.remove();
+    if (!expiresAt) { sel.value = ""; return; }
+    const o = document.createElement("option");
+    o.value = KEEP;
+    o.textContent = `Unchanged (expires ${new Date(expiresAt * 1000).toLocaleDateString(undefined, {year: "numeric", month: "short", day: "numeric"})})`;
+    sel.prepend(o);
+    sel.value = KEEP;
   };
   const sorted = (a) => (a || []).slice().sort();
   const sameSet = (a, b) => JSON.stringify(sorted(a)) === JSON.stringify(sorted(b));
@@ -143,7 +149,7 @@
       editing = true; editingId = k.id; origKey = k;
       el("key-name").value = k.name;
       [...el("key-tools").querySelectorAll("input")].forEach((c) => c.checked = (k.tools || []).includes(c.value));
-      el("key-expires").value = expOption(k.expires_at);
+      setKeepOption(k.expires_at);
       el("key-req-day").value = k.limits && k.limits.requests_per_day != null ? String(k.limits.requests_per_day) : "";
       el("key-tok-day").value = k.limits && k.limits.tokens_per_day != null ? String(k.limits.tokens_per_day) : "";
       el("key-models").value = (k.models || []).join(", ");
@@ -161,7 +167,9 @@
       const body = {};
       if (cur.name !== o.name) body.name = cur.name;
       if (!sameSet(cur.tools, o.tools)) body.tools = cur.tools;
-      if (cur.expires !== expOption(o.expires_at)) {
+      // "keep" (a key that expires, left alone) or "" on a key that never expires: unchanged; anything else is new
+      const unchanged = cur.expires === KEEP || (!o.expires_at && cur.expires === "");
+      if (!unchanged) {
         if (cur.expires) body.expires_in = cur.expires; else body.expires_at = null;
       }
       const oLim = o.limits || {};
@@ -174,6 +182,7 @@
         const j = await api(`api/keys/${encodeURIComponent(editingId)}`, {method: "POST", body: JSON.stringify(body)});
         toast("success", "Key updated", `${j.name} saved.`);
         editing = false; editingId = ""; origKey = null;
+        setKeepOption(null);
         el("key-form").reset();
         setSubmitLabel();
         loadApiKeys();
