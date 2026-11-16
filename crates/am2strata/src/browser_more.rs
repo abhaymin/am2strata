@@ -644,6 +644,16 @@ pub fn extract_js(args: &Value) -> String {
 
 const EXTRACT_JS: &str = r#"(() => { const A = __ARGS__;
   const txt = e => e ? (e.innerText || e.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  // footnote marks are either real elements to drop from a clone or, rarely, plain text left behind. The text strip only
+  // catches the footnote shapes at a value's end or before a space, so something like a formula's C[1] (a subscript) stays.
+  const FN_MARKERS = /\[(?:[0-9]{2,}|[a-z]+|[a-z]+\s[0-9]+|[a-z]+ [a-z]+)\](?=\s|$)/g;
+  const cellTxt = cell => {
+    if (!cell) return '';
+    const c = cell.cloneNode(true); // a clone is not laid out, so innerText falls back to textContent (handled below)
+    try { c.querySelectorAll('sup.reference, sup.noprint, .mw-ref, sup[class*="cite"], span.sortkey, .reference').forEach(e => e.remove()); } catch (x) {}
+    let s = (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim();
+    return s.replace(FN_MARKERS, '').replace(/\s+/g, ' ').trim();
+  };
   const abs = u => { try { return new URL(u, location.href).href; } catch (x) { return u; } };
   const pick = (root, spec) => {
     spec = String(spec == null ? '' : spec); let css = spec, attr = null; const at = spec.lastIndexOf('@');
@@ -683,12 +693,12 @@ const EXTRACT_JS: &str = r#"(() => { const A = __ARGS__;
     const g = grid(trs), width = Math.max(...g.map(l => l.length));
     const names = [];
     for (let c = 0; c < width; c++) { const parts = [];
-      for (let r = 0; r < nh; r++) { const v = g[r][c]; const x = v ? txt(v.cell).replace(/\[[\w\s]*\]/g, '').trim() : ''; if (x && parts[parts.length - 1] !== x) parts.push(x); }
+      for (let r = 0; r < nh; r++) { const v = g[r][c]; const x = v ? cellTxt(v.cell) : ''; if (x && parts[parts.length - 1] !== x) parts.push(x); }
       names.push(parts.join(' ') || ('col' + (c + 1))); }
     const seen = {}; names.forEach((n, i) => { if (seen[n]) names[i] = n + '_' + (++seen[n]); else seen[n] = 1; });
     for (let r = nh; r < g.length; r++) { const line = g[r]; if (!line.length) continue;
       const o = {}; let any = false;
-      for (let c = 0; c < width; c++) { const v = line[c]; if (!v) continue; const n = names[c]; const x = txt(v.cell); o[n] = x; if (x) any = true;
+      for (let c = 0; c < width; c++) { const v = line[c]; if (!v) continue; const n = names[c]; const x = cellTxt(v.cell); o[n] = x; if (x) any = true;
         const as = v.cell.querySelectorAll("a[href]:not([href^='#'])"); if (as.length === 1) o[n + '_link'] = abs(as[0].getAttribute('href')); }
       if (any) rows.push(o); }
   } else if (A.kind === 'items') {
@@ -904,5 +914,16 @@ mod tests {
         let t = tools(false, false);
         assert_eq!(t.len(), NAMES.len());
         for n in NAMES { assert!(t.iter().any(|x| x["name"] == n), "{n}"); assert!(super::super::TOOL_NAMES.contains(&n), "{n} in TOOL_NAMES"); }
+    }
+
+    #[test]
+    fn the_table_extract_drops_footnote_marks_in_cells_and_headers() {
+        let js = extract_js(&json!({"kind": "table"}));
+        // cellTxt exists and is used where values and header names come from, and both ways a mark hides are handled
+        assert!(js.contains("const cellTxt"));
+        assert!(js.contains("cellTxt(v.cell)"));
+        assert!(js.contains(".reference") && js.contains("FN_MARKERS") && js.contains("[0-9]{2,}"), "{js}");
+        // the old header regex that left marks on cells is gone; every cell/name now goes through cellTxt
+        assert!(!js.contains(r#"txt(v.cell).replace(/\[""#));
     }
 }
