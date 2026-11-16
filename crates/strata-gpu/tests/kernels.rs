@@ -251,3 +251,32 @@ fn several_products_at_once_match_the_cpu_on_every_device() {
         }
     }
 }
+
+/// A Q4_K matrix too wide for the wide kernel's shared memory on a device with a 32 KiB limit (Metal): 3072 rows x
+/// 9216 columns, a 3B model's ffn_down, which gave a Mac M4 wrong tokens. Whatever kernel is chosen, it must match.
+#[test]
+fn a_wide_q4k_ffn_down_matches_the_cpu_on_every_device() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let (rows, cols) = (3072usize, 9216usize);
+    eprintln!("wide kernel needs {} bytes of shared memory for {cols} columns", strata_gpu::kernels::wide_shared_bytes(cols as u32));
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let w = weights("Q4_K", rows, cols, &mut rng);
+    let rb = w.len() / rows;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let want: Vec<(f32, f64)> = (0..rows).map(|r| {
+        let mut row = vec![0f32; cols];
+        strata_pack::quants::dequantize_into("Q4_K", &w[r * rb..(r + 1) * rb], &mut row).unwrap();
+        let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+        (s as f32, mag.max(1e-9))
+    }).collect();
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let up = gpu.upload("Q4_K", &w, rows, cols).unwrap();
+        let y = gpu.matvec(&up, &x);
+        let wrong = y.iter().zip(&want).filter(|(a, (b, m))| !(((**a as f64 - *b as f64).abs() / m) < 1e-3)).count();
+        eprintln!("{}: {wrong} of {rows} rows wrong", d.name);
+        assert_eq!(wrong, 0, "{}: a 3072 x 9216 Q4_K product has {wrong} wrong rows", d.name);
+    }
+}
