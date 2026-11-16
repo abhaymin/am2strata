@@ -210,7 +210,22 @@ cluster's pins, failure falls back to local computation. GLM-4.7-Flash, master 3
 | PC to PC, host killed mid-prompt | marked down after 91 calls, identical tokens |
 | Unpaired master, wrong host pin | refused at the TLS handshake; the model runs on locally |
 | Mac to Mac (two processes, 16 GB) | identical 64 tokens, 397 experts and 1,243 calls remote (slower: one machine, swap) |
-| Mac and PC, either way | built on both; waiting for the owner's approval of the Mac's network listener |
+| PC master, Mac host (4 GiB) | identical tokens batched and not (x86 and Apple silicon give the same bits); no gain, as this PC holds the model in RAM |
+| **Mac master, PC host (8 GiB)** | identical tokens; see below |
+
+**The 16 GB Mac running GLM-4.7-Flash (17.5 GB) with 8 GiB of the PC's RAM as its next tier** (512-token prompt, 64
+tokens, 8 threads, gigabit LAN; tokens identical in every pair):
+
+| Mac's own RAM for experts | Prompt tok/s, alone -> with the PC | Generation tok/s | Pages read from the SSD |
+|---|---|---|---|
+| 3 GiB | 15.52 -> **23.83** (+54%) | 8.83 -> 8.75 | 1.20 M -> 50 K |
+| 6 GiB | 16.46 -> **25.49** (+55%) | 9.40 -> **10.40** (+11%) | 1.05 M -> 8 K |
+
+Two bugs these runs found, both fixed: the host kept a previous master's experts and refused a different set (it now
+lets go of what is no longer wanted), and `f32::exp` differs in the last bit between glibc and Apple's libm, which
+flipped a near-tie once enough experts were remote (the engine now has a portable `exp`, `exp_f32`, whose bits are
+checked by a hash test that passes on both machines).
+
 
 ## Next
 - **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
