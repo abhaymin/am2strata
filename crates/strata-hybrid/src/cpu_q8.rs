@@ -449,7 +449,95 @@ mod avx2 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn row_dot_many_dotprod(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
-    body_many(t, row, xs, out)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("AM2_NO_NEON").is_some()) {
+        return body_many(t, row, xs, out);
+    }
+    match t {
+        Fast::Q4K => neon::q4k_many(row, xs, out),
+        Fast::Q8_0 => neon::q80_many(row, xs, out),
+        _ => body_many(t, row, xs, out),
+    }
+}
+
+/// Hand-written NEON with the dot-product instruction (sdot: 16 i8 products into 4 i32 lanes; Apple M1 and later,
+/// Graviton 2+) for the most used types. The integer sums are exact and the float arithmetic is the scalar kernels'
+/// in the same order, so every result equals the baseline build's bit for bit (the same test as AVX2's).
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use super::{h, Q8K};
+    use std::arch::aarch64::*;
+
+    /// acc + the 4-lane dot products of a and b (sdot; inline assembly, which is stable where the intrinsic may not be).
+    #[inline(always)]
+    unsafe fn sdot(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+        let mut r = acc;
+        std::arch::asm!("sdot {r:v}.4s, {a:v}.16b, {b:v}.16b", r = inout(vreg) r, a = in(vreg) a, b = in(vreg) b,
+                        options(pure, nomem, nostack));
+        r
+    }
+
+    /// Σ w[i] x[i] over 32 values (w as two halves), exact in i32.
+    #[inline(always)]
+    unsafe fn dot32(w0: int8x16_t, w1: int8x16_t, x: *const i8) -> i32 {
+        let s = sdot(sdot(vdupq_n_s32(0), w0, vld1q_s8(x)), w1, vld1q_s8(x.add(16)));
+        vaddvq_s32(s)
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q4k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        out.iter_mut().for_each(|o| *o = 0.0);
+        let m4 = vdupq_n_u8(0x0f);
+        let mut ds = [0f32; 8];
+        let mut ms = [0f32; 8];
+        let mut w = [vdupq_n_s8(0); 16];
+        for (bi, b) in row.chunks_exact(144).enumerate() {
+            let (d, dmin) = (h(b, 0), h(b, 2));
+            let sc = &b[4..16];
+            let qs = b[16..144].as_ptr();
+            for c in 0..4 {
+                for half in 0..2 {
+                    let v = vld1q_u8(qs.add(c * 32 + half * 16));
+                    w[(2 * c) * 2 + half] = vreinterpretq_s8_u8(vandq_u8(v, m4));
+                    w[(2 * c + 1) * 2 + half] = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+                }
+            }
+            for g in 0..8 {
+                let j = g % 4;
+                let (scale, min) = if g < 4 {
+                    (sc[j] & 0x3f, sc[4 + j] & 0x3f)
+                } else {
+                    ((sc[8 + j] & 0x0f) | ((sc[j] >> 2) & 0x30), (sc[8 + j] >> 4) | ((sc[4 + j] >> 2) & 0x30))
+                };
+                ds[g] = d * scale as f32;
+                ms[g] = dmin * min as f32;
+            }
+            for (x, o) in xs.iter().zip(out.iter_mut()) {
+                let xq = x.q.as_ptr().add(bi * 256);
+                let mut acc = 0f32;
+                for g in 0..8 {
+                    let p = dot32(w[g * 2], w[g * 2 + 1], xq.add(g * 32));
+                    acc += ds[g] * p as f32 - ms[g] * x.sum32[bi * 8 + g] as f32;
+                }
+                *o += acc * x.d[bi];
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q80_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+        let nb = row.len() / 34;
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let mut acc = 0f32;
+            for bi in 0..nb {
+                let b = row.as_ptr().add(bi * 34);
+                let d = h(&row[bi * 34..bi * 34 + 2], 0);
+                let p = dot32(vld1q_s8(b.add(2) as *const i8), vld1q_s8(b.add(18) as *const i8), x.q.as_ptr().add(bi * 32));
+                acc += d * x.d[bi] * p as f32;
+            }
+            *o = acc;
+        }
+    }
 }
 
 /// One weight row dotted with several inputs (a prompt chunk): out[i] = row_dot(t, row, &xs[i]), the row unpacked once.
@@ -499,7 +587,14 @@ unsafe fn row_dot_avx2(t: Fast, row: &[u8], x: &Q8K) -> f32 {
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
 unsafe fn row_dot_dotprod(t: Fast, row: &[u8], x: &Q8K) -> f32 {
-    body(t, row, x)
+    match t {
+        Fast::Q4K | Fast::Q8_0 => {
+            let mut o = [0f32];
+            row_dot_many_dotprod(t, row, std::slice::from_ref(x), &mut o);
+            o[0]
+        }
+        _ => body(t, row, x),
+    }
 }
 
 /// Which build of the kernel this CPU runs, checked once.
