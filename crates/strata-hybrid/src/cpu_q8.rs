@@ -455,7 +455,9 @@ unsafe fn row_dot_many_dotprod(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32])
     }
     match t {
         Fast::Q4K => neon::q4k_many(row, xs, out),
-        Fast::Q8_0 => neon::q80_many(row, xs, out),
+        // Q8_0 with several inputs stays on the compiler's loop (M4: 39 vs 20 GMAC/s with eight); one input is NEON's
+        // (20 vs 16). Both are exact, so the results are the same either way.
+        Fast::Q8_0 if xs.len() == 1 => neon::q80_many(row, xs, out),
         _ => body_many(t, row, xs, out),
     }
 }
