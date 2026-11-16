@@ -32,7 +32,7 @@ out=$here/target-hybrid/.hybrid-bench.out
 {
   for _ in $(seq 1 "$iters"); do echo "GEN $new $ids"; done
   echo QUIT
-} | timeout 900 "$engine" ${thread_args[@]} "${extra[@]}" --serve --model "$model" --max-context 4096 >"$out" 2>"$out.err"
+} | timeout 900 "$engine" ${thread_args[@]+"${thread_args[@]}"} ${extra[@]+"${extra[@]}"} --serve --model "$model" --max-context 4096 >"$out" 2>"$out.err"
 
 # DONE fields (docs/PROTOCOL.md): 1 generated, 2 prompt tokens, 3 prompt ms, 4 decode ms; after the word DONE they are
 # awk's $2..$5. Summed across iters.
