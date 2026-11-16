@@ -2,12 +2,13 @@
 # Benchmark am2strata-hybrid over its stdin protocol (docs/PROTOCOL.md): a greedy prompt read, then a greedy decode.
 # The engine measures both itself (DONE #3 prompt ms, #4 decode ms); this parses those and reports tok/s. Same script
 # drives the Mac: nothing here is x86 specific. Keep each model's runs short (the numbers are engine-side).
-#   tools/hybrid-bench.sh <model.gguf> [--prompt N] [--new N] [--threads T] [--iters I] [--engine PATH]
+#   tools/hybrid-bench.sh <model.gguf> [--prompt N] [--new N] [--threads T] [--iters I] [--engine PATH] [-- ENGINE ARGS...]
+# Everything after `--` goes to the engine as is (e.g. -- --resident-experts --expert-ram-gib 8).
 set -uo pipefail
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 engine=${ENGINE:-$here/target-hybrid/release/am2strata-hybrid}  # where CARGO_TARGET_DIR=target-hybrid builds it
-model=; prompt_len=754; new=64; threads=; iters=2
+model=; prompt_len=754; new=64; threads=; iters=2; extra=()
 while [ $# -gt 0 ]; do
   case $1 in
     --prompt) prompt_len=$2; shift 2;;
@@ -15,6 +16,7 @@ while [ $# -gt 0 ]; do
     --threads) threads=$2; shift 2;;
     --iters) iters=$2; shift 2;;
     --engine) engine=$2; shift 2;;
+    --) shift; extra=("$@"); break;;
     *) [ -z "$model" ] && model=$1; shift;;
   esac
 done
@@ -30,7 +32,7 @@ out=$here/target-hybrid/.hybrid-bench.out
 {
   for _ in $(seq 1 "$iters"); do echo "GEN $new $ids"; done
   echo QUIT
-} | timeout 900 "$engine" ${thread_args[@]} --serve --model "$model" --max-context 4096 >"$out" 2>/dev/null
+} | timeout 900 "$engine" ${thread_args[@]} "${extra[@]}" --serve --model "$model" --max-context 4096 >"$out" 2>"$out.err"
 
 # DONE fields (docs/PROTOCOL.md): 1 generated, 2 prompt tokens, 3 prompt ms, 4 decode ms; after the word DONE they are
 # awk's $2..$5. Summed across iters.

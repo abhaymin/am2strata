@@ -87,6 +87,59 @@ about 6x slower on the M4. So `--devices` now builds the whole-token graph whene
 On the M4 the CPU stays faster: the graph reads the prompt one token at a time, while the CPU reads it in chunks of
 32 with integer kernels. A batched prompt on the device is the next GPU step.
 
+## Past the memory limit: GLM-4.7-Flash (17.5 GB) in less RAM
+
+This is the case the engine is for: a mixture of experts bigger than the RAM, with the hot experts kept in memory and the
+cold ones read from the SSD. GLM-4.7-Flash UD-Q4_K_XL (deepseek2: MLA attention, 64 experts, 4 used, ~3B active), a
+512-token prompt and 64 generated tokens, greedy.
+
+**Mac mini M4, 16 GB** (old build d8c65da, 4 threads):
+
+| | Prompt tok/s | Generation tok/s | Swap written |
+|---|---|---|---|
+| llama.cpp CPU (`-ngl 0`, default) | 11.4 | 2.05 | ~98 GB (6.1 M swapouts) |
+| llama.cpp Metal (`-ngl 99`) | 24.1 | out of GPU memory | |
+| llama.cpp `-ngl 20` | 18.0 | 2.30 | ~70 GB |
+| ours, `--resident-experts --expert-ram-gib 8` with a learned profile | 7.0 | **5.90** | 0 |
+
+llama.cpp's CPU backend repacks the weights into anonymous memory by default, which on 16 GB means swapping; our engine
+keeps the hot experts resident and reads only the cold ones (resident_hit 0.98).
+
+**PC, in a 10 GiB cgroup with no swap** (`systemd-run --user --scope -p MemoryMax=10G -p MemorySwapMax=0`, page cache
+dropped first, 8 threads):
+
+| | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| ours before (plain mmap) | 4.91 | 4.40 |
+| ours before, `--resident-experts --expert-ram-gib 6` (advice only) | 2.77 | 2.36 |
+| ours now, plain | 9.68 | 5.32 |
+| ours now, `--resident-experts --expert-profile` (auto budget: 6.3 GiB experts + 1.1 GiB always-used, copied) | **11.28** | **5.88** |
+| llama.cpp default (repacks into RAM) | killed: out of memory | |
+| llama.cpp `--no-repack` (plain mmap) | 31.2 | 13.4 |
+
+The same model with everything in RAM: ours before 6.3 / 6.1, ours now 15.4 / 7.9, llama.cpp 76 / 18.3. So the tiers
+work (capped runs at 75-90% of in-RAM speed) and the remaining gap to llama.cpp is compute on this model, not reading.
+
+What changed:
+- **MoE and MLA prompts are batched.** `forward_batch` took only dense attention and feed-forwards, so an MoE prompt went
+  token by token and each token pulled its experts again. Now a chunk's tokens are grouped by expert (each chosen expert is
+  read once and multiplied for all its tokens), MLA's projections take the whole chunk, and blocks that cannot batch (Mamba,
+  GDN, QSA) run token by token inside it. Each token's expert sum is added in its own routing order, so the tokens are
+  identical with and without batching (checked on GLM and Ministral).
+- **Integer kernels for Q5_K and Q8_0** (cpu_q8.rs). MLA's matrices are Q8_0 and some experts Q5_K; they took the float
+  path, which decodes each row again for every token. One input is the many-input function, so single and batched results
+  are identical.
+- **No MADV_RANDOM on cold experts.** It switched off readahead: an expert is megabytes in one piece, and it was read 4 KiB
+  per fault (5.8 M major faults instead of 0.2 M). macOS got only that hint for its cold experts.
+- **Residency that holds.** Where mlock is refused (the usual 8 MiB memlock limit), the always-used matrices and the
+  resident experts are copied into the engine's own memory (`pinned=copy`; `AM2_RESIDENT_COPY=0` for the old advice):
+  file pages are evicted under pressure, so advice alone read 25 GB a request with 95% of the routing "resident". The
+  automatic budget subtracts the always-used matrices and reads a cgroup's limit.
+- **The chosen experts are asked for at once** (MADV_WILLNEED before multiplying, on with `--resident-experts`,
+  `AM2_PREFETCH=0/1`).
+- `AM2_TIMES=1` prints each request's time by block kind (`INFO times_ms=mla=...,moe=...`), and `tools/hybrid-bench.sh`
+  passes engine flags after `--`.
+
 ## Next
-- **Q5_K, Q8_0 and Q4_0 the same way.**
+- **Q4_0 the same way; SIMD for the integer kernels** (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).

@@ -89,7 +89,17 @@ fn sample(logits: &[f32], s: &mut Sampling) -> u32 {
 
 /// Free RAM in bytes (0 when unknown), on Linux, macOS and Windows (strata_pack::sysmem).
 fn mem_available() -> u64 {
-    strata_pack::sysmem::available_mib() * 1024 * 1024
+    let sys = strata_pack::sysmem::available_mib() * 1024 * 1024;
+    cgroup_room().map_or(sys, |c| c.min(sys))
+}
+
+/// Room left under this process's cgroup v2 memory limit (a container, or systemd's MemoryMax), when it has one.
+fn cgroup_room() -> Option<u64> {
+    let path = std::fs::read_to_string("/proc/self/cgroup").ok()?.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string))?;
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().and_then(|v| v.trim().parse::<u64>().ok());
+    let (max, cur) = (read("memory.max")?, read("memory.current").unwrap_or(0));
+    Some(max.saturating_sub(cur))
 }
 
 fn main() {
@@ -137,16 +147,33 @@ fn main() {
     let res = if args.iter().any(|a| a == "--resident-experts") {
         // the budget: --expert-ram-gib, else what the expert tensors need, capped at 3/4 of the RAM available now
         let all: u64 = m.moes().map(|x| x.up_exps.bytes() + x.down_exps.bytes() + x.gate_exps.as_ref().map(|g| g.bytes()).unwrap_or(0)).sum();
+        // the matrices every token uses stay in RAM too: the experts get what is left of 3/4 of the free RAM
+        let always: u64 = m.matrices_mut().0.iter().map(|q| q.data.len() as u64).sum();
         let budget = arg("--expert-ram-gib").and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as u64)
-            .unwrap_or_else(|| all.min(mem_available() / 4 * 3));
+            .unwrap_or_else(|| all.min((mem_available() / 4 * 3).saturating_sub(always)));
         let r = pack::place(&m, profile.as_ref(), budget);
-        placement = format!("cpu resident_experts={} resident_gib={:.2} of_gib={:.2} pinned={}", r.n_resident,
-                            r.bytes as f64 / (1u64 << 30) as f64, all as f64 / (1u64 << 30) as f64,
-                            if r.locked { "mlock" } else { "advice" });
+        // without mlock, advice does not keep them: the hot experts are copied into memory of our own
+        // (AM2_RESIDENT_COPY=0 keeps the old advice-only behaviour, to compare)
+        let how = if r.locked {
+            "mlock"
+        } else if std::env::var("AM2_RESIDENT_COPY").ok().as_deref() != Some("0") {
+            pack::copy_resident(&mut m, &r);
+            "copy"
+        } else {
+            "advice"
+        };
+        placement = format!("cpu resident_experts={} resident_gib={:.2} of_gib={:.2} always_gib={:.2} pinned={how}", r.n_resident,
+                            r.bytes as f64 / (1u64 << 30) as f64, all as f64 / (1u64 << 30) as f64, always as f64 / (1u64 << 30) as f64);
         Some(r)
     } else {
         None
     };
+    // the experts each step chose, asked for at once: on with residency (the cold ones are on disk), AM2_PREFETCH=0/1
+    let prefetch = match std::env::var("AM2_PREFETCH").ok().as_deref() { Some("0") => false, Some(_) => true, None => res.is_some() };
+    m.prefetch.store(prefetch, std::sync::atomic::Ordering::Relaxed);
+    if prefetch {
+        placement = format!("{placement} prefetch=on");
+    }
     // weights on GPUs: --devices cuda:0=12,hip:0=6 (GiB each), in that order of preference
     #[cfg(feature = "gpu")]
     if let Some(spec) = arg("--devices") {
@@ -341,6 +368,9 @@ fn main() {
             if let Err(e) = pack::Profile::learned(&m, profile.as_ref()).write(p) {
                 out(&format!("INFO expert_profile_save_failed={}", e.replace(' ', "_")));
             }
+        }
+        if model::times::on() {
+            out(&format!("INFO times_ms={}", model::times::take()));
         }
         out(&format!("DONE {n} {} {prompt_ms} {} {finish} 0 0 0 {reused}", ids.len(), td.elapsed().as_millis()));
     }

@@ -18,7 +18,7 @@
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use strata_gguf::{Gguf, TensorInfo};
 
 /// One weight matrix in the GGUF: `rows` output features of `cols` inputs, in its stored encoding.
@@ -48,6 +48,16 @@ impl QMat {
                #[cfg(feature = "gpu")] gpu: None }
     }
 
+    /// Whether the integer kernels (cpu_q8.rs) multiply this matrix: the weight type has one, and the activations are
+    /// rounded the way that kernel's are (Q8_K for the K-quants, Q8_0 for Q8_0).
+    fn int8(&self, fast: crate::cpu_dot::Fast) -> bool {
+        use crate::cpu_dot::Fast;
+        crate::cpu_q8::handles(fast) && match fast {
+            Fast::Q8_0 => self.vdt == Vdt::Q8_0,
+            _ => self.vdt == Vdt::Q8K,
+        }
+    }
+
     /// y = W x, rows in parallel.
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) {
         debug_assert_eq!(x.len(), self.cols);
@@ -63,8 +73,8 @@ impl QMat {
         let x = &xq[..];
         let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
         // Q4_K / Q6_K with Q8_K activations: integer products (cpu_q8.rs), the same values as the f32 path below
-        if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty).filter(|f| crate::cpu_q8::handles(*f) && self.vdt == Vdt::Q8K) {
-            if let Some(xq8) = crate::cpu_q8::Q8K::quantize(&x_in) {
+        if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty).filter(|f| self.int8(*f)) {
+            if let Some(xq8) = crate::cpu_q8::Q8K::quantize_for(fast, x_in) {
                 y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
                     for (k, out) in ys.iter_mut().enumerate() {
                         let r = ci * chunk + k;
@@ -109,8 +119,8 @@ impl QMat {
         let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) else {
             return xs.iter().map(|x| self.mul(x)).collect();
         };
-        let int8 = crate::cpu_q8::handles(fast) && self.vdt == Vdt::Q8K;
-        let q8: Vec<crate::cpu_q8::Q8K> = if int8 { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize(x)).collect() } else { Vec::new() };
+        let int8 = self.int8(fast);
+        let q8: Vec<crate::cpu_q8::Q8K> = if int8 { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
         if int8 && q8.len() != n {
             return xs.iter().map(|x| self.mul(x)).collect();
         }
@@ -621,6 +631,9 @@ pub struct Model {
     pub profile_experts: usize,
     /// how often each (layer, expert) was routed to, for the expert profile
     pub heat: Vec<AtomicU32>,
+    /// Ask the OS for every chosen expert's pages at once, before multiplying (`--resident-experts` turns it on): the
+    /// experts not in RAM are then read from disk in parallel instead of one page fault at a time.
+    pub prefetch: AtomicBool,
 }
 
 /// Per-conversation state: per layer the attention cache (K, V - or MLA's latent and rotary key), and the Mamba
@@ -894,6 +907,7 @@ impl Model {
             d_conv: u("ssm.conv_kernel").unwrap_or(0) as usize, eps, rope, attn_temp, stops,
             embd, out_norm: optf("output_norm.weight").unwrap_or_default(), output, hc, hc_head,
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
+            prefetch: AtomicBool::new(false),
             profile_experts, layers, arch,
         }, from_pack))
     }
@@ -914,6 +928,7 @@ impl Model {
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
                 let h = rms_norm(&x, norm, self.eps);
                 let kind = if dbg { match block { Block::Attn(_) => "attn", Block::Dense(_) => "ffn", Block::Moe(_) => "moe", _ => "other" } } else { "" };
+                let t0 = times::on().then(std::time::Instant::now);
                 let out = match block {
                     Block::Mamba(b) => self.mamba(l, b, &h, st),
                     Block::Gdn(b) => self.gdn(l, b, &h, st),
@@ -922,6 +937,9 @@ impl Model {
                     Block::Dense(b) => b.forward(&h),
                     Block::Moe(b) => self.moe(b, &h),
                 };
+                if let Some(t0) = t0 {
+                    times::add(times::kind(block), t0);
+                }
                 x.iter_mut().zip(&out).for_each(|(a, b)| *a += b);
                 if dbg {
                     let (sum, abs) = out.iter().fold((0f64, 0f64), |(s, a), v| (s + *v as f64, a + v.abs() as f64));
@@ -930,8 +948,12 @@ impl Model {
             }
         }
         st.pos += 1;
+        let t0 = times::on().then(std::time::Instant::now);
         let h = rms_norm(&x, &self.out_norm, self.eps);
         let logits = self.output.mul(&h);
+        if let Some(t0) = t0 {
+            times::add(times::OUTPUT, t0);
+        }
         if dbg {
             let (sum, abs) = logits.iter().fold((0f64, 0f64), |(s, a), v| (s + *v as f64, a + v.abs() as f64));
             let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
@@ -940,13 +962,10 @@ impl Model {
         logits
     }
 
-    /// Whether a prompt can go through `forward_batch`: plain attention (no QSA) and dense feed-forward layers only.
+    /// Whether a prompt can go through `forward_batch`: every model without hyper-connections. Attention, dense and MoE
+    /// feed-forwards are batched; the other blocks run token by token inside it.
     pub fn batchable(&self) -> bool {
-        self.hc == 0 && self.layers.iter().all(|l| l.parts.iter().all(|(_, b)| match b {
-            Block::Attn(a) => a.qsa.is_none(),
-            Block::Dense(_) => true,
-            _ => false,
-        }))
+        self.hc == 0
     }
 
     /// Several prompt tokens at once (a chunk): each matrix is applied to all of them together (`QMat::matmul`), the
@@ -959,8 +978,9 @@ impl Model {
         for (l, layer) in self.layers.iter().enumerate() {
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
                 let hs: Vec<Vec<f32>> = xs.iter().map(|x| rms_norm(x, norm, self.eps)).collect();
+                let t0 = times::on().then(std::time::Instant::now);
                 let outs: Vec<Vec<f32>> = match block {
-                    Block::Attn(a) => {
+                    Block::Attn(a) if a.qsa.is_none() => {
                         let (q, k, v) = (a.q.matmul(&hs), a.k.matmul(&hs), a.v.matmul(&hs));
                         let mut atts = Vec::with_capacity(tokens.len());
                         for (i, ((qv, kv), vv)) in q.into_iter().zip(k).zip(v).enumerate() {
@@ -972,8 +992,23 @@ impl Model {
                         o
                     }
                     Block::Dense(b) => b.forward_batch(&hs),
-                    _ => unreachable!("forward_batch is for batchable models"),
+                    Block::Moe(b) => self.moe_batch(b, &hs),
+                    Block::Mla(b) => self.mla_batch(l * 2 + pi, b, &hs, st, base),
+                    // the rest token by token, in order, each at its own position: what `forward` computes
+                    _ => hs.iter().enumerate().map(|(i, h)| {
+                        st.pos = base + i;
+                        match block {
+                            Block::Mamba(b) => self.mamba(l, b, h, st),
+                            Block::Gdn(b) => self.gdn(l, b, h, st),
+                            Block::Attn(b) => self.attention(l * 2 + pi, b, h, st),
+                            Block::Mla(b) => self.mla(l * 2 + pi, b, h, st),
+                            _ => unreachable!("batched above"),
+                        }
+                    }).collect(),
                 };
+                if let Some(t0) = t0 {
+                    times::add(times::kind(block), t0);
+                }
                 for (x, out) in xs.iter_mut().zip(&outs) {
                     x.iter_mut().zip(out).for_each(|(a, b)| *a += b);
                 }
@@ -1378,7 +1413,76 @@ impl Model {
         m.o.mul(&out_heads)
     }
 
-    fn moe(&self, m: &Moe, h: &[f32]) -> Vec<f32> {
+    /// `mla` for a prompt chunk at positions base..: every projection (q_a, q_b, kv_a, each head's absorbed k_b and
+    /// v_b, o) is applied to the whole chunk, so each weight is read once; the attention itself runs token by token in
+    /// order over the cache, each token seeing itself and what came before. The same values as `mla`.
+    fn mla_batch(&self, slot: usize, m: &Mla, hs: &[Vec<f32>], st: &mut State, base: usize) -> Vec<Vec<f32>> {
+        let rope = self.rope.as_ref().expect("rope");
+        let n_tok = hs.len();
+        let qs = match &m.q_a {
+            Some((qa, norm)) => {
+                let a: Vec<Vec<f32>> = qa.matmul(hs).iter().map(|v| rms_norm(v, norm, self.eps)).collect();
+                m.q_b.matmul(&a)
+            }
+            None => m.q_b.matmul(hs),
+        };
+        let kvrs = m.kv_a.matmul(hs);
+        let qk = m.nope + m.rope_dim;
+        // the absorbed queries, per head for every token: q_lat[head][token]
+        let q_lat: Vec<Vec<Vec<f32>>> = (0..m.n_head).into_par_iter().map(|hh| {
+            let nopes: Vec<Vec<f32>> = qs.iter().map(|q| q[hh * qk..hh * qk + m.nope].to_vec()).collect();
+            m.k_b.slice(hh, m.kv_lora).matmul(&nopes)
+        }).collect();
+        // the attention, token by token: accs[head][token] in the latent space
+        let mut accs: Vec<Vec<Vec<f32>>> = vec![Vec::with_capacity(n_tok); m.n_head];
+        for (t, kvr) in kvrs.iter().enumerate() {
+            let pos = base + t;
+            let mut k_pe = kvr[m.kv_lora..m.kv_lora + m.rope_dim].to_vec();
+            rope.apply(&mut k_pe, pos);
+            let mut kv = rms_norm(&kvr[..m.kv_lora], &m.kv_norm, self.eps);
+            f16_round(&mut kv);
+            f16_round(&mut k_pe);
+            let cache = st.kv.entry(slot).or_default();
+            cache.0.extend_from_slice(&kv);
+            cache.1.extend_from_slice(&k_pe);
+            let (lat, pe) = (&cache.0, &cache.1);
+            let n = lat.len() / m.kv_lora;
+            let ts = self.temp_scale(pos);
+            let per_head: Vec<Vec<f32>> = (0..m.n_head).into_par_iter().map(|hh| {
+                let qh = &qs[t][hh * qk..(hh + 1) * qk];
+                let mut ql = q_lat[hh][t].clone();
+                let mut q_pe = qh[m.nope..].to_vec();
+                rope.apply(&mut q_pe, pos);
+                if ts != 1.0 {
+                    ql.iter_mut().chain(q_pe.iter_mut()).for_each(|v| *v *= ts);
+                }
+                let mut scores: Vec<f32> = (0..n)
+                    .map(|j| (dot(&ql, &lat[j * m.kv_lora..(j + 1) * m.kv_lora]) + dot(&q_pe, &pe[j * m.rope_dim..(j + 1) * m.rope_dim])) * m.kq_scale)
+                    .collect();
+                softmax(&mut scores);
+                let mut acc = vec![0f32; m.kv_lora];
+                for (j, p) in scores.iter().enumerate() {
+                    acc.iter_mut().zip(&lat[j * m.kv_lora..(j + 1) * m.kv_lora]).for_each(|(a, v)| *a += p * v);
+                }
+                acc
+            }).collect();
+            for (hh, acc) in per_head.into_iter().enumerate() {
+                accs[hh].push(acc);
+            }
+        }
+        st.pos = base + n_tok;
+        // each head's v_b on all its tokens, then the output projection on the chunk
+        let heads: Vec<Vec<Vec<f32>>> = (0..m.n_head).into_par_iter().map(|hh| m.v_b.slice(hh, m.v_dim).matmul(&accs[hh])).collect();
+        let outs: Vec<Vec<f32>> = (0..n_tok).map(|t| {
+            let mut oh = Vec::with_capacity(m.n_head * m.v_dim);
+            heads.iter().for_each(|h| oh.extend_from_slice(&h[t]));
+            oh
+        }).collect();
+        m.o.matmul(&outs)
+    }
+
+    /// The router's choice for one input: the experts, best first, and their weights. Counts them in the heat map.
+    fn route(&self, m: &Moe, h: &[f32]) -> (Vec<usize>, Vec<f32>) {
         let d = self.n_embd;
         let logits: Vec<f32> = (0..m.n_expert).map(|e| dot(&m.router[e * d..(e + 1) * d], h)).collect();
         let probs: Vec<f32> = match m.gating {
@@ -1393,8 +1497,8 @@ impl Model {
         let sel = |e: usize| probs[e] + m.bias.as_ref().map(|b| b[e]).unwrap_or(0.0);
         let mut order: Vec<usize> = (0..m.n_expert).collect();
         order.sort_by(|&a, &b| sel(b).total_cmp(&sel(a)));
-        let chosen = &order[..m.top_k];
-        let mut w: Vec<f32> = chosen.iter().map(|&e| probs[e]).collect();
+        order.truncate(m.top_k);
+        let mut w: Vec<f32> = order.iter().map(|&e| probs[e]).collect();
         if m.w_norm {
             let s = w.iter().sum::<f32>().max(6.103515625e-5);
             w.iter_mut().for_each(|v| *v /= s);
@@ -1402,9 +1506,80 @@ impl Model {
         if m.w_scale != 0.0 && m.w_scale != 1.0 {
             w.iter_mut().for_each(|v| *v *= m.w_scale);
         }
-        for &e in chosen {
+        for &e in &order {
             self.heat[m.layer * self.profile_experts + e].fetch_add(1, Ordering::Relaxed);
         }
+        (order, w)
+    }
+
+    /// Asks for these experts' pages all at once (when `prefetch` is on), so the ones on disk load in parallel.
+    fn prefetch_experts(&self, m: &Moe, experts: impl Iterator<Item = usize>) {
+        if self.prefetch.load(Ordering::Relaxed) {
+            experts.for_each(|e| crate::pack::prefetch_expert(m, e));
+        }
+    }
+
+    /// `moe` for a prompt chunk: tokens grouped by expert, so each chosen expert is read once (from RAM or from disk)
+    /// for all the tokens that chose it. Each token's sum is added up in its own routing order, as `moe` does, so the
+    /// values are identical.
+    fn moe_batch(&self, m: &Moe, hs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let routes: Vec<(Vec<usize>, Vec<f32>)> = hs.iter().map(|h| self.route(m, h)).collect();
+        let mut users: Vec<Vec<(usize, usize)>> = vec![Vec::new(); m.n_expert];
+        for (t, (chosen, _)) in routes.iter().enumerate() {
+            for (slot, &e) in chosen.iter().enumerate() {
+                users[e].push((t, slot));
+            }
+        }
+        self.prefetch_experts(m, (0..m.n_expert).filter(|&e| !users[e].is_empty()));
+        let xs: Vec<Vec<f32>> = match &m.latent {
+            Some((down, _)) => down.matmul(hs),
+            None => hs.to_vec(),
+        };
+        let mut outs: Vec<Vec<Vec<f32>>> = routes.iter().map(|(c, _)| vec![Vec::new(); c.len()]).collect();
+        for (e, who) in users.iter().enumerate() {
+            if who.is_empty() {
+                continue;
+            }
+            let ins: Vec<Vec<f32>> = who.iter().map(|&(t, _)| xs[t].clone()).collect();
+            let mut mid = m.up_exps.0[e].matmul(&ins);
+            match &m.gate_exps {
+                Some(g) => {
+                    let gv = g.0[e].matmul(&ins);
+                    for (u, g) in mid.iter_mut().zip(&gv) {
+                        u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(m.act, *g));
+                    }
+                }
+                None => mid.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(m.act, *v))),
+            }
+            for (o, &(t, slot)) in m.down_exps.0[e].matmul(&mid).into_iter().zip(who) {
+                outs[t][slot] = o;
+            }
+        }
+        let rows = m.down_exps.0[0].rows;
+        let accs: Vec<Vec<f32>> = outs.iter().zip(&routes).map(|(os, (_, w))| {
+            let mut acc = vec![0f32; rows];
+            for (o, &we) in os.iter().zip(w) {
+                acc.iter_mut().zip(o).for_each(|(a, v)| *a += we * v);
+            }
+            acc
+        }).collect();
+        let mut out = match &m.latent {
+            Some((_, up)) => up.matmul(&accs),
+            None => accs,
+        };
+        if let Some(sh) = &m.shared {
+            for ((o, s), h) in out.iter_mut().zip(sh.forward_batch(hs)).zip(hs) {
+                let gate = m.shared_gate.as_ref().map_or(1.0, |w| sigmoid(dot(w, h)));
+                o.iter_mut().zip(&s).for_each(|(a, b)| *a += b * gate);
+            }
+        }
+        out
+    }
+
+    fn moe(&self, m: &Moe, h: &[f32]) -> Vec<f32> {
+        let (chosen, w) = self.route(m, h);
+        let chosen = &chosen[..];
+        self.prefetch_experts(m, chosen.iter().copied());
         let x = match &m.latent {
             Some((down, _)) => down.mul(h),
             None => h.to_vec(),
@@ -1668,5 +1843,31 @@ mod tests {
         let mut a = x;
         r(true).apply(&mut a, 1);
         assert!((a[0] - (c - 3.0 * s)).abs() < 1e-6 && (a[2] - (s + 3.0 * c)).abs() < 1e-6);
+    }
+}
+
+/// AM2_TIMES=1: where a request's time went, by block kind (printed by the server loop as INFO times_ms=...).
+pub mod times {
+    use super::Block;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const OUTPUT: usize = 6;
+    const NAMES: [&str; 7] = ["mamba", "gdn", "attn", "mla", "dense", "moe", "output"];
+    static NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    pub fn on() -> bool {
+        *ON.get_or_init(|| std::env::var_os("AM2_TIMES").is_some())
+    }
+    pub fn kind(b: &Block) -> usize {
+        match b { Block::Mamba(_) => 0, Block::Gdn(_) => 1, Block::Attn(_) => 2, Block::Mla(_) => 3, Block::Dense(_) => 4, Block::Moe(_) => 5 }
+    }
+    pub fn add(k: usize, t0: std::time::Instant) {
+        NS[k].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// "moe=1234,mla=567,..." in ms since the last call, the non-zero ones; resets them.
+    pub fn take() -> String {
+        NAMES.iter().zip(&NS).filter_map(|(n, v)| {
+            let ns = v.swap(0, Ordering::Relaxed);
+            (ns > 0).then(|| format!("{n}={}", ns / 1_000_000))
+        }).collect::<Vec<_>>().join(",")
     }
 }
