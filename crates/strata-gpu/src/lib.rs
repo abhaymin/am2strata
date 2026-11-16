@@ -40,6 +40,9 @@ pub struct Weights {
     row_bytes: u32,
     geometry: (u32, u32, u32),
     pub bytes: usize,
+    /// whether matvec_q4k's shared memory (x, its group sums and the cube's partial sums) fits this device: Metal
+    /// allows 32 KiB, so a 9216-column Q4_K matrix (a 3B model's ffn_down) must take the plain kernel there
+    wide_fits: bool,
 }
 
 /// Values on the device, so that a chain of kernels needs no trip through the CPU.
@@ -82,7 +85,7 @@ macro_rules! product {
     ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $tokens:expr) => {{
         let w = $w;
         let (be, bb, k) = w.geometry;
-        let wide = k == kernels::kind::Q4_K && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        let wide = k == kernels::kind::Q4_K && w.wide_fits && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
         // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
         let cubes = w.rows.div_ceil(if wide { 32 } else { kernels::ROWS_PER_CUBE });
         let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
@@ -209,7 +212,9 @@ impl Gpu {
             words[i] = u32::from_le_bytes(b);
         }
         let handle = with_client!(self, c, R, c.create_from_slice(u32::as_bytes(&words)));
-        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len() })
+        let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
+        let wide_fits = kernels::wide_shared_bytes(cols as u32) <= shared;
+        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len(), wide_fits })
     }
 
     /// The products of several matrices with the same input (q, k, v; gate and up): one upload of x, the kernels

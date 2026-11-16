@@ -176,3 +176,107 @@ fn product_speed() {
         }
     }
 }
+
+/// A model's real sizes: the output projection of a 3B model is about 131072 x 3072 (Q6_K: ~330 MB), far above
+/// the small matrices above and above wgpu's default 128 MiB storage-binding limit. Found when Metal on a Mac M4 gave
+/// wrong tokens although every small kernel test passed. Rows from the start, the middle and the end are checked
+/// against the CPU, so a binding cut short or a grid that wraps shows as the rows it gets wrong.
+#[test]
+fn a_model_sized_matrix_matches_the_cpu_on_every_device() {
+    // STRATA_GPU_TEST_ONLY=<device> checks one device (a card that is full with a running model would only OOM)
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let (rows, cols) = (131072usize, 3072usize);
+    let mut rng = Rng(0x2545f4914f6cdd1d);
+    let ty = "Q6_K";
+    let w = weights(ty, rows, cols, &mut rng);
+    let row_bytes = w.len() / rows;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let pick: Vec<usize> = (0..16).chain(rows / 2..rows / 2 + 16).chain(rows - 16..rows).collect();
+    let want: Vec<(f32, f64)> = pick.iter().map(|&r| {
+        let mut row = vec![0f32; cols];
+        strata_pack::quants::dequantize_into(ty, &w[r * row_bytes..(r + 1) * row_bytes], &mut row).unwrap();
+        let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+        (s as f32, mag.max(1e-9))
+    }).collect();
+    eprintln!("a {rows} x {cols} {ty} matrix: {} MB", w.len() / 1_000_000);
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let up = match gpu.upload(ty, &w, rows, cols) { Ok(u) => u, Err(e) => { eprintln!("{}: upload refused: {e}", d.name); continue } };
+        let y = gpu.matvec(&up, &x);
+        let mut wrong = Vec::new();
+        for (k, &r) in pick.iter().enumerate() {
+            let e = (y[r] as f64 - want[k].0 as f64).abs() / want[k].1;
+            if !(e < 1e-3) { wrong.push(r); }
+        }
+        eprintln!("{}: {} of {} checked rows wrong{}", d.name, wrong.len(), pick.len(),
+                  if wrong.is_empty() { String::new() } else { format!(" (first: {:?})", &wrong[..wrong.len().min(6)]) });
+        assert!(wrong.is_empty(), "{}: a model-sized {ty} matrix gives wrong rows {:?}", d.name, &wrong[..wrong.len().min(10)]);
+    }
+}
+
+/// The engine's q/k/v and gate/up products go through `matvec_many`: one upload, the kernels launched back to back,
+/// then each result read. The single-matrix tests never run that path; here three matrices of different heights share
+/// one input, as q, k and v do, and each must match the CPU.
+#[test]
+fn several_products_at_once_match_the_cpu_on_every_device() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let mut rng = Rng(0x0ddba11c0ffee123);
+    let cols = 3072usize;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let shapes = [("Q4_K", 4096usize), ("Q4_K", 1024), ("Q6_K", 1024)];
+    let ws: Vec<Vec<u8>> = shapes.iter().map(|(ty, rows)| weights(ty, *rows, cols, &mut rng)).collect();
+    let want: Vec<Vec<(f32, f64)>> = shapes.iter().zip(&ws).map(|((ty, rows), w)| {
+        let rb = w.len() / rows;
+        (0..*rows).map(|r| {
+            let mut row = vec![0f32; cols];
+            strata_pack::quants::dequantize_into(ty, &w[r * rb..(r + 1) * rb], &mut row).unwrap();
+            let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+            (s as f32, mag.max(1e-9))
+        }).collect()
+    }).collect();
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let ups: Vec<_> = shapes.iter().zip(&ws).map(|((ty, rows), w)| gpu.upload(ty, w, *rows, cols).unwrap()).collect();
+        for round in 0..3 {
+            let got = gpu.matvec_many(&ups.iter().collect::<Vec<_>>(), &x);
+            for (m, (g, wn)) in got.iter().zip(&want).enumerate() {
+                let wrong = g.iter().zip(wn).filter(|(a, (b, mag))| !(((**a as f64 - *b as f64).abs() / mag) < 1e-3)).count();
+                eprintln!("{} round {round} matrix {m} ({} rows): {wrong} wrong", d.name, wn.len());
+                assert_eq!(wrong, 0, "{}: matvec_many matrix {m} has {wrong} wrong rows (round {round})", d.name);
+            }
+        }
+    }
+}
+
+/// A Q4_K matrix too wide for the wide kernel's shared memory on a device with a 32 KiB limit (Metal): 3072 rows x
+/// 9216 columns, a 3B model's ffn_down, which gave a Mac M4 wrong tokens. Whatever kernel is chosen, it must match.
+#[test]
+fn a_wide_q4k_ffn_down_matches_the_cpu_on_every_device() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let (rows, cols) = (3072usize, 9216usize);
+    eprintln!("wide kernel needs {} bytes of shared memory for {cols} columns", strata_gpu::kernels::wide_shared_bytes(cols as u32));
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let w = weights("Q4_K", rows, cols, &mut rng);
+    let rb = w.len() / rows;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let want: Vec<(f32, f64)> = (0..rows).map(|r| {
+        let mut row = vec![0f32; cols];
+        strata_pack::quants::dequantize_into("Q4_K", &w[r * rb..(r + 1) * rb], &mut row).unwrap();
+        let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+        let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+        (s as f32, mag.max(1e-9))
+    }).collect();
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let up = gpu.upload("Q4_K", &w, rows, cols).unwrap();
+        let y = gpu.matvec(&up, &x);
+        let wrong = y.iter().zip(&want).filter(|(a, (b, m))| !(((**a as f64 - *b as f64).abs() / m) < 1e-3)).count();
+        eprintln!("{}: {wrong} of {rows} rows wrong", d.name);
+        assert_eq!(wrong, 0, "{}: a 3072 x 9216 Q4_K product has {wrong} wrong rows", d.name);
+    }
+}

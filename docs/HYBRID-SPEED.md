@@ -62,6 +62,31 @@ again for every token. Each token's sums keep the same order, so the results are
 | main (#65) | 6.97, 6.98 |
 | unpack once | **8.67, 11.25** |
 
+## The GPU path (wgpu: Metal on macOS, Vulkan elsewhere)
+
+**Correctness.** On a Mac M4, Metal gave wrong tokens: different from the first token, or one token repeated with
+the graph. Per-layer checksums (`AM2_DEBUG_LAYERS=1`) showed Metal matching the CPU through layer 2, then the
+feed-forward of layers 3, 4 and 6 going wrong: exactly the layers whose ffn_down is Q4_K, 3072 x 9216.
+- **Cause:** the wide Q4_K kernel keeps the whole input in threadgroup memory, 42,112 bytes at 9216 columns, over
+  Metal's 32 KiB limit.
+- **Fix:** it now runs only where it fits the device's limit, else the plain kernel runs.
+- **Result:** Metal gives the CPU's tokens exactly.
+
+**The device graph is taken by itself.** The matrix-by-matrix path syncs with the device after every product, which is
+about 6x slower on the M4. So `--devices` now builds the whole-token graph whenever the model allows it (`graph=auto`);
+`--no-graph` keeps the old path.
+
+| Ministral 3B, 64-token prompt | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| Mac M4, Metal, matrix by matrix | 2.21 | 1.98 |
+| Mac M4, Metal, graph | 12.53 | 12.46 |
+| Mac M4, CPU, 4 threads | **20.82** | **15.28** |
+| Linux PC, Radeon 780M (Vulkan), matrix by matrix | 6.8 | 7.0 |
+| Linux PC, Radeon 780M (Vulkan), graph | **14.0** | **14.2** |
+
+On the M4 the CPU stays faster: the graph reads the prompt one token at a time, while the CPU reads it in chunks of
+32 with integer kernels. A batched prompt on the device is the next GPU step.
+
 ## Next
 - **Q5_K, Q8_0 and Q4_0 the same way.**
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).

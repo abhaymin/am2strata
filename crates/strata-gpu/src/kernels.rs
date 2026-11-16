@@ -268,6 +268,12 @@ pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, col
 
 /// Units in a cube of [`matvec_q4k`]: 32 rows of 32 units.
 pub const WIDE_CUBE: u32 = 1024;
+/// The shared memory [`matvec_q4k`] takes for `cols` columns: x, one sum per 32-value group, and the cube's partial sums.
+/// A device whose limit is smaller (Metal: 32 KiB) gives wrong results with it, so the plain kernel is used there.
+pub fn wide_shared_bytes(cols: u32) -> usize {
+    (cols as usize + cols as usize / 32 + WIDE_CUBE as usize) * 4
+}
+
 /// Rows from which [`matvec_q4k`] takes a Q4_K product.
 pub const WIDE_ROWS: u32 = 256;
 
