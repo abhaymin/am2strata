@@ -158,6 +158,48 @@ impl QMat {
         Ok(QMat { data, ty: ty.to_string(), vdt: Vdt::of(ty), rows: self.rows, cols: self.cols, row_bytes, #[cfg(feature = "gpu")] gpu: None })
     }
 
+    /// Several products at once, y_i = W_i x_i, in one parallel pass over all their rows: one join instead of one per
+    /// matrix (a MoE layer's chosen experts, as ggml's mul_mat_id). Every value is the one `matvec` gives: the same row
+    /// function on the same rounded input. None when a matrix is on a GPU or has no CPU kernel here (the caller then
+    /// multiplies one by one).
+    pub fn mul_set(jobs: &[(&QMat, &[f32])]) -> Option<Vec<Vec<f32>>> {
+        use crate::cpu_dot::Fast;
+        enum In {
+            Int(Fast, crate::cpu_q8::Q8K),
+            F(Fast, Vec<f32>),
+        }
+        let mut ins = Vec::with_capacity(jobs.len());
+        for (q, x) in jobs {
+            #[cfg(feature = "gpu")]
+            if q.gpu.is_some() {
+                return None;
+            }
+            debug_assert_eq!(x.len(), q.cols);
+            let fast = Fast::of(&q.ty)?;
+            match q.int8(fast).then(|| crate::cpu_q8::Q8K::quantize_for(fast, x)).flatten() {
+                Some(xq) => ins.push(In::Int(fast, xq)),
+                None => ins.push(In::F(fast, q.vdt.round_trip(x))),
+            }
+        }
+        const ROWS: usize = 32;
+        let mut outs: Vec<Vec<f32>> = jobs.iter().map(|(q, _)| vec![0f32; q.rows]).collect();
+        let tasks: Vec<(usize, usize, &mut [f32])> = outs.iter_mut().enumerate()
+            .flat_map(|(j, o)| o.chunks_mut(ROWS).enumerate().map(move |(ci, c)| (j, ci * ROWS, c)))
+            .collect();
+        tasks.into_par_iter().for_each(|(j, r0, ys)| {
+            let q = jobs[j].0;
+            for (k, y) in ys.iter_mut().enumerate() {
+                let r = r0 + k;
+                let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
+                *y = match &ins[j] {
+                    In::Int(f, xq) => crate::cpu_q8::row_dot(*f, row, xq),
+                    In::F(f, x) => crate::cpu_dot::row_dot(*f, row, x),
+                };
+            }
+        });
+        Some(outs)
+    }
+
     /// The products of several matrices with the same input: in one GPU submission when they are all on one device
     /// and round the input the same way, else one by one.
     pub fn mul_many(qs: &[&QMat], x: &[f32]) -> Vec<Vec<f32>> {
@@ -1373,11 +1415,21 @@ impl Model {
     fn mla(&self, slot: usize, m: &Mla, h: &[f32], st: &mut State) -> Vec<f32> {
         let pos = st.pos;
         let rope = self.rope.as_ref().expect("rope");
-        let q = match &m.q_a {
-            Some((qa, norm)) => m.q_b.mul(&rms_norm(&qa.mul(h), norm, self.eps)),
-            None => m.q_b.mul(h),
+        // q_a and kv_a read the same input: one pass for both where the CPU kernels take them
+        let (qa_out, kvr) = match &m.q_a {
+            Some((qa, _)) => match QMat::mul_set(&[(qa, h), (&m.kv_a, h)]) {
+                Some(mut v) => {
+                    let kvr = v.pop().unwrap();
+                    (Some(v.pop().unwrap()), kvr)
+                }
+                None => (Some(qa.mul(h)), m.kv_a.mul(h)),
+            },
+            None => (None, m.kv_a.mul(h)),
         };
-        let kvr = m.kv_a.mul(h);
+        let q = match (&m.q_a, qa_out) {
+            (Some((_, norm)), Some(a)) => m.q_b.mul(&rms_norm(&a, norm, self.eps)),
+            _ => m.q_b.mul(h),
+        };
         let mut k_pe = kvr[m.kv_lora..m.kv_lora + m.rope_dim].to_vec();
         rope.apply(&mut k_pe, pos);
         let mut kv = rms_norm(&kvr[..m.kv_lora], &m.kv_norm, self.eps);
@@ -1390,6 +1442,33 @@ impl Model {
         let n = lat.len() / m.kv_lora;
         let ts = self.temp_scale(pos);
         let qk = m.nope + m.rope_dim;
+        // the heads' absorbed products in one pass each (k_b before the scores, v_b after), when the CPU kernels take them
+        let k_bs: Vec<QMat> = (0..m.n_head).map(|hh| m.k_b.slice(hh, m.kv_lora)).collect();
+        let jobs: Vec<(&QMat, &[f32])> = k_bs.iter().enumerate().map(|(hh, k)| (k, &q[hh * qk..hh * qk + m.nope])).collect();
+        if let Some(q_lats) = QMat::mul_set(&jobs) {
+            let accs: Vec<Vec<f32>> = q_lats.into_par_iter().enumerate().map(|(hh, mut q_lat)| {
+                let qh = &q[hh * qk..(hh + 1) * qk];
+                let mut q_pe = qh[m.nope..].to_vec();
+                rope.apply(&mut q_pe, pos);
+                if ts != 1.0 {
+                    q_lat.iter_mut().chain(q_pe.iter_mut()).for_each(|v| *v *= ts);
+                }
+                let mut scores: Vec<f32> = (0..n)
+                    .map(|t| (dot(&q_lat, &lat[t * m.kv_lora..(t + 1) * m.kv_lora]) + dot(&q_pe, &pe[t * m.rope_dim..(t + 1) * m.rope_dim])) * m.kq_scale)
+                    .collect();
+                softmax(&mut scores);
+                let mut acc = vec![0f32; m.kv_lora];
+                for (t, p) in scores.iter().enumerate() {
+                    acc.iter_mut().zip(&lat[t * m.kv_lora..(t + 1) * m.kv_lora]).for_each(|(a, v)| *a += p * v);
+                }
+                acc
+            }).collect();
+            let v_bs: Vec<QMat> = (0..m.n_head).map(|hh| m.v_b.slice(hh, m.v_dim)).collect();
+            let jobs: Vec<(&QMat, &[f32])> = v_bs.iter().zip(&accs).map(|(v, a)| (v, &a[..])).collect();
+            if let Some(heads) = QMat::mul_set(&jobs) {
+                return m.o.mul(&heads.concat());
+            }
+        }
         let mut out_heads = vec![0f32; m.n_head * m.v_dim];
         out_heads.par_chunks_mut(m.v_dim).enumerate().for_each(|(hh, oh)| {
             let qh = &q[hh * qk..(hh + 1) * qk];
@@ -1576,6 +1655,61 @@ impl Model {
         out
     }
 
+    /// `moe`'s experts in two parallel passes (`QMat::mul_set`): every chosen expert's up and gate with the shared
+    /// expert's, then every down. The same values, summed in the same order, as the one-by-one path below.
+    fn moe_fused(&self, m: &Moe, h: &[f32], x: &[f32], chosen: &[usize], w: &[f32]) -> Option<Vec<f32>> {
+        let per = if m.gate_exps.is_some() { 2 } else { 1 };
+        let mut jobs: Vec<(&QMat, &[f32])> = Vec::with_capacity(chosen.len() * per + 2);
+        for &e in chosen {
+            jobs.push((&m.up_exps.0[e], x));
+            if let Some(g) = &m.gate_exps {
+                jobs.push((&g.0[e], x));
+            }
+        }
+        if let Some(sh) = &m.shared {
+            jobs.push((&sh.up, h));
+            if let Some(g) = &sh.gate {
+                jobs.push((g, h));
+            }
+        }
+        let mut first = QMat::mul_set(&jobs)?.into_iter();
+        let gated = |mut up: Vec<f32>, gate: Option<Vec<f32>>, a: Act| {
+            match gate {
+                Some(gv) => up.iter_mut().zip(&gv).for_each(|(u, g)| *u *= act(a, *g)),
+                None => up.iter_mut().for_each(|v| *v = act(a, *v)),
+            }
+            up
+        };
+        let mids: Vec<Vec<f32>> = chosen.iter().map(|_| {
+            let up = first.next().unwrap();
+            let gate = (per == 2).then(|| first.next().unwrap());
+            gated(up, gate, m.act)
+        }).collect();
+        let sh_mid = m.shared.as_ref().map(|sh| {
+            let up = first.next().unwrap();
+            let gate = sh.gate.as_ref().map(|_| first.next().unwrap());
+            gated(up, gate, sh.act)
+        });
+        let mut jobs: Vec<(&QMat, &[f32])> = chosen.iter().zip(&mids).map(|(&e, mid)| (&m.down_exps.0[e], &mid[..])).collect();
+        if let (Some(sh), Some(mid)) = (&m.shared, &sh_mid) {
+            jobs.push((&sh.down, &mid[..]));
+        }
+        let second = QMat::mul_set(&jobs)?;
+        let mut acc = vec![0f32; m.down_exps.0[0].rows];
+        for (o, &we) in second.iter().zip(w) {
+            acc.iter_mut().zip(o).for_each(|(a, v)| *a += we * v);
+        }
+        let mut out = match &m.latent {
+            Some((_, up)) => up.mul(&acc),
+            None => acc,
+        };
+        if m.shared.is_some() {
+            let gate = m.shared_gate.as_ref().map_or(1.0, |sw| sigmoid(dot(sw, h)));
+            out.iter_mut().zip(&second[chosen.len()]).for_each(|(a, b)| *a += b * gate);
+        }
+        Some(out)
+    }
+
     fn moe(&self, m: &Moe, h: &[f32]) -> Vec<f32> {
         let (chosen, w) = self.route(m, h);
         let chosen = &chosen[..];
@@ -1584,6 +1718,12 @@ impl Model {
             Some((down, _)) => down.mul(h),
             None => h.to_vec(),
         };
+        static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *FUSED.get_or_init(|| std::env::var_os("AM2_NO_FUSED").is_none()) {
+            if let Some(out) = self.moe_fused(m, h, &x, chosen, &w) {
+                return out;
+            }
+        }
         let mut acc = vec![0f32; m.down_exps.0[0].rows];
         for (&e, &we) in chosen.iter().zip(&w) {
             let (mut mid, gate) = match &m.gate_exps {
