@@ -117,7 +117,7 @@ impl QMat {
             return xs.iter().map(|x| self.mul(x)).collect();
         }
         let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) else {
-            return xs.iter().map(|x| self.mul(x)).collect();
+            return self.matmul_dequant(xs);
         };
         let int8 = self.int8(fast);
         let q8: Vec<crate::cpu_q8::Q8K> = if int8 { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
@@ -144,6 +144,27 @@ impl QMat {
         (0..n).map(|t| (0..self.rows).map(|r| flat[r * n + t]).collect()).collect()
     }
 
+    /// `matmul` for encodings with no row kernel here (the IQ types): each row is unpacked once for every input,
+    /// instead of once per input. The same values as `matvec`'s fallback (the same row, the same rounded input).
+    fn matmul_dequant(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n = xs.len();
+        let rounded: Vec<Vec<f32>> = xs.iter().map(|x| self.vdt.round_trip(x)).collect();
+        let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
+        let mut flat = vec![0f32; self.rows * n];
+        flat.par_chunks_mut(chunk * n).enumerate().for_each(|(ci, ys)| {
+            let mut row = vec![0f32; self.cols];
+            for (k, yr) in ys.chunks_mut(n).enumerate() {
+                let r = ci * chunk + k;
+                strata_pack::quants::dequantize_into(&self.ty, &self.data[r * self.row_bytes..(r + 1) * self.row_bytes], &mut row)
+                    .expect("weight row");
+                for t in 0..n {
+                    yr[t] = dot(&row, &rounded[t]);
+                }
+            }
+        });
+        (0..n).map(|t| (0..self.rows).map(|r| flat[r * n + t]).collect()).collect()
+    }
+
     /// The same matrix stored differently (a pack's copy of a float tensor).
     /// The GGUF type name of the stored encoding.
     pub fn ty(&self) -> &str {
@@ -160,13 +181,14 @@ impl QMat {
 
     /// Several products at once, y_i = W_i x_i, in one parallel pass over all their rows: one join instead of one per
     /// matrix (a MoE layer's chosen experts, as ggml's mul_mat_id). Every value is the one `matvec` gives: the same row
-    /// function on the same rounded input. None when a matrix is on a GPU or has no CPU kernel here (the caller then
-    /// multiplies one by one).
+    /// function on the same rounded input. None when a matrix is on a GPU (the caller then multiplies one by one).
     pub fn mul_set(jobs: &[(&QMat, &[f32])]) -> Option<Vec<Vec<f32>>> {
         use crate::cpu_dot::Fast;
         enum In {
             Int(Fast, crate::cpu_q8::Q8K),
             F(Fast, Vec<f32>),
+            // no row kernel (the IQ types): unpacked, then a dot product, as matvec's fallback
+            D(Vec<f32>),
         }
         let mut ins = Vec::with_capacity(jobs.len());
         for (q, x) in jobs {
@@ -175,7 +197,10 @@ impl QMat {
                 return None;
             }
             debug_assert_eq!(x.len(), q.cols);
-            let fast = Fast::of(&q.ty)?;
+            let Some(fast) = Fast::of(&q.ty) else {
+                ins.push(In::D(q.vdt.round_trip(x)));
+                continue;
+            };
             match q.int8(fast).then(|| crate::cpu_q8::Q8K::quantize_for(fast, x)).flatten() {
                 Some(xq) => ins.push(In::Int(fast, xq)),
                 None => ins.push(In::F(fast, q.vdt.round_trip(x))),
@@ -188,12 +213,17 @@ impl QMat {
             .collect();
         tasks.into_par_iter().for_each(|(j, r0, ys)| {
             let q = jobs[j].0;
+            let mut buf = if matches!(ins[j], In::D(_)) { vec![0f32; q.cols] } else { Vec::new() };
             for (k, y) in ys.iter_mut().enumerate() {
                 let r = r0 + k;
                 let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
                 *y = match &ins[j] {
                     In::Int(f, xq) => crate::cpu_q8::row_dot(*f, row, xq),
                     In::F(f, x) => crate::cpu_dot::row_dot(*f, row, x),
+                    In::D(x) => {
+                        strata_pack::quants::dequantize_into(&q.ty, row, &mut buf).expect("weight row");
+                        dot(&buf, x)
+                    }
                 };
             }
         });
@@ -202,12 +232,13 @@ impl QMat {
 
     /// Several matmuls in one parallel pass, Y_i = W_i X_i where each X_i is several inputs (a prompt chunk's experts, each
     /// with the tokens that chose it). One join instead of one per matrix; every value is the one `matmul` gives (the same
-    /// row functions on the same rounded inputs). None when a matrix is on a GPU or has no CPU kernel here.
+    /// row functions on the same rounded inputs). None when a matrix is on a GPU.
     pub fn matmul_set(jobs: &[(&QMat, &[Vec<f32>])]) -> Option<Vec<Vec<Vec<f32>>>> {
         use crate::cpu_dot::Fast;
         enum In {
             Int(Fast, Vec<crate::cpu_q8::Q8K>),
             F(Fast, Vec<Vec<f32>>),
+            D(Vec<Vec<f32>>),
         }
         let mut ins = Vec::with_capacity(jobs.len());
         for (q, xs) in jobs {
@@ -215,7 +246,10 @@ impl QMat {
             if q.gpu.is_some() {
                 return None;
             }
-            let fast = Fast::of(&q.ty)?;
+            let Some(fast) = Fast::of(&q.ty) else {
+                ins.push(In::D(xs.iter().map(|x| q.vdt.round_trip(x)).collect()));
+                continue;
+            };
             let q8: Vec<crate::cpu_q8::Q8K> = if q.int8(fast) { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
             ins.push(if q.int8(fast) && q8.len() == xs.len() { In::Int(fast, q8) } else { In::F(fast, xs.iter().map(|x| q.vdt.round_trip(x)).collect()) });
         }
@@ -227,12 +261,17 @@ impl QMat {
         tasks.into_par_iter().for_each(|(j, r0, ys)| {
             let q = jobs[j].0;
             let n = jobs[j].1.len();
+            let mut buf = if matches!(ins[j], In::D(_)) { vec![0f32; q.cols] } else { Vec::new() };
             for (k, yr) in ys.chunks_mut(n).enumerate() {
                 let r = r0 + k;
                 let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
                 match &ins[j] {
                     In::Int(f, q8) => crate::cpu_q8::row_dot_many(*f, row, q8, yr),
                     In::F(f, xs) => for t in 0..n { yr[t] = crate::cpu_dot::row_dot(*f, row, &xs[t]); },
+                    In::D(xs) => {
+                        strata_pack::quants::dequantize_into(&q.ty, row, &mut buf).expect("weight row");
+                        for t in 0..n { yr[t] = dot(&buf, &xs[t]); }
+                    }
                 }
             }
         });
@@ -2250,11 +2289,11 @@ mod tests {
     fn mul_set_equals_one_by_one_exactly() {
         let mut seed = 0x0F05_ED00_1234_5678u64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        let shapes = [("Q4_K", 70, 512), ("Q5_K", 33, 256), ("Q6_K", 41, 512), ("Q8_0", 64, 192), ("F32", 9, 96)];
+        let shapes = [("Q4_K", 70, 512), ("Q5_K", 33, 256), ("Q6_K", 41, 512), ("Q8_0", 64, 192), ("F32", 9, 96), ("IQ3_XXS", 21, 512), ("Q5_0", 12, 64)];
         let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c)| random_qmat(ty, r, c, &mut next)).collect();
         let xs: Vec<Vec<f32>> = mats.iter().map(|q| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect();
         let jobs: Vec<(&QMat, &[f32])> = mats.iter().zip(&xs).map(|(q, x)| (q, &x[..])).collect();
-        let fused = QMat::mul_set(&jobs).expect("every type here has a CPU kernel");
+        let fused = QMat::mul_set(&jobs).expect("no matrix on a GPU");
         assert_eq!(fused.len(), mats.len());
         for ((q, x), y) in mats.iter().zip(&xs).zip(&fused) {
             assert_eq!(y, &q.mul(x), "{}", q.ty);
@@ -2270,11 +2309,11 @@ mod tests {
     fn matmul_set_equals_matmul_exactly() {
         let mut seed = 0x7E57_5E70_0000_0001u64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        let shapes = [("Q4_K", 70, 512, 3), ("Q5_K", 33, 256, 1), ("Q6_K", 41, 512, 5), ("Q8_0", 64, 192, 2), ("F32", 9, 96, 4)];
+        let shapes = [("Q4_K", 70, 512, 3), ("Q5_K", 33, 256, 1), ("Q6_K", 41, 512, 5), ("Q8_0", 64, 192, 2), ("F32", 9, 96, 4), ("IQ3_XXS", 21, 512, 3), ("Q5_0", 12, 64, 2)];
         let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c, _)| random_qmat(ty, r, c, &mut next)).collect();
         let xss: Vec<Vec<Vec<f32>>> = mats.iter().zip(&shapes).map(|(q, s)| (0..s.3).map(|_| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect()).collect();
         let jobs: Vec<(&QMat, &[Vec<f32>])> = mats.iter().zip(&xss).map(|(q, x)| (q, &x[..])).collect();
-        let set = QMat::matmul_set(&jobs).expect("every type here has a CPU kernel");
+        let set = QMat::matmul_set(&jobs).expect("no matrix on a GPU");
         for ((q, xs), ys) in mats.iter().zip(&xss).zip(&set) {
             let want: Vec<Vec<f32>> = q.matmul(xs);
             assert_eq!(ys, &want, "{}", q.ty);
@@ -2285,7 +2324,7 @@ mod tests {
     fn matmul_equals_matvec_exactly() {
         let mut seed = 0x51_7CC1_B727_220Au64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        for ty in ["Q4_K", "Q6_K", "Q8_0", "F32", "Q5_0"] {
+        for ty in ["Q4_K", "Q6_K", "Q8_0", "F32", "Q5_0", "IQ3_XXS"] {
             let (rows, cols) = (37, 512);
             let rb = QMat::row_bytes(ty, cols);
             let mut data: Vec<u8> = (0..rows * rb).map(|_| next() as u8).collect();
