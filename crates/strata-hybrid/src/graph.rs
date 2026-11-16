@@ -67,7 +67,8 @@ impl<'a> Graph<'a> {
                       n2, on_device(gate, &mut dev)?, on_device(&f.up, &mut dev)?, on_device(&f.down, &mut dev)?));
         }
         let dev = dev.ok_or("--graph: no layers")?;
-        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget
+        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget. All three are
+        // f32 on the device (Gpu::scratch reserves len * 4 bytes; the f16 rounding of K and V is the CPU path's), so 4 bytes.
         let kv: u64 = raw.iter().map(|r| (2 * r.1.n_kv * r.1.head_dim + r.1.n_head) as u64 * max_ctx as u64 * 4).sum();
         if let Some(room) = crate::gpu::ROOM.get().and_then(|r| r.get(dev)) {
             if kv > *room {

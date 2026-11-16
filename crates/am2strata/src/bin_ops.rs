@@ -287,7 +287,7 @@ fn key_spec(o: &ClientsOpts, name: Option<&str>) -> Result<Value, String> {
     }
     let limit = |v: &str, what: &str| -> Result<Value, String> {
         if v.eq_ignore_ascii_case("none") { return Ok(Value::Null); }
-        match v.trim().parse::<u64>() { Ok(n) if n > 0 => Ok(json!(n)), _ => Err(format!("--{what}: a whole number above zero, or none")) }
+        match v.trim().parse::<u64>() { Ok(n) if n > 0 => Ok(json!(n)), _ => Err(format!("--{what}: a positive whole number, or none (any case) for no limit")) }
     };
     let mut limits = serde_json::Map::new();
     if let Some(v) = &o.requests_per_day { limits.insert("requests_per_day".into(), limit(v, "requests-per-day")?); }

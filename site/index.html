@@ -892,6 +892,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   };
   for (const b of document.querySelectorAll("[data-view]")) b.addEventListener("click", () => {
     opener = b;
+    // open first: fit() measures the image, and a hidden dialog has no size (a cached image was left off-centre)
     if (!dlg.open) dlg.showModal();
     show(items.findIndex(x => x.dataset.view === b.dataset.view));
     document.body.style.overflow = "hidden";

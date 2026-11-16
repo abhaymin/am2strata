@@ -132,7 +132,7 @@ fn clients_set_limits_and_models_and_refuse_empty_values() {
     // refused before sending: an empty tool list, an empty name, a zero limit, two different names, nothing to change
     for (args, want) in [(vec!["edit", "--tools", " , ", "--", id.as_str()], "at least one tool"),
                          (vec!["edit", "--name", " ", "--", id.as_str()], "name cannot be empty"),
-                         (vec!["edit", "--tokens-per-day", "0", "--", id.as_str()], "above zero"),
+                         (vec!["edit", "--tokens-per-day", "0", "--", id.as_str()], "positive whole number"),
                          (vec!["new", "--name", "one", "--", "two"], "two names"),
                          (vec!["edit", "--", id.as_str()], "nothing to change")] {
         let (ok, _, err) = run(&s, "clients", &args);

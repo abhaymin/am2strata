@@ -1610,7 +1610,7 @@ impl Model {
             }
         }
         self.prefetch_experts(m, (0..m.n_expert).filter(|&e| !users[e].is_empty()));
-        // the experts' inputs: the latent projection when there is one, else the hidden states as they are (no copy)
+        // the experts' inputs: the latent projection when there is one, else the hidden states directly (no extra allocation)
         let projected;
         let xs: &[Vec<f32>] = match &m.latent {
             Some((down, _)) => {
