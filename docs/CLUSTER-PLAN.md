@@ -190,6 +190,24 @@ order of the work. Each step is measured on real machines before the next starts
    6. **Then layer splitting** (whole layers on a worker) as a second mode, for models where it costs fewer round
       trips. Then the same tier in the Rust engine on the master.
 
+   **Media jobs on workers (owner, 2026-11-16): renders shared across machines.**
+   - **The ask:** video rendering run by am2Strata across the cluster, with the Mac helping, before upload.
+   - **Today:** a media job (image, video, compose, speech) runs on the machine that received it; only chats are routed
+     to workers. Promo videos are rendered by scripts outside am2Strata.
+   - **Plan:**
+     - `/v1/media/videos/compose` splits a render into independent segments;
+     - the master sends a share of them to ready workers over the pinned cluster link (worker form, like experts), joins
+       the results, and keeps any segment a worker fails;
+     - a worker encodes with its hardware encoder when it has one: VideoToolbox (`h264_videotoolbox`) on Apple
+       silicon, NVENC on NVIDIA; else libx264.
+     - then the demo pipeline renders through compose, so videos made for the channel use the cluster.
+   - **Baseline to beat:** the browser-use demo (2:47, 2560x1440, 11 segments) took 138 s with libx264 on this PC's
+     CPU alone.
+   - **Gates:**
+     - the joined video equals a single-machine render frame for frame, in count, duration and audio sync;
+     - the time is measured against the baseline;
+     - a worker that drops mid-render has its segments done locally.
+
    **Both sides know where every part of a model is (owner, 2026-11-15).**
    - The master's engine and each worker share one placement map: for each model, which layers and experts sit in
      which machine's VRAM, RAM or disk.
