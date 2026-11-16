@@ -215,3 +215,39 @@ fn a_model_sized_matrix_matches_the_cpu_on_every_device() {
         assert!(wrong.is_empty(), "{}: a model-sized {ty} matrix gives wrong rows {:?}", d.name, &wrong[..wrong.len().min(10)]);
     }
 }
+
+/// The engine's q/k/v and gate/up products go through `matvec_many`: one upload, the kernels launched back to back,
+/// then each result read. The single-matrix tests never run that path; here three matrices of different heights share
+/// one input, as q, k and v do, and each must match the CPU.
+#[test]
+fn several_products_at_once_match_the_cpu_on_every_device() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let mut rng = Rng(0x0ddba11c0ffee123);
+    let cols = 3072usize;
+    let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+    let shapes = [("Q4_K", 4096usize), ("Q4_K", 1024), ("Q6_K", 1024)];
+    let ws: Vec<Vec<u8>> = shapes.iter().map(|(ty, rows)| weights(ty, *rows, cols, &mut rng)).collect();
+    let want: Vec<Vec<(f32, f64)>> = shapes.iter().zip(&ws).map(|((ty, rows), w)| {
+        let rb = w.len() / rows;
+        (0..*rows).map(|r| {
+            let mut row = vec![0f32; cols];
+            strata_pack::quants::dequantize_into(ty, &w[r * rb..(r + 1) * rb], &mut row).unwrap();
+            let s: f64 = row.iter().zip(&x).map(|(a, b)| *a as f64 * *b as f64).sum();
+            let mag: f64 = row.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
+            (s as f32, mag.max(1e-9))
+        }).collect()
+    }).collect();
+    for d in &devices {
+        let gpu = Gpu::open(&d.name).unwrap();
+        let ups: Vec<_> = shapes.iter().zip(&ws).map(|((ty, rows), w)| gpu.upload(ty, w, *rows, cols).unwrap()).collect();
+        for round in 0..3 {
+            let got = gpu.matvec_many(&ups.iter().collect::<Vec<_>>(), &x);
+            for (m, (g, wn)) in got.iter().zip(&want).enumerate() {
+                let wrong = g.iter().zip(wn).filter(|(a, (b, mag))| !(((**a as f64 - *b as f64).abs() / mag) < 1e-3)).count();
+                eprintln!("{} round {round} matrix {m} ({} rows): {wrong} wrong", d.name, wn.len());
+                assert_eq!(wrong, 0, "{}: matvec_many matrix {m} has {wrong} wrong rows (round {round})", d.name);
+            }
+        }
+    }
+}

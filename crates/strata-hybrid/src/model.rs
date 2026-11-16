@@ -908,9 +908,12 @@ impl Model {
             return self.forward_hc(st, token);
         }
         let mut x = self.embd.row(token as usize);
+        // AM2_DEBUG_LAYERS=1: a checksum of the hidden state after each block, to compare devices (CPU vs a GPU)
+        let dbg = std::env::var_os("AM2_DEBUG_LAYERS").is_some();
         for (l, layer) in self.layers.iter().enumerate() {
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
                 let h = rms_norm(&x, norm, self.eps);
+                let kind = if dbg { match block { Block::Attn(_) => "attn", Block::Dense(_) => "ffn", Block::Moe(_) => "moe", _ => "other" } } else { "" };
                 let out = match block {
                     Block::Mamba(b) => self.mamba(l, b, &h, st),
                     Block::Gdn(b) => self.gdn(l, b, &h, st),
@@ -920,11 +923,21 @@ impl Model {
                     Block::Moe(b) => self.moe(b, &h),
                 };
                 x.iter_mut().zip(&out).for_each(|(a, b)| *a += b);
+                if dbg {
+                    let (sum, abs) = out.iter().fold((0f64, 0f64), |(s, a), v| (s + *v as f64, a + v.abs() as f64));
+                    eprintln!("layer pos={} L{l:02} {kind:<5} out_sum={sum:+.6e} out_abs={abs:.6e} x0={:+.6e}", st.pos, x[0]);
+                }
             }
         }
         st.pos += 1;
         let h = rms_norm(&x, &self.out_norm, self.eps);
-        self.output.mul(&h)
+        let logits = self.output.mul(&h);
+        if dbg {
+            let (sum, abs) = logits.iter().fold((0f64, 0f64), |(s, a), v| (s + *v as f64, a + v.abs() as f64));
+            let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
+            eprintln!("logits pos={} sum={sum:+.6e} abs={abs:.6e} argmax={best}", st.pos - 1);
+        }
+        logits
     }
 
     /// Whether a prompt can go through `forward_batch`: plain attention (no QSA) and dense feed-forward layers only.
