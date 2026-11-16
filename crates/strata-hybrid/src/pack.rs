@@ -10,10 +10,10 @@
 //!   learned profile (`--expert-profile-save`) in the same format, ranked as PolyStrata's rank_learned_profile does:
 //!   by heat, then by the prior profile's rank.
 //! - Residency: the hottest experts within `--expert-ram-gib` are paged in at load and kept (mlock when the memlock limit
-//!   allows it, else MADV_WILLNEED), the others are marked MADV_COLD so that under memory pressure the kernel evicts them
+//!   allows it, else MADV_WILLNEED), the others are marked MADV_COLD (Linux) so that under memory pressure the kernel evicts them
 //!   first: a model larger than the free RAM then reads only its cold experts from the SSD.
 
-use crate::model::{Model, Moe, QMat};
+use crate::model::{Block, Model, Moe, QMat};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -252,16 +252,21 @@ fn pin(_: &[u8]) -> bool {
     false
 }
 
+/// One expert's matrices asked for in the background (MADV_WILLNEED starts the reads and returns).
+pub fn prefetch_expert(m: &Moe, e: usize) {
+    expert_ranges(m, e).iter().for_each(|r| wanted(r));
+}
+
 fn wanted(_b: &[u8]) {
     #[cfg(unix)]
     advise(_b, libc::MADV_WILLNEED);
 }
 
+// Not MADV_RANDOM: an expert is megabytes in one piece, and without readahead it is read 4 KiB per fault (measured
+// on GLM-4.7-Flash in 10 GiB: 5.8 M major faults instead of 0.2 M, generation 2.4 tok/s instead of 4.4).
 fn cold(_b: &[u8]) {
     #[cfg(target_os = "linux")]
     advise(_b, libc::MADV_COLD);
-    #[cfg(unix)]
-    advise(_b, libc::MADV_RANDOM);
 }
 
 /// Keeps the hottest experts (profile order, else layer order) within `budget` bytes in RAM; marks the rest cold.
@@ -313,6 +318,60 @@ pub fn place(model: &Model, profile: Option<&Profile>, budget: u64) -> Residency
         }
     }
     Residency { resident, n_resident, bytes, locked: locked && n_resident > 0 }
+}
+
+/// Moves the matrices every token uses, then the resident experts, into the engine's own memory, for when mlock was refused (the usual 8 MiB memlock limit).
+/// File pages are the kernel's to evict under pressure, so advice alone did not keep them: on GLM-4.7-Flash in 10 GiB a
+/// profile routing 95% to "resident" experts still read 25 GB a request. Anonymous memory stays (macOS compresses it
+/// instead of dropping it). The mapping's copies are then marked cold. -> bytes copied.
+pub fn copy_resident(model: &mut Model, res: &Residency) -> u64 {
+    let ne = model.profile_experts;
+    let mut copied = 0u64;
+    // first the matrices every token uses (attention, dense and shared feed-forwards, the output): when they are
+    // evicted, every token reads them again (round 3: 21 GB a request with 95% of the routing resident)
+    for q in model.matrices_mut().0 {
+        let old = q.data;
+        q.data = owned(old);
+        cold(old);
+        copied += old.len() as u64;
+    }
+    for layer in model.layers.iter_mut() {
+        for (_, block) in layer.parts.iter_mut() {
+            let Block::Moe(m) = block else { continue };
+            for e in 0..m.n_expert {
+                if !res.resident.get(m.layer * ne + e).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut qs: Vec<&mut QMat> = vec![&mut m.up_exps.0[e], &mut m.down_exps.0[e]];
+                if let Some(g) = &mut m.gate_exps {
+                    qs.push(&mut g.0[e]);
+                }
+                for q in qs {
+                    let old = q.data;
+                    q.data = owned(old);
+                    cold(old);
+                    copied += old.len() as u64;
+                }
+            }
+        }
+    }
+    copied
+}
+
+/// A copy in memory of our own, 64-byte aligned like the GGUF's tensor data, kept for the life of the process.
+fn owned(b: &[u8]) -> &'static [u8] {
+    if b.is_empty() {
+        return &[];
+    }
+    let layout = std::alloc::Layout::from_size_align(b.len(), 64).expect("layout");
+    unsafe {
+        let p = std::alloc::alloc(layout);
+        if p.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        std::ptr::copy_nonoverlapping(b.as_ptr(), p, b.len());
+        std::slice::from_raw_parts(p, b.len())
+    }
 }
 
 /// Routing since the last call that went to resident experts: (resident hits, all routed).

@@ -1,5 +1,6 @@
-//! Integer row products for the K-quant weights (Q4_K, Q6_K) against activations quantized to Q8_K, the way ggml's CPU
-//! backend computes them (ggml_vec_dot_q4_K_q8_K, ggml_vec_dot_q6_K_q8_K).
+//! Integer row products for the K-quant weights (Q4_K, Q5_K, Q6_K) against activations quantized to Q8_K, and for Q8_0
+//! weights against activations quantized to Q8_0, the way ggml's CPU backend computes them (ggml_vec_dot_q4_K_q8_K,
+//! ggml_vec_dot_q5_K_q8_K, ggml_vec_dot_q6_K_q8_K, ggml_vec_dot_q8_0_q8_0).
 //!
 //! The activations are quantized once per matrix product, with exactly `Vdt::Q8K`'s rule (`model::Vdt::round_trip`):
 //! per block of 256, iscale = -127 / (the value with the largest magnitude), q = round-half-even(iscale * x), at most
@@ -48,11 +49,35 @@ impl Q8K {
         let sum32 = q.chunks_exact(32).map(|c| c.iter().map(|&v| v as i32).sum()).collect();
         Some(Q8K { q, d, sum32 })
     }
+
+    /// Q8_0's rule instead (`Vdt::Q8_0`, quantize_row_q8_0_ref): per block of 32, d = amax / 127 stored as f16,
+    /// q = round-half-away(x / d). `d` then has one scale per 32 and `sum32` is empty.
+    pub fn quantize_q8_0(x: &[f32]) -> Option<Q8K> {
+        use strata_pack::num::f32_to_f16;
+        if x.is_empty() || x.len() % 32 != 0 {
+            return None;
+        }
+        let mut q = Vec::with_capacity(x.len());
+        let mut d = Vec::with_capacity(x.len() / 32);
+        for b in x.chunks_exact(32) {
+            let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let dd = amax / 127.0;
+            let id = if dd != 0.0 { 1.0 / dd } else { 0.0 };
+            q.extend(b.iter().map(|v| (v * id).round() as i8));
+            d.push(f16_to_f32(f32_to_f16(dd)));
+        }
+        Some(Q8K { q, d, sum32: Vec::new() })
+    }
+
+    /// The activations this weight type multiplies with (Q8_0 for Q8_0, Q8_K for the K-quants).
+    pub fn quantize_for(t: Fast, x: &[f32]) -> Option<Q8K> {
+        if t == Fast::Q8_0 { Q8K::quantize_q8_0(x) } else { Q8K::quantize(x) }
+    }
 }
 
 /// Whether this weight type has an integer kernel here.
 pub fn handles(t: Fast) -> bool {
-    matches!(t, Fast::Q4K | Fast::Q6K)
+    matches!(t, Fast::Q4K | Fast::Q5K | Fast::Q6K | Fast::Q8_0)
 }
 
 #[inline(always)]
@@ -60,7 +85,7 @@ fn h(b: &[u8], at: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([b[at], b[at + 1]]))
 }
 
-/// Σ a[i] * b[i] over 32 values, exact in i32 (|a| < 64, |b| <= 127).
+/// Σ a[i] * b[i] over 32 values, exact in i32 (|a|, |b| <= 128: at most 2^19).
 #[inline(always)]
 fn dot32(a: &[i8; 32], b: &[i8]) -> i32 {
     let b: &[i8; 32] = b.try_into().unwrap();
@@ -220,12 +245,88 @@ fn q6k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
     }
 }
 
+/// Q5_K block (176 bytes, 256 values): d, dmin (f16), 12 bytes of 6-bit scales and mins, 32 bytes of fifth bits, 128
+/// of nibbles. Value = d * scale_g * (nibble | bit << 4) - dmin * min_g (the layout cpu_dot's row_dot reads). Several
+/// inputs, the block unpacked once; one input is the same function (`q5k`), so the results are identical either way.
+#[inline(always)]
+fn q5k_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    out.iter_mut().for_each(|o| *o = 0.0);
+    let mut vals = [[0i8; 32]; 8];
+    let mut ds = [0f32; 8];
+    let mut ms = [0f32; 8];
+    for (bi, b) in row.chunks_exact(176).enumerate() {
+        let (d, dmin) = (h(b, 0), h(b, 2));
+        let sc = &b[4..16];
+        let (qh, qs) = (&b[16..48], &b[48..176]);
+        for c in 0..4 {
+            for l in 0..32 {
+                let v = qs[c * 32 + l];
+                vals[2 * c][l] = ((v & 0x0f) | (((qh[l] >> (2 * c)) & 1) << 4)) as i8;
+                vals[2 * c + 1][l] = ((v >> 4) | (((qh[l] >> (2 * c + 1)) & 1) << 4)) as i8;
+            }
+        }
+        for g in 0..8 {
+            let j = g % 4;
+            let (scale, min) = if g < 4 {
+                (sc[j] & 0x3f, sc[4 + j] & 0x3f)
+            } else {
+                ((sc[8 + j] & 0x0f) | ((sc[j] >> 2) & 0x30), (sc[8 + j] >> 4) | ((sc[4 + j] >> 2) & 0x30))
+            };
+            ds[g] = d * scale as f32;
+            ms[g] = dmin * min as f32;
+        }
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let xq = &x.q[bi * 256..bi * 256 + 256];
+            let mut acc = 0f32;
+            for g in 0..8 {
+                let p = dot32(&vals[g], &xq[g * 32..g * 32 + 32]);
+                acc += ds[g] * p as f32 - ms[g] * x.sum32[bi * 8 + g] as f32;
+            }
+            *o += acc * x.d[bi];
+        }
+    }
+}
+
+#[inline(always)]
+fn q5k(row: &[u8], x: &Q8K) -> f32 {
+    let mut o = [0f32];
+    q5k_many(row, std::slice::from_ref(x), &mut o);
+    o[0]
+}
+
+/// Q8_0 block (34 bytes, 32 values): d (f16), 32 i8. Against Q8_0 activations (`Q8K::quantize_q8_0`): Σ d_w d_x Σ q_w q_x,
+/// the inner sum exact in i32. One input is the same function, so the results are identical either way.
+#[inline(always)]
+fn q80_many(row: &[u8], xs: &[Q8K], out: &mut [f32]) {
+    out.iter_mut().for_each(|o| *o = 0.0);
+    let mut w = [0i8; 32];
+    for (bi, b) in row.chunks_exact(34).enumerate() {
+        let d = h(b, 0);
+        for j in 0..32 {
+            w[j] = b[2 + j] as i8;
+        }
+        for (x, o) in xs.iter().zip(out.iter_mut()) {
+            let p = dot32(&w, &x.q[bi * 32..bi * 32 + 32]);
+            *o += d * x.d[bi] * p as f32;
+        }
+    }
+}
+
+#[inline(always)]
+fn q80(row: &[u8], x: &Q8K) -> f32 {
+    let mut o = [0f32];
+    q80_many(row, std::slice::from_ref(x), &mut o);
+    o[0]
+}
+
 #[inline(always)]
 fn body_many(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
     match t {
         Fast::Q4K => q4k_many(row, xs, out),
+        Fast::Q5K => q5k_many(row, xs, out),
         Fast::Q6K => q6k_many(row, xs, out),
-        _ => unreachable!("cpu_q8 handles Q4_K and Q6_K"),
+        Fast::Q8_0 => q80_many(row, xs, out),
+        _ => unreachable!("cpu_q8 handles Q4_K, Q5_K, Q6_K and Q8_0"),
     }
 }
 
@@ -259,8 +360,10 @@ pub fn row_dot_many(t: Fast, row: &[u8], xs: &[Q8K], out: &mut [f32]) {
 fn body(t: Fast, row: &[u8], x: &Q8K) -> f32 {
     match t {
         Fast::Q4K => q4k(row, x),
+        Fast::Q5K => q5k(row, x),
         Fast::Q6K => q6k(row, x),
-        _ => unreachable!("cpu_q8 handles Q4_K and Q6_K"),
+        Fast::Q8_0 => q80(row, x),
+        _ => unreachable!("cpu_q8 handles Q4_K, Q5_K, Q6_K and Q8_0"),
     }
 }
 
@@ -331,21 +434,37 @@ mod tests {
     }
 
     /// Several inputs at once give exactly what one at a time gives (each input's sums in the same order).
+    const TYPES: [&str; 4] = ["Q4_K", "Q5_K", "Q6_K", "Q8_0"];
+
+    /// `blocks` x 256 values of random bytes with sane f16 scales where each type keeps them.
+    fn random_row(ty: &str, blocks: usize, seed: &mut u64, scale: f32) -> Vec<u8> {
+        let (per256, bb, at): (usize, usize, &[usize]) = match ty {
+            "Q4_K" => (1, 144, &[0, 2]),
+            "Q5_K" => (1, 176, &[0, 2]),
+            "Q6_K" => (1, 210, &[208]),
+            "Q8_0" => (8, 34, &[0]),
+            _ => unreachable!(),
+        };
+        let mut row: Vec<u8> = (0..blocks * per256 * bb).map(|_| rng(seed) as u8).collect();
+        for b in 0..blocks * per256 {
+            for (k, &a) in at.iter().enumerate() {
+                let v = scale / (k + 1) as f32;
+                row[b * bb + a..b * bb + a + 2].copy_from_slice(&strata_pack::num::f32_to_f16(v).to_le_bytes());
+            }
+        }
+        row
+    }
+
     #[test]
     fn many_inputs_equal_one_at_a_time_exactly() {
         let mut seed = 0x0DDB_A11C_0FFE_E123u64;
-        for (ty, bb) in [("Q4_K", 144usize), ("Q6_K", 210usize)] {
+        for ty in TYPES {
             let t = Fast::of(ty).unwrap();
             let blocks = 3;
-            let mut row: Vec<u8> = (0..blocks * bb).map(|_| rng(&mut seed) as u8).collect();
-            for b in 0..blocks {
-                let o = b * bb;
-                let mut set = |at: usize, v: f32| row[o + at..o + at + 2].copy_from_slice(&strata_pack::num::f32_to_f16(v).to_le_bytes());
-                if ty == "Q4_K" { set(0, 0.02); set(2, 0.01); } else { set(208, 0.015); }
-            }
+            let row = random_row(ty, blocks, &mut seed, 0.02);
             let xs: Vec<Q8K> = (0..7).map(|_| {
                 let x: Vec<f32> = (0..blocks * 256).map(|_| (rng(&mut seed) % 4001) as f32 / 1000.0 - 2.0).collect();
-                Q8K::quantize(&x).unwrap()
+                Q8K::quantize_for(t, &x).unwrap()
             }).collect();
             let mut many = vec![0f32; xs.len()];
             row_dot_many(t, &row, &xs, &mut many);
@@ -368,6 +487,13 @@ mod tests {
             assert_eq!(q.q[i] as f32 * q.d[i / 256], *w, "value {i}");
         }
         assert!(Q8K::quantize(&x[..100]).is_none());
+        // and Q8_0's rule, a scale per 32 (the zero blocks included)
+        let q = Q8K::quantize_q8_0(&x).unwrap();
+        let want = crate::model::Vdt::Q8_0.round_trip(&x);
+        for (i, w) in want.iter().enumerate() {
+            assert_eq!(q.q[i] as f32 * q.d[i / 32], *w, "Q8_0 value {i}");
+        }
+        assert!(Q8K::quantize_q8_0(&x[..100]).is_none());
     }
 
     /// Every build of the kernel this CPU can run equals the f32 path (row_dot over the same rounded activations),
@@ -375,19 +501,14 @@ mod tests {
     #[test]
     fn integer_kernels_equal_the_f32_path() {
         let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        for (ty, bb) in [("Q4_K", 144usize), ("Q6_K", 210usize)] {
+        for ty in TYPES {
             let t = Fast::of(ty).unwrap();
             for _ in 0..50 {
                 let blocks = 4;
-                let mut row: Vec<u8> = (0..blocks * bb).map(|_| rng(&mut seed) as u8).collect();
-                for b in 0..blocks {
-                    let o = b * bb;
-                    let mut set = |at: usize, v: f32| row[o + at..o + at + 2].copy_from_slice(&strata_pack::num::f32_to_f16(v).to_le_bytes());
-                    if ty == "Q4_K" { set(0, 0.013); set(2, 0.007); } else { set(208, 0.011); }
-                }
+                let row = random_row(ty, blocks, &mut seed, 0.013);
                 let x: Vec<f32> = (0..blocks * 256).map(|_| (rng(&mut seed) % 4001) as f32 / 1000.0 - 2.0).collect();
-                let xq = Q8K::quantize(&x).unwrap();
-                let rounded = crate::model::Vdt::Q8K.round_trip(&x);
+                let xq = Q8K::quantize_for(t, &x).unwrap();
+                let rounded = crate::model::Vdt::of(ty).round_trip(&x);
                 let want = crate::cpu_dot::row_dot(t, &row, &rounded) as f64;
                 let mut deq = vec![0f32; blocks * 256];
                 strata_pack::quants::dequantize_into(ty, &row, &mut deq).unwrap();
