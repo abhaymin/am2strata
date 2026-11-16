@@ -11,6 +11,9 @@
 <meta property="og:url" content="https://am2strata.am2.ai/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="theme-color" content="#070d1c">
+<!-- Ads: leave empty for house ads only; put the EthicalAds publisher id here to show paid, privacy-friendly ads
+     (_headers already allows media.ethicalads.io and server.ethicalads.io). -->
+<meta name="am2-ads-publisher" content="">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 @font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
@@ -253,6 +256,26 @@ tr:last-child td { border-bottom: 0; }
 .pillar span { color: var(--muted); font-size: 16px; }
 
 footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); background: var(--bg2); }
+/* ads: two quiet, labelled slots; fixed size, no motion, no pop-ups */
+.adslot { margin: 34px auto 0; max-width: 760px; min-height: 92px; border: 1px dashed var(--line2); border-radius: 16px; padding: 14px 16px;
+          display: flex; align-items: center; gap: 14px; background: color-mix(in srgb, var(--card) 60%, transparent); position: relative; }
+.adslot .adlbl { position: absolute; top: -9px; left: 14px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+                 background: var(--bg); padding: 0 6px; }
+.adslot.house a.house { display: flex; align-items: center; gap: 14px; color: var(--ink); width: 100%; }
+.adslot.house a.house:hover { text-decoration: none; }
+.adslot .hico { flex: none; width: 56px; height: 56px; border-radius: 12px; display: grid; place-items: center;
+                background: color-mix(in srgb, var(--accent) 14%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent); }
+.adslot .hico svg { width: 26px; height: 26px; stroke: var(--accent); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.adslot .htxt b { display: block; font-size: 16px; }
+.adslot .htxt span { color: var(--muted); font-size: 14px; }
+.adslot .hgo { margin-left: auto; flex: none; font-size: 14px; color: var(--accent); white-space: nowrap; }
+@media (max-width: 560px) { .adslot .hgo { display: none; } }
+.adline { font-size: 13px; color: var(--faint); margin-top: 18px; min-height: 20px; }
+.adline .adlbl2 { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
+/* EthicalAds' own markup, toned to the page */
+.adslot [data-ea-publisher] { width: 100%; }
+.adslot .ea-content { background: transparent !important; box-shadow: none !important; margin: 0 !important; }
+.adslot .ea-callout a { color: var(--faint) !important; }
 footer .cols { display: flex; flex-wrap: wrap; gap: 30px; justify-content: space-between; }
 footer p { margin: 6px 0; }
 
@@ -562,6 +585,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
         <b>The Moon Woman Singing to Maven (Short)</b><span>The ballad's chorus, vertical.</span></a>
     </div>
     <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">am2Strata on YouTube</a>.</p>
+    <aside class="adslot" id="ad-main" aria-label="Sponsored"><span class="adlbl">Sponsored</span></aside>
   </div>
 </section>
 
@@ -632,6 +656,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
         <a href="https://github.com/VecSzn/PolyStrata">PolyStrata</a> (MIT).</p>
       <p>Coding-agent setup inspired by <a href="https://github.com/unslothai/unsloth">Unsloth</a>'s <code>unsloth start</code>.</p>
       <p>The background image was made with am2Strata's media engine.</p>
+      <p class="adline" id="ad-foot" aria-label="Sponsored"></p>
     </div>
   </div>
 </footer>
@@ -764,6 +789,37 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   const up = e => { pts.delete(e.pointerId); pinch = null; if (!pts.size) stage.classList.remove("drag"); else { const p = [...pts.values()][0]; last = { x: p.clientX, y: p.clientY }; } };
   stage.addEventListener("pointerup", up); stage.addEventListener("pointercancel", up);
   addEventListener("resize", () => dlg.open && fit());
+
+  // ads: labelled, at most two, never in the hero, never animated
+  const house = [
+    { b: "Sponsor am2Strata", s: "Free and open source, built in the open. Sponsors keep it that way.", go: "GitHub Sponsors",
+      href: "https://github.com/sponsors/abhaymin", ico: '<path d="M12 21s-7-4.4-9.3-9A5 5 0 0 1 12 6a5 5 0 0 1 9.3 6c-2.3 4.6-9.3 9-9.3 9z"/>' },
+    { b: "Lofi for Coding: 1 hour", s: "Twenty original instrumentals made with am2Strata, for deep focus.", go: "Listen",
+      href: "https://www.youtube.com/watch?v=uJLNWaZfMzM", ico: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>' },
+    { b: "New demos on YouTube", s: "Browser use, the cluster and models bigger than RAM, recorded live.", go: "Subscribe",
+      href: "https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw?sub_confirmation=1", ico: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="M10 9l5 3-5 3z"/>' },
+  ];
+  const pick = house[Math.floor(Math.random() * house.length)];
+  const main = document.getElementById("ad-main"), foot = document.getElementById("ad-foot");
+  const showHouse = () => {
+    main.classList.add("house"); main.querySelector(".adlbl").textContent = "From am2Strata";
+    const a = document.createElement("a"); a.className = "house"; a.href = pick.href; a.target = "_blank"; a.rel = "noopener";
+    a.innerHTML = '<span class="hico"><svg viewBox="0 0 24 24">' + pick.ico + '</svg></span><span class="htxt"><b></b><span></span></span><span class="hgo"></span>';
+    a.querySelector("b").textContent = pick.b; a.querySelector(".htxt span").textContent = pick.s; a.querySelector(".hgo").textContent = pick.go + " →";
+    for (const x of main.querySelectorAll("[data-ea-publisher]")) x.remove();
+    main.append(a);
+  };
+  const other = house.find(h => h !== pick);
+  foot.innerHTML = '<span class="adlbl2">From am2Strata</span>';
+  const fa = document.createElement("a"); fa.href = other.href; fa.target = "_blank"; fa.rel = "noopener"; fa.textContent = other.b; foot.append(fa);
+  const pub = (document.querySelector('meta[name="am2-ads-publisher"]') || {}).content || "";
+  if (!pub) { showHouse(); return; }
+  // EthicalAds: one image ad under the videos, no tracking cookies; if none is served in 4 s, the house ad stays
+  const ea = document.createElement("div"); ea.dataset.eaPublisher = pub; ea.dataset.eaType = "image";
+  ea.className = "horizontal"; main.append(ea);
+  const sc = document.createElement("script"); sc.async = true; sc.src = "https://media.ethicalads.io/media/client/ethicalads.min.js";
+  sc.onerror = showHouse; document.head.append(sc);
+  setTimeout(() => { if (!main.querySelector(".ea-content, a[href]")) showHouse(); }, 4000);
 })();
 </script>
 </body>
