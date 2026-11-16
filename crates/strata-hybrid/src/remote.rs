@@ -201,6 +201,28 @@ struct Held {
     up: QMat,
     gate: Option<QMat>,
     down: QMat,
+    /// the bytes the three matrices point into; freed when the last Arc<Held> goes (a compute in flight keeps it)
+    _mem: Vec<Box<[u8]>>,
+    size: u64,
+}
+
+impl Held {
+    fn copy(m: &Moe, e: usize) -> Held {
+        let mut mem = Vec::new();
+        let mut take = |q: &QMat| {
+            let b: Box<[u8]> = q.data.into();
+            // SAFETY: the box lives in this Held next to the matrix that points into it, never moves (a Box's heap
+            // data does not move with the Box) and is dropped with it; no QMat leaves the Held.
+            let data: &'static [u8] = unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+            mem.push(b);
+            q.with_data(data, q.ty()).expect("same shape")
+        };
+        let up = take(&m.up_exps.0[e]);
+        let gate = m.gate_exps.as_ref().map(|g| take(&g.0[e]));
+        let down = take(&m.down_exps.0[e]);
+        let size = mem.iter().map(|b| b.len() as u64).sum();
+        Held { up, gate, down, _mem: mem, size }
+    }
 }
 
 /// Serves `model`'s experts to the masters whose pins are allowed, until the process ends.
@@ -248,28 +270,41 @@ fn handle(h: &Value, data: &[f32], model: &Model, model_id: &str, moes: &HashMap
         // the whole budget: experts already held (from this master's last session) cost nothing to assign again
         "hello" => (json!({"ok": true, "model": model_id, "budget_bytes": budget, "used_bytes": used.load(Ordering::Relaxed),
                           "layers": model.layers.len()}), Vec::new()),
+        // the master's whole wanted list, hottest first: experts no longer wanted are let go, then the wanted ones are
+        // taken in order while they fit (already held ones cost nothing new); the answer says how many of the list are
+        // held, a prefix, so a master whose order differs from the last one's still gets the most it can
         "assign" => {
-            let mut n = 0usize;
-            let mut map = held.lock().unwrap();
+            let mut want = Vec::new();
             for pair in h["experts"].as_array().cloned().unwrap_or_default() {
                 let (l, e) = (pair[0].as_u64().unwrap_or(u64::MAX) as usize, pair[1].as_u64().unwrap_or(u64::MAX) as usize);
                 let Some(m) = moes.get(&l) else { return err(format!("layer {l} has no experts")) };
                 if e >= m.n_expert {
                     return err(format!("layer {l} has no expert {e}"));
                 }
-                if map.contains_key(&(l, e)) {
-                    continue;
-                }
-                let size = m.up_exps.0[e].data.len() + m.down_exps.0[e].data.len() + m.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len());
-                if used.load(Ordering::Relaxed) + size as u64 > budget {
-                    return err(format!("out of room after {n} experts ({} bytes used)", used.load(Ordering::Relaxed)));
-                }
-                let copy = |q: &QMat| q.with_data(crate::pack::owned(q.data), q.ty()).expect("same shape");
-                map.insert((l, e), Arc::new(Held { up: copy(&m.up_exps.0[e]), gate: m.gate_exps.as_ref().map(|g| copy(&g.0[e])), down: copy(&m.down_exps.0[e]) }));
-                used.fetch_add(size as u64, Ordering::Relaxed);
-                n += 1;
+                want.push((l, e));
             }
-            (json!({"ok": true, "held": map.len(), "bytes": used.load(Ordering::Relaxed)}), Vec::new())
+            let mut map = held.lock().unwrap();
+            let keep: std::collections::HashSet<(usize, usize)> = want.iter().copied().collect();
+            map.retain(|k, _| keep.contains(k));
+            let mut bytes: u64 = map.values().map(|x| x.size).sum();
+            let mut taken = 0usize;
+            for &(l, e) in &want {
+                if !map.contains_key(&(l, e)) {
+                    let m = moes[&l];
+                    let size = (m.up_exps.0[e].data.len() + m.down_exps.0[e].data.len() + m.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64;
+                    if bytes + size > budget {
+                        break;
+                    }
+                    map.insert((l, e), Arc::new(Held::copy(m, e)));
+                    bytes += size;
+                }
+                taken += 1;
+            }
+            // anything after the prefix that happened to be held already is let go too: the master will not send it
+            let prefix: std::collections::HashSet<(usize, usize)> = want[..taken].iter().copied().collect();
+            map.retain(|k, _| prefix.contains(k));
+            used.store(map.values().map(|x| x.size).sum(), Ordering::Relaxed);
+            (json!({"ok": true, "taken": taken, "bytes": used.load(Ordering::Relaxed)}), Vec::new())
         }
         "compute" => {
             let l = h["layer"].as_u64().unwrap_or(u64::MAX) as usize;
@@ -346,23 +381,23 @@ impl Remote {
             free))
     }
 
-    /// Hands these experts to the host (it copies them into its memory). Only experts it took are marked held.
+    /// Hands the host this master's wanted experts, hottest first, in one request: it lets go of what is no longer
+    /// wanted and takes a prefix of the list as far as its memory goes. Only the experts it took are marked held.
     pub fn assign(&mut self, model: &Model, experts: &[(usize, usize)]) -> Result<(), String> {
         let mut guard = self.conn.lock().unwrap();
         let s = guard.as_mut().ok_or("not connected")?;
-        for chunk in experts.chunks(256) {
-            let list: Vec<[usize; 2]> = chunk.iter().map(|&(l, e)| [l, e]).collect();
-            write_frame(s, &json!({"op": "assign", "experts": list}), &[]).map_err(|e| e.to_string())?;
-            let (h, _) = read_frame(s).map_err(|e| e.to_string())?;
-            if h["ok"] != true {
-                return Err(h["error"].as_str().unwrap_or("assign refused").to_string());
-            }
-            for &(l, e) in chunk {
-                self.held[l * self.per_layer + e] = true;
-                self.n_held += 1;
-                let m = model.moes().find(|m| m.layer == l).expect("an MoE layer");
-                self.bytes += (m.up_exps.0[e].data.len() + m.down_exps.0[e].data.len() + m.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64;
-            }
+        let list: Vec<[usize; 2]> = experts.iter().map(|&(l, e)| [l, e]).collect();
+        write_frame(s, &json!({"op": "assign", "experts": list}), &[]).map_err(|e| e.to_string())?;
+        let (h, _) = read_frame(s).map_err(|e| e.to_string())?;
+        if h["ok"] != true {
+            return Err(h["error"].as_str().unwrap_or("assign refused").to_string());
+        }
+        let taken = (h["taken"].as_u64().unwrap_or(0) as usize).min(experts.len());
+        for &(l, e) in &experts[..taken] {
+            self.held[l * self.per_layer + e] = true;
+            self.n_held += 1;
+            let m = model.moes().find(|m| m.layer == l).expect("an MoE layer");
+            self.bytes += (m.up_exps.0[e].data.len() + m.down_exps.0[e].data.len() + m.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64;
         }
         Ok(())
     }
