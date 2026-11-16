@@ -3,6 +3,9 @@
 //! engine protocol (docs/PROTOCOL.md) so am2Strata's server drives it like `strata` and `strata-poly`:
 //!   am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]
 //!       [--pack DIR] [--expert-profile FILE] [--expert-profile-save FILE] [--resident-experts [--expert-ram-gib N]]
+//!       [--remote-experts HOST:PORT --remote-pin PIN --identity node-tls.json]     (another machine's memory, remote.rs)
+//!   am2strata-hybrid --serve-experts ADDR --model M --identity node-tls.json --allow-pin PIN[,PIN] [--expert-ram-gib N]
+//!   am2strata-hybrid --make-identity node-tls.json [--name NAME]      (prints the new identity's pin)
 //! The computation runs on the CPU (correctness first, compared with llama.cpp by tools/reference-llamacpp); the
 //! placement is strata's (pack.rs): a pack's float tensors, the expert loadings (profile), and the hottest experts kept
 //! in RAM with the rest left to the SSD. The GPU tier (dense weights and hot experts in VRAM) comes next.
@@ -15,6 +18,7 @@ mod gpu;
 #[cfg(feature = "gpu")]
 mod graph;
 mod pack;
+mod remote;
 
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
@@ -122,6 +126,13 @@ fn main() {
         println!("{}", serde_json::Value::Array(list));
         return;
     }
+    // a node identity in the cluster's format (node-tls.json), for machines without am2Strata's server and for tests
+    if let Some(p) = arg("--make-identity") {
+        match remote::Identity::make(std::path::Path::new(&p), &arg("--name").unwrap_or_else(|| "node".into())) {
+            Ok(id) => { println!("{}", id.pin); return; }
+            Err(e) => { eprintln!("--make-identity: {e}"); std::process::exit(1); }
+        }
+    }
     let Some(model_path) = arg("--model") else {
         eprintln!("usage: am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]");
         std::process::exit(2);
@@ -140,6 +151,21 @@ fn main() {
     #[allow(unused_mut)]
     let (mut m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
     let n_layers = m.layers.len();
+    // the expert host: this machine lends its memory to a paired master (remote.rs); it serves until stopped
+    if let Some(addr) = arg("--serve-experts") {
+        let id = remote::Identity::load(std::path::Path::new(&arg("--identity").unwrap_or_else(|| fail("--serve-experts needs --identity node-tls.json".into()))))
+            .unwrap_or_else(|e| fail(e));
+        let allow: Vec<String> = arg("--allow-pin").unwrap_or_default().split(',').map(|p| p.trim().to_lowercase()).filter(|p| p.len() == 64).collect();
+        if allow.is_empty() {
+            fail("--serve-experts needs --allow-pin: the pins of the masters it serves (64 hex digits each)".into());
+        }
+        let budget = arg("--expert-ram-gib").and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as u64)
+            .unwrap_or_else(|| mem_available() / 4 * 3);
+        let model_id = remote::fingerprint(std::path::Path::new(&model_path)).unwrap_or_else(|e| fail(e));
+        let mm: &'static model::Model = Box::leak(Box::new(m));
+        remote::serve(mm, model_id, &addr, id, allow, budget).unwrap_or_else(|e| fail(e));
+        return;
+    }
     // a profile not written yet (the first run of a config that also saves to it) is learned from scratch
     let profile = arg("--expert-profile").filter(|p| std::path::Path::new(p).exists())
         .map(|p| pack::Profile::read(std::path::Path::new(&p), n_layers, m.profile_experts).unwrap_or_else(|e| fail(e)));
@@ -169,6 +195,49 @@ fn main() {
     } else {
         None
     };
+    // another machine's memory, after this machine's RAM: the next-hottest experts that would otherwise come from the disk
+    if let Some(addr) = arg("--remote-experts") {
+        let Some(r) = &res else { fail("--remote-experts needs --resident-experts: this machine's own RAM tier is placed first".into()) };
+        let pin = arg("--remote-pin").map(|p| p.trim().to_lowercase()).filter(|p| p.len() == 64)
+            .unwrap_or_else(|| fail("--remote-experts needs --remote-pin: the expert host's pin (64 hex digits)".into()));
+        let id = remote::Identity::load(std::path::Path::new(&arg("--identity").unwrap_or_else(|| fail("--remote-experts needs --identity node-tls.json".into()))))
+            .unwrap_or_else(|e| fail(e));
+        let model_id = remote::fingerprint(std::path::Path::new(&model_path)).unwrap_or_else(|e| fail(e));
+        let ne = m.profile_experts;
+        match remote::Remote::connect(&addr, &pin, &id, &model_id, n_layers, ne) {
+            Ok((mut rm, free)) => {
+                let sizes: std::collections::HashMap<(usize, usize), u64> = m.moes().flat_map(|x| (0..x.n_expert).map(move |e|
+                    ((x.layer, e), (x.up_exps.0[e].data.len() + x.down_exps.0[e].data.len() + x.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64))).collect();
+                // the profile's order, then layer by layer; only experts not already in this machine's RAM
+                let mut order: Vec<(usize, usize)> = profile.as_ref().map(|p| p.ranked.iter().map(|&(l, e)| (l as usize, e as usize)).collect()).unwrap_or_default();
+                let mut seen = std::collections::HashSet::new();
+                order.retain(|k| sizes.contains_key(k) && seen.insert(*k));
+                let mut rest: Vec<(usize, usize)> = sizes.keys().copied().filter(|k| !seen.contains(k)).collect();
+                rest.sort();
+                order.extend(rest);
+                let (mut take, mut bytes) = (Vec::new(), 0u64);
+                for k in order {
+                    if r.resident.get(k.0 * ne + k.1).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let b = sizes[&k];
+                    if bytes + b > free {
+                        break;
+                    }
+                    bytes += b;
+                    take.push(k);
+                }
+                rm.assign(&m, &take).unwrap_or_else(|e| fail(format!("--remote-experts {addr}: {e}")));
+                placement = format!("{placement} remote={addr} remote_experts={} remote_gib={:.2}", rm.n_held, rm.bytes as f64 / (1u64 << 30) as f64);
+                m.remote = Some(rm);
+            }
+            // no worker: the model still runs, its cold experts from this machine's disk
+            Err(e) => {
+                eprintln!("remote experts: {e}; running without them");
+                placement = format!("{placement} remote_unavailable");
+            }
+        }
+    }
     // the experts each step chose, asked for at once: on with residency (the cold ones are on disk), AM2_PREFETCH=0/1
     let prefetch = match std::env::var("AM2_PREFETCH").ok().as_deref() { Some("0") => false, Some(_) => true, None => res.is_some() };
     m.prefetch.store(prefetch, std::sync::atomic::Ordering::Relaxed);
@@ -368,6 +437,9 @@ fn main() {
             if all > 0 {
                 out(&format!("INFO experts_routed={all} resident_hit={:.3}", hit as f64 / all as f64));
             }
+        }
+        if let Some(rm) = &m.remote {
+            out(&format!("INFO {}", rm.take_stats()));
         }
         if let Some(p) = &save {
             if let Err(e) = pack::Profile::learned(&m, profile.as_ref()).write(p) {

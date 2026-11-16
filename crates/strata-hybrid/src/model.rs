@@ -511,6 +511,28 @@ pub struct Moe {
     shared_gate: Option<Vec<f32>>,
 }
 
+impl Moe {
+    /// One expert on several inputs: up (and gate), the activation, down. The batched prompt path and the remote expert
+    /// host (remote.rs) both run exactly this, so an expert's outputs are the same bits wherever it is computed.
+    pub(crate) fn expert_forward(&self, up: &QMat, gate: Option<&QMat>, down: &QMat, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let mut mid = up.matmul(xs);
+        match gate {
+            Some(g) => {
+                let gv = g.matmul(xs);
+                for (u, g) in mid.iter_mut().zip(&gv) {
+                    u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(self.act, *g));
+                }
+            }
+            None => mid.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(self.act, *v))),
+        }
+        down.matmul(&mid)
+    }
+
+    fn expert_local(&self, e: usize, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        self.expert_forward(&self.up_exps.0[e], self.gate_exps.as_ref().map(|g| &g.0[e]), &self.down_exps.0[e], xs)
+    }
+}
+
 /// One projection of every expert in a layer, a matrix per expert: sliced from the stacked tensor
 /// (`blk.N.ffn_up_exps.weight`), or the per-expert tensors of GGUFs converted before April 2024 (`blk.N.ffn_up.E.weight`,
 /// e.g. most Mixtral 8x7B files), which llama.cpp still loads.
@@ -676,6 +698,8 @@ pub struct Model {
     /// Ask the OS for every chosen expert's pages at once, before multiplying (`--resident-experts` turns it on): the
     /// experts not in RAM are then read from disk in parallel instead of one page fault at a time.
     pub prefetch: AtomicBool,
+    /// Another machine's memory as an expert tier (remote.rs): set by --remote-experts.
+    pub remote: Option<crate::remote::Remote>,
 }
 
 /// Per-conversation state: per layer the attention cache (K, V - or MLA's latent and rotary key), and the Mamba
@@ -950,6 +974,7 @@ impl Model {
             embd, out_norm: optf("output_norm.weight").unwrap_or_default(), output, hc, hc_head,
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
             prefetch: AtomicBool::new(false),
+            remote: None,
             profile_experts, layers, arch,
         }, from_pack))
     }
@@ -1609,7 +1634,10 @@ impl Model {
                 users[e].push((t, slot));
             }
         }
-        self.prefetch_experts(m, (0..m.n_expert).filter(|&e| !users[e].is_empty()));
+        // experts another machine holds (remote.rs): sent first in one request, computed there while the local ones run here
+        let remote = self.remote.as_ref().filter(|r| (0..m.n_expert).any(|e| !users[e].is_empty() && r.holds(m.layer, e)));
+        let far: Vec<usize> = remote.map(|r| (0..m.n_expert).filter(|&e| !users[e].is_empty() && r.holds(m.layer, e)).collect()).unwrap_or_default();
+        self.prefetch_experts(m, (0..m.n_expert).filter(|&e| !users[e].is_empty() && !far.contains(&e)));
         // the experts' inputs: the latent projection when there is one, else the hidden states directly (no extra allocation)
         let projected;
         let xs: &[Vec<f32>] = match &m.latent {
@@ -1620,26 +1648,36 @@ impl Model {
             None => hs,
         };
         let mut outs: Vec<Vec<Vec<f32>>> = routes.iter().map(|(c, _)| vec![Vec::new(); c.len()]).collect();
+        let rows = m.down_exps.0[0].rows;
+        let pending = remote.and_then(|r| {
+            let jobs: Vec<(usize, Vec<&[f32]>)> = far.iter().map(|&e| (e, users[e].iter().map(|&(t, _)| &xs[t][..]).collect())).collect();
+            r.start(m.layer, &jobs)
+        });
         for (e, who) in users.iter().enumerate() {
-            if who.is_empty() {
+            if who.is_empty() || (pending.is_some() && far.contains(&e)) {
                 continue;
             }
             let ins: Vec<Vec<f32>> = who.iter().map(|&(t, _)| xs[t].clone()).collect();
-            let mut mid = m.up_exps.0[e].matmul(&ins);
-            match &m.gate_exps {
-                Some(g) => {
-                    let gv = g.0[e].matmul(&ins);
-                    for (u, g) in mid.iter_mut().zip(&gv) {
-                        u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(m.act, *g));
-                    }
-                }
-                None => mid.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(m.act, *v))),
-            }
-            for (o, &(t, slot)) in m.down_exps.0[e].matmul(&mid).into_iter().zip(who) {
+            for (o, &(t, slot)) in m.expert_local(e, &ins).into_iter().zip(who) {
                 outs[t][slot] = o;
             }
         }
-        let rows = m.down_exps.0[0].rows;
+        if let (Some(r), Some(p)) = (remote, pending) {
+            match r.finish(p, rows) {
+                Some(got) => for (&e, os) in far.iter().zip(got) {
+                    for (o, &(t, slot)) in os.into_iter().zip(&users[e]) {
+                        outs[t][slot] = o;
+                    }
+                },
+                // the worker failed: the same experts, computed here from the file
+                None => for &e in &far {
+                    let ins: Vec<Vec<f32>> = users[e].iter().map(|&(t, _)| xs[t].clone()).collect();
+                    for (o, &(t, slot)) in m.expert_local(e, &ins).into_iter().zip(&users[e]) {
+                        outs[t][slot] = o;
+                    }
+                },
+            }
+        }
         let accs: Vec<Vec<f32>> = outs.iter().zip(&routes).map(|(os, (_, w))| {
             let mut acc = vec![0f32; rows];
             for (o, &we) in os.iter().zip(w) {
@@ -1715,14 +1753,54 @@ impl Model {
         Some(out)
     }
 
+    /// `moe` when some chosen experts are held by another machine: those go out first, the local ones are computed here
+    /// meanwhile, and every expert's output is added in routing order, the same sum as the plain path.
+    fn moe_remote(&self, m: &Moe, r: &crate::remote::Remote, h: &[f32], x: &[f32], chosen: &[usize], w: &[f32]) -> Vec<f32> {
+        let rows = m.down_exps.0[0].rows;
+        let far: Vec<usize> = chosen.iter().copied().filter(|&e| r.holds(m.layer, e)).collect();
+        let jobs: Vec<(usize, Vec<&[f32]>)> = far.iter().map(|&e| (e, vec![x])).collect();
+        let pending = r.start(m.layer, &jobs);
+        let one = [x.to_vec()];
+        let mut outs: Vec<Option<Vec<f32>>> = chosen.iter()
+            .map(|&e| (pending.is_none() || !far.contains(&e)).then(|| m.expert_local(e, &one).pop().unwrap())).collect();
+        if let Some(p) = pending {
+            let got = r.finish(p, rows);
+            for (k, &e) in far.iter().enumerate() {
+                let o = match &got { Some(g) => g[k][0].clone(), None => m.expert_local(e, &one).pop().unwrap() };
+                for (slot, &c) in chosen.iter().enumerate() {
+                    if c == e && outs[slot].is_none() {
+                        outs[slot] = Some(o.clone());
+                    }
+                }
+            }
+        }
+        let mut acc = vec![0f32; rows];
+        for (o, &we) in outs.iter().zip(w) {
+            acc.iter_mut().zip(o.as_ref().expect("every slot computed")).for_each(|(a, v)| *a += we * v);
+        }
+        let mut out = match &m.latent {
+            Some((_, up)) => up.mul(&acc),
+            None => acc,
+        };
+        if let Some(sh) = &m.shared {
+            let gate = m.shared_gate.as_ref().map_or(1.0, |sw| sigmoid(dot(sw, h)));
+            out.iter_mut().zip(&sh.forward(h)).for_each(|(a, b)| *a += b * gate);
+        }
+        out
+    }
+
     fn moe(&self, m: &Moe, h: &[f32]) -> Vec<f32> {
         let (chosen, w) = self.route(m, h);
         let chosen = &chosen[..];
-        self.prefetch_experts(m, chosen.iter().copied());
+        let remote = self.remote.as_ref().filter(|r| chosen.iter().any(|&e| r.holds(m.layer, e)));
+        self.prefetch_experts(m, chosen.iter().copied().filter(|&e| remote.is_none_or(|r| !r.holds(m.layer, e))));
         let x = match &m.latent {
             Some((down, _)) => down.mul(h),
             None => h.to_vec(),
         };
+        if let Some(r) = remote {
+            return self.moe_remote(m, r, h, &x, chosen, &w);
+        }
         static FUSED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *FUSED.get_or_init(|| std::env::var_os("AM2_NO_FUSED").is_none()) {
             if let Some(out) = self.moe_fused(m, h, &x, chosen, &w) {
