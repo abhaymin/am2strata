@@ -311,6 +311,8 @@ pub struct Remote {
     calls: AtomicU64,
     us: AtomicU64,
     failed: AtomicU64,
+    /// expert uses (one expert for one token) answered by the host
+    uses: AtomicU64,
 }
 
 /// A request sent and not yet answered (the master computes its own experts meanwhile).
@@ -339,7 +341,8 @@ impl Remote {
         }
         let free = h["budget_bytes"].as_u64().unwrap_or(0);
         Ok((Remote { addr: addr.to_string(), held: vec![false; n_layers * per_layer], per_layer, conn: Mutex::new(Some(s)),
-                     alive: AtomicBool::new(true), n_held: 0, bytes: 0, calls: AtomicU64::new(0), us: AtomicU64::new(0), failed: AtomicU64::new(0) },
+                     alive: AtomicBool::new(true), n_held: 0, bytes: 0, calls: AtomicU64::new(0), us: AtomicU64::new(0), failed: AtomicU64::new(0),
+                     uses: AtomicU64::new(0) },
             free))
     }
 
@@ -417,6 +420,7 @@ impl Remote {
         let mut at = 0;
         let out = p.shapes.iter().map(|&(_, n)| (0..n).map(|_| { let v = data[at..at + rows].to_vec(); at += rows; v }).collect()).collect();
         self.calls.fetch_add(1, Ordering::Relaxed);
+        self.uses.fetch_add(p.shapes.iter().map(|&(_, n)| n as u64).sum(), Ordering::Relaxed);
         self.us.fetch_add(p.t0.elapsed().as_micros() as u64, Ordering::Relaxed);
         Some(out)
     }
@@ -429,10 +433,11 @@ impl Remote {
         *self.conn.lock().unwrap() = None;
     }
 
-    /// "calls=N avg_us=M alive=true" since the last call (for the INFO line after a request).
+    /// "remote_uses=U remote_calls=N remote_avg_us=M remote_alive=true" since the last call (for the INFO line after a
+    /// request): U expert uses (one expert for one token) were served by the host, in N round trips.
     pub fn take_stats(&self) -> String {
-        let (c, us) = (self.calls.swap(0, Ordering::Relaxed), self.us.swap(0, Ordering::Relaxed));
-        format!("remote_calls={c} remote_avg_us={} remote_alive={}", if c > 0 { us / c } else { 0 }, self.alive.load(Ordering::Relaxed))
+        let (c, us, u) = (self.calls.swap(0, Ordering::Relaxed), self.us.swap(0, Ordering::Relaxed), self.uses.swap(0, Ordering::Relaxed));
+        format!("remote_uses={u} remote_calls={c} remote_avg_us={} remote_alive={}", if c > 0 { us / c } else { 0 }, self.alive.load(Ordering::Relaxed))
     }
 }
 

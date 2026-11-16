@@ -188,6 +188,30 @@ limit the Mac now reads the prompt about as fast as llama.cpp and generates 2.5x
 on the M4 (4 performance + 6 efficiency cores). These Mac runs had eight-input Q8_0 on NEON (since moved back to the
 loop), so MLA's prompt share there should drop on the next run.
 
+## Gated delta net prompts, and a chunk's experts in one pass (Tiel)
+
+Tiel (qwen35moe: 40 layers, 3 in 4 a gated delta net, 256 experts with 8 chosen) read its prompt barely faster batched,
+because each chunk's experts ran as ~250 small parallel jobs one after another and the GDN layers ran token by token.
+Now the GDN input and output projections take the whole chunk (the recurrence stays token by token), and a chunk's
+experts run in two parallel passes (`QMat::matmul_set`: every expert's up and gate on its tokens, then every down).
+128-token prompt, 8 threads, this PC: **Tiel 13.0 -> 6.8 s, GLM-4.7-Flash 11.9 -> 8.2 s**, tokens identical batched
+and not. Tiel against llama.cpp (`parity.sh`, oracle3, 24 steps of real text): **24/24 identical**, worst logit
+difference 1.28.
+
+## Another machine's memory as an expert tier (remote.rs)
+
+Whichever machine runs the model lends nothing; another paired machine lends RAM as an expert host. Tokens identical
+with and without it (each expert's output comes back separately and is added in routing order), mutual TLS with the
+cluster's pins, failure falls back to local computation. GLM-4.7-Flash, master 3 GiB resident + host 4 GiB:
+
+| Pairing | Result |
+|---|---|
+| PC to PC (two processes) | identical tokens batched and not; prompt 11.65 -> 7.3 s (the host's threads add compute) |
+| PC to PC, host killed mid-prompt | marked down after 91 calls, identical tokens |
+| Unpaired master, wrong host pin | refused at the TLS handshake; the model runs on locally |
+| Mac to Mac (two processes, 16 GB) | identical 64 tokens, 397 experts and 1,243 calls remote (slower: one machine, swap) |
+| Mac and PC, either way | built on both; waiting for the owner's approval of the Mac's network listener |
+
 ## Next
 - **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).

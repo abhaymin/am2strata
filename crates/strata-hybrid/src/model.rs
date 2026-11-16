@@ -200,6 +200,45 @@ impl QMat {
         Some(outs)
     }
 
+    /// Several matmuls in one parallel pass, Y_i = W_i X_i where each X_i is several inputs (a prompt chunk's experts, each
+    /// with the tokens that chose it). One join instead of one per matrix; every value is the one `matmul` gives (the same
+    /// row functions on the same rounded inputs). None when a matrix is on a GPU or has no CPU kernel here.
+    pub fn matmul_set(jobs: &[(&QMat, &[Vec<f32>])]) -> Option<Vec<Vec<Vec<f32>>>> {
+        use crate::cpu_dot::Fast;
+        enum In {
+            Int(Fast, Vec<crate::cpu_q8::Q8K>),
+            F(Fast, Vec<Vec<f32>>),
+        }
+        let mut ins = Vec::with_capacity(jobs.len());
+        for (q, xs) in jobs {
+            #[cfg(feature = "gpu")]
+            if q.gpu.is_some() {
+                return None;
+            }
+            let fast = Fast::of(&q.ty)?;
+            let q8: Vec<crate::cpu_q8::Q8K> = if q.int8(fast) { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
+            ins.push(if q.int8(fast) && q8.len() == xs.len() { In::Int(fast, q8) } else { In::F(fast, xs.iter().map(|x| q.vdt.round_trip(x)).collect()) });
+        }
+        const ROWS: usize = 16;
+        let mut flats: Vec<Vec<f32>> = jobs.iter().map(|(q, xs)| vec![0f32; q.rows * xs.len()]).collect();
+        let tasks: Vec<(usize, usize, &mut [f32])> = flats.iter_mut().enumerate()
+            .flat_map(|(j, f)| { let n = jobs[j].1.len().max(1); f.chunks_mut(ROWS * n).enumerate().map(move |(ci, c)| (j, ci * ROWS, c)) })
+            .collect();
+        tasks.into_par_iter().for_each(|(j, r0, ys)| {
+            let q = jobs[j].0;
+            let n = jobs[j].1.len();
+            for (k, yr) in ys.chunks_mut(n).enumerate() {
+                let r = r0 + k;
+                let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
+                match &ins[j] {
+                    In::Int(f, q8) => crate::cpu_q8::row_dot_many(*f, row, q8, yr),
+                    In::F(f, xs) => for t in 0..n { yr[t] = crate::cpu_dot::row_dot(*f, row, &xs[t]); },
+                }
+            }
+        });
+        Some(flats.into_iter().zip(jobs).map(|(f, (q, xs))| { let n = xs.len(); (0..n).map(|t| (0..q.rows).map(|r| f[r * n + t]).collect()).collect() }).collect())
+    }
+
     /// The products of several matrices with the same input: in one GPU submission when they are all on one device
     /// and round the input the same way, else one by one.
     pub fn mul_many(qs: &[&QMat], x: &[f32]) -> Vec<Vec<f32>> {
@@ -1061,6 +1100,10 @@ impl Model {
                     Block::Dense(b) => b.forward_batch(&hs),
                     Block::Moe(b) => self.moe_batch(b, &hs),
                     Block::Mla(b) => self.mla_batch(l * 2 + pi, b, &hs, st, base),
+                    Block::Gdn(b) => {
+                        st.pos = base;
+                        self.gdn_batch(l, b, &hs, st)
+                    }
                     // the rest token by token, in order, each at its own position: what `forward` computes
                     _ => hs.iter().enumerate().map(|(i, h)| {
                         st.pos = base + i;
@@ -1304,17 +1347,34 @@ impl Model {
     }
 
     fn gdn(&self, l: usize, b: &Gdn, h: &[f32], st: &mut State) -> Vec<f32> {
-        let Gdn { qkv, z, alpha, beta, conv_w, dt_b, a, ssm_norm, ssm_out, z_sigmoid } = b;
+        let (mix, z) = {
+            let mut v = QMat::mul_many(&[&b.qkv, &b.z], h);
+            let z = v.pop().unwrap();
+            (v.pop().unwrap(), z)
+        };
+        let (al, be) = (b.alpha.mul(h), b.beta.mul(h));
+        let y = self.gdn_core(l, b, &mix, &z, &al, &be, st);
+        b.ssm_out.mul(&y)
+    }
+
+    /// `gdn` for a prompt chunk: the four input projections and the output projection take the whole chunk (each weight
+    /// read once), and the recurrence runs token by token in order, the same core as `gdn`. The same values.
+    fn gdn_batch(&self, l: usize, b: &Gdn, hs: &[Vec<f32>], st: &mut State) -> Vec<Vec<f32>> {
+        let (mixes, zs) = (b.qkv.matmul(hs), b.z.matmul(hs));
+        let (als, bes) = (b.alpha.matmul(hs), b.beta.matmul(hs));
+        let ys: Vec<Vec<f32>> = (0..hs.len()).map(|t| self.gdn_core(l, b, &mixes[t], &zs[t], &als[t], &bes[t], st)).collect();
+        b.ssm_out.matmul(&ys)
+    }
+
+    /// One token's gated delta net after its projections: the causal conv, q/k normalization, the delta-rule state update
+    /// and the gated norm; the result before the output projection.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_core(&self, l: usize, b: &Gdn, mix: &[f32], z: &[f32], al: &[f32], be: &[f32], st: &mut State) -> Vec<f32> {
+        let Gdn { conv_w, dt_b, a, ssm_norm, z_sigmoid, .. } = b;
         let (nk, sk, nv, dc) = (self.n_group, self.d_state, self.n_ssm_head, self.d_conv);
         let sv = self.d_inner / nv;
         let key = nk * sk;
         let n_conv = 2 * key + nv * sv;
-        let (mix, z) = {
-            let mut v = QMat::mul_many(&[qkv, z], h);
-            let z = v.pop().unwrap();
-            (v.pop().unwrap(), z)
-        };
-        let (al, be) = (alpha.mul(h), beta.mul(h));
         // the same causal conv1d as Mamba's, without a bias
         let win = st.conv.entry(l).or_insert_with(|| vec![0f32; (dc - 1) * n_conv]);
         let mut conv = vec![0f32; n_conv];
@@ -1328,7 +1388,7 @@ impl Model {
         }
         win.copy_within(n_conv.., 0);
         let last = (dc - 2) * n_conv;
-        win[last..last + n_conv].copy_from_slice(&mix);
+        win[last..last + n_conv].copy_from_slice(mix);
         // q and k per key head, L2 normalized as build_gdn_l2_norm: an RMS norm with eps / n, over sqrt(n)
         let l2 = |x: &mut [f32]| {
             x.chunks_mut(sk).for_each(|hd| {
@@ -1356,7 +1416,7 @@ impl Model {
             let n = rms_norm(yh, nw, self.eps);
             yh.iter_mut().zip(n.iter().zip(zh)).for_each(|(o, (n, g))| *o = n * if *z_sigmoid { sigmoid(*g) } else { silu(*g) });
         }
-        ssm_out.mul(&y)
+        y
     }
 
     fn attention(&self, slot: usize, a: &Attn, h: &[f32], st: &mut State) -> Vec<f32> {
@@ -1653,14 +1713,41 @@ impl Model {
             let jobs: Vec<(usize, Vec<&[f32]>)> = far.iter().map(|&e| (e, users[e].iter().map(|&(t, _)| &xs[t][..]).collect())).collect();
             r.start(m.layer, &jobs)
         });
-        for (e, who) in users.iter().enumerate() {
-            if who.is_empty() || (pending.is_some() && far.contains(&e)) {
-                continue;
+        // the local experts in two parallel passes (matmul_set): every expert's up and gate on its tokens, then every down;
+        // with many experts and few tokens each (Tiel: 256, 8 chosen) one pass per matrix would mostly wait on joins
+        let local: Vec<usize> = (0..m.n_expert).filter(|&e| !users[e].is_empty() && !(pending.is_some() && far.contains(&e))).collect();
+        let ins: Vec<Vec<Vec<f32>>> = local.iter().map(|&e| users[e].iter().map(|&(t, _)| xs[t].clone()).collect()).collect();
+        let fused = (|| {
+            let mut jobs: Vec<(&QMat, &[Vec<f32>])> = Vec::new();
+            for (&e, x) in local.iter().zip(&ins) {
+                jobs.push((&m.up_exps.0[e], x));
+                if let Some(g) = &m.gate_exps {
+                    jobs.push((&g.0[e], x));
+                }
             }
-            let ins: Vec<Vec<f32>> = who.iter().map(|&(t, _)| xs[t].clone()).collect();
-            for (o, &(t, slot)) in m.expert_local(e, &ins).into_iter().zip(who) {
-                outs[t][slot] = o;
-            }
+            let mut first = QMat::matmul_set(&jobs)?.into_iter();
+            let mids: Vec<Vec<Vec<f32>>> = local.iter().map(|_| {
+                let mut up = first.next().unwrap();
+                match m.gate_exps.as_ref().map(|_| first.next().unwrap()) {
+                    Some(gv) => for (u, g) in up.iter_mut().zip(&gv) { u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(m.act, *g)); },
+                    None => up.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(m.act, *v))),
+                }
+                up
+            }).collect();
+            let jobs: Vec<(&QMat, &[Vec<f32>])> = local.iter().zip(&mids).map(|(&e, mid)| (&m.down_exps.0[e], &mid[..])).collect();
+            QMat::matmul_set(&jobs)
+        })();
+        match fused {
+            Some(downs) => for (&e, os) in local.iter().zip(downs) {
+                for (o, &(t, slot)) in os.into_iter().zip(&users[e]) {
+                    outs[t][slot] = o;
+                }
+            },
+            None => for (&e, x) in local.iter().zip(&ins) {
+                for (o, &(t, slot)) in m.expert_local(e, x).into_iter().zip(&users[e]) {
+                    outs[t][slot] = o;
+                }
+            },
         }
         if let (Some(r), Some(p)) = (remote, pending) {
             match r.finish(p, rows) {
@@ -2019,6 +2106,22 @@ mod tests {
         let jobs = [(&mats[0], &xs[0][..]), (&mats[0], &xs[0][..])];
         let twice = QMat::mul_set(&jobs).unwrap();
         assert_eq!(twice[0], twice[1]);
+    }
+
+    /// matmul_set (a prompt chunk's experts) gives exactly what one matmul per matrix gives: mixed types and token counts.
+    #[test]
+    fn matmul_set_equals_matmul_exactly() {
+        let mut seed = 0x7E57_5E70_0000_0001u64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        let shapes = [("Q4_K", 70, 512, 3), ("Q5_K", 33, 256, 1), ("Q6_K", 41, 512, 5), ("Q8_0", 64, 192, 2), ("F32", 9, 96, 4)];
+        let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c, _)| random_qmat(ty, r, c, &mut next)).collect();
+        let xss: Vec<Vec<Vec<f32>>> = mats.iter().zip(&shapes).map(|(q, s)| (0..s.3).map(|_| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect()).collect();
+        let jobs: Vec<(&QMat, &[Vec<f32>])> = mats.iter().zip(&xss).map(|(q, x)| (q, &x[..])).collect();
+        let set = QMat::matmul_set(&jobs).expect("every type here has a CPU kernel");
+        for ((q, xs), ys) in mats.iter().zip(&xss).zip(&set) {
+            let want: Vec<Vec<f32>> = q.matmul(xs);
+            assert_eq!(ys, &want, "{}", q.ty);
+        }
     }
 
     #[test]
