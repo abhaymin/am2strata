@@ -544,6 +544,19 @@ async fn main() -> Result<()> {
     }
     let _ = mgr.experts.set(Arc::new(experts));
     let _ = mgr.browser.set(Arc::new(browser::Browsers::new(browser::Settings::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
+    // browser-use sessions are thrown away: one idle for 10 minutes ends, its tabs and context (cookies, cache,
+    // storage) deleted, and the server's browser closes with its profile when no session is left (browser.rs)
+    let sweep = mgr.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let mut all = browser_api::others();
+            all.extend(sweep.browser.get().cloned());
+            for b in all {
+                b.sweep_idle().await;
+            }
+        }
+    });
     // the sandbox VM (computer/vm): made before computer use, whose "vm" mode drives it; it starts only when used
     #[cfg(target_os = "linux")]
     computer::vm::Vm::init(&expand(&args.data_dir));
