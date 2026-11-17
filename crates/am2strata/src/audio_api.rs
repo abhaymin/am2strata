@@ -179,9 +179,13 @@ async fn fields(s: &AppState, req: Request) -> Result<(Vec<u8>, Value), Response
         return Ok((file, f));
     }
     let Json(v): Json<Value> = Json::from_request(req, s).await.map_err(|e| bad(format!("send multipart/form-data, or JSON: {e}")))?;
-    let raw = v["file"].as_str().unwrap_or("");
+    let raw = v["file"].as_str().or_else(|| v["file_id"].as_str()).unwrap_or("");
+    // a media library id ("mf_..."): a recording kept from an earlier upload or speech
+    if let Some(f) = crate::media_files::resolve(raw, crate::media_files::MAIN) {
+        return f.map(|b| (b, v.clone())).map_err(|e| bad(format!("\"file\": {e}")));
+    }
     let b64 = raw.split_once(";base64,").map(|(_, b)| b).unwrap_or(raw);
-    let file = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|_| bad("\"file\": base64 or a data: URL"))?;
+    let file = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|_| bad("\"file\": base64, a data: URL or a media file id"))?;
     Ok((file, v))
 }
 
@@ -203,6 +207,10 @@ async fn transcribe(s: AppState, headers: HeaderMap, req: Request, translate: bo
     };
     if file.is_empty() {
         return bad("send the audio as \"file\"");
+    }
+    // the recording is kept in the media library (once, by its content), for use again by id
+    if let Some(o) = crate::media_files::owner_of(&s, &headers) {
+        crate::media_files::keep_uploaded(&file, &o, json!({"used_for": if translate { "translation" } else { "transcription" }}));
     }
     let format = f["response_format"].as_str().unwrap_or("json").to_string();
     if !matches!(format.as_str(), "json" | "text" | "verbose_json" | "srt" | "vtt") {
@@ -415,10 +423,15 @@ pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         Ok(b) => b,
         Err(_) => return error(StatusCode::BAD_GATEWAY, "audio_error", "the media engine returned no audio"),
     };
-    s.mgr.monitor.media_file_add(id, "wav", wav.clone());
+    s.mgr.monitor.media_prompt(id, &text);
+    let file_id = s.mgr.monitor.media_file_add(id, "wav", wav.clone());
+    if let (Some(fid), Some(o), Some(l)) = (&file_id, crate::media_files::owner_of(&s, &headers), crate::media_files::FILES.get()) {
+        l.own(fid, &o);
+    }
     s.mgr.monitor.media_end(id, "stop", &format!("{:.1} s of speech, {} characters, on the {device}", r["seconds"].as_f64().unwrap_or(0.0),
                                           text.chars().count()));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav")
+        .header("x-strata-file-id", file_id.unwrap_or_default())
         .header("x-strata-seconds", r["seconds"].to_string()).header("x-strata-model", model).header("x-strata-language", language).header("x-strata-language-found", detected)
         .body(Body::from(wav)).unwrap()
 }

@@ -88,6 +88,11 @@ pub async fn fetch_public(src: &str, allow_private: bool) -> Result<reqwest::Res
 }
 
 pub async fn load_source(src: &str) -> Result<Vec<u8>> {
+    // a media library id ("mf_..."): a file the server made or was sent before. The id is the file's content hash, so
+    // holding it is holding the file; listing the library stays per key (media_files.rs)
+    if let Some(f) = crate::media_files::resolve(src, crate::media_files::MAIN) {
+        return f.map_err(|e| anyhow!(e));
+    }
     if let Some(rest) = src.strip_prefix("data:") {
         let (_, b64) = rest.split_once(',').ok_or_else(|| anyhow!("the data: URL could not be read (no comma)"))?;
         return base64::engine::general_purpose::STANDARD

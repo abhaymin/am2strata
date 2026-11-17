@@ -79,6 +79,30 @@ The answer is audio/wav, 48 kHz stereo; `duration` is 10 to 600 seconds. With `p
 structure is planned first, which adds a missing tempo, key and time signature. In a chat, `make_song` makes a sung
 song and `compose_music` an instrumental.
 
+## The media library
+
+Every image, video and sound the server makes, and every one it is sent to edit or transcribe, is kept once, by its
+content, in `<data dir>/media-files/`. Each has an id, `mf_` and 16 hex digits of its SHA-256, which works in place of
+the file in any media request:
+
+```bash
+# an image made earlier, edited without sending it again
+curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model": "qwen-image-2.1:q8", "prompt": "at night", "images": ["mf_3f2a9c0d1e4b5a67"]}'
+```
+
+- Generation answers carry the id: `data[i].file_id` for images and video, the `x-strata-file-id` header for speech
+  and songs.
+- `GET /v1/media/files?kind=image|video|audio&source=generated|uploaded&limit=&offset=` lists them, newest first, with
+  what is known of each (model, prompt, seed, name, size, when).
+- `POST /v1/media/files` adds one: JSON `{"data": base64 or a data: URL, "name"}`, or multipart `file`.
+- `GET /v1/media/files/{id}` (its entry), `GET /v1/media/files/{id}/content` (the file), `DELETE /v1/media/files/{id}`.
+- **Who sees what:** the main key sees every file; a client key lists and reads the files it sent or had made. An id
+  is the file's content hash, so a request holding one may use the file.
+- **Room:** `"media_files_max_gib"` in the run config (default 10); past it the least recently used files go.
+- **In the app:** Media › Library, with Edit this, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
+  `media add <file>`, `media get <id> --out f`, `media rm <id>`.
+
 ## Productions: one long piece from parts
 
 `POST /v1/media/productions` queues one job for a whole piece:

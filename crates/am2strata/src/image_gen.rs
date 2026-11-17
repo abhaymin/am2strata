@@ -303,6 +303,13 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
             let name = field.name().unwrap_or("").trim_end_matches("[]").to_string();
             match name.as_str() {
                 "image" => match field.bytes().await {
+                    Ok(b) if crate::media_files::is_id(std::str::from_utf8(&b).unwrap_or("").trim()) => {
+                        match crate::media_files::resolve(std::str::from_utf8(&b).unwrap_or(""), crate::media_files::MAIN) {
+                            Some(Ok(f)) => files.push(f),
+                            Some(Err(e)) => return bad(e),
+                            None => {}
+                        }
+                    }
                     Ok(b) => files.push(b.to_vec()),
                     Err(e) => return bad(format!("the image: {e}")),
                 },
@@ -329,7 +336,15 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
         };
         for (i, item) in list.iter().enumerate() {
             // a string, or {"image_url": ...} / {"b64_json": ...} as OpenAI's newer clients send
-            let raw = item.as_str().or_else(|| item["image_url"].as_str()).or_else(|| item["b64_json"].as_str()).unwrap_or("");
+            let raw = item.as_str().or_else(|| item["image_url"].as_str()).or_else(|| item["b64_json"].as_str())
+                .or_else(|| item["file_id"].as_str()).unwrap_or("");
+            // a media library id ("mf_..."): the file kept from an earlier generation or upload
+            if let Some(f) = crate::media_files::resolve(raw, crate::media_files::MAIN) {
+                match f {
+                    Ok(b) => { files.push(b); continue; }
+                    Err(e) => return bad(format!("images[{i}]: {e}")),
+                }
+            }
             let b64 = raw.split_once(";base64,").map(|(_, b)| b).unwrap_or(raw);
             match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                 Ok(b) if !b.is_empty() => files.push(b),
@@ -348,6 +363,12 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
         match edit_size(&files[0]) {
             Some((w, h)) => fields["size"] = json!(format!("{w}x{h}")),
             None => return bad("the image is not a PNG, JPEG or WebP"),
+        }
+    }
+    // the images sent to edit are kept in the media library too (the same image is the same file), for use again
+    if let Some(o) = crate::media_files::owner_of(&s, &headers) {
+        for f in &files {
+            crate::media_files::keep_uploaded(f, &o, json!({"used_for": "image edit"}));
         }
     }
     let b64 = files.iter().map(|f| base64::engine::general_purpose::STANDARD.encode(f)).collect();
@@ -425,6 +446,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin(if edit_images.is_empty() { "image" } else { "image edit" }, &model);
+    mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut data = Vec::new();
     let mut failure = None;
@@ -500,10 +522,17 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
         } else { f };
         return error(StatusCode::BAD_GATEWAY, "image_error", f);
     }
-    for d in &data {
+    let owner = crate::media_files::owner_of(&s, &headers);
+    for d in data.iter_mut() {
         use base64::Engine as _;
         if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d["b64_json"].as_str().unwrap_or("")) {
-            mon.media_file_add(job, "png", png);
+            // kept in the media library: the id uses it again (an edit's image, a video's first frame, a chat)
+            if let Some(id) = mon.media_file_add(job, "png", png) {
+                if let (Some(o), Some(l)) = (&owner, crate::media_files::FILES.get()) {
+                    l.own(&id, o);
+                }
+                d["file_id"] = json!(id);
+            }
         }
     }
     mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
@@ -913,6 +942,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("video", &model);
     mon.media_seed(job, seed);
+    mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut clip = None;
     let res = s.media.call(json!({"op": op, "request": r}), |ev| {
@@ -937,14 +967,20 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}"));
         }
     };
+    let mut file_id = Value::Null;
     if let Ok(clip) = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or(""))
     } {
-        mon.media_file_add(job, v["format"].as_str().unwrap_or("mp4"), clip);
+        if let Some(id) = mon.media_file_add(job, v["format"].as_str().unwrap_or("mp4"), clip) {
+            if let (Some(o), Some(l)) = (crate::media_files::owner_of(&s, &headers), crate::media_files::FILES.get()) {
+                l.own(&id, &o);
+            }
+            file_id = json!(id);
+        }
     }
     mon.media_end(job, "stop", &format!("{}x{}, {} frames at {} fps", v["width"], v["height"], v["frames"], v["fps"]));
-    Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
+    Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed, "file_id": file_id}],
                 "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"], "clips": v["clips"].as_u64().unwrap_or(1),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
                            "engine": "am2strata-media (Rust, candle)", "frames_note": frames_note}})).into_response()

@@ -3152,3 +3152,54 @@ fn video_frames_come_from_the_media_engine_without_ffmpeg() {
         {"type": "text", "text": "What is in this video?"}, {"type": "video_url", "video_url": {"url": mp4}}]}], "max_tokens": 16}));
     assert_eq!(c, 200, "a chat video becomes frames without ffmpeg: {r}");
 }
+
+/// The media library (media_files.rs): what the server makes and what it is sent is kept once, by its content, and used
+/// again by id; a client key sees only its own files, the main key all; a file goes when deleted.
+#[test]
+fn media_is_kept_in_the_library_and_used_again_by_id() {
+    let m = Model { extra: json!({"clients": {"laptop": {"key": LAPTOP, "tools": ["image"]}, "phone": {"key": PHONE, "tools": ["image"]}}}),
+                    ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    // a generated image comes back with its id, and the library has it with its prompt and seed
+    let (c, r) = post_as(&s, LAPTOP, "/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "seed": 5, "steps": 2}), &[]);
+    assert_eq!(c, 200, "{r}");
+    let made = r["data"][0]["file_id"].as_str().unwrap().to_string();
+    assert!(made.starts_with("mf_") && made.len() == 19, "{r}");
+    let get_as = |key: &str, path: &str| {
+        let r = reqwest::blocking::Client::new().get(format!("{}{path}", s.base)).bearer_auth(key).send().unwrap();
+        let code = r.status().as_u16();
+        (code, r.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()), r.bytes().unwrap().to_vec())
+    };
+    let (c, _, body) = get_as(LAPTOP, &format!("/v1/media/files/{made}"));
+    let e: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((c, e["kind"].as_str(), e["source"].as_str(), e["prompt"].as_str(), e["seed"].as_u64()),
+               (200, Some("image"), Some("generated"), Some("a lighthouse"), Some(5)), "{e}");
+    let (c, ct, made_png) = get_as(LAPTOP, &format!("/v1/media/files/{made}/content"));
+    assert_eq!((c, ct.as_deref()), (200, Some("image/png")));
+    assert!(made_png.starts_with(b"\x89PNG"));
+    // another client neither lists nor reads it; the main key does
+    assert_eq!(get_as(PHONE, &format!("/v1/media/files/{made}")).0, 404);
+    let (_, _, list) = get_as(PHONE, "/v1/media/files");
+    assert_eq!(serde_json::from_slice::<Value>(&list).unwrap()["total"], 0);
+    assert_eq!(s.get(&format!("/v1/media/files/{made}"), true).0, 200);
+    // the id edits the image: no base64 sent again
+    let (c, r) = post_as(&s, LAPTOP, "/v1/images/edits", &json!({"prompt": "at night", "model": "chatr-omni-qwen-image-2.1:q8", "images": [made], "steps": 2}), &[]);
+    assert_eq!(c, 200, "{r}");
+    // an upload: JSON with a data: URL; the same bytes again are the same file
+    let (c, up) = post_as(&s, PHONE, "/v1/media/files", &json!({"data": png(), "name": "two-pixels.png"}), &[]);
+    assert_eq!((c, up["kind"].as_str(), up["source"].as_str(), up["name"].as_str()), (200, Some("image"), Some("uploaded"), Some("two-pixels.png")), "{up}");
+    let (_, again) = post_as(&s, PHONE, "/v1/media/files", &json!({"data": png()}), &[]);
+    assert_eq!(again["id"], up["id"]);
+    let (_, _, list) = get_as(PHONE, "/v1/media/files?kind=image");
+    assert_eq!(serde_json::from_slice::<Value>(&list).unwrap()["total"], 1);
+    // deleted: gone from the library and from use
+    let id = up["id"].as_str().unwrap();
+    let r = reqwest::blocking::Client::new().delete(format!("{}/v1/media/files/{id}", s.base)).bearer_auth(PHONE).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(get_as(PHONE, &format!("/v1/media/files/{id}")).0, 404);
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": "chatr-omni-qwen-image-2.1:q8", "images": [id]}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("no media file"), "{r}");
+    // no key, no library
+    assert_eq!(get_as("wrong", "/v1/media/files").0, 401);
+}

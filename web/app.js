@@ -588,7 +588,7 @@ function fillEditRow() {
   $("img-edit-row").hidden = !can;
   if (!can) editImages = [];
   const n = editImages.length;
-  $("img-edit-thumbs").innerHTML = editImages.map((u, i) => `<img src="${u}" alt="${i ? "reference" : "image to edit"} ${i + 1}" title="${i ? "reference" : "edited"}">`).join("");
+  $("img-edit-thumbs").innerHTML = editImages.map((u, i) => `<img src="${u.startsWith("mf_") ? (libUrls.get(u) || "") : u}" alt="${i ? "reference" : "image to edit"} ${i + 1}" title="${i ? "reference" : "edited"}">`).join("");
   $("img-edit-clear").hidden = !n;
   $("img-size-auto").hidden = !n;
   if (n && !$("img-size").dataset.touched) $("img-size").value = "auto";
@@ -607,7 +607,8 @@ $("img-edit-clear").onclick = () => { editImages = []; fillEditRow(); };
 $("img-size").onchange = () => { $("img-size").dataset.touched = "1"; };
 $("img-results").addEventListener("click", (e) => {
   const b = e.target.closest("[data-edit-this]"); if (!b) return;
-  editImages = [b.closest("figure").querySelector("img").src];
+  const fig = b.closest("figure");
+  editImages = [fig.dataset.fileId || fig.querySelector("img").src];
   fillEditRow();
   $("img-prompt").focus();
 });
@@ -628,6 +629,84 @@ $("media-kinds").addEventListener("click", (e) => {
   const k = b.dataset.kind;
   $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
   $("song-form").hidden = k !== "song"; $("tools-forms").hidden = k !== "tools";
+  $("lib-panel").hidden = k !== "library"; $("img-results").hidden = k === "library";
+  if (k === "library") loadLibrary();
+});
+
+// ------------------------------------------------------------------ Media > Library (GET/POST/DELETE /v1/media/files)
+const libUrls = new Map();   // a library file id -> its blob URL (fetched once, with the API key)
+async function libUrl(id) {
+  if (libUrls.has(id)) return libUrls.get(id);
+  const r = await fetch(`v1/media/files/${id}/content`, {headers: headers()});
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const u = URL.createObjectURL(await r.blob());
+  libUrls.set(id, u);
+  return u;
+}
+const kib = (n) => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+async function loadLibrary() {
+  const q = new URLSearchParams({limit: "120"});
+  if ($("lib-kind").value) q.set("kind", $("lib-kind").value);
+  if ($("lib-source").value) q.set("source", $("lib-source").value);
+  let j;
+  try {
+    const r = await fetch(`v1/media/files?${q}`, {headers: headers()});
+    j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  } catch (e) { $("lib-grid").innerHTML = `<p class="muted small">Not opened: ${esc(String(e.message || e))}</p>`; return; }
+  const l = j.library;
+  $("lib-usage").textContent = `${j.total} file${j.total === 1 ? "" : "s"}` + (l ? ` · ${kib(l.bytes)} of ${kib(l.max_bytes)}` : "");
+  if (!j.data.length) { $("lib-grid").innerHTML = `<p class="muted small">Nothing yet. What you make or send to be edited appears here.</p>`; return; }
+  $("lib-grid").innerHTML = j.data.map((f) => {
+    const what = f.prompt || f.name || f.used_for || "";
+    const sub = [f.source === "generated" ? "made" : "sent", f.model, f.seed != null ? `seed ${f.seed}` : null, kib(f.bytes),
+                 new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
+    return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
+      <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
+      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="delete">Delete</button></div></figure>`;
+  }).join("");
+  for (const fig of $("lib-grid").querySelectorAll("figure")) {
+    libUrl(fig.dataset.lib).then((u) => {
+      const k = fig.dataset.kind;
+      const el = document.createElement(k === "video" ? "video" : k === "audio" ? "audio" : "img");
+      if (k === "video" || k === "audio") el.controls = true; else el.alt = fig.querySelector("figcaption").textContent.slice(0, 80);
+      el.src = u;
+      fig.querySelector(".lib-media").append(el);
+    }).catch(() => { fig.querySelector(".lib-media").textContent = "not read"; });
+  }
+}
+$("lib-kind").onchange = loadLibrary;
+$("lib-source").onchange = loadLibrary;
+$("lib-add").onchange = async () => {
+  const f = $("lib-add").files[0]; $("lib-add").value = "";
+  if (!f) return;
+  try {
+    const r = await fetch("v1/media/files", {method: "POST", headers: headers(true), body: JSON.stringify({data: await asDataUrl(f), name: f.name})});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    toast("success", "Added", `${f.name} is ${j.id}.`);
+    loadLibrary();
+  } catch (e) { toast("error", "Not added", String(e.message || e), 8000); }
+};
+$("lib-grid").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-lib-act]"); if (!b) return;
+  const fig = b.closest("figure"), id = fig.dataset.lib;
+  if (b.dataset.libAct === "copy") { navigator.clipboard.writeText(id).then(() => toast("success", "Copied", id)); }
+  else if (b.dataset.libAct === "save") {
+    const a = document.createElement("a"); a.href = await libUrl(id); a.download = id; a.click();
+  } else if (b.dataset.libAct === "delete") {
+    const r = await fetch(`v1/media/files/${id}`, {method: "DELETE", headers: headers()});
+    if (r.ok) { libUrls.delete(id); fig.remove(); } else toast("error", "Not deleted", `HTTP ${r.status}`);
+  } else if (b.dataset.libAct === "edit") {
+    // to the Image form with this file as the image to edit (sent by its id, not again as base64)
+    $("media-kinds").querySelector('[data-kind="image"]').click();
+    editImages = [id];
+    fillEditRow();
+    $("img-prompt").focus();
+  }
 });
 $("vid-model").addEventListener("change", fillVideoSizes);
 $("vid-form").onsubmit = async (ev) => {
@@ -3602,7 +3681,9 @@ $("img-form").onsubmit = async (ev) => {
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${editing ? "edit, " : ""}${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      cap.textContent = `${editing ? "edit, " : ""}${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}` +
+        (d.file_id ? ` (library ${d.file_id})` : "");
+      if (d.file_id) { fig.dataset.fileId = d.file_id; libUrls.set(d.file_id, img.src); }
       fig.append(img, cap);
       if (!$("img-edit-row").hidden) {
         const again = document.createElement("button");

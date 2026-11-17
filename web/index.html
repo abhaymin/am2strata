@@ -194,8 +194,8 @@
   <!-- ============================ Media Generation ============================ -->
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
     <div class="about">
-      <div class="seg seg--5 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
-        <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="song">Song</button><button type="button" role="tab" aria-selected="false" data-kind="tools">Tools</button>
+      <div class="seg seg--6 media-kinds" role="tablist" aria-label="What to make" id="media-kinds">
+        <button type="button" role="tab" aria-selected="true" data-kind="image">Image</button><button type="button" role="tab" aria-selected="false" data-kind="video">Video</button><button type="button" role="tab" aria-selected="false" data-kind="audio">Audio</button><button type="button" role="tab" aria-selected="false" data-kind="song">Song</button><button type="button" role="tab" aria-selected="false" data-kind="tools">Tools</button><button type="button" role="tab" aria-selected="false" data-kind="library">Library</button>
       </div>
       <div class="audio-forms" id="audio-forms" hidden>
         <form class="st-card img-form" id="stt-form">
@@ -319,6 +319,19 @@
         <span class="composer-hint" id="song-hint">ACE-Step 1.5 with its song planner, on this PC's graphics card: a minute of song takes about half a minute. Sung words follow the lyrics most of the time; if a line is lost, try another seed or more takes.</span>
       </form>
       <div class="img-results" id="img-results"></div>
+
+      <!-- ============================ Library: every file made or sent, kept by its content (GET /v1/media/files) ============================ -->
+      <div class="st-card lib-panel" id="lib-panel" hidden>
+        <span class="card-title">Library</span>
+        <div class="lib-bar">
+          <select class="st-input" id="lib-kind" aria-label="Kind"><option value="">Everything</option><option value="image">Images</option><option value="video">Videos</option><option value="audio">Sounds</option></select>
+          <select class="st-input" id="lib-source" aria-label="Source"><option value="">Made and sent</option><option value="generated">Made here</option><option value="uploaded">Sent here</option></select>
+          <label class="st-btn st-btn--secondary">Add a file<input type="file" id="lib-add" hidden accept="image/*,video/*,audio/*"></label>
+          <span class="muted small" id="lib-usage"></span>
+        </div>
+        <div class="lib-grid" id="lib-grid"><p class="muted small">Opening the library&hellip;</p></div>
+        <p class="muted small">Every image, video and sound made here or sent to be edited or transcribed is kept once. Its id (<code>mf_…</code>) works in place of the file in any media request: <code>"images": ["mf_…"]</code>, <code>"file": "mf_…"</code>, a video's first frame. API: <code>GET /v1/media/files</code>.</p>
+      </div>
 
       <!-- ============================ Tools: media check, dubbing, productions ============================ -->
       <div class="tools-forms" id="tools-forms" hidden>
