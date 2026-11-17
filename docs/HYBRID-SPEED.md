@@ -265,6 +265,29 @@ What these runs fixed:
 Still open: the PC's attention on Orca is about 4x the Mac's time for the same work; Orca generation on the PC.
 
 
+## Prompt-lookup drafting (branch engine/prompt-lookup)
+
+`GEN ... lookup=k` (or `AM2_LOOKUP=k`) guesses up to k tokens from the context: what followed the latest earlier
+occurrence of the last 4, 3 or 2 tokens. One `forward_batch_all` pass gives the logits at t and at every guess; each
+position is sampled once, in order, as without drafting, so greedy and seeded sampling give exactly the same tokens.
+Guesses that are not kept are undone (`State::checkpoint` / `rollback`: the attention caches are cut back, the
+recurrent states restored, the kept tokens run again). The number of guesses halves when most are wrong, doubles back
+when all are right, and drafting rests for 32 tokens after a check with none right. The CPU path only (not `--graph`).
+
+A code-edit prompt (a 20-line Rust function, then "the same function, renamed"), this PC, CPU, our model files:
+
+| Model | Without | lookup=8 | Kept / offered | Tokens |
+|---|---|---|---|---|
+| Ministral-3 3B Q4_K_M, 200 tokens | 14.2 tok/s | **21.1** (+49%) | 174 / 202 | identical |
+| Cyber-Tiel UD-Q8_K_XL, 160 tokens | 8.69 | **13.61** (+57%) | 141 / 144 | identical |
+| the same, temperature 0.8, seed 7 | 8.46 | 8.29 (-2%) | 6 / 23 | identical |
+| GLM-4.7-Flash UD-Q4_K_XL, 120 tokens | 9.10 | **11.46** (+26%) | 88 / 96 | identical |
+| Orca IQ3_XXS, 24 tokens | 0.57 | 0.47 | 0 / 8 | identical |
+
+Orca did not copy the function in its first 24 tokens, and one wasted check costs it 9 s (its experts are read from
+the SSD); the rest after a failed check bounds that.
+
+
 ## Next
 - **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).
