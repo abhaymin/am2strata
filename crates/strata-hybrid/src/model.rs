@@ -844,6 +844,41 @@ pub struct State {
     prev: Vec<u32>,
 }
 
+/// What `State::rollback` returns to: the recurrent parts copied (conv windows, SSM / delta-net states, the QSA index,
+/// the per-layer embedding's window and history), and the position, to which the attention caches are cut back.
+pub struct Checkpoint {
+    pos: usize,
+    conv: HashMap<usize, Vec<f32>>,
+    ssm: HashMap<usize, Vec<f32>>,
+    idx: HashMap<usize, (Vec<f32>, Vec<f32>)>,
+    ple_win: Vec<f32>,
+    prev: Vec<u32>,
+}
+
+impl State {
+    pub fn checkpoint(&self) -> Checkpoint {
+        Checkpoint { pos: self.pos, conv: self.conv.clone(), ssm: self.ssm.clone(), idx: self.idx.clone(),
+                     ple_win: self.ple_win.clone(), prev: self.prev.clone() }
+    }
+
+    /// Back to the checkpoint: the tokens after it are forgotten. Each attention cache holds the same number of values
+    /// per token, so it is cut at the checkpoint's share of its length.
+    pub fn rollback(&mut self, ck: Checkpoint) {
+        if self.pos > 0 && ck.pos < self.pos {
+            for (k, v) in self.kv.values_mut() {
+                k.truncate(k.len() / self.pos * ck.pos);
+                v.truncate(v.len() / self.pos * ck.pos);
+            }
+        }
+        self.pos = ck.pos;
+        self.conv = ck.conv;
+        self.ssm = ck.ssm;
+        self.idx = ck.idx;
+        self.ple_win = ck.ple_win;
+        self.prev = ck.prev;
+    }
+}
+
 fn arr_u64(g: &Gguf, key: &str, i: usize) -> u64 {
     match g.metadata.get(key) {
         Some(serde_json::Value::Array(a)) => a.get(i).and_then(|v| v.as_u64()).unwrap_or(0),
@@ -1168,9 +1203,19 @@ impl Model {
     /// attention runs token by token in order with each token's own position, so every value is the one `forward`
     /// computes. -> the logits after the last token. Only for `batchable` models.
     pub fn forward_batch(&self, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+        self.forward_chunk(st, tokens, false).pop().expect("a token")
+    }
+
+    /// `forward_batch` with the logits after every token of the chunk, not only the last: what checking drafted tokens
+    /// needs (one pass over k guesses gives the model's own choice at each of them). Each equals `forward`'s exactly.
+    pub fn forward_batch_all(&self, st: &mut State, tokens: &[u32]) -> Vec<Vec<f32>> {
+        self.forward_chunk(st, tokens, true)
+    }
+
+    fn forward_chunk(&self, st: &mut State, tokens: &[u32], all: bool) -> Vec<Vec<f32>> {
         debug_assert!(self.batchable());
         if self.hc > 0 {
-            return self.forward_hc_batch(st, tokens);
+            return self.forward_hc_batch(st, tokens, all);
         }
         let base = st.pos;
         let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize)).collect();
@@ -1218,8 +1263,12 @@ impl Model {
             }
         }
         st.pos = base + tokens.len();
+        if all {
+            let hs: Vec<Vec<f32>> = xs.iter().map(|x| rms_norm(x, &self.out_norm, self.eps)).collect();
+            return self.output.matmul(&hs);
+        }
         let h = rms_norm(xs.last().expect("a token"), &self.out_norm, self.eps);
-        self.output.mul(&h)
+        vec![self.output.mul(&h)]
     }
 
     /// The same with hyper-connections: the residual is `hc` streams, mixed down for each block and given its output
@@ -1252,7 +1301,7 @@ impl Model {
     /// A prompt chunk with hyper-connections: what `forward_hc` computes token by token, with the mixer's projections
     /// (GDN or attention) and the MoE batched across the chunk. The stream mixers and the per-layer embedding stay per
     /// token; the embedding reads the tokens before it, so `st.prev` grows token by token there and is reset after.
-    fn forward_hc_batch(&self, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+    fn forward_hc_batch(&self, st: &mut State, tokens: &[u32], all: bool) -> Vec<Vec<f32>> {
         let base = st.pos;
         let n0 = st.prev.len();
         let mut res: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize).repeat(self.hc)).collect();
@@ -1310,8 +1359,13 @@ impl Model {
         }
         st.pos = base + tokens.len();
         st.prev.extend_from_slice(tokens);
-        let (h, _) = self.hc_mix(res.last().expect("a token"), self.hc_head.as_ref().expect("hc head"));
-        self.output.mul(&h)
+        let head = self.hc_head.as_ref().expect("hc head");
+        if all {
+            let hs: Vec<Vec<f32>> = res.iter().map(|r| self.hc_mix(r, head).0).collect();
+            return self.output.matmul(&hs);
+        }
+        let (h, _) = self.hc_mix(res.last().expect("a token"), head);
+        vec![self.output.mul(&h)]
     }
 
     fn grouped_norm(&self, x: &[f32], w: &[f32]) -> Vec<f32> {
