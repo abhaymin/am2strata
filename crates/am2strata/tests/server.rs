@@ -2855,7 +2855,7 @@ fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
     assert_eq!(get("/api/models", &key), 200);
     assert_eq!(get("/api/queue", &key), 200);
     assert_eq!(get("/api/cluster", &key), 401, "not the worker's settings");
-    assert_eq!(get("/api/system", &key), 401);
+    assert_eq!(get("/api/system", &key), 200, "its hardware, read-only, so the master can show every machine");
     // the master uses it at once (no restart)
     let t0 = Instant::now();
     while master.get("/api/cluster", true).1["workers"][0]["ready"] != true {
@@ -2864,6 +2864,12 @@ fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
     }
     let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
     assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the paired worker.")), "{v}");
+    // the master lists the worker's hardware next to its own (Settings › Server and access)
+    let (c, hw) = master.get("/api/cluster/system", true);
+    assert_eq!(c, 200, "{hw}");
+    assert_eq!(hw["workers"][0]["name"], name.as_str(), "{hw}");
+    assert!(hw["workers"][0]["system"]["memory"]["total_mib"].as_f64().unwrap_or(0.0) > 0.0, "{hw}");
+    assert_eq!(master.get("/api/cluster/system", false).0, 401, "the main key only");
     // removed: the master stops using it and the worker forgets the master
     let r = reqwest::blocking::Client::new().delete(format!("{}/api/cluster/workers/{name}", master.base)).bearer_auth(KEY).send().unwrap();
     let v: Value = r.json().unwrap();

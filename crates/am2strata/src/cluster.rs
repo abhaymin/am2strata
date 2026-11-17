@@ -678,6 +678,28 @@ pub async fn status(axum::extract::State(s): axum::extract::State<crate::AppStat
     axum::Json(s.cluster.view()).into_response()
 }
 
+/// GET /api/cluster/system (the main key): each worker's own GET /api/system, read with the key it gave this master,
+/// for Settings' machine list. A worker that does not answer within 5 s is listed with why.
+pub async fn systems(axum::extract::State(s): axum::extract::State<crate::AppState>, headers: HeaderMap) -> Response {
+    if !crate::authorized(&s, &headers) {
+        return crate::error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    let reads = s.cluster.workers().into_iter().map(|w| async move {
+        let r = w.client.get(format!("{}/api/system", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(5)).send().await;
+        let (system, error) = match r {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("its answer was not read ({e})"))),
+            },
+            Ok(r) => (None, Some(format!("it answered HTTP {} (a worker older than v0.1.9 does not share its hardware)", r.status().as_u16()))),
+            Err(e) => (None, Some(error_chain(&e))),
+        };
+        serde_json::json!({"name": w.name, "url": w.base(), "ready": w.is_ready(), "system": system, "error": error})
+    });
+    let machines: Vec<Value> = futures::future::join_all(reads).await;
+    axum::Json(serde_json::json!({"workers": machines})).into_response()
+}
+
 /// POST /api/cluster/pair {"url" or "node_id", "code"} (the master; its own page or main key): sends the code to the
 /// worker, and on its yes keeps the worker and its key and starts using it.
 pub async fn pair(axum::extract::State(s): axum::extract::State<crate::AppState>, headers: HeaderMap,

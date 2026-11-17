@@ -180,6 +180,7 @@ const ROUTES: &[Row] = &[
     row("GET", "/api/gpus", Owner),
     row("GET", "/api/machine", Owner),
     row("GET", "/api/cluster", Owner),
+    row("GET", "/api/cluster/system", Owner),
     row("POST", "/api/cluster/pair", Owner).json(r#"{"url": "", "code": ""}"#).ok(400).note("an empty address: refused before anything is contacted"),
     row("POST", "/api/cluster/join", Special).json(r#"{"code": "123456", "master_id": "m"}"#).statuses(404, 404, 404, 404, 400)
         .note("a worker's pairing code is the proof, not a key; this server is no worker, so there is nothing to join"),

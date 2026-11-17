@@ -320,8 +320,9 @@ pub async fn clear_snapshots(State(s): State<AppState>, headers: HeaderMap) -> R
 }
 
 /// GET /api/system: this machine for any client: every GPU, the CPU, the memory (each with its load now) and any NPU or TPU.
+/// On a worker its master's key reads it too (read-only hardware facts), so the master shows every machine.
 pub async fn system(State(s): State<AppState>, headers: HeaderMap) -> Response {
-    if !authorized(&s, &headers) {
+    if !crate::authorized_or_master(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     let mon = s.mgr.monitor.clone();

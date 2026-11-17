@@ -803,9 +803,9 @@
             </div>
             <p class="muted small">Kept in this browser only.</p>
           </div>
-          <div class="st-card"><span class="card-title">This PC</span>
+          <div class="st-card"><span class="card-title" id="hw-title">This PC</span>
             <div class="hw-list" id="hw-list"><p class="muted small">Reading the hardware&hellip;</p></div>
-            <p class="muted small">Other apps read the same from <code>GET /api/system</code> (with the API key, if the server has one).</p>
+            <p class="muted small">Other apps read the same from <code>GET /api/system</code>, and a master's workers from <code>GET /api/cluster/system</code> (with the API key, if the server has one).</p>
           </div>
           <div class="st-card"><span class="card-title">Start at boot</span>
             <p class="muted small">To make am2Strata the service that starts at boot (it takes the place of a strata-orca service, if this PC has one), run in the am2strata folder:</p>

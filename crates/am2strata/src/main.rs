@@ -562,6 +562,7 @@ async fn main() -> Result<()> {
         .route("/api/gpus", get(web::gpus))
         .route("/api/machine", get(web::machine))
         .route("/api/cluster", get(cluster::status))
+        .route("/api/cluster/system", get(cluster::systems))
         .route("/api/cluster/pair", post(cluster::pair))
         .route("/api/cluster/join", post(cluster::join))
         .route("/api/cluster/forget", post(cluster::forget))
