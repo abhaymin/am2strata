@@ -507,8 +507,15 @@ impl Monitor {
                    "temperature_c": g["temp"], "power_w": g["power"], "power_limit_w": g["power_limit"],
                    "pcie": {"gen": g["pcie_gen"], "gen_max": g["pcie_gen_max"], "width": g["pcie_width"]}})
         }).collect();
+        let mut cpu = json!({"name": tel.stat.get("cpu_name"), "cores": tel.stat.get("cores"), "threads": tel.stat.get("threads"), "util_pct": tel.now.get("cpu")});
+        // Apple silicon's performance and efficiency cores (macOS only: absent elsewhere, so Linux's answer is unchanged)
+        for k in ["performance_cores", "efficiency_cores"] {
+            if let Some(v) = tel.stat.get(k) {
+                cpu[k] = v.clone();
+            }
+        }
         json!({"alerts": self.alerts(), "gpus": gpus, "gpu_driver": tel.stat.get("gpu_driver"), "gpu_note": tel.stat.get("gpu_note"),
-               "cpu": {"name": tel.stat.get("cpu_name"), "cores": tel.stat.get("cores"), "threads": tel.stat.get("threads"), "util_pct": tel.now.get("cpu")},
+               "cpu": cpu,
                "memory": {"used_mib": mib("ram_used"), "total_mib": mib("ram_total")},
                "accelerators": accelerators()})
     }
@@ -518,6 +525,10 @@ impl Monitor {
 /// Coral's USB sticks. Most report no load to the OS: `util_pct` is then null and `state` says what can be seen.
 pub fn accelerators() -> Vec<Value> {
     let mut out = Vec::new();
+    // Apple silicon's Neural Engine: on every M-series chip, and macOS reports no load for it
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    out.push(json!({"kind": "NPU", "name": "Apple Neural Engine", "bus": "on-chip", "address": null, "driver": null, "device": null,
+                    "state": "ready", "util_pct": null, "temperature_c": null, "busy_time_us": null, "note": "load not reported"}));
     let read = |p: std::path::PathBuf| std::fs::read_to_string(p).ok().map(|t| t.trim().to_string());
     let lspci = std::process::Command::new("lspci").args(["-D", "-nn"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
     for line in lspci.lines() {
@@ -747,6 +758,11 @@ mod sampler {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let mut s = serde_json::Map::new();
                 gpu_fields(&gpus.lock().unwrap(), &mut s);
+                #[cfg(target_os = "macos")]
+                if let Some(g) = mac::gpu_now().await {
+                    s.insert("gpu_util".into(), g["util"].clone());
+                    s.insert("gpus".into(), json!([g]));
+                }
                 let cpu = cpu_times();
                 if let (Some((b0, i0)), Some((b1, i1))) = (cpu_prev, cpu) {
                     let (db, di) = (b1.saturating_sub(b0) as f64, i1.saturating_sub(i0) as f64);
@@ -846,16 +862,150 @@ mod sampler {
         if !cores.is_empty() {
             st.insert("cores".into(), json!(cores.len()));
         }
+        #[cfg(target_os = "macos")]
+        mac::static_facts(&mut st);
         st.insert("psutil".into(), json!(true)); // the web app's "needs psutil" hint does not apply
         m.tel.lock().unwrap().stat = st;
     }
 
+    /// (busy, idle) ticks of all CPUs: the kernel's counters on macOS (no process started).
+    #[cfg(target_os = "macos")]
+    fn cpu_times() -> Option<(u64, u64)> {
+        mac::cpu_times()
+    }
+
     /// (busy, idle) jiffies of all CPUs.
+    #[cfg(not(target_os = "macos"))]
     fn cpu_times() -> Option<(u64, u64)> {
         let stat = std::fs::read_to_string("/proc/stat").ok()?;
         let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
         let idle = v.get(3)? + v.get(4).unwrap_or(&0);
         Some((v.iter().take(8).sum::<u64>() - idle, idle))
+    }
+
+    /// macOS: the CPU from sysctl, its load from the kernel's tick counters, the GPU (Apple silicon's, on the same memory
+    /// as the CPU) from the IOAccelerator entry in the I/O registry.
+    #[cfg(target_os = "macos")]
+    pub(super) mod mac {
+        use serde_json::{json, Map, Value};
+
+        fn sysctl_string(name: &str) -> Option<String> {
+            let c = std::ffi::CString::new(name).ok()?;
+            let mut len: libc::size_t = 0;
+            unsafe {
+                if libc::sysctlbyname(c.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) != 0 || len == 0 {
+                    return None;
+                }
+                let mut buf = vec![0u8; len];
+                if libc::sysctlbyname(c.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) != 0 {
+                    return None;
+                }
+                buf.truncate(len);
+                let s = String::from_utf8_lossy(&buf).trim_end_matches('\0').trim().to_string();
+                (!s.is_empty()).then_some(s)
+            }
+        }
+
+        fn sysctl_u32(name: &str) -> Option<u32> {
+            let c = std::ffi::CString::new(name).ok()?;
+            let mut v: u32 = 0;
+            let mut len = std::mem::size_of::<u32>();
+            let ok = unsafe { libc::sysctlbyname(c.as_ptr(), (&mut v as *mut u32).cast(), &mut len, std::ptr::null_mut(), 0) } == 0;
+            (ok && v > 0).then_some(v)
+        }
+
+        /// The chip's name ("Apple M4"), its cores (and Apple silicon's performance / efficiency split), and the GPU.
+        pub fn static_facts(st: &mut Map<String, Value>) {
+            if let Some(n) = sysctl_string("machdep.cpu.brand_string") {
+                st.insert("cpu_name".into(), json!(n));
+            }
+            if let Some(c) = sysctl_u32("hw.physicalcpu") {
+                st.insert("cores".into(), json!(c));
+            }
+            // perflevel0 is the performance cluster, perflevel1 the efficiency one (absent on Intel Macs)
+            if let (Some(p), Some(e)) = (sysctl_u32("hw.perflevel0.physicalcpu"), sysctl_u32("hw.perflevel1.physicalcpu")) {
+                st.insert("performance_cores".into(), json!(p));
+                st.insert("efficiency_cores".into(), json!(e));
+            }
+            if let Some(name) = gpu_name() {
+                st.insert("gpu_name".into(), json!(name));
+                st.insert("gpu_note".into(), json!("unified memory: the GPU uses the system RAM; its memory is what it has allocated now"));
+            }
+        }
+
+        /// (busy, idle) ticks of all CPUs since boot: host_statistics64(HOST_CPU_LOAD_INFO).
+        pub fn cpu_times() -> Option<(u64, u64)> {
+            let mut info: libc::host_cpu_load_info = unsafe { std::mem::zeroed() };
+            let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
+            #[allow(deprecated)] // mach_host_self: libc points to the mach2 crate, which this crate does not use
+            let r = unsafe { libc::host_statistics64(libc::mach_host_self(), libc::HOST_CPU_LOAD_INFO, (&mut info as *mut libc::host_cpu_load_info).cast(), &mut count) };
+            if r != libc::KERN_SUCCESS {
+                return None;
+            }
+            let t = info.cpu_ticks.map(|x| x as u64);
+            let idle = t[libc::CPU_STATE_IDLE as usize];
+            Some((t.iter().sum::<u64>() - idle, idle))
+        }
+
+        /// A value of the IOAccelerator entry's text as `ioreg -r -d 1 -c IOAccelerator` prints it: `"key" = value`.
+        fn field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+            let at = text.find(&format!("\"{key}\""))? + key.len() + 2;
+            let rest = text[at..].trim_start().strip_prefix('=')?.trim_start();
+            Some(rest.split(['\n', ',', '}']).next()?.trim())
+        }
+
+        fn ioreg() -> Option<String> {
+            let o = std::process::Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]).output().ok()?;
+            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+
+        /// "Apple M4 (10-core GPU)": the accelerator's model and core count, read once.
+        fn gpu_name() -> Option<String> {
+            let text = ioreg()?;
+            let model = field(&text, "model")?.trim_matches('"').to_string();
+            Some(match field(&text, "gpu-core-count").and_then(|c| c.parse::<u32>().ok()) {
+                Some(n) => format!("{model} ({n}-core GPU)"),
+                None => model,
+            })
+        }
+
+        /// The GPU now: its utilization and the memory it has in use (one `ioreg` a second, about 10 ms; not on the
+        /// sampler's thread).
+        pub async fn gpu_now() -> Option<Value> {
+            let o = tokio::process::Command::new("ioreg").args(["-r", "-d", "1", "-c", "IOAccelerator"]).output().await.ok()?;
+            let text = String::from_utf8_lossy(&o.stdout);
+            let util = field(&text, "Device Utilization %").and_then(|v| v.parse::<f64>().ok())?;
+            let used = field(&text, "In use system memory").and_then(|v| v.parse::<f64>().ok());
+            // the name static_facts read ("Apple M4 (10-core GPU)"), else the model
+            static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+            let name = NAME.get_or_init(gpu_name).clone().or_else(|| field(&text, "model").map(|m| m.trim_matches('"').to_string()));
+            Some(json!({"index": 0, "name": name, "util": util, "mem_used": used, "mem_total": null, "temp": null, "power": null,
+                        "power_limit": null, "pcie_gen": null, "pcie_gen_max": null, "pcie_width": null}))
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[test]
+            fn this_mac_has_a_named_cpu_with_cores() {
+                let mut st = serde_json::Map::new();
+                super::static_facts(&mut st);
+                assert!(st.get("cpu_name").and_then(|v| v.as_str()).is_some_and(|n| !n.is_empty()), "{st:?}");
+                assert!(st.get("cores").and_then(|v| v.as_u64()).is_some_and(|c| c > 0), "{st:?}");
+                let (b, i) = super::cpu_times().expect("cpu ticks");
+                assert!(b + i > 0);
+            }
+
+            #[test]
+            fn the_io_registry_fields_are_read() {
+                let text = r#"  "model" = "Apple M4"
+      "gpu-core-count" = 10
+      "PerformanceStatistics" = {"Tiler Utilization %"=11,"Device Utilization %"=7,"In use system memory"=287227904}"#;
+                assert_eq!(super::field(text, "model"), Some("\"Apple M4\""));
+                assert_eq!(super::field(text, "gpu-core-count"), Some("10"));
+                assert_eq!(super::field(text, "Device Utilization %"), Some("7"));
+                assert_eq!(super::field(text, "In use system memory"), Some("287227904"));
+            }
+        }
     }
 
     /// (used, total) bytes of RAM, as psutil counts them (total - available). From mem.rs on every OS.
