@@ -182,7 +182,10 @@ fn main() {
         // without mlock, advice does not keep them: the hot experts are copied into memory of our own
         // (AM2_RESIDENT_COPY=0 keeps the old advice-only behaviour, to compare)
         let how = if r.locked {
-            "mlock"
+            match pack::keep_always(&mut m) {
+                "mlock" => "mlock",
+                _ => "mlock always=copy",
+            }
         } else if std::env::var("AM2_RESIDENT_COPY").ok().as_deref() != Some("0") {
             pack::copy_resident(&mut m, &r);
             "copy"

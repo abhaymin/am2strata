@@ -327,15 +327,9 @@ pub fn place(model: &Model, profile: Option<&Profile>, budget: u64) -> Residency
 /// instead of dropping it). The mapping's copies are then marked cold. -> bytes copied.
 pub fn copy_resident(model: &mut Model, res: &Residency) -> u64 {
     let ne = model.profile_experts;
-    let mut copied = 0u64;
     // first the matrices every token uses (attention, dense and shared feed-forwards, the output): when they are
     // evicted, every token reads them again (round 3: 21 GB a request with 95% of the routing resident)
-    for q in model.matrices_mut().0 {
-        let old = q.data;
-        q.data = owned(old);
-        cold(old);
-        copied += old.len() as u64;
-    }
+    let mut copied = copy_always(model);
     for layer in model.layers.iter_mut() {
         for (_, block) in layer.parts.iter_mut() {
             let Block::Moe(m) = block else { continue };
@@ -355,6 +349,30 @@ pub fn copy_resident(model: &mut Model, res: &Residency) -> u64 {
                 }
             }
         }
+    }
+    copied
+}
+
+/// Keeps the matrices every token uses in RAM when the experts were locked: mlock where the limit allows, else a copy.
+/// Without it they are file pages like the cold experts and are evicted with them (Tiel on the 16 GB Mac: the GDN and
+/// attention took 3x longer while the cold experts paged in). -> "mlock" or "copy".
+pub fn keep_always(model: &mut Model) -> &'static str {
+    if model.matrices_mut().0.iter().all(|q| pin(q.data)) {
+        "mlock"
+    } else {
+        copy_always(model);
+        "copy"
+    }
+}
+
+/// Moves the matrices every token uses into the engine's own memory. -> bytes copied.
+fn copy_always(model: &mut Model) -> u64 {
+    let mut copied = 0u64;
+    for q in model.matrices_mut().0 {
+        let old = q.data;
+        q.data = owned(old);
+        cold(old);
+        copied += old.len() as u64;
     }
     copied
 }
