@@ -60,6 +60,16 @@ struct NArgs { n: u32, at: u32 }
 #[repr(C)]
 struct RopeArgs { hd: u32, n_rot: u32, neox: u32 }
 #[repr(C)]
+struct MmArgs { rows: u32, cols: u32, row_bytes: u32, kind: u32, tokens: u32 }
+#[repr(C)]
+struct RopeTArgs { hd: u32, n_rot: u32, neox: u32, heads: u32 }
+#[repr(C)]
+struct AttnTArgs { base: u32, n_head: u32, n_kv: u32, group: u32, hd: u32 }
+/// MM_BM, MM_BN and MM_THREADS in native.metal
+const MM_BM: u32 = 64;
+const MM_BN: u32 = 32;
+const MM_THREADS: usize = 128;
+#[repr(C)]
 struct AttnArgs { n: u32, n_kv: u32, group: u32, hd: u32, scale: f32 }
 
 /// Rows a threadgroup of `mv` takes (NSG * NR in native.metal) and its threads (NSG * 32).
@@ -82,7 +92,7 @@ impl Native {
         let lib = dev.newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
             .map_err(|e| format!("native Metal kernels did not compile: {}", e.localizedDescription()))?;
         let mut pso = HashMap::new();
-        for name in ["mv", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend"] {
+        for name in ["mv", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend", "mm", "rope_tokens", "copy_from", "attend_tokens"] {
             let f = lib.newFunctionWithName(&NSString::from_str(name)).ok_or_else(|| format!("no kernel {name}"))?;
             let p = dev.newComputePipelineStateWithFunction_error(&f).map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
             pso.insert(name, p);
@@ -168,6 +178,13 @@ impl Native {
     /// y = W x for `tokens` vectors, queued.
     pub fn mv(&self, w: &MBuf, rows: u32, cols: u32, row_bytes: u32, kind: u32, x: &MBuf, tokens: u32) -> Arc<MBuf> {
         let y = self.temp(tokens as usize * rows as usize * 4);
+        if tokens > 1 {
+            // a chunk: each row's weights read once per MM_BN tokens, multiplied on the matrix units
+            let a = MmArgs { rows, cols, row_bytes, kind, tokens };
+            self.encode("mm", &[w, x, &y], Self::args(&a), size(rows.div_ceil(MM_BM) as usize, tokens.div_ceil(MM_BN) as usize, 1),
+                        size(MM_THREADS, 1, 1));
+            return y;
+        }
         let a = MvArgs { rows, cols, row_bytes, kind };
         self.encode("mv", &[w, x, &y], Self::args(&a), size(rows.div_ceil(MV_ROWS) as usize, tokens as usize, 1), size(MV_THREADS, 1, 1));
         y
@@ -200,6 +217,30 @@ impl Native {
     pub fn rope(&self, tab: &MBuf, x: &MBuf, heads: u32, hd: u32, n_rot: u32, neox: bool) {
         let a = RopeArgs { hd, n_rot, neox: neox as u32 };
         self.encode("rope", &[tab, x], Self::args(&a), size(heads as usize, 1, 1), size(((n_rot / 2).max(1)).next_multiple_of(32) as usize, 1, 1));
+    }
+
+    /// RoPE for `tokens` tokens of `heads` heads each; `tab` holds each token's n_rot / 2 pairs in turn.
+    pub fn rope_tokens(&self, tab: &MBuf, x: &MBuf, heads: u32, tokens: u32, hd: u32, n_rot: u32, neox: bool) {
+        let a = RopeTArgs { hd, n_rot, neox: neox as u32, heads };
+        self.encode("rope_tokens", &[tab, x], Self::args(&a), size(heads as usize, tokens as usize, 1),
+                    size(((n_rot / 2).max(1)).next_multiple_of(32) as usize, 1, 1));
+    }
+
+    /// x[at .. at + n] as a buffer of its own.
+    pub fn copy_from(&self, x: &MBuf, at: u32, n: u32) -> Arc<MBuf> {
+        let y = self.temp(n as usize * 4);
+        let a = NArgs { n, at };
+        self.encode("copy_from", &[x, &y], Self::args(&a), size(n.div_ceil(256) as usize, 1, 1), size(256, 1, 1));
+        y
+    }
+
+    /// Causal attention of `tokens` query tokens at positions base.. over the cache (which already holds their K and V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_tokens(&self, q: &MBuf, k: &MBuf, v: &MBuf, scales: &MBuf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Arc<MBuf> {
+        let o = self.temp((tokens * n_head * hd) as usize * 4);
+        let a = AttnTArgs { base, n_head, n_kv, group: n_head / n_kv, hd };
+        self.encode("attend_tokens", &[q, k, v, scales, &o], Self::args(&a), size(n_head as usize, tokens as usize, 1), size(256, 1, 1));
+        o
     }
 
     #[allow(clippy::too_many_arguments)]

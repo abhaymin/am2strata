@@ -134,6 +134,45 @@ impl<'a> Graph<'a> {
         eprintln!("GPU_BENCH whole token (forward + read)  {:9.1} us/token, {} layers", t.elapsed().as_secs_f64() * 1e6 / 20.0, self.layers.len());
     }
 
+    /// Whether prompts can go through [`Graph::forward_batch`]: the device has the chunk kernels (native Metal) and every
+    /// head fits its attention kernel (at most 256 values, a divisor of its 256 threads).
+    pub fn batches(&self) -> bool {
+        self.g.is_native() && self.layers.iter().all(|(a, _)| a.hd <= 256 && 256 % a.hd == 0)
+    }
+
+    /// A chunk of prompt tokens at once: each matrix applied to all of them in one dispatch (its weights read once per
+    /// chunk), RMS norm and RoPE per token with its own position, K and V appended for the whole chunk, then causal
+    /// attention per token. -> the logits after the last token, as `forward` would give them token by token.
+    pub fn forward_batch(&self, m: &Model, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+        let g = self.g;
+        let base = st.pos;
+        let nt = tokens.len();
+        let rope = m.rope.as_ref().expect("rope");
+        let tab = g.buffer(&(0..nt).flat_map(|i| rope.table(base + i)).collect::<Vec<f32>>());
+        let x = g.buffer(&tokens.iter().flat_map(|&t| m.embd.row(t as usize)).collect::<Vec<f32>>());
+        let dim = x.len / nt;
+        let mut scales = None;
+        for (a, f) in &self.layers {
+            let sc = scales.get_or_insert_with(|| g.buffer(&(0..nt).map(|i| m.temp_scale_at(base + i) / (a.hd as f32).sqrt()).collect::<Vec<f32>>()));
+            let h = g.rms_norm(&x, &a.norm, m.eps);
+            let (q, k, v) = (g.mv_tokens(a.q, &h, nt as u32), g.mv_tokens(a.k, &h, nt as u32), g.mv_tokens(a.v, &h, nt as u32));
+            g.rope_tokens(&tab, &q, a.hd, self.n_rot, self.neox, nt as u32);
+            g.rope_tokens(&tab, &k, a.hd, self.n_rot, self.neox, nt as u32);
+            let row = (a.n_kv * a.hd) as usize;
+            g.kv_append(&k, &a.kc, base * row);
+            g.kv_append(&v, &a.vc, base * row);
+            let att = g.attend_tokens(&q, &a.kc, &a.vc, sc, base as u32, nt as u32, a.n_head, a.n_kv, a.hd);
+            g.add_into(&g.mv_tokens(a.o, &att, nt as u32), &x);
+            let h = g.rms_norm(&x, &f.norm, m.eps);
+            let (up, gate) = (g.mv_tokens(f.up, &h, nt as u32), g.mv_tokens(f.gate, &h, nt as u32));
+            g.silu_gate(&gate, &up);
+            g.add_into(&g.mv_tokens(f.down, &up, nt as u32), &x);
+        }
+        st.pos += nt;
+        let last = g.row(&x, (nt - 1) * dim, dim);
+        g.read(&g.mv(self.output, &g.rms_norm(&last, &self.out_norm, m.eps)))
+    }
+
     /// One token: the logits of the next one. The state only counts positions: K and V are on the device.
     pub fn forward(&self, m: &Model, st: &mut State, token: u32) -> Vec<f32> {
         let g = self.g;

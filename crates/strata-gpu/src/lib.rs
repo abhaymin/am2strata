@@ -388,6 +388,35 @@ impl Gpu {
         o
     }
 
+    /// Whether this device runs the native Metal backend (which has the chunk kernels below).
+    pub fn is_native(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Client::Metal(_) = &self.client {
+            return true;
+        }
+        false
+    }
+
+    /// RoPE over a chunk of `tokens` tokens (native Metal only): `tab` holds each token's (cos, sin) pairs in turn.
+    pub fn rope_tokens(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, tokens: u32) {
+        native!(self, m, m.rope_tokens(tab.handle.mtl(), x.handle.mtl(), x.len as u32 / hd / tokens, tokens, hd, n_rot, neox));
+        panic!("rope_tokens needs the native Metal backend")
+    }
+
+    /// x[at .. at + n] as a buffer of its own (native Metal only).
+    pub fn row(&self, x: &Buf, at: usize, n: usize) -> Buf {
+        native!(self, m, Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n });
+        panic!("row needs the native Metal backend")
+    }
+
+    /// Causal attention for a chunk (native Metal only): `tokens` queries at positions base.., K and V already appended.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
+        native!(self, m, Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
+                                                                n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize });
+        panic!("attend_tokens needs the native Metal backend")
+    }
+
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).
     pub fn matvec(&self, w: &Weights, x: &[f32]) -> Vec<f32> {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;

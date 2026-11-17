@@ -298,3 +298,212 @@ kernel void attend(device const float* q [[buffer(0)]], device const float* k [[
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// ------------------------------------------------------------------ a prompt chunk: several tokens per dispatch
+
+// The 32 values of group g of the block at o, dequantized (the same values group_dot multiplies).
+static inline void group_values(device const uchar* o, uint g, uint kind, thread float* wv) {
+    if (kind == K_Q4_K || kind == K_Q5_K) {
+        float d = f16_at(o), dmin = f16_at(o + 2);
+        float sc, mn;
+        scale_min_k4(o + 4, g, sc, mn);
+        const float a = d * sc, b = dmin * mn;
+        device const uchar* qs = o + (kind == K_Q5_K ? 48 : 16) + (g / 2) * 32;
+        const uint sh = (g % 2) * 4;
+        if (kind == K_Q4_K) {
+            for (uint l = 0; l < 32; l++) wv[l] = a * float((qs[l] >> sh) & 0x0f) - b;
+        } else {
+            device const uchar* qh = o + 16;
+            for (uint l = 0; l < 32; l++) wv[l] = a * float(((qs[l] >> sh) & 0x0f) | (((qh[l] >> g) & 1) << 4)) - b;
+        }
+    } else if (kind == K_Q6_K) {
+        const float d = f16_at(o + 208);
+        const uint hh = g / 4, kk = g % 4;
+        device const uchar* lo = o + hh * 64 + (kk % 2) * 32;
+        const uint lo_sh = 4 * (kk / 2);
+        device const uchar* hi = o + 128 + hh * 32;
+        const float s0 = d * float(as_type<char>(o[192 + g * 2]));
+        const float s1 = d * float(as_type<char>(o[192 + g * 2 + 1]));
+        for (uint l = 0; l < 32; l++) {
+            const int q = int(((lo[l] >> lo_sh) & 0x0f) | (((hi[l] >> (2 * kk)) & 3) << 4)) - 32;
+            wv[l] = (l < 16 ? s0 : s1) * float(q);
+        }
+    } else if (kind == K_Q8_0) {
+        const float d = f16_at(o);
+        for (uint l = 0; l < 32; l++) wv[l] = d * float(as_type<char>(o[2 + l]));
+    } else if (kind == K_Q4_0) {
+        const float d = f16_at(o);
+        for (uint l = 0; l < 16; l++) {
+            const uint b = o[2 + l];
+            wv[l] = d * (float(b & 0x0f) - 8.0f);
+            wv[l + 16] = d * (float(b >> 4) - 8.0f);
+        }
+    } else if (kind == K_F16) {
+        for (uint l = 0; l < 32; l++) wv[l] = f16_at(o + 2 * l);
+    } else if (kind == K_BF16) {
+        for (uint l = 0; l < 32; l++) wv[l] = bf16_at(o + 2 * l);
+    } else {
+        for (uint l = 0; l < 32; l++) wv[l] = f32_at(o + 4 * l);
+    }
+}
+
+#define MM_BM 64   // rows per threadgroup
+#define MM_BN 32   // tokens per threadgroup
+#define MM_THREADS 128
+
+struct MmArgs { uint rows; uint cols; uint row_bytes; uint kind; uint tokens; };
+
+// Y[t][r] = W[r] . X[t] for a chunk of tokens, on the SIMD-group matrix units: threadgroup (i, j) computes rows
+// i * 64 .. and tokens j * 32 ..; per 32-column step, 64 threads dequantize one row's 32-value group each into
+// threadgroup memory while the other 64 load the tokens' 32 values, then each of the 4 SIMD groups multiplies its
+// 32 x 16 corner in 8 x 8 tiles (f32 throughout, so the sums are the ones `mv` makes up to their order).
+kernel void mm(device const uchar* w [[buffer(0)]],
+               device const float* x [[buffer(1)]],
+               device float* y [[buffer(2)]],
+               constant MmArgs& a [[buffer(3)]],
+               uint2 tg [[threadgroup_position_in_grid]],
+               uint2 tid2 [[thread_position_in_threadgroup]],
+               uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sa[MM_BM * 32];   // weights [row][k]
+    threadgroup float sb[MM_BN * 32];   // tokens [token][k]
+    threadgroup float sc[MM_BM * MM_BN];
+    const uint tid = tid2.x;
+    const uint r0 = tg.x * MM_BM, t0 = tg.y * MM_BN;
+    const bool big = a.kind >= K_Q4_K;
+    const uint vpb = big ? 256 : 32;
+    const uint bpb = a.row_bytes / (a.cols / vpb);
+    const uint ng = a.cols / 32;
+    const uint mr = (sg / 2) * 32, mt = (sg % 2) * 16;   // this SIMD group's corner
+    simdgroup_float8x8 c[4][2];
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 2; j++) c[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint gi = 0; gi < ng; gi++) {
+        if (tid < MM_BM) {
+            const uint row = r0 + tid;
+            float wv[32];
+            if (row < a.rows) {
+                group_values(w + row * a.row_bytes + (big ? gi / 8 : gi) * bpb, big ? gi % 8 : 0, a.kind, wv);
+            } else {
+                for (uint l = 0; l < 32; l++) wv[l] = 0.0f;
+            }
+            for (uint l = 0; l < 32; l++) sa[tid * 32 + l] = wv[l];
+        } else {
+            // 64 threads, 32 tokens x 32 values: 16 each
+            const uint i = tid - MM_BM;
+            const uint tt = i / 2, half_ = (i % 2) * 16;
+            const uint t = t0 + tt;
+            for (uint l = 0; l < 16; l++) {
+                sb[tt * 32 + half_ + l] = t < a.tokens ? x[t * a.cols + gi * 32 + half_ + l] : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint kk = 0; kk < 32; kk += 8) {
+            simdgroup_float8x8 am[4], bm[2];
+            for (uint i = 0; i < 4; i++) simdgroup_load(am[i], sa + (mr + i * 8) * 32 + kk, 32);
+            for (uint j = 0; j < 2; j++) simdgroup_load(bm[j], sb + (mt + j * 8) * 32 + kk, 32, ulong2(0, 0), true);
+            for (uint i = 0; i < 4; i++) for (uint j = 0; j < 2; j++) simdgroup_multiply_accumulate(c[i][j], am[i], bm[j], c[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < 4; i++) for (uint j = 0; j < 2; j++) simdgroup_store(c[i][j], sc + (mr + i * 8) * MM_BN + mt + j * 8, MM_BN);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < MM_BM * MM_BN; e += MM_THREADS) {
+        const uint rr = e / MM_BN, tt = e % MM_BN;
+        if (r0 + rr < a.rows && t0 + tt < a.tokens) y[(t0 + tt) * a.rows + r0 + rr] = sc[e];
+    }
+}
+
+// rope for a chunk: threadgroup (head, token); tab holds each token's n_rot / 2 (cos, sin) pairs one after another,
+// x holds each token's heads one after another.
+struct RopeTArgs { uint hd; uint n_rot; uint neox; uint heads; };
+kernel void rope_tokens(device const float* tab [[buffer(0)]], device float* x [[buffer(1)]], constant RopeTArgs& a [[buffer(2)]],
+                        uint2 g [[threadgroup_position_in_grid]], uint2 p2 [[thread_position_in_threadgroup]]) {
+    const uint p = p2.x;
+    if (p < a.n_rot / 2) {
+        device const float* tt = tab + g.y * a.n_rot;
+        const float c = tt[p * 2], s = tt[p * 2 + 1];
+        const uint at = (g.y * a.heads + g.x) * a.hd;
+        uint i0 = at + p * 2, i1 = i0 + 1;
+        if (a.neox == 1) {
+            i0 = at + p;
+            i1 = i0 + a.n_rot / 2;
+        }
+        const float x0 = x[i0], x1 = x[i1];
+        x[i0] = x0 * c - x1 * s;
+        x[i1] = x0 * s + x1 * c;
+    }
+}
+
+// y[j] = x[at + j]: one row out of a chunk (the last token's, for the logits).
+kernel void copy_from(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant NArgs& a [[buffer(2)]],
+                      uint j [[thread_position_in_grid]]) {
+    if (j < a.n) y[j] = x[a.at + j];
+}
+
+// Causal attention for a chunk of query tokens (positions base .. base + tokens), one threadgroup per (query head,
+// token): keys 0 ..= base + t in blocks of ATG, an online softmax (running max and sum), V blended as it goes.
+// scales[t] is token t's scale (temperature included).
+struct AttnTArgs { uint base; uint n_head; uint n_kv; uint group; uint hd; };
+kernel void attend_tokens(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]], device const float* v [[buffer(2)]],
+                          device const float* scales [[buffer(3)]], device float* o [[buffer(4)]], constant AttnTArgs& a [[buffer(5)]],
+                          uint2 g [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    const uint tid = tid2.x;
+    threadgroup float qs[256];
+    threadgroup float p[ATG];
+    threadgroup float red[ATG / 32];
+    threadgroup float accs[ATG];
+    const uint hh = g.x, t = g.y;
+    const uint kh = hh / a.group;
+    const uint n = a.base + t + 1;
+    const float scale = scales[t];
+    device const float* qh = q + (t * a.n_head + hh) * a.hd;
+    for (uint j = tid; j < a.hd; j += ATG) qs[j] = qh[j];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint stripes = a.hd <= ATG ? ATG / a.hd : 1;
+    const uint width = ATG / stripes;           // dimensions per stripe pass
+    const uint jd = tid % width, stripe = tid / width;
+    float m = -1.0e30f, l = 0.0f;
+    float acc0 = 0.0f;                          // this thread's dimension jd (hd <= ATG), its stripe's positions
+    for (uint b0 = 0; b0 < n; b0 += ATG) {
+        const uint nb = min(uint(ATG), n - b0);
+        // scores of this block: thread tid takes position b0 + tid
+        float sc = -1.0e30f;
+        if (tid < nb) {
+            device const float* kt = k + ((b0 + tid) * a.n_kv + kh) * a.hd;
+            float s = 0.0f;
+            for (uint j = 0; j < a.hd; j++) s += qs[j] * kt[j];
+            sc = s * scale;
+        }
+        // the block's max
+        float bm = simd_max(sc);
+        if (lane == 0) red[sg] = bm;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        bm = red[0];
+        for (uint i = 1; i < ATG / 32; i++) bm = max(bm, red[i]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float m2 = max(m, bm);
+        const float corr = exp(m - m2);
+        const float e = tid < nb ? exp(sc - m2) : 0.0f;
+        p[tid] = e;
+        float bs = simd_sum(e);
+        if (lane == 0) red[sg] = bs;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        bs = 0.0f;
+        for (uint i = 0; i < ATG / 32; i++) bs += red[i];
+        l = l * corr + bs;
+        m = m2;
+        // V: dimension jd, positions stripe, stripe + stripes, ... of the block
+        acc0 *= corr;
+        if (jd < a.hd) {
+            for (uint i = stripe; i < nb; i += stripes) acc0 += p[i] * v[((b0 + i) * a.n_kv + kh) * a.hd + jd];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    accs[tid] = acc0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (stripe == 0 && jd < a.hd) {
+        float sum = 0.0f;
+        for (uint i = 0; i < stripes; i++) sum += accs[i * width + jd];
+        o[(t * a.n_head + hh) * a.hd + jd] = sum / l;
+    }
+}
