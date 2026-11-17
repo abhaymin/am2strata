@@ -1074,9 +1074,9 @@ fn images_are_edited_by_a_model_that_takes_edit_images() {
     let r = reqwest::blocking::Client::new().post(format!("{}/v1/images/edits", s.base)).bearer_auth(KEY).multipart(form).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.json::<Value>().unwrap()["size"], "512x512");
-    // refused plainly: a model without edits, a mask, no image, too many
-    for (body, what) in [(json!({"prompt": "p", "images": [url]}), "cannot edit images"),
-                         (json!({"prompt": "p", "model": model, "images": [url], "mask": url}), "mask is not supported"),
+    // refused plainly: a model that cannot edit, a mask that is no image, no image, too many
+    for (body, what) in [(json!({"prompt": "p", "model": "wan21-t2v-1.3b:turbo", "images": [url]}), "cannot edit images"),
+                         (json!({"prompt": "p", "model": model, "images": [url], "mask": "bm90IGFuIGltYWdl"}), "mask: not an image"),
                          (json!({"prompt": "p", "model": model}), "send the image"),
                          (json!({"prompt": "p", "model": model, "images": [url, url, url, url]}), "at most 3")] {
         let (c, r) = s.post("/v1/images/edits", &body);
@@ -3207,4 +3207,49 @@ fn media_is_kept_in_the_library_and_used_again_by_id() {
     assert!(r["error"]["message"].as_str().unwrap().contains("no media file"), "{r}");
     // no key, no library
     assert_eq!(get_as("wrong", "/v1/media/files").0, 401);
+}
+
+/// How much an edit keeps of the original (edit_controls.rs): a model that starts from the image gets it as its source
+/// with the strength and the mask; an instruction model gets references, and refuses strength by name; on both the
+/// original's pixels come back outside the mask; the answer names the original's library id for a before/after.
+#[test]
+fn an_edit_keeps_what_the_mask_and_the_controls_say() {
+    use base64::Engine as _;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let enc = |img: image::DynamicImage| { let mut b = std::io::Cursor::new(Vec::new()); img.write_to(&mut b, image::ImageFormat::Png).unwrap(); b.into_inner() };
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let orig = enc(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([250, 0, 0]))));
+    // keep the left half, change the right
+    let mask = enc(image::DynamicImage::ImageLuma8(image::GrayImage::from_fn(64, 64, |x, _| image::Luma([if x >= 32 { 255 } else { 0 }]))));
+    let url = format!("data:image/png;base64,{}", b64(&orig));
+    let murl = format!("data:image/png;base64,{}", b64(&mask));
+    // Z-Image: redrawn from the image, at the strength, inside the mask
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "a blue sky", "model": "z-image-turbo:q8", "images": [url], "mask": murl,
+                                                     "strength": 0.4, "mask_feather": 0, "size": "512x512", "steps": 2}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["strata"]["edit"]["mode"], "redrawn from the image", "{r}");
+    assert_eq!(r["strata"]["edit"]["original_file_id"], json!(id_of(&orig)), "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let g: Value = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "generate").unwrap();
+    assert_eq!((g["request"]["strength"].as_f64(), g["request"]["mask_image"].is_string(), g["request"]["source_image"].is_string(),
+                g["request"]["edit_images"].is_null()), (Some(0.4), true, true, true), "{g}");
+    let out = image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(r["data"][0]["b64_json"].as_str().unwrap()).unwrap()).unwrap().to_rgb8();
+    assert_eq!(out.get_pixel(0, out.height() / 2).0, [250, 0, 0], "outside the mask the original stays");
+    // Qwen Image 2.1: by instructions; strength is refused by name, a mask and a blend are taken
+    let qwen = "chatr-omni-qwen-image-2.1:q8";
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "strength": 0.4}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("strength does not apply"), "{r}");
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "mask": murl, "blend": 0.3, "keep_colors": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!((r["strata"]["edit"]["mode"].as_str(), r["strata"]["edit"]["controls"]["blend"].as_f64()), (Some("by instructions"), Some(0.3)), "{r}");
+    // a wrong control is refused by name, before any drawing
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "blend": 2}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("blend"), "{r}");
+}
+
+fn id_of(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("mf_{}", sha2::Sha256::digest(b).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>())
 }
