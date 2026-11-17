@@ -243,12 +243,12 @@ fn advise(b: &[u8], advice: libc::c_int) -> bool {
 
 // Residency is a hint: without these, the operating system's page cache decides and the model still runs.
 #[cfg(unix)]
-fn pin(b: &[u8]) -> bool {
+pub(crate) fn pin(b: &[u8]) -> bool {
     unsafe { libc::mlock(b.as_ptr() as *const libc::c_void, b.len()) == 0 }
 }
 
 #[cfg(not(unix))]
-fn pin(_: &[u8]) -> bool {
+pub(crate) fn pin(_: &[u8]) -> bool {
     false
 }
 

@@ -214,6 +214,9 @@ impl Held {
             // SAFETY: the box lives in this Held next to the matrix that points into it, never moves (a Box's heap
             // data does not move with the Box) and is dropped with it; no QMat leaves the Held.
             let data: &'static [u8] = unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) };
+            // locked where the memlock limit allows: a lent expert that the OS compresses or swaps out costs the
+            // master a disk read on the host per call (the Mac host held 2.9 of 8 GiB resident, 64 ms a call)
+            crate::pack::pin(&b);
             mem.push(b);
             q.with_data(data, q.ty()).expect("same shape")
         };
