@@ -164,10 +164,6 @@ pub fn model_id_components(model_id: &str, total_params: i64) -> Components {
 
     // Dash-split the name, dropping leading/trailing/consecutive-dash empty parts.
     let mut name_parts: Vec<String> = full_name.split('-').filter(|p| !p.is_empty()).map(|p| p.to_string()).collect();
-    // Guard against a single empty token from an all-dash name.
-    if name_parts.len() == 1 && name_parts[0].is_empty() {
-        name_parts.pop();
-    }
     let mut name_types: Vec<HashSet<&'static str>> = vec![HashSet::new(); name_parts.len()];
 
     // Annotate each part (version / quant type / size label / finetune tag), mirroring gguf-py's loop.
