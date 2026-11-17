@@ -152,7 +152,9 @@ impl Server {
                 return Ok(());
             }
             if let Ok(Some(status)) = self.child.try_wait() {
-                return Err(format!("it ended after {:.1} s ({status})", t0.elapsed().as_secs_f32()));
+                let err = std::fs::read_to_string(self.dir.join(format!("stderr-{}.txt", self.port))).unwrap_or_default();
+                let tail: Vec<&str> = err.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect();
+                return Err(format!("it ended after {:.1} s ({status}): {}", t0.elapsed().as_secs_f32(), tail.join(" | ")));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -256,7 +258,8 @@ fn spawn(dir: &Path, port: u16, model: &str, extra: &Value, record: &Path) -> Ch
             // more environment for the server, from the test (e.g. AM2STRATA_HOME), never changed in this process
             .envs(extra.get("env").and_then(|e| e.as_object()).into_iter().flatten()
                   .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))))
-            .stderr(Stdio::null())
+            // the server's error output, so a server that does not start says why (wait_until_up reads its tail)
+            .stderr(std::fs::File::create(dir.join(format!("stderr-{port}.txt"))).map(Stdio::from).unwrap_or(Stdio::null()))
             .stdout(match extra.get("server_log") {
                 Some(_) => std::fs::OpenOptions::new().create(true).append(true).open(dir.join("server.log")).map(Stdio::from).unwrap_or(Stdio::null()),
                 None => Stdio::null(),
