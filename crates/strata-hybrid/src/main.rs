@@ -288,6 +288,10 @@ fn main() {
     } else {
         None
     };
+    #[cfg(feature = "gpu")]
+    if let (Some(g), Some(_)) = (&graph, std::env::var_os("AM2_GPU_BENCH")) {
+        g.bench(&m);
+    }
     let forward = |st: &mut model::State, t: u32| -> Vec<f32> {
         #[cfg(feature = "gpu")]
         if let Some(g) = &graph {

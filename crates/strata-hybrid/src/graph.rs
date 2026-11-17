@@ -87,6 +87,53 @@ impl<'a> Graph<'a> {
         Ok(Graph { g, layers, out_norm: g.buffer(&m.out_norm), output, n_rot: rope.n_dims as u32, neox: rope.neox })
     }
 
+    /// AM2_GPU_BENCH=1: how long each kind of kernel takes on this device, each queued `n` times before one read (so the
+    /// time per call is the device's plus the queueing, without a wait per call). Prints one line per kernel to stderr.
+    pub fn bench(&self, m: &Model) {
+        let g = self.g;
+        let n = 50;
+        let time = |what: &str, bytes: usize, f: &dyn Fn() -> Buf| {
+            let warm = f();
+            g.read(&warm);
+            let t = std::time::Instant::now();
+            let mut last = f();
+            for _ in 1..n {
+                last = f();
+            }
+            g.read(&last);
+            let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let gbs = if bytes > 0 { format!(" {:.1} GB/s", bytes as f64 / us / 1e3) } else { String::new() };
+            eprintln!("GPU_BENCH {what:<28} {us:9.1} us/call{gbs}");
+        };
+        let (a, f) = &self.layers[0];
+        let dim = m.embd.row(0).len();
+        let x = g.buffer(&vec![0.01f32; dim]);
+        for (name, w) in [("attn_q", a.q), ("attn_k", a.k), ("attn_v", a.v), ("attn_o", a.o), ("ffn_gate", f.gate), ("ffn_up", f.up), ("ffn_down", f.down), ("output", self.output)] {
+            let xin = g.buffer(&vec![0.01f32; w.cols as usize]);
+            time(&format!("mv {name} {}x{}", w.rows, w.cols), w.bytes, &|| g.mv(w, &xin));
+        }
+        time("rms_norm", 0, &|| g.rms_norm(&x, &a.norm, m.eps));
+        time("add_into", 0, &|| { g.add_into(&x, &x); x.clone() });
+        let up = g.scratch(f.up.rows as usize);
+        time("silu_gate", 0, &|| { g.silu_gate(&up, &up); up.clone() });
+        let rope = m.rope.as_ref().expect("rope");
+        let tab = g.buffer(&rope.table(5));
+        let q = g.scratch(a.q.rows as usize);
+        time("rope q", 0, &|| { g.rope(&tab, &q, a.hd, self.n_rot, self.neox); q.clone() });
+        let k = g.scratch(a.k.rows as usize);
+        time("kv_append", 0, &|| { g.kv_append(&k, &a.kc, 0); k.clone() });
+        for ctx in [16u32, 128, 1024] {
+            time(&format!("attend n={ctx}"), 0, &|| g.attend(&q, &a.kc, &a.vc, &a.s, ctx, a.n_head, a.n_kv, a.hd, 0.1));
+        }
+        time("buffer upload (rope table)", 0, &|| g.buffer(&rope.table(5)));
+        let mut st = m.new_state();
+        let t = std::time::Instant::now();
+        for i in 0..20 {
+            self.forward(m, &mut st, 1000 + i);
+        }
+        eprintln!("GPU_BENCH whole token (forward + read)  {:9.1} us/token, {} layers", t.elapsed().as_secs_f64() * 1e6 / 20.0, self.layers.len());
+    }
+
     /// One token: the logits of the next one. The state only counts positions: K and V are on the device.
     pub fn forward(&self, m: &Model, st: &mut State, token: u32) -> Vec<f32> {
         let g = self.g;

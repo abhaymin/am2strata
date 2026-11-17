@@ -2867,6 +2867,9 @@ name = "strata-gpu"
 version = "0.1.0"
 dependencies = [
  "cubecl",
+ "objc2",
+ "objc2-foundation",
+ "objc2-metal",
  "strata-pack",
 ]
 

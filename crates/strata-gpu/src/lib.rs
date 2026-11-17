@@ -8,6 +8,8 @@
 //! One source of kernels (kernels.rs) for every backend; the C/C++ under it is only the vendors' runtimes.
 
 pub mod kernels;
+#[cfg(target_os = "macos")]
+pub mod native;
 
 use cubecl::prelude::*;
 use cubecl::server::Handle;
@@ -22,6 +24,35 @@ enum Client {
     #[cfg(feature = "wgpu")]
     Wgpu(ComputeClient<cubecl::wgpu::WgpuRuntime>),
     Cpu(ComputeClient<cubecl::cpu::CpuRuntime>),
+    /// the native Metal backend (native.rs), for `metal:*` when AM2_METAL_NATIVE=1
+    #[cfg(target_os = "macos")]
+    Metal(native::Native),
+}
+
+/// Where a buffer or a matrix lives: a CubeCL handle, or a native Metal buffer.
+#[derive(Clone)]
+enum Mem {
+    Cube(Handle),
+    #[cfg(target_os = "macos")]
+    Mtl(std::sync::Arc<native::MBuf>),
+}
+
+impl Mem {
+    fn cube(&self) -> Handle {
+        match self {
+            Mem::Cube(h) => h.clone(),
+            #[cfg(target_os = "macos")]
+            Mem::Mtl(_) => panic!("a native Metal buffer given to a CubeCL kernel"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn mtl(&self) -> &native::MBuf {
+        match self {
+            Mem::Mtl(b) => b,
+            Mem::Cube(_) => panic!("a CubeCL buffer given to a native Metal kernel"),
+        }
+    }
 }
 
 /// A device: its name as `Gpu::open` takes it, and what it is.
@@ -34,7 +65,7 @@ pub struct DeviceInfo {
 
 /// One weight matrix on the device, in its GGUF encoding.
 pub struct Weights {
-    handle: Handle,
+    handle: Mem,
     pub rows: u32,
     pub cols: u32,
     row_bytes: u32,
@@ -48,13 +79,13 @@ pub struct Weights {
 /// Values on the device, so that a chain of kernels needs no trip through the CPU.
 #[derive(Clone)]
 pub struct Buf {
-    handle: Handle,
+    handle: Mem,
     pub len: usize,
 }
 
 impl Buf {
     fn arg<R: Runtime>(&self) -> ArrayArg<R> {
-        unsafe { ArrayArg::from_raw_parts(self.handle.clone(), self.len) }
+        unsafe { ArrayArg::from_raw_parts(self.handle.cube(), self.len) }
     }
 }
 
@@ -73,6 +104,18 @@ macro_rules! with_client {
             #[cfg(feature = "wgpu")]
             Client::Wgpu($c) => { #[allow(dead_code)] type $R = cubecl::wgpu::WgpuRuntime; $body }
             Client::Cpu($c) => { #[allow(dead_code)] type $R = cubecl::cpu::CpuRuntime; $body }
+            #[cfg(target_os = "macos")]
+            Client::Metal(_) => unreachable!("native Metal is handled before with_client!"),
+        }
+    };
+}
+
+/// Runs `$body` with `$n` the native Metal backend when that is this device's client, and returns its value.
+macro_rules! native {
+    ($self:expr, $n:ident, $body:expr) => {
+        #[cfg(target_os = "macos")]
+        if let Client::Metal($n) = &$self.client {
+            return $body;
         }
     };
 }
@@ -92,7 +135,7 @@ macro_rules! product {
         let count = CubeCount::Static(cx, cy, $tokens);
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $tokens as usize * w.rows as usize);
-            let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.clone(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
+            let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.cube(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
             if wide {
                 kernels::matvec_q4k::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::WIDE_CUBE), wa, xa, y, w.rows, w.row_bytes, w.cols);
             } else {
@@ -178,6 +221,10 @@ impl Gpu {
             "hip" | "rocm" => works::<cubecl::hip::HipRuntime>(cubecl::hip::AmdDevice { index: i }).map(Client::Hip),
             #[cfg(feature = "wgpu")]
             // "metal" is what macOS names it (see wgpu_backend); "vulkan"/"wgpu" stay accepted for older configs.
+            #[cfg(target_os = "macos")]
+            "metal" if native::wanted() => {
+                return native::Native::open().map(|n| Gpu { client: Client::Metal(n), name: name.to_string() });
+            }
             "metal" | "vulkan" | "wgpu" => {
                 use cubecl::wgpu::WgpuDevice;
                 let d = match idx {
@@ -204,6 +251,8 @@ impl Gpu {
         if data.len() != rows * row_bytes {
             return Err(format!("{} bytes for a {rows}x{cols} {ty} matrix (want {})", data.len(), rows * row_bytes));
         }
+        native!(self, n, Ok(Weights { handle: Mem::Mtl(n.upload(data)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
+                                      geometry, bytes: data.len(), wide_fits: false }));
         // whole u32 words: the tail padded with zeros
         let mut words = vec![0u32; data.len().div_ceil(4)];
         for (i, c) in data.chunks(4).enumerate() {
@@ -211,7 +260,7 @@ impl Gpu {
             b[..c.len()].copy_from_slice(c);
             words[i] = u32::from_le_bytes(b);
         }
-        let handle = with_client!(self, c, R, c.create_from_slice(u32::as_bytes(&words)));
+        let handle = Mem::Cube(with_client!(self, c, R, c.create_from_slice(u32::as_bytes(&words))));
         let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
         let wide_fits = kernels::wide_shared_bytes(cols as u32) <= shared;
         Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len(), wide_fits })
@@ -226,6 +275,12 @@ impl Gpu {
         let cols = ws[0].cols;
         debug_assert!(ws.iter().all(|w| w.cols == cols));
         let tokens = (x.len() / cols as usize).max(1) as u32;
+        native!(self, n, {
+            let hx = self.buffer(x);
+            let outs: Vec<Buf> = ws.iter().map(|w| self.mv_tokens(w, &hx, tokens)).collect();
+            let _ = n;
+            outs.iter().map(|b| self.read(b)).collect()
+        });
         with_client!(self, c, R, {
             let hx = c.create_from_slice(f32::as_bytes(x));
             let outs: Vec<_> = ws.iter().map(|w| {
@@ -239,30 +294,41 @@ impl Gpu {
 
     /// A buffer of f32 on the device.
     pub fn buffer(&self, v: &[f32]) -> Buf {
-        Buf { handle: with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v))), len: v.len() }
+        native!(self, n, Buf { handle: Mem::Mtl(n.upload(f32::as_bytes(v))), len: v.len() });
+        Buf { handle: Mem::Cube(with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v)))), len: v.len() }
     }
 
     /// An uninitialized buffer of `len` f32 on the device.
     pub fn scratch(&self, len: usize) -> Buf {
-        Buf { handle: with_client!(self, c, R, c.empty(len * 4)), len }
+        native!(self, n, Buf { handle: Mem::Mtl(n.empty(len * 4)), len });
+        Buf { handle: Mem::Cube(with_client!(self, c, R, c.empty(len * 4))), len }
     }
 
     /// Waits for the device and reads a buffer back. Only this waits: every call below just queues its kernel.
     pub fn read(&self, b: &Buf) -> Vec<f32> {
-        with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.clone())).to_vec())
+        native!(self, n, n.read(b.handle.mtl(), b.len));
+        with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.cube())).to_vec())
     }
 
     /// y = W x, queued; y stays on the device.
     pub fn mv(&self, w: &Weights, x: &Buf) -> Buf {
+        self.mv_tokens(w, x, 1)
+    }
+
+    /// y = W x for `tokens` vectors of `w.cols` values in x, queued; y (tokens * rows) stays on the device.
+    pub fn mv_tokens(&self, w: &Weights, x: &Buf, tokens: u32) -> Buf {
+        native!(self, n, Buf { handle: Mem::Mtl(n.mv(w.handle.mtl(), w.rows, w.cols, w.row_bytes, w.geometry.2, x.handle.mtl(), tokens)),
+                               len: tokens as usize * w.rows as usize });
         with_client!(self, c, R, {
-            let hy = c.empty(w.rows as usize * 4);
-            product!(c, R, w, x.handle.clone(), x.len, hy.clone(), 1u32);
-            Buf { handle: hy, len: w.rows as usize }
+            let hy = c.empty(tokens as usize * w.rows as usize * 4);
+            product!(c, R, w, x.handle.cube(), x.len, hy.clone(), tokens);
+            Buf { handle: Mem::Cube(hy), len: tokens as usize * w.rows as usize }
         })
     }
 
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
+        native!(self, n, Buf { handle: Mem::Mtl(n.rms_norm(x.handle.mtl(), w.handle.mtl(), w.len as u32, (x.len / w.len) as u32, eps)), len: x.len });
         let y = self.scratch(x.len);
         with_client!(self, c, R, unsafe {
             kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), x.len as u32, eps);
@@ -272,6 +338,7 @@ impl Gpu {
 
     /// y += x, queued.
     pub fn add_into(&self, x: &Buf, y: &Buf) {
+        native!(self, m, m.add_into(x.handle.mtl(), y.handle.mtl(), x.len as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
             kernels::add_into::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), y.arg(), n);
@@ -280,6 +347,7 @@ impl Gpu {
 
     /// up *= silu(gate), queued.
     pub fn silu_gate(&self, gate: &Buf, up: &Buf) {
+        native!(self, m, m.silu_gate(gate.handle.mtl(), up.handle.mtl(), up.len as u32));
         let n = up.len as u32;
         with_client!(self, c, R, unsafe {
             kernels::silu_gate::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), gate.arg(), up.arg(), n);
@@ -289,6 +357,7 @@ impl Gpu {
     /// Rotates x, `hd` values per head, by a (cos, sin) table of `n_rot / 2` pairs, queued.
     pub fn rope(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool) {
         let heads = x.len as u32 / hd;
+        native!(self, m, m.rope(tab.handle.mtl(), x.handle.mtl(), heads, hd, n_rot, neox));
         with_client!(self, c, R, unsafe {
             kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, 1, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot, neox as u32);
         });
@@ -296,6 +365,7 @@ impl Gpu {
 
     /// cache[at..] = x, queued.
     pub fn kv_append(&self, x: &Buf, cache: &Buf, at: usize) {
+        native!(self, m, m.kv_append(x.handle.mtl(), cache.handle.mtl(), x.len as u32, at as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
             kernels::kv_append::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), cache.arg(), at as u32, n);
@@ -306,6 +376,8 @@ impl Gpu {
     /// values. `s` is scratch for n_head * n scores.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
+                               len: (n_head * hd) as usize });
         let o = self.scratch((n_head * hd) as usize);
         let group = n_head / n_kv;
         with_client!(self, c, R, unsafe {
@@ -319,6 +391,7 @@ impl Gpu {
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).
     pub fn matvec(&self, w: &Weights, x: &[f32]) -> Vec<f32> {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;
+        native!(self, m, { let _ = m; let hx = self.buffer(x); let y = self.mv_tokens(w, &hx, tokens); self.read(&y) });
         with_client!(self, c, R, {
             let hx = c.create_from_slice(f32::as_bytes(x));
             let hy = c.empty(tokens as usize * w.rows as usize * 4);
