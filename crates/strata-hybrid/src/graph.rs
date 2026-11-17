@@ -67,9 +67,10 @@ impl<'a> Graph<'a> {
                       n2, on_device(gate, &mut dev)?, on_device(&f.up, &mut dev)?, on_device(&f.down, &mut dev)?));
         }
         let dev = dev.ok_or("--graph: no layers")?;
-        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget. All three are
-        // f32 on the device (Gpu::scratch reserves len * 4 bytes; the f16 rounding of K and V is the CPU path's), so 4 bytes.
-        let kv: u64 = raw.iter().map(|r| (2 * r.1.n_kv * r.1.head_dim + r.1.n_head) as u64 * max_ctx as u64 * 4).sum();
+        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget: K and V at
+        // Gpu::kv_bytes each (half on native Metal, f32 on CubeCL), the scores f32.
+        let kvb = crate::gpu::device(dev).kv_bytes();
+        let kv: u64 = raw.iter().map(|r| (2 * r.1.n_kv * r.1.head_dim) as u64 * max_ctx as u64 * kvb + r.1.n_head as u64 * max_ctx as u64 * 4).sum();
         if let Some(room) = crate::gpu::ROOM.get().and_then(|r| r.get(dev)) {
             if kv > *room {
                 let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -80,7 +81,7 @@ impl<'a> Graph<'a> {
         let g = crate::gpu::device(dev);
         let layers = raw.into_iter().map(|(n1, a, q, k, v, o, n2, gate, up, down)| {
             let row = a.n_kv * a.head_dim;
-            (Attn { norm: g.buffer(n1), q, k, v, o, kc: g.scratch(row * max_ctx), vc: g.scratch(row * max_ctx), s: g.scratch(a.n_head * max_ctx),
+            (Attn { norm: g.buffer(n1), q, k, v, o, kc: g.kv_cache(row * max_ctx), vc: g.kv_cache(row * max_ctx), s: g.scratch(a.n_head * max_ctx),
                     n_head: a.n_head as u32, n_kv: a.n_kv as u32, hd: a.head_dim as u32 },
              Ffn { norm: g.buffer(n2), gate, up, down })
         }).collect();

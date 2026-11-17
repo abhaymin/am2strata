@@ -298,6 +298,18 @@ impl Gpu {
         Buf { handle: Mem::Cube(with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v)))), len: v.len() }
     }
 
+    /// A K or V cache of `len` values: half on the native Metal backend (its attention kernels read half), f32 on CubeCL.
+    pub fn kv_cache(&self, len: usize) -> Buf {
+        // 1 MiB to spare: the matrix-unit attention reads whole blocks of 8 positions, past the context's end (masked)
+        native!(self, n, Buf { handle: Mem::Mtl(n.empty(len * 2 + (1 << 20))), len });
+        self.scratch(len)
+    }
+
+    /// Bytes per value of [`Gpu::kv_cache`].
+    pub fn kv_bytes(&self) -> u64 {
+        if self.is_native() { 2 } else { 4 }
+    }
+
     /// An uninitialized buffer of `len` f32 on the device.
     pub fn scratch(&self, len: usize) -> Buf {
         native!(self, n, Buf { handle: Mem::Mtl(n.empty(len * 4)), len });

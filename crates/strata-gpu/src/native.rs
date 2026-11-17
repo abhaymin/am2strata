@@ -70,6 +70,18 @@ const MM_BM: u32 = 64;
 const MM_BN: u32 = 32;
 const MM_THREADS: usize = 128;
 #[repr(C)]
+struct SplitArgs { n: u32, n_kv: u32, group: u32, hd: u32, scale: f32, parts: u32 }
+#[repr(C)]
+struct FlashArgs { base: u32, tokens: u32, n_head: u32, n_kv: u32, group: u32, hd: u32 }
+#[repr(C)]
+struct MergeArgs { hd: u32, parts: u32 }
+/// DP, DG and DV in native.metal: positions per SIMD group, most query heads per KV head, most values per lane
+const DP: u32 = 32;
+/// DPM in native.metal: positions per SIMD group of attend_split_mma
+const DPM: u32 = 128;
+const DG: u32 = 8;
+const DV: u32 = 8;
+#[repr(C)]
 struct AttnArgs { n: u32, n_kv: u32, group: u32, hd: u32, scale: f32 }
 
 /// Rows a threadgroup of `mv` takes (NSG * NR in native.metal) and its threads (NSG * 32).
@@ -94,7 +106,7 @@ impl Native {
         let lib = dev.newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
             .map_err(|e| format!("native Metal kernels did not compile: {}", e.localizedDescription()))?;
         let mut pso = HashMap::new();
-        for name in ["mv", "mv1", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend", "mm", "rope_tokens", "copy_from", "attend_tokens"] {
+        for name in ["mv", "mv1", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend", "mm", "rope_tokens", "copy_from", "attend_tokens", "attend_split", "attend_merge", "attend_flash", "attend_split_mma", "attend_flash2"] {
             let f = lib.newFunctionWithName(&NSString::from_str(name)).ok_or_else(|| format!("no kernel {name}"))?;
             let p = dev.newComputePipelineStateWithFunction_error(&f).map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
             pso.insert(name, p);
@@ -243,6 +255,20 @@ impl Native {
     #[allow(clippy::too_many_arguments)]
     pub fn attend_tokens(&self, q: &MBuf, k: &MBuf, v: &MBuf, scales: &MBuf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Arc<MBuf> {
         let o = self.temp((tokens * n_head * hd) as usize * 4);
+        let group = n_head / n_kv;
+        if group <= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() && std::env::var_os("AM2_METAL_FLASH1").is_none() {
+            // a SIMD group per (query head, 8 tokens), the heads of a KV head together, K and V straight from the cache
+            let a = FlashArgs { base, tokens, n_head, n_kv, group, hd };
+            self.encode("attend_flash2", &[q, k, v, scales, &o], Self::args(&a), size(n_kv as usize, tokens.div_ceil(8) as usize, 1),
+                        size(group as usize * 32, 1, 1));
+            return o;
+        }
+        if hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() {
+            // on the matrix units: 32 query tokens x 32 positions a step (FQ, FK in native.metal)
+            let a = FlashArgs { base, tokens, n_head, n_kv, group: n_head / n_kv, hd };
+            self.encode("attend_flash", &[q, k, v, scales, &o], Self::args(&a), size(n_head as usize, tokens.div_ceil(32) as usize, 1), size(128, 1, 1));
+            return o;
+        }
         let a = AttnTArgs { base, n_head, n_kv, group: n_head / n_kv, hd };
         self.encode("attend_tokens", &[q, k, v, scales, &o], Self::args(&a), size(n_head as usize, tokens as usize, 1), size(256, 1, 1));
         o
@@ -251,7 +277,30 @@ impl Native {
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &MBuf, k: &MBuf, v: &MBuf, s: &MBuf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Arc<MBuf> {
         let o = self.temp((n_head * hd) as usize * 4);
-        let a = AttnArgs { n, n_kv, group: n_head / n_kv, hd, scale };
+        let group = n_head / n_kv;
+        if group <= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() && std::env::var_os("AM2_METAL_SPLIT_SIMD").is_none() {
+            // on the matrix units: a SIMD group per (KV head, DPM positions), then merged
+            let parts = n.div_ceil(DPM);
+            let part = self.temp((n_head * parts * (hd + 2)) as usize * 4);
+            let a = SplitArgs { n, n_kv, group, hd, scale, parts };
+            self.encode("attend_split_mma", &[q, k, v, &part], Self::args(&a), size(n_kv as usize, parts as usize, 1), size(32, 1, 1));
+            let a = MergeArgs { hd, parts };
+            self.encode("attend_merge", &[&part, &o], Self::args(&a), size(n_head as usize, 1, 1), size(hd.next_multiple_of(32) as usize, 1, 1));
+            return o;
+        }
+        if group <= DG && hd % 32 == 0 && hd / 32 <= DV && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() {
+            // split by positions, K and V read once per KV head, then merged
+            let parts = n.div_ceil(DP);
+            let part = self.temp((n_head * parts * (hd + 2)) as usize * 4);
+            let a = SplitArgs { n, n_kv, group, hd, scale, parts };
+            let per_tg = 8u32;
+            self.encode("attend_split", &[q, k, v, &part], Self::args(&a), size(n_kv as usize, parts.div_ceil(per_tg) as usize, 1),
+                        size(per_tg as usize * 32, 1, 1));
+            let a = MergeArgs { hd, parts };
+            self.encode("attend_merge", &[&part, &o], Self::args(&a), size(n_head as usize, 1, 1), size(hd.next_multiple_of(32) as usize, 1, 1));
+            return o;
+        }
+        let a = AttnArgs { n, n_kv, group, hd, scale };
         self.encode("attend", &[q, k, v, s, &o], Self::args(&a), size(n_head as usize, 1, 1), size(256, 1, 1));
         o
     }
