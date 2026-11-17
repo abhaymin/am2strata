@@ -120,7 +120,7 @@ macro_rules! native {
     };
 }
 
-/// From this many rows a Q4_K product takes `matvec_q4k` (a variable so a test can force either kernel).
+/// From this many rows a Q4_K or Q6_K product takes `matvec_q4k` / `matvec_q6k` (a variable so a test can force either kernel).
 pub static WIDE_ROWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(kernels::WIDE_ROWS);
 
 /// Queues y = W x for `tokens` vectors with the kernel that suits the matrix.
@@ -128,7 +128,8 @@ macro_rules! product {
     ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $tokens:expr) => {{
         let w = $w;
         let (be, bb, k) = w.geometry;
-        let wide = k == kernels::kind::Q4_K && w.wide_fits && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
+        let wide = (k == kernels::kind::Q4_K || k == kernels::kind::Q6_K) && w.wide_fits
+            && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
         // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
         let cubes = w.rows.div_ceil(if wide { 32 } else { kernels::ROWS_PER_CUBE });
         let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
@@ -136,7 +137,9 @@ macro_rules! product {
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $tokens as usize * w.rows as usize);
             let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.cube(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
-            if wide {
+            if wide && k == kernels::kind::Q6_K {
+                kernels::matvec_q6k::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::WIDE_CUBE), wa, xa, y, w.rows, w.row_bytes, w.cols);
+            } else if wide {
                 kernels::matvec_q4k::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::WIDE_CUBE), wa, xa, y, w.rows, w.row_bytes, w.cols);
             } else {
                 kernels::matvec::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::CUBE), wa, xa, y, w.rows, w.cols, w.row_bytes, be, bb, k);
@@ -262,7 +265,11 @@ impl Gpu {
         }
         let handle = Mem::Cube(with_client!(self, c, R, c.create_from_slice(u32::as_bytes(&words))));
         let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
-        let wide_fits = kernels::wide_shared_bytes(cols as u32) <= shared;
+        let need = match geometry.2 {
+            kernels::kind::Q6_K => kernels::wide_q6k_shared_bytes(cols as u32),
+            _ => kernels::wide_shared_bytes(cols as u32),
+        };
+        let wide_fits = need <= shared;
         Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len(), wide_fits })
     }
 

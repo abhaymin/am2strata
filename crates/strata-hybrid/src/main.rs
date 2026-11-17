@@ -41,6 +41,30 @@ impl Rng {
     }
 }
 
+/// Prompt lookup: the tokens that followed the most recent earlier occurrence of the history's last 4, 3 or 2 tokens
+/// (longest first), at most `k` of them. Code edits and quoted text repeat the context, so the guesses are often right;
+/// the model checks them all in one pass and keeps the ones it would have chosen itself.
+fn lookup_draft(history: &[u32], k: usize) -> Vec<u32> {
+    let n = history.len();
+    for ng in [4usize, 3, 2] {
+        if k == 0 || n <= ng {
+            continue;
+        }
+        let key = &history[n - ng..];
+        // the latest earlier match whose continuation lies before the key
+        for j in (0..n - ng).rev() {
+            if &history[j..j + ng] == key {
+                let from = j + ng;
+                let to = (from + k).min(n);
+                if from < to {
+                    return history[from..to].to_vec();
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
 struct Sampling {
     temperature: f32,
     top_k: usize,
@@ -362,6 +386,8 @@ fn main() {
         let max_new: usize = parts.first().and_then(|v| v.parse().ok()).unwrap_or(256);
         let ids: Vec<u32> = parts.last().map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect()).unwrap_or_default();
         let mut s = Sampling { temperature: 0.0, top_k: 64, top_p: 1.0, min_p: 0.0, rng: Rng(0x9E3779B97F4A7C15) };
+        // drafted tokens per step from prompt lookup (0: off); the CPU path only, where a chunk's logits come back
+        let mut lookup: usize = std::env::var("AM2_LOOKUP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         for kv in &parts[1..parts.len().saturating_sub(1)] {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
@@ -370,6 +396,7 @@ fn main() {
                     "top_p" => s.top_p = v.parse().unwrap_or(1.0),
                     "min_p" => s.min_p = v.parse().unwrap_or(0.0),
                     "seed" => s.rng = Rng(v.parse::<u64>().unwrap_or(1).max(1)),
+                    "lookup" => lookup = v.parse().unwrap_or(0),
                     _ => {}
                 }
             }
@@ -412,6 +439,15 @@ fn main() {
         let force: Option<Vec<u32>> = std::env::var("AM2_DEBUG_FORCE").ok().map(|v| v.split(',').filter_map(|t| t.parse().ok()).collect());
         let td = Instant::now();
         let (mut n, mut finish) = (0usize, "length");
+        if on_graph || batch <= 1 || force.is_some() {
+            lookup = 0;
+        }
+        // a token already sampled: a rejected draft's replacement, the model's own choice at that position
+        let mut next: Option<u32> = None;
+        let (mut drafted, mut accepted, mut checks) = (0usize, 0usize, 0usize);
+        // how many guesses to check now: halved when most of a check's are wrong (a wrong guess costs its share of
+        // the pass and a re-run), doubled back when all are right; none right and drafting rests for 32 tokens
+        let (mut want, mut rest) = (lookup, 0usize);
         while n < max_new {
             if let Ok(cmd) = rx.try_recv() {
                 if cmd.trim() == "STOP" {
@@ -419,11 +455,11 @@ fn main() {
                     break;
                 }
             }
-            if logits.iter().any(|v| !v.is_finite()) {
+            if next.is_none() && logits.iter().any(|v| !v.is_finite()) {
                 finish = "nonfinite";
                 break;
             }
-            if std::env::var_os("AM2_DEBUG_TOP").is_some() {
+            if next.is_none() && std::env::var_os("AM2_DEBUG_TOP").is_some() {
                 // the five best logits, as tools/reference-llamacpp/oracle prints them (for parity checks)
                 let mut ix: Vec<usize> = (0..logits.len()).collect();
                 ix.select_nth_unstable_by(5, |a, b| logits[*b].total_cmp(&logits[*a]));
@@ -432,7 +468,10 @@ fn main() {
                 let top: Vec<String> = ix.iter().map(|&i| format!("[{i},{:.4}]", logits[i])).collect();
                 eprintln!("{{\"step\":{n},\"top\":[{}]}}", top.join(","));
             }
-            let mut t = sample(&logits, &mut s);
+            let mut t = match next.take() {
+                Some(t) => t,
+                None => sample(&logits, &mut s),
+            };
             // parity tests (teacher forcing): continue with the reference's tokens, so that a near-tie both engines
             // resolve differently does not change everything after it
             if let Some(forced) = force.as_ref().and_then(|f| f.get(n)) {
@@ -445,7 +484,64 @@ fn main() {
                 finish = "eos";
                 break;
             }
-            logits = forward(&mut st, t);
+            rest = rest.saturating_sub(1);
+            if want == 0 && rest == 0 {
+                want = 1;
+            }
+            let draft = if lookup > 0 && want > 0 && n < max_new { lookup_draft(&history, want.min(max_new - n)) } else { Vec::new() };
+            if draft.is_empty() {
+                logits = forward(&mut st, t);
+                continue;
+            }
+            // t and the guesses in one pass; position i's logits are the model's choice after draft[..i]. Each is
+            // sampled once, in order, as without drafting, so greedy and seeded sampling give the same tokens.
+            let ck = st.checkpoint();
+            let mut seq = vec![t];
+            seq.extend_from_slice(&draft);
+            let all = m.forward_batch_all(&mut st, &seq);
+            checks += 1;
+            drafted += draft.len();
+            let mut i = 0;
+            let mut stopped = false;
+            while i < draft.len() && n < max_new {
+                let c = sample(&all[i], &mut s);
+                if c != draft[i] {
+                    next = Some(c);
+                    break;
+                }
+                out(&format!("T {c}"));
+                n += 1;
+                history.push(c);
+                accepted += 1;
+                i += 1;
+                if m.stops.contains(&c) {
+                    finish = "eos";
+                    stopped = true;
+                    break;
+                }
+            }
+            if i == draft.len() {
+                want = (want * 2).min(lookup);
+            } else if i == 0 {
+                // not one guess right: the pass and the re-run were wasted, so rest
+                want = 0;
+                rest = 32;
+            } else if i * 2 < draft.len() {
+                want /= 2;
+            }
+            if i < draft.len() {
+                // the state saw guesses that were not kept: back to before t, then t and the kept ones again
+                st.rollback(ck);
+                m.forward_batch(&mut st, &seq[..=i]);
+            } else {
+                logits = all[i].clone();
+            }
+            if stopped {
+                break;
+            }
+        }
+        if lookup > 0 {
+            out(&format!("INFO lookup_checks={checks} lookup_drafted={drafted} lookup_accepted={accepted}"));
         }
         // the expert loadings: how much of this request's routing the resident experts served, and the learned profile
         if let Some(r) = &res {
@@ -465,6 +561,7 @@ fn main() {
         if model::times::on() {
             out(&format!("INFO times_ms={}", model::times::take()));
         }
-        out(&format!("DONE {n} {} {prompt_ms} {} {finish} 0 0 0 {reused}", ids.len(), td.elapsed().as_millis()));
+        // fields 6 and 7: drafted tokens kept and offered (strata-protocol's drafts_accepted / drafts_offered)
+        out(&format!("DONE {n} {} {prompt_ms} {} {finish} {accepted} {drafted} 0 {reused}", ids.len(), td.elapsed().as_millis()));
     }
 }

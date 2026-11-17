@@ -268,69 +268,160 @@ pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, col
 
 /// Units in a cube of [`matvec_q4k`]: 32 rows of 32 units.
 pub const WIDE_CUBE: u32 = 1024;
-/// The shared memory [`matvec_q4k`] takes for `cols` columns: x, one sum per 32-value group, and the cube's partial sums.
+/// The shared memory [`matvec_q4k`] takes for `cols` columns: x and the cube's partial sums.
 /// A device whose limit is smaller (Metal: 32 KiB) gives wrong results with it, so the plain kernel is used there.
 pub fn wide_shared_bytes(cols: u32) -> usize {
-    (cols as usize + cols as usize / 32 + WIDE_CUBE as usize) * 4
+    (cols as usize + WIDE_CUBE as usize) * 4
 }
 
 /// Rows from which [`matvec_q4k`] takes a Q4_K product.
 pub const WIDE_ROWS: u32 = 256;
 
-/// The dot products of up to 32 rows of a Q4_K matrix, as in [`matvec`], with x and each group's sum in shared memory: read once
-/// per cube, not once per weight. A load of x per weight is what limits [`matvec`] on a big matrix.
+/// The 6-bit scale (`min == false`) or min of group `g` of a Q4_K/Q5_K block, from its three scale words.
+#[cube]
+fn k4_scale(s0: u32, s1: u32, s2: u32, g: u32, #[comptime] min: bool) -> u32 {
+    let at = (g % 4) * 8;
+    let lo = (s0 >> at) & 0xff;
+    let hi = (s1 >> at) & 0xff;
+    let mut v = u32::new(0);
+    if g < 4 {
+        v = if comptime![min] { hi & 0x3f } else { lo & 0x3f };
+    } else {
+        let more = (s2 >> at) & 0xff;
+        v = if comptime![min] { (more >> 4) | ((hi >> 2) & 0x30) } else { (more & 0x0f) | ((lo >> 2) & 0x30) };
+    }
+    v
+}
+
+/// The dot products of up to 32 rows of a Q4_K matrix, with x in shared memory (read once per cube, not once per
+/// weight). A row's 32 units take one block at a time, unit l reading word l of the block's 32 words of nibbles: a
+/// warp's loads are 128 contiguous bytes. Word l holds 4 values of groups 2(l/8) (low nibbles) and 2(l/8)+1 (high).
 #[cube(launch_unchecked)]
 pub fn matvec_q4k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, row_bytes: u32, #[comptime] cols: u32) {
     let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 32 + UNIT_POS / 32;
     let lane = UNIT_POS % 32;
     let t = CUBE_POS_Z;
-    let n_groups = comptime![cols / 32];
     let mut sx = SharedMemory::<f32>::new(comptime![cols as usize]);
-    let mut gs = SharedMemory::<f32>::new(comptime![(cols / 32) as usize]);
     let mut sum = SharedMemory::<f32>::new(WIDE_CUBE as usize);
     let mut at = UNIT_POS;
-    while at < n_groups {
-        let mut all = f32::new(0.0);
-        for l in 0..32u32 {
-            let v = x[(t * n_groups * 32 + at * 32 + l) as usize];
-            sx[(at * 32 + l) as usize] = v;
-            all += v;
-        }
-        gs[at as usize] = all;
+    while at < comptime![cols] {
+        sx[at as usize] = x[(t * comptime![cols] + at) as usize];
         at += WIDE_CUBE;
     }
     sync_cube();
     let mut acc = f32::new(0.0);
     if row < rows {
-        let mut gi = lane;
-        while gi < n_groups {
-            let o = row * row_bytes + (gi / 8) * 144;
-            let g = gi % 8;
-            // the block's head, a word at a time: d and dmin, then the 6-bit scales and mins (blocks are whole words)
-            let head = w[(o / 4) as usize];
+        let ga = (lane / 8) * 2;
+        let gb = ga + 1;
+        let p = (lane % 8) * 4;
+        let nb = row_bytes / 144;
+        let mut b = u32::new(0);
+        while b < nb {
+            let o = (row * row_bytes + b * 144) / 4;
+            let head = w[o as usize];
             let d = half_bits(head & 0xffff);
             let dmin = half_bits(head >> 16);
-            let at = (g % 4) * 8;
-            let lo = (w[(o / 4 + 1) as usize] >> at) & 0xff;
-            let hi = (w[(o / 4 + 2) as usize] >> at) & 0xff;
-            let mut sc = lo & 0x3f;
-            let mut mn = hi & 0x3f;
-            if g >= 4 {
-                let more = (w[(o / 4 + 3) as usize] >> at) & 0xff;
-                sc = (more & 0x0f) | ((lo >> 2) & 0x30);
-                mn = (more >> 4) | ((hi >> 2) & 0x30);
+            let (s0, s1, s2) = (w[(o + 1) as usize], w[(o + 2) as usize], w[(o + 3) as usize]);
+            let word = w[(o + 4 + lane) as usize];
+            let xa = b * 256 + ga * 32 + p;
+            let xb = xa + 32;
+            let mut pa = f32::new(0.0);
+            let mut sa = f32::new(0.0);
+            let mut pb = f32::new(0.0);
+            let mut sb = f32::new(0.0);
+            for k in 0..4u32 {
+                let va = sx[(xa + k) as usize];
+                let vb = sx[(xb + k) as usize];
+                pa += f32::cast_from((word >> (k * 8)) & 0x0f) * va;
+                sa += va;
+                pb += f32::cast_from((word >> (k * 8 + 4)) & 0x0f) * vb;
+                sb += vb;
             }
-            let qs = (o + 16 + (g / 2) * 32) / 4;
-            let sh = (g % 2) * 4;
-            let mut part = f32::new(0.0);
-            for i in 0..8u32 {
-                let word = w[(qs + i) as usize];
-                for c in 0..4u32 {
-                    part += f32::cast_from((word >> (c * 8 + sh)) & 0x0f) * sx[(gi * 32 + i * 4 + c) as usize];
-                }
+            acc += d * f32::cast_from(k4_scale(s0, s1, s2, ga, false)) * pa - dmin * f32::cast_from(k4_scale(s0, s1, s2, ga, true)) * sa
+                + d * f32::cast_from(k4_scale(s0, s1, s2, gb, false)) * pb - dmin * f32::cast_from(k4_scale(s0, s1, s2, gb, true)) * sb;
+            b += 1;
+        }
+    }
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(16);
+    while stride > 0 {
+        if lane < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if lane == 0 && row < rows {
+        y[(t * rows + row) as usize] = sum[UNIT_POS as usize];
+    }
+}
+
+/// The 4 bytes at an even byte offset `off` as one word: Q6_K blocks are 210 bytes, so a block (and every 2-byte field
+/// in it) starts on a 2-byte boundary but only every other one on a word. Two loads at most.
+#[cube]
+fn word_at_even(w: &Array<u32>, off: u32) -> u32 {
+    let i = off / 4;
+    let mut v = w[i as usize];
+    if off % 4 != 0 {
+        v = (v >> 16) | (w[(i + 1) as usize] << 16);
+    }
+    v
+}
+
+/// The shared memory [`matvec_q6k`] takes for `cols` columns: x and the cube's partial sums.
+pub fn wide_q6k_shared_bytes(cols: u32) -> usize {
+    (cols as usize + WIDE_CUBE as usize) * 4
+}
+
+/// [`matvec_q4k`]'s design for Q6_K: up to 32 rows per cube of 1024 units, x in shared memory, a row's 32 units on one
+/// block at a time. Unit l reads word l of the block's 128 bytes of low bits (contiguous across the warp) and the word
+/// of high bits that goes with it: 4 values at low nibbles, 4 at high, as ggml's dequantize_row_q6_K lays them out.
+/// Q6_K holds the output matrix and ffn_down of most k-quant models.
+#[cube(launch_unchecked)]
+pub fn matvec_q6k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, row_bytes: u32, #[comptime] cols: u32) {
+    let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 32 + UNIT_POS / 32;
+    let lane = UNIT_POS % 32;
+    let t = CUBE_POS_Z;
+    let mut sx = SharedMemory::<f32>::new(comptime![cols as usize]);
+    let mut sum = SharedMemory::<f32>::new(WIDE_CUBE as usize);
+    let mut at = UNIT_POS;
+    while at < comptime![cols] {
+        sx[at as usize] = x[(t * comptime![cols] + at) as usize];
+        at += WIDE_CUBE;
+    }
+    sync_cube();
+    let mut acc = f32::new(0.0);
+    if row < rows {
+        // this unit's place in a block: half hh, low-bits chunk c (ql[l] or ql[l + 32]), values l0..l0 + 4
+        let hh = lane / 16;
+        let c = (lane / 8) % 2;
+        let l0 = (lane % 8) * 4;
+        let v_lo = hh * 128 + c * 32 + l0;
+        let v_hi = v_lo + 64;
+        let sh_lo = c * 2;
+        let sh_hi = c * 2 + 4;
+        let nb = row_bytes / 210;
+        let mut b = u32::new(0);
+        while b < nb {
+            let o = row * row_bytes + b * 210;
+            let d = half(w, o + 208);
+            let sc_lo = d * signed(byte(w, o + 192 + v_lo / 16));
+            let sc_hi = d * signed(byte(w, o + 192 + v_hi / 16));
+            let ql = word_at_even(w, o + lane * 4);
+            let qh = word_at_even(w, o + 128 + hh * 32 + l0);
+            let xo = b * 256;
+            let mut p_lo = f32::new(0.0);
+            let mut p_hi = f32::new(0.0);
+            for k in 0..4u32 {
+                let h = (qh >> (k * 8)) & 0xff;
+                let q_lo = ((ql >> (k * 8)) & 0x0f) | (((h >> sh_lo) & 0x03) << 4);
+                let q_hi = ((ql >> (k * 8 + 4)) & 0x0f) | (((h >> sh_hi) & 0x03) << 4);
+                p_lo += (f32::cast_from(q_lo) - 32.0) * sx[(xo + v_lo + k) as usize];
+                p_hi += (f32::cast_from(q_hi) - 32.0) * sx[(xo + v_hi + k) as usize];
             }
-            acc += d * f32::cast_from(sc) * part - dmin * f32::cast_from(mn) * gs[gi as usize];
-            gi += 32;
+            acc += sc_lo * p_lo + sc_hi * p_hi;
+            b += 1;
         }
     }
     sum[UNIT_POS as usize] = acc;
