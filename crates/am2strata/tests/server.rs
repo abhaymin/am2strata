@@ -1018,6 +1018,10 @@ fn images_are_drawn_by_the_media_engine_and_the_text_model_comes_back() {
     assert_eq!((data[0]["seed"].as_u64(), data[1]["seed"].as_u64()), (Some(7), Some(8)), "image i uses seed + i");
     assert!(data[0]["b64_json"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG");
     assert_eq!((r["size"].as_str(), r["strata"]["steps"].as_u64()), (Some("512x512"), Some(4)));
+    // Monitor's row for the job carries the seed of its last image and its time per step (the Speed card shows both)
+    let row = s.get("/metrics", true).1["requests"][0].clone();
+    assert_eq!((row["kind"].as_str(), row["seed"].as_u64()), (Some("image"), Some(8)), "{row}");
+    assert!(row["s_per_step"].as_f64().is_some_and(|v| v >= 0.0), "{row}");
     // two generations, then the media engine frees its VRAM; the text model was stopped for the job
     let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
     let ops: Vec<String> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].as_str().unwrap().to_string()).collect();

@@ -432,6 +432,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let mut vae_on_cpu = false;
     let mut notes: Vec<String> = Vec::new();
     for i in 0..n {
+        mon.media_seed(job, seed + i);
         let mut r = json!({"model": model, "prompt": prompt, "width": w, "height": h, "seed": seed + i, "batch_size": 1});
         if let Some(p) = placement(&s, &model, w as u64 * h as u64, vae_on_cpu) {
             r["placement"] = p;
@@ -911,6 +912,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("video", &model);
+    mon.media_seed(job, seed);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut clip = None;
     let res = s.media.call(json!({"op": op, "request": r}), |ev| {

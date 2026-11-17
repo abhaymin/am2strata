@@ -164,6 +164,7 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("song", MODEL);
+    mon.media_seed(job, seed);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     // takes: a song is made again with other seeds until the speech-to-text model hears enough of its lyrics (even
     // with the song planner, sung words vary with the seed), the best take kept

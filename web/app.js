@@ -1020,7 +1020,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
     label = mediaLabel(live.kind);
     delete prog.dataset.tone;
     pct = live.steps ? (100 * live.step) / live.steps : 0;
-    detail = `${live.model}${live.steps ? ` · ${mediaUnit(live.kind)} ${live.step} of ${live.steps}` : ""} · ${fmt(live.elapsed_s, 0)} s`;
+    detail = `${live.model}${live.steps ? ` · ${mediaUnit(live.kind)} ${live.step} of ${live.steps}` : ""}` +
+             `${live.s_per_step != null ? ` · ${fmt(live.s_per_step, 2)} s/${mediaUnit(live.kind)}` : ""}` +
+             `${live.seed != null ? ` · seed ${live.seed}` : ""} · ${fmt(live.elapsed_s, 0)} s`;
   } else if (last && last.kind) {
     delete prog.dataset.tone;
     detail = `last: ${last.kind}, ${last.output || ""} in ${fmt(last.duration_s, 0)} s`;
@@ -1032,14 +1034,22 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the eight cards
-  const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
-  setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-            live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-            live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+  // the eight cards; while a media job runs (or was the last request) the speed card shows its time per step and its seed
+  const media = live.state === "media" ? live : live.state === "idle" && last && last.kind ? last : null;
+  if (media) {
+    const unit = mediaUnit(media.kind), now = media === live;
+    setMetric("speed", media.s_per_step == null ? null : fmt(media.s_per_step, 2), `s/${unit}`,
+              `${now ? "Now" : "Last"}: ${mediaLabel(media.kind).toLowerCase()}`);
+    setMetric("prefill", media.seed == null ? null : String(media.seed), "", now ? "Seed now" : "Seed of the last one");
+  } else {
+    const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+    setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
+              live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
+    const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+                  : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
+    setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
+              live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+  }
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
@@ -4061,16 +4071,8 @@ async function readAloud(i, btn) {
 }
 
 // ------------------------------------------------------------------ Settings > Server and access: this PC (GET /api/system)
-var systemTimer;   // var: start-up reaches loadSystem before this line when the page opens on this section
-async function loadSystem() {
-  clearTimeout(systemTimer);
-  if (tab !== "settings" || section !== "server") return;
-  let j;
-  try {
-    const r = await fetch("api/system", {headers: headers()});
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    j = await r.json();
-  } catch (e) { $("hw-list").innerHTML = `<p class="muted small">Not read: ${esc(String(e.message || e))}</p>`; systemTimer = setTimeout(loadSystem, 5000); return; }
+// one machine's /api/system as rows (this PC, or a cluster worker's)
+function hwRows(j) {
   const bar = (pct, text) => `<div class="hw-bar"><div class="st-progress"><div class="st-progress__bar" style="width:${Math.min(100, pct || 0).toFixed(0)}%"></div></div><span class="mono small">${esc(text)}</span></div>`;
   const row = (name, sub, bars) => `<div class="hw-row"><div class="hw-row__name"><b>${esc(name)}</b><span>${esc(sub)}</span></div><div class="hw-row__load">${bars}</div></div>`;
   const gib = (m) => (m == null ? "–" : (m / 1024).toFixed(1));
@@ -4087,9 +4089,34 @@ async function loadSystem() {
     rows.push(row(`${a.kind}: ${a.name}`, [a.bus, a.driver ? `driver ${a.driver}` : null, a.device, a.temperature_c != null ? `${fmt(a.temperature_c)} °C` : null].filter(Boolean).join(" · "),
       `<span class="st-badge">${esc(a.state)}</span>` + (a.util_pct == null ? ` <span class="muted small">load not reported by this device</span>` : bar(a.util_pct, `load ${fmt(a.util_pct)}%`))));
   }
-  $("hw-list").innerHTML = alerts + rows.join("");
+  return alerts + rows.join("");
+}
+var systemTimer;   // var: start-up reaches loadSystem before this line when the page opens on this section
+async function loadSystem() {
+  clearTimeout(systemTimer);
+  if (tab !== "settings" || section !== "server") return;
+  let j;
+  try {
+    const r = await fetch("api/system", {headers: headers()});
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    j = await r.json();
+  } catch (e) { $("hw-list").innerHTML = `<p class="muted small">Not read: ${esc(String(e.message || e))}</p>`; systemTimer = setTimeout(loadSystem, 5000); return; }
+  let html = hwRows(j);
+  // a master shows its workers too, each read through the cluster (GET /api/cluster/system)
+  try {
+    const r = await fetch("api/cluster/system", {headers: headers()});
+    const c = r.ok ? await r.json() : {workers: []};
+    for (const w of c.workers || []) {
+      const head = `<div class="hw-machine"><b>${esc(w.name)}</b> <span class="st-badge ${w.ready ? "" : "st-badge--queued"}">${w.ready ? "worker" : "worker, not answering"}</span></div>`;
+      html += head + (w.system ? hwRows(w.system) : `<p class="muted small">Not read: ${esc(w.error || "no answer")}</p>`);
+    }
+    if ((c.workers || []).length) html = `<div class="hw-machine"><b>This PC</b> <span class="st-badge">master</span></div>` + html;
+    $("hw-title").textContent = (c.workers || []).length ? "Machines in this cluster" : "This PC";
+  } catch (e) { /* a server without the cluster route: this PC only */ }
+  $("hw-list").innerHTML = html;
   systemTimer = setTimeout(loadSystem, 2000);
 }
+
 
 // ------------------------------------------------------------------ Settings > Connect: set up an application
 var APPS = {       // var: start-up reaches renderAppSetup before this line when the page opens on Connect

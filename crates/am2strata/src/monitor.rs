@@ -61,6 +61,14 @@ struct Live {
     recent: VecDeque<f64>,
 }
 
+/// Seconds per step from the first to the latest step reported; None before two steps.
+fn s_per_step(m: &MediaLive) -> Option<f64> {
+    match (m.first_step, m.last_step) {
+        (Some((s0, t0)), Some((s1, t1))) if s1 > s0 => Some(((t1 - t0) / (s1 - s0) as f64 * 100.0).round() / 100.0),
+        _ => None,
+    }
+}
+
 /// A media job (image or video) on the GPU: shown live and kept in the request history like a chat request.
 struct MediaLive {
     id: u64,
@@ -68,6 +76,11 @@ struct MediaLive {
     model: String,
     started: f64,
     step: Option<(u64, u64)>,
+    /// the seed of the image or clip being made now (each image of a batch has its own)
+    seed: Option<u64>,
+    /// (step, time) of the first and the latest step reported: the time per step
+    first_step: Option<(u64, f64)>,
+    last_step: Option<(u64, f64)>,
     /// what the job made, saved with its row: (file extension, bytes)
     files: Vec<(String, Vec<u8>)>,
 }
@@ -253,7 +266,8 @@ impl Monitor {
         let mut g = self.inner.lock().unwrap();
         g.next_id += 1;
         let id = g.next_id;
-        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, files: Vec::new() });
+        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, seed: None, first_step: None,
+                                   last_step: None, files: Vec::new() });
         g.last_at = Some(now());
         id
     }
@@ -261,6 +275,18 @@ impl Monitor {
     pub fn media_step(&self, id: u64, step: u64, total: u64) {
         if let Some(m) = self.inner.lock().unwrap().media.as_mut().filter(|m| m.id == id) {
             m.step = Some((step, total));
+            let t = now();
+            if m.first_step.is_none_or(|(s0, _)| step < s0) {
+                m.first_step = Some((step, t));
+            }
+            m.last_step = Some((step, t));
+        }
+    }
+
+    /// The seed of the image or clip a media job is making now.
+    pub fn media_seed(&self, id: u64, seed: u64) {
+        if let Some(m) = self.inner.lock().unwrap().media.as_mut().filter(|m| m.id == id) {
+            m.seed = Some(seed);
         }
     }
 
@@ -283,7 +309,8 @@ impl Monitor {
         let t = now();
         let media = self.save_media(m.id, m.started, &m.files);
         let row = json!({"id": m.id, "time": m.started, "duration_s": ((t - m.started) * 10.0).round() / 10.0, "finish": finish,
-                         "kind": m.kind, "model": m.model, "output": output, "steps": m.step.map(|s| s.1), "media": media});
+                         "kind": m.kind, "model": m.model, "output": output, "steps": m.step.map(|s| s.1), "media": media,
+                         "seed": m.seed, "s_per_step": s_per_step(&m)});
         self.push(&mut g, row);
     }
 
@@ -377,6 +404,7 @@ impl Monitor {
             None if g.media.is_some() => {
                 let m = g.media.as_ref().unwrap();
                 json!({"state": "media", "kind": m.kind, "model": m.model, "step": m.step.map(|s| s.0), "steps": m.step.map(|s| s.1),
+                       "seed": m.seed, "s_per_step": s_per_step(m),
                        "elapsed_s": r1(t - m.started), "queued": g.queued, "phase": null, "generated": null, "max_tokens": null,
                        "tok_s": null, "tok_s_mean": null, "prompt_tokens": null, "prompt_read": null, "prompt_total": null,
                        "prefill_tok_s_mean": null, "tok_s_window_s": null})
