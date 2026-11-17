@@ -2082,12 +2082,15 @@ impl Model {
         out
     }
 
-    /// Whether this expert's matrices were placed on a GPU (the first tier): such an expert is never given to another
-    /// machine.
+    /// Whether all of this expert's matrices were placed on a GPU (the first tier), as gpu::place counts it: such an
+    /// expert is never given to another machine. One split between a GPU and the CPU can still go to another machine.
     pub fn expert_on_device(&self, layer: usize, e: usize) -> bool {
         #[cfg(feature = "gpu")]
         {
-            self.moes().find(|m| m.layer == layer).is_some_and(|m| e < m.n_expert && m.up_exps.0[e].gpu.is_some())
+            self.moes().find(|m| m.layer == layer).is_some_and(|m| {
+                e < m.n_expert && m.up_exps.0[e].gpu.is_some() && m.down_exps.0[e].gpu.is_some()
+                    && m.gate_exps.as_ref().is_none_or(|g| g.0[e].gpu.is_some())
+            })
         }
         #[cfg(not(feature = "gpu"))]
         {
