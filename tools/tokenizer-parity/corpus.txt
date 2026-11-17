@@ -1,0 +1,39 @@
+Hello world
+ Hello world
+  leading spaces and trailing spaces   
+Numbers: 1 12 123 1234 12345 123456 3.14159 -42 1,000,000 0x1F 1e-9
+fn main() {\n    let x: Vec<u32> = (0..10).map(|i| i * 2).collect();\n    println!("{x:?}");\n}
+def f(a, b=2, *args, **kw):\n\treturn {"a": a, 'b': b}  # comment
+<div class="x">&amp; &lt;tag&gt; &nbsp;</div>
+SELECT id, name FROM users WHERE age >= 18 AND name LIKE '%an%';
+I'm sure they'll say it's fine, we've done it, you'd agree. DON'T SHOUT. I'M, YOU'LL
+naïve café résumé coöperate Zürich Ångström ﬁ ligature
+Ελληνικά, русский язык, українська, Српски
+中文测试，这是一个句子。日本語のテキストです。한국어 문장입니다.
+العربية لغة جميلة. עברית שפה יפה.
+हिन्दी भाषा। தமிழ் மொழி। ভাষা ไทย ภาษา
+Emoji: 😀😃😄 👍🏽 👨‍👩‍👧‍👦 🏳️‍🌈 ❤️ ✨
+Combining: e\u0301 a\u0308 — e​x a mix of é and é
+Tabs\tand\t\tmany\t\t\ttabs
+Line one\nLine two\n\nLine four\n\n\n\nLine eight
+Windows\r\nline\r\nendings
+Mixed   	 whitespace  \n   \n	\n
+Punctuation!!! ??? ... --- ___ *** /// \\\\ ~~~ ``` ''' """
+URL https://example.com/path?q=1&r=two#frag and email a.b@c.de
+Markdown **bold** _it_ `code` [link](http://x.y) # Heading\n- item\n1. item
+JSON {"key": [1, 2.5, true, null], "nested": {"k": "v"}}
+Long word: Pneumonoultramicroscopicsilicovolcanoconiosis supercalifragilisticexpialidocious
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+1111111111111111111111111111111111111111111
+   ...   !!!   ???   
+<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
+<think>reasoning here</think> answer <tool_call>{"name":"x"}</tool_call>
+[INST] Mistral style [/INST] <s> </s>
+Ünïcödé ÀÉÎÕÜ ŁŚŻŹĆŃ ßẞ ĲĳŒœ Ææ
+Zero​width​spaces‌and‍joiners﻿bom
+Math: ∀x∈ℝ, ∑ᵢ xᵢ² ≤ ∫₀^∞ e^{-t} dt ≈ 1.0 ± 0.1 → ∞
+Box ─│┌┐└┘├┤┬┴┼ ░▒▓█ ♠♣♥♦ ☃☂☀
+$ git commit -m "fix: handle \"quotes\"" && echo $?
+    indented code\n        more indented\n            deep
+the the the the the the the the
+.\n,\n;\n:\n

@@ -11,3 +11,7 @@ serde_json.workspace = true
 fancy-regex.workspace = true
 aho-corasick.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+strata-gguf = { path = "../strata-gguf" }
+serde_json.workspace = true
