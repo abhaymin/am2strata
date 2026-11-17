@@ -348,6 +348,90 @@ pub fn matvec_q4k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32,
     }
 }
 
+/// The 4 bytes at an even byte offset `off` as one word: Q6_K blocks are 210 bytes, so a block (and every 2-byte field
+/// in it) starts on a 2-byte boundary but only every other one on a word. Two loads at most.
+#[cube]
+fn word_at_even(w: &Array<u32>, off: u32) -> u32 {
+    let i = off / 4;
+    let mut v = w[i as usize];
+    if off % 4 != 0 {
+        v = (v >> 16) | (w[(i + 1) as usize] << 16);
+    }
+    v
+}
+
+/// The shared memory [`matvec_q6k`] takes for `cols` columns: x and the cube's partial sums.
+pub fn wide_q6k_shared_bytes(cols: u32) -> usize {
+    (cols as usize + WIDE_CUBE as usize) * 4
+}
+
+/// [`matvec_q4k`]'s design for Q6_K: up to 32 rows per cube of 1024 units, x in shared memory, and the weights read a
+/// word (four values' low or high bits) at a time instead of two byte loads per value as [`matvec`] does. Q6_K holds
+/// the output matrix and ffn_down of most k-quant models, which were half of a token's time.
+#[cube(launch_unchecked)]
+pub fn matvec_q6k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, row_bytes: u32, #[comptime] cols: u32) {
+    let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * 32 + UNIT_POS / 32;
+    let lane = UNIT_POS % 32;
+    let t = CUBE_POS_Z;
+    let n_groups = comptime![cols / 32];
+    let mut sx = SharedMemory::<f32>::new(comptime![cols as usize]);
+    let mut sum = SharedMemory::<f32>::new(WIDE_CUBE as usize);
+    let mut at = UNIT_POS;
+    while at < comptime![cols] {
+        sx[at as usize] = x[(t * comptime![cols] + at) as usize];
+        at += WIDE_CUBE;
+    }
+    sync_cube();
+    let mut acc = f32::new(0.0);
+    if row < rows {
+        let mut gi = lane;
+        while gi < n_groups {
+            let o = row * row_bytes + (gi / 8) * 210;
+            let g = gi % 8;
+            let hh = g / 4;
+            let kk = g % 4;
+            let d = half(w, o + 208);
+            let s0 = d * signed(byte(w, o + 192 + g * 2));
+            let s1 = d * signed(byte(w, o + 192 + g * 2 + 1));
+            let lo_at = o + hh * 64 + (kk % 2) * 32;
+            let lo_sh = 4 * (kk / 2);
+            let hi_at = o + 128 + hh * 32;
+            let hi_sh = 2 * kk;
+            let mut p0 = f32::new(0.0);
+            let mut p1 = f32::new(0.0);
+            for i in 0..8u32 {
+                let lw = word_at_even(w, lo_at + i * 4);
+                let hw = word_at_even(w, hi_at + i * 4);
+                let mut part = f32::new(0.0);
+                for c in 0..4u32 {
+                    let q = ((lw >> (c * 8 + lo_sh)) & 0x0f) | (((hw >> (c * 8 + hi_sh)) & 0x03) << 4);
+                    part += (f32::cast_from(q) - 32.0) * sx[(gi * 32 + i * 4 + c) as usize];
+                }
+                if i < 4 {
+                    p0 += part;
+                } else {
+                    p1 += part;
+                }
+            }
+            acc += s0 * p0 + s1 * p1;
+            gi += 32;
+        }
+    }
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(16);
+    while stride > 0 {
+        if lane < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if lane == 0 && row < rows {
+        y[(t * rows + row) as usize] = sum[UNIT_POS as usize];
+    }
+}
+
 // ------------------------------------------------------------------ a whole token on the device (docs/ENGINE-PLAN.md phase 1)
 // These run between the matrix products, so the activations stay on the device and only the logits come back.
 
