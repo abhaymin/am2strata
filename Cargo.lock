@@ -3508,6 +3508,7 @@ dependencies = [
  "libc",
  "memmap2",
  "prost",
+ "regex",
  "reqwest",
  "safetensors",
  "serde",
