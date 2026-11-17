@@ -67,9 +67,10 @@ impl<'a> Graph<'a> {
                       n2, on_device(gate, &mut dev)?, on_device(&f.up, &mut dev)?, on_device(&f.down, &mut dev)?));
         }
         let dev = dev.ok_or("--graph: no layers")?;
-        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget. All three are
-        // f32 on the device (Gpu::scratch reserves len * 4 bytes; the f16 rounding of K and V is the CPU path's), so 4 bytes.
-        let kv: u64 = raw.iter().map(|r| (2 * r.1.n_kv * r.1.head_dim + r.1.n_head) as u64 * max_ctx as u64 * 4).sum();
+        // the KV caches and score scratch for max_ctx tokens count against the device's --devices budget: K and V at
+        // Gpu::kv_bytes each (half on native Metal, f32 on CubeCL), the scores f32.
+        let kvb = crate::gpu::device(dev).kv_bytes();
+        let kv: u64 = raw.iter().map(|r| (2 * r.1.n_kv * r.1.head_dim) as u64 * max_ctx as u64 * kvb + r.1.n_head as u64 * max_ctx as u64 * 4).sum();
         if let Some(room) = crate::gpu::ROOM.get().and_then(|r| r.get(dev)) {
             if kv > *room {
                 let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
@@ -80,11 +81,109 @@ impl<'a> Graph<'a> {
         let g = crate::gpu::device(dev);
         let layers = raw.into_iter().map(|(n1, a, q, k, v, o, n2, gate, up, down)| {
             let row = a.n_kv * a.head_dim;
-            (Attn { norm: g.buffer(n1), q, k, v, o, kc: g.scratch(row * max_ctx), vc: g.scratch(row * max_ctx), s: g.scratch(a.n_head * max_ctx),
+            (Attn { norm: g.buffer(n1), q, k, v, o, kc: g.kv_cache(row * max_ctx), vc: g.kv_cache(row * max_ctx), s: g.scratch(a.n_head * max_ctx),
                     n_head: a.n_head as u32, n_kv: a.n_kv as u32, hd: a.head_dim as u32 },
              Ffn { norm: g.buffer(n2), gate, up, down })
         }).collect();
         Ok(Graph { g, layers, out_norm: g.buffer(&m.out_norm), output, n_rot: rope.n_dims as u32, neox: rope.neox })
+    }
+
+    /// AM2_GPU_BENCH=1: how long each kind of kernel takes on this device, each queued `n` times before one read (so the
+    /// time per call is the device's plus the queueing, without a wait per call). Prints one line per kernel to stderr.
+    pub fn bench(&self, m: &Model) {
+        let g = self.g;
+        let n = 50;
+        let time = |what: &str, bytes: usize, f: &dyn Fn() -> Buf| {
+            let warm = f();
+            g.read(&warm);
+            let t = std::time::Instant::now();
+            let mut last = f();
+            for _ in 1..n {
+                last = f();
+            }
+            g.read(&last);
+            let us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let gbs = if bytes > 0 { format!(" {:.1} GB/s", bytes as f64 / us / 1e3) } else { String::new() };
+            eprintln!("GPU_BENCH {what:<28} {us:9.1} us/call{gbs}");
+        };
+        let (a, f) = &self.layers[0];
+        let dim = m.embd.row(0).len();
+        let x = g.buffer(&vec![0.01f32; dim]);
+        for (name, w) in [("attn_q", a.q), ("attn_k", a.k), ("attn_v", a.v), ("attn_o", a.o), ("ffn_gate", f.gate), ("ffn_up", f.up), ("ffn_down", f.down), ("output", self.output)] {
+            let xin = g.buffer(&vec![0.01f32; w.cols as usize]);
+            time(&format!("mv {name} {}x{}", w.rows, w.cols), w.bytes, &|| g.mv(w, &xin));
+        }
+        time("rms_norm", 0, &|| g.rms_norm(&x, &a.norm, m.eps));
+        time("add_into", 0, &|| { g.add_into(&x, &x); x.clone() });
+        let up = g.scratch(f.up.rows as usize);
+        time("silu_gate", 0, &|| { g.silu_gate(&up, &up); up.clone() });
+        let rope = m.rope.as_ref().expect("rope");
+        let tab = g.buffer(&rope.table(5));
+        let q = g.scratch(a.q.rows as usize);
+        time("rope q", 0, &|| { g.rope(&tab, &q, a.hd, self.n_rot, self.neox); q.clone() });
+        let k = g.scratch(a.k.rows as usize);
+        time("kv_append", 0, &|| { g.kv_append(&k, &a.kc, 0); k.clone() });
+        for ctx in [16u32, 128, 1024] {
+            time(&format!("attend n={ctx}"), 0, &|| g.attend(&q, &a.kc, &a.vc, &a.s, ctx, a.n_head, a.n_kv, a.hd, 0.1));
+        }
+        time("buffer upload (rope table)", 0, &|| g.buffer(&rope.table(5)));
+        if self.batches() {
+            let nt = 128u32;
+            for (name, w) in [("attn_q", a.q), ("attn_k", a.k), ("attn_o", a.o), ("ffn_up", f.up), ("ffn_down", f.down)] {
+                let xin = g.buffer(&vec![0.01f32; (w.cols * nt) as usize]);
+                time(&format!("mm x{nt} {name} {}x{}", w.rows, w.cols), w.bytes, &|| g.mv_tokens(w, &xin, nt));
+            }
+            let qt = g.buffer(&vec![0.01f32; (a.q.rows * nt) as usize]);
+            let sc = g.buffer(&vec![0.1f32; nt as usize]);
+            time(&format!("attend_tokens x{nt} at 0"), 0, &|| g.attend_tokens(&qt, &a.kc, &a.vc, &sc, 0, nt, a.n_head, a.n_kv, a.hd));
+            let xt = g.buffer(&vec![0.01f32; dim * nt as usize]);
+            time(&format!("rms_norm x{nt}"), 0, &|| g.rms_norm(&xt, &a.norm, m.eps));
+        }
+        let mut st = m.new_state();
+        let t = std::time::Instant::now();
+        for i in 0..20 {
+            self.forward(m, &mut st, 1000 + i);
+        }
+        eprintln!("GPU_BENCH whole token (forward + read)  {:9.1} us/token, {} layers", t.elapsed().as_secs_f64() * 1e6 / 20.0, self.layers.len());
+    }
+
+    /// Whether prompts can go through [`Graph::forward_batch`]: the device has the chunk kernels (native Metal) and every
+    /// head fits its attention kernel (at most 256 values, a divisor of its 256 threads).
+    pub fn batches(&self) -> bool {
+        self.g.is_native() && self.layers.iter().all(|(a, _)| a.hd <= 256 && 256 % a.hd == 0)
+    }
+
+    /// A chunk of prompt tokens at once: each matrix applied to all of them in one dispatch (its weights read once per
+    /// chunk), RMS norm and RoPE per token with its own position, K and V appended for the whole chunk, then causal
+    /// attention per token. -> the logits after the last token, as `forward` would give them token by token.
+    pub fn forward_batch(&self, m: &Model, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+        let g = self.g;
+        let base = st.pos;
+        let nt = tokens.len();
+        let rope = m.rope.as_ref().expect("rope");
+        let tab = g.buffer(&(0..nt).flat_map(|i| rope.table(base + i)).collect::<Vec<f32>>());
+        let x = g.buffer(&tokens.iter().flat_map(|&t| m.embd.row(t as usize)).collect::<Vec<f32>>());
+        let dim = x.len / nt;
+        let mut scales = None;
+        for (a, f) in &self.layers {
+            let sc = scales.get_or_insert_with(|| g.buffer(&(0..nt).map(|i| m.temp_scale_at(base + i) / (a.hd as f32).sqrt()).collect::<Vec<f32>>()));
+            let h = g.rms_norm(&x, &a.norm, m.eps);
+            let (q, k, v) = (g.mv_tokens(a.q, &h, nt as u32), g.mv_tokens(a.k, &h, nt as u32), g.mv_tokens(a.v, &h, nt as u32));
+            g.rope_tokens(&tab, &q, a.hd, self.n_rot, self.neox, nt as u32);
+            g.rope_tokens(&tab, &k, a.hd, self.n_rot, self.neox, nt as u32);
+            let row = (a.n_kv * a.hd) as usize;
+            g.kv_append(&k, &a.kc, base * row);
+            g.kv_append(&v, &a.vc, base * row);
+            let att = g.attend_tokens(&q, &a.kc, &a.vc, sc, base as u32, nt as u32, a.n_head, a.n_kv, a.hd);
+            g.add_into(&g.mv_tokens(a.o, &att, nt as u32), &x);
+            let h = g.rms_norm(&x, &f.norm, m.eps);
+            let (up, gate) = (g.mv_tokens(f.up, &h, nt as u32), g.mv_tokens(f.gate, &h, nt as u32));
+            g.silu_gate(&gate, &up);
+            g.add_into(&g.mv_tokens(f.down, &up, nt as u32), &x);
+        }
+        st.pos += nt;
+        let last = g.row(&x, (nt - 1) * dim, dim);
+        g.read(&g.mv(self.output, &g.rms_norm(&last, &self.out_norm, m.eps)))
     }
 
     /// One token: the logits of the next one. The state only counts positions: K and V are on the device.

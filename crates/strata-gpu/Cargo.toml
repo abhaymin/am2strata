@@ -19,3 +19,10 @@ cubecl = { version = "=0.10.0", default-features = false, features = ["std", "cp
 
 [dev-dependencies]
 strata-pack = { path = "../strata-pack" }
+
+# the native Metal backend (src/native.rs): objc2's bindings, the versions wgpu already brings in
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLBuffer", "MTLResource", "MTLAllocation",
+    "MTLLibrary", "MTLComputePipeline", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLTypes"] }
