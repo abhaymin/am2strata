@@ -4,6 +4,8 @@
 //! - **Where:** `<data dir>/media-files/<id>.<ext>`, and `index.json` beside them with what is known of each file.
 //! - **Reuse:** any media input that takes base64, a data: URL or a URL also takes a file id (`resolve`).
 //! - **Room:** `media_files_max_gib` in the run config (default 10); past it the least recently used files go.
+//! - **Age:** a file made or sent more than `media_files_max_age_days` ago (default 90) goes, unless it is pinned.
+//!   A pinned file stays until it is unpinned or deleted, and is never the one dropped for room.
 //! - **Who sees what:** the main key sees every file; a client key sees and uses the files it sent or had made.
 //!
 //! Routes (main.rs): GET/POST /v1/media/files, GET/DELETE /v1/media/files/{id}, GET /v1/media/files/{id}/content.
@@ -28,6 +30,8 @@ pub const MAIN: &str = "main";
 pub struct Library {
     dir: PathBuf,
     max_bytes: u64,
+    /// files older than this (seconds since they were first kept) go, unless pinned; 0: no limit
+    max_age_s: f64,
     index: Mutex<BTreeMap<String, Value>>,
 }
 
@@ -73,11 +77,18 @@ fn mime(ext: &str) -> &'static str {
 
 impl Library {
     pub fn open(dir: PathBuf, max_gib: f64) -> Library {
+        Self::open_with_age(dir, max_gib, 90.0)
+    }
+
+    pub fn open_with_age(dir: PathBuf, max_gib: f64, max_age_days: f64) -> Library {
         let index = std::fs::read(dir.join("index.json")).ok().and_then(|b| serde_json::from_slice::<BTreeMap<String, Value>>(&b).ok())
             .unwrap_or_default();
         // entries whose file is gone (removed by hand) are forgotten
         let index = index.into_iter().filter(|(_, m)| dir.join(m["file"].as_str().unwrap_or("")).is_file()).collect();
-        Library { dir, max_bytes: (max_gib.max(0.0) * (1u64 << 30) as f64) as u64, index: Mutex::new(index) }
+        let l = Library { dir, max_bytes: (max_gib.max(0.0) * (1u64 << 30) as f64) as u64, max_age_s: max_age_days.max(0.0) * 86400.0,
+                          index: Mutex::new(index) };
+        l.expire();
+        l
     }
 
     fn save(&self, index: &BTreeMap<String, Value>) {
@@ -122,6 +133,8 @@ impl Library {
         }
         self.evict(&mut idx, &id);
         self.save(&idx);
+        drop(idx);
+        self.expire();
         Some(id)
     }
 
@@ -134,17 +147,51 @@ impl Library {
         }
     }
 
-    /// Least recently used first, until the library fits; never `keep` (the file just added).
+    /// Least recently used first, until the library fits; never `keep` (the file just added) nor a pinned one.
     fn evict(&self, idx: &mut BTreeMap<String, Value>, keep: &str) {
         let total = |idx: &BTreeMap<String, Value>| idx.values().map(|m| m["bytes"].as_u64().unwrap_or(0)).sum::<u64>();
         while total(idx) > self.max_bytes {
-            let Some(old) = idx.iter().filter(|(k, _)| *k != keep)
+            let Some(old) = idx.iter().filter(|(k, e)| *k != keep && e["pinned"] != true)
                 .min_by(|a, b| a.1["last_used"].as_f64().unwrap_or(0.0).total_cmp(&b.1["last_used"].as_f64().unwrap_or(0.0)))
                 .map(|(k, _)| k.clone()) else { break };
             if let Some(m) = idx.remove(&old) {
                 let _ = std::fs::remove_file(self.dir.join(m["file"].as_str().unwrap_or("")));
             }
         }
+    }
+
+    /// Removes the files older than the age limit that are not pinned. -> how many went.
+    pub fn expire(&self) -> usize {
+        if self.max_age_s <= 0.0 {
+            return 0;
+        }
+        let cut = now() - self.max_age_s;
+        let mut idx = self.index.lock().unwrap();
+        let old: Vec<String> = idx.iter().filter(|(_, e)| e["pinned"] != true && e["created"].as_f64().unwrap_or(0.0) < cut)
+            .map(|(k, _)| k.clone()).collect();
+        for k in &old {
+            if let Some(m) = idx.remove(k) {
+                let _ = std::fs::remove_file(self.dir.join(m["file"].as_str().unwrap_or("")));
+            }
+        }
+        if !old.is_empty() {
+            self.save(&idx);
+        }
+        old.len()
+    }
+
+    /// Pins (kept past the age limit and never dropped for room) or unpins the file `id`. -> its entry.
+    pub fn pin(&self, id: &str, owner: &str, pinned: bool) -> Option<Value> {
+        let mut idx = self.index.lock().unwrap();
+        let e = idx.get_mut(id).filter(|e| may(e, owner))?;
+        e["pinned"] = json!(pinned);
+        let out = e.clone();
+        self.save(&idx);
+        Some(out)
+    }
+
+    pub fn max_age_days(&self) -> f64 {
+        self.max_age_s / 86400.0
     }
 
     /// The file `id` and its entry, when `owner` may use it (the main key may use any); its last use is now.
@@ -164,6 +211,7 @@ impl Library {
 
     /// Newest first: `kind` (image, video, audio) and `source` (generated, uploaded) filter.
     pub fn list(&self, owner: &str, kind: Option<&str>, source: Option<&str>) -> Vec<Value> {
+        self.expire();
         let mut v: Vec<Value> = self.index.lock().unwrap().values()
             .filter(|e| may(e, owner) && kind.is_none_or(|k| e["kind"] == k) && source.is_none_or(|s| e["source"] == s)).cloned().collect();
         v.sort_by(|a, b| b["created"].as_f64().unwrap_or(0.0).total_cmp(&a["created"].as_f64().unwrap_or(0.0)));
@@ -259,7 +307,7 @@ pub async fn list(State(s): State<crate::AppState>, headers: HeaderMap, Query(q)
     let offset = q.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     let (n, used, max) = l.usage();
     let page: Vec<Value> = all.iter().skip(offset).take(limit).map(public).collect();
-    Json(json!({"object": "list", "data": page, "total": all.len(),
+    Json(json!({"object": "list", "data": page, "total": all.len(), "max_age_days": l.max_age_days(),
                 "library": if owner == MAIN { json!({"files": n, "bytes": used, "max_bytes": max}) } else { Value::Null }})).into_response()
 }
 
@@ -340,6 +388,18 @@ pub async fn content(State(s): State<crate::AppState>, headers: HeaderMap, Path(
     }
 }
 
+/// PATCH /v1/media/files/{id} {"pinned": true|false}: a pinned file stays past the age limit and is never dropped for room.
+pub async fn patch(State(s): State<crate::AppState>, headers: HeaderMap, Path(id): Path<String>, Json(req): Json<Value>) -> Response {
+    let (owner, l) = match (who(&s, &headers), lib()) { (Ok(o), Ok(l)) => (o, l), (Err(e), _) | (_, Err(e)) => return e };
+    let Some(pinned) = req["pinned"].as_bool() else {
+        return crate::error(StatusCode::BAD_REQUEST, "invalid_request_error", "send {\"pinned\": true} or {\"pinned\": false}");
+    };
+    match l.pin(&id, &owner, pinned) {
+        Some(e) => Json(public(&e)).into_response(),
+        None => crate::error(StatusCode::NOT_FOUND, "invalid_request_error", format!("no media file {id}")),
+    }
+}
+
 /// DELETE /v1/media/files/{id}
 pub async fn delete(State(s): State<crate::AppState>, headers: HeaderMap, Path(id): Path<String>) -> Response {
     let (owner, l) = match (who(&s, &headers), lib()) { (Ok(o), Ok(l)) => (o, l), (Err(e), _) | (_, Err(e)) => return e };
@@ -394,6 +454,24 @@ mod tests {
         let c = l.put(&[3u8; 1000], "uploaded", json!({}), Some(MAIN)).unwrap();
         assert!(l.entry(&a, MAIN).is_some() && l.entry(&c, MAIN).is_some() && l.entry(&b, MAIN).is_none());
         assert_eq!(std::fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "bin")).count(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_files_go_unless_pinned() {
+        let d = tmp();
+        let l = Library::open_with_age(d.clone(), 1.0, 90.0);
+        let a = l.put(&[1u8; 10], "uploaded", json!({}), Some(MAIN)).unwrap();
+        let b = l.put(&[2u8; 10], "uploaded", json!({}), Some(MAIN)).unwrap();
+        l.pin(&b, MAIN, true).unwrap();
+        // both made 100 days ago
+        for id in [&a, &b] {
+            l.index.lock().unwrap().get_mut(id.as_str()).unwrap()["created"] = json!(now() - 100.0 * 86400.0);
+        }
+        assert_eq!(l.expire(), 1);
+        assert!(l.entry(&a, MAIN).is_none() && l.entry(&b, MAIN).is_some(), "the pinned one stays");
+        l.pin(&b, MAIN, false);
+        assert_eq!(l.list(MAIN, None, None).len(), 0, "unpinned, it goes at the next look");
         let _ = std::fs::remove_dir_all(&d);
     }
 

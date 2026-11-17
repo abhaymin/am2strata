@@ -514,7 +514,17 @@ async fn main() -> Result<()> {
     let _ = media::ENGINE.set(state.media.clone()); // MP4/H.264 frames without ffmpeg (media.rs rust_frames)
     // the media library: what the server makes and what it is sent, kept for use again by id (media_files.rs)
     let max_gib = first.cfg.rest.get("media_files_max_gib").and_then(|v| v.as_f64()).unwrap_or(10.0);
-    let _ = media_files::FILES.set(Arc::new(media_files::Library::open(expand(&args.data_dir).join("media-files"), max_gib)));
+    let max_age = first.cfg.rest.get("media_files_max_age_days").and_then(|v| v.as_f64()).unwrap_or(90.0);
+    let _ = media_files::FILES.set(Arc::new(media_files::Library::open_with_age(expand(&args.data_dir).join("media-files"), max_gib, max_age)));
+    // the age limit is checked when the library is used, and once a day in case it is not
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(86400)).await;
+            if let Some(l) = media_files::FILES.get() {
+                l.expire();
+            }
+        }
+    });
     let unfinished = state.media_jobs.open(expand(&args.data_dir).join("media-jobs"));
     state.media_jobs.bind(state.clone());
     let _ = mgr.code.set(state.code_run.clone());
@@ -600,7 +610,7 @@ async fn main() -> Result<()> {
         .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/files", get(media_files::list).post(media_files::upload))
-        .route("/v1/media/files/{id}", get(media_files::get).delete(media_files::delete))
+        .route("/v1/media/files/{id}", get(media_files::get).delete(media_files::delete).patch(media_files::patch))
         .route("/v1/media/files/{id}/content", get(media_files::content))
         .route("/v1/media/jobs/{id}", get(media_jobs::status))
         .route("/v1/media/jobs/{id}/content", get(media_jobs::content))

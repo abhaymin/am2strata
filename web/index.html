@@ -330,7 +330,7 @@
           <span class="muted small" id="lib-usage"></span>
         </div>
         <div class="lib-grid" id="lib-grid"><p class="muted small">Opening the library&hellip;</p></div>
-        <p class="muted small">Every image, video and sound made here or sent to be edited or transcribed is kept once. Its id (<code>mf_…</code>) works in place of the file in any media request: <code>"images": ["mf_…"]</code>, <code>"file": "mf_…"</code>, a video's first frame. API: <code>GET /v1/media/files</code>.</p>
+        <p class="muted small">Every image, video and sound made here or sent to be edited or transcribed is kept once, for 90 days (the run config's <code>media_files_max_age_days</code>) unless you pin it. Its id (<code>mf_…</code>) works in place of the file in any media request: <code>"images": ["mf_…"]</code>, <code>"file": "mf_…"</code>, a video's first frame. API: <code>GET /v1/media/files</code>.</p>
       </div>
 
       <!-- ============================ Tools: media check, dubbing, productions ============================ -->

@@ -140,6 +140,7 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   add <file>                                            (puts a file in the library; prints its id)
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
+///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
 #[derive(Args)]
 pub struct MediaOpts {
     /// the answer's file (image, video, speech, song, dub and job --out all need it; refuse a missing one)
@@ -202,6 +203,7 @@ pub struct MediaOpts {
 ///   add <file>                                            (puts a file in the library; prints its id)
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
+///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
 #[allow(clippy::too_many_arguments)]
 pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
@@ -231,8 +233,8 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
-            "files" | "add" | "get" | "rm" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
-            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm")),
+            "files" | "add" | "get" | "rm" | "pin" | "unpin" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
+            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm, pin, unpin")),
         }
         Ok(())
     })();
@@ -414,7 +416,7 @@ fn cmd_files(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
             }
             for f in j["data"].as_array().into_iter().flatten() {
                 let what = f["prompt"].as_str().or(f["name"].as_str()).or(f["used_for"].as_str()).unwrap_or("");
-                println!("{}  {:5} {:9} {:>8} KB  {}", f["id"].as_str().unwrap_or("?"), f["kind"].as_str().unwrap_or(""),
+                println!("{}{} {:5} {:9} {:>8} KB  {}", f["id"].as_str().unwrap_or("?"), if f["pinned"] == true { " pinned" } else { "" }, f["kind"].as_str().unwrap_or(""),
                          f["source"].as_str().unwrap_or(""), f["bytes"].as_u64().unwrap_or(0) / 1024, what.chars().take(60).collect::<String>());
             }
             println!("{} file(s)", j["total"]);
@@ -432,6 +434,11 @@ fn cmd_files(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
             let bytes = send(client.get(format!("{url}/v1/media/files/{id}/content")))?.bytes().map_err(|e| e.to_string())?;
             write_file(&out, &bytes)?;
             println!("saved {} ({} KB)", out.display(), bytes.len() / 1024);
+        }
+        "pin" | "unpin" => {
+            let id = first.ok_or("pin needs an id")?;
+            send(client.patch(format!("{url}/v1/media/files/{id}")).json(&json!({"pinned": action == "pin"})))?;
+            println!("{id} {}", if action == "pin" { "pinned: kept until unpinned or removed" } else { "unpinned" });
         }
         _ => {
             let id = first.ok_or("rm needs an id")?;

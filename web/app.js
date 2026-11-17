@@ -655,15 +655,18 @@ async function loadLibrary() {
     if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
   } catch (e) { $("lib-grid").innerHTML = `<p class="muted small">Not opened: ${esc(String(e.message || e))}</p>`; return; }
   const l = j.library;
-  $("lib-usage").textContent = `${j.total} file${j.total === 1 ? "" : "s"}` + (l ? ` · ${kib(l.bytes)} of ${kib(l.max_bytes)}` : "");
+  $("lib-usage").textContent = `${j.total} file${j.total === 1 ? "" : "s"}` + (l ? ` · ${kib(l.bytes)} of ${kib(l.max_bytes)}` : "") +
+    (j.max_age_days ? ` · kept ${Math.round(j.max_age_days)} days unless pinned` : "");
   if (!j.data.length) { $("lib-grid").innerHTML = `<p class="muted small">Nothing yet. What you make or send to be edited appears here.</p>`; return; }
   $("lib-grid").innerHTML = j.data.map((f) => {
     const what = f.prompt || f.name || f.used_for || "";
-    const sub = [f.source === "generated" ? "made" : "sent", f.model, f.seed != null ? `seed ${f.seed}` : null, kib(f.bytes),
+    const left = j.max_age_days && !f.pinned ? Math.max(0, Math.ceil(j.max_age_days - (Date.now() / 1000 - f.created) / 86400)) : null;
+    const sub = [f.pinned ? "pinned" : left != null ? `goes in ${left} day${left === 1 ? "" : "s"}` : null, f.source === "generated" ? "made" : "sent", f.model, f.seed != null ? `seed ${f.seed}` : null, kib(f.bytes),
                  new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
     return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
       <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
       <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="pin" data-pinned="${f.pinned ? 1 : 0}">${f.pinned ? "Unpin" : "Pin"}</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="delete">Delete</button></div></figure>`;
@@ -695,6 +698,10 @@ $("lib-grid").addEventListener("click", async (e) => {
   const b = e.target.closest("[data-lib-act]"); if (!b) return;
   const fig = b.closest("figure"), id = fig.dataset.lib;
   if (b.dataset.libAct === "copy") { navigator.clipboard.writeText(id).then(() => toast("success", "Copied", id)); }
+  else if (b.dataset.libAct === "pin") {
+    const r = await fetch(`v1/media/files/${id}`, {method: "PATCH", headers: headers(true), body: JSON.stringify({pinned: b.dataset.pinned !== "1"})});
+    if (r.ok) loadLibrary(); else toast("error", "Not changed", `HTTP ${r.status}`);
+  }
   else if (b.dataset.libAct === "save") {
     const a = document.createElement("a"); a.href = await libUrl(id); a.download = id; a.click();
   } else if (b.dataset.libAct === "delete") {

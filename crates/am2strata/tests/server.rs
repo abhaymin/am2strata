@@ -3192,8 +3192,13 @@ fn media_is_kept_in_the_library_and_used_again_by_id() {
     assert_eq!(again["id"], up["id"]);
     let (_, _, list) = get_as(PHONE, "/v1/media/files?kind=image");
     assert_eq!(serde_json::from_slice::<Value>(&list).unwrap()["total"], 1);
-    // deleted: gone from the library and from use
+    // pinned: kept past the age limit; the entry says so
     let id = up["id"].as_str().unwrap();
+    let r = reqwest::blocking::Client::new().patch(format!("{}/v1/media/files/{id}", s.base)).bearer_auth(PHONE).json(&json!({"pinned": true})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, _, e) = get_as(PHONE, &format!("/v1/media/files/{id}"));
+    assert_eq!(serde_json::from_slice::<Value>(&e).unwrap()["pinned"], true);
+    // deleted: gone from the library and from use
     let r = reqwest::blocking::Client::new().delete(format!("{}/v1/media/files/{id}", s.base)).bearer_auth(PHONE).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(get_as(PHONE, &format!("/v1/media/files/{id}")).0, 404);

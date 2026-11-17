@@ -100,8 +100,11 @@ curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: a
 - **Who sees what:** the main key sees every file; a client key lists and reads the files it sent or had made. An id
   is the file's content hash, so a request holding one may use the file.
 - **Room:** `"media_files_max_gib"` in the run config (default 10); past it the least recently used files go.
-- **In the app:** Media › Library, with Edit this, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
-  `media add <file>`, `media get <id> --out f`, `media rm <id>`.
+- **Age:** a file is kept `"media_files_max_age_days"` (default 90) from when it was first made or sent, then it goes,
+  unless it is **pinned**: `PATCH /v1/media/files/{id}` `{"pinned": true}`, the Pin button, or `media pin <id>`. A
+  pinned file stays until unpinned or deleted, and is never the one dropped for room.
+- **In the app:** Media › Library, with Edit this, Pin, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
+  `media add <file>`, `media get <id> --out f`, `media rm <id>`, `media pin <id>`, `media unpin <id>`.
 
 ## Productions: one long piece from parts
 

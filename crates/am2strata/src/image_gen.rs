@@ -525,6 +525,9 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let owner = crate::media_files::owner_of(&s, &headers);
     for d in data.iter_mut() {
         use base64::Engine as _;
+        if let Some(seed) = d["seed"].as_u64() {
+            mon.media_seed(job, seed);   // each image of a batch is kept with its own seed
+        }
         if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d["b64_json"].as_str().unwrap_or("")) {
             // kept in the media library: the id uses it again (an edit's image, a video's first frame, a chat)
             if let Some(id) = mon.media_file_add(job, "png", png) {
