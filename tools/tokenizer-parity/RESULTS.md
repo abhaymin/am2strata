@@ -19,7 +19,6 @@ characters, chat-template control tokens). llama-tokenize from llama.cpp's build
 
 The one difference (both tekken models) is Devanagari/Tamil/Bengali text: our pattern keeps combining marks (`\p{M}`)
 with the letters before them; llama.cpp's own regex engine splits them off, giving more and shorter tokens (24 against
-18 here). Mistral's reference tokenizer (tiktoken-style regex with full Unicode classes) keeps the marks, so ours is
-the closer one; left as is.
+18 here). Which one Mistral's own tokenizer (mistral-common) gives is not checked yet; left as is until it is.
 
 Speed: 1.6-2.7 MB/s for the byte-level BPE vocabularies, 8.5-10 MB/s for SPM (Mixtral), single thread.
