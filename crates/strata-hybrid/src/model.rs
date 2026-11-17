@@ -117,7 +117,7 @@ impl QMat {
             return xs.iter().map(|x| self.mul(x)).collect();
         }
         let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) else {
-            return xs.iter().map(|x| self.mul(x)).collect();
+            return self.matmul_dequant(xs);
         };
         let int8 = self.int8(fast);
         let q8: Vec<crate::cpu_q8::Q8K> = if int8 { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
@@ -144,6 +144,27 @@ impl QMat {
         (0..n).map(|t| (0..self.rows).map(|r| flat[r * n + t]).collect()).collect()
     }
 
+    /// `matmul` for encodings with no row kernel here (the IQ types): each row is unpacked once for every input,
+    /// instead of once per input. The same values as `matvec`'s fallback (the same row, the same rounded input).
+    fn matmul_dequant(&self, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let n = xs.len();
+        let rounded: Vec<Vec<f32>> = xs.iter().map(|x| self.vdt.round_trip(x)).collect();
+        let chunk = (self.rows / (rayon::current_num_threads() * 4)).max(16);
+        let mut flat = vec![0f32; self.rows * n];
+        flat.par_chunks_mut(chunk * n).enumerate().for_each(|(ci, ys)| {
+            let mut row = vec![0f32; self.cols];
+            for (k, yr) in ys.chunks_mut(n).enumerate() {
+                let r = ci * chunk + k;
+                strata_pack::quants::dequantize_into(&self.ty, &self.data[r * self.row_bytes..(r + 1) * self.row_bytes], &mut row)
+                    .expect("weight row");
+                for t in 0..n {
+                    yr[t] = dot(&row, &rounded[t]);
+                }
+            }
+        });
+        (0..n).map(|t| (0..self.rows).map(|r| flat[r * n + t]).collect()).collect()
+    }
+
     /// The same matrix stored differently (a pack's copy of a float tensor).
     /// The GGUF type name of the stored encoding.
     pub fn ty(&self) -> &str {
@@ -160,13 +181,14 @@ impl QMat {
 
     /// Several products at once, y_i = W_i x_i, in one parallel pass over all their rows: one join instead of one per
     /// matrix (a MoE layer's chosen experts, as ggml's mul_mat_id). Every value is the one `matvec` gives: the same row
-    /// function on the same rounded input. None when a matrix is on a GPU or has no CPU kernel here (the caller then
-    /// multiplies one by one).
+    /// function on the same rounded input. None when a matrix is on a GPU (the caller then multiplies one by one).
     pub fn mul_set(jobs: &[(&QMat, &[f32])]) -> Option<Vec<Vec<f32>>> {
         use crate::cpu_dot::Fast;
         enum In {
             Int(Fast, crate::cpu_q8::Q8K),
             F(Fast, Vec<f32>),
+            // no row kernel (the IQ types): unpacked, then a dot product, as matvec's fallback
+            D(Vec<f32>),
         }
         let mut ins = Vec::with_capacity(jobs.len());
         for (q, x) in jobs {
@@ -175,7 +197,10 @@ impl QMat {
                 return None;
             }
             debug_assert_eq!(x.len(), q.cols);
-            let fast = Fast::of(&q.ty)?;
+            let Some(fast) = Fast::of(&q.ty) else {
+                ins.push(In::D(q.vdt.round_trip(x)));
+                continue;
+            };
             match q.int8(fast).then(|| crate::cpu_q8::Q8K::quantize_for(fast, x)).flatten() {
                 Some(xq) => ins.push(In::Int(fast, xq)),
                 None => ins.push(In::F(fast, q.vdt.round_trip(x))),
@@ -188,12 +213,17 @@ impl QMat {
             .collect();
         tasks.into_par_iter().for_each(|(j, r0, ys)| {
             let q = jobs[j].0;
+            let mut buf = if matches!(ins[j], In::D(_)) { vec![0f32; q.cols] } else { Vec::new() };
             for (k, y) in ys.iter_mut().enumerate() {
                 let r = r0 + k;
                 let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
                 *y = match &ins[j] {
                     In::Int(f, xq) => crate::cpu_q8::row_dot(*f, row, xq),
                     In::F(f, x) => crate::cpu_dot::row_dot(*f, row, x),
+                    In::D(x) => {
+                        strata_pack::quants::dequantize_into(&q.ty, row, &mut buf).expect("weight row");
+                        dot(&buf, x)
+                    }
                 };
             }
         });
@@ -202,12 +232,13 @@ impl QMat {
 
     /// Several matmuls in one parallel pass, Y_i = W_i X_i where each X_i is several inputs (a prompt chunk's experts, each
     /// with the tokens that chose it). One join instead of one per matrix; every value is the one `matmul` gives (the same
-    /// row functions on the same rounded inputs). None when a matrix is on a GPU or has no CPU kernel here.
+    /// row functions on the same rounded inputs). None when a matrix is on a GPU.
     pub fn matmul_set(jobs: &[(&QMat, &[Vec<f32>])]) -> Option<Vec<Vec<Vec<f32>>>> {
         use crate::cpu_dot::Fast;
         enum In {
             Int(Fast, Vec<crate::cpu_q8::Q8K>),
             F(Fast, Vec<Vec<f32>>),
+            D(Vec<Vec<f32>>),
         }
         let mut ins = Vec::with_capacity(jobs.len());
         for (q, xs) in jobs {
@@ -215,7 +246,10 @@ impl QMat {
             if q.gpu.is_some() {
                 return None;
             }
-            let fast = Fast::of(&q.ty)?;
+            let Some(fast) = Fast::of(&q.ty) else {
+                ins.push(In::D(xs.iter().map(|x| q.vdt.round_trip(x)).collect()));
+                continue;
+            };
             let q8: Vec<crate::cpu_q8::Q8K> = if q.int8(fast) { xs.iter().filter_map(|x| crate::cpu_q8::Q8K::quantize_for(fast, x)).collect() } else { Vec::new() };
             ins.push(if q.int8(fast) && q8.len() == xs.len() { In::Int(fast, q8) } else { In::F(fast, xs.iter().map(|x| q.vdt.round_trip(x)).collect()) });
         }
@@ -227,12 +261,17 @@ impl QMat {
         tasks.into_par_iter().for_each(|(j, r0, ys)| {
             let q = jobs[j].0;
             let n = jobs[j].1.len();
+            let mut buf = if matches!(ins[j], In::D(_)) { vec![0f32; q.cols] } else { Vec::new() };
             for (k, yr) in ys.chunks_mut(n).enumerate() {
                 let r = r0 + k;
                 let row = &q.data[r * q.row_bytes..(r + 1) * q.row_bytes];
                 match &ins[j] {
                     In::Int(f, q8) => crate::cpu_q8::row_dot_many(*f, row, q8, yr),
                     In::F(f, xs) => for t in 0..n { yr[t] = crate::cpu_dot::row_dot(*f, row, &xs[t]); },
+                    In::D(xs) => {
+                        strata_pack::quants::dequantize_into(&q.ty, row, &mut buf).expect("weight row");
+                        for t in 0..n { yr[t] = dot(&buf, &xs[t]); }
+                    }
                 }
             }
         });
@@ -371,6 +410,25 @@ fn rms_norm(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 /// and flip a near-tie (the remote tier's B3 run on the Mac). This uses only IEEE-exact operations (+, *, rounding) in
 /// f64: x = k ln2 + r with |r| <= ln2 / 2, e^r by a degree-11 polynomial (relative error under 1e-14), times 2^k. The f32
 /// result is within an ulp of the true value, and the same everywhere.
+/// The other transcendental functions the model uses, through f64 and rounded to f32: libm's f64 results are
+/// within an ulp of the true value on every platform, so after rounding to f32 they agree bit for bit (the f32
+/// versions differ between glibc and Apple's libm, which changed tokens across machines).
+pub(crate) fn ln_f32(x: f32) -> f32 {
+    (x as f64).ln() as f32
+}
+fn ln_1p_f32(x: f32) -> f32 {
+    (x as f64).ln_1p() as f32
+}
+fn powf_f32(x: f32, y: f32) -> f32 {
+    (x as f64).powf(y as f64) as f32
+}
+fn sin_f32(x: f32) -> f32 {
+    (x as f64).sin() as f32
+}
+fn cos_f32(x: f32) -> f32 {
+    (x as f64).cos() as f32
+}
+
 pub(crate) fn exp_f32(x: f32) -> f32 {
     if x.is_nan() {
         return x;
@@ -407,7 +465,7 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 fn softplus(x: f32) -> f32 {
-    if x > 20.0 { x } else { x.exp().ln_1p() }
+    if x > 20.0 { x } else { ln_1p_f32(exp_f32(x)) }
 }
 
 fn relu_sqr(x: f32) -> f32 {
@@ -448,7 +506,7 @@ impl Rope {
         let ext_factor = if kind == "yarn" { 1.0 } else { 0.0 };
         let mut attn_factor = 1.0f32;
         if ext_factor != 0.0 {
-            let gm = |s: f32, m: f32| if s <= 1.0 { 1.0 } else { 0.1 * m * s.ln() + 1.0 };
+            let gm = |s: f32, m: f32| if s <= 1.0 { 1.0 } else { 0.1 * m * ln_f32(s) + 1.0 };
             let fac = 1.0 / freq_scale;
             attn_factor = if log_mul != 0.0 {
                 let m = if arch == "deepseek2" && log_mul != 1.0 { log_mul } else { 1.0 };
@@ -456,17 +514,17 @@ impl Rope {
             } else {
                 gm(fac, 1.0)
             };
-            attn_factor *= 1.0 / (1.0 + 0.1 * fac.ln());
+            attn_factor *= 1.0 / (1.0 + 0.1 * ln_f32(fac));
         }
         attn_factor *= f("rope.scaling.attn_factor").unwrap_or(1.0);
-        let corr_dim = |rot: f32| n_dims as f32 * (n_ctx_orig / (rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln());
+        let corr_dim = |rot: f32| n_dims as f32 * ln_f32(n_ctx_orig / (rot * 2.0 * std::f32::consts::PI)) / (2.0 * ln_f32(base));
         let corr = [corr_dim(beta_fast).floor().max(0.0), corr_dim(beta_slow).ceil().min(n_dims as f32 - 1.0)];
         Rope { n_dims, base, freq_scale, ext_factor, attn_factor, corr, neox, factors }
     }
 
     /// The (cos, sin) pairs of position `pos` (the device rotates with these).
     pub(crate) fn table(&self, pos: usize) -> Vec<f32> {
-        let theta_scale = self.base.powf(-2.0 / self.n_dims as f32);
+        let theta_scale = powf_f32(self.base, -2.0 / self.n_dims as f32);
         let mut theta = pos as f32;
         let mut out = Vec::with_capacity(self.n_dims);
         for i0 in (0..self.n_dims).step_by(2) {
@@ -478,10 +536,10 @@ impl Rope {
                 let y = ((i0 / 2) as f32 - self.corr[0]) / (self.corr[1] - self.corr[0]).max(0.001);
                 let ramp = (1.0 - y.clamp(0.0, 1.0)) * self.ext_factor;
                 th = interp * (1.0 - ramp) + extrap * ramp;
-                mscale *= 1.0 + 0.1 * (1.0 / self.freq_scale).ln();
+                mscale *= 1.0 + 0.1 * ln_f32(1.0 / self.freq_scale);
             }
-            out.push(th.cos() * mscale);
-            out.push(th.sin() * mscale);
+            out.push(cos_f32(th) * mscale);
+            out.push(sin_f32(th) * mscale);
             theta *= theta_scale;
         }
         out
@@ -952,8 +1010,8 @@ impl Model {
                 // llama.cpp's deepseek2 graph pre-scales kq by YaRN's magnitude, as DeepSeek's reference does
                 let fs = 1.0 / fl("rope.scaling.factor").filter(|v| *v > 0.0).unwrap_or(1.0);
                 let rope_tmp = Rope::from_gguf(&g, &arch, rope_dim, false, None);
-                let af_org = rope_tmp.attn_factor * (1.0 + 0.1 * (1.0 / fs).ln());
-                let mscale = af_org * (1.0 + 0.1 * fl("rope.scaling.yarn_log_multiplier").unwrap_or(0.0) * (1.0 / fs).ln());
+                let af_org = rope_tmp.attn_factor * (1.0 + 0.1 * ln_f32(1.0 / fs));
+                let mscale = af_org * (1.0 + 0.1 * fl("rope.scaling.yarn_log_multiplier").unwrap_or(0.0) * ln_f32(1.0 / fs));
                 parts.push((vecf(&p("attn_norm.weight"))?, Block::Mla(Mla {
                     q_a, q_b, kv_a: take(&p("attn_kv_a_mqa.weight"))?, kv_norm: vecf(&p("attn_kv_a_norm.weight"))?,
                     k_b: take(&p("attn_k_b.weight"))?, v_b: take(&p("attn_v_b.weight"))?, o: take(&p("attn_output.weight"))?,
@@ -1100,10 +1158,10 @@ impl Model {
         logits
     }
 
-    /// Whether a prompt can go through `forward_batch`: every model without hyper-connections. Attention, dense and MoE
-    /// feed-forwards are batched; the other blocks run token by token inside it.
+    /// Whether a prompt can go through `forward_batch`: every model (with hyper-connections through `forward_hc_batch`).
+    /// Attention, dense and MoE feed-forwards are batched; the other blocks run token by token inside it.
     pub fn batchable(&self) -> bool {
-        self.hc == 0
+        true
     }
 
     /// Several prompt tokens at once (a chunk): each matrix is applied to all of them together (`QMat::matmul`), the
@@ -1111,6 +1169,9 @@ impl Model {
     /// computes. -> the logits after the last token. Only for `batchable` models.
     pub fn forward_batch(&self, st: &mut State, tokens: &[u32]) -> Vec<f32> {
         debug_assert!(self.batchable());
+        if self.hc > 0 {
+            return self.forward_hc_batch(st, tokens);
+        }
         let base = st.pos;
         let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize)).collect();
         for (l, layer) in self.layers.iter().enumerate() {
@@ -1185,6 +1246,71 @@ impl Model {
         st.pos += 1;
         st.prev.push(token);
         let (h, _) = self.hc_mix(&res, self.hc_head.as_ref().expect("hc head"));
+        self.output.mul(&h)
+    }
+
+    /// A prompt chunk with hyper-connections: what `forward_hc` computes token by token, with the mixer's projections
+    /// (GDN or attention) and the MoE batched across the chunk. The stream mixers and the per-layer embedding stay per
+    /// token; the embedding reads the tokens before it, so `st.prev` grows token by token there and is reset after.
+    fn forward_hc_batch(&self, st: &mut State, tokens: &[u32]) -> Vec<f32> {
+        let base = st.pos;
+        let n0 = st.prev.len();
+        let mut res: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize).repeat(self.hc)).collect();
+        for (l, layer) in self.layers.iter().enumerate() {
+            let [before_attn, before_ffn] = layer.hc.as_ref().expect("hc layer");
+            if let Some(p) = &layer.ple {
+                for (i, (&t, r)) in tokens.iter().zip(res.iter_mut()).enumerate() {
+                    st.pos = base + i;
+                    self.ple(p, t, r, st);
+                    st.prev.push(t);
+                }
+                st.prev.truncate(n0);
+            }
+            let (curs, injs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = res.iter().map(|r| self.hc_mix(r, before_attn)).unzip();
+            let block = &layer.parts[0].1;
+            let t0 = times::on().then(std::time::Instant::now);
+            let outs: Vec<Vec<f32>> = match block {
+                Block::Gdn(b) => {
+                    st.pos = base;
+                    self.gdn_batch(l, b, &curs, st)
+                }
+                Block::Attn(a) if a.qsa.is_none() => {
+                    let (q, k, v) = (a.q.matmul(&curs), a.k.matmul(&curs), a.v.matmul(&curs));
+                    let mut atts = Vec::with_capacity(tokens.len());
+                    for (i, ((qv, kv), vv)) in q.into_iter().zip(k).zip(v).enumerate() {
+                        st.pos = base + i;
+                        atts.push(self.attend(l * 2, a, qv, kv, vv, None, st));
+                    }
+                    let mut o = a.o.matmul(&atts);
+                    o.iter_mut().for_each(|y| add_bias(y, &a.o_b));
+                    o
+                }
+                Block::Attn(a) => curs.iter().enumerate().map(|(i, h)| {
+                    st.pos = base + i;
+                    self.attention(l * 2, a, h, st)
+                }).collect(),
+                _ => unreachable!("a mixer"),
+            };
+            if let Some(t0) = t0 {
+                times::add(times::kind(block), t0);
+            }
+            for ((r, out), inj) in res.iter_mut().zip(&outs).zip(&injs) {
+                self.hc_combine(r, out, inj);
+            }
+            let (curs, injs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = res.iter().map(|r| self.hc_mix(r, before_ffn)).unzip();
+            let Block::Moe(m) = &layer.parts[1].1 else { unreachable!("a feed-forward") };
+            let t0 = times::on().then(std::time::Instant::now);
+            let outs = self.moe_batch(m, &curs);
+            if let Some(t0) = t0 {
+                times::add(times::kind(&layer.parts[1].1), t0);
+            }
+            for ((r, out), inj) in res.iter_mut().zip(&outs).zip(&injs) {
+                self.hc_combine(r, out, inj);
+            }
+        }
+        st.pos = base + tokens.len();
+        st.prev.extend_from_slice(tokens);
+        let (h, _) = self.hc_mix(res.last().expect("a token"), self.hc_head.as_ref().expect("hc head"));
         self.output.mul(&h)
     }
 
@@ -1311,7 +1437,7 @@ impl Model {
 
     fn temp_scale(&self, pos: usize) -> f32 {
         match self.attn_temp {
-            Some((s, floor)) => ((pos as f32 / floor).floor() + 1.0).ln() * s + 1.0,
+            Some((s, floor)) => ln_f32((pos as f32 / floor).floor() + 1.0) * s + 1.0,
             None => 1.0,
         }
     }
@@ -1345,7 +1471,7 @@ impl Model {
         let mut y = vec![0f32; di];
         for hh in 0..nh {
             let dts = softplus(dt[hh] + dt_b[hh]);
-            let da = (dts * a[hh]).exp();
+            let da = exp_f32(dts * a[hh]);
             let g = hh / (nh / ng);
             let bg = &bm[g * ds..(g + 1) * ds];
             let cg = &cm[g * ds..(g + 1) * ds];
@@ -1441,7 +1567,7 @@ impl Model {
         y.par_chunks_mut(sv).zip(state.par_chunks_mut(sv * sv)).enumerate().for_each(|(hh, (out, s))| {
             let (qh, kh) = (&q[(hh % nk) * sk..(hh % nk + 1) * sk], &k[(hh % nk) * sk..(hh % nk + 1) * sk]);
             let vh = &v[hh * sv..(hh + 1) * sv];
-            let decay = (softplus(al[hh] + dt_b[hh]) * a[hh]).exp();
+            let decay = exp_f32(softplus(al[hh] + dt_b[hh]) * a[hh]);
             delta_step(s, kh, vh, qh, decay, sigmoid(be[hh]), scale, out);
         });
         for ((yh, nw), zh) in y.chunks_mut(sv).zip(std::iter::repeat(ssm_norm)).zip(z.chunks(sv)) {
@@ -1682,7 +1808,7 @@ impl Model {
         let d = self.n_embd;
         let logits: Vec<f32> = (0..m.n_expert).map(|e| dot(&m.router[e * d..(e + 1) * d], h)).collect();
         let probs: Vec<f32> = match m.gating {
-            Gating::Sigmoid => logits.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect(),
+            Gating::Sigmoid => logits.iter().map(|&v| sigmoid(v)).collect(),
             Gating::Softmax => {
                 let mut p = logits.clone();
                 softmax(&mut p);
@@ -1956,6 +2082,23 @@ impl Model {
         out
     }
 
+    /// Whether all of this expert's matrices were placed on a GPU (the first tier), as gpu::place counts it: such an
+    /// expert is never given to another machine. One split between a GPU and the CPU can still go to another machine.
+    pub fn expert_on_device(&self, layer: usize, e: usize) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.moes().find(|m| m.layer == layer).is_some_and(|m| {
+                e < m.n_expert && m.up_exps.0[e].gpu.is_some() && m.down_exps.0[e].gpu.is_some()
+                    && m.gate_exps.as_ref().is_none_or(|g| g.0[e].gpu.is_some())
+            })
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let _ = (layer, e);
+            false
+        }
+    }
+
     /// The MoE layers, in order.
     /// Every matrix the forward pass multiplies by, for placing on devices: the ones every token uses (the output
     /// projection first, then each layer's attention / SSM / dense / shared-expert / latent ones), and the routed
@@ -2078,7 +2221,7 @@ fn softmax(v: &mut [f32]) {
     let m = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
     for s in v.iter_mut() {
-        *s = (*s - m).exp();
+        *s = exp_f32(*s - m);
         sum += *s;
     }
     v.iter_mut().for_each(|s| *s /= sum);
@@ -2149,11 +2292,11 @@ mod tests {
     fn mul_set_equals_one_by_one_exactly() {
         let mut seed = 0x0F05_ED00_1234_5678u64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        let shapes = [("Q4_K", 70, 512), ("Q5_K", 33, 256), ("Q6_K", 41, 512), ("Q8_0", 64, 192), ("F32", 9, 96)];
+        let shapes = [("Q4_K", 70, 512), ("Q5_K", 33, 256), ("Q6_K", 41, 512), ("Q8_0", 64, 192), ("F32", 9, 96), ("IQ3_XXS", 21, 512), ("Q5_0", 12, 64)];
         let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c)| random_qmat(ty, r, c, &mut next)).collect();
         let xs: Vec<Vec<f32>> = mats.iter().map(|q| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect();
         let jobs: Vec<(&QMat, &[f32])> = mats.iter().zip(&xs).map(|(q, x)| (q, &x[..])).collect();
-        let fused = QMat::mul_set(&jobs).expect("every type here has a CPU kernel");
+        let fused = QMat::mul_set(&jobs).expect("no matrix on a GPU");
         assert_eq!(fused.len(), mats.len());
         for ((q, x), y) in mats.iter().zip(&xs).zip(&fused) {
             assert_eq!(y, &q.mul(x), "{}", q.ty);
@@ -2169,11 +2312,11 @@ mod tests {
     fn matmul_set_equals_matmul_exactly() {
         let mut seed = 0x7E57_5E70_0000_0001u64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        let shapes = [("Q4_K", 70, 512, 3), ("Q5_K", 33, 256, 1), ("Q6_K", 41, 512, 5), ("Q8_0", 64, 192, 2), ("F32", 9, 96, 4)];
+        let shapes = [("Q4_K", 70, 512, 3), ("Q5_K", 33, 256, 1), ("Q6_K", 41, 512, 5), ("Q8_0", 64, 192, 2), ("F32", 9, 96, 4), ("IQ3_XXS", 21, 512, 3), ("Q5_0", 12, 64, 2)];
         let mats: Vec<QMat> = shapes.iter().map(|&(ty, r, c, _)| random_qmat(ty, r, c, &mut next)).collect();
         let xss: Vec<Vec<Vec<f32>>> = mats.iter().zip(&shapes).map(|(q, s)| (0..s.3).map(|_| (0..q.cols).map(|_| (next() % 4001) as f32 / 1000.0 - 2.0).collect()).collect()).collect();
         let jobs: Vec<(&QMat, &[Vec<f32>])> = mats.iter().zip(&xss).map(|(q, x)| (q, &x[..])).collect();
-        let set = QMat::matmul_set(&jobs).expect("every type here has a CPU kernel");
+        let set = QMat::matmul_set(&jobs).expect("no matrix on a GPU");
         for ((q, xs), ys) in mats.iter().zip(&xss).zip(&set) {
             let want: Vec<Vec<f32>> = q.matmul(xs);
             assert_eq!(ys, &want, "{}", q.ty);
@@ -2184,7 +2327,7 @@ mod tests {
     fn matmul_equals_matvec_exactly() {
         let mut seed = 0x51_7CC1_B727_220Au64;
         let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
-        for ty in ["Q4_K", "Q6_K", "Q8_0", "F32", "Q5_0"] {
+        for ty in ["Q4_K", "Q6_K", "Q8_0", "F32", "Q5_0", "IQ3_XXS"] {
             let (rows, cols) = (37, 512);
             let rb = QMat::row_bytes(ty, cols);
             let mut data: Vec<u8> = (0..rows * rb).map(|_| next() as u8).collect();

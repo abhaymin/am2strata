@@ -182,7 +182,10 @@ fn main() {
         // without mlock, advice does not keep them: the hot experts are copied into memory of our own
         // (AM2_RESIDENT_COPY=0 keeps the old advice-only behaviour, to compare)
         let how = if r.locked {
-            "mlock"
+            match pack::keep_always(&mut m) {
+                "mlock" => "mlock",
+                _ => "mlock always=copy",
+            }
         } else if std::env::var("AM2_RESIDENT_COPY").ok().as_deref() != Some("0") {
             pack::copy_resident(&mut m, &r);
             "copy"
@@ -195,49 +198,6 @@ fn main() {
     } else {
         None
     };
-    // another machine's memory, after this machine's RAM: the next-hottest experts that would otherwise come from the disk
-    if let Some(addr) = arg("--remote-experts") {
-        let Some(r) = &res else { fail("--remote-experts needs --resident-experts: this machine's own RAM tier is placed first".into()) };
-        let pin = arg("--remote-pin").map(|p| p.trim().to_lowercase()).filter(|p| p.len() == 64)
-            .unwrap_or_else(|| fail("--remote-experts needs --remote-pin: the expert host's pin (64 hex digits)".into()));
-        let id = remote::Identity::load(std::path::Path::new(&arg("--identity").unwrap_or_else(|| fail("--remote-experts needs --identity node-tls.json".into()))))
-            .unwrap_or_else(|e| fail(e));
-        let model_id = remote::fingerprint(std::path::Path::new(&model_path)).unwrap_or_else(|e| fail(e));
-        let ne = m.profile_experts;
-        match remote::Remote::connect(&addr, &pin, &id, &model_id, n_layers, ne) {
-            Ok((mut rm, free)) => {
-                let sizes: std::collections::HashMap<(usize, usize), u64> = m.moes().flat_map(|x| (0..x.n_expert).map(move |e|
-                    ((x.layer, e), (x.up_exps.0[e].data.len() + x.down_exps.0[e].data.len() + x.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64))).collect();
-                // the profile's order, then layer by layer; only experts not already in this machine's RAM
-                let mut order: Vec<(usize, usize)> = profile.as_ref().map(|p| p.ranked.iter().map(|&(l, e)| (l as usize, e as usize)).collect()).unwrap_or_default();
-                let mut seen = std::collections::HashSet::new();
-                order.retain(|k| sizes.contains_key(k) && seen.insert(*k));
-                let mut rest: Vec<(usize, usize)> = sizes.keys().copied().filter(|k| !seen.contains(k)).collect();
-                rest.sort();
-                order.extend(rest);
-                let (mut take, mut bytes) = (Vec::new(), 0u64);
-                for k in order {
-                    if r.resident.get(k.0 * ne + k.1).copied().unwrap_or(false) {
-                        continue;
-                    }
-                    let b = sizes[&k];
-                    if bytes + b > free {
-                        break;
-                    }
-                    bytes += b;
-                    take.push(k);
-                }
-                rm.assign(&m, &take).unwrap_or_else(|e| fail(format!("--remote-experts {addr}: {e}")));
-                placement = format!("{placement} remote={addr} remote_experts={} remote_gib={:.2}", rm.n_held, rm.bytes as f64 / (1u64 << 30) as f64);
-                m.remote = Some(rm);
-            }
-            // no worker: the model still runs, its cold experts from this machine's disk
-            Err(e) => {
-                eprintln!("remote experts: {e}; running without them");
-                placement = format!("{placement} remote_unavailable");
-            }
-        }
-    }
     // the experts each step chose, asked for at once: on with residency (the cold ones are on disk), AM2_PREFETCH=0/1
     let prefetch = match std::env::var("AM2_PREFETCH").ok().as_deref() { Some("0") => false, Some(_) => true, None => res.is_some() };
     m.prefetch.store(prefetch, std::sync::atomic::Ordering::Relaxed);
@@ -263,6 +223,50 @@ fn main() {
     #[cfg(not(feature = "gpu"))]
     if arg("--devices").is_some() {
         fail("--devices: this am2strata-hybrid was built without the gpu feature".into());
+    }
+    // another machine's memory, the third tier: after this machine's GPUs (placed just above) and its RAM, the next-hottest
+    // experts that would otherwise come from the disk; an expert on a GPU or in RAM here is never sent away
+    if let Some(addr) = arg("--remote-experts") {
+        let Some(r) = &res else { fail("--remote-experts needs --resident-experts: this machine's own RAM tier is placed first".into()) };
+        let pin = arg("--remote-pin").map(|p| p.trim().to_lowercase()).filter(|p| p.len() == 64)
+            .unwrap_or_else(|| fail("--remote-experts needs --remote-pin: the expert host's pin (64 hex digits)".into()));
+        let id = remote::Identity::load(std::path::Path::new(&arg("--identity").unwrap_or_else(|| fail("--remote-experts needs --identity node-tls.json".into()))))
+            .unwrap_or_else(|e| fail(e));
+        let model_id = remote::fingerprint(std::path::Path::new(&model_path)).unwrap_or_else(|e| fail(e));
+        let ne = m.profile_experts;
+        match remote::Remote::connect(&addr, &pin, &id, &model_id, n_layers, ne) {
+            Ok((mut rm, free)) => {
+                let sizes: std::collections::HashMap<(usize, usize), u64> = m.moes().flat_map(|x| (0..x.n_expert).map(move |e|
+                    ((x.layer, e), (x.up_exps.0[e].data.len() + x.down_exps.0[e].data.len() + x.gate_exps.as_ref().map_or(0, |g| g.0[e].data.len())) as u64))).collect();
+                // the profile's order, then layer by layer; only experts not already in this machine's RAM
+                let mut order: Vec<(usize, usize)> = profile.as_ref().map(|p| p.ranked.iter().map(|&(l, e)| (l as usize, e as usize)).collect()).unwrap_or_default();
+                let mut seen = std::collections::HashSet::new();
+                order.retain(|k| sizes.contains_key(k) && seen.insert(*k));
+                let mut rest: Vec<(usize, usize)> = sizes.keys().copied().filter(|k| !seen.contains(k)).collect();
+                rest.sort();
+                order.extend(rest);
+                let (mut take, mut bytes) = (Vec::new(), 0u64);
+                for k in order {
+                    if r.resident.get(k.0 * ne + k.1).copied().unwrap_or(false) || m.expert_on_device(k.0, k.1) {
+                        continue;
+                    }
+                    let b = sizes[&k];
+                    if bytes + b > free {
+                        break;
+                    }
+                    bytes += b;
+                    take.push(k);
+                }
+                rm.assign(&m, &take).unwrap_or_else(|e| fail(format!("--remote-experts {addr}: {e}")));
+                placement = format!("{placement} remote={addr} remote_experts={} remote_gib={:.2}", rm.n_held, rm.bytes as f64 / (1u64 << 30) as f64);
+                m.remote = Some(rm);
+            }
+            // no worker: the model still runs, its cold experts from this machine's disk
+            Err(e) => {
+                eprintln!("remote experts: {e}; running without them");
+                placement = format!("{placement} remote_unavailable");
+            }
+        }
     }
     // a whole token on the device (dense attention models whose matrices are all on one device): asked with --graph, and
     // taken by itself whenever --devices placed such a model, because the matrix-by-matrix path syncs with the device

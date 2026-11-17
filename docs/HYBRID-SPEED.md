@@ -227,6 +227,44 @@ flipped a near-tie once enough experts were remote (the engine now has a portabl
 checked by a hash test that passes on both machines).
 
 
+## Tiel and Orca across the two machines (clean runs: am2Strata stopped on both)
+
+**Tiel (qwen35moe, 38.5 GB) on the 16 GB Mac**, 6 GiB of experts resident, a 512-token prompt of varied ids, 32
+tokens, 8 threads. Tokens identical in every run.
+
+| Run | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| alone, no profile | 4.07 | 1.92 |
+| alone, with a profile | 6.05 | 4.61 |
+| alone, profile, the always-used matrices locked too | 7.94 | 6.18 |
+| with the PC lending 27.3 GiB (5.0 ms a call) | **24.10** | **9.61** |
+
+With the PC the Mac read 13 K pages from its SSD instead of 5.7 M. Locking the matrices every token uses (they were
+file pages, evicted with the cold experts) cut GDN from 23.7 to 9.0 s and attention from 6.2 to 2.2 s.
+
+**Orca (qwen4exp, 85 GB, IQ3_XXS)**, 64-token prompt:
+
+| Machine | Prompt tok/s | Generation tok/s |
+|---|---|---|
+| Mac, 6 GiB resident, profile | 1.13 | 1.14 |
+| the same with the PC lending 30 GiB | 1.00 | 1.28 |
+| Mac, after IQ rows are unpacked once per chunk | **2.06** | 1.2 |
+| PC alone (59 GB RAM, 37.5 GiB resident) | 1.06 | 0.46 |
+| PC, 6 GiB resident, 128 varied tokens: alone -> with the Mac's 8 GiB | 1.22 -> 1.33 | 0.54 -> 0.58 |
+
+What these runs fixed:
+- **Different tokens on the two machines:** the f32 libm calls left (GDN decay, softplus, router sigmoid, softmax,
+  RoPE tables) differ between glibc and Apple's libm. They now go through `exp_f32` or f64. The PC and Mac logits
+  agree to every printed digit, and Orca's llama.cpp parity went from a worst logit difference of 1.37 to 0.33 (16/16).
+- **The master gave up while the host loaded its share** (20 s timeout): assign now waits up to 30 minutes.
+- **IQ types had no batched path:** every expert row was unpacked once per token. It is now unpacked once per chunk
+  (Mac Orca MoE 34.3 -> 15.8 s).
+- **Hyper-connection models read prompts one token at a time:** `forward_hc_batch`, the same values exactly.
+- **A host's lent experts and a master's always-used matrices were not locked:** the OS compressed or evicted them.
+
+Still open: the PC's attention on Orca is about 4x the Mac's time for the same work; Orca generation on the PC.
+
+
 ## Next
 - **Explicit SIMD integer kernels** (AVX2 maddubs here, NEON sdot on Apple silicon; integer sums are exact, so they can match the current results bit for bit), several rows by several inputs per step; Q4_0 the same way (MoE is now the largest share of a GLM prompt: 42 ms a token).
 - **The Metal (wgpu) path on the Mac:** it is bound by host-side waits, not by the GPU (FINDINGS item 6).
