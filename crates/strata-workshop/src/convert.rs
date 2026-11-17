@@ -556,12 +556,25 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
 
     // general.name (a title-cased form of the HF folder) and general.size_label (the parameter count) are derived like
     // convert_hf_to_gguf.py does; head_dim drives llama.rope.dimension_count, which the engine needs.
-    let name = match dir.file_name().and_then(|n| n.to_str()) {
+    let folder = dir.file_name().and_then(|n| n.to_str());
+    let name = match folder {
         Some(folder) => id_to_title(folder),
         None => "llama".to_string(),
     };
     let size_label = model_size_label(total_params);
     let head_dim = hparams.hidden_size / hparams.num_attention_heads;
+
+    // general.basename / .finetune / .version come from gguf-py's get_model_id_components (exactly what llama.cpp's
+    // converter derives from the HF folder id); write each one that parses out, mirroring convert_hf_to_gguf.py.
+    let components = crate::naming::model_id_components(folder.unwrap_or_default(), total_params as i64);
+    let guessed: Vec<(&'static str, Kv)> = [
+        ("general.basename", components.basename.as_deref()),
+        ("general.finetune", components.finetune.as_deref()),
+        ("general.version", components.version.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|v| (key, Kv::Str(v.to_string()))))
+    .collect::<Vec<_>>();
 
     // metadata key/value pairs, in convert_hf_to_gguf.py's exact order (general.* first, then the llama.* hyper-parameters,
     // then tokenizer.*), matching llama.cpp for a BPE (HF) checkpoint.
@@ -583,6 +596,13 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         ("llama.rope.dimension_count", Kv::U32(head_dim as u32)),
         ("general.quantization_version", Kv::U32(2)),
     ];
+    // Insert the guessed components (general.basename / .finetune / .version) just before general.size_label so the
+    // general.* keys stay grouped in convert_hf_to_gguf.py's order; a no-op when the model id yields none of them.
+    if let Some(idx) = kv.iter().position(|entry| entry.0 == "general.size_label") {
+        for e in guessed.into_iter().rev() {
+            kv.insert(idx, e);
+        }
+    }
     // tokenizer.* in llama.cpp's order; a BPE tokenizer carries no scores array (only SentencePiece vocabularies do), so
     // tok_arrays[3] (scores) is deliberately not written here.
     kv.push(("tokenizer.ggml.model", tok_arrays[1].clone()));
