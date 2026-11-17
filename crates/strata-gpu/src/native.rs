@@ -46,6 +46,8 @@ pub struct Native {
     open: Mutex<Option<Open>>,
     /// device-written temporaries, reused once nothing else holds them
     pool: Mutex<Vec<Arc<MBuf>>>,
+    /// matrices with fewer rows take `mv1` (AM2_METAL_SMALL_ROWS, read once when the device opens)
+    small_rows: u32,
 }
 
 unsafe impl Send for Native {}
@@ -111,7 +113,8 @@ impl Native {
             let p = dev.newComputePipelineStateWithFunction_error(&f).map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
             pso.insert(name, p);
         }
-        Ok(Native { dev, queue, pso, open: Mutex::new(None), pool: Mutex::new(Vec::new()) })
+        let small_rows = std::env::var("AM2_METAL_SMALL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(SMALL_ROWS_DEFAULT);
+        Ok(Native { dev, queue, pso, open: Mutex::new(None), pool: Mutex::new(Vec::new()), small_rows })
     }
 
     pub fn name(&self) -> String {
@@ -201,8 +204,7 @@ impl Native {
         }
         let a = MvArgs { rows, cols, row_bytes, kind };
         // below SMALL_ROWS rows, one row per SIMD group keeps enough threadgroups in flight
-        let small: u32 = std::env::var("AM2_METAL_SMALL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(SMALL_ROWS_DEFAULT);
-        let (pso, per) = if rows < small { ("mv1", MV_ROWS / 4) } else { ("mv", MV_ROWS) };
+        let (pso, per) = if rows < self.small_rows { ("mv1", MV_ROWS / 4) } else { ("mv", MV_ROWS) };
         self.encode(pso, &[w, x, &y], Self::args(&a), size(rows.div_ceil(per) as usize, tokens as usize, 1), size(MV_THREADS, 1, 1));
         y
     }
@@ -256,14 +258,14 @@ impl Native {
     pub fn attend_tokens(&self, q: &MBuf, k: &MBuf, v: &MBuf, scales: &MBuf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Arc<MBuf> {
         let o = self.temp((tokens * n_head * hd) as usize * 4);
         let group = n_head / n_kv;
-        if group <= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() && std::env::var_os("AM2_METAL_FLASH1").is_none() {
+        if group <= 8 && hd >= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() && std::env::var_os("AM2_METAL_FLASH1").is_none() {
             // a SIMD group per (query head, 8 tokens), the heads of a KV head together, K and V straight from the cache
             let a = FlashArgs { base, tokens, n_head, n_kv, group, hd };
             self.encode("attend_flash2", &[q, k, v, scales, &o], Self::args(&a), size(n_kv as usize, tokens.div_ceil(8) as usize, 1),
                         size(group as usize * 32, 1, 1));
             return o;
         }
-        if hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() {
+        if hd >= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_NO_FLASH").is_none() {
             // on the matrix units: 32 query tokens x 32 positions a step (FQ, FK in native.metal)
             let a = FlashArgs { base, tokens, n_head, n_kv, group: n_head / n_kv, hd };
             self.encode("attend_flash", &[q, k, v, scales, &o], Self::args(&a), size(n_head as usize, tokens.div_ceil(32) as usize, 1), size(128, 1, 1));
@@ -278,7 +280,7 @@ impl Native {
     pub fn attend(&self, q: &MBuf, k: &MBuf, v: &MBuf, s: &MBuf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Arc<MBuf> {
         let o = self.temp((n_head * hd) as usize * 4);
         let group = n_head / n_kv;
-        if group <= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() && std::env::var_os("AM2_METAL_SPLIT_SIMD").is_none() {
+        if group <= 8 && hd >= 8 && hd % 8 == 0 && hd <= 128 && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() && std::env::var_os("AM2_METAL_SPLIT_SIMD").is_none() {
             // on the matrix units: a SIMD group per (KV head, DPM positions), then merged
             let parts = n.div_ceil(DPM);
             let part = self.temp((n_head * parts * (hd + 2)) as usize * 4);
@@ -288,7 +290,7 @@ impl Native {
             self.encode("attend_merge", &[&part, &o], Self::args(&a), size(n_head as usize, 1, 1), size(hd.next_multiple_of(32) as usize, 1, 1));
             return o;
         }
-        if group <= DG && hd % 32 == 0 && hd / 32 <= DV && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() {
+        if group <= DG && hd >= 32 && hd % 32 == 0 && hd / 32 <= DV && std::env::var_os("AM2_METAL_ATTEND_ONE").is_none() {
             // split by positions, K and V read once per KV head, then merged
             let parts = n.div_ceil(DP);
             let part = self.temp((n_head * parts * (hd + 2)) as usize * 4);
