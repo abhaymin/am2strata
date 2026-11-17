@@ -10,7 +10,6 @@
 using namespace metal;
 
 #define NSG 2   // SIMD groups per threadgroup in the products
-#define NR 4    // rows per SIMD group
 
 struct MvArgs {
     uint rows;
@@ -66,18 +65,24 @@ static inline float group_dot(device const uchar* o, uint g, thread const float*
         float d = f16_at(o), dmin = f16_at(o + 2);
         float sc, mn;
         scale_min_k4(o + 4, g, sc, mn);
-        device const uchar* qs = o + (kind == K_Q5_K ? 48 : 16) + (g / 2) * 32;
+        // the blocks are 144 / 176 bytes and rows whole blocks: the quants are read a word (four values) at a time
+        device const uint* qs = (device const uint*)(o + (kind == K_Q5_K ? 48 : 16) + (g / 2) * 32);
         uint sh = (g % 2) * 4;
         float part = 0.0f;
         if (kind == K_Q4_K) {
-            for (uint l = 0; l < 32; l++) {
-                part += float((qs[l] >> sh) & 0x0f) * xv[l];
+            for (uint i = 0; i < 8; i++) {
+                const uint q = qs[i] >> sh;
+                part += float(q & 0x0f) * xv[4 * i] + float((q >> 8) & 0x0f) * xv[4 * i + 1]
+                      + float((q >> 16) & 0x0f) * xv[4 * i + 2] + float((q >> 24) & 0x0f) * xv[4 * i + 3];
             }
         } else {
-            device const uchar* qh = o + 16;
-            for (uint l = 0; l < 32; l++) {
-                uint q = ((qs[l] >> sh) & 0x0f) | (((qh[l] >> g) & 1) << 4);
-                part += float(q) * xv[l];
+            device const uint* qh = (device const uint*)(o + 16);
+            for (uint i = 0; i < 8; i++) {
+                const uint q = qs[i] >> sh;
+                const uint h = qh[i] >> g;
+                part += float((q & 0x0f) | ((h & 1) << 4)) * xv[4 * i] + float(((q >> 8) & 0x0f) | (((h >> 8) & 1) << 4)) * xv[4 * i + 1]
+                      + float(((q >> 16) & 0x0f) | (((h >> 16) & 1) << 4)) * xv[4 * i + 2]
+                      + float(((q >> 24) & 0x0f) | (((h >> 24) & 1) << 4)) * xv[4 * i + 3];
             }
         }
         acc = d * sc * part - dmin * mn * xs;
@@ -89,14 +94,15 @@ static inline float group_dot(device const uchar* o, uint g, thread const float*
         device const uchar* hi = o + 128 + hh * 32;
         float s0 = d * float(as_type<char>(o[192 + g * 2]));
         float s1 = d * float(as_type<char>(o[192 + g * 2 + 1]));
+        // 210-byte blocks: two bytes at a time
+        device const ushort* lo2 = (device const ushort*)lo;
+        device const ushort* hi2 = (device const ushort*)hi;
         float p0 = 0.0f, p1 = 0.0f;
-        for (uint l = 0; l < 16; l++) {
-            int q = int(((lo[l] >> lo_sh) & 0x0f) | (((hi[l] >> (2 * kk)) & 3) << 4)) - 32;
-            p0 += float(q) * xv[l];
-        }
-        for (uint l = 16; l < 32; l++) {
-            int q = int(((lo[l] >> lo_sh) & 0x0f) | (((hi[l] >> (2 * kk)) & 3) << 4)) - 32;
-            p1 += float(q) * xv[l];
+        for (uint i = 0; i < 16; i++) {
+            const uint l = lo2[i] >> lo_sh, h = hi2[i] >> (2 * kk);
+            const float v = float(int((l & 0x0f) | ((h & 3) << 4)) - 32) * xv[2 * i]
+                          + float(int(((l >> 8) & 0x0f) | (((h >> 8) & 3) << 4)) - 32) * xv[2 * i + 1];
+            if (i < 8) p0 += v; else p1 += v;
         }
         acc = s0 * p0 + s1 * p1;
     } else if (kind == K_Q8_0) {
@@ -125,13 +131,9 @@ static inline float group_dot(device const uchar* o, uint g, thread const float*
 // y[t * rows + r] = W[r] . x[t * cols ..]: threadgroup (i, t) takes rows i * NSG * NR .. for token t.
 // Lane `lane` takes the 32-value groups lane, lane + 32, ... of each row: for 256-value blocks that is block
 // lane / 8 + 4k, group lane % 8; for 32-value blocks, block lane + 32k.
-kernel void mv(device const uchar* w [[buffer(0)]],
-               device const float* x [[buffer(1)]],
-               device float* y [[buffer(2)]],
-               constant MvArgs& a [[buffer(3)]],
-               uint2 tg [[threadgroup_position_in_grid]],
-               uint sg [[simdgroup_index_in_threadgroup]],
-               uint lane [[thread_index_in_simdgroup]]) {
+template <uint NR>
+static inline void mv_rows(device const uchar* w, device const float* x, device float* y, constant MvArgs& a,
+                           uint2 tg, uint sg, uint lane) {
     const uint r0 = (tg.x * NSG + sg) * NR;
     const uint t = tg.y;
     const bool big = a.kind >= K_Q4_K;
@@ -166,6 +168,19 @@ kernel void mv(device const uchar* w [[buffer(0)]],
             y[t * a.rows + row] = s;
         }
     }
+}
+
+// NR rows per SIMD group: 4 for big matrices (x reused across them), 1 for small ones (more threadgroups in flight)
+kernel void mv(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]],
+               constant MvArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+               uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    mv_rows<4>(w, x, y, a, tg, sg, lane);
+}
+
+kernel void mv1(device const uchar* w [[buffer(0)]], device const float* x [[buffer(1)]], device float* y [[buffer(2)]],
+                constant MvArgs& a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    mv_rows<1>(w, x, y, a, tg, sg, lane);
 }
 
 // ------------------------------------------------------------------ the steps between the products
@@ -308,13 +323,25 @@ static inline void group_values(device const uchar* o, uint g, uint kind, thread
         float sc, mn;
         scale_min_k4(o + 4, g, sc, mn);
         const float a = d * sc, b = dmin * mn;
-        device const uchar* qs = o + (kind == K_Q5_K ? 48 : 16) + (g / 2) * 32;
+        device const uint* qs = (device const uint*)(o + (kind == K_Q5_K ? 48 : 16) + (g / 2) * 32);
         const uint sh = (g % 2) * 4;
         if (kind == K_Q4_K) {
-            for (uint l = 0; l < 32; l++) wv[l] = a * float((qs[l] >> sh) & 0x0f) - b;
+            for (uint i = 0; i < 8; i++) {
+                const uint q = qs[i] >> sh;
+                wv[4 * i] = a * float(q & 0x0f) - b;
+                wv[4 * i + 1] = a * float((q >> 8) & 0x0f) - b;
+                wv[4 * i + 2] = a * float((q >> 16) & 0x0f) - b;
+                wv[4 * i + 3] = a * float((q >> 24) & 0x0f) - b;
+            }
         } else {
-            device const uchar* qh = o + 16;
-            for (uint l = 0; l < 32; l++) wv[l] = a * float(((qs[l] >> sh) & 0x0f) | (((qh[l] >> g) & 1) << 4)) - b;
+            device const uint* qh = (device const uint*)(o + 16);
+            for (uint i = 0; i < 8; i++) {
+                const uint q = qs[i] >> sh, h = qh[i] >> g;
+                wv[4 * i] = a * float((q & 0x0f) | ((h & 1) << 4)) - b;
+                wv[4 * i + 1] = a * float(((q >> 8) & 0x0f) | (((h >> 8) & 1) << 4)) - b;
+                wv[4 * i + 2] = a * float(((q >> 16) & 0x0f) | (((h >> 16) & 1) << 4)) - b;
+                wv[4 * i + 3] = a * float(((q >> 24) & 0x0f) | (((h >> 24) & 1) << 4)) - b;
+            }
         }
     } else if (kind == K_Q6_K) {
         const float d = f16_at(o + 208);
@@ -324,9 +351,13 @@ static inline void group_values(device const uchar* o, uint g, uint kind, thread
         device const uchar* hi = o + 128 + hh * 32;
         const float s0 = d * float(as_type<char>(o[192 + g * 2]));
         const float s1 = d * float(as_type<char>(o[192 + g * 2 + 1]));
-        for (uint l = 0; l < 32; l++) {
-            const int q = int(((lo[l] >> lo_sh) & 0x0f) | (((hi[l] >> (2 * kk)) & 3) << 4)) - 32;
-            wv[l] = (l < 16 ? s0 : s1) * float(q);
+        device const ushort* lo2 = (device const ushort*)lo;
+        device const ushort* hi2 = (device const ushort*)hi;
+        for (uint i = 0; i < 16; i++) {
+            const uint l = lo2[i] >> lo_sh, h = hi2[i] >> (2 * kk);
+            const float sc = i < 8 ? s0 : s1;
+            wv[2 * i] = sc * float(int((l & 0x0f) | ((h & 3) << 4)) - 32);
+            wv[2 * i + 1] = sc * float(int(((l >> 8) & 0x0f) | (((h >> 8) & 3) << 4)) - 32);
         }
     } else if (kind == K_Q8_0) {
         const float d = f16_at(o);
@@ -355,8 +386,10 @@ struct MmArgs { uint rows; uint cols; uint row_bytes; uint kind; uint tokens; };
 
 // Y[t][r] = W[r] . X[t] for a chunk of tokens, on the SIMD-group matrix units: threadgroup (i, j) computes rows
 // i * 64 .. and tokens j * 32 ..; per 32-column step, 64 threads dequantize one row's 32-value group each into
-// threadgroup memory while the other 64 load the tokens' 32 values, then each of the 4 SIMD groups multiplies its
-// 32 x 16 corner in 8 x 8 tiles (f32 throughout, so the sums are the ones `mv` makes up to their order).
+// threadgroup memory (as half: a dequantized weight is a half scale times a small integer, as ggml's Metal GEMM keeps it)
+// while the other 64 load the tokens' 32 values (f32), then each of the 4 SIMD groups multiplies its 32 x 16 corner in
+// 8 x 8 tiles, accumulating in f32. One 8 KiB array holds both tiles and then the results, so several threadgroups fit
+// on a core.
 kernel void mm(device const uchar* w [[buffer(0)]],
                device const float* x [[buffer(1)]],
                device float* y [[buffer(2)]],
@@ -364,9 +397,9 @@ kernel void mm(device const uchar* w [[buffer(0)]],
                uint2 tg [[threadgroup_position_in_grid]],
                uint2 tid2 [[thread_position_in_threadgroup]],
                uint sg [[simdgroup_index_in_threadgroup]]) {
-    threadgroup float sa[MM_BM * 32];   // weights [row][k]
-    threadgroup float sb[MM_BN * 32];   // tokens [token][k]
-    threadgroup float sc[MM_BM * MM_BN];
+    threadgroup float mem[MM_BM * MM_BN];                          // 8 KiB
+    threadgroup half* sa = (threadgroup half*)mem;                 // weights [row][k]: 64 x 32 half = 4 KiB
+    threadgroup float* sb = mem + MM_BM * 32 / 2;                  // tokens [token][k]: 32 x 32 f32 = 4 KiB
     const uint tid = tid2.x;
     const uint r0 = tg.x * MM_BM, t0 = tg.y * MM_BN;
     const bool big = a.kind >= K_Q4_K;
@@ -385,25 +418,31 @@ kernel void mm(device const uchar* w [[buffer(0)]],
             } else {
                 for (uint l = 0; l < 32; l++) wv[l] = 0.0f;
             }
-            for (uint l = 0; l < 32; l++) sa[tid * 32 + l] = wv[l];
+            threadgroup half4* sp = (threadgroup half4*)(sa + tid * 32);
+            for (uint l = 0; l < 8; l++) sp[l] = half4(wv[4 * l], wv[4 * l + 1], wv[4 * l + 2], wv[4 * l + 3]);
         } else {
-            // 64 threads, 32 tokens x 32 values: 16 each
             const uint i = tid - MM_BM;
-            const uint tt = i / 2, half_ = (i % 2) * 16;
+            const uint tt = i / 2, h = (i % 2) * 16;
             const uint t = t0 + tt;
-            for (uint l = 0; l < 16; l++) {
-                sb[tt * 32 + half_ + l] = t < a.tokens ? x[t * a.cols + gi * 32 + half_ + l] : 0.0f;
+            if (t < a.tokens) {
+                device const float4* xp = (device const float4*)(x + t * a.cols + gi * 32 + h);
+                threadgroup float4* sp = (threadgroup float4*)(sb + tt * 32 + h);
+                for (uint l = 0; l < 4; l++) sp[l] = xp[l];
+            } else {
+                for (uint l = 0; l < 16; l++) sb[tt * 32 + h + l] = 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint kk = 0; kk < 32; kk += 8) {
-            simdgroup_float8x8 am[4], bm[2];
+            simdgroup_half8x8 am[4];
+            simdgroup_float8x8 bm[2];
             for (uint i = 0; i < 4; i++) simdgroup_load(am[i], sa + (mr + i * 8) * 32 + kk, 32);
             for (uint j = 0; j < 2; j++) simdgroup_load(bm[j], sb + (mt + j * 8) * 32 + kk, 32, ulong2(0, 0), true);
             for (uint i = 0; i < 4; i++) for (uint j = 0; j < 2; j++) simdgroup_multiply_accumulate(c[i][j], am[i], bm[j], c[i][j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup float* sc = mem;
     for (uint i = 0; i < 4; i++) for (uint j = 0; j < 2; j++) simdgroup_store(c[i][j], sc + (mr + i * 8) * MM_BN + mt + j * 8, MM_BN);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint e = tid; e < MM_BM * MM_BN; e += MM_THREADS) {

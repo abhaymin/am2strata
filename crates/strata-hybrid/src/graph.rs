@@ -126,6 +126,18 @@ impl<'a> Graph<'a> {
             time(&format!("attend n={ctx}"), 0, &|| g.attend(&q, &a.kc, &a.vc, &a.s, ctx, a.n_head, a.n_kv, a.hd, 0.1));
         }
         time("buffer upload (rope table)", 0, &|| g.buffer(&rope.table(5)));
+        if self.batches() {
+            let nt = 128u32;
+            for (name, w) in [("attn_q", a.q), ("attn_k", a.k), ("attn_o", a.o), ("ffn_up", f.up), ("ffn_down", f.down)] {
+                let xin = g.buffer(&vec![0.01f32; (w.cols * nt) as usize]);
+                time(&format!("mm x{nt} {name} {}x{}", w.rows, w.cols), w.bytes, &|| g.mv_tokens(w, &xin, nt));
+            }
+            let qt = g.buffer(&vec![0.01f32; (a.q.rows * nt) as usize]);
+            let sc = g.buffer(&vec![0.1f32; nt as usize]);
+            time(&format!("attend_tokens x{nt} at 0"), 0, &|| g.attend_tokens(&qt, &a.kc, &a.vc, &sc, 0, nt, a.n_head, a.n_kv, a.hd));
+            let xt = g.buffer(&vec![0.01f32; dim * nt as usize]);
+            time(&format!("rms_norm x{nt}"), 0, &|| g.rms_norm(&xt, &a.norm, m.eps));
+        }
         let mut st = m.new_state();
         let t = std::time::Instant::now();
         for i in 0..20 {

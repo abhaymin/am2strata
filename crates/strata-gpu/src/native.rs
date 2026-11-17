@@ -75,6 +75,8 @@ struct AttnArgs { n: u32, n_kv: u32, group: u32, hd: u32, scale: f32 }
 /// Rows a threadgroup of `mv` takes (NSG * NR in native.metal) and its threads (NSG * 32).
 const MV_ROWS: u32 = 8;
 const MV_THREADS: usize = 64;
+/// Matrices with fewer rows take `mv1` (AM2_METAL_SMALL_ROWS overrides, for tuning).
+static SMALL_ROWS_DEFAULT: u32 = 8192;
 
 fn size(w: usize, h: usize, d: usize) -> MTLSize {
     MTLSize { width: w, height: h, depth: d }
@@ -92,7 +94,7 @@ impl Native {
         let lib = dev.newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
             .map_err(|e| format!("native Metal kernels did not compile: {}", e.localizedDescription()))?;
         let mut pso = HashMap::new();
-        for name in ["mv", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend", "mm", "rope_tokens", "copy_from", "attend_tokens"] {
+        for name in ["mv", "mv1", "rms_norm", "add_into", "silu_gate", "kv_append", "rope", "attend", "mm", "rope_tokens", "copy_from", "attend_tokens"] {
             let f = lib.newFunctionWithName(&NSString::from_str(name)).ok_or_else(|| format!("no kernel {name}"))?;
             let p = dev.newComputePipelineStateWithFunction_error(&f).map_err(|e| format!("{name}: {}", e.localizedDescription()))?;
             pso.insert(name, p);
@@ -186,7 +188,10 @@ impl Native {
             return y;
         }
         let a = MvArgs { rows, cols, row_bytes, kind };
-        self.encode("mv", &[w, x, &y], Self::args(&a), size(rows.div_ceil(MV_ROWS) as usize, tokens as usize, 1), size(MV_THREADS, 1, 1));
+        // below SMALL_ROWS rows, one row per SIMD group keeps enough threadgroups in flight
+        let small: u32 = std::env::var("AM2_METAL_SMALL_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(SMALL_ROWS_DEFAULT);
+        let (pso, per) = if rows < small { ("mv1", MV_ROWS / 4) } else { ("mv", MV_ROWS) };
+        self.encode(pso, &[w, x, &y], Self::args(&a), size(rows.div_ceil(per) as usize, tokens as usize, 1), size(MV_THREADS, 1, 1));
         y
     }
 
