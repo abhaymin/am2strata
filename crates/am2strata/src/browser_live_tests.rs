@@ -71,7 +71,11 @@ async fn serve() -> String {
 }
 
 fn chrome() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("AM2_TEST_CHROME").map(PathBuf::from).filter(|p| p.is_file()) { return Some(p); }
+    // CI's ci.yml sets AM2_TEST_CHROME; release.yml sets AM2STRATA_TEST_CHROME (the chrome-headless-shell it downloads):
+    // without reading it, the macOS Intel runner fell back to the full Chrome app, whose input events hung the map test
+    for var in ["AM2_TEST_CHROME", "AM2STRATA_TEST_CHROME"] {
+        if let Some(p) = std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_file()) { return Some(p); }
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     for d in [home.join("Development/Strata-data"), home.join(".local/share/am2strata")] {
         if let Some(p) = find_chrome(&d) { return Some(p); }
