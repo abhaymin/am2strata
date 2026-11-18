@@ -375,7 +375,7 @@ async fn probe_seconds(f: &std::path::Path) -> Option<f64> {
 /// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
 /// fade out at the end. `subs` is the ASS file's path already escaped for a filter option.
 pub fn final_filter(subs: &str, played: f64) -> String {
-    format!("[0:v]subtitles='{}'[v];[1:a]atrim=start=0,asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, played.max(4.0) - 4.0)
+    format!("[0:v]subtitles=filename='{}'[v];[1:a]atrim=start=0,asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, played.max(4.0) - 4.0)
 }
 
 /// The xfade chain that joins the shots in order, each beginning one crossfade before the previous ends (so their joins
