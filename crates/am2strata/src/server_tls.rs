@@ -856,13 +856,15 @@ mod tests {
         let brew_dir = base.join("homebrewbin"); // as if it were /opt/homebrew/bin
         let app_dir = base.join("appmacos");     // as if it were /Applications/Tailscale.app/Contents/MacOS
         for d in [&path_dir, &brew_dir, &app_dir] { std::fs::create_dir_all(d).unwrap(); }
-        std::fs::write(brew_dir.join("tailscale"), b"").unwrap();
-        std::fs::write(app_dir.join("tailscale"), b"").unwrap();
+        // the program's own name on this platform (tailscale.exe on Windows), as program_in looks for it
+        let exe = format!("tailscale{}", std::env::consts::EXE_SUFFIX);
+        std::fs::write(brew_dir.join(&exe), b"").unwrap();
+        std::fs::write(app_dir.join(&exe), b"").unwrap();
 
         let homes = [brew_dir.clone(), app_dir.clone()]; // documented order: Homebrew before the app
         assert_eq!(tailscale_in(&[] as &[std::path::PathBuf], &homes).unwrap().parent().unwrap(), brew_dir.as_path(), "Homebrew's folder is tried before the app");
 
-        std::fs::write(path_dir.join("tailscale"), b"").unwrap();
+        std::fs::write(path_dir.join(&exe), b"").unwrap();
         let dirs = vec![path_dir.clone()];
         assert_eq!(tailscale_in(&dirs, &homes).unwrap().parent().unwrap(), path_dir.as_path(), "a PATH entry beats every macOS home");
 

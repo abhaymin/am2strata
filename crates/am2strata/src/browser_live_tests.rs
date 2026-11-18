@@ -71,7 +71,11 @@ async fn serve() -> String {
 }
 
 fn chrome() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("AM2_TEST_CHROME").map(PathBuf::from).filter(|p| p.is_file()) { return Some(p); }
+    // CI's ci.yml sets AM2_TEST_CHROME; release.yml sets AM2STRATA_TEST_CHROME (the chrome-headless-shell it downloads):
+    // without reading it, the macOS Intel runner fell back to the full Chrome app, whose input events hung the map test
+    for var in ["AM2_TEST_CHROME", "AM2STRATA_TEST_CHROME"] {
+        if let Some(p) = std::env::var_os(var).map(PathBuf::from).filter(|p| p.is_file()) { return Some(p); }
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     for d in [home.join("Development/Strata-data"), home.join(".local/share/am2strata")] {
         if let Some(p) = find_chrome(&d) { return Some(p); }
@@ -93,8 +97,18 @@ fn tmp() -> PathBuf {
     d
 }
 
+/// The page's answer to `js`: tried again for up to 10 s while the page is still loading or its script not yet run
+/// (a slow runner, the macOS Intel one, read a page before its script had made `window.log`).
 async fn eval(b: &Browsers, conv: &str, js: &str) -> Value {
-    b.current(conv).await.unwrap().evaluate(js).await.unwrap().into_value::<Value>().unwrap()
+    let mut last = String::new();
+    for _ in 0..50 {
+        match b.current(conv).await.unwrap().evaluate(js).await {
+            Ok(v) => return v.into_value::<Value>().unwrap(),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("the page did not answer {js:?} in 10 s: {last}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -183,8 +197,10 @@ async fn the_browser_tools_work_on_real_pages() {
     b.call(c, "browser_key", &json!({"keys": "ArrowLeft", "times": 2})).await.unwrap();
     b.call(c, "browser_key", &json!({"keys": "Ctrl+a"})).await.unwrap();
     b.call(c, "browser_key", &json!({"keys": "+"})).await.unwrap();
+    // the page's own record of what it got (printed in full when it differs: a macOS runner once did, without saying how)
     let log = eval(&b, c, "window.log.join('|')").await;
-    assert_eq!(log, json!("drag -100,50|wheel -1|wheel -1|wheel 1|dbl|right|key ArrowLeft|key ArrowLeft|key a ctrl|key +"));
+    let want = "drag -100,50|wheel -1|wheel -1|wheel 1|dbl|right|key ArrowLeft|key ArrowLeft|key a ctrl|key +";
+    assert_eq!(log.as_str(), Some(want), "the map page got {log} on {}", std::env::consts::OS);
 
     // ---- site checks: status, console and script errors, failed requests, broken links; console listing
     b.call(c, "browser_open", &json!({"url": format!("{base}/errors")})).await.unwrap();

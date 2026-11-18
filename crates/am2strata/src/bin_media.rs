@@ -84,8 +84,12 @@ pub fn out_names(out: &str, n: u32) -> Vec<String> {
     let mut v = vec![out.to_string()];
     for i in 2..=n {
         match &ext {
-            // in the same folder as `out` (pics/cat.png -> pics/cat-2.png), not the current one
-            Some(e) => v.push(base.with_file_name(format!("{stem}-{i}.{e}")).to_string_lossy().into_owned()),
+            // in the same folder as `out` (pics/cat.png -> pics/cat-2.png), not the current one, written with the
+            // separator the user wrote (Path::with_file_name would put a backslash on Windows)
+            Some(e) => {
+                let name = base.file_name().and_then(|n| n.to_str()).unwrap_or(out);
+                v.push(format!("{}{stem}-{i}.{e}", &out[..out.len() - name.len()]));
+            }
             None => v.push(format!("{out}-{i}")),
         }
     }
