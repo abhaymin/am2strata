@@ -297,7 +297,7 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
         let (w2, h2) = (w * 2, h * 2);
         if kind == "clip" {
             // fitted to the frame, held on its last frame if shorter than the shot (so a short clip still fills it)
-            let fit = format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},tpad=stop_mode=clone:stop_duration=0.5,format=yuv420p");
+            let fit = clip_filter(w, h, durations[i]);
             let srcp = src.display().to_string();
             let outp = out.display().to_string();
             run_ffmpeg(&["-i", srcp.as_str(), "-vf", fit.as_str(), "-frames:v", frames.to_string().as_str(), "-an", "-c:v", "libx264", "-crf", "18", outp.as_str()]).await?;
@@ -336,6 +336,12 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let args: Vec<&str> = inps.iter().map(String::as_str).collect();
     run_ffmpeg(&args).await?;
 
+    // the joined pictures must play as long as planned (a chain cut short would leave a long video with a still end)
+    if let Some(got) = probe_seconds(&pictures).await {
+        if got + 1.0 < played {
+            return Err(format!("the joined pictures play {got:.1} s of the {played:.1} s planned; not finished"));
+        }
+    }
     // mux the picture chain with the audio, captions burned in by libass, one MP4 (H.264 + AAC, faststart)
     let out = dir.join(format!("{id}.mp4"));
     let picp = pictures.display().to_string();
@@ -348,6 +354,22 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
+}
+
+/// A clip fitted to the frame and held on its last frame for as long as its shot plays (a 5 s clip in a 14 s shot
+/// fills all 14 s; held only briefly, the crossfade chain ended early and the video stopped long before the audio).
+pub fn clip_filter(w: u32, h: u32, shot_s: f64) -> String {
+    format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p",
+            shot_s.max(0.5) + 1.0)
+}
+
+/// A video file's video-stream length in seconds, by ffprobe.
+async fn probe_seconds(f: &std::path::Path) -> Option<f64> {
+    let o = TokioCommand::new(crate::server_tls::program("ffprobe"))
+        .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "default=nw=1:nk=1"])
+        .arg(f).output().await.ok()?;
+    let frames: f64 = String::from_utf8_lossy(&o.stdout).trim().parse().ok()?;
+    Some(frames / FPS as f64)
 }
 
 /// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
@@ -493,6 +515,23 @@ fn thumbnail_drawtext(text: &str, font: &str, color: &str, y: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A short clip in a long shot is held to the shot's whole length (Peace and Harmony's 5 s clips in 14 s shots
+    /// once made a 15 s picture track under 200 s of audio). Only runs where ffmpeg is installed.
+    #[tokio::test]
+    async fn a_short_clip_fills_its_whole_shot() {
+        if !crate::media::ffmpeg_available() { return; }
+        let dir = std::env::temp_dir().join(format!("strata-clip-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (clip, out) = (dir.join("c.mp4"), dir.join("o.mp4"));
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "testsrc=s=320x240:r=16:d=1", "-c:v", "libx264", &clip.display().to_string()]).await.unwrap();
+        let frames = frames_for(4.0);
+        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 4.0), "-frames:v", &frames.to_string(),
+                     "-an", "-c:v", "libx264", &out.display().to_string()]).await.unwrap();
+        let got = probe_seconds(&out).await.unwrap();
+        assert!((got - 4.0).abs() < 0.05, "a 1 s clip plays its whole 4 s shot: {got}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The crossfade chain is a filtergraph ffmpeg accepts: three shots joined then faded in (the chains were once run
     /// together without ';', which ffmpeg refused as "trailing garbage"). Only runs where ffmpeg is installed.
