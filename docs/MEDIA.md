@@ -154,6 +154,9 @@ person from their face: no face-search engine is used.
   machine. Yandex answers with what the image seems to show and the sites it is on, read in the server's own headless
   browser. Google Lens asks a browser like that to prove it is a person; that is never solved here, so its answer is
   `needs_you` with its results link, to open in your own browser. The image is kept in the media library.
+  The answer is `{"object": "reverse_search", "file_id", "engines": [{"engine", "status": "ok" | "needs_you" | "failed",
+  "contains": [what the image seems to show], "sites": [{"title", "url", …}], "results_url", "similar_url"}]}`: the
+  results are per engine, under `engines[].sites`, not in one list.
 - **Chat tools** (with the web on, `"strata_web": true`): `image_search` and `reverse_image_search` (an `mf_` id or a URL).
 - **In the app:** Media › Tools › Image search, and **Find on the web** on each library image.
   **CLI:** `am2strata-run media search -- "words"`, `am2strata-run media reverse -- <file | mf_id | url>`.
