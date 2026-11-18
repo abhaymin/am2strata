@@ -573,6 +573,8 @@ body.resizing iframe { pointer-events: none; }
 .hw-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
 @media (max-width: 640px) { .hw-row { grid-template-columns: minmax(0, 1fr); } }
 .hw-alert { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.hw-machine { display: flex; gap: 8px; align-items: center; margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--st-line-soft); }
+.hw-machine:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
 
 /* The media viewer */
 .viewer { position: fixed; inset: 0; z-index: 1000; background: rgba(6, 8, 12, .94); display: flex; flex-direction: column; }

@@ -1018,6 +1018,10 @@ fn images_are_drawn_by_the_media_engine_and_the_text_model_comes_back() {
     assert_eq!((data[0]["seed"].as_u64(), data[1]["seed"].as_u64()), (Some(7), Some(8)), "image i uses seed + i");
     assert!(data[0]["b64_json"].as_str().unwrap().starts_with("iVBORw0KGgo"), "a PNG");
     assert_eq!((r["size"].as_str(), r["strata"]["steps"].as_u64()), (Some("512x512"), Some(4)));
+    // Monitor's row for the job carries the seed of its last image and its time per step (the Speed card shows both)
+    let row = s.get("/metrics", true).1["requests"][0].clone();
+    assert_eq!((row["kind"].as_str(), row["seed"].as_u64()), (Some("image"), Some(8)), "{row}");
+    assert!(row["s_per_step"].as_f64().is_some_and(|v| v >= 0.0), "{row}");
     // two generations, then the media engine frees its VRAM; the text model was stopped for the job
     let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
     let ops: Vec<String> = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["op"].as_str().unwrap().to_string()).collect();
@@ -2855,7 +2859,7 @@ fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
     assert_eq!(get("/api/models", &key), 200);
     assert_eq!(get("/api/queue", &key), 200);
     assert_eq!(get("/api/cluster", &key), 401, "not the worker's settings");
-    assert_eq!(get("/api/system", &key), 401);
+    assert_eq!(get("/api/system", &key), 200, "its hardware, read-only, so the master can show every machine");
     // the master uses it at once (no restart)
     let t0 = Instant::now();
     while master.get("/api/cluster", true).1["workers"][0]["ready"] != true {
@@ -2864,6 +2868,12 @@ fn a_worker_pairs_by_its_code_and_is_removed_cleanly() {
     }
     let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")]}));
     assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the paired worker.")), "{v}");
+    // the master lists the worker's hardware next to its own (Settings › Server and access)
+    let (c, hw) = master.get("/api/cluster/system", true);
+    assert_eq!(c, 200, "{hw}");
+    assert_eq!(hw["workers"][0]["name"], name.as_str(), "{hw}");
+    assert!(hw["workers"][0]["system"]["memory"]["total_mib"].as_f64().unwrap_or(0.0) > 0.0, "{hw}");
+    assert_eq!(master.get("/api/cluster/system", false).0, 401, "the main key only");
     // removed: the master stops using it and the worker forgets the master
     let r = reqwest::blocking::Client::new().delete(format!("{}/api/cluster/workers/{name}", master.base)).bearer_auth(KEY).send().unwrap();
     let v: Value = r.json().unwrap();
