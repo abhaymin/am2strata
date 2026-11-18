@@ -51,21 +51,25 @@ fn extra() -> &'static Mutex<HashMap<String, Arc<Browsers>>> {
 /// Chromium (started on first use, which can take a minute the first time: the VM, then installing Chromium).
 pub async fn pick(mgr: &crate::manager::Manager, target: &str) -> Result<Arc<Browsers>, String> {
     let base = mgr.browser.get().cloned().ok_or("browser use is not set up on this server")?;
-    let t = match target { "" | "default" | "true" => return Ok(base), t => t };
     let is_mine = base.settings.connect.is_some();
+    let t = match target { "" | "default" | "true" if is_mine => "mine", "" | "default" | "true" => return Ok(base), t => t };
     match t {
-        "server" | "headless" if !is_mine => return Ok(base),
-        "mine" | "user" | "chrome" if is_mine => return Ok(base),
         "server" | "headless" | "mine" | "user" | "chrome" | "sandbox" | "vm" => {}
         other => return Err(format!("{other:?} is not a browser here: server, mine or sandbox")),
     }
     let mut key = match t { "headless" => "server", "user" | "chrome" => "mine", "vm" => "sandbox", t => t }.to_string();
-    // "mine" with no Chrome on its DevTools port: use this server's own headless browser rather than fail every step
-    if key == "mine" && base.settings.exe.is_some() && !answers("http://127.0.0.1:9222").await {
-        tracing::info!("browser: your Chrome is not on http://127.0.0.1:9222; the chat uses this server's headless browser");
-        if !is_mine { return Ok(base); }
-        key = "server".into();
+    // the user's Chrome (named, or the config's default) with nothing on its DevTools port: use this server's own
+    // headless browser rather than fail every step
+    if key == "mine" {
+        let ep = base.settings.connect.clone().unwrap_or_else(|| "http://127.0.0.1:9222".into());
+        if base.settings.exe.is_some() && !answers(&ep).await {
+            tracing::info!("browser: your Chrome is not on {ep}; the chat uses this server's headless browser");
+            key = "server".into();
+        } else if is_mine {
+            return Ok(base);
+        }
     }
+    if key == "server" && !is_mine { return Ok(base); }
     if let Some(b) = extra().lock().unwrap().get(&key).cloned() {
         if key != "sandbox" { return Ok(b); }
     }
