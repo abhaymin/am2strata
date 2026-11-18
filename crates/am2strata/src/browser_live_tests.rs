@@ -183,8 +183,10 @@ async fn the_browser_tools_work_on_real_pages() {
     b.call(c, "browser_key", &json!({"keys": "ArrowLeft", "times": 2})).await.unwrap();
     b.call(c, "browser_key", &json!({"keys": "Ctrl+a"})).await.unwrap();
     b.call(c, "browser_key", &json!({"keys": "+"})).await.unwrap();
+    // the page's own record of what it got (printed in full when it differs: a macOS runner once did, without saying how)
     let log = eval(&b, c, "window.log.join('|')").await;
-    assert_eq!(log, json!("drag -100,50|wheel -1|wheel -1|wheel 1|dbl|right|key ArrowLeft|key ArrowLeft|key a ctrl|key +"));
+    let want = "drag -100,50|wheel -1|wheel -1|wheel 1|dbl|right|key ArrowLeft|key ArrowLeft|key a ctrl|key +";
+    assert_eq!(log.as_str(), Some(want), "the map page got {log} on {}", std::env::consts::OS);
 
     // ---- site checks: status, console and script errors, failed requests, broken links; console listing
     b.call(c, "browser_open", &json!({"url": format!("{base}/errors")})).await.unwrap();
