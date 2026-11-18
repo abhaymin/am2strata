@@ -84,7 +84,61 @@ pub struct TrainSettings {
     pub chat_template: Option<PathBuf>,
     /// score every token, not only the assistant's (Soup's `train_on_responses_only: false`)
     pub score_everything: bool,
+    /// where the run computes: the CPU, Apple's GPU (Metal) or an NVIDIA GPU (CUDA); the GPUs need a build with the
+    /// `metal` or `cuda` feature
+    pub device: TrainDevice,
+    /// rebuild each trained block's graph in the backward pass instead of keeping it ([`LlamaModel::loss_and_grads_recompute`])
+    pub recompute: bool,
 }
+
+/// Where a run computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainDevice {
+    Cpu,
+    Metal,
+    Cuda(usize),
+}
+
+impl TrainDevice {
+    /// `cpu`, `metal`, `cuda` or `cuda:N`
+    pub fn from_s(s: &str) -> Result<Self> {
+        let s = s.trim().to_ascii_lowercase();
+        Ok(match s.as_str() {
+            "cpu" => TrainDevice::Cpu,
+            "metal" | "mps" => TrainDevice::Metal,
+            "cuda" => TrainDevice::Cuda(0),
+            // "gpu": this machine's kind of GPU
+            "gpu" if cfg!(target_os = "macos") => TrainDevice::Metal,
+            "gpu" => TrainDevice::Cuda(0),
+            _ => match s.strip_prefix("cuda:").map(str::parse::<usize>) {
+                Some(Ok(n)) => TrainDevice::Cuda(n),
+                _ => bail!("--device {s}: choose cpu, metal, cuda or cuda:N"),
+            },
+        })
+    }
+
+    pub fn as_str(self) -> String {
+        match self {
+            TrainDevice::Cpu => "cpu".into(),
+            TrainDevice::Metal => "metal".into(),
+            TrainDevice::Cuda(n) => format!("cuda:{n}"),
+        }
+    }
+
+    /// The candle device, or why there is none (a build without that backend, or no such GPU).
+    pub fn open(self) -> Result<Device> {
+        let built = |f: &str| if (f == "metal" && cfg!(feature = "metal")) || (f == "cuda" && cfg!(feature = "cuda")) { String::new() }
+                              else { format!(" (this build has no {f}: build strata-workshop with --features {f})") };
+        match self {
+            TrainDevice::Cpu => Ok(Device::Cpu),
+            TrainDevice::Metal => Device::new_metal(0).map_err(|e| anyhow!("--device metal: {e}{}", built("metal"))),
+            TrainDevice::Cuda(n) => Device::new_cuda(n).map_err(|e| anyhow!("--device cuda:{n}: {e}{}", built("cuda"))),
+        }
+    }
+}
+
+/// Rows of the output head scored at once with `recompute` (its logits are `[rows, vocab]` f32).
+pub const HEAD_ROWS: usize = 256;
 
 impl TrainSettings {
     /// Soup's defaults where it has them (epochs 3, warm-up 3 %, weight decay 0.01, clip 1.0, accumulation 4,
@@ -94,7 +148,7 @@ impl TrainSettings {
             model: model.into(), data: data.into(), data_format: DataFormat::Auto, eval_data: None, val_split: 0.1, out: out.into(),
             lora: LoraSpec::default(), base_dtype: BaseDtype::F32, lr: 2e-4, epochs: 3.0, max_steps: None, accumulation: 4, max_len: 2048,
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
-            logging_steps: 10, resume: None, chat_template: None, score_everything: false,
+            logging_steps: 10, resume: None, chat_template: None, score_everything: false, device: TrainDevice::Cpu, recompute: false,
         }
     }
 
@@ -409,6 +463,7 @@ struct Runner {
     seed: u64,
     accumulation: usize,
     max_grad_norm: f64,
+    recompute: bool,
     /// per-epoch order of the training conversations
     orders: HashMap<usize, Vec<usize>>,
     tokens_seen: u64,
@@ -417,7 +472,7 @@ struct Runner {
 
 impl Runner {
     fn new(s: &TrainSettings, data: Data, on_event: &mut dyn FnMut(Event)) -> Result<Self> {
-        let dev = Device::Cpu;
+        let dev = s.device.open()?;
         let cfg = ModelConfig::load(&s.model)?;
         let first = s.lora.first_trained(cfg.num_hidden_layers);
         if let Some(n) = s.lora.train_layers {
@@ -453,7 +508,7 @@ impl Runner {
         params.lr = s.lr;
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
-        Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
+        Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, recompute: s.recompute, orders: HashMap::new(),
                   tokens_seen: 0, lower_in_memory })
     }
 
@@ -483,19 +538,27 @@ impl Runner {
             let h = self.hidden(&ex)?;
             let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let ctx = Ctx::train(splitmix(&mut dropout_seed));
-            let loss = self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &ctx)?;
-            let value = loss.to_scalar::<f32>()? as f64;
+            let (value, grads): (f64, Vec<Option<Tensor>>) = if self.recompute {
+                self.model.loss_and_grads_recompute(&h, &ex.tokens, &ex.supervised, &ctx, &self.vars, HEAD_ROWS)?
+            } else {
+                let loss = self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &ctx)?;
+                let value = loss.to_scalar::<f32>()? as f64;
+                if !value.is_finite() {
+                    bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
+                }
+                let store = loss.backward()?;
+                (value, self.vars.iter().map(|v| store.get(v).cloned()).collect())
+            };
             if !value.is_finite() {
                 bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
             }
             loss_sum += value;
             self.tokens_seen += ex.tokens.len() as u64;
-            let grads = loss.backward()?;
-            for (slot, var) in sum.iter_mut().zip(&self.vars) {
-                if let Some(g) = grads.get(var) {
+            for (slot, g) in sum.iter_mut().zip(grads) {
+                if let Some(g) = g {
                     *slot = Some(match slot.take() {
                         Some(acc) => (acc + g)?,
-                        None => g.clone(),
+                        None => g,
                     });
                 }
             }

@@ -153,7 +153,12 @@ fn a_run_that_will_not_fit_is_refused_before_it_starts() {
     // other refusals, each plain: a 4-bit base, a GPU
     let msg = |args: &[&str]| run(args).0.last().unwrap()["message"].as_str().unwrap().to_string();
     assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--base-dtype", "4bit"]).contains("QLoRA"));
-    assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]).contains("CPU only"));
+    // a GPU this build has no backend for is refused with the feature to build (a `cuda` build would open the card)
+    if !cfg!(feature = "cuda") {
+        let m = msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]);
+        assert!(m.contains("--features cuda"), "{m}");
+        assert!(!root.join("o").exists(), "nothing was written");
+    }
 }
 
 #[test]

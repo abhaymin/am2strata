@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use candle_core::{CpuStorage, CustomOp1, DType, Device, Layout, Shape, Tensor, Var, D};
+use candle_core::backend::BackendStorage;
+use candle_core::{CpuStorage, CudaStorage, CustomOp1, DType, Device, Layout, MetalStorage, Shape, Storage, Tensor, Var, D};
 use serde_json::Value;
 
 /// The decoder families this forward pass covers (each checked against transformers).
@@ -336,6 +337,14 @@ impl CustomOp1 for FrozenLinear {
         take_value(&self.y, "frozen-half-linear")
     }
 
+    fn metal_fwd(&self, _storage: &MetalStorage, _layout: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+        take_device_value(&self.y, "frozen-half-linear", |s| match s { Storage::Metal(m) => Some(m), _ => None })
+    }
+
+    fn cuda_fwd(&self, _storage: &CudaStorage, _layout: &Layout) -> candle_core::Result<(CudaStorage, Shape)> {
+        take_device_value(&self.y, "frozen-half-linear", |s| match s { Storage::Cuda(c) => Some(c), _ => None })
+    }
+
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let w = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
         Ok(Some(grad_res.matmul(&w)?))
@@ -361,6 +370,14 @@ impl CustomOp1 for MaskedSoftmax {
         take_value(&self.y, "masked-softmax")
     }
 
+    fn metal_fwd(&self, _storage: &MetalStorage, _layout: &Layout) -> candle_core::Result<(MetalStorage, Shape)> {
+        take_device_value(&self.y, "masked-softmax", |s| match s { Storage::Metal(m) => Some(m), _ => None })
+    }
+
+    fn cuda_fwd(&self, _storage: &CudaStorage, _layout: &Layout) -> candle_core::Result<(CudaStorage, Shape)> {
+        take_device_value(&self.y, "masked-softmax", |s| match s { Storage::Cuda(c) => Some(c), _ => None })
+    }
+
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let gy = grad_res.mul(res)?;
         let inner = gy.broadcast_sub(&res.broadcast_mul(&gy.sum_keepdim(D::Minus1)?)?)?;
@@ -375,6 +392,19 @@ fn take_value(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(
     // one copy of the values into a buffer of their own (the tensor may be a view of a larger one)
     let shape = y.shape().clone();
     Ok((CpuStorage::F32(y.flatten_all()?.to_vec1::<f32>()?), shape))
+}
+
+/// The same on a GPU: the value already sits in device memory, so it is handed over as one device-side copy of its
+/// buffer (made contiguous from offset 0 first when it is a view), never through the CPU.
+fn take_device_value<S: BackendStorage>(slot: &Mutex<Option<Tensor>>, name: &str, pick: impl Fn(&Storage) -> Option<&S>)
+                                        -> candle_core::Result<(S, Shape)> {
+    let y = slot.lock().map_err(|_| candle_core::Error::Msg(format!("{name}: lock")))?.take()
+        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: forward ran twice")))?;
+    let y = if y.is_contiguous() && y.layout().start_offset() == 0 { y } else { y.affine(1.0, 0.0)? };
+    let shape = y.shape().clone();
+    let (storage, layout) = y.storage_and_layout();
+    let s = pick(&storage).ok_or_else(|| candle_core::Error::Msg(format!("{name}: the value is on another device than its input")))?;
+    Ok((s.try_clone(layout)?, shape))
 }
 
 /// The plain version, from differentiable operations (what [`masked_softmax`] is checked against).
@@ -879,6 +909,75 @@ impl LlamaModel {
         let hidden = self.upper_hidden(h, ctx)?.index_select(&Tensor::from_vec(rows, (n,), &self.dev)?, 0)?;
         let logits = self.head(&hidden)?;
         Ok(candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), &self.dev)?)?)
+    }
+
+    /// The same loss, and the gradient of every variable in `vars`, with each trained block **recomputed** in the
+    /// backward pass instead of kept: the forward pass keeps only the hidden state entering each trained block (and
+    /// where its dropout masks start), the head is scored `head_rows` rows at a time, and the backward pass then runs
+    /// one block at a time from the top, rebuilding that block's graph from its saved input and sending the gradient
+    /// on to the block below. Memory: one block's graph plus `[seq, hidden]` per trained block, instead of every
+    /// block's graph; time: about one more forward pass of the trained blocks. The dropout masks repeat exactly, so the
+    /// gradients are the plain backward pass's (up to the order of float additions).
+    pub fn loss_and_grads_recompute(&self, h: &Tensor, tokens: &[u32], supervised: &[bool], ctx: &Ctx, vars: &[Var], head_rows: usize)
+                                    -> Result<(f64, Vec<Option<Tensor>>)> {
+        let rows: Vec<u32> = (1..tokens.len()).filter(|p| supervised[*p]).map(|p| (p - 1) as u32).collect();
+        if rows.is_empty() {
+            bail!("an example with no supervised token");
+        }
+        let n = rows.len();
+        let seq = h.dim(0)?;
+        if seq == 0 {
+            bail!("an empty token sequence");
+        }
+        let (rope, mask) = (self.rope(seq)?, self.causal_mask(seq)?);
+        let range = self.first_trained..self.cfg.num_hidden_layers;
+        let block = |i: usize| self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (the activation cache stands in for it)"));
+
+        // forward: each block's graph is dropped as soon as its (detached) output exists
+        let mut saved: Vec<(Tensor, u64)> = Vec::with_capacity(range.len());
+        let mut x = h.detach();
+        for i in range.clone() {
+            saved.push((x.clone(), ctx.calls.get()));
+            x = self.block_forward(block(i)?, &x, &rope, &mask, ctx)?.detach();
+        }
+
+        // the head and the loss, a chunk of rows at a time (the logits are [rows, vocab]: the biggest tensor of a step)
+        let top = Var::from_tensor(&x)?;
+        drop(x);
+        let normed = rms_norm(top.as_tensor(), &self.norm, self.cfg.rms_norm_eps)?;
+        let mut loss = 0.0f64;
+        let mut g: Option<Tensor> = None;
+        for chunk in rows.chunks(head_rows.max(1)) {
+            let idx = Tensor::from_vec(chunk.to_vec(), (chunk.len(),), &self.dev)?;
+            let targets: Vec<u32> = chunk.iter().map(|r| tokens[*r as usize + 1]).collect();
+            let logits = self.head(&normed.index_select(&idx, 0)?)?;
+            let part = (candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (chunk.len(),), &self.dev)?)? * (chunk.len() as f64 / n as f64))?;
+            loss += part.to_scalar::<f32>()? as f64;
+            let grads = part.backward()?;
+            let gt = grads.get(&top).ok_or_else(|| anyhow!("the loss sent no gradient to the last block"))?.clone();
+            g = Some(match g { Some(a) => (a + gt)?, None => gt });
+        }
+        drop(normed);
+        let mut g = g.ok_or_else(|| anyhow!("no row was scored"))?;
+
+        // backward: one block's graph at a time, from the top
+        let mut out: Vec<Option<Tensor>> = vec![None; vars.len()];
+        for (k, i) in range.enumerate().rev() {
+            let (input, calls) = &saved[k];
+            let input = Var::from_tensor(input)?;
+            ctx.calls.set(*calls);
+            let y = self.block_forward(block(i)?, input.as_tensor(), &rope, &mask, ctx)?;
+            let grads = y.mul(&g)?.sum_all()?.backward()?;
+            for (slot, var) in out.iter_mut().zip(vars) {
+                if let Some(gv) = grads.get(var) {
+                    *slot = Some(match slot.take() { Some(a) => (a + gv)?, None => gv.clone() });
+                }
+            }
+            if k > 0 {
+                g = grads.get(&input).ok_or_else(|| anyhow!("block {i} sent no gradient to its input"))?.clone();
+            }
+        }
+        Ok((loss, out))
     }
 
     pub fn loss(&self, tokens: &[u32], supervised: &[bool], ctx: &Ctx) -> Result<Tensor> {

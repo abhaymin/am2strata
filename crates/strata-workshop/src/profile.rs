@@ -53,6 +53,8 @@ pub struct ProfileInput {
     pub accumulation: usize,
     /// the activation cache is on (it needs `lora.train_layers` below the block count)
     pub cache: bool,
+    /// each trained block is rebuilt in the backward pass ([`crate::model::LlamaModel::loss_and_grads_recompute`])
+    pub recompute: bool,
     pub examples: usize,
     pub epochs: f64,
     /// mean tokens per conversation, for the time estimate (the memory estimate uses `max_len`)
@@ -123,8 +125,11 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let adapter = trainable * 4;
 
     let per_token = graph_floats_per_token(cfg, &p.lora, seq);
-    let graph = 2.0 * 4.0 * seq as f64 * per_token * trained as f64;
-    let head = 6.0 * 4.0 * (seq * cfg.vocab_size) as f64;
+    // with recompute: one block's graph at a time, the input of every trained block, and the head a chunk of rows at a time
+    let graph = if p.recompute { 2.0 * 4.0 * seq as f64 * per_token + 4.0 * (seq * cfg.hidden_size * (trained + 2)) as f64 }
+                else { 2.0 * 4.0 * seq as f64 * per_token * trained as f64 };
+    let head_rows = if p.recompute { seq.min(crate::finetune::HEAD_ROWS) } else { seq };
+    let head = 6.0 * 4.0 * (head_rows * cfg.vocab_size) as f64;
     let frozen = if cached || first == 0 { 0.0 } else { 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
     let activations = (graph + head + frozen) as u64;
 
@@ -148,7 +153,9 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let head_fwd = 2.0 * (cfg.vocab_size * cfg.hidden_size) as f64;
     let passes = p.examples as f64 * p.epochs;
     let lower_passes = if cached { p.examples as f64 } else { passes };
-    let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * 3.0 * (trained as f64 * block_fwd + head_fwd));
+    // recompute runs the trained blocks forward once more (4 passes instead of 3)
+    let trained_passes = if p.recompute { 4.0 } else { 3.0 };
+    let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * (trained_passes * trained as f64 * block_fwd + 3.0 * head_fwd));
 
     Estimate {
         total_params: cfg.total_params(), trainable_params: trainable, trained_blocks: trained, weights_bytes: weights, adapter_bytes: adapter,
@@ -387,7 +394,7 @@ pub fn autopilot(a: &AutopilotInput) -> Result<Plan> {
                               train_layers: (train_layers < layers).then_some(train_layers), seed: 42 };
         // whenever blocks are frozen: besides the time over several epochs, it is what keeps them out of memory
         let cache = train_layers < layers;
-        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, epochs,
+        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, recompute: false, examples: a.examples, epochs,
                                          avg_tokens: a.avg_tokens.min(max_len) });
         (lora, cache, e)
     };
