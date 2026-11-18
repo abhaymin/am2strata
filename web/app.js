@@ -580,15 +580,25 @@ $("song-form").onsubmit = async (ev) => {
   hint.textContent = was;
   $("song-go").disabled = false;
 };
-// Image > edit: shown for a model that takes edit images; the files picked (or a result sent back to it)
-let editImages = [];
+// Image > edit: shown for a model that edits by instructions (edit images) or redraws from the image (a source image
+// and a mask: edit_controls.rs's families); the files picked (or a result sent back to it), and what may change
+const RETOUCH = ["z-image", "flux", "flux2", "sdxl", "sd15", "sd3", "qwen-image", "wuerstchen"];
+let editImages = [], editMask = null;
+const editModel = () => (media.models || []).find((x) => x.name === $("img-model").value);
+const redraws = () => { const m = editModel(); return !!(m && !m.edits && RETOUCH.includes(m.family)); };
 function fillEditRow() {
-  const m = (media.models || []).find((x) => x.name === $("img-model").value);
-  const can = !!(m && m.edits);
+  const m = editModel();
+  const can = !!(m && (m.edits || RETOUCH.includes(m.family)));
   $("img-edit-row").hidden = !can;
-  if (!can) editImages = [];
+  if (!can) { editImages = []; editMask = null; }
   const n = editImages.length;
-  $("img-edit-thumbs").innerHTML = editImages.map((u, i) => `<img src="${u}" alt="${i ? "reference" : "image to edit"} ${i + 1}" title="${i ? "reference" : "edited"}">`).join("");
+  $("img-edit-controls").hidden = !n;
+  $("img-strength-f").hidden = !redraws();
+  $("img-mode-note").textContent = !n ? "" : redraws()
+    ? `${m.name} redraws from the image: the slider is how far it may move from it, and a mask keeps the rest as it is.`
+    : `${m ? m.name : "This model"} edits by your instructions. A mask and "show the original through" decide what stays.`;
+  $("img-mask-note").textContent = editMask ? "A mask is set: only the painted area may change." : "No mask: the whole image may change.";
+  $("img-edit-thumbs").innerHTML = editImages.map((u, i) => `<img src="${u.startsWith("mf_") ? (libUrls.get(u) || "") : u}" alt="${i ? "reference" : "image to edit"} ${i + 1}" title="${i ? "reference" : "edited"}">`).join("");
   $("img-edit-clear").hidden = !n;
   $("img-size-auto").hidden = !n;
   if (n && !$("img-size").dataset.touched) $("img-size").value = "auto";
@@ -600,14 +610,80 @@ const asDataUrl = (f) => new Promise((ok, no) => { const r = new FileReader(); r
 $("img-edit").onchange = async () => {
   const files = [...$("img-edit").files].slice(0, 3);
   editImages = await Promise.all(files.map(asDataUrl));
+  editMask = null;
   $("img-edit").value = "";
   fillEditRow();
 };
-$("img-edit-clear").onclick = () => { editImages = []; fillEditRow(); };
+$("img-edit-clear").onclick = () => { editImages = []; editMask = null; fillEditRow(); };
+for (const [id, out] of [["img-strength", "img-strength-v"], ["img-blend", "img-blend-v"]]) $(id).oninput = () => { $(out).textContent = `${$(id).value}%`; };
+$("img-model").addEventListener("change", fillEditRow);
+
+// the mask painter: white (painted) may change, black stays; kept at the image's own size
+const editSrc = (u) => u && u.startsWith("mf_") ? libUrls.get(u) || "" : u;
+let maskCtx = null, maskData = null, maskErase = false;
+$("img-mask-btn").onclick = () => {
+  const src = editSrc(editImages[0]);
+  if (!src) return;
+  const img = $("mask-img");
+  img.onload = () => {
+    const c = $("mask-canvas");
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    maskCtx = c.getContext("2d");
+    // the shown overlay (red where it may change) and the real mask (white on black) drawn together
+    maskData = document.createElement("canvas");
+    maskData.width = c.width; maskData.height = c.height;
+    const md = maskData.getContext("2d");
+    md.fillStyle = "#000"; md.fillRect(0, 0, c.width, c.height);
+    maskCtx.clearRect(0, 0, c.width, c.height);
+    if (editMask) {
+      const prev = new Image();
+      prev.onload = () => { md.drawImage(prev, 0, 0, c.width, c.height); redrawOverlay(); };
+      prev.src = editMask;
+    }
+    $("mask-dlg").showModal();
+  };
+  img.src = src;
+};
+function redrawOverlay() {
+  const c = $("mask-canvas"), d = maskData.getContext("2d").getImageData(0, 0, c.width, c.height);
+  for (let i = 0; i < d.data.length; i += 4) { const on = d.data[i] > 127; d.data[i] = 255; d.data[i + 1] = 40; d.data[i + 2] = 40; d.data[i + 3] = on ? 255 : 0; }
+  maskCtx.putImageData(d, 0, 0);
+}
+function paintAt(e) {
+  const c = $("mask-canvas"), b = c.getBoundingClientRect();
+  const k = c.width / b.width, x = (e.clientX - b.left) * k, y = (e.clientY - b.top) * k, rad = Number($("mask-brush").value) * k / 2;
+  for (const [ctx, col] of [[maskData.getContext("2d"), maskErase ? "#000" : "#fff"], [maskCtx, "rgba(255,40,40,1)"]]) {
+    ctx.save();
+    if (ctx === maskCtx && maskErase) ctx.globalCompositeOperation = "destination-out";
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+  }
+}
+$("mask-canvas").addEventListener("pointerdown", (e) => { $("mask-canvas").setPointerCapture(e.pointerId); paintAt(e); });
+$("mask-canvas").addEventListener("pointermove", (e) => { if (e.buttons) paintAt(e); });
+$("mask-brush").oninput = () => {};
+$("mask-erase").onclick = () => { maskErase = !maskErase; $("mask-erase").setAttribute("aria-pressed", String(maskErase)); $("mask-erase").textContent = maskErase ? "Painting" : "Erase"; };
+$("mask-invert").onclick = () => {
+  const md = maskData.getContext("2d"), d = md.getImageData(0, 0, maskData.width, maskData.height);
+  for (let i = 0; i < d.data.length; i += 4) { const v = d.data[i] > 127 ? 0 : 255; d.data[i] = d.data[i + 1] = d.data[i + 2] = v; d.data[i + 3] = 255; }
+  md.putImageData(d, 0, 0); redrawOverlay();
+};
+$("mask-clear").onclick = () => { const md = maskData.getContext("2d"); md.fillStyle = "#000"; md.fillRect(0, 0, maskData.width, maskData.height); redrawOverlay(); };
+$("mask-cancel").onclick = () => $("mask-dlg").close();
+$("mask-done").onclick = () => {
+  // nothing painted is no mask (the whole image may change)
+  const d = maskData.getContext("2d").getImageData(0, 0, maskData.width, maskData.height).data;
+  let any = false;
+  for (let i = 0; i < d.length; i += 4) if (d[i] > 127) { any = true; break; }
+  editMask = any ? maskData.toDataURL("image/png") : null;
+  $("mask-dlg").close();
+  fillEditRow();
+};
 $("img-size").onchange = () => { $("img-size").dataset.touched = "1"; };
 $("img-results").addEventListener("click", (e) => {
   const b = e.target.closest("[data-edit-this]"); if (!b) return;
-  editImages = [b.closest("figure").querySelector("img").src];
+  const fig = b.closest("figure");
+  editImages = [fig.dataset.fileId || (fig.querySelector(".cmp-top img") || fig.querySelector("img")).src];
+  editMask = null;
   fillEditRow();
   $("img-prompt").focus();
 });
@@ -628,6 +704,91 @@ $("media-kinds").addEventListener("click", (e) => {
   const k = b.dataset.kind;
   $("img-form").hidden = k !== "image"; $("vid-form").hidden = k !== "video"; $("audio-forms").hidden = k !== "audio";
   $("song-form").hidden = k !== "song"; $("tools-forms").hidden = k !== "tools";
+  $("lib-panel").hidden = k !== "library"; $("img-results").hidden = k === "library";
+  if (k === "library") loadLibrary();
+});
+
+// ------------------------------------------------------------------ Media > Library (GET/POST/DELETE /v1/media/files)
+const libUrls = new Map();   // a library file id -> its blob URL (fetched once, with the API key)
+async function libUrl(id) {
+  if (libUrls.has(id)) return libUrls.get(id);
+  const r = await fetch(`v1/media/files/${id}/content`, {headers: headers()});
+  if (!r.ok) throw new Error(`HTTP ${r.status}`);
+  const u = URL.createObjectURL(await r.blob());
+  libUrls.set(id, u);
+  return u;
+}
+const kib = (n) => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
+async function loadLibrary() {
+  const q = new URLSearchParams({limit: "120"});
+  if ($("lib-kind").value) q.set("kind", $("lib-kind").value);
+  if ($("lib-source").value) q.set("source", $("lib-source").value);
+  let j;
+  try {
+    const r = await fetch(`v1/media/files?${q}`, {headers: headers()});
+    j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+  } catch (e) { $("lib-grid").innerHTML = `<p class="muted small">Not opened: ${esc(String(e.message || e))}</p>`; return; }
+  const l = j.library;
+  $("lib-usage").textContent = `${j.total} file${j.total === 1 ? "" : "s"}` + (l ? ` · ${kib(l.bytes)} of ${kib(l.max_bytes)}` : "") +
+    (j.max_age_days ? ` · kept ${Math.round(j.max_age_days)} days unless pinned` : "");
+  if (!j.data.length) { $("lib-grid").innerHTML = `<p class="muted small">Nothing yet. What you make or send to be edited appears here.</p>`; return; }
+  $("lib-grid").innerHTML = j.data.map((f) => {
+    const what = f.prompt || f.name || f.used_for || "";
+    const left = j.max_age_days && !f.pinned ? Math.max(0, Math.ceil(j.max_age_days - (Date.now() / 1000 - f.created) / 86400)) : null;
+    const sub = [f.pinned ? "pinned" : left != null ? `goes in ${left} day${left === 1 ? "" : "s"}` : null, f.source === "generated" ? "made" : "sent", f.model, f.seed != null ? `seed ${f.seed}` : null, kib(f.bytes),
+                 new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
+    return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
+      <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
+      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="pin" data-pinned="${f.pinned ? 1 : 0}">${f.pinned ? "Unpin" : "Pin"}</button>
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
+        <button type="button" class="st-btn st-btn--secondary" data-lib-act="delete">Delete</button></div></figure>`;
+  }).join("");
+  for (const fig of $("lib-grid").querySelectorAll("figure")) {
+    libUrl(fig.dataset.lib).then((u) => {
+      const k = fig.dataset.kind;
+      const el = document.createElement(k === "video" ? "video" : k === "audio" ? "audio" : "img");
+      if (k === "video" || k === "audio") el.controls = true; else el.alt = fig.querySelector("figcaption").textContent.slice(0, 80);
+      el.src = u;
+      fig.querySelector(".lib-media").append(el);
+    }).catch(() => { fig.querySelector(".lib-media").textContent = "not read"; });
+  }
+}
+$("lib-kind").onchange = loadLibrary;
+$("lib-source").onchange = loadLibrary;
+$("lib-add").onchange = async () => {
+  const f = $("lib-add").files[0]; $("lib-add").value = "";
+  if (!f) return;
+  try {
+    const r = await fetch("v1/media/files", {method: "POST", headers: headers(true), body: JSON.stringify({data: await asDataUrl(f), name: f.name})});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    toast("success", "Added", `${f.name} is ${j.id}.`);
+    loadLibrary();
+  } catch (e) { toast("error", "Not added", String(e.message || e), 8000); }
+};
+$("lib-grid").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-lib-act]"); if (!b) return;
+  const fig = b.closest("figure"), id = fig.dataset.lib;
+  if (b.dataset.libAct === "copy") { navigator.clipboard.writeText(id).then(() => toast("success", "Copied", id)); }
+  else if (b.dataset.libAct === "pin") {
+    const r = await fetch(`v1/media/files/${id}`, {method: "PATCH", headers: headers(true), body: JSON.stringify({pinned: b.dataset.pinned !== "1"})});
+    if (r.ok) loadLibrary(); else toast("error", "Not changed", `HTTP ${r.status}`);
+  }
+  else if (b.dataset.libAct === "save") {
+    const a = document.createElement("a"); a.href = await libUrl(id); a.download = id; a.click();
+  } else if (b.dataset.libAct === "delete") {
+    const r = await fetch(`v1/media/files/${id}`, {method: "DELETE", headers: headers()});
+    if (r.ok) { libUrls.delete(id); fig.remove(); } else toast("error", "Not deleted", `HTTP ${r.status}`);
+  } else if (b.dataset.libAct === "edit") {
+    // to the Image form with this file as the image to edit (sent by its id, not again as base64)
+    $("media-kinds").querySelector('[data-kind="image"]').click();
+    editImages = [id];
+    fillEditRow();
+    $("img-prompt").focus();
+  }
 });
 $("vid-model").addEventListener("change", fillVideoSizes);
 $("vid-form").onsubmit = async (ev) => {
@@ -3587,7 +3748,14 @@ $("img-form").onsubmit = async (ev) => {
   if (!prompt) return;
   const editing = editImages.length > 0 && !$("img-edit-row").hidden;
   const body = {prompt, size: $("img-size").value, response_format: "b64_json", model: $("img-model").value};
-  if (editing) body.images = editImages;
+  if (editing) {
+    body.images = editImages;
+    if (editMask) body.mask = editMask;
+    if (redraws()) body.strength = Number($("img-strength").value) / 100;
+    if (Number($("img-blend").value) > 0) body.blend = Number($("img-blend").value) / 100;
+    if ($("img-keepcol").checked) body.keep_colors = true;
+  }
+  const before = editing ? editSrc(editImages[0]) : null;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   $("img-go").disabled = true;
   const t0 = performance.now();
@@ -3602,8 +3770,23 @@ $("img-form").onsubmit = async (ev) => {
       img.src = "data:image/png;base64," + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      cap.textContent = `${editing ? "edit, " : ""}${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
-      fig.append(img, cap);
+      cap.textContent = `${editing ? "edit, " : ""}${j.size}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}` +
+        (d.file_id ? ` (library ${d.file_id})` : "");
+      if (d.file_id) { fig.dataset.fileId = d.file_id; libUrls.set(d.file_id, img.src); }
+      // an edit: the result over the original, with a slider between them
+      if (before) {
+        const cmp = document.createElement("div");
+        cmp.className = "cmp";
+        cmp.innerHTML = `<img alt="the original" src="${before}"><div class="cmp-top"></div>` +
+          `<div class="cmp-label"><span>original</span><span>edit</span></div><input type="range" min="0" max="100" value="50" aria-label="Original or edit">`;
+        cmp.querySelector(".cmp-top").append(img);
+        const top = cmp.querySelector(".cmp-top"), sl = cmp.querySelector("input");
+        const at = () => { top.style.clipPath = `inset(0 0 0 ${sl.value}%)`; };
+        sl.oninput = at; at();
+        fig.append(cmp, cap);
+      } else {
+        fig.append(img, cap);
+      }
       if (!$("img-edit-row").hidden) {
         const again = document.createElement("button");
         again.type = "button"; again.className = "st-btn st-btn--secondary"; again.dataset.editThis = "1"; again.textContent = "Edit this";

@@ -165,6 +165,7 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("song", MODEL);
     mon.media_seed(job, seed);
+    mon.media_prompt(job, &format!("{style}\n\n{lyrics}"));
     let _row = crate::monitor::MediaRow::new(&mon, job);
     // takes: a song is made again with other seeds until the speech-to-text model hears enough of its lyrics (even
     // with the song planner, sung words vary with the seed), the best take kept
@@ -220,12 +221,17 @@ pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Jso
             Err(_) => return error(StatusCode::BAD_GATEWAY, "music_error", "the media engine returned no audio"),
         }
     };
-    mon.media_file_add(job, "wav", wav.clone());
     let seed = v["seed"].as_u64().unwrap_or(seed);
+    mon.media_seed(job, seed);
+    let file_id = mon.media_file_add(job, "wav", wav.clone());
+    if let (Some(fid), Some(o), Some(l)) = (&file_id, crate::media_files::owner_of(&s, &headers), crate::media_files::FILES.get()) {
+        l.own(fid, &o);
+    }
     mon.media_end(job, "stop", &format!("{duration} s {}, {language}, seed {seed}{heard_note}", if instrumental { "music" } else { "song" }));
     Response::builder().header(header::CONTENT_TYPE, "audio/wav")
         .header("x-strata-seconds", duration.to_string()).header("x-strata-model", MODEL)
         .header("x-strata-language", language).header("x-strata-seed", seed.to_string())
+        .header("x-strata-file-id", file_id.unwrap_or_default())
         .header("x-strata-ms", t0.elapsed().as_millis().to_string())
         .header("x-strata-lyrics-heard", if best >= 0.0 { format!("{best:.2}") } else { "-".into() })
         // the planner's tempo, key and time signature, for a song asked without them

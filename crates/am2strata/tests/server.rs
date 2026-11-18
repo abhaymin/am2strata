@@ -1074,9 +1074,9 @@ fn images_are_edited_by_a_model_that_takes_edit_images() {
     let r = reqwest::blocking::Client::new().post(format!("{}/v1/images/edits", s.base)).bearer_auth(KEY).multipart(form).send().unwrap();
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.json::<Value>().unwrap()["size"], "512x512");
-    // refused plainly: a model without edits, a mask, no image, too many
-    for (body, what) in [(json!({"prompt": "p", "images": [url]}), "cannot edit images"),
-                         (json!({"prompt": "p", "model": model, "images": [url], "mask": url}), "mask is not supported"),
+    // refused plainly: a model that cannot edit, a mask that is no image, no image, too many
+    for (body, what) in [(json!({"prompt": "p", "model": "wan21-t2v-1.3b:turbo", "images": [url]}), "cannot edit images"),
+                         (json!({"prompt": "p", "model": model, "images": [url], "mask": "bm90IGFuIGltYWdl"}), "mask: not an image"),
                          (json!({"prompt": "p", "model": model}), "send the image"),
                          (json!({"prompt": "p", "model": model, "images": [url, url, url, url]}), "at most 3")] {
         let (c, r) = s.post("/v1/images/edits", &body);
@@ -3151,4 +3151,105 @@ fn video_frames_come_from_the_media_engine_without_ffmpeg() {
     let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
         {"type": "text", "text": "What is in this video?"}, {"type": "video_url", "video_url": {"url": mp4}}]}], "max_tokens": 16}));
     assert_eq!(c, 200, "a chat video becomes frames without ffmpeg: {r}");
+}
+
+/// The media library (media_files.rs): what the server makes and what it is sent is kept once, by its content, and used
+/// again by id; a client key sees only its own files, the main key all; a file goes when deleted.
+#[test]
+fn media_is_kept_in_the_library_and_used_again_by_id() {
+    let m = Model { extra: json!({"clients": {"laptop": {"key": LAPTOP, "tools": ["image"]}, "phone": {"key": PHONE, "tools": ["image"]}}}),
+                    ..Model::default() };
+    let s = Server::start(&[m], &[ids("x")], json!({}));
+    // a generated image comes back with its id, and the library has it with its prompt and seed
+    let (c, r) = post_as(&s, LAPTOP, "/v1/images/generations", &json!({"prompt": "a lighthouse", "size": "512x512", "seed": 5, "steps": 2}), &[]);
+    assert_eq!(c, 200, "{r}");
+    let made = r["data"][0]["file_id"].as_str().unwrap().to_string();
+    assert!(made.starts_with("mf_") && made.len() == 19, "{r}");
+    let get_as = |key: &str, path: &str| {
+        let r = reqwest::blocking::Client::new().get(format!("{}{path}", s.base)).bearer_auth(key).send().unwrap();
+        let code = r.status().as_u16();
+        (code, r.headers().get("content-type").map(|v| v.to_str().unwrap().to_string()), r.bytes().unwrap().to_vec())
+    };
+    let (c, _, body) = get_as(LAPTOP, &format!("/v1/media/files/{made}"));
+    let e: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((c, e["kind"].as_str(), e["source"].as_str(), e["prompt"].as_str(), e["seed"].as_u64()),
+               (200, Some("image"), Some("generated"), Some("a lighthouse"), Some(5)), "{e}");
+    let (c, ct, made_png) = get_as(LAPTOP, &format!("/v1/media/files/{made}/content"));
+    assert_eq!((c, ct.as_deref()), (200, Some("image/png")));
+    assert!(made_png.starts_with(b"\x89PNG"));
+    // another client neither lists nor reads it; the main key does
+    assert_eq!(get_as(PHONE, &format!("/v1/media/files/{made}")).0, 404);
+    let (_, _, list) = get_as(PHONE, "/v1/media/files");
+    assert_eq!(serde_json::from_slice::<Value>(&list).unwrap()["total"], 0);
+    assert_eq!(s.get(&format!("/v1/media/files/{made}"), true).0, 200);
+    // the id edits the image: no base64 sent again
+    let (c, r) = post_as(&s, LAPTOP, "/v1/images/edits", &json!({"prompt": "at night", "model": "chatr-omni-qwen-image-2.1:q8", "images": [made], "steps": 2}), &[]);
+    assert_eq!(c, 200, "{r}");
+    // an upload: JSON with a data: URL; the same bytes again are the same file
+    let (c, up) = post_as(&s, PHONE, "/v1/media/files", &json!({"data": png(), "name": "two-pixels.png"}), &[]);
+    assert_eq!((c, up["kind"].as_str(), up["source"].as_str(), up["name"].as_str()), (200, Some("image"), Some("uploaded"), Some("two-pixels.png")), "{up}");
+    let (_, again) = post_as(&s, PHONE, "/v1/media/files", &json!({"data": png()}), &[]);
+    assert_eq!(again["id"], up["id"]);
+    let (_, _, list) = get_as(PHONE, "/v1/media/files?kind=image");
+    assert_eq!(serde_json::from_slice::<Value>(&list).unwrap()["total"], 1);
+    // pinned: kept past the age limit; the entry says so
+    let id = up["id"].as_str().unwrap();
+    let r = reqwest::blocking::Client::new().patch(format!("{}/v1/media/files/{id}", s.base)).bearer_auth(PHONE).json(&json!({"pinned": true})).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (_, _, e) = get_as(PHONE, &format!("/v1/media/files/{id}"));
+    assert_eq!(serde_json::from_slice::<Value>(&e).unwrap()["pinned"], true);
+    // deleted: gone from the library and from use
+    let r = reqwest::blocking::Client::new().delete(format!("{}/v1/media/files/{id}", s.base)).bearer_auth(PHONE).send().unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(get_as(PHONE, &format!("/v1/media/files/{id}")).0, 404);
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": "chatr-omni-qwen-image-2.1:q8", "images": [id]}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("no media file"), "{r}");
+    // no key, no library
+    assert_eq!(get_as("wrong", "/v1/media/files").0, 401);
+}
+
+/// How much an edit keeps of the original (edit_controls.rs): a model that starts from the image gets it as its source
+/// with the strength and the mask; an instruction model gets references, and refuses strength by name; on both the
+/// original's pixels come back outside the mask; the answer names the original's library id for a before/after.
+#[test]
+fn an_edit_keeps_what_the_mask_and_the_controls_say() {
+    use base64::Engine as _;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let enc = |img: image::DynamicImage| { let mut b = std::io::Cursor::new(Vec::new()); img.write_to(&mut b, image::ImageFormat::Png).unwrap(); b.into_inner() };
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({}));
+    let orig = enc(image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(64, 64, image::Rgb([250, 0, 0]))));
+    // keep the left half, change the right
+    let mask = enc(image::DynamicImage::ImageLuma8(image::GrayImage::from_fn(64, 64, |x, _| image::Luma([if x >= 32 { 255 } else { 0 }]))));
+    let url = format!("data:image/png;base64,{}", b64(&orig));
+    let murl = format!("data:image/png;base64,{}", b64(&mask));
+    // Z-Image: redrawn from the image, at the strength, inside the mask
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "a blue sky", "model": "z-image-turbo:q8", "images": [url], "mask": murl,
+                                                     "strength": 0.4, "mask_feather": 0, "size": "512x512", "steps": 2}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["strata"]["edit"]["mode"], "redrawn from the image", "{r}");
+    assert_eq!(r["strata"]["edit"]["original_file_id"], json!(id_of(&orig)), "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let g: Value = rec.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["op"] == "generate").unwrap();
+    assert_eq!((g["request"]["strength"].as_f64(), g["request"]["mask_image"].is_string(), g["request"]["source_image"].is_string(),
+                g["request"]["edit_images"].is_null()), (Some(0.4), true, true, true), "{g}");
+    let out = image::load_from_memory(&base64::engine::general_purpose::STANDARD.decode(r["data"][0]["b64_json"].as_str().unwrap()).unwrap()).unwrap().to_rgb8();
+    assert_eq!(out.get_pixel(0, out.height() / 2).0, [250, 0, 0], "outside the mask the original stays");
+    // Qwen Image 2.1: by instructions; strength is refused by name, a mask and a blend are taken
+    let qwen = "chatr-omni-qwen-image-2.1:q8";
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "strength": 0.4}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("strength does not apply"), "{r}");
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "mask": murl, "blend": 0.3, "keep_colors": true}));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!((r["strata"]["edit"]["mode"].as_str(), r["strata"]["edit"]["controls"]["blend"].as_f64()), (Some("by instructions"), Some(0.3)), "{r}");
+    // a wrong control is refused by name, before any drawing
+    let (c, r) = s.post("/v1/images/edits", &json!({"prompt": "p", "model": qwen, "images": [url], "blend": 2}));
+    assert_eq!(c, 400, "{r}");
+    assert!(r["error"]["message"].as_str().unwrap().contains("blend"), "{r}");
+}
+
+fn id_of(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("mf_{}", sha2::Sha256::digest(b).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>())
 }

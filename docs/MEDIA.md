@@ -38,6 +38,23 @@ The answer has `data: [{"b64_json": …}]`. The model's own defaults fill in any
 with `images` as base64 or data URLs. The first image is edited and the others are references; it needs an image
 model that takes edits (Qwen Image 2.1).
 
+### How much an edit keeps of the original
+
+`POST /v1/images/edits` takes these besides the image and the prompt:
+
+| Field | What it does | Models |
+|---|---|---|
+| `strength` (0.05-1.0) | how far the result may move from the image: it is the starting point (default 0.65) | those that redraw from an image: Z-Image, FLUX, SDXL, SD 1.5/3, Qwen Image 1 |
+| `mask` (image, file id) | white = may change, black = keep. Those models redraw only there; on every model the original's own pixels are put back outside it, with a soft edge (`mask_feather`, px, default 8) | all |
+| `keep_colors` | the result's colours matched to the original's | all |
+| `blend` (0-0.95) | how much of the original shows through | all |
+
+An instruction model (Qwen Image 2.1) refuses `strength` by name (it cannot start from the image); `mask`, `blend`
+and `keep_colors` work with it. The answer's `strata.edit` says how it was drawn, the controls, and
+`original_file_id` (the library id of the image edited), for a before/after. In the app: Media › Image, with a file
+picked or **Edit this**: the sliders, the checkbox and **Paint what may change** (a brush, Erase, Invert, Clear);
+each edit is shown over its original with a slider between them.
+
 ## Video
 
 `POST /v1/videos/generations`:
@@ -78,6 +95,33 @@ cover 8 languages. Indic Parler speaks Malayalam and 11 more Indian languages, a
 The answer is audio/wav, 48 kHz stereo; `duration` is 10 to 600 seconds. With `planner` on (the default), the song's
 structure is planned first, which adds a missing tempo, key and time signature. In a chat, `make_song` makes a sung
 song and `compose_music` an instrumental.
+
+## The media library
+
+Every image, video and sound the server makes, and every one it is sent to edit or transcribe, is kept once, by its
+content, in `<data dir>/media-files/`. Each has an id, `mf_` and 16 hex digits of its SHA-256, which works in place of
+the file in any media request:
+
+```bash
+# an image made earlier, edited without sending it again
+curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model": "qwen-image-2.1:q8", "prompt": "at night", "images": ["mf_3f2a9c0d1e4b5a67"]}'
+```
+
+- Generation answers carry the id: `data[i].file_id` for images and video, the `x-strata-file-id` header for speech
+  and songs.
+- `GET /v1/media/files?kind=image|video|audio&source=generated|uploaded&limit=&offset=` lists them, newest first, with
+  what is known of each (model, prompt, seed, name, size, when).
+- `POST /v1/media/files` adds one: JSON `{"data": base64 or a data: URL, "name"}`, or multipart `file`.
+- `GET /v1/media/files/{id}` (its entry), `GET /v1/media/files/{id}/content` (the file), `DELETE /v1/media/files/{id}`.
+- **Who sees what:** the main key sees every file; a client key lists and reads the files it sent or had made. An id
+  is the file's content hash, so a request holding one may use the file.
+- **Room:** `"media_files_max_gib"` in the run config (default 10); past it the least recently used files go.
+- **Age:** a file is kept `"media_files_max_age_days"` (default 90) from when it was first made or sent, then it goes,
+  unless it is **pinned**: `PATCH /v1/media/files/{id}` `{"pinned": true}`, the Pin button, or `media pin <id>`. A
+  pinned file stays until unpinned or deleted, and is never the one dropped for room.
+- **In the app:** Media › Library, with Edit this, Pin, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
+  `media add <file>`, `media get <id> --out f`, `media rm <id>`, `media pin <id>`, `media unpin <id>`.
 
 ## Productions: one long piece from parts
 

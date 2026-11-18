@@ -78,6 +78,8 @@ struct MediaLive {
     step: Option<(u64, u64)>,
     /// the seed of the image or clip being made now (each image of a batch has its own)
     seed: Option<u64>,
+    /// what it was asked to make
+    prompt: Option<String>,
     /// (step, time) of the first and the latest step reported: the time per step
     first_step: Option<(u64, f64)>,
     last_step: Option<(u64, f64)>,
@@ -266,7 +268,7 @@ impl Monitor {
         let mut g = self.inner.lock().unwrap();
         g.next_id += 1;
         let id = g.next_id;
-        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, seed: None, first_step: None,
+        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, seed: None, prompt: None, first_step: None,
                                    last_step: None, files: Vec::new() });
         g.last_at = Some(now());
         id
@@ -296,9 +298,20 @@ impl Monitor {
     }
 
     /// What a media job made, to be saved with its row when it ends: `ext` names the type ("png", "mp4", "wav").
-    pub fn media_file_add(&self, id: u64, ext: &str, bytes: Vec<u8>) {
+    /// It also goes into the media library (media_files.rs), with the job's kind, model, seed and prompt. -> its id there.
+    pub fn media_file_add(&self, id: u64, ext: &str, bytes: Vec<u8>) -> Option<String> {
+        let mut g = self.inner.lock().unwrap();
+        let m = g.media.as_mut().filter(|m| m.id == id)?;
+        let meta = json!({"job": m.kind, "model": m.model, "seed": m.seed, "prompt": m.prompt});
+        m.files.push((ext.to_string(), bytes.clone()));
+        drop(g);
+        crate::media_files::keep_generated(&bytes, meta)
+    }
+
+    /// What the media job was asked to make (kept with its files in the library).
+    pub fn media_prompt(&self, id: u64, prompt: &str) {
         if let Some(m) = self.inner.lock().unwrap().media.as_mut().filter(|m| m.id == id) {
-            m.files.push((ext.to_string(), bytes));
+            m.prompt = Some(prompt.chars().take(2000).collect());
         }
     }
 

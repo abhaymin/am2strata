@@ -53,6 +53,11 @@ async fn serve() -> String {
     let app = axum::Router::new()
         .route("/form", get(|| async { Html(FORM) }))
         .route("/sent", get(|| async { Html("<title>Thanks</title>sent") }))
+        .route("/remember", get(|| async { (
+            [("set-cookie", "visitor=seen; Path=/; Max-Age=86400")],
+            Html("<title>Remember</title><script>localStorage.setItem('mark','set')</script>set")) }))
+        .route("/look", get(|h: axum::http::HeaderMap| async move { Html(format!(
+            "<title>Look</title><p id=c>{}</p>", h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("none"))) }))
         .route("/merged", get(|| async { Html(MERGED) }))
         .route("/footnotes", get(|| async { Html(FOOTNOTES) }))
         .route("/map", get(|| async { Html(MAP) }))
@@ -235,4 +240,28 @@ async fn the_browser_tools_work_on_real_pages() {
 
     b.close().await;
     let _ = std::fs::remove_dir_all(data);
+}
+
+/// Each browser-use session is thrown away: what one stores (a cookie, local storage) another never sees, and it is gone
+/// once the session ends, when the same conversation starts again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_browser_session_is_thrown_away_when_it_ends() {
+    let data = tmp();
+    let Some(b) = browsers(&data) else { return };
+    let base = serve().await;
+    b.call("one", "browser_open", &json!({"url": format!("{base}/remember")})).await.unwrap();
+    b.call("one", "browser_open", &json!({"url": format!("{base}/look")})).await.unwrap();
+    assert_eq!(eval(&b, "one", "document.getElementById('c').textContent").await, json!("visitor=seen"), "the session keeps its own cookie");
+    assert_eq!(eval(&b, "one", "localStorage.getItem('mark')").await, json!("set"));
+    // another session at the same time: nothing of the first
+    b.call("two", "browser_open", &json!({"url": format!("{base}/look")})).await.unwrap();
+    assert_eq!(eval(&b, "two", "document.getElementById('c').textContent").await, json!("none"), "another session sees no cookie");
+    assert_eq!(eval(&b, "two", "String(localStorage.getItem('mark'))").await, json!("null"));
+    // the first session ends: its context goes; the same conversation starts clean
+    b.close_session("one").await;
+    b.call("one", "browser_open", &json!({"url": format!("{base}/look")})).await.unwrap();
+    assert_eq!(eval(&b, "one", "document.getElementById('c').textContent").await, json!("none"), "nothing kept after the session ended");
+    assert_eq!(eval(&b, "one", "String(localStorage.getItem('mark'))").await, json!("null"));
+    b.close().await;
+    let _ = std::fs::remove_dir_all(&data);
 }

@@ -264,7 +264,7 @@ fn bad(msg: impl Into<String>) -> Response {
 }
 
 pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
-    images(s, headers, req, Vec::new()).await
+    images(s, headers, req, Vec::new(), None).await
 }
 
 /// The most images one edit takes: the one edited and its references (Qwen Image 2.1 takes up to 3 in all).
@@ -289,6 +289,8 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
     }
     let ct =req.headers().get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let (mut fields, mut files) = (json!({}), Vec::<Vec<u8>>::new());
+    // what to change (white) and keep (black): the edit controls (edit_controls.rs)
+    let mut mask: Option<Vec<u8>> = None;
     if ct.starts_with("multipart/form-data") {
         let mut mp = match axum::extract::Multipart::from_request(req, &s).await {
             Ok(m) => m,
@@ -303,10 +305,20 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
             let name = field.name().unwrap_or("").trim_end_matches("[]").to_string();
             match name.as_str() {
                 "image" => match field.bytes().await {
+                    Ok(b) if crate::media_files::is_id(std::str::from_utf8(&b).unwrap_or("").trim()) => {
+                        match crate::media_files::resolve(std::str::from_utf8(&b).unwrap_or(""), crate::media_files::MAIN) {
+                            Some(Ok(f)) => files.push(f),
+                            Some(Err(e)) => return bad(e),
+                            None => {}
+                        }
+                    }
                     Ok(b) => files.push(b.to_vec()),
                     Err(e) => return bad(format!("the image: {e}")),
                 },
-                "mask" => return bad("mask is not supported: describe the change in the prompt (the whole image is edited)"),
+                "mask" => match field.bytes().await {
+                    Ok(b) => mask = Some(b.to_vec()),
+                    Err(e) => return bad(format!("the mask: {e}")),
+                },
                 _ => {
                     let v = field.text().await.unwrap_or_default();
                     fields[name] = v.parse::<u64>().map(Value::from).unwrap_or(Value::String(v));
@@ -318,8 +330,18 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
             Ok(j) => j,
             Err(e) => return bad(format!("send multipart/form-data, or JSON: {e}")),
         };
-        if v.get("mask").is_some_and(|m| !m.is_null()) {
-            return bad("mask is not supported: describe the change in the prompt (the whole image is edited)");
+        if let Some(m) = v["mask"].as_str().filter(|m| !m.is_empty()) {
+            match crate::media_files::resolve(m, crate::media_files::MAIN) {
+                Some(Ok(b)) => mask = Some(b),
+                Some(Err(e)) => return bad(format!("mask: {e}")),
+                None => {
+                    let b64 = m.split_once(";base64,").map(|(_, b)| b).unwrap_or(m);
+                    match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                        Ok(b) if !b.is_empty() => mask = Some(b),
+                        _ => return bad("mask: base64, a data: URL or a media file id"),
+                    }
+                }
+            }
         }
         let list: Vec<Value> = match (&v["images"], &v["image"]) {
             (Value::Array(a), _) => a.clone(),
@@ -329,7 +351,15 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
         };
         for (i, item) in list.iter().enumerate() {
             // a string, or {"image_url": ...} / {"b64_json": ...} as OpenAI's newer clients send
-            let raw = item.as_str().or_else(|| item["image_url"].as_str()).or_else(|| item["b64_json"].as_str()).unwrap_or("");
+            let raw = item.as_str().or_else(|| item["image_url"].as_str()).or_else(|| item["b64_json"].as_str())
+                .or_else(|| item["file_id"].as_str()).unwrap_or("");
+            // a media library id ("mf_..."): the file kept from an earlier generation or upload
+            if let Some(f) = crate::media_files::resolve(raw, crate::media_files::MAIN) {
+                match f {
+                    Ok(b) => { files.push(b); continue; }
+                    Err(e) => return bad(format!("images[{i}]: {e}")),
+                }
+            }
             let b64 = raw.split_once(";base64,").map(|(_, b)| b).unwrap_or(raw);
             match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                 Ok(b) if !b.is_empty() => files.push(b),
@@ -350,8 +380,18 @@ pub async fn edits(State(s): State<AppState>, headers: HeaderMap, req: axum::ext
             None => return bad("the image is not a PNG, JPEG or WebP"),
         }
     }
+    // the images sent to edit are kept in the media library too (the same image is the same file), for use again
+    if let Some(o) = crate::media_files::owner_of(&s, &headers) {
+        for f in &files {
+            crate::media_files::keep_uploaded(f, &o, json!({"used_for": "image edit"}));
+        }
+    }
+    let ctl = match crate::edit_controls::EditControls::from_fields(&fields, mask) {
+        Ok(c) => c,
+        Err(e) => return bad(e),
+    };
     let b64 = files.iter().map(|f| base64::engine::general_purpose::STANDARD.encode(f)).collect();
-    images(s, headers, fields, b64).await
+    images(s, headers, fields, b64, Some(ctl)).await
 }
 
 /// POST /api/media/licenses/accept {"id": "qwen-research"}: the user agreed to a model licence in the app (the
@@ -371,7 +411,9 @@ pub async fn accept_license(State(s): State<AppState>, headers: HeaderMap, Json(
 }
 
 /// Generations and edits: `edit_images` (base64) empty for a text-to-image request.
-async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<String>) -> Response {
+async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<String>,
+                ctl: Option<crate::edit_controls::EditControls>) -> Response {
+    use base64::Engine as _;
     if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
@@ -405,16 +447,27 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     let negative = req["negative_prompt"].as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.model());
+    // an edit: by instructions (a model that takes edit images, as Qwen Image 2.1) or by redrawing from the image
+    // (a model that starts from a source image and takes a mask, as Z-Image): `retouch`
+    let mut retouch = false;
     if !edit_images.is_empty() {
         // a model that cannot take edit images would draw from the prompt alone: say so instead
-        let takes = match s.media.list().await {
-            Ok(r) => r["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model.as_str())).map(|m| m["edits"] == true),
+        let entry = match s.media.list().await {
+            Ok(r) => r["models"].as_array().and_then(|a| a.iter().find(|m| m["name"] == model.as_str())).cloned(),
             Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "media_error", format!("{e:#}")),
         };
-        match takes {
-            None => return bad(format!("{model} is not in the media catalog")),
-            Some(false) => return bad(format!("{model} cannot edit images; choose one that can, such as chatr-omni-qwen-image-2.1:q8 or qwen-image-2.1:q8 (\"model\")")),
-            Some(true) => {}
+        let Some(entry) = entry else { return bad(format!("{model} is not in the media catalog")) };
+        let instructions = entry["edits"] == true;
+        retouch = !instructions && entry["family"].as_str().is_some_and(|f| crate::edit_controls::RETOUCH_FAMILIES.contains(&f));
+        let strength = ctl.as_ref().and_then(|c| c.strength);
+        if !instructions && !retouch {
+            return bad(format!("{model} cannot edit images; choose one that can, such as chatr-omni-qwen-image-2.1:q8 or qwen-image-2.1:q8 \
+                                (by instructions), or z-image-turbo:q8 (redrawn from the image, with strength and a mask) (\"model\")"));
+        }
+        if instructions && strength.is_some() {
+            return bad(format!("{model} edits by instructions and cannot start from the image, so strength does not apply: \
+                                use a model that does (z-image-turbo:q8), or blend (how much of the original shows through) \
+                                and a mask (what may change) with this one"));
         }
     }
     let t0 = Instant::now();
@@ -425,6 +478,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     };
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin(if edit_images.is_empty() { "image" } else { "image edit" }, &model);
+    mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut data = Vec::new();
     let mut failure = None;
@@ -447,7 +501,17 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
             r["negative_prompt"] = json!(neg);
         }
         if !edit_images.is_empty() {
-            r["edit_images"] = json!(edit_images);
+            if retouch {
+                // redrawn from the image: it is the starting point, changed by `strength`, and only inside the mask
+                let c = ctl.clone().unwrap_or_default();
+                r["source_image"] = json!(edit_images[0]);
+                r["strength"] = json!(c.strength.unwrap_or(0.65));
+                if let Some(m) = &c.mask {
+                    r["mask_image"] = json!(base64::engine::general_purpose::STANDARD.encode(m));
+                }
+            } else {
+                r["edit_images"] = json!(edit_images);
+            }
         }
         let mut png = None;
         let mut res = s.media.call(json!({"op": "generate", "request": r.clone()}), |ev| {
@@ -477,7 +541,25 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
             }
         }
         match (res, png) {
-            (Ok(_), Some(b64)) => data.push(json!({"b64_json": b64, "seed": seed + i, "revised_prompt": prompt})),
+            (Ok(_), Some(b64)) => {
+                // the edit's finish: the original kept outside the mask, its colours, a blend (edit_controls.rs)
+                let b64 = match (&ctl, edit_images.first()) {
+                    (Some(c), Some(orig)) if c.finishes() => {
+                        let done = base64::engine::general_purpose::STANDARD.decode(orig).ok().zip(base64::engine::general_purpose::STANDARD.decode(&b64).ok())
+                            .ok_or_else(|| "not base64".to_string())
+                            .and_then(|(o, p)| crate::edit_controls::finish(&o, &p, c));
+                        match done {
+                            Ok(png) => base64::engine::general_purpose::STANDARD.encode(png),
+                            Err(e) => {
+                                notes.push(format!("the edit's finish was not applied: {e}"));
+                                b64
+                            }
+                        }
+                    }
+                    _ => b64,
+                };
+                data.push(json!({"b64_json": b64, "seed": seed + i, "revised_prompt": prompt}))
+            }
             (Ok(_), None) => {
                 failure = Some("the media engine returned no image".to_string());
                 break;
@@ -500,16 +582,32 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
         } else { f };
         return error(StatusCode::BAD_GATEWAY, "image_error", f);
     }
-    for d in &data {
+    let owner = crate::media_files::owner_of(&s, &headers);
+    for d in data.iter_mut() {
         use base64::Engine as _;
+        if let Some(seed) = d["seed"].as_u64() {
+            mon.media_seed(job, seed);   // each image of a batch is kept with its own seed
+        }
         if let Ok(png) = base64::engine::general_purpose::STANDARD.decode(d["b64_json"].as_str().unwrap_or("")) {
-            mon.media_file_add(job, "png", png);
+            // kept in the media library: the id uses it again (an edit's image, a video's first frame, a chat)
+            if let Some(id) = mon.media_file_add(job, "png", png) {
+                if let (Some(o), Some(l)) = (&owner, crate::media_files::FILES.get()) {
+                    l.own(&id, o);
+                }
+                d["file_id"] = json!(id);
+            }
         }
     }
     mon.media_end(job, "stop", &format!("{} image{}, {w}x{h}", data.len(), if data.len() == 1 { "" } else { "s" }));
     Json(json!({"created": crate::now(), "data": data, "size": format!("{w}x{h}"),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": ran, "model": model,
                            "edit_images": edit_images.len(), "notes": notes,
+                           // the edit: how it was drawn, the controls, and the original's library id (for a before/after)
+                           "edit": if edit_images.is_empty() { Value::Null } else {
+                               json!({"mode": if retouch { "redrawn from the image" } else { "by instructions" },
+                                      "controls": ctl.as_ref().map(|c| c.describe()),
+                                      "original_file_id": base64::engine::general_purpose::STANDARD.decode(&edit_images[0]).ok()
+                                          .map(|b| crate::media_files::id_of(&b))}) },
                            "engine": "am2strata-media (Rust, candle)"}})).into_response()
 }
 
@@ -913,6 +1011,7 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let mon = s.mgr.monitor.clone();
     let job = mon.media_begin("video", &model);
     mon.media_seed(job, seed);
+    mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
     let mut clip = None;
     let res = s.media.call(json!({"op": op, "request": r}), |ev| {
@@ -937,14 +1036,20 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
             return error(StatusCode::BAD_GATEWAY, "video_error", format!("{e:#}"));
         }
     };
+    let mut file_id = Value::Null;
     if let Ok(clip) = {
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD.decode(v["data"].as_str().unwrap_or(""))
     } {
-        mon.media_file_add(job, v["format"].as_str().unwrap_or("mp4"), clip);
+        if let Some(id) = mon.media_file_add(job, v["format"].as_str().unwrap_or("mp4"), clip) {
+            if let (Some(o), Some(l)) = (crate::media_files::owner_of(&s, &headers), crate::media_files::FILES.get()) {
+                l.own(&id, &o);
+            }
+            file_id = json!(id);
+        }
     }
     mon.media_end(job, "stop", &format!("{}x{}, {} frames at {} fps", v["width"], v["height"], v["frames"], v["fps"]));
-    Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed}],
+    Json(json!({"created": crate::now(), "data": [{"b64": v["data"], "format": v["format"], "seed": seed, "file_id": file_id}],
                 "size": format!("{}x{}", v["width"], v["height"]), "frames": v["frames"], "fps": v["fps"], "clips": v["clips"].as_u64().unwrap_or(1),
                 "strata": {"seconds": (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0, "steps": steps, "model": model,
                            "engine": "am2strata-media (Rust, candle)", "frames_note": frames_note}})).into_response()

@@ -37,6 +37,11 @@ pub fn target_of(v: &Value) -> String {
     match v.as_str() { Some(s) => s.trim().to_lowercase(), None => String::new() }
 }
 
+/// Every browser besides the default one (the user's own, the sandbox's), for the idle sweep.
+pub fn others() -> Vec<Arc<Browsers>> {
+    extra().lock().unwrap().values().cloned().collect()
+}
+
 fn extra() -> &'static Mutex<HashMap<String, Arc<Browsers>>> {
     static E: OnceLock<Mutex<HashMap<String, Arc<Browsers>>>> = OnceLock::new();
     E.get_or_init(Default::default)

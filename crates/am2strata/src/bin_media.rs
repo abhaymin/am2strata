@@ -136,6 +136,11 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts, polls every 3 s for step N of M, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
+///   files [image|video|audio]                             (the media library: every file made or sent, newest first)
+///   add <file>                                            (puts a file in the library; prints its id)
+///   get <id> --out file                                   (a library file)
+///   rm <id>                                               (removes a library file)
+///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
 #[derive(Args)]
 pub struct MediaOpts {
     /// the answer's file (image, video, speech, song, dub and job --out all need it; refuse a missing one)
@@ -194,6 +199,11 @@ pub struct MediaOpts {
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts the plan, polls step N of M every 3 s, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
+///   files [image|video|audio]                             (the media library: every file made or sent, newest first)
+///   add <file>                                            (puts a file in the library; prints its id)
+///   get <id> --out file                                   (a library file)
+///   rm <id>                                               (removes a library file)
+///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
 #[allow(clippy::too_many_arguments)]
 pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
@@ -223,7 +233,8 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
-            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job")),
+            "files" | "add" | "get" | "rm" | "pin" | "unpin" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
+            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm, pin, unpin")),
         }
         Ok(())
     })();
@@ -252,7 +263,8 @@ fn cmd_image(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim()).map_err(|e| e.to_string())?;
         write_file(Path::new(&names[i]), &bytes)?;
     }
-    println!("saved {}", names[0].clone());
+    let ids: Vec<&str> = data.iter().filter_map(|d| d["file_id"].as_str()).collect();
+    println!("saved {}{}", names[0].clone(), if ids.is_empty() { String::new() } else { format!(" (library {})", ids.join(", ")) });
     Ok(())
 }
 
@@ -387,6 +399,52 @@ fn cmd_job(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwe
         let bytes = c.bytes().map_err(|e| e.to_string())?;
         write_file(&expand_path(Path::new(p)), &bytes)?;
         println!("saved {} ({} KB)", Path::new(p).display(), bytes.len() / 1024);
+    }
+    Ok(())
+}
+
+/// The media library (GET/POST/DELETE /v1/media/files).
+fn cmd_files(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+             action: &str, first: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    match action {
+        "files" => {
+            let q = first.map(|k| format!("?kind={k}")).unwrap_or_default();
+            let j: Value = send(client.get(format!("{url}/v1/media/files{q}")))?.json().map_err(|e| e.to_string())?;
+            if o.json {
+                println!("{}", serde_json::to_string_pretty(&j).map_err(|e| e.to_string())?);
+                return Ok(());
+            }
+            for f in j["data"].as_array().into_iter().flatten() {
+                let what = f["prompt"].as_str().or(f["name"].as_str()).or(f["used_for"].as_str()).unwrap_or("");
+                println!("{}{} {:5} {:9} {:>8} KB  {}", f["id"].as_str().unwrap_or("?"), if f["pinned"] == true { " pinned" } else { "" }, f["kind"].as_str().unwrap_or(""),
+                         f["source"].as_str().unwrap_or(""), f["bytes"].as_u64().unwrap_or(0) / 1024, what.chars().take(60).collect::<String>());
+            }
+            println!("{} file(s)", j["total"]);
+        }
+        "add" => {
+            let p = expand_path(Path::new(first.ok_or("add needs a file")?));
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned());
+            let j: Value = send(client.post(format!("{url}/v1/media/files")).json(&json!({"data": data_url(&p)?, "name": name})))?
+                .json().map_err(|e| e.to_string())?;
+            if o.json { println!("{j}"); } else { println!("{} ({}, {} KB)", j["id"].as_str().unwrap_or("?"), j["kind"].as_str().unwrap_or(""), j["bytes"].as_u64().unwrap_or(0) / 1024); }
+        }
+        "get" => {
+            let id = first.ok_or("get needs an id")?;
+            let out = require_out(&o.out)?;
+            let bytes = send(client.get(format!("{url}/v1/media/files/{id}/content")))?.bytes().map_err(|e| e.to_string())?;
+            write_file(&out, &bytes)?;
+            println!("saved {} ({} KB)", out.display(), bytes.len() / 1024);
+        }
+        "pin" | "unpin" => {
+            let id = first.ok_or("pin needs an id")?;
+            send(client.patch(format!("{url}/v1/media/files/{id}")).json(&json!({"pinned": action == "pin"})))?;
+            println!("{id} {}", if action == "pin" { "pinned: kept until unpinned or removed" } else { "unpinned" });
+        }
+        _ => {
+            let id = first.ok_or("rm needs an id")?;
+            send(client.delete(format!("{url}/v1/media/files/{id}")))?;
+            println!("removed {id}");
+        }
     }
     Ok(())
 }

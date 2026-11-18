@@ -212,6 +212,12 @@ const ROUTES: &[Row] = &[
     row("GET", "/v1/media/jobs/{id}", Client).at("/v1/media/jobs/mj-999").ok(404),
     row("GET", "/v1/media/jobs/{id}/content", Client).at("/v1/media/jobs/mj-999/content").ok(404),
     row("GET", "/v1/media/jobs/{id}/captions.srt", Client).at("/v1/media/jobs/mj-999/captions.srt").ok(404),
+    row("GET", "/v1/media/files", Client),
+    row("POST", "/v1/media/files", Client).json(r#"{}"#).ok(400).note("nothing sent: refused before anything is kept"),
+    row("GET", "/v1/media/files/{id}", Client).at("/v1/media/files/mf_0000000000000000").ok(404),
+    row("DELETE", "/v1/media/files/{id}", Client).at("/v1/media/files/mf_0000000000000000").ok(404),
+    row("PATCH", "/v1/media/files/{id}", Client).at("/v1/media/files/mf_0000000000000000").json(r#"{"pinned": true}"#).ok(404),
+    row("GET", "/v1/media/files/{id}/content", Client).at("/v1/media/files/mf_0000000000000000/content").ok(404),
     // ------------------------------------------------------------------------------- downloads, monitor, the canvas
     row("GET", "/api/models/updates", Owner).at("/api/models/updates?id=nope").ok(404).note("no such model: Hugging Face is not asked"),
     row("POST", "/api/models/update", Owner).json(r#"{"id": "nope"}"#).ok(404).note("no such model: nothing is fetched"),

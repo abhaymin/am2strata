@@ -444,6 +444,9 @@ struct Tab {
     used: Instant,
     /// a tab the user already had open (the `connect` mode): the job works in it and never closes it
     adopted: bool,
+    /// the throwaway browser context of its session (the server's own browser): its cookies, cache and storage are
+    /// in memory only and are deleted with it when the session ends
+    context: Option<chromiumoxide::cdp::browser_protocol::browser::BrowserContextId>,
 }
 
 impl Tab {
@@ -554,6 +557,21 @@ struct Running {
     tabs: Vec<(String, Tab)>,
     /// per conversation: the id of the tab the other tools act on (the "current" one for this job)
     active: HashMap<String, String>,
+    /// per conversation: its throwaway browser context (the server's own browser only). Every tab of the session
+    /// opens in it, and it is deleted, with all it stored, once the session has no tab left.
+    contexts: HashMap<String, chromiumoxide::cdp::browser_protocol::browser::BrowserContextId>,
+}
+
+/// Deletes the browser contexts no tab uses any more: a session that ended leaves no cookie, cache or storage behind.
+async fn sweep_contexts(run: &mut Running) {
+    let used: Vec<_> = run.tabs.iter().filter_map(|(_, t)| t.context.clone()).collect();
+    let gone: Vec<String> = run.contexts.iter().filter(|(_, c)| !used.contains(c)).map(|(k, _)| k.clone()).collect();
+    for conv in gone {
+        if let Some(c) = run.contexts.remove(&conv) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), run.browser.dispose_browser_context(c)).await;
+            tracing::info!(conv = %conv, "browser: a session ended; its context and everything it stored are deleted");
+        }
+    }
 }
 
 pub struct Browsers {
@@ -705,7 +723,7 @@ impl Browsers {
                                       --remote-debugging-port and --user-data-dir, then try again"))?;
             tokio::spawn(async move { while handler.next().await.is_some() {} });
             tracing::info!(%endpoint, "attached to the user's browser (its own logins)");
-            *run = Some(Running { browser, child: None, profile: None, tabs: Vec::new(), active: HashMap::new() });
+            *run = Some(Running { browser, child: None, profile: None, tabs: Vec::new(), active: HashMap::new(), contexts: HashMap::new() });
             return Ok(());
         }
         let exe = self.settings.exe.clone().ok_or("no browser here: install Chrome (or run the installer with its browser option), put chrome-headless-shell in <data>/browser, set \"browser\": {\"exe\": ...}, or attach to your own with \"browser\": {\"connect\": \"http://127.0.0.1:9222\"}")?;
@@ -759,7 +777,7 @@ impl Browsers {
         let (browser, mut handler) = Browser::connect(ws).await.map_err(|e| format!("connecting to the browser: {e}"))?;
         tokio::spawn(async move { while handler.next().await.is_some() {} });
         tracing::info!(exe = %exe.display(), "browser started (headless, a fresh profile)");
-        *run = Some(Running { browser, child, profile: Some(profile), tabs: Vec::new(), active: HashMap::new() });
+        *run = Some(Running { browser, child, profile: Some(profile), tabs: Vec::new(), active: HashMap::new(), contexts: HashMap::new() });
         Ok(())
     }
 
@@ -768,7 +786,17 @@ impl Browsers {
         self.ensure().await?;
         let mut guard = self.run.lock().await;
         let run = guard.as_mut().unwrap();
-        run.tabs.retain(|(_id, _t)| _t.used.elapsed() < IDLE);
+        // tabs left idle are closed (and with them, a session's context)
+        let mut i = 0;
+        while i < run.tabs.len() {
+            if run.tabs[i].1.used.elapsed() >= IDLE {
+                let (id, t) = run.tabs.remove(i);
+                run.active.retain(|_, v| *v != id);
+                t.release().await;
+            } else {
+                i += 1;
+            }
+        }
         if let Some(id) = run.active.get(conv).cloned() {
             if let Some((_, t)) = run.tabs.iter_mut().find(|(tid, _)| *tid == id) {
                 t.used = Instant::now();
@@ -785,11 +813,32 @@ impl Browsers {
             run.active.retain(|_, v| *v != id);
             t.release().await;
         }
+        sweep_contexts(run).await;
         let user_tab = if self.settings.connect.is_some() { adopt_user_tab(run).await } else { None };
         let adopted = user_tab.is_some();
+        // the server's own browser: each session in its own throwaway context (like a private window), so nothing one
+        // session stored (cookies, cache, local storage, logins it made) is seen by another or kept after it ends.
+        // The user's own browser (`connect`) keeps its profile: its logins are the reason to use it.
+        let mut context = None;
+        if self.settings.connect.is_none() {
+            let c = match run.contexts.get(conv) {
+                Some(c) => c.clone(),
+                None => {
+                    let c = run.browser.create_browser_context(
+                        chromiumoxide::cdp::browser_protocol::target::CreateBrowserContextParams::default()).await.map_err(|e| e.to_string())?;
+                    run.contexts.insert(conv.to_string(), c.clone());
+                    c
+                }
+            };
+            context = Some(c);
+        }
         let page = match user_tab {
             Some(p) => p,
-            None => run.browser.new_page("about:blank").await.map_err(|e| e.to_string())?,
+            None => {
+                let mut params = chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::new("about:blank");
+                params.browser_context_id = context.clone();
+                run.browser.new_page(params).await.map_err(|e| e.to_string())?
+            }
         };
         // where a page's download lands (a folder, the file name sanitised when placed), or denied so it never reaches here
         if let Some(dir) = self.settings.download_dir.clone() {
@@ -840,7 +889,7 @@ impl Browsers {
         more::watch(&page, self.diag.clone()).await;
         // a new tab for this conversation is the one the tools act on until browser_tabs closes or switches it
         let id = format!("tab-{}", uuid::Uuid::new_v4().simple());
-        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted }));
+        run.tabs.push((id.clone(), Tab { page: page.clone(), used: Instant::now(), adopted, context }));
         run.active.insert(conv.to_string(), id);
         Ok(page)
     }
@@ -1094,6 +1143,36 @@ impl Browsers {
         }
     }
 
+    /// Ends the sessions idle for IDLE: their tabs close and their throwaway contexts (cookies, cache, storage) are
+    /// deleted. A browser the server started that has no session left is closed too, and its profile folder removed,
+    /// so nothing of the sessions stays on disk. Run every minute (main.rs).
+    pub async fn sweep_idle(&self) {
+        let empty = {
+            let mut guard = self.run.lock().await;
+            let Some(run) = guard.as_mut() else { return };
+            let mut i = 0;
+            while i < run.tabs.len() {
+                if run.tabs[i].1.used.elapsed() >= IDLE {
+                    let (id, t) = run.tabs.remove(i);
+                    let convs: Vec<String> = run.active.iter().filter(|(_, v)| **v == id).map(|(k, _)| k.clone()).collect();
+                    run.active.retain(|_, v| *v != id);
+                    for c in convs {
+                        self.last.lock().unwrap().remove(&c);
+                    }
+                    t.release().await;
+                } else {
+                    i += 1;
+                }
+            }
+            sweep_contexts(run).await;
+            run.tabs.is_empty() && run.child.is_some()
+        };
+        if empty {
+            tracing::info!("browser: no session left; the server's browser is closed and its profile removed");
+            self.close().await;
+        }
+    }
+
     /// End a session (a site test's run): its tab closes and its step memory goes.
     pub async fn close_session(&self, conv: &str) {
         self.drop_tab(conv).await;
@@ -1110,6 +1189,7 @@ impl Browsers {
                     let (_, t) = run.tabs.remove(i);
                     t.release().await;
                 }
+                sweep_contexts(run).await;
             }
         }
     }
@@ -1257,6 +1337,7 @@ impl Browsers {
                                 run.active.retain(|_, v| *v != target.id);
                                 t.release().await;
                             }
+                            sweep_contexts(run).await;
                         }
                         if let Some(page) = self.current(conv).await.or_else(|| guard.as_ref().and_then(|r| r.tabs.first().map(|(_, t)| t.page.clone()))) {
                             return Ok(render_page(&page, &format!("Closed tab {}: {}", idx, target.label())).await);
