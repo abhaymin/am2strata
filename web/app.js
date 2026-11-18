@@ -1882,13 +1882,22 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false, browser: false};
+// web search and the browser are on by default (the owner: the chat should be able to look things up and browse);
+// each can be switched off in the chat's settings, and their queries are said to leave this machine there
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: true, browser: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// settings saved before web and the browser were on by default kept them off without anyone choosing that: once,
+// they take the new default (a later switch-off is kept)
+if (!store.get("tools-default-v2", false)) {
+  settings.web = true; settings.browser = true;
+  store.set("tools-default-v2", true);
+  store.set("sampling", settings);
+}
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 // chats: [{id, title, time, model, messages}], the newest first; the one on screen is `current`
 let chats = store.get("chats", null);
