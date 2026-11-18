@@ -268,7 +268,9 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
         }).collect::<Vec<_>>()
     }).unwrap_or_default();
     // the shots' lengths: their own when given, else spread over the audio (with crossfades)
-    let total_s = duration_of(&dir, "audio.wav", &audio).await?;
+    let whole_s = duration_of(&dir, "audio.wav", &audio).await?;
+    // a part of the audio (a Short from the chorus): audio_from seconds in, for audio_seconds; captions are timed in it
+    let (from, total_s) = audio_part(whole_s, req["audio_from"].as_f64(), req["audio_seconds"].as_f64())?;
     let ass = ass_script(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s);
     let subs = dir.join("subs.ass");
     std::fs::write(&subs, &ass).map_err(|e| format!("could not write the captions: {e}"))?;
@@ -347,7 +349,7 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let picp = pictures.display().to_string();
     let audiop = dir.join("audio.wav").display().to_string();
     let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
-    let fc = final_filter(&subsp, played);
+    let fc = final_filter(&subsp, played, from);
     run_ffmpeg(&["-i", picp.as_str(), "-i", audiop.as_str(), "-filter_complex", fc.as_str(), "-map", "[v]", "-map", "[a]", "-t", played.to_string().as_str(), "-r", FPS.to_string().as_str(), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.display().to_string().as_str()]).await?;
 
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
@@ -374,8 +376,22 @@ async fn probe_seconds(f: &std::path::Path) -> Option<f64> {
 
 /// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
 /// fade out at the end. `subs` is the ASS file's path already escaped for a filter option.
-pub fn final_filter(subs: &str, played: f64) -> String {
-    format!("[0:v]subtitles=filename='{}'[v];[1:a]atrim=start=0,asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, played.max(4.0) - 4.0)
+pub fn final_filter(subs: &str, played: f64, audio_from: f64) -> String {
+    format!("[0:v]subtitles=filename='{}'[v];[1:a]atrim=start={:.3},asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, audio_from.max(0.0),
+            played.max(4.0) - 4.0)
+}
+
+/// The part of the audio a video plays: (start, length) from `audio_from` and `audio_seconds` within the whole length.
+pub fn audio_part(whole: f64, from: Option<f64>, seconds: Option<f64>) -> Result<(f64, f64), String> {
+    let from = from.unwrap_or(0.0);
+    if !(0.0..whole).contains(&from) {
+        return Err(format!("audio_from: {from} s is not inside the audio ({whole:.1} s)"));
+    }
+    let len = seconds.map(|s| s.min(whole - from)).unwrap_or(whole - from);
+    if len < 1.0 {
+        return Err("audio_seconds: at least 1 s of audio is needed".into());
+    }
+    Ok((from, len))
 }
 
 /// The xfade chain that joins the shots in order, each beginning one crossfade before the previous ends (so their joins
@@ -518,6 +534,15 @@ mod tests {
 
     /// A short clip in a long shot is held to the shot's whole length (Peace and Harmony's 5 s clips in 14 s shots
     /// once made a 15 s picture track under 200 s of audio). Only runs where ffmpeg is installed.
+    #[test]
+    fn a_short_plays_a_part_of_the_song() {
+        assert_eq!(audio_part(200.0, Some(35.9), Some(58.0)).unwrap(), (35.9, 58.0));
+        assert_eq!(audio_part(200.0, Some(180.0), Some(58.0)).unwrap(), (180.0, 20.0), "to the end at most");
+        assert_eq!(audio_part(45.0, None, None).unwrap(), (0.0, 45.0));
+        assert!(audio_part(45.0, Some(50.0), None).is_err());
+        assert!(final_filter("s.ass", 58.0, 35.9).contains("atrim=start=35.900"));
+    }
+
     #[test]
     fn an_ffmpeg_without_libass_cannot_compose() {
         // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
@@ -668,7 +693,7 @@ mod tests {
         // the held picture first (make() joins its shots the same way), then make()'s own final filter
         let held = dir.join("held.mp4");
         run_ffmpeg(&["-y", "-i", &shot.display().to_string(), "-vf", "tpad=stop_mode=clone:stop_duration=1", "-c:v", "libx264", &held.display().to_string()]).await.unwrap();
-        let fc = final_filter(&subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"), 3.0);
+        let fc = final_filter(&subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"), 3.0, 0.0);
         run_ffmpeg(&[
             "-y", "-i", &held.display().to_string(), "-i", &wav.display().to_string(),
             "-filter_complex", &fc, "-map", "[v]", "-map", "[a]",
