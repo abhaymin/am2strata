@@ -80,6 +80,9 @@ struct MediaLive {
     seed: Option<u64>,
     /// what it was asked to make
     prompt: Option<String>,
+    /// a long job's stage now (a video's clip k of n), and a line for each stage finished, oldest first
+    stage: Option<(u64, u64)>,
+    stage_log: Vec<String>,
     /// (step, time) of the first and the latest step reported: the time per step
     first_step: Option<(u64, f64)>,
     last_step: Option<(u64, f64)>,
@@ -97,6 +100,8 @@ struct Inner {
     totals: Totals,
     last_timings: Option<Value>,
     last_at: Option<f64>,
+    /// requests answered by another machine of the cluster now: id -> (machine, model, path, started)
+    remote: HashMap<u64, (String, String, String, f64)>,
 }
 
 #[derive(Default)]
@@ -268,7 +273,7 @@ impl Monitor {
         let mut g = self.inner.lock().unwrap();
         g.next_id += 1;
         let id = g.next_id;
-        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, seed: None, prompt: None, first_step: None,
+        g.media = Some(MediaLive { id, kind, model: model.to_string(), started: now(), step: None, seed: None, prompt: None, stage: None, stage_log: Vec::new(), first_step: None,
                                    last_step: None, files: Vec::new() });
         g.last_at = Some(now());
         id
@@ -306,6 +311,57 @@ impl Monitor {
         m.files.push((ext.to_string(), bytes.clone()));
         drop(g);
         crate::media_files::keep_generated(&bytes, meta)
+    }
+
+    /// A request a cluster worker answers (cluster.rs forward): shown live under Monitor's machines and kept in the
+    /// history like the requests this machine answers. -> its id, for `remote_end`.
+    pub fn remote_begin(&self, machine: &str, model: &str, path: &str) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.next_id += 1;
+        let id = g.next_id;
+        g.remote.insert(id, (machine.to_string(), model.to_string(), path.to_string(), now()));
+        g.last_at = Some(now());
+        id
+    }
+
+    /// The worker's answer has ended (its stream finished, or the client went away): its history row.
+    pub fn remote_end(&self, id: u64, finish: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let Some((machine, model, path, started)) = g.remote.remove(&id) else { return };
+        let t = now();
+        let row = json!({"id": id, "time": started, "duration_s": ((t - started) * 10.0).round() / 10.0, "finish": finish,
+                         "kind": "chat", "model": model, "machine": machine, "path": path, "output": format!("answered by {machine}")});
+        self.push(&mut g, row);
+    }
+
+    /// A long job's stage (a video's clip `stage` of `stages`, of the scene `what`): when it moves on, the stage before
+    /// is logged as finished, with the time it took so far.
+    pub fn media_stage(&self, id: u64, stage: u64, stages: u64, what: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(m) = g.media.as_mut().filter(|m| m.id == id) else { return };
+        if m.stage.is_some_and(|(s, _)| s == stage) {
+            return;
+        }
+        if let Some((prev, n)) = m.stage {
+            let t = now() - m.started;
+            m.stage_log.push(format!("clip {prev} of {n} done at {}:{:02}", (t / 60.0) as u64, (t % 60.0) as u64));
+        }
+        if !what.is_empty() && (m.stage_log.is_empty() || m.stage.is_none_or(|(s, _)| s + 1 == stage)) {
+            // the scene a clip belongs to, said once when it starts
+            let scene: String = what.chars().take(80).collect();
+            if !m.stage_log.last().is_some_and(|l| l.ends_with(&format!("\"{scene}\""))) {
+                m.stage_log.push(format!("clip {stage} of {stages}: \"{scene}\""));
+            }
+        }
+        m.stage = Some((stage, stages));
+    }
+
+    /// The media job running now: its step, stage and the stages finished (for the job's status and a waiting chat).
+    pub fn media_detail(&self) -> Option<Value> {
+        let g = self.inner.lock().unwrap();
+        let m = g.media.as_ref()?;
+        Some(json!({"step": m.step.map(|s| s.0), "steps": m.step.map(|s| s.1), "stage": m.stage.map(|s| s.0),
+                    "stages": m.stage.map(|s| s.1), "log": m.stage_log, "elapsed_s": (now() - m.started).round()}))
     }
 
     /// What the media job was asked to make (kept with its files in the library).
@@ -417,6 +473,7 @@ impl Monitor {
             None if g.media.is_some() => {
                 let m = g.media.as_ref().unwrap();
                 json!({"state": "media", "kind": m.kind, "model": m.model, "step": m.step.map(|s| s.0), "steps": m.step.map(|s| s.1),
+                       "stage": m.stage.map(|s| s.0), "stages": m.stage.map(|s| s.1), "stage_log": m.stage_log,
                        "seed": m.seed, "s_per_step": s_per_step(m),
                        "elapsed_s": r1(t - m.started), "queued": g.queued, "phase": null, "generated": null, "max_tokens": null,
                        "tok_s": null, "tok_s_mean": null, "prompt_tokens": null, "prompt_read": null, "prompt_total": null,
@@ -447,7 +504,10 @@ impl Monitor {
         let tel = self.tel.lock().unwrap();
         let history: serde_json::Map<String, Value> =
             tel.hist.iter().map(|(k, v)| (k.to_string(), Value::Array(v.iter().cloned().collect()))).collect();
-        json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache,
+        // the requests other machines of the cluster are answering now
+        let remote: Vec<Value> = g.remote.values().map(|(m, model, path, st)| json!({"machine": m, "model": model, "path": path,
+                                                                                         "elapsed_s": (t - st).round()})).collect();
+        json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache, "remote_active": remote,
                "requests_kept": total, "requests_page": {"page": page, "per": per, "pages": pages, "total": total}, "totals": totals, "hardware": tel.now, "hardware_static": tel.stat,
                "history": history, "time": t, "alerts": self.alerts()})
     }

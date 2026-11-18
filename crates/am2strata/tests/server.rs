@@ -2718,7 +2718,7 @@ fn the_optimizer_tunes_a_model_on_the_mock() {
 #[test]
 fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
     let worker = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("Ok.\n</think>\n\nFrom the worker.")], json!({}));
-    let m = Model { extra: json!({"cluster": {"workers": {"pc2": {"url": worker.base, "key": KEY}}}}), ..Model::default() };
+    let m = Model { extra: json!({"cluster": {"workers": {"pc2": {"url": worker.base, "key": KEY}}}, "api_monitor": true}), ..Model::default() };
     let master = Server::start(&[m], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
     let t0 = Instant::now();
     let cl = loop {
@@ -2739,9 +2739,19 @@ fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
     let ev = master.stream("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "stream": true}));
     let text: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
     assert_eq!(text, "From the worker.");
+    // the master's Monitor and API calls say which machine answered (the owner: the cluster truly integrated)
+    let m = master.get("/metrics", true).1;
+    let rows: Vec<&Value> = m["requests"].as_array().unwrap().iter().filter(|r| r["machine"] == "pc2").collect();
+    assert_eq!(rows.len(), 2, "both worker-answered chats in Monitor's history: {}", m["requests"]);
+    assert_eq!((rows[0]["model"].as_str(), rows[0]["finish"].as_str()), (Some("mock-b"), Some("stop")), "{}", rows[0]);
+    assert!(m["remote_active"].as_array().unwrap().is_empty(), "nothing still running on the worker: {m}");
+    let calls = master.get("/api/requests", true).1;
+    assert!(calls["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/v1/chat/completions").take(2).all(|r| r["machine"] == "pc2"), "{calls}");
     // its own model is answered here
     let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("hi")]}));
     assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the master.")), "{v}");
+    let calls = master.get("/api/requests", true).1;
+    assert_ne!(calls["requests"][0]["machine"], "pc2", "this one answered here: {}", calls["requests"][0]);
     // a request without the master's key is never sent on
     let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", master.base))
         .json(&json!({"model": "mock-b", "messages": [user("hi")]})).send().unwrap();
@@ -3253,4 +3263,60 @@ fn an_edit_keeps_what_the_mask_and_the_controls_say() {
 fn id_of(b: &[u8]) -> String {
     use sha2::Digest;
     format!("mf_{}", sha2::Sha256::digest(b).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>())
+}
+
+/// A long video in scenes (the owner: anything of minutes is planned and stitched inside the server, never made in pieces
+/// in the chat): one request makes one chain, each scene's prompt on as many clips as its length takes, into one file;
+/// the chat tool takes `seconds` and `scenes` and queues ONE job.
+#[test]
+fn a_video_in_scenes_is_one_job_and_one_file() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let scenes = json!([{"prompt": "dawn over a harbour", "seconds": 12}, {"prompt": "fishing boats leave", "seconds": 8},
+                        {"prompt": "the sea at noon", "seconds": 4}]);
+    let (c, r) = s.post("/v1/videos/generations", &json!({"scenes": scenes, "frames": 81, "fps": 16}));
+    assert_eq!(c, 200, "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["op"] == "chain").expect("one chain for the whole video");
+    let stages = chain["request"]["stages"].as_array().unwrap();
+    let prompts: Vec<&str> = stages.iter().map(|s| s["prompt"].as_str().unwrap()).collect();
+    // 12 s at 16 fps = 192 frames: 3 clips of 65; 8 s = 128: 2 of 65; 4 s = 64: 1 of 65 (Wan's 4n+1)
+    assert_eq!(prompts, ["dawn over a harbour", "dawn over a harbour", "dawn over a harbour", "fishing boats leave", "fishing boats leave",
+                         "the sea at noon"], "{chain}");
+    assert!(stages.iter().all(|s| s["frames"].as_u64().unwrap() <= 81 && (s["frames"].as_u64().unwrap() - 1) % 4 == 0), "{chain}");
+    assert_eq!(rec.lines().filter(|l| l.contains("\"op\":\"chain\"") || l.contains("\"op\":\"generate\"")).count(), 1, "one engine job");
+    assert_eq!(r["data"].as_array().unwrap().len(), 1, "one file");
+    // a scene without its prompt, or too long, is refused by name
+    let (c, e) = s.post("/v1/videos/generations", &json!({"scenes": [{"seconds": 3}]}));
+    assert_eq!(c, 400, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("scenes[0]"), "{e}");
+    // the chat tool (and the job API): seconds and scenes go through as one queued job
+    let (c, j) = s.post("/api/jobs", &json!({"tool": "generate_video", "arguments": {"scenes": scenes}}));
+    assert_eq!(c, 200, "{j}");
+    assert_eq!(j["kind"], "video", "{j}");
+}
+
+/// A streaming API client's chat that queues a long video stays open while it is made (the owner: keep the window
+/// engaged): after the answer, a line for the job, and the file's link at the end; the web app (its own page) does
+/// not wait (its job cards follow the job), nor a client that sends "strata_media_wait": false.
+#[test]
+fn a_streaming_api_chat_follows_its_video_to_the_end() {
+    let call = "\n\n<tool_call>\n<function=generate_video>\n<parameter=scenes>\n[{\"prompt\": \"dawn\", \"seconds\": 8}, {\"prompt\": \"noon\", \"seconds\": 4}]\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Make it.\n</think>{call}")), ids("Done.\n</think>\n\nIt is on its way."),
+                                                  ids(&format!("Make it.\n</think>{call}")), ids("Done.\n</think>\n\nIt is on its way.")],
+                          json!({"media_delay_ms": 300}));
+    let body = json!({"messages": [user("A video of a harbour day.")], "strata_media": true, "stream": true});
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY).json(&body)
+        .timeout(Duration::from_secs(120)).send().unwrap();
+    let text = r.text().unwrap();
+    let content: String = text.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(str::to_string)).collect();
+    assert!(content.contains("It is on its way."), "{content}");
+    assert!(content.contains("✓ video mj-") && content.contains("is ready: /v1/media/jobs/mj-"), "the stream ends with the file: {content}");
+    // opted out: the answer alone
+    let mut body = body.clone();
+    body["strata_media_wait"] = json!(false);
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY).json(&body)
+        .timeout(Duration::from_secs(120)).send().unwrap();
+    let text = r.text().unwrap();
+    assert!(!text.contains("is ready: /v1/media"), "{text}");
 }

@@ -1,7 +1,7 @@
 # am2Strata installer for Windows (x64 and Arm64): the latest release, checked against its SHA-256. No admin rights.
 #
 #   irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
-#   & ([scriptblock]::Create((irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1))) -Version v0.1.9
+#   & ([scriptblock]::Create((irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1))) -Version v0.2.0
 #
 #   -Version X    install release X instead of the latest
 #   -Dir DIR      install into DIR instead of %LOCALAPPDATA%\am2strata (models and settings stay there too)
@@ -98,7 +98,7 @@ function Install-Am2Strata {
             [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
             if (-not $Version) {
                 $Version = (Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest").tag_name
-                if (-not $Version) { throw "could not find the latest release: try -Version v0.1.9" }
+                if (-not $Version) { throw "could not find the latest release: try -Version v0.2.0" }
             }
             if (-not $Version.StartsWith("v")) { $Version = "v$Version" }
             $Url = "https://github.com/$Repo/releases/download/$Version"

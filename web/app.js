@@ -740,7 +740,7 @@ async function loadLibrary() {
                  new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
     return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
       <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
-      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button><button type="button" class="st-btn st-btn--secondary" data-lib-act="find">Find on the web</button>` : ""}
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="pin" data-pinned="${f.pinned ? 1 : 0}">${f.pinned ? "Unpin" : "Pin"}</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
@@ -756,6 +756,34 @@ async function loadLibrary() {
     }).catch(() => { fig.querySelector(".lib-media").textContent = "not read"; });
   }
 }
+// Media › Tools › Image search: by words (POST /v1/search/images) or by an image (POST /v1/search/reverse)
+$("search-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const q = $("search-q").value.trim(), f = $("search-file").files[0], id = $("search-id").value.trim();
+  if (!q && !f && !id) return;
+  const byImage = !!(f || id);
+  $("search-go").disabled = true;
+  $("search-hint").textContent = byImage ? "Searching the engines (up to a minute)\u2026" : "Searching\u2026";
+  $("search-out").innerHTML = "";
+  try {
+    const body = byImage ? {image: f ? await asDataUrl(f) : id} : {query: q, n: 24};
+    const r = await fetch(byImage ? "v1/search/reverse" : "v1/search/images", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    if (!byImage) {
+      $("search-out").innerHTML = `<p class="muted small">${j.data.length} from ${esc(j.backend)}</p><div class="search-grid">` +
+        j.data.map((x) => `<a href="${esc(x.page_url || x.image_url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(x.thumbnail || x.image_url)}" alt="${esc(x.title)}" loading="lazy" referrerpolicy="no-referrer">${esc(x.title)}${x.license ? ` · ${esc(x.license)}` : ""}</a>`).join("") + "</div>";
+    } else {
+      $("search-out").innerHTML = j.engines.map((e) => `<div><b>${esc(e.engine)}</b> <span class="st-badge ${e.status === "ok" ? "" : "st-badge--queued"}">${esc(e.status)}</span>` +
+        (e.contains && e.contains.length ? `<p class="small">Seems to show: ${esc(e.contains.join(", "))}</p>` : "") +
+        (e.sites && e.sites.length ? `<ul>${e.sites.map((x) => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a> <span class="muted">${esc(x.domain)}</span></li>`).join("")}</ul>` : "") +
+        (e.note ? `<p class="muted small">${esc(e.note)}</p>` : "") +
+        (e.results_url ? `<p class="small"><a href="${esc(e.results_url)}" target="_blank" rel="noopener noreferrer">All of ${esc(e.engine)}'s results</a></p>` : "") + "</div>").join("");
+    }
+    $("search-hint").textContent = "";
+  } catch (e) { $("search-hint").textContent = ""; toast("error", "No results", String(e.message || e), 8000); }
+  finally { $("search-go").disabled = false; }
+};
 $("lib-kind").onchange = loadLibrary;
 $("lib-source").onchange = loadLibrary;
 $("lib-add").onchange = async () => {
@@ -782,6 +810,11 @@ $("lib-grid").addEventListener("click", async (e) => {
   } else if (b.dataset.libAct === "delete") {
     const r = await fetch(`v1/media/files/${id}`, {method: "DELETE", headers: headers()});
     if (r.ok) { libUrls.delete(id); fig.remove(); } else toast("error", "Not deleted", `HTTP ${r.status}`);
+  } else if (b.dataset.libAct === "find") {
+    // to Tools › Image search with this file's id
+    $("media-kinds").querySelector('[data-kind="tools"]').click();
+    $("search-q").value = ""; $("search-file").value = ""; $("search-id").value = id;
+    $("search-form").requestSubmit();
   } else if (b.dataset.libAct === "edit") {
     // to the Image form with this file as the image to edit (sent by its id, not again as base64)
     $("media-kinds").querySelector('[data-kind="image"]').click();
@@ -919,7 +952,7 @@ $("models-list").addEventListener("click", async (e) => {
   }
   if (load) { $("model-select").value = load.dataset.load; $("model-select").onchange(); }
   if (unload) {
-    if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+    if (running.size) { toast("warn", "Still writing", "Stop the answers first."); return; }
     unload.disabled = true;
     try {
       const r = await fetch("api/models/unload", {method: "POST", headers: headers(true), body: "{}"});
@@ -931,7 +964,7 @@ $("models-list").addEventListener("click", async (e) => {
 });
 $("model-select").onchange = async () => {
   const sel = $("model-select"), name = sel.value, before = sel.dataset.current;
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); sel.value = remoteModel || before; return; }
+  if (running.size) { toast("warn", "Still writing", "Stop the answers first."); sel.value = remoteModel || before; return; }
   if (sel.selectedOptions[0] && sel.selectedOptions[0].dataset.remote) {
     remoteModel = name;
     toast("info", `${name} answers`, "Sent to its provider; the model in memory stays loaded.");
@@ -992,7 +1025,9 @@ function spark(id, values, max) {
   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
 }
 function setMetric(key, value, unit, sub) {
-  $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  const el = $(`mv-${key}`);
+  el.innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  el.classList.toggle("st-metric__value--long", value != null && String(value).length > 6); // a seed: 10 digits
   $(`ms-${key}`).textContent = sub || "";
 }
 
@@ -1110,8 +1145,26 @@ function render(m) {
     setPill("queued", `${q.waiting.length} waiting${r}`);
   } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.requests_page);
+  if (tab === "monitor") renderMachines(live, hw, m.remote_active);
+  if (tab === "monitor") renderNow(m.queue, m.remote_active);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);
+}
+
+// Recent requests' top rows: what runs now and what waits (each chat waiting in the queue gets its own row), and the
+// requests a cluster worker is answering now, so a second chat is visible while the first one, or a media job, runs
+function renderNow(q, remote) {
+  q = q || {};
+  const label = (x) => x.label || (x.kind === "chat" ? "a chat" : x.kind ? `a ${x.kind} job` : "a request");
+  const need = (n) => !n ? "" : n === "gpu" ? "the GPU" : n === "any" ? "" : n.text_model || "";
+  const rows = [];
+  if (q.running) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span> <span class="st-badge st-badge--reading">${esc(q.running.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(q.running))}">${esc(label(q.running))}</td><td colspan="6" class="muted">${esc(need(q.running.need))}</td><td class="num">${fmt(q.running.running_s)} s</td></tr>`);
+  for (const r of Array.isArray(remote) ? remote : []) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span></td>
+    <td class="req-model">${esc(r.model || "–")} <span class="st-badge st-badge--reading">${esc(r.machine || "")}</span></td><td colspan="6" class="muted">answered by ${esc(r.machine || "a worker")}</td><td class="num">${fmt(r.elapsed_s)} s</td></tr>`);
+  for (const w of Array.isArray(q.waiting) ? q.waiting : []) rows.push(`<tr><td class="muted">#${esc(w.position)}</td><td><span class="st-badge st-badge--queued">Waiting</span> <span class="st-badge st-badge--reading">${esc(w.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(w))}">${esc(label(w))}</td><td colspan="6" class="muted">${esc([w.client, need(w.need) && `needs ${need(w.need)}`, w.eta_s != null ? `about ${fmt(w.eta_s)} s to go` : ""].filter(Boolean).join(" · "))}</td><td class="num">${fmt(w.waiting_s)} s</td></tr>`);
+  $("req-now").innerHTML = rows.join("");
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -1156,6 +1209,39 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// a row another machine of the cluster answered: its name beside the model
+const machineBadge = (r) => r.machine ? ` <span class="st-badge st-badge--reading" title="answered by ${esc(r.machine)}">${esc(r.machine)}</span>` : "";
+
+// Monitor › Machines: this one and each worker, with what it is doing now (from /metrics' remote_active) and its load
+// (GET api/cluster/system, read every few seconds while Monitor is open); hidden on a machine with no workers
+let machinesAt = 0, machinesHw = [];
+async function renderMachines(live, hw, remote) {
+  if (Date.now() - machinesAt > 5000) {
+    machinesAt = Date.now();
+    try {
+      const r = await fetch("api/cluster/system", {headers: headers()});
+      machinesHw = r.ok ? (await r.json()).workers || [] : [];
+    } catch (e) { machinesHw = []; }
+  }
+  $("machines-card").hidden = !machinesHw.length;
+  if (!machinesHw.length) return;
+  const load = (s) => {
+    if (!s) return "load not read";
+    const g = (s.gpus || []).map((x) => x.util_pct).filter((x) => x != null);
+    return [s.cpu && s.cpu.util_pct != null ? `CPU ${fmt(s.cpu.util_pct)}%` : null, g.length ? `GPU ${g.map((x) => fmt(x) + "%").join(" · ")}` : null,
+            s.memory && s.memory.total_mib ? `RAM ${(s.memory.used_mib / 1024).toFixed(1)} of ${(s.memory.total_mib / 1024).toFixed(1)} GB` : null].filter(Boolean).join(" · ");
+  };
+  const here = live.state === "generating" ? `writing (${fmt(live.tok_s, 1)} tok/s)` : live.state === "reading" ? "reading a prompt"
+    : live.state === "media" ? mediaLabel(live.kind).toLowerCase() : "idle";
+  const mine = `<div class="machine"><b>This PC</b><span>${esc(here)}</span><span class="muted">${esc([hw.cpu != null ? `CPU ${fmt(hw.cpu)}%` : null,
+    hw.gpu_util != null ? `GPU ${fmt(hw.gpu_util)}%` : null].filter(Boolean).join(" · "))}</span></div>`;
+  $("machines").innerHTML = mine + machinesHw.map((w) => {
+    const busy = (remote || []).filter((x) => x.machine === w.name);
+    const doing = busy.length ? busy.map((x) => `answering ${x.model} (${fmt(x.elapsed_s)} s)`).join("; ") : (w.ready ? "idle" : "not answering");
+    return `<div class="machine"><b>${esc(w.name)}</b><span>${esc(doing)}</span><span class="muted">${esc(load(w.system))}</span></div>`;
+  }).join("");
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
@@ -1286,7 +1372,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
         const tm = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
         const media = (r.media || []).map((f) => `<span class="req-media" data-name="${esc(f.name)}" data-type="${esc(f.type)}"></span>`).join("");
         return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
-          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td>
+          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td>
           <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} ${mediaUnit(r.kind)}${r.steps === 1 ? "" : "s"}` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
       }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -1298,7 +1384,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
-        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
@@ -1815,13 +1901,22 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false, browser: false};
+// web search and the browser are on by default (the owner: the chat should be able to look things up and browse);
+// each can be switched off in the chat's settings, and their queries are said to leave this machine there
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: true, browser: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// settings saved before web and the browser were on by default kept them off without anyone choosing that: once,
+// they take the new default (a later switch-off is kept)
+if (!store.get("tools-default-v2", false)) {
+  settings.web = true; settings.browser = true;
+  store.set("tools-default-v2", true);
+  store.set("sampling", settings);
+}
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 // chats: [{id, title, time, model, messages}], the newest first; the one on screen is `current`
 let chats = store.get("chats", null);
@@ -1833,7 +1928,12 @@ let current = store.get("current-chat", chats[0] ? chats[0].id : null);
 if (!chats.some((c) => c.id === current)) current = chats[0] ? chats[0].id : null;
 let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
-let busy = null;                      // {controller, msg, cutoff?}
+// each chat's answer in progress: chat id -> {controller, msg, cutoff?}. Several chats answer at once (the server
+// queues them, or a cluster answers them in parallel); `busy` is the current chat's
+const running = new Map();
+let busy = null;                      // the current chat's entry of `running`, or null
+const isStreaming = (m) => [...running.values()].some((b) => b.msg === m);
+function syncBusy() { busy = running.get(current) || null; setBusy(!!busy); }
 // a chat is actively driving the computer or browser; the floating pill offers to stop it (reuses busy's controller)
 let usingComputer = false, usingBrowser = false;
 function updateUsePill() {
@@ -1875,28 +1975,45 @@ function saveChat() {
   renderChatList();
 }
 function newChat() {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return false; }
   messages = []; current = null; attachments = []; renderAttachments();
   store.set("current-chat", null);
+  syncBusy(); clearUsing();
   renderChat(); renderChatList(); openChats(false);
   return true;
 }
 function openChat(id) {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
   const c = chats.find((x) => x.id === id);
   if (!c) return;
   current = id; messages = c.messages; store.set("current-chat", id);
+  syncBusy();
   renderChat(); renderChatList(); openChats(false);
 }
 function deleteChat(id) {
   const i = chats.findIndex((x) => x.id === id);
   if (i < 0) return;
-  if (busy && id === current) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (running.has(id)) { toast("warn", "Still writing", "Stop this chat's answer first."); return; }
   const [gone] = chats.splice(i, 1);
   if (id === current) { messages = []; current = null; renderChat(); }
   store.set("chats", chats.map((c) => ({...c, messages: slim(c.messages)})));
   renderChatList();
   toast("info", "Chat deleted", gone.title || "", 6000, {label: "Undo", run: () => { chats.splice(i, 0, gone); saveChat(); }});
+}
+// a chat with something running (its answer streaming or waiting in the queue, or a media job it started) gets a
+// blinking dot in the list, so work going on in another chat is visible from here
+function chatLive(c) {
+  const b = running.get(c.id);
+  if (b) return b.msg.waitingMeta ? "waiting in the queue" : "answering";
+  for (const m of c.messages) for (const t of m.tools || []) {
+    const j = t.job && jobs[t.job.id];
+    if (j && !["done", "error", "gone"].includes(j.state)) return j.state === "running" ? "making media" : "media job waiting";
+  }
+  return "";
+}
+const chatLiveDot = (c) => { const w = chatLive(c); return w ? `<span class="chat-live" title="${esc(w)}" aria-label="${esc(w)}"></span>` : ""; };
+let liveSig = "";
+function updateLiveDots() {   // re-renders the list only when a chat's running state changed
+  const sig = chats.map((c) => chatLive(c)).join("|");
+  if (sig !== liveSig) { liveSig = sig; renderChatList(); }
 }
 function renderChatList() {
   const q = ($("chat-search").value || "").toLowerCase();
@@ -1909,7 +2026,7 @@ function renderChatList() {
     const g = day(c.time);
     if (g !== group) { html += `<div class="chat-group">${g}</div>`; group = g; }
     const n = c.messages.filter((m) => m.role === "user").length;
-    html += `<div class="chat-item" aria-current="${c.id === current}"><button type="button" data-chat="${esc(c.id)}"><b>${esc(c.title || "New chat")}</b>` +
+    html += `<div class="chat-item" aria-current="${c.id === current}"><button type="button" data-chat="${esc(c.id)}"><b>${chatLiveDot(c)}${esc(c.title || "New chat")}</b>` +
       `<span>${esc(c.model || "")}${c.model ? " · " : ""}${n} message${n === 1 ? "" : "s"}</span></button>` +
       `<button type="button" class="st-btn st-btn--icon" data-del="${esc(c.id)}" aria-label="Delete this chat">${icon("trash")}</button></div>`;
   }
@@ -2038,7 +2155,7 @@ function jobCardHtml(id) {
     const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
     const chapters = (j.meta && j.meta.chapters || []).map((c) => `<li><span class="muted">${fmtClock(c.start_s)}</span> ${esc(c.title)}</li>`).join("");
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
-      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "");
+      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "") + jobLogHtml(j, true);
   }
   // gone from the server (made before it kept jobs, or past the newest it keeps): made again from the same call
   if (j.state === "gone") return `<div class="media-job__gone"><span class="muted small">This ${esc(what.toLowerCase())} is no longer on the server.</span>` +
@@ -2046,9 +2163,18 @@ function jobCardHtml(id) {
   if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>` +
     (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Try again</button>` : "");
   const where = j.kind === "production" && j.meta && j.meta.part ? `part ${j.meta.part} of ${j.meta.parts}${j.meta.now ? ` (${j.meta.now})` : ""}`
-    : j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
+    : j.state === "running" ? (j.stages ? `clip ${j.stage} of ${j.stages}` : j.steps ? `step ${j.step} of ${j.steps}` : "running")
+      + (j.elapsed_s ? ` · ${fmtClock(j.elapsed_s)}` : "")
     : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
-  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
+  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>` + jobLogHtml(j, false);
+}
+// a long job's stages as they clear (clip k of n, its scene), kept under the finished file too (folded)
+function jobLogHtml(j, done) {
+  const log = j.log || [];
+  if (!log.length) return "";
+  const items = log.map((l) => `<li>${esc(l)}</li>`).join("");
+  return done ? `<details class="media-job__log small"><summary>${log.length} stage${log.length === 1 ? "" : "s"}</summary><ol>${items}</ol></details>`
+              : `<ol class="media-job__log small">${items}</ol>`;
 }
 // "Make it again": the same tool call queued as a new job; the chat's tool call now points to it (kept with the chat)
 document.addEventListener("click", async (e) => {
@@ -2070,6 +2196,7 @@ document.addEventListener("click", async (e) => {
 });
 const fmtClock = (t) => { t = Math.round(+t || 0); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`; };
 function paintJob(id) {
+  updateLiveDots();
   document.querySelectorAll(`.media-job[data-job="${CSS.escape(id)}"]`).forEach((e) => { e.innerHTML = jobCardHtml(id); });
 }
 async function watchJob(id, t) {
@@ -2132,6 +2259,13 @@ function onTool(m, x) {
   }
 }
 function updateAssistant(el, m, streaming) {
+  if (!el || !el.isConnected) {
+    // a stream whose chat was closed and opened again paints the new element; an element not yet in the page
+    // (msgEl builds it before renderChat adds it) or another chat's answer is still painted, off screen
+    const i = messages.indexOf(m), live = i >= 0 && $("chat").querySelector(`.st-msg[data-i="${i}"]`);
+    if (live) el = live;
+    if (!el) return;
+  }
   const det = el.querySelector("details.think");
   if (m.reasoning) {
     det.hidden = false;
@@ -2191,7 +2325,7 @@ $("chat").addEventListener("click", async (e) => {
     if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
     if (t) t.approve.answered = ok;
   } catch (err) { toast("error", "Not answered", String(err.message || err), 6000); if (t) t.approve.answered = "ended"; }
-  if (t && m) updateAssistant(el, m, busy && busy.msg === m);
+  if (t && m) updateAssistant(el, m, isStreaming(m));
 });
 $("chat").addEventListener("click", (e) => {
   const cv = e.target.closest("[data-canvas]");
@@ -2215,7 +2349,7 @@ $("chat").addEventListener("click", (e) => {
     const el = sum.closest(".st-msg"), m = messages[+el.dataset.i], t = m && m.tools && m.tools[+sum.parentElement.dataset.tool];
     if (!t) return;
     t.open = !t.open;
-    updateAssistant(el, m, !!busy && busy.msg === m);
+    updateAssistant(el, m, isStreaming(m));
   }
 });
 $("chat").addEventListener("toggle", (e) => {
@@ -2283,6 +2417,7 @@ function assistantMessages(m) {
 }
 
 function setBusy(on) {
+  setTimeout(updateLiveDots, 0);
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
@@ -2290,7 +2425,7 @@ function setBusy(on) {
 
 async function send() {
   const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
+  if ((!text && !attachments.length) || running.has(current)) return;
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind === "image"),
                  files: attachments.filter((a) => a.kind === "file"),
                  media: attachments.filter((a) => a.kind === "video" || a.kind === "pdf" || a.kind === "audio"), time: Date.now()});
@@ -2300,12 +2435,14 @@ async function send() {
   autosize();
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
+  saveChat();     // the chat has its id before its answer starts, so the answer stays with it when another is opened
+  const chatId = current;
   renderChat();
    const el = $("chat").lastElementChild;
    const controller = new AbortController();
    clearUsing();   // a fresh answer starts with no computer/browser in use
-   busy = {controller, msg: m};
-   setBusy(true);
+   running.set(chatId, {controller, msg: m});
+   syncBusy();
 
    try {
      await streamInto(m, el, controller.signal);
@@ -2313,13 +2450,13 @@ async function send() {
      m.error = e.message || String(e);
      toast("error", "The request failed", m.error, 6000);
    }
-   busy = null;
-   setBusy(false);
-   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
+   running.delete(chatId);
+   syncBusy();
+   if (chatId === current) clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
   updateAssistant(el, m, false);
   saveChat();
-  scrollDown();
-  if (!m.error && !m.stopped) afterAnswer(m);
+  if (chatId === current) scrollDown();
+  if (!m.error && !m.stopped && chatId === current) afterAnswer(m);
 }
 
 // ------------------------------------------------------------------ variants (PolyStrata PR 74: swipes)
@@ -2354,7 +2491,7 @@ function swipeGo(i, delta) {
 }
 // A new answer at messages[i], kept beside the old one; on failure the old one comes back.
 async function regenerateMessage(i) {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (running.has(current)) { toast("warn", "Still writing", "Stop the answer first."); return; }
   const m = messages[i];
   if (!m || m.role !== "assistant") return;
   const el = $("chat").querySelector(`.st-msg[data-i="${i}"]`);
@@ -2365,12 +2502,13 @@ async function regenerateMessage(i) {
   Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null, dropped: null});
    const controller = new AbortController();
    clearUsing();   // regenerating starts a fresh answer with no computer/browser in use
-   busy = {controller, msg: m, cutoff: i};
+   const chatId = current;
+   running.set(chatId, {controller, msg: m, cutoff: i});
+   syncBusy();
   if (i < messages.length - 1) {
     toast("info", "Regenerating an earlier answer",
           `${messages.length - i - 1} later message(s) stay in the chat; this request sees the chat up to here.`, 7000);
   }
-  setBusy(true);
   updateAssistant(el, m, true);
   try {
     await streamInto(m, el, controller.signal);
@@ -2381,9 +2519,9 @@ async function regenerateMessage(i) {
     Object.assign(m, keep, {error: null});
     m.swipes[m.swipeIndex] = keep;
   }
-   busy = null;
-   setBusy(false);
-   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
+   running.delete(chatId);
+   syncBusy();
+   if (chatId === current) clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
    updateAssistant(el, m, false);
    saveChat();
 }
@@ -2397,11 +2535,11 @@ function chatStream(m, el) {
   // a long prompt is read
   st.comment = (c) => {
     const q = /^queued: (\d+) ahead/.exec(c);
-    if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); }
+    if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); updateLiveDots(); }
   };
   // an event's data: the chunk's JSON (text from an SSE line, or already parsed by the live channel), or "[DONE]"
   st.data = (data) => {
-    if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; }
+    if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; updateLiveDots(); }
     if (data === "[DONE]") return;
     let j = data;
     if (typeof data === "string") { try { j = JSON.parse(data); } catch (e) { return; } }
@@ -2552,7 +2690,7 @@ async function streamInto(m, el, signal) {
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 // stop a running answer (reuses the same AbortController) and hide the "using the computer/browser" pill
-function stopChat() { if (busy) busy.controller.abort(); clearUsing(); }
+function stopChat() { const b = running.get(current); if (b) b.controller.abort(); clearUsing(); }
 $("stop-btn").onclick = stopChat;
 $("use-pill-stop").onclick = stopChat;
 $("input").addEventListener("keydown", (e) => {
@@ -3092,7 +3230,7 @@ async function refreshCalls() {
 let callsStamp = "";
 function renderCalls() {
   const q = $("calls-search").value.toLowerCase(), f = $("calls-filter").value;
-  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
+  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model} ${r.machine || ""}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
   const stamp = JSON.stringify([list, callSel]);
   if (stamp === callsStamp) return;
   callsStamp = stamp;
@@ -3101,7 +3239,7 @@ function renderCalls() {
     return `<button type="button" class="call-item" data-call="${esc(r.id)}" aria-current="${r.id === callSel}">` +
       `<span class="call-item__top"><span>${callWhen(r.started_at)}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
       `<span class="call-item__path">POST ${esc(r.path)}</span>` +
-      `<span class="call-item__meta">${esc(r.model || "")} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
+      `<span class="call-item__meta">${esc(r.model || "")}${r.machine ? ` · on ${esc(r.machine)}` : ""} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
       `${r.stream ? " · stream" : ""}${r.http_status && r.http_status !== 200 ? ` · HTTP ${r.http_status}` : ""}</span></button>`;
   }).join("") : `<p class="muted small">${calls.length ? "No call matches." : "No API calls yet: they appear here as clients send them."}</p>`;
 }
@@ -3734,6 +3872,24 @@ $("wb-send").onclick = async () => {
 setBusy(false);
 renderChat();
 renderChatList();
+// media jobs other chats started that may still be running (after a reload): one status check each, and the
+// running ones are followed, so their chats get the blinking dot too; finished ones are left to their chat
+(async () => {
+  const day = Date.now() - 864e5;
+  for (const c of chats) {
+    if (c.id === current || (c.time || 0) < day) continue;
+    for (const m of c.messages) for (const t of m.tools || []) {
+      if (!t.job || jobs[t.job.id]) continue;
+      try {
+        const r = await api(`api/jobs/${encodeURIComponent(t.job.id)}`, {headers: headers()});
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (!["done", "error"].includes(j.state)) watchJob(t.job.id, t);
+      } catch (_) { /* the dot is a hint; a failed check just leaves it off */ }
+    }
+  }
+  updateLiveDots();
+})();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
 loadModels();
@@ -4550,9 +4706,9 @@ async function refreshJobs(pushed = null) {
     for (const b of document.querySelectorAll("[data-ws-next]")) b.onclick = () => {
       const x = jobs.find((y) => String(y.id) === b.dataset.wsNext);
       if (!x) return;
-      if (x.kind === "merge") $("ws-c-in").value = x.result.output;   // merged model → convert
-      if (x.kind === "convert") $("ws-q-in").value = x.result.output; // GGUF → quantize
-      if (x.kind === "quantize") $("ws-s-in").value = x.result.output; // quantized GGUF → install
+      if (x.kind === "merge") { $("ws-c-in").value = x.result.output; wsStep("convert"); }    // merged model → convert
+      if (x.kind === "convert") { $("ws-q-in").value = x.result.output; wsStep("quantize"); } // GGUF → quantize
+      if (x.kind === "quantize") { $("ws-s-in").value = x.result.output; wsStep("install"); } // quantized GGUF → install
     };
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
@@ -4579,6 +4735,15 @@ $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").val
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
 $("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);
+
+// the step bar: one step's form at a time (the last one chosen is remembered)
+function wsStep(id) {
+  for (const b of document.querySelectorAll("[data-ws-step]")) b.setAttribute("aria-selected", String(b.dataset.wsStep === id));
+  for (const p of document.querySelectorAll("[data-ws-panel]")) p.hidden = p.dataset.wsPanel !== id;
+  store.set("ws-step", id);
+}
+$("ws-steps").addEventListener("click", (e) => { const b = e.target.closest("[data-ws-step]"); if (b) wsStep(b.dataset.wsStep); });
+wsStep(store.get("ws-step", "data"));
 
 // ------------------------------------------------------------------ Workshop: training data (datagen) and its review
 const wsRecipe = () => {
@@ -4619,6 +4784,7 @@ function wsReviewOpen(path) {
   $("ws-r-pick").value = path;
   Object.assign(wsRev, {path, offset: 0});
   wsReviewLoad();
+  wsStep("data");
   $("ws-data").scrollIntoView({behavior: "smooth", block: "start"});
 }
 $("ws-r-open").onclick = () => wsReviewOpen($("ws-r-pick").value);

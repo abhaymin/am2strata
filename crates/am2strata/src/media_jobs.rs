@@ -203,12 +203,19 @@ impl Jobs {
         if ok("video") {
             let v = &caps["kinds"]["video"];
             t.push(json!({"name": "generate_video", "description": format!(
-                "Make a short video clip on this PC from a text description. It is queued and appears in the chat after \
-                 your answer (it takes minutes): say that it is on its way. Sizes: {}; frames up to {}.", v["sizes"], v["max_frames"]),
+                "Make a video on this PC, of any length up to 15 minutes, as ONE file in ONE call: give `seconds` for its length, \
+                 or `scenes` (each a prompt and its seconds) for a story in several scenes. The clips are made and joined inside \
+                 the server as one background job, each continued from the one before; never split a long video into several \
+                 calls. It appears in the chat after your answer (a long one takes a while): say that it is on its way. \
+                 Sizes: {}; one clip is up to {} frames.", v["sizes"], v["max_frames"]),
                 "parameters": {"type": "object", "properties": {
-                    "prompt": {"type": "string", "description": "a detailed description of the scene and its motion"},
-                    "frames": {"type": "integer", "description": "number of frames (default the model's)"},
-                    "size": {"type": "string", "description": "WIDTHxHEIGHT"}}, "required": ["prompt"]}}));
+                    "prompt": {"type": "string", "description": "a detailed description of the scene and its motion (one scene)"},
+                    "seconds": {"type": "number", "description": "the whole video's length in seconds (one scene), up to 900"},
+                    "scenes": {"type": "array", "description": "a longer story: the scenes in order, each {\"prompt\", \"seconds\"}",
+                               "items": {"type": "object", "properties": {"prompt": {"type": "string"}, "seconds": {"type": "number"}},
+                                         "required": ["prompt", "seconds"]}},
+                    "frames": {"type": "integer", "description": "one short clip's frames instead of seconds (rarely needed)"},
+                    "size": {"type": "string", "description": "WIDTHxHEIGHT"}}}}));
         }
         if ok("music") {
             let genres: Vec<&str> = crate::music::GENRES.iter().map(|g| g.0).collect();
@@ -431,7 +438,9 @@ impl Jobs {
         };
         let fail = |t: String| json!({"ok": false, "text": t, "chars": t.len(), "truncated": false, "ms": 0});
         // instrumental music needs a genre or a style
-        let given = args[key].as_str().or_else(|| if kind == "music" { args["style"].as_str() } else { None });
+        let given = args[key].as_str().or_else(|| if kind == "music" { args["style"].as_str() } else { None })
+            // a video in scenes: its first scene's prompt names it
+            .or_else(|| if kind == "video" { args["scenes"][0]["prompt"].as_str() } else { None });
         let Some(prompt) = given.map(str::trim).filter(|p| !p.is_empty()) else {
             return fail(format!("error: {name} needs \"{key}\"{}", if kind == "music" { " or \"style\"" } else { "" }));
         };
@@ -462,6 +471,16 @@ impl Jobs {
             }
             "video" => {
                 let mut r = json!({"prompt": prompt});
+                // one long video in one job: its length, or its scenes (the server chains the clips into one file)
+                if let Some(secs) = args["seconds"].as_f64() {
+                    if !(1.0..=900.0).contains(&secs) {
+                        return fail("error: seconds is 1 to 900 (15 minutes)".into());
+                    }
+                    r["seconds"] = json!(secs);
+                }
+                if let Some(sc) = args["scenes"].as_array().filter(|a| !a.is_empty()) {
+                    r["scenes"] = json!(sc);
+                }
                 if let Some(f) = args["frames"].as_u64() {
                     let max = k["max_frames"].as_u64().unwrap_or(81);
                     if f > max {
@@ -751,7 +770,7 @@ impl Jobs {
         ids.iter().filter_map(|id| self.status(id)).collect()
     }
 
-    fn status(&self, id: &str) -> Option<Value> {
+    pub fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();
         let j = jobs.get(&n)?;
@@ -771,6 +790,12 @@ impl Jobs {
                 if let Some((st, tot)) = self.app().mgr.monitor.media_progress() {
                     v["step"] = json!(st);
                     v["steps"] = json!(tot);
+                }
+                // a long job: its clip now and the clips finished (the web app's card appends them)
+                if let Some(d) = self.app().mgr.monitor.media_detail() {
+                    for k in ["stage", "stages", "log", "elapsed_s"] {
+                        v[k] = d[k].clone();
+                    }
                 }
             } else if let Some(w) = q["waiting"].as_array().and_then(|a| a.iter().find(|w| w["label"] == j.id.as_str())) {
                 v["position"] = w["position"].clone();

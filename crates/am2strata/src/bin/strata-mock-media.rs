@@ -24,12 +24,15 @@ fn main() {
         match cmd["op"].as_str().unwrap_or("") {
             "chain" => {
                 let r = &cmd["request"];
-                let clips = r["total_frames"].as_u64().unwrap_or(0).div_ceil(r["clip_frames"].as_u64().unwrap_or(1).max(1));
+                // scenes come as the chain's own stages (one clip each); a single scene as total_frames
+                let stages = r["stages"].as_array().map(|a| (a.len() as u64, a.iter().map(|s| s["frames"].as_u64().unwrap_or(0)).sum::<u64>()));
+                let clips = stages.map(|s| s.0).unwrap_or_else(|| r["total_frames"].as_u64().unwrap_or(0).div_ceil(r["clip_frames"].as_u64().unwrap_or(1).max(1)));
+                let total = stages.map(|s| serde_json::json!(s.1)).unwrap_or(r["total_frames"].clone());
                 for st in 1..=3u64 {
                     emit(serde_json::json!({"event": "step", "step": st, "total": 3, "stage": 1, "stages": clips}));
                 }
                 emit(serde_json::json!({"event": "video", "format": r["output_format"], "width": r["width"], "height": r["height"],
-                                        "frames": r["total_frames"], "fps": r["fps"], "clips": clips, "data": "AAAAIGZ0eXBpc29t"}));
+                                        "frames": total, "fps": r["fps"], "clips": clips, "data": "AAAAIGZ0eXBpc29t"}));
                 emit(serde_json::json!({"event": "done", "ms": 1}));
             }
             "generate" => {

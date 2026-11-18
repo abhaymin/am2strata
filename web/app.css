@@ -753,3 +753,89 @@ body.resizing iframe { pointer-events: none; }
 .cmp .cmp-top img { width: 100%; height: 100%; object-fit: fill; }
 .cmp input[type=range] { width: 100%; }
 .cmp-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--st-ink-muted); }
+
+/* Media › Tools › Image search */
+.search-out { display: grid; gap: 8px; }
+.search-out .search-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.search-out .search-grid a { display: grid; gap: 4px; font-size: 12px; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.search-out .search-grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: var(--st-r-md, 8px); background: var(--st-surface); }
+.search-out ul { margin: 0; padding-left: 18px; font-size: 13px; }
+
+/* a long media job's stages, appended as they clear */
+.media-job__log { margin: 6px 0 0; padding-left: 18px; color: var(--st-ink-muted); max-height: 220px; overflow: auto; }
+details.media-job__log { padding-left: 0; }
+details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
+
+/* Monitor › Machines: each machine of the cluster, its work now and its load */
+.machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.machine { border: 1px solid var(--st-line-soft); border-radius: var(--st-r-lg); padding: 10px; display: grid; gap: 6px; font-size: 13px; }
+.machine b { font-size: 14px; }
+.machine .muted { font-size: 12px; }
+
+/* Monitor layout: the machines as a compact strip above the row; Recent requests gets the wide column beside
+   Context fill; the conversation cache is one short block */
+.machines-card { display: flex; align-items: center; gap: var(--st-s-4); padding-block: 10px; }
+.machines-card .card-title { flex: none; }
+.machines-card .machines { flex: 1; display: flex; flex-wrap: wrap; gap: 8px; }
+.machines-card .machine { display: flex; align-items: baseline; gap: 10px; padding: 6px 12px; flex: 0 1 auto; }
+.st-metric__value--long { font-size: 15px !important; white-space: nowrap; font-weight: 700; padding-top: 6px; }
+.speed-values { min-width: 0; }
+.speed-values > div { min-width: 0; }
+.cc-card { gap: 6px; padding-block: 12px; }
+.cc-card .facts { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 13px; }
+.cc-card .facts dt::after { content: ":"; }
+.cc-card .facts dd { margin-right: var(--st-s-5); }
+.cc-card .cc-note { font-size: 12px; }
+
+/* the chat list: a blinking dot on each chat with something running */
+.chat-live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--st-accent, #3ddc97);
+  margin-right: 6px; vertical-align: middle; animation: chat-live 1.2s ease-in-out infinite; }
+@keyframes chat-live { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .chat-live { animation: none; } }
+
+/* Recent requests: the running and waiting rows on top */
+.req-now tr { background: color-mix(in srgb, var(--st-warn, #f5b942) 6%, transparent); }
+
+/* Workshop: one pipeline, a step bar, one wide form at a time, jobs beside it */
+.ws { max-width: 90rem; padding: 1.25rem 1.5rem; gap: 1rem; }
+.ws-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap; }
+.ws-head p { margin: 0; max-width: 52rem; }
+.ws-folders { max-width: 32rem; }
+.ws-folders summary { cursor: pointer; color: var(--st-ink-muted); }
+.ws-folders p { margin: .35rem 0 0; overflow-wrap: anywhere; }
+.ws-steps { display: flex; gap: .4rem; overflow-x: auto; padding-bottom: 2px; }
+.ws-steps button { flex: 1 1 0; min-width: 8.5rem; display: flex; align-items: center; gap: .55rem; padding: .6rem .8rem;
+  background: var(--st-surface-soft); border: 1px solid var(--st-line);
+  border-radius: 10px; color: inherit; font: inherit; font-size: .85rem; cursor: pointer; text-align: left; }
+.ws-steps button b { display: inline-grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%; flex: none;
+  font-size: .75rem; border: 1px solid var(--st-line-strong); }
+.ws-steps button:hover { border-color: var(--st-accent); }
+.ws-steps button[aria-selected="true"] { border-color: var(--st-accent); background: var(--st-accent-tint); }
+.ws-steps button[aria-selected="true"] b { background: var(--st-accent); border-color: var(--st-accent); color: var(--st-accent-ink); }
+.ws-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem); gap: 1rem; align-items: start; }
+.ws-main { display: flex; flex-direction: column; gap: 1rem; min-width: 0; }
+.ws-side { display: flex; flex-direction: column; gap: .75rem; position: sticky; top: 1rem; min-width: 0; }
+.ws-jobs #ws-jobs { display: flex; flex-direction: column; gap: .5rem; max-height: 70vh; overflow: auto; }
+.ws-panel { display: flex; flex-direction: column; gap: 1rem; margin: 0; padding: 1.25rem 1.4rem; }
+.ws-panel[hidden] { display: none; }
+.ws-panel__head p { margin: .35rem 0 0; max-width: 48rem; }
+.ws-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .85rem 1rem; }
+.ws-field { display: flex; flex-direction: column; gap: .3rem; min-width: 0; }
+.ws-field[hidden] { display: none; }
+.ws-field--wide { grid-column: 1 / -1; }
+.ws-field .st-input { width: 100%; box-sizing: border-box; }
+.ws-more summary { cursor: pointer; color: var(--st-ink-muted); }
+.ws-more .ws-form { margin-top: .75rem; }
+.ws-check { display: flex; align-items: center; gap: .45rem; }
+.ws-actions { display: flex; justify-content: flex-end; gap: .5rem; border-top: 1px solid var(--st-line-soft); padding-top: .85rem; }
+.ws-cmd { margin: 0; padding: .75rem 1rem; border-radius: 8px; background: var(--st-code-bg); overflow-x: auto; font-size: .85rem; }
+.ws-review { padding-top: 1rem; }
+@media (max-width: 960px) {
+  .ws { padding: 1rem; }
+  .ws-layout { grid-template-columns: minmax(0, 1fr); }
+  .ws-side { position: static; }
+}
+@media (max-width: 600px) {
+  .ws-form { grid-template-columns: minmax(0, 1fr); }
+  .ws-steps button { min-width: 7rem; }
+}
