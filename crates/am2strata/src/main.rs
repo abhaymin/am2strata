@@ -7,6 +7,7 @@
 
 mod agents;
 mod media_files;
+mod edit_controls;
 mod cluster;
 mod cluster_tls;
 mod workshop;

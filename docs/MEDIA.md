@@ -38,6 +38,23 @@ The answer has `data: [{"b64_json": …}]`. The model's own defaults fill in any
 with `images` as base64 or data URLs. The first image is edited and the others are references; it needs an image
 model that takes edits (Qwen Image 2.1).
 
+### How much an edit keeps of the original
+
+`POST /v1/images/edits` takes these besides the image and the prompt:
+
+| Field | What it does | Models |
+|---|---|---|
+| `strength` (0.05-1.0) | how far the result may move from the image: it is the starting point (default 0.65) | those that redraw from an image: Z-Image, FLUX, SDXL, SD 1.5/3, Qwen Image 1 |
+| `mask` (image, file id) | white = may change, black = keep. Those models redraw only there; on every model the original's own pixels are put back outside it, with a soft edge (`mask_feather`, px, default 8) | all |
+| `keep_colors` | the result's colours matched to the original's | all |
+| `blend` (0-0.95) | how much of the original shows through | all |
+
+An instruction model (Qwen Image 2.1) refuses `strength` by name (it cannot start from the image); `mask`, `blend`
+and `keep_colors` work with it. The answer's `strata.edit` says how it was drawn, the controls, and
+`original_file_id` (the library id of the image edited), for a before/after. In the app: Media › Image, with a file
+picked or **Edit this**: the sliders, the checkbox and **Paint what may change** (a brush, Erase, Invert, Clear);
+each edit is shown over its original with a slider between them.
+
 ## Video
 
 `POST /v1/videos/generations`:
