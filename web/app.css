@@ -786,3 +786,9 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .cc-card .facts dt::after { content: ":"; }
 .cc-card .facts dd { margin-right: var(--st-s-5); }
 .cc-card .cc-note { font-size: 12px; }
+
+/* the chat list: a blinking dot on each chat with something running */
+.chat-live { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--st-accent, #3ddc97);
+  margin-right: 6px; vertical-align: middle; animation: chat-live 1.2s ease-in-out infinite; }
+@keyframes chat-live { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .chat-live { animation: none; } }

@@ -1976,6 +1976,22 @@ function deleteChat(id) {
   renderChatList();
   toast("info", "Chat deleted", gone.title || "", 6000, {label: "Undo", run: () => { chats.splice(i, 0, gone); saveChat(); }});
 }
+// a chat with something running (its answer streaming or waiting in the queue, or a media job it started) gets a
+// blinking dot in the list, so work going on in another chat is visible from here
+function chatLive(c) {
+  if (busy && c.messages.includes(busy.msg)) return busy.msg.waitingMeta ? "waiting in the queue" : "answering";
+  for (const m of c.messages) for (const t of m.tools || []) {
+    const j = t.job && jobs[t.job.id];
+    if (j && !["done", "error", "gone"].includes(j.state)) return j.state === "running" ? "making media" : "media job waiting";
+  }
+  return "";
+}
+const chatLiveDot = (c) => { const w = chatLive(c); return w ? `<span class="chat-live" title="${esc(w)}" aria-label="${esc(w)}"></span>` : ""; };
+let liveSig = "";
+function updateLiveDots() {   // re-renders the list only when a chat's running state changed
+  const sig = chats.map((c) => chatLive(c)).join("|");
+  if (sig !== liveSig) { liveSig = sig; renderChatList(); }
+}
 function renderChatList() {
   const q = ($("chat-search").value || "").toLowerCase();
   const list = chats.filter((c) => !q || (c.title || "").toLowerCase().includes(q) ||
@@ -1987,7 +2003,7 @@ function renderChatList() {
     const g = day(c.time);
     if (g !== group) { html += `<div class="chat-group">${g}</div>`; group = g; }
     const n = c.messages.filter((m) => m.role === "user").length;
-    html += `<div class="chat-item" aria-current="${c.id === current}"><button type="button" data-chat="${esc(c.id)}"><b>${esc(c.title || "New chat")}</b>` +
+    html += `<div class="chat-item" aria-current="${c.id === current}"><button type="button" data-chat="${esc(c.id)}"><b>${chatLiveDot(c)}${esc(c.title || "New chat")}</b>` +
       `<span>${esc(c.model || "")}${c.model ? " · " : ""}${n} message${n === 1 ? "" : "s"}</span></button>` +
       `<button type="button" class="st-btn st-btn--icon" data-del="${esc(c.id)}" aria-label="Delete this chat">${icon("trash")}</button></div>`;
   }
@@ -2157,6 +2173,7 @@ document.addEventListener("click", async (e) => {
 });
 const fmtClock = (t) => { t = Math.round(+t || 0); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`; };
 function paintJob(id) {
+  updateLiveDots();
   document.querySelectorAll(`.media-job[data-job="${CSS.escape(id)}"]`).forEach((e) => { e.innerHTML = jobCardHtml(id); });
 }
 async function watchJob(id, t) {
@@ -2370,6 +2387,7 @@ function assistantMessages(m) {
 }
 
 function setBusy(on) {
+  setTimeout(updateLiveDots, 0);
   $("stop-btn").hidden = !on;
   $("send-btn").disabled = on;
   $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
@@ -2484,11 +2502,11 @@ function chatStream(m, el) {
   // a long prompt is read
   st.comment = (c) => {
     const q = /^queued: (\d+) ahead/.exec(c);
-    if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); }
+    if (q) { m.meta = `Waiting in the queue: ${q[1] === "0" ? "next" : q[1] + " ahead"}`; m.waitingMeta = true; paint(); updateLiveDots(); }
   };
   // an event's data: the chunk's JSON (text from an SSE line, or already parsed by the live channel), or "[DONE]"
   st.data = (data) => {
-    if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; }
+    if (m.waitingMeta) { m.meta = null; m.waitingMeta = false; updateLiveDots(); }
     if (data === "[DONE]") return;
     let j = data;
     if (typeof data === "string") { try { j = JSON.parse(data); } catch (e) { return; } }
@@ -3821,6 +3839,24 @@ $("wb-send").onclick = async () => {
 setBusy(false);
 renderChat();
 renderChatList();
+// media jobs other chats started that may still be running (after a reload): one status check each, and the
+// running ones are followed, so their chats get the blinking dot too; finished ones are left to their chat
+(async () => {
+  const day = Date.now() - 864e5;
+  for (const c of chats) {
+    if (c.id === current || (c.time || 0) < day) continue;
+    for (const m of c.messages) for (const t of m.tools || []) {
+      if (!t.job || jobs[t.job.id]) continue;
+      try {
+        const r = await api(`api/jobs/${encodeURIComponent(t.job.id)}`, {headers: headers()});
+        if (!r.ok) continue;
+        const j = await r.json();
+        if (!["done", "error"].includes(j.state)) watchJob(t.job.id, t);
+      } catch (_) { /* the dot is a hint; a failed check just leaves it off */ }
+    }
+  }
+  updateLiveDots();
+})();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
 loadModels();
