@@ -15,7 +15,7 @@ fn lora(r: usize, train_layers: Option<usize>) -> LoraSpec {
 }
 
 fn input(cfg: ModelConfig, r: usize, train_layers: Option<usize>, dtype: BaseDtype, max_len: usize, cache: bool) -> ProfileInput {
-    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, examples: 20, epochs: 3.0, avg_tokens: 12 }
+    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, recompute: false, examples: 20, epochs: 3.0, avg_tokens: 12 }
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn the_autopilot_fits_the_machine_and_says_why() {
     assert_eq!((tight.lora.r, tight.lora.alpha, tight.lr, tight.epochs), (16, 32.0, 2e-4, 3.0));
     // the largest number of blocks that fits: twice as many would not
     let twice = profile::estimate(&ProfileInput { cfg: big.clone(), lora: LoraSpec { train_layers: Some(n * 2), ..tight.lora.clone() }, base_dtype: tight.base_dtype,
-                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, examples: 2000, epochs: tight.epochs, avg_tokens: 250 });
+                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, recompute: false, examples: 2000, epochs: tight.epochs, avg_tokens: 250 });
     assert!(profile::need_bytes(&twice) > 16 << 30 || profile::cpu_seconds(&twice, 100.0) > 200.0 * 3600.0);
 
     // every choice has its one-line reason

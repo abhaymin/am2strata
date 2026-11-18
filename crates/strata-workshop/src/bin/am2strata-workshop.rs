@@ -26,7 +26,7 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use strata_workshop::chatdata::{self, ChatTokenizer, DataFormat};
-use strata_workshop::finetune::{self, Event, FindLr, Resume, TrainSettings};
+use strata_workshop::finetune::{self, Event, FindLr, Resume, TrainDevice, TrainSettings};
 use strata_workshop::model::{BaseDtype, ModelConfig, Target};
 use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput};
 use strata_workshop::{convert, datagen, merge, quantize_gguf, soup};
@@ -257,17 +257,19 @@ struct RunArgs {
     /// CPU threads (all cores when not given)
     #[arg(long)]
     threads: Option<usize>,
-    /// cpu (GPU runs are not part of this trainer yet)
+    /// cpu, metal (Apple GPU) or cuda / cuda:N (NVIDIA GPU); a GPU needs a build with that feature
     #[arg(long, default_value = "cpu")]
     device: String,
+    /// rebuild each trained block in the backward pass instead of keeping its tensors: far less memory, about one more
+    /// forward pass of time
+    #[arg(long)]
+    recompute: bool,
 }
 
 impl RunArgs {
     /// The settings these flags (and the Soup file) describe, and what to say about them.
     fn settings(&self, need_data: bool) -> Result<(TrainSettings, Vec<String>), String> {
-        if self.device != "cpu" {
-            return Err(format!("--device {}: this trainer runs on the CPU only for now (GPU runs through the server's queue are the next milestone)", self.device));
-        }
+        let device = TrainDevice::from_s(&self.device).map_err(|e| e.to_string())?;
         let (mut s, mut notes) = match &self.soup {
             Some(path) => {
                 let imp = soup::import_file(path, self.soup_relax).map_err(|e| e.to_string())?;
@@ -314,6 +316,8 @@ impl RunArgs {
         if let Some(r) = &self.resume { s.resume = Some(if r == "auto" { Resume::Auto } else { Resume::Dir(PathBuf::from(r)) }); }
         if let Some(c) = &self.chat_template { s.chat_template = Some(c.clone()); }
         if self.score_everything { s.score_everything = true; }
+        s.device = device;
+        if self.recompute { s.recompute = true; }
         if s.cache_dir.is_some() && s.lora.train_layers.is_none() {
             notes.push("--cache-activations needs --train-layers N: with every block training there is no frozen part to cache".into());
         }
@@ -369,7 +373,7 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
     };
     let max_len = s.max_len.min(cfg.max_position_embeddings.max(8));
     Ok(ProfileInput { lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
-                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg })
+                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, recompute: s.recompute, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg })
 }
 
 fn os_threads() -> Option<u64> {
@@ -512,7 +516,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             let (s, notes) = run.settings(true)?;
             let cfg = ModelConfig::load(&s.model).map_err(|e| format!("{e:#}"))?;
             out.event(json!({"event": "start", "what": format!("train a LoRA adapter on {} with {} into {}", s.model.display(), s.data.display(), s.out.display()),
-                             "threads": run.threads, "device": "cpu", "base_dtype": s.base_dtype.as_str()}));
+                             "threads": run.threads, "device": s.device.as_str(), "recompute": s.recompute, "base_dtype": s.base_dtype.as_str()}));
             for n in notes {
                 out.event(json!({"event": "log", "message": n}));
             }

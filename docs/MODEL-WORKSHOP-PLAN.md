@@ -230,19 +230,32 @@ Three things learned while building it, kept here because each would have been a
   false. The 16-bit base, top-N blocks and the cache are what cuts memory today.
 - **Expert adapters of mixture-of-experts models** — `merge` folds them, training does not make them; a MoE config is
   refused by name.
-- **GPU runs, several GPUs** — the trainer runs on the CPU. The two custom nodes hand over CPU buffers; a GPU run needs
-  their CUDA side (and would use the card's native 16-bit products instead of widening).
+- **Several GPUs** — one device per run. (One GPU is done: see *GPU runs and recompute* below.) The GPU path widens a
+  16-bit weight to f32 for each product like the CPU; the card's native 16-bit products are not used yet.
 - **Vision and audio towers**, full fine-tuning (rank 0), DoRA, other optimizers and schedulers, preference and
   reinforcement objectives (DPO, GRPO, …): refused by name when a `soup.yaml` asks for them.
-- **Gradient checkpointing**: the activations of the trained blocks are all kept for the backward pass; `--train-layers`
-  is the lever instead.
+
+### GPU runs and recompute (done)
+
+- **`train --device metal | cuda | cuda:N`** (a build with `--features metal` or `--features cuda`; the macOS Arm64
+  release builds Metal). The two custom nodes (`FrozenLinear`, `MaskedSoftmax`) hand their value over as one device-side
+  copy (`take_device_value`), never through the CPU. Checked by `tests/recompute_gpu.rs::the_gpu_trains_like_the_cpu`:
+  Metal's loss equals the CPU's and its gradients differ by at most 1e-6 of their largest value (f32 and bf16 bases).
+  CUDA compiles from the same code and still needs its run on an NVIDIA machine.
+- **`--recompute`** (gradient checkpointing, per block): the forward pass keeps only each trained block's input and
+  where its dropout masks start; the head is scored 256 rows at a time; the backward pass rebuilds one block's graph at a
+  time from the top. Same loss, gradients within 7e-7 (`recompute_gives_the_plain_backward_pass`). A 3B Llama in bf16
+  at 2048 tokens with every block training: 119 GB estimated without it, 13.2 GB with it (`profile --recompute`).
+- Measured on an M4 Mac mini (`step_time_cpu_against_gpu`, bf16 base, rank 16 on all seven projections, 512 tokens):
+  hidden 1024 × 8 blocks 1.11 s per step on the CPU, 0.49 s on Metal; hidden 2048 × 4 blocks 1.59 s against 0.50 s.
+  Recompute costs about 30 % more time. `profile`'s time estimate still assumes the CPU (and a guessed GPU rate).
 
 ### Next milestones
 
 1. **Server job kind + the Workshop "Train" card + GPU.** `"train"` in `/v1/workshop/jobs` (the same `am2strata-workshop
    train --json` command, paths confined as the other kinds), the profile shown before the job is queued, loss and
    rate plotted from the progress events, cancel = SIGTERM, resume; a GPU run through the queue (the text model stopped
-   and reloaded like the media jobs), with the CUDA side of the two custom nodes.
+   and reloaded like the media jobs), passing `--device` and `--recompute`.
 2. **Diagnose / eval report** (Soup's `diagnose`): after training, compare base and adapter on held-out prompts —
    forgetting, refusals, format, repetition — and write a report card.
 3. **Sweeps** (Soup's `sweep`): a grid or random search over rank, rate and trained blocks, each run a queued job, with
