@@ -71,6 +71,19 @@ each edit is shown over its original with a slider between them.
 - **`"image"`** starts a clip from a picture, on a model that takes a source image.
 - **The answer** is the clip in base64: MP4 by default, `"webp"` or `"gif"` on request.
 
+### Long videos: one request, one file
+
+A video of minutes is never made in pieces by the caller: one request makes the whole of it inside the server, as one
+background job, each clip continued from the one before (the media engine's chain), stitched into one file.
+
+- `"seconds": 120`: one scene that long.
+- `"scenes": [{"prompt", "seconds"}, ...]`: a story in scenes (up to 60), each its own prompt, as many clips as its
+  length takes; up to 15 minutes in all.
+- The chat tool `generate_video` and the job API (`POST /api/jobs {"tool": "generate_video", "arguments": {...}}`) take
+  the same; the model is told to make a long video in one call, never several.
+- Short asks stay one shot: one image, one clip, one sound. Long audio is one job too: `speak` reads up to ~20 minutes,
+  `produce` joins speech, songs and music into one file with chapters.
+
 ## Speech
 
 | Endpoint | Body | Answer |

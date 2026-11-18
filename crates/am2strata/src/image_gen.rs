@@ -873,9 +873,34 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
         return error(StatusCode::NOT_IMPLEMENTED, "not_available",
                      "video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
     }
-    let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
-        return bad("send {\"prompt\": \"...\"}");
+    // "scenes": [{"prompt", "seconds"}, ...]: one long video, scene after scene, each continued from the one before
+    // (the media engine's chain, one stage per clip), made as one job into one file
+    let scenes: Vec<(String, f64)> = match req["scenes"].as_array() {
+        None => Vec::new(),
+        Some(a) => {
+            let mut v = Vec::new();
+            for (i, sc) in a.iter().enumerate() {
+                let Some(p) = sc["prompt"].as_str().map(str::trim).filter(|p| !p.is_empty()) else {
+                    return bad(format!("scenes[{i}]: give its prompt"));
+                };
+                let secs = sc["seconds"].as_f64().unwrap_or(5.0);
+                if !(1.0..=600.0).contains(&secs) {
+                    return bad(format!("scenes[{i}].seconds: 1 to 600"));
+                }
+                v.push((p.to_string(), secs));
+            }
+            if v.is_empty() || v.len() > 60 {
+                return bad("scenes: 1 to 60 of them");
+            }
+            v
+        }
     };
+    let first_scene = scenes.first().map(|(p, _)| p.clone());
+    let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()).or(first_scene.as_deref()) else {
+        return bad("send {\"prompt\": \"...\"}, or {\"scenes\": [{\"prompt\", \"seconds\"}, ...]} for a longer video");
+    };
+    let prompt = prompt.to_string();
+    let prompt = prompt.as_str();
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.video_model());
     // the model's own defaults (size, steps, guidance, frames, fps) fill what the request leaves out
     let list = match s.media.list().await {
@@ -956,8 +981,20 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let format = format.as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
+    // the scenes as the chain's stages: each scene as many clips as its length takes, every clip a whole one (step n+1)
+    let stages: Vec<Value> = scenes.iter().flat_map(|(p, secs)| {
+        let want = ((secs * fps as f64).round() as u64).max(1);
+        let n = want.div_ceil(frames).max(1);
+        let each = ((want.div_ceil(n)).saturating_sub(1)).div_ceil(step) * step + 1;
+        (0..n).map(move |_| json!({"prompt": p, "frames": each.min(frames)}))
+    }).collect();
+    let stage_frames: u64 = stages.iter().map(|s| s["frames"].as_u64().unwrap_or(0)).sum();
+    if stage_frames > MAX_CHAIN_FRAMES {
+        return bad(format!("the scenes add up to {} s; at most {} s in one video", stage_frames / fps, MAX_CHAIN_FRAMES / fps));
+    }
     {
-        let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64)).unwrap_or(0).max(frames);
+        let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64)).unwrap_or(0).max(frames)
+            .max(stage_frames);
         if let Err(e) = crate::clients::video_allowed(&s.clients, total as f64 / fps as f64)
             .and_then(|_| crate::clients::image_allowed(&s.clients, w, h)) {
             return error(StatusCode::FORBIDDEN, "permission_error", e);
@@ -980,11 +1017,19 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let tail = if m["family"].as_str().unwrap_or("").starts_with("wan") { 1 } else { 17 };
     let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64))
         .map(|t| t.min(MAX_CHAIN_FRAMES));
+    let total = if stages.len() > 1 || stage_frames > frames { Some(stage_frames) } else { total };
     let (op, r) = match total.filter(|t| *t > frames) {
         Some(t) => {
             let mut c = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
                                "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
                                "motion_tail_frames": tail});
+            if !stages.is_empty() {
+                // the scenes' own stages (each its prompt); total_frames is left to them
+                c["stages"] = json!(stages);
+                if let Some(o) = c.as_object_mut() {
+                    o.remove("total_frames");
+                }
+            }
             if let Some(b) = &start {
                 c["source_image"] = json!(b);
             }

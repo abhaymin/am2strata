@@ -3253,3 +3253,33 @@ fn id_of(b: &[u8]) -> String {
     use sha2::Digest;
     format!("mf_{}", sha2::Sha256::digest(b).iter().take(8).map(|x| format!("{x:02x}")).collect::<String>())
 }
+
+/// A long video in scenes (the owner: anything of minutes is planned and stitched inside the server, never made in pieces
+/// in the chat): one request makes one chain, each scene's prompt on as many clips as its length takes, into one file;
+/// the chat tool takes `seconds` and `scenes` and queues ONE job.
+#[test]
+fn a_video_in_scenes_is_one_job_and_one_file() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({}));
+    let scenes = json!([{"prompt": "dawn over a harbour", "seconds": 12}, {"prompt": "fishing boats leave", "seconds": 8},
+                        {"prompt": "the sea at noon", "seconds": 4}]);
+    let (c, r) = s.post("/v1/videos/generations", &json!({"scenes": scenes, "frames": 81, "fps": 16}));
+    assert_eq!(c, 200, "{r}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap();
+    let chain = rec.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).find(|v| v["op"] == "chain").expect("one chain for the whole video");
+    let stages = chain["request"]["stages"].as_array().unwrap();
+    let prompts: Vec<&str> = stages.iter().map(|s| s["prompt"].as_str().unwrap()).collect();
+    // 12 s at 16 fps = 192 frames: 3 clips of 65; 8 s = 128: 2 of 65; 4 s = 64: 1 of 65 (Wan's 4n+1)
+    assert_eq!(prompts, ["dawn over a harbour", "dawn over a harbour", "dawn over a harbour", "fishing boats leave", "fishing boats leave",
+                         "the sea at noon"], "{chain}");
+    assert!(stages.iter().all(|s| s["frames"].as_u64().unwrap() <= 81 && (s["frames"].as_u64().unwrap() - 1) % 4 == 0), "{chain}");
+    assert_eq!(rec.lines().filter(|l| l.contains("\"op\":\"chain\"") || l.contains("\"op\":\"generate\"")).count(), 1, "one engine job");
+    assert_eq!(r["data"].as_array().unwrap().len(), 1, "one file");
+    // a scene without its prompt, or too long, is refused by name
+    let (c, e) = s.post("/v1/videos/generations", &json!({"scenes": [{"seconds": 3}]}));
+    assert_eq!(c, 400, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("scenes[0]"), "{e}");
+    // the chat tool (and the job API): seconds and scenes go through as one queued job
+    let (c, j) = s.post("/api/jobs", &json!({"tool": "generate_video", "arguments": {"scenes": scenes}}));
+    assert_eq!(c, 200, "{j}");
+    assert_eq!(j["kind"], "video", "{j}");
+}
