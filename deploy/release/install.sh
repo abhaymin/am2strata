@@ -22,7 +22,7 @@ am2Strata installer (Linux x86_64/arm64, macOS Apple silicon/Intel)
   curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sh
   curl -fsSL .../install.sh | sh -s -- [options]
 
-  --version X     install release X (v0.1.9) instead of the latest
+  --version X     install release X (v0.1.10) instead of the latest
   --dir DIR       install into DIR instead of ~/.local/share/am2strata (models and settings stay there too)
   --bin-dir DIR   where the am2strata commands go (default ~/.local/bin)
   --from DIR      install from a folder that already holds the download and its .sha256 (no network)
@@ -415,7 +415,7 @@ main() {
             if [ -z "$VERSION" ]; then
                 VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
             fi
-            [ -n "$VERSION" ] || fail "could not find the latest release (GitHub is unreachable or refused): try --version v0.1.9"
+            [ -n "$VERSION" ] || fail "could not find the latest release (GitHub is unreachable or refused): try --version v0.1.10"
         fi
         case "$VERSION" in v*) ;; *) VERSION=v$VERSION ;; esac
         VER=${VERSION#v}
