@@ -4706,9 +4706,9 @@ async function refreshJobs(pushed = null) {
     for (const b of document.querySelectorAll("[data-ws-next]")) b.onclick = () => {
       const x = jobs.find((y) => String(y.id) === b.dataset.wsNext);
       if (!x) return;
-      if (x.kind === "merge") $("ws-c-in").value = x.result.output;   // merged model → convert
-      if (x.kind === "convert") $("ws-q-in").value = x.result.output; // GGUF → quantize
-      if (x.kind === "quantize") $("ws-s-in").value = x.result.output; // quantized GGUF → install
+      if (x.kind === "merge") { $("ws-c-in").value = x.result.output; wsStep("convert"); }    // merged model → convert
+      if (x.kind === "convert") { $("ws-q-in").value = x.result.output; wsStep("quantize"); } // GGUF → quantize
+      if (x.kind === "quantize") { $("ws-s-in").value = x.result.output; wsStep("install"); } // quantized GGUF → install
     };
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
@@ -4735,6 +4735,15 @@ $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").val
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
 $("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);
+
+// the step bar: one step's form at a time (the last one chosen is remembered)
+function wsStep(id) {
+  for (const b of document.querySelectorAll("[data-ws-step]")) b.setAttribute("aria-selected", String(b.dataset.wsStep === id));
+  for (const p of document.querySelectorAll("[data-ws-panel]")) p.hidden = p.dataset.wsPanel !== id;
+  store.set("ws-step", id);
+}
+$("ws-steps").addEventListener("click", (e) => { const b = e.target.closest("[data-ws-step]"); if (b) wsStep(b.dataset.wsStep); });
+wsStep(store.get("ws-step", "data"));
 
 // ------------------------------------------------------------------ Workshop: training data (datagen) and its review
 const wsRecipe = () => {
@@ -4775,6 +4784,7 @@ function wsReviewOpen(path) {
   $("ws-r-pick").value = path;
   Object.assign(wsRev, {path, offset: 0});
   wsReviewLoad();
+  wsStep("data");
   $("ws-data").scrollIntoView({behavior: "smooth", block: "start"});
 }
 $("ws-r-open").onclick = () => wsReviewOpen($("ws-r-pick").value);

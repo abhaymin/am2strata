@@ -499,142 +499,167 @@
   <section class="view view--workshop" id="view-workshop" role="tabpanel" aria-labelledby="tab-btn-workshop" hidden>
     <div class="ws">
       <header class="ws-head">
-        <h2>Workshop</h2>
-        <p class="muted small">Make models in Rust on this PC: convert a Hugging Face model to GGUF, quantize it, merge a
-          LoRA adapter (from Unsloth or PEFT) into its base. Jobs run one at a time and keep running if you leave this tab.
-          <span id="ws-folders"></span></p>
+        <div>
+          <h2>Workshop</h2>
+          <p class="muted small">Make your own models on this PC, in order: training data, a LoRA adapter, merged into its
+            base, converted to GGUF, quantized, installed. Jobs run one at a time and keep going if you leave this tab.</p>
+        </div>
+        <details class="ws-folders small"><summary>Folders</summary><p class="muted small" id="ws-folders"></p></details>
       </header>
-      <div class="ws-grid">
-        <div class="st-card ws-card"><span class="card-title">1 · Merge an adapter</span>
-          <p class="muted small">A LoRA adapter folder (<code>adapter_model.safetensors</code> + <code>adapter_config.json</code>)
-            into the Hugging Face model it was trained on. rsLoRA and MoE expert adapters are handled.</p>
-          <label class="st-label" for="ws-m-base">Base model (HF folder)</label>
-          <input class="st-input mono" id="ws-m-base" list="ws-hf" placeholder="~/models/Qwen3-8B">
-          <label class="st-label" for="ws-m-adapter">Adapter folder</label>
-          <input class="st-input mono" id="ws-m-adapter" list="ws-adapters" placeholder="~/outputs/my-lora">
-          <label class="st-label" for="ws-m-out">Output folder <output>optional</output></label>
-          <input class="st-input mono" id="ws-m-out" placeholder="(in the Workshop folder)">
-          <button type="button" class="st-btn st-btn--primary" id="ws-merge">Merge</button>
-        </div>
-        <div class="st-card ws-card"><span class="card-title">2 · Convert to GGUF</span>
-          <p class="muted small">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, byte for
-            byte as llama.cpp's converter writes it. Llama-family models for now.</p>
-          <label class="st-label" for="ws-c-in">Model (HF folder)</label>
-          <input class="st-input mono" id="ws-c-in" list="ws-hf" placeholder="~/models/Qwen3-8B">
-          <label class="st-label" for="ws-c-type">Precision</label>
-          <select class="st-input" id="ws-c-type"><option value="f16">F16 (half the size)</option><option value="f32">F32</option></select>
-          <label class="st-label" for="ws-c-pre">Pre-tokenizer <output>only if asked for</output></label>
-          <input class="st-input mono" id="ws-c-pre" placeholder="e.g. llama-bpe, qwen2">
-          <label class="st-label" for="ws-c-out">Output file <output>optional</output></label>
-          <input class="st-input mono" id="ws-c-out" placeholder="(in the Workshop folder)">
-          <button type="button" class="st-btn st-btn--primary" id="ws-convert">Convert</button>
-        </div>
-        <div class="st-card ws-card"><span class="card-title">3 · Quantize</span>
-          <p class="muted small">A GGUF to a smaller type, matching <code>llama-quantize --pure</code> byte for byte.</p>
-          <label class="st-label" for="ws-q-in">GGUF</label>
-          <input class="st-input mono" id="ws-q-in" list="ws-gguf" placeholder="~/models/model-f16.gguf">
-          <label class="st-label" for="ws-q-type">Type</label>
-          <select class="st-input" id="ws-q-type">
-            <option value="q8_0">Q8_0 (best quality, 8.5 bits)</option><option value="q6_k">Q6_K (6.6 bits)</option>
-            <option value="q5_k">Q5_K (5.5 bits)</option><option value="q4_k" selected>Q4_K (4.5 bits, the usual choice)</option>
-            <option value="q4_0">Q4_0 (4.5 bits, older)</option><option value="f16">F16</option></select>
-          <label class="st-label" for="ws-q-out">Output file <output>optional</output></label>
-          <input class="st-input mono" id="ws-q-out" placeholder="(in the Workshop folder)">
-          <button type="button" class="st-btn st-btn--primary" id="ws-quantize">Quantize</button>
-        </div>
-        <div class="st-card ws-card"><span class="card-title">4 · Make it a model am2Strata runs</span>
-          <p class="muted small">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for
-            its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p>
-          <label class="st-label" for="ws-s-in">GGUF</label>
-          <input class="st-input mono" id="ws-s-in" list="ws-gguf" placeholder="~/models/model-Q4_K.gguf">
-          <label class="st-label" for="ws-s-name">Name <output>optional: from the file</output></label>
-          <input class="st-input mono" id="ws-s-name" placeholder="my-model-q4_k">
-          <label class="st-label" for="ws-s-display">Display name <output>optional</output></label>
-          <input class="st-input" id="ws-s-display" placeholder="My model Q4_K">
-          <label class="small"><input type="checkbox" id="ws-s-over"> replace a model with the same name</label>
-          <button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button>
-        </div>
-        <div class="st-card ws-card ws-card--soon"><span class="card-title">Train · from the command line</span>
-          <p class="muted small">LoRA training runs on this PC's CPU for Llama, Mistral and Qwen models:
-            <code>am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</code> on a dataset made below,
-            then merge the adapter here. <code>profile</code> and <code>autopilot</code> say what fits this PC;
-            training from this tab comes next.</p>
-        </div>
-      </div>
-      <div class="st-card ws-data" id="ws-data"><span class="card-title">Training data · written by the loaded model</span>
-        <p class="muted small">Turn documents into a chat dataset (JSONL with <code>messages</code>, as Unsloth and the
-          trainer read it). The model you have loaded writes it through this server; a judge pass can check each answer
-          against its source. Every run writes a dataset card beside the file saying what it was made from and what was dropped.</p>
-        <div class="ws-data__grid">
-          <div class="ws-card">
-            <label class="st-label" for="ws-d-recipe">Recipe</label>
-            <select class="st-input" id="ws-d-recipe">
-              <option value="qa">Questions and answers from documents</option>
-              <option value="chat">Multi-turn chats about documents</option>
-              <option value="instruct">More examples like my own (seed JSONL)</option></select>
-            <div id="ws-d-src-box">
-              <label class="st-label" for="ws-d-sources">Documents <output>files or folders, one per line</output></label>
-              <textarea class="st-input mono" id="ws-d-sources" rows="3" placeholder="~/docs/manual.pdf&#10;~/notes/"></textarea>
-              <div class="ws-data__row">
-                <label class="st-btn st-btn--secondary" for="ws-d-files">Add files…</label>
-                <input type="file" id="ws-d-files" multiple hidden accept=".txt,.md,.markdown,.rst,.pdf,.html,.htm,.json,.jsonl,.csv,.py,.rs,.js,.ts,.go,.java,.c,.cpp,.h,.sh,.toml,.yaml,.yml">
-                <span class="muted small" id="ws-d-up"></span>
+      <nav class="ws-steps" id="ws-steps" role="tablist" aria-label="Workshop steps">
+        <button type="button" role="tab" data-ws-step="data" aria-selected="true"><b>1</b><span>Training data</span></button>
+        <button type="button" role="tab" data-ws-step="train"><b>2</b><span>Train</span></button>
+        <button type="button" role="tab" data-ws-step="merge"><b>3</b><span>Merge adapter</span></button>
+        <button type="button" role="tab" data-ws-step="convert"><b>4</b><span>Convert to GGUF</span></button>
+        <button type="button" role="tab" data-ws-step="quantize"><b>5</b><span>Quantize</span></button>
+        <button type="button" role="tab" data-ws-step="install"><b>6</b><span>Install</span></button>
+      </nav>
+      <div class="ws-layout">
+        <div class="ws-main">
+          <div class="st-card ws-panel ws-data" id="ws-data" data-ws-panel="data">
+            <div class="ws-panel__head"><span class="card-title">Training data</span>
+              <p class="muted small">Turn documents into a chat dataset (JSONL with <code>messages</code>, as Unsloth and the
+                trainer read it), written by the model you have loaded. A judge pass can check each answer against its source,
+                and a dataset card beside the file says what it was made from and what was dropped.</p></div>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-d-recipe">Recipe</label>
+                <select class="st-input" id="ws-d-recipe">
+                  <option value="qa">Questions and answers from documents</option>
+                  <option value="chat">Multi-turn chats about documents</option>
+                  <option value="instruct">More examples like my own (seed JSONL)</option></select></div>
+              <div class="ws-field ws-field--wide" id="ws-d-src-box">
+                <label class="st-label" for="ws-d-sources">Documents <output>files or folders, one per line</output></label>
+                <textarea class="st-input mono" id="ws-d-sources" rows="3" placeholder="~/docs/manual.pdf&#10;~/notes/"></textarea>
+                <div class="ws-data__row">
+                  <label class="st-btn st-btn--secondary" for="ws-d-files">Add files…</label>
+                  <input type="file" id="ws-d-files" multiple hidden accept=".txt,.md,.markdown,.rst,.pdf,.html,.htm,.json,.jsonl,.csv,.py,.rs,.js,.ts,.go,.java,.c,.cpp,.h,.sh,.toml,.yaml,.yml">
+                  <span class="muted small" id="ws-d-up">Text, Markdown, code, HTML and PDF; kept in the Workshop's uploads folder.</span>
+                </div>
               </div>
-              <p class="muted small">Text, Markdown, code, HTML and PDF. Added files are kept in the Workshop's uploads folder.</p>
+              <div class="ws-field ws-field--wide" id="ws-d-seed-box" hidden>
+                <label class="st-label" for="ws-d-seeds">Seed examples (JSONL of chats)</label>
+                <input class="st-input mono" id="ws-d-seeds" list="ws-datasets" placeholder="~/data/examples.jsonl">
+              </div>
+              <div class="ws-field"><label class="st-label" for="ws-d-count">Records</label>
+                <input class="st-input" id="ws-d-count" type="number" min="1" max="100000" value="100"></div>
+              <div class="ws-field"><label class="st-label" for="ws-d-judge">Quality check</label>
+                <select class="st-input" id="ws-d-judge">
+                  <option value="0">None (fastest)</option><option value="3">Judge: keep 3 of 5 and up</option>
+                  <option value="4" selected>Judge: keep 4 of 5 and up</option><option value="5">Judge: only 5 of 5</option></select></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-d-topic">Focus <output>optional</output></label>
+                <input class="st-input" id="ws-d-topic" placeholder="e.g. setting up HTTPS"></div>
+              <details class="ws-more ws-field--wide small"><summary>More options</summary>
+                <div class="ws-form">
+                  <div class="ws-field"><label class="st-label" for="ws-d-per">Records per passage</label>
+                    <input class="st-input" id="ws-d-per" type="number" min="1" max="20" value="4"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-d-chunk">Passage length (characters)</label>
+                    <input class="st-input" id="ws-d-chunk" type="number" min="500" max="20000" step="500" value="3000"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-d-temp">Temperature</label>
+                    <input class="st-input" id="ws-d-temp" type="number" min="0" max="2" step="0.1" value="0.7"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-d-lang">Language <output>optional</output></label>
+                    <input class="st-input" id="ws-d-lang" placeholder="the documents' own"></div>
+                  <div class="ws-field ws-field--wide"><label class="st-label" for="ws-d-out">Output file <output>optional</output></label>
+                    <input class="st-input mono" id="ws-d-out" placeholder="in the Workshop's datasets folder"></div>
+                </div>
+              </details>
             </div>
-            <div id="ws-d-seed-box" hidden>
-              <label class="st-label" for="ws-d-seeds">Seed examples (JSONL of chats)</label>
-              <input class="st-input mono" id="ws-d-seeds" list="ws-datasets" placeholder="~/data/examples.jsonl">
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-datagen">Generate dataset</button></div>
+            <div class="ws-review">
+              <span class="card-title">Review a dataset</span>
+              <div class="ws-data__row">
+                <select class="st-input mono" id="ws-r-pick" aria-label="Dataset to review"><option value="">(none yet)</option></select>
+                <button type="button" class="st-btn st-btn--secondary" id="ws-r-open">Open</button>
+              </div>
+              <div id="ws-r-body" hidden>
+                <p class="small"><strong id="ws-r-total"></strong> <span class="muted" id="ws-r-note"></span></p>
+                <details class="small" id="ws-r-card-box"><summary>Dataset card</summary><pre class="ws-review__card" id="ws-r-card"></pre></details>
+                <div class="ws-review__table" id="ws-r-rows"></div>
+                <div class="ws-data__row">
+                  <button type="button" class="st-btn st-btn--secondary" id="ws-r-prev">Previous</button>
+                  <button type="button" class="st-btn st-btn--secondary" id="ws-r-next">Next</button>
+                  <span class="muted small" id="ws-r-page"></span>
+                  <button type="button" class="st-btn st-btn--danger" id="ws-r-del" disabled>Delete selected</button>
+                </div>
+              </div>
             </div>
           </div>
-          <div class="ws-card">
-            <label class="st-label" for="ws-d-count">Records</label>
-            <input class="st-input" id="ws-d-count" type="number" min="1" max="100000" value="100">
-            <label class="st-label" for="ws-d-judge">Quality check</label>
-            <select class="st-input" id="ws-d-judge">
-              <option value="0">None (fastest)</option><option value="3">Judge: keep 3 of 5 and up</option>
-              <option value="4" selected>Judge: keep 4 of 5 and up</option><option value="5">Judge: only 5 of 5</option></select>
-            <label class="st-label" for="ws-d-topic">Focus <output>optional</output></label>
-            <input class="st-input" id="ws-d-topic" placeholder="e.g. setting up HTTPS">
-            <details class="small"><summary>More options</summary>
-              <label class="st-label" for="ws-d-per">Records per passage</label>
-              <input class="st-input" id="ws-d-per" type="number" min="1" max="20" value="4">
-              <label class="st-label" for="ws-d-chunk">Passage length (characters)</label>
-              <input class="st-input" id="ws-d-chunk" type="number" min="500" max="20000" step="500" value="3000">
-              <label class="st-label" for="ws-d-temp">Temperature</label>
-              <input class="st-input" id="ws-d-temp" type="number" min="0" max="2" step="0.1" value="0.7">
-              <label class="st-label" for="ws-d-lang">Language <output>optional: the documents'</output></label>
-              <input class="st-input" id="ws-d-lang" placeholder="e.g. English">
-              <label class="st-label" for="ws-d-out">Output file <output>optional</output></label>
-              <input class="st-input mono" id="ws-d-out" placeholder="(in the Workshop's datasets folder)">
-            </details>
-            <button type="button" class="st-btn st-btn--primary" id="ws-datagen">Generate</button>
+          <div class="st-card ws-panel" data-ws-panel="train" hidden>
+            <div class="ws-panel__head"><span class="card-title">Train a LoRA adapter</span>
+              <p class="muted small">Training runs on this PC's CPU for Llama, Mistral and Qwen models, from a terminal for now
+                (training from this tab comes next). <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></div>
+            <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</pre>
+            <p class="muted small">Use a dataset from step 1, then merge the adapter in step 3.</p>
           </div>
+          <div class="st-card ws-panel" data-ws-panel="merge" hidden>
+            <div class="ws-panel__head"><span class="card-title">Merge an adapter</span>
+              <p class="muted small">A LoRA adapter folder (<code>adapter_model.safetensors</code> + <code>adapter_config.json</code>,
+                from Unsloth or PEFT) into the Hugging Face model it was trained on. rsLoRA and MoE expert adapters are handled.</p></div>
+            <div class="ws-form">
+              <div class="ws-field"><label class="st-label" for="ws-m-base">Base model (HF folder)</label>
+                <input class="st-input mono" id="ws-m-base" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field"><label class="st-label" for="ws-m-adapter">Adapter folder</label>
+                <input class="st-input mono" id="ws-m-adapter" list="ws-adapters" placeholder="~/outputs/my-lora"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-m-out">Output folder <output>optional</output></label>
+                <input class="st-input mono" id="ws-m-out" placeholder="in the Workshop folder"></div>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-merge">Merge</button></div>
+          </div>
+          <div class="st-card ws-panel" data-ws-panel="convert" hidden>
+            <div class="ws-panel__head"><span class="card-title">Convert to GGUF</span>
+              <p class="muted small">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, byte for
+                byte as llama.cpp's converter writes it. Llama-family models for now.</p></div>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-in">Model (HF folder)</label>
+                <input class="st-input mono" id="ws-c-in" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-type">Precision</label>
+                <select class="st-input" id="ws-c-type"><option value="f16">F16 (half the size)</option><option value="f32">F32</option></select></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-pre">Pre-tokenizer <output>only if asked for</output></label>
+                <input class="st-input mono" id="ws-c-pre" placeholder="e.g. llama-bpe, qwen2"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-out">Output file <output>optional</output></label>
+                <input class="st-input mono" id="ws-c-out" placeholder="in the Workshop folder"></div>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-convert">Convert</button></div>
+          </div>
+          <div class="st-card ws-panel" data-ws-panel="quantize" hidden>
+            <div class="ws-panel__head"><span class="card-title">Quantize</span>
+              <p class="muted small">A GGUF to a smaller type, matching <code>llama-quantize --pure</code> byte for byte.</p></div>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-q-in">GGUF</label>
+                <input class="st-input mono" id="ws-q-in" list="ws-gguf" placeholder="~/models/model-f16.gguf"></div>
+              <div class="ws-field"><label class="st-label" for="ws-q-type">Type</label>
+                <select class="st-input" id="ws-q-type">
+                  <option value="q8_0">Q8_0 (best quality, 8.5 bits)</option><option value="q6_k">Q6_K (6.6 bits)</option>
+                  <option value="q5_k">Q5_K (5.5 bits)</option><option value="q4_k" selected>Q4_K (4.5 bits, the usual choice)</option>
+                  <option value="q4_0">Q4_0 (4.5 bits, older)</option><option value="f16">F16</option></select></div>
+              <div class="ws-field"><label class="st-label" for="ws-q-out">Output file <output>optional</output></label>
+                <input class="st-input mono" id="ws-q-out" placeholder="in the Workshop folder"></div>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-quantize">Quantize</button></div>
+          </div>
+          <div class="st-card ws-panel" data-ws-panel="install" hidden>
+            <div class="ws-panel__head"><span class="card-title">Install as a model am2Strata runs</span>
+              <p class="muted small">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for
+                its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p></div>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-s-in">GGUF</label>
+                <input class="st-input mono" id="ws-s-in" list="ws-gguf" placeholder="~/models/model-Q4_K.gguf"></div>
+              <div class="ws-field"><label class="st-label" for="ws-s-name">Name <output>optional</output></label>
+                <input class="st-input mono" id="ws-s-name" placeholder="from the file name"></div>
+              <div class="ws-field"><label class="st-label" for="ws-s-display">Display name <output>optional</output></label>
+                <input class="st-input" id="ws-s-display" placeholder="My model Q4_K"></div>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-s-over"> Replace a model with the same name</label>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button></div>
+          </div>
+          <div class="msg-error" id="ws-error" hidden></div>
         </div>
-        <div class="ws-review">
-          <div class="ws-data__row">
-            <label class="st-label" for="ws-r-pick">Review a dataset</label>
-            <select class="st-input mono" id="ws-r-pick"><option value="">(none yet)</option></select>
-            <button type="button" class="st-btn st-btn--secondary" id="ws-r-open">Open</button>
-          </div>
-          <div id="ws-r-body" hidden>
-            <p class="small"><strong id="ws-r-total"></strong> <span class="muted" id="ws-r-note"></span></p>
-            <details class="small" id="ws-r-card-box"><summary>Dataset card</summary><pre class="ws-review__card" id="ws-r-card"></pre></details>
-            <div class="ws-review__table" id="ws-r-rows"></div>
-            <div class="ws-data__row">
-              <button type="button" class="st-btn st-btn--secondary" id="ws-r-prev">Previous</button>
-              <button type="button" class="st-btn st-btn--secondary" id="ws-r-next">Next</button>
-              <span class="muted small" id="ws-r-page"></span>
-              <button type="button" class="st-btn st-btn--danger" id="ws-r-del" disabled>Delete selected</button>
-            </div>
-          </div>
-        </div>
+        <aside class="ws-side">
+          <div class="st-card ws-jobs"><span class="card-title">Jobs</span>
+            <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
+          <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|strata|datagen|upload|dataset|jobs|cancel</code>
+            (through this server), or <code>am2strata-workshop</code> on its own.</p>
+        </aside>
       </div>
-      <div class="msg-error" id="ws-error" hidden></div>
-      <div class="st-card"><span class="card-title">Jobs</span>
-        <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
-      <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|strata|datagen|upload|dataset|jobs|cancel</code> (through this server),
-        or <code>am2strata-workshop</code> on its own.</p>
       <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist><datalist id="ws-datasets"></datalist>
     </div>
   </section>
