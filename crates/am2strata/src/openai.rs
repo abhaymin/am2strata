@@ -154,7 +154,7 @@ async fn chat_with(s: AppState, headers: HeaderMap, mut req: Value,
     let own_page = !crate::foreign_origin(&s, &headers) && headers.contains_key("origin");
     let mut opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: req.get("tool_choice").cloned(),
                               memory: crate::memory::scope_of(&req, own_page), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)),
-                                  media: None };
+                                  media: None, media_wait: stream && !own_page && req.get("strata_media_wait") != Some(&Value::Bool(false)) };
     // the server's own tools (MCP, memory, media) this request opted in to
     let mcp = match crate::server_tools::offer(&s, &headers, &req, &mut prep, &mut opts, validator.is_some()).await {
         Ok(o) => o,

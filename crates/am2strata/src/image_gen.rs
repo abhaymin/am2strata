@@ -1058,6 +1058,8 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     mon.media_seed(job, seed);
     mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
+    // each clip's scene, for the stage log (one scene: its prompt)
+    let stage_prompts: Vec<String> = stages.iter().filter_map(|s| s["prompt"].as_str().map(str::to_string)).collect();
     let mut clip = None;
     let res = s.media.call(json!({"op": op, "request": r}), |ev| {
         if ev["event"] == "video" && clip.is_none() {
@@ -1065,6 +1067,11 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
         }
         if ev["event"] == "step" {
             mon.media_step(job, ev["step"].as_u64().unwrap_or(0), ev["total"].as_u64().unwrap_or(steps));
+            // a chain: which clip, and the scene it belongs to
+            if let (Some(st), Some(n)) = (ev["stage"].as_u64(), ev["stages"].as_u64()) {
+                let what = stage_prompts.get(st.saturating_sub(1) as usize).map(String::as_str).unwrap_or(prompt);
+                mon.media_stage(job, st, n, what);
+            }
         }
     }).await;
     if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {

@@ -3283,3 +3283,29 @@ fn a_video_in_scenes_is_one_job_and_one_file() {
     assert_eq!(c, 200, "{j}");
     assert_eq!(j["kind"], "video", "{j}");
 }
+
+/// A streaming API client's chat that queues a long video stays open while it is made (the owner: keep the window
+/// engaged): after the answer, a line for the job, and the file's link at the end; the web app (its own page) does
+/// not wait (its job cards follow the job), nor a client that sends "strata_media_wait": false.
+#[test]
+fn a_streaming_api_chat_follows_its_video_to_the_end() {
+    let call = "\n\n<tool_call>\n<function=generate_video>\n<parameter=scenes>\n[{\"prompt\": \"dawn\", \"seconds\": 8}, {\"prompt\": \"noon\", \"seconds\": 4}]\n</parameter>\n</function>\n</tool_call>";
+    let s = Server::start(&[Model::default()], &[ids(&format!("Make it.\n</think>{call}")), ids("Done.\n</think>\n\nIt is on its way."),
+                                                  ids(&format!("Make it.\n</think>{call}")), ids("Done.\n</think>\n\nIt is on its way.")],
+                          json!({"media_delay_ms": 300}));
+    let body = json!({"messages": [user("A video of a harbour day.")], "strata_media": true, "stream": true});
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY).json(&body)
+        .timeout(Duration::from_secs(120)).send().unwrap();
+    let text = r.text().unwrap();
+    let content: String = text.lines().filter_map(|l| l.strip_prefix("data: ")).filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|v| v["choices"][0]["delta"]["content"].as_str().map(str::to_string)).collect();
+    assert!(content.contains("It is on its way."), "{content}");
+    assert!(content.contains("✓ video mj-") && content.contains("is ready: /v1/media/jobs/mj-"), "the stream ends with the file: {content}");
+    // opted out: the answer alone
+    let mut body = body.clone();
+    body["strata_media_wait"] = json!(false);
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", s.base)).bearer_auth(KEY).json(&body)
+        .timeout(Duration::from_secs(120)).send().unwrap();
+    let text = r.text().unwrap();
+    assert!(!text.contains("is ready: /v1/media"), "{text}");
+}

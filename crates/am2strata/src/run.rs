@@ -257,6 +257,62 @@ pub struct RunOpts {
     /// the media tools (generate_image, generate_video, speak) for a request that opted in: the capability check
     /// they were offered by
     pub media: Option<Value>,
+    /// a streaming API client (not the web app, whose job cards follow the jobs): after the answer the stream stays open
+    /// while this answer's media jobs run, a line for each clip or part cleared and the file's link at the end
+    /// (`"strata_media_wait": false` turns it off)
+    pub media_wait: bool,
+}
+
+/// The answer's media jobs, followed to the end in the stream: a line for each stage cleared, then each file's link.
+/// false when the client went away.
+async fn report_media(jobs: &crate::media_jobs::Jobs, ids: &[String], tx: &tokio::sync::mpsc::Sender<RunEvent>) -> bool {
+    let say = |t: String| RunEvent::Event(Event::Content(t));
+    if tx.send(say("\n\n".into())).await.is_err() {
+        return false;
+    }
+    for id in ids {
+        let (mut logged, mut said_wait, t0) = (0usize, false, std::time::Instant::now());
+        loop {
+            let Some(v) = jobs.status(id) else { break };
+            let what = v["kind"].as_str().unwrap_or("media").to_string();
+            let mut lines = Vec::new();
+            match v["state"].as_str().unwrap_or("") {
+                "done" => {
+                    lines.push(format!("✓ {what} {id} is ready: {}\n", v["url"].as_str().unwrap_or("")));
+                }
+                "error" => lines.push(format!("✗ {what} {id} failed: {}\n", v["error"].as_str().unwrap_or("unknown"))),
+                "queued" if !said_wait => {
+                    said_wait = true;
+                    lines.push(format!("… {what} {id} is waiting its turn\n"));
+                }
+                "running" => {
+                    let log = v["log"].as_array().cloned().unwrap_or_default();
+                    for l in log.iter().skip(logged) {
+                        lines.push(format!("· {what} {id}: {}\n", l.as_str().unwrap_or("")));
+                    }
+                    logged = log.len();
+                    if logged == 0 && !said_wait {
+                        said_wait = true;
+                        lines.push(format!("… {what} {id} is being made\n"));
+                    }
+                }
+                _ => {}
+            }
+            for l in lines {
+                if tx.send(say(l)).await.is_err() {
+                    return false;
+                }
+            }
+            if matches!(v["state"].as_str(), Some("done" | "error")) || t0.elapsed() > std::time::Duration::from_secs(3 * 3600) {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                _ = tx.closed() => return false,
+            }
+        }
+    }
+    true
 }
 
 /// What the memory adds to a request before its prompt is built: the <memory> block (matching facts and archived turns),
@@ -839,6 +895,7 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
         let mut prompt_total: Option<u64> = None; // a provider's counts: every round's prompt is billed
         let mut media_jobs = 0usize; // queued by this answer's media tools
+        let mut media_ids: Vec<String> = Vec::new();
         let mut web_queries = 0u32; // this answer's web searches (a client profile may limit them)
         let web_limit = mgr.clients.get().and_then(|c| crate::clients::current(c)).and_then(|p| p.web_queries_per_turn);
         loop {
@@ -894,6 +951,14 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                 }
                 sum.completion_tokens = total;
                 sum.prompt_tokens = prompt_total;
+                // an API client's stream stays open while this answer's media jobs are made, a line per stage cleared
+                if opts.media_wait && !media_ids.is_empty() {
+                    if let Some(j) = mgr.media_jobs.get() {
+                        if !report_media(j, &media_ids, &tx).await {
+                            return;
+                        }
+                    }
+                }
                 let _ = tx.send(RunEvent::Done(sum)).await;
                 return;
             }
@@ -923,6 +988,9 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         Some(j) => {
                             media_jobs += 1;
                             let mut r = j.submit(&c.name, &args, caps);
+                            if let Some(id) = r["job"]["id"].as_str().filter(|_| r["ok"] == true) {
+                                media_ids.push(id.to_string());
+                            }
                             // speech on the CPU (Chatterbox, beside the text model, no GPU turn): finished inside the
                             // answer, so the model can say it is ready; past the wait it stays queued as before
                             let cpu_speech = c.name == "speak" && caps["kinds"]["tts"]["model"].as_str().is_some_and(|m| m.contains("chatterbox"));

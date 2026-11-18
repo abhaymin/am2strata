@@ -81,6 +81,11 @@ background job, each clip continued from the one before (the media engine's chai
   length takes; up to 15 minutes in all.
 - The chat tool `generate_video` and the job API (`POST /api/jobs {"tool": "generate_video", "arguments": {...}}`) take
   the same; the model is told to make a long video in one call, never several.
+- **Following it:** `GET /api/jobs/{id}` (and the chat's job card) gives the clip now (`stage` of `stages`), the time so
+  far, and `log`, a line for each clip finished with its scene; the web app's card appends them as they clear.
+- **An API chat stays engaged:** a streaming chat (Chat Completions, Messages, Responses) from an API client that
+  queued media keeps its stream open after the answer, adding a line as each clip clears and, at the end,
+  `✓ video mj-N is ready: /v1/media/jobs/mj-N/content`. `"strata_media_wait": false` ends the stream with the answer.
 - Short asks stay one shot: one image, one clip, one sound. Long audio is one job too: `speak` reads up to ~20 minutes,
   `produce` joins speech, songs and music into one file with chapters.
 

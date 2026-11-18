@@ -2071,7 +2071,7 @@ function jobCardHtml(id) {
     const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
     const chapters = (j.meta && j.meta.chapters || []).map((c) => `<li><span class="muted">${fmtClock(c.start_s)}</span> ${esc(c.title)}</li>`).join("");
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
-      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "");
+      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "") + jobLogHtml(j, true);
   }
   // gone from the server (made before it kept jobs, or past the newest it keeps): made again from the same call
   if (j.state === "gone") return `<div class="media-job__gone"><span class="muted small">This ${esc(what.toLowerCase())} is no longer on the server.</span>` +
@@ -2079,9 +2079,18 @@ function jobCardHtml(id) {
   if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>` +
     (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Try again</button>` : "");
   const where = j.kind === "production" && j.meta && j.meta.part ? `part ${j.meta.part} of ${j.meta.parts}${j.meta.now ? ` (${j.meta.now})` : ""}`
-    : j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
+    : j.state === "running" ? (j.stages ? `clip ${j.stage} of ${j.stages}` : j.steps ? `step ${j.step} of ${j.steps}` : "running")
+      + (j.elapsed_s ? ` · ${fmtClock(j.elapsed_s)}` : "")
     : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
-  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
+  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>` + jobLogHtml(j, false);
+}
+// a long job's stages as they clear (clip k of n, its scene), kept under the finished file too (folded)
+function jobLogHtml(j, done) {
+  const log = j.log || [];
+  if (!log.length) return "";
+  const items = log.map((l) => `<li>${esc(l)}</li>`).join("");
+  return done ? `<details class="media-job__log small"><summary>${log.length} stage${log.length === 1 ? "" : "s"}</summary><ol>${items}</ol></details>`
+              : `<ol class="media-job__log small">${items}</ol>`;
 }
 // "Make it again": the same tool call queued as a new job; the chat's tool call now points to it (kept with the chat)
 document.addEventListener("click", async (e) => {

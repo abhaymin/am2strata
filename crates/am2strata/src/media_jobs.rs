@@ -770,7 +770,7 @@ impl Jobs {
         ids.iter().filter_map(|id| self.status(id)).collect()
     }
 
-    fn status(&self, id: &str) -> Option<Value> {
+    pub fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();
         let j = jobs.get(&n)?;
@@ -790,6 +790,12 @@ impl Jobs {
                 if let Some((st, tot)) = self.app().mgr.monitor.media_progress() {
                     v["step"] = json!(st);
                     v["steps"] = json!(tot);
+                }
+                // a long job: its clip now and the clips finished (the web app's card appends them)
+                if let Some(d) = self.app().mgr.monitor.media_detail() {
+                    for k in ["stage", "stages", "log", "elapsed_s"] {
+                        v[k] = d[k].clone();
+                    }
                 }
             } else if let Some(w) = q["waiting"].as_array().and_then(|a| a.iter().find(|w| w["label"] == j.id.as_str())) {
                 v["position"] = w["position"].clone();

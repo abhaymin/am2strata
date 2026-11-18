@@ -74,7 +74,7 @@ pub async fn messages(State(s): State<AppState>, headers: HeaderMap, Json(mut re
     }
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut opts = run::RunOpts { stream_tools: stream, budget, tool_choice: req.get("tool_choice").cloned(),
-                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None };
+                           memory: crate::memory::scope_of(&req, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None, media_wait: stream && !(!crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) && req.get("strata_media_wait") != Some(&Value::Bool(false)) };
     // the server's own tools (MCP, memory, media) this request opted in to
     let offered = match crate::server_tools::offer(&s, &headers, &req, &mut prep, &mut opts, false).await {
         Ok(o) => o,
