@@ -1241,7 +1241,15 @@ impl Browsers {
                 if !allowed_host(&url, self.settings.private_urls).await {
                     return Err(format!("{url} is not a public web address; the browser does not open this PC's or the LAN's pages"));
                 }
-                page.goto(url.as_str()).await.map_err(|e| format!("opening {url}: {e}"))?;
+                if let Err(e) = page.goto(url.as_str()).await {
+                    // ERR_ABORTED is what Chromium reports when the page replaces its own first navigation (a redirect
+                    // through script, as Yandex's results do); the open counts when a real page loads after it
+                    let e = e.to_string();
+                    if !e.contains("ERR_ABORTED") { return Err(format!("opening {url}: {e}")); }
+                    let _ = tokio::time::timeout(Duration::from_secs(10), page.wait_for_navigation()).await;
+                    let now = page.url().await.ok().flatten().unwrap_or_default();
+                    if !opened_after_abort(&now) { return Err(format!("opening {url}: {e}")); }
+                }
             }
             "browser_click" => {
                 // a click needs a target by point (both coordinates) or by a link/button's text; an empty argument or a
@@ -1878,5 +1886,22 @@ mod tests {
         assert_eq!(with_title.label(), "https://a.com/ - Home");
         let plain = TabView { id: "t".into(), index: 1, url: "https://b.com/".into(), title: String::new() };
         assert_eq!(plain.label(), "https://b.com/");
+    }
+}
+
+/// After a navigation Chromium reported as aborted, the page still counts as opened when it shows a real web page
+fn opened_after_abort(now: &str) -> bool {
+    let n = now.trim().to_lowercase();
+    (n.starts_with("https://") || n.starts_with("http://")) && !n.starts_with("chrome-error://")
+}
+
+#[cfg(test)]
+mod abort_tests {
+    #[test]
+    fn an_aborted_open_counts_only_when_a_real_page_loaded() {
+        assert!(super::opened_after_abort("https://yandex.com/images/search?rpt=imageview"));
+        assert!(!super::opened_after_abort("about:blank"));
+        assert!(!super::opened_after_abort("chrome-error://chromewebdata/"));
+        assert!(!super::opened_after_abort(""));
     }
 }
