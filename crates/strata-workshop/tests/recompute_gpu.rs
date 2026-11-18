@@ -70,20 +70,24 @@ fn recompute_gives_the_plain_backward_pass() {
     }
 }
 
-/// The first GPU the build has, if this machine has it.
-fn gpu() -> Option<Device> {
+/// The first GPU the build has, if this machine has it, and its name for the output.
+fn gpu_named() -> Option<(&'static str, Device)> {
     if cfg!(feature = "metal") {
-        Device::new_metal(0).ok()
+        Device::new_metal(0).ok().map(|d| ("Metal", d))
     } else if cfg!(feature = "cuda") {
-        Device::new_cuda(0).ok()
+        Device::new_cuda(0).ok().map(|d| ("CUDA", d))
     } else {
         None
     }
 }
 
+fn gpu() -> Option<Device> {
+    gpu_named().map(|(_, d)| d)
+}
+
 #[test]
 fn the_gpu_trains_like_the_cpu() {
-    let Some(dev) = gpu() else {
+    let Some((name, dev)) = gpu_named() else {
         println!("no GPU in this build or machine: skipped");
         return;
     };
@@ -92,7 +96,7 @@ fn the_gpu_trains_like_the_cpu() {
         let (l0, g0) = run(d.path(), &Device::Cpu, dtype, recompute, 16, None);
         let (l1, g1) = run(d.path(), &dev, dtype, recompute, 16, None);
         let w = worst(&g0, &g1);
-        println!("{dtype:?} recompute {recompute}: CPU loss {l0:.6}, GPU {l1:.6}; gradients differ by {w:.2e} of their largest value");
+        println!("{dtype:?} recompute {recompute}: CPU loss {l0:.6}, {name} {l1:.6}; gradients differ by {w:.2e} of their largest value");
         assert!((l0 - l1).abs() < 1e-3, "loss {l0} vs {l1}");
         assert!(w < 1e-2, "GPU gradients differ by {w}");
     }
@@ -134,7 +138,7 @@ fn step_time_cpu_against_gpu() {
     let tokens: Vec<u32> = (0..seq).map(|i| ((i * 7 + 3) % 259) as u32).collect();
     let supervised: Vec<bool> = (0..seq).map(|p| p >= 8).collect();
     let mut devs = vec![("cpu", Device::Cpu)];
-    if let Some(g) = gpu() { devs.push(("gpu", g)); }
+    if let Some((name, g)) = gpu_named() { devs.push((name, g)); }
     for (label, dev) in devs {
         for recompute in [false, true] {
             let mut model = LlamaModel::load(d.path(), BaseDtype::BF16, &dev).unwrap();

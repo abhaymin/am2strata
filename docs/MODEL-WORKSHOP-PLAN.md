@@ -241,14 +241,15 @@ Three things learned while building it, kept here because each would have been a
   release builds Metal). The two custom nodes (`FrozenLinear`, `MaskedSoftmax`) hand their value over as one device-side
   copy (`take_device_value`), never through the CPU. Checked by `tests/recompute_gpu.rs::the_gpu_trains_like_the_cpu`:
   Metal's loss equals the CPU's and its gradients differ by at most 1e-6 of their largest value (f32 and bf16 bases).
-  CUDA compiles from the same code and still needs its run on an NVIDIA machine.
+  CUDA, on an RTX 5060 Ti 16 GB (CUDA 13, Linux): the same test passes, gradients within 1.5e-6 of the CPU's.
 - **`--recompute`** (gradient checkpointing, per block): the forward pass keeps only each trained block's input and
   where its dropout masks start; the head is scored 256 rows at a time; the backward pass rebuilds one block's graph at a
   time from the top. Same loss, gradients within 7e-7 (`recompute_gives_the_plain_backward_pass`). A 3B Llama in bf16
   at 2048 tokens with every block training: 119 GB estimated without it, 13.2 GB with it (`profile --recompute`).
 - Measured on an M4 Mac mini (`step_time_cpu_against_gpu`, bf16 base, rank 16 on all seven projections, 512 tokens):
   hidden 1024 × 8 blocks 1.11 s per step on the CPU, 0.49 s on Metal; hidden 2048 × 4 blocks 1.59 s against 0.50 s.
-  Recompute costs about 30 % more time. `profile`'s time estimate still assumes the CPU (and a guessed GPU rate).
+  On the RTX 5060 Ti, hidden 2048 × 4 blocks: 2.01 s on its CPU, 0.105 s on CUDA (19×), 0.168 s with recompute.
+  Recompute costs about 30 % more time on the Mac and 60 % on CUDA. `profile`'s time estimate still assumes the CPU (and a guessed GPU rate).
 
 ### Next milestones
 
