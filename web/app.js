@@ -2260,9 +2260,11 @@ function onTool(m, x) {
 }
 function updateAssistant(el, m, streaming) {
   if (!el || !el.isConnected) {
+    // a stream whose chat was closed and opened again paints the new element; an element not yet in the page
+    // (msgEl builds it before renderChat adds it) or another chat's answer is still painted, off screen
     const i = messages.indexOf(m), live = i >= 0 && $("chat").querySelector(`.st-msg[data-i="${i}"]`);
-    if (!live) return;
-    el = live;
+    if (live) el = live;
+    if (!el) return;
   }
   const det = el.querySelector("details.think");
   if (m.reasoning) {
