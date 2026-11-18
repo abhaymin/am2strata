@@ -438,8 +438,8 @@ enum Cmd {
     /// the frames scores picture, captions, fit, sequence and thumbnail; exit 1 unless it passes). A file argument goes after --
     Media {
         action: String,
-        /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job
-        #[arg(last = true)]
+        /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job. Either right
+        /// after the action (`media image "a lake" --out a.png`) or after `--` (`media judge --brief b.txt -- v.mp4`)
         first: Option<String>,
         #[command(flatten)]
         m: bin_media::MediaOpts,
