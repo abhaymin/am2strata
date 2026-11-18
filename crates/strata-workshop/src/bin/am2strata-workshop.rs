@@ -270,6 +270,10 @@ impl RunArgs {
     /// The settings these flags (and the Soup file) describe, and what to say about them.
     fn settings(&self, need_data: bool) -> Result<(TrainSettings, Vec<String>), String> {
         let device = TrainDevice::from_s(&self.device).map_err(|e| e.to_string())?;
+        // a GPU that is not there (or not in this build) is refused before any data is read or anything written
+        if device != TrainDevice::Cpu {
+            device.open().map_err(|e| format!("{e:#}"))?;
+        }
         let (mut s, mut notes) = match &self.soup {
             Some(path) => {
                 let imp = soup::import_file(path, self.soup_relax).map_err(|e| e.to_string())?;

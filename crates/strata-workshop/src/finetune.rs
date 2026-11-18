@@ -106,8 +106,10 @@ impl TrainDevice {
         Ok(match s.as_str() {
             "cpu" => TrainDevice::Cpu,
             "metal" | "mps" => TrainDevice::Metal,
-            "cuda" | "gpu" if cfg!(not(target_os = "macos")) => TrainDevice::Cuda(0),
-            "gpu" => TrainDevice::Metal,
+            "cuda" => TrainDevice::Cuda(0),
+            // "gpu": this machine's kind of GPU
+            "gpu" if cfg!(target_os = "macos") => TrainDevice::Metal,
+            "gpu" => TrainDevice::Cuda(0),
             _ => match s.strip_prefix("cuda:").map(str::parse::<usize>) {
                 Some(Ok(n)) => TrainDevice::Cuda(n),
                 _ => bail!("--device {s}: choose cpu, metal, cuda or cuda:N"),
