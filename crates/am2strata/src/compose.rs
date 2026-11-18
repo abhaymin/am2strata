@@ -347,7 +347,7 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": played.round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
+    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
 }
 
 /// The xfade chain that joins the shots in order, each beginning one crossfade before the previous ends (so their joins
@@ -374,7 +374,9 @@ pub fn xfade_chain(durations: &[f64], crossfade: f64) -> String {
         parts.push(format!("{}[{}:v]xfade=transition=fade:duration={:.3}:offset={:.3}{}", last, k, xf, starts[k], out));
         last = out;
     }
-    if parts.is_empty() { String::from("[0:v]") } else { parts.join("") }
+    // filter chains are separated by ';' (ffmpeg reads two chains run together as trailing garbage), and the caller's
+    // next filter reads the joined stream as its own chain from the [v] label
+    if parts.is_empty() { String::from("[0:v]") } else { format!("{};[v]", parts.join(";")) }
 }
 
 /// ffmpeg reads a drawtext option between its quotes (e.g. `text='…'`), where inside those quotes a backslash still opens an
@@ -485,6 +487,21 @@ fn thumbnail_drawtext(text: &str, font: &str, color: &str, y: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The crossfade chain is a filtergraph ffmpeg accepts: three shots joined then faded in (the chains were once run
+    /// together without ';', which ffmpeg refused as "trailing garbage"). Only runs where ffmpeg is installed.
+    #[test]
+    fn the_crossfade_chain_parses_in_ffmpeg() {
+        let chain = xfade_chain(&[2.0, 2.0, 2.0], 0.5);
+        assert_eq!(chain.matches(';').count(), 2, "{chain}");
+        if !crate::media::ffmpeg_available() { return; }
+        let mut args: Vec<String> = Vec::new();
+        for _ in 0..3 { args.extend(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=2"].map(String::from)); }
+        args.extend(["-filter_complex".into(), format!("{chain}fade=t=in:st=0:d=1.0,format=yuv420p[out]"),
+                     "-map".into(), "[out]".into(), "-f".into(), "null".into(), "-".into()]);
+        let out = std::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error"]).args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
     use super::*;
 
     #[test]
@@ -591,10 +608,14 @@ mod tests {
             "-frames:v", "81", "-an", "-c:v", "libx264", "-crf", "18", &shot.display().to_string(),
         ]).await.unwrap();
 
-        // pass 2: hold it to 3 s, burn in a caption, and mux the tone under one MP4 (faststart)
+        // pass 2: hold it to 3 s, burn in a caption with make()'s own ASS script and filter, and mux the tone (faststart)
+        let subs = dir.join("subs.ass");
+        std::fs::write(&subs, ass_script(1920, 1080, &[(0.2, 2.5, "Hello there".into())], Some("Title"), None, 3.0)).unwrap();
+        let fc = format!("[0:v]tpad=stop_mode=clone:stop_duration=1,subtitles='{}',format=yuv420p[v]",
+            subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"));
         run_ffmpeg(&[
             "-y", "-i", &shot.display().to_string(), "-i", &wav.display().to_string(),
-            "-filter_complex", "[0:v]subtitles='':format=yuv420p[v]", "-map", "[v]", "-map", "1:a",
+            "-filter_complex", &fc, "-map", "[v]", "-map", "1:a",
             "-t", "3.0", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
             &out.display().to_string(),
         ]).await.unwrap();
