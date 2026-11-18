@@ -93,8 +93,18 @@ fn tmp() -> PathBuf {
     d
 }
 
+/// The page's answer to `js`: tried again for up to 10 s while the page is still loading or its script not yet run
+/// (a slow runner, the macOS Intel one, read a page before its script had made `window.log`).
 async fn eval(b: &Browsers, conv: &str, js: &str) -> Value {
-    b.current(conv).await.unwrap().evaluate(js).await.unwrap().into_value::<Value>().unwrap()
+    let mut last = String::new();
+    for _ in 0..50 {
+        match b.current(conv).await.unwrap().evaluate(js).await {
+            Ok(v) => return v.into_value::<Value>().unwrap(),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("the page did not answer {js:?} in 10 s: {last}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
