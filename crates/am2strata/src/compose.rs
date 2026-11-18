@@ -274,12 +274,22 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let ass = ass_script(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s);
     let subs = dir.join("subs.ass");
     std::fs::write(&subs, &ass).map_err(|e| format!("could not write the captions: {e}"))?;
-    let per_shot: Vec<Option<f64>> = shots.iter().map(|sh| sh["seconds"].as_f64()).collect();
-    let durations = if per_shot.iter().all(|d| d.is_some()) {
-        per_shot.iter().map(|d| d.unwrap_or(5.0)).collect()
-    } else {
-        spread_over(total_s, cross, shots.len())
-    };
+    // each shot's file, its kind, and a clip's own length (a clip plays its motion, never a frozen last frame)
+    let mut srcs: Vec<(std::path::PathBuf, &'static str, Option<f64>)> = Vec::new();
+    for (i, sh) in shots.iter().enumerate() {
+        let raw = sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).unwrap_or("");
+        let bytes = source_bytes(s, if sh.get("clip").is_some() { "clip" } else { "image" }, &Value::from(raw)).await?;
+        let kind = kind_of_bytes(&bytes);
+        let ext = if kind == "clip" { "mp4" } else { "png" };
+        let name = format!("src-{i}.{ext}");
+        let len = if kind == "clip" { duration_of(&dir, &name, &bytes).await.ok() } else {
+            std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("could not write the {kind}: {e}"))?;
+            None
+        };
+        srcs.push((dir.join(name), kind, len));
+    }
+    let plan: Vec<(Option<f64>, Option<f64>)> = shots.iter().zip(&srcs).map(|(sh, (_, _, len))| (sh["seconds"].as_f64(), *len)).collect();
+    let durations = layout(total_s, cross, &plan);
     // a shot over its given length: images still play their whole zoom (clips are held on the last frame when short)
     let played = total_length(&durations, cross); // what the joined footage actually plays; cap to it
     let _ = join_offsets(&durations, cross);
@@ -287,19 +297,14 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     s.media_jobs.set_meta(n, json!({"part": 0, "parts": shots.len(), "now": "compose"}));
     // make each input a temp file (a data URL is decoded to bytes above; the rest are paths / job ids already resolved)
     let mut inputs = Vec::new();
-    for (i, sh) in shots.iter().enumerate() {
-        let raw = sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).unwrap_or("");
-        let bytes = source_bytes(s, if sh.get("clip").is_some() { "clip" } else { "image" }, &Value::from(raw)).await?;
-        let kind = kind_of_bytes(&bytes);
-        let ext = if kind == "clip" { "mp4" } else { "png" };
-        let src = dir.join(format!("src-{i}.{ext}"));
-        std::fs::write(&src, &bytes).map_err(|e| format!("could not write the {kind}: {e}"))?;
+    for (i, (src, kind, clip_len)) in srcs.iter().enumerate() {
+        let (src, kind) = (src.clone(), *kind);
         let out = dir.join(format!("shot-{:02}.mp4", i));
         let frames = frames_for(durations[i]);
         let (w2, h2) = (w * 2, h * 2);
         if kind == "clip" {
             // fitted to the frame, held on its last frame if shorter than the shot (so a short clip still fills it)
-            let fit = clip_filter(w, h, durations[i]);
+            let fit = clip_filter(w, h, durations[i], *clip_len);
             let srcp = src.display().to_string();
             let outp = out.display().to_string();
             run_ffmpeg(&["-i", srcp.as_str(), "-vf", fit.as_str(), "-frames:v", frames.to_string().as_str(), "-an", "-c:v", "libx264", "-crf", "18", outp.as_str()]).await?;
@@ -381,9 +386,39 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
 
 /// A clip fitted to the frame and held on its last frame for as long as its shot plays (a 5 s clip in a 14 s shot
 /// fills all 14 s; held only briefly, the crossfade chain ended early and the video stopped long before the audio).
-pub fn clip_filter(w: u32, h: u32, shot_s: f64) -> String {
-    format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p",
-            shot_s.max(0.5) + 1.0)
+pub fn clip_filter(w: u32, h: u32, shot_s: f64, clip_s: Option<f64>) -> String {
+    // slowed to fill its shot, by up to MAX_SLOW (calm motion slowed reads as calm; frozen reads as broken); evened
+    // out first, as generated clips flicker from frame to frame
+    let slow = clip_s.filter(|c| *c > 0.1).map(|c| (shot_s / c).clamp(1.0, MAX_SLOW)).unwrap_or(1.0);
+    format!("deflicker=size=5,setpts={slow:.4}*PTS,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},\
+             tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p", shot_s.max(0.5) + 1.0)
+}
+
+/// The most a clip is slowed to fill its shot.
+pub const MAX_SLOW: f64 = 1.6;
+
+/// Each shot's length. Shots given "seconds" keep them. A clip plays its own length, slowed by up to MAX_SLOW, but never
+/// more than an even share. The images take the rest of the audio, evenly, so no clip is held on a frozen frame. When
+/// every shot is a clip, they share the audio evenly (and the last frames hold).
+pub fn layout(total_s: f64, crossfade: f64, shots: &[(Option<f64>, Option<f64>)]) -> Vec<f64> {
+    let n = shots.len();
+    if n == 0 { return vec![]; }
+    if shots.iter().all(|(given, _)| given.is_some()) {
+        return shots.iter().map(|(g, _)| g.unwrap_or(5.0)).collect();
+    }
+    let xf = crossfade.clamp(0.0, 8.0);
+    let budget = (total_s + xf * (n as f64 - 1.0)).max(1.0);
+    let even = budget / n as f64;
+    let mut out: Vec<Option<f64>> = shots.iter().map(|(given, clip)| given.or_else(|| clip.map(|c| (c * MAX_SLOW).min(even).max(xf + 0.5)))).collect();
+    let free: Vec<usize> = (0..n).filter(|&i| out[i].is_none()).collect();
+    if free.is_empty() {
+        // only clips (and given lengths): spread what is left over the clips
+        return spread_over(total_s, crossfade, n);
+    }
+    let used: f64 = out.iter().flatten().sum();
+    let each = ((budget - used) / free.len() as f64).max(xf + 1.0);
+    for i in free { out[i] = Some(each); }
+    out.into_iter().map(|d| d.unwrap_or(each)).collect()
 }
 
 /// A video file's video-stream length in seconds, by ffprobe.
@@ -556,6 +591,21 @@ mod tests {
     /// A short clip in a long shot is held to the shot's whole length (Peace and Harmony's 5 s clips in 14 s shots
     /// once made a 15 s picture track under 200 s of audio). Only runs where ffmpeg is installed.
     #[test]
+    fn clips_play_their_motion_and_the_pictures_take_the_rest() {
+        // 200 s of song, 14 shots, 5 clips of 5.06 s: each clip plays 1.6x slowed (8.1 s), the 9 pictures share the rest
+        let mut plan = vec![(None, None); 14];
+        for i in [0usize, 3, 5, 9, 13] { plan[i] = (None, Some(5.0625)); }
+        let d = layout(200.0, 0.8, &plan);
+        assert!((d[0] - 8.1).abs() < 0.01, "{d:?}");
+        let pic = d[1];
+        assert!(pic > 15.0 && (d.iter().sum::<f64>() - (200.0 + 0.8 * 13.0)).abs() < 1e-6, "fills the audio: {d:?}");
+        assert!(d.iter().enumerate().all(|(i, x)| [0, 3, 5, 9, 13].contains(&i) || (*x - pic).abs() < 1e-9));
+        // a given length is kept; only clips share the audio evenly
+        assert_eq!(layout(20.0, 0.0, &[(Some(3.0), None), (None, None)]), [3.0, 17.0]);
+        assert_eq!(layout(10.0, 0.0, &[(None, Some(2.0)), (None, Some(2.0))]), [5.0, 5.0]);
+    }
+
+    #[test]
     fn a_short_plays_a_part_of_the_song() {
         assert_eq!(audio_part(200.0, Some(35.9), Some(58.0)).unwrap(), (35.9, 58.0));
         assert_eq!(audio_part(200.0, Some(180.0), Some(58.0)).unwrap(), (180.0, 20.0), "to the end at most");
@@ -568,7 +618,7 @@ mod tests {
     fn compose_needs_no_libass_only_stock_filters() {
         // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
         // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by am2Strata it composes all the same
-        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade";
+        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade\n ... deflicker V->V even";
         let encoders = " V....D libx264  H.264\n A....D aac   AAC";
         assert_eq!(crate::media::missing_for_compose(filters, encoders), ["overlay"]);
         assert!(crate::media::missing_for_compose(&format!("{filters}\n ... overlay VV->V over"), encoders).is_empty());
@@ -616,10 +666,13 @@ mod tests {
         let (clip, out) = (dir.join("c.mp4"), dir.join("o.mp4"));
         run_ffmpeg(&["-y", "-f", "lavfi", "-i", "testsrc=s=320x240:r=16:d=1", "-c:v", "libx264", &clip.display().to_string()]).await.unwrap();
         let frames = frames_for(4.0);
-        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 4.0), "-frames:v", &frames.to_string(),
+        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 4.0, Some(1.0)), "-frames:v", &frames.to_string(),
                      "-an", "-c:v", "libx264", &out.display().to_string()]).await.unwrap();
         let got = probe_seconds(&out).await.unwrap();
         assert!((got - 4.0).abs() < 0.05, "a 1 s clip plays its whole 4 s shot: {got}");
+        // slowed to 1.6 s of motion, then held only for the rest
+        assert!(clip_filter(160, 90, 4.0, Some(1.0)).contains("setpts=1.6000*PTS"));
+        assert!(clip_filter(160, 90, 4.0, Some(5.0)).contains("setpts=1.0000*PTS"), "a long clip is not slowed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

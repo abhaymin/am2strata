@@ -370,7 +370,9 @@ fn print_transcript_text(r: reqwest::blocking::Response, out: Option<&str>) -> R
 fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let file = expand_path(Path::new(first.ok_or("check needs a file")?));
-    let body = check_body(&data_url(&file)?, o.expect.as_deref(), o.language.as_deref());
+    let url_ = data_url(&file)?;
+    // a video goes in "video" (its frames are checked, and its picture against its sound); a take in "audio"
+    let body = if url_.starts_with("data:video/") { json!({"video": url_}) } else { check_body(&url_, o.expect.as_deref(), o.language.as_deref()) };
     let r = send(client.post(format!("{url}/v1/media/check")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let mut problems = 0usize;
