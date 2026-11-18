@@ -357,6 +357,19 @@
 
       <!-- ============================ Tools: media check, dubbing, productions ============================ -->
       <div class="tools-forms" id="tools-forms" hidden>
+        <form class="st-card img-form" id="search-form">
+          <span class="card-title">Image search</span>
+          <label class="st-field">Find images for some words
+            <input class="st-input" id="search-q" placeholder="a lighthouse at dusk" aria-label="Words"></label>
+          <label class="st-field">or find where an image appears on the web (a file, or a library id mf_…)
+            <input class="st-input" id="search-file" type="file" accept="image/*" aria-label="An image"></label>
+          <input class="st-input mono" id="search-id" placeholder="mf_… (optional)" aria-label="A library id">
+          <div class="img-row"><button class="st-btn" id="search-go" type="submit">Search</button><span class="muted small" id="search-hint"></span></div>
+          <p class="muted small">Runs from this machine in a throwaway browser session; for an image search the image is sent to the
+            engines (Yandex, Google Lens), and the results stay here. Nothing is filtered for what an image shows. Not for identifying
+            a person from their face.</p>
+          <div class="search-out" id="search-out"></div>
+        </form>
         <form class="st-card img-form" id="check-form">
           <span class="card-title">Media check</span>
           <label class="st-field">File (audio or video)
@@ -440,6 +453,10 @@
           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
           <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
+        </div>
+        <div class="st-card machines-card" id="machines-card" hidden>
+          <span class="card-title">Machines</span>
+          <div class="machines" id="machines"></div>
         </div>
         <div class="st-card req-card">
           <div class="req-head"><span class="card-title">Recent requests</span>
@@ -1168,6 +1185,7 @@
     <div class="bv">
       <div class="cv-bar">
         <select class="st-input" id="bv-target" aria-label="Which browser" style="width:auto"></select>
+        <select class="st-input" id="bv-session" aria-label="Which session to watch" style="width:auto" title="Your own session, or one a chat or a client is driving"></select>
         <button type="button" class="st-btn st-btn--secondary" id="bv-back" title="Back">&larr;</button>
         <button type="button" class="st-btn st-btn--secondary" id="bv-fwd" title="Forward">&rarr;</button>
         <form id="bv-go" class="bv-url"><input class="st-input" id="bv-url" placeholder="Address, e.g. example.com" aria-label="Address" autocomplete="off">

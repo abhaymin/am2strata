@@ -753,3 +753,21 @@ body.resizing iframe { pointer-events: none; }
 .cmp .cmp-top img { width: 100%; height: 100%; object-fit: fill; }
 .cmp input[type=range] { width: 100%; }
 .cmp-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--st-ink-muted); }
+
+/* Media › Tools › Image search */
+.search-out { display: grid; gap: 8px; }
+.search-out .search-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+.search-out .search-grid a { display: grid; gap: 4px; font-size: 12px; color: inherit; text-decoration: none; overflow-wrap: anywhere; }
+.search-out .search-grid img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: var(--st-r-md, 8px); background: var(--st-surface); }
+.search-out ul { margin: 0; padding-left: 18px; font-size: 13px; }
+
+/* a long media job's stages, appended as they clear */
+.media-job__log { margin: 6px 0 0; padding-left: 18px; color: var(--st-ink-muted); max-height: 220px; overflow: auto; }
+details.media-job__log { padding-left: 0; }
+details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
+
+/* Monitor › Machines: each machine of the cluster, its work now and its load */
+.machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.machine { border: 1px solid var(--st-line-soft); border-radius: var(--st-r-lg); padding: 10px; display: grid; gap: 6px; font-size: 13px; }
+.machine b { font-size: 14px; }
+.machine .muted { font-size: 12px; }

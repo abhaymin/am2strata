@@ -183,7 +183,18 @@ pub async fn status(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = guard(&s, &headers) { return r; }
     let pending: Vec<Value> = waiting().lock().unwrap().iter()
         .map(|w| json!({"id": w.id, "what": w.what, "from": w.from, "waiting_s": w.since.elapsed().as_secs()})).collect();
+    // the live sessions of every browser: chats from the web app, API calls, site tests, the operator's own
+    let mut sessions = Vec::new();
+    let mut all = others();
+    all.extend(s.mgr.browser.get().cloned());
+    for (i, b) in all.iter().enumerate() {
+        for mut v in b.sessions().await {
+            v["browser"] = json!(if i + 1 == all.len() { "default" } else { "other" });
+            sessions.push(v);
+        }
+    }
     Json(json!({"available": s.mgr.browser.get().is_some_and(|b| b.available()), "targets": targets(&s.mgr).await, "waiting": pending,
+                "sessions": sessions,
                 "datasets": crate::datasets::list(&s.data_dir), "tests": crate::browser_test::list(&s.data_dir),
                 "tools": Browsers::tools(true, false, true).iter().map(|t| t["name"].clone()).collect::<Vec<_>>()})).into_response()
 }
@@ -218,8 +229,19 @@ pub async fn view(State(s): State<AppState>, headers: HeaderMap, Query(q): Query
     if let Err(r) = guard(&s, &headers) { return r; }
     let b = match pick(&s.mgr, &q.get("target").map(|t| t.to_lowercase()).unwrap_or_default()).await {
         Ok(b) => b, Err(e) => return error(StatusCode::SERVICE_UNAVAILABLE, "unavailable", e) };
-    let sess = session(q.get("session").map(String::as_str), q.get("kind").map(String::as_str).filter(|k| *k == "mcp").unwrap_or("manual"));
-    let Some(page) = b.current(&sess).await else { return Json(json!({"open": false})).into_response() };
+    // "id": a live session as /api/browser lists it (a chat's, an API call's); else the operator's own
+    let sess = match q.get("id").filter(|v| !v.is_empty()) {
+        Some(id) => id.clone(),
+        None => session(q.get("session").map(String::as_str), q.get("kind").map(String::as_str).filter(|k| *k == "mcp").unwrap_or("manual")),
+    };
+    let mut page = b.current(&sess).await;
+    if page.is_none() && q.contains_key("id") {
+        // the session may be in another of the browsers (the server's own beside the user's)
+        for o in others() {
+            if let Some(p) = o.current(&sess).await { page = Some(p); break; }
+        }
+    }
+    let Some(page) = page else { return Json(json!({"open": false})).into_response() };
     let url = page.url().await.ok().flatten().unwrap_or_default();
     let title = page.get_title().await.ok().flatten().unwrap_or_default();
     let shot = tokio::time::timeout(Duration::from_secs(5), page.screenshot(chromiumoxide::page::ScreenshotParams::builder()

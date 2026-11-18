@@ -740,7 +740,7 @@ async function loadLibrary() {
                  new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
     return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
       <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
-      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button><button type="button" class="st-btn st-btn--secondary" data-lib-act="find">Find on the web</button>` : ""}
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="pin" data-pinned="${f.pinned ? 1 : 0}">${f.pinned ? "Unpin" : "Pin"}</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
@@ -756,6 +756,34 @@ async function loadLibrary() {
     }).catch(() => { fig.querySelector(".lib-media").textContent = "not read"; });
   }
 }
+// Media › Tools › Image search: by words (POST /v1/search/images) or by an image (POST /v1/search/reverse)
+$("search-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const q = $("search-q").value.trim(), f = $("search-file").files[0], id = $("search-id").value.trim();
+  if (!q && !f && !id) return;
+  const byImage = !!(f || id);
+  $("search-go").disabled = true;
+  $("search-hint").textContent = byImage ? "Searching the engines (up to a minute)\u2026" : "Searching\u2026";
+  $("search-out").innerHTML = "";
+  try {
+    const body = byImage ? {image: f ? await asDataUrl(f) : id} : {query: q, n: 24};
+    const r = await fetch(byImage ? "v1/search/reverse" : "v1/search/images", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    if (!byImage) {
+      $("search-out").innerHTML = `<p class="muted small">${j.data.length} from ${esc(j.backend)}</p><div class="search-grid">` +
+        j.data.map((x) => `<a href="${esc(x.page_url || x.image_url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(x.thumbnail || x.image_url)}" alt="${esc(x.title)}" loading="lazy" referrerpolicy="no-referrer">${esc(x.title)}${x.license ? ` · ${esc(x.license)}` : ""}</a>`).join("") + "</div>";
+    } else {
+      $("search-out").innerHTML = j.engines.map((e) => `<div><b>${esc(e.engine)}</b> <span class="st-badge ${e.status === "ok" ? "" : "st-badge--queued"}">${esc(e.status)}</span>` +
+        (e.contains && e.contains.length ? `<p class="small">Seems to show: ${esc(e.contains.join(", "))}</p>` : "") +
+        (e.sites && e.sites.length ? `<ul>${e.sites.map((x) => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a> <span class="muted">${esc(x.domain)}</span></li>`).join("")}</ul>` : "") +
+        (e.note ? `<p class="muted small">${esc(e.note)}</p>` : "") +
+        (e.results_url ? `<p class="small"><a href="${esc(e.results_url)}" target="_blank" rel="noopener noreferrer">All of ${esc(e.engine)}'s results</a></p>` : "") + "</div>").join("");
+    }
+    $("search-hint").textContent = "";
+  } catch (e) { $("search-hint").textContent = ""; toast("error", "No results", String(e.message || e), 8000); }
+  finally { $("search-go").disabled = false; }
+};
 $("lib-kind").onchange = loadLibrary;
 $("lib-source").onchange = loadLibrary;
 $("lib-add").onchange = async () => {
@@ -782,6 +810,11 @@ $("lib-grid").addEventListener("click", async (e) => {
   } else if (b.dataset.libAct === "delete") {
     const r = await fetch(`v1/media/files/${id}`, {method: "DELETE", headers: headers()});
     if (r.ok) { libUrls.delete(id); fig.remove(); } else toast("error", "Not deleted", `HTTP ${r.status}`);
+  } else if (b.dataset.libAct === "find") {
+    // to Tools › Image search with this file's id
+    $("media-kinds").querySelector('[data-kind="tools"]').click();
+    $("search-q").value = ""; $("search-file").value = ""; $("search-id").value = id;
+    $("search-form").requestSubmit();
   } else if (b.dataset.libAct === "edit") {
     // to the Image form with this file as the image to edit (sent by its id, not again as base64)
     $("media-kinds").querySelector('[data-kind="image"]').click();
@@ -1110,6 +1143,7 @@ function render(m) {
     setPill("queued", `${q.waiting.length} waiting${r}`);
   } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.requests_page);
+  if (tab === "monitor") renderMachines(live, hw, m.remote_active);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);
 }
@@ -1156,6 +1190,39 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// a row another machine of the cluster answered: its name beside the model
+const machineBadge = (r) => r.machine ? ` <span class="st-badge st-badge--reading" title="answered by ${esc(r.machine)}">${esc(r.machine)}</span>` : "";
+
+// Monitor › Machines: this one and each worker, with what it is doing now (from /metrics' remote_active) and its load
+// (GET api/cluster/system, read every few seconds while Monitor is open); hidden on a machine with no workers
+let machinesAt = 0, machinesHw = [];
+async function renderMachines(live, hw, remote) {
+  if (Date.now() - machinesAt > 5000) {
+    machinesAt = Date.now();
+    try {
+      const r = await fetch("api/cluster/system", {headers: headers()});
+      machinesHw = r.ok ? (await r.json()).workers || [] : [];
+    } catch (e) { machinesHw = []; }
+  }
+  $("machines-card").hidden = !machinesHw.length;
+  if (!machinesHw.length) return;
+  const load = (s) => {
+    if (!s) return "load not read";
+    const g = (s.gpus || []).map((x) => x.util_pct).filter((x) => x != null);
+    return [s.cpu && s.cpu.util_pct != null ? `CPU ${fmt(s.cpu.util_pct)}%` : null, g.length ? `GPU ${g.map((x) => fmt(x) + "%").join(" · ")}` : null,
+            s.memory && s.memory.total_mib ? `RAM ${(s.memory.used_mib / 1024).toFixed(1)} of ${(s.memory.total_mib / 1024).toFixed(1)} GB` : null].filter(Boolean).join(" · ");
+  };
+  const here = live.state === "generating" ? `writing (${fmt(live.tok_s, 1)} tok/s)` : live.state === "reading" ? "reading a prompt"
+    : live.state === "media" ? mediaLabel(live.kind).toLowerCase() : "idle";
+  const mine = `<div class="machine"><b>This PC</b><span>${esc(here)}</span><span class="muted">${esc([hw.cpu != null ? `CPU ${fmt(hw.cpu)}%` : null,
+    hw.gpu_util != null ? `GPU ${fmt(hw.gpu_util)}%` : null].filter(Boolean).join(" · "))}</span></div>`;
+  $("machines").innerHTML = mine + machinesHw.map((w) => {
+    const busy = (remote || []).filter((x) => x.machine === w.name);
+    const doing = busy.length ? busy.map((x) => `answering ${x.model} (${fmt(x.elapsed_s)} s)`).join("; ") : (w.ready ? "idle" : "not answering");
+    return `<div class="machine"><b>${esc(w.name)}</b><span>${esc(doing)}</span><span class="muted">${esc(load(w.system))}</span></div>`;
+  }).join("");
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
@@ -1286,7 +1353,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
         const tm = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
         const media = (r.media || []).map((f) => `<span class="req-media" data-name="${esc(f.name)}" data-type="${esc(f.type)}"></span>`).join("");
         return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
-          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td>
+          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td>
           <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} ${mediaUnit(r.kind)}${r.steps === 1 ? "" : "s"}` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
       }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -1298,7 +1365,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
-        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
@@ -1815,13 +1882,22 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: false, browser: false};
+// web search and the browser are on by default (the owner: the chat should be able to look things up and browse);
+// each can be switched off in the chat's settings, and their queries are said to leave this machine there
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, flows: true, web: true, browser: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// settings saved before web and the browser were on by default kept them off without anyone choosing that: once,
+// they take the new default (a later switch-off is kept)
+if (!store.get("tools-default-v2", false)) {
+  settings.web = true; settings.browser = true;
+  store.set("tools-default-v2", true);
+  store.set("sampling", settings);
+}
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 // chats: [{id, title, time, model, messages}], the newest first; the one on screen is `current`
 let chats = store.get("chats", null);
@@ -2038,7 +2114,7 @@ function jobCardHtml(id) {
     const ext = {"image/png": "png", "video/mp4": "mp4", "image/gif": "gif", "image/apng": "png", "audio/wav": "wav"}[j.mime] || "bin";
     const chapters = (j.meta && j.meta.chapters || []).map((c) => `<li><span class="muted">${fmtClock(c.start_s)}</span> ${esc(c.title)}</li>`).join("");
     return el + `<div class="media-job__bar muted small"><span>${esc(what)} · ${esc(j.model)}${j.seconds ? ` · ${fmt(j.seconds, 1)} s` : ""}</span>` +
-      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "");
+      `<a href="${u}" download="${esc(id)}.${ext}">Save</a></div>` + (chapters ? `<ol class="media-job__chapters small">${chapters}</ol>` : "") + jobLogHtml(j, true);
   }
   // gone from the server (made before it kept jobs, or past the newest it keeps): made again from the same call
   if (j.state === "gone") return `<div class="media-job__gone"><span class="muted small">This ${esc(what.toLowerCase())} is no longer on the server.</span>` +
@@ -2046,9 +2122,18 @@ function jobCardHtml(id) {
   if (j.state === "error") return `<div class="msg-error">${esc(what)} job failed: ${esc(j.error || "unknown error")}</div>` +
     (j.tool && j.tool.name ? `<button type="button" class="st-btn st-btn--secondary" data-redo="${esc(id)}">Try again</button>` : "");
   const where = j.kind === "production" && j.meta && j.meta.part ? `part ${j.meta.part} of ${j.meta.parts}${j.meta.now ? ` (${j.meta.now})` : ""}`
-    : j.state === "running" ? (j.steps ? `step ${j.step} of ${j.steps}` : "running")
+    : j.state === "running" ? (j.stages ? `clip ${j.stage} of ${j.stages}` : j.steps ? `step ${j.step} of ${j.steps}` : "running")
+      + (j.elapsed_s ? ` · ${fmtClock(j.elapsed_s)}` : "")
     : j.ahead != null ? `waiting: ${j.ahead === 0 ? "next" : j.ahead + " ahead"}` : "queued";
-  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>`;
+  return `<span class="muted small"><span class="cursor"></span> ${esc(what)} (${esc(j.model || "")}): ${esc(where)}</span>` + jobLogHtml(j, false);
+}
+// a long job's stages as they clear (clip k of n, its scene), kept under the finished file too (folded)
+function jobLogHtml(j, done) {
+  const log = j.log || [];
+  if (!log.length) return "";
+  const items = log.map((l) => `<li>${esc(l)}</li>`).join("");
+  return done ? `<details class="media-job__log small"><summary>${log.length} stage${log.length === 1 ? "" : "s"}</summary><ol>${items}</ol></details>`
+              : `<ol class="media-job__log small">${items}</ol>`;
 }
 // "Make it again": the same tool call queued as a new job; the chat's tool call now points to it (kept with the chat)
 document.addEventListener("click", async (e) => {
@@ -3092,7 +3177,7 @@ async function refreshCalls() {
 let callsStamp = "";
 function renderCalls() {
   const q = $("calls-search").value.toLowerCase(), f = $("calls-filter").value;
-  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
+  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model} ${r.machine || ""}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
   const stamp = JSON.stringify([list, callSel]);
   if (stamp === callsStamp) return;
   callsStamp = stamp;
@@ -3101,7 +3186,7 @@ function renderCalls() {
     return `<button type="button" class="call-item" data-call="${esc(r.id)}" aria-current="${r.id === callSel}">` +
       `<span class="call-item__top"><span>${callWhen(r.started_at)}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
       `<span class="call-item__path">POST ${esc(r.path)}</span>` +
-      `<span class="call-item__meta">${esc(r.model || "")} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
+      `<span class="call-item__meta">${esc(r.model || "")}${r.machine ? ` · on ${esc(r.machine)}` : ""} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
       `${r.stream ? " · stream" : ""}${r.http_status && r.http_status !== 200 ? ` · HTTP ${r.http_status}` : ""}</span></button>`;
   }).join("") : `<p class="muted small">${calls.length ? "No call matches." : "No API calls yet: they appear here as clients send them."}</p>`;
 }

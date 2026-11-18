@@ -279,7 +279,11 @@ pub async fn layer(State(s): State<AppState>, req: Request, next: Next) -> Respo
     let id = mon.begin(&path, note.as_deref().unwrap_or(&bytes), &default_model);
     let resp = next.run(Request::from_parts(parts, Body::from(bytes))).await;
     let status = resp.status().as_u16();
+    // the machine that answered: a cluster worker (cluster.rs forward sets x-strata-worker), else this one
+    let machine = resp.headers().get("x-strata-worker").and_then(|v| v.to_str().ok()).map(str::to_string)
+        .unwrap_or_else(|| s.cluster.node_name().to_string());
     mon.update(&id, |r, clock| {
+        r.insert("machine".into(), json!(machine));
         r.insert("http_status".into(), json!(status));
         r.insert("queue_s".into(), json!((clock.elapsed().as_secs_f64() * 1000.0).round() / 1000.0));
         r.insert("state".into(), json!("generating"));

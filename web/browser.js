@@ -16,10 +16,16 @@
     return j;
   }
   const target = () => el("bv-target").value || "";
+  // the session watched: "" is your own (the controls drive it); another is a chat's or a client's, watched live
+  // (the tab follows a web-app chat that starts browsing, until you pick a session yourself)
+  const watched = () => el("bv-session").value || "";
+  let picked = false;
   const out = (t) => { el("bv-out").textContent = t || ""; };
 
   async function step(tool, args = {}) {
     if (busy) return null;
+    // your controls drive your own session: watching a chat's, they switch back to yours first
+    if (watched()) { el("bv-session").value = ""; picked = true; document.body.classList.remove("bv-watching"); }
     busy = true;
     document.body.classList.add("bv-busy");
     out(`${tool} …`);
@@ -43,7 +49,8 @@
   async function refreshView(force) {
     if (!on || (busy && !force)) return;
     try {
-      const v = await api(`/api/browser/view?target=${encodeURIComponent(target())}`);
+      const id = watched();
+      const v = await api(`/api/browser/view?target=${encodeURIComponent(target())}${id ? `&id=${encodeURIComponent(id)}` : ""}`);
       if (!v.open) return;
       if (v.image) show(v.image);
       el("bv-here").textContent = `${v.title || ""}  ${v.url || ""}`.trim();
@@ -63,8 +70,26 @@
     w.hidden = !status.waiting.length;
     w.innerHTML = status.waiting.map((x) => `<div><b>Waiting for you:</b> ${esc(x.what)} <span class="muted">(${esc(x.from)}, ${x.waiting_s} s)</span>
       <button class="st-btn st-btn--primary" data-ok="${esc(x.id)}">Allow</button> <button class="st-btn st-btn--secondary" data-no="${esc(x.id)}">Deny</button></div>`).join("");
+    renderSessions(status.sessions || []);
     renderDatasets(status.datasets);
     renderTests(status.tests);
+  }
+
+  // the live sessions: yours, and those chats and clients drive (a web-app chat browsing now is followed)
+  function renderSessions(list) {
+    const sel = el("bv-session"), keep = sel.value;
+    const label = (x) => `${x.from === "web app" ? "Chat" : x.from}: ${x.about || x.title || x.url || x.id}`.slice(0, 70);
+    sel.innerHTML = `<option value="">Your session</option>` +
+      list.filter((x) => !x.id.startsWith("manual:")).map((x) => `<option value="${esc(x.id)}">${esc(label(x))}</option>`).join("");
+    const live = list.find((x) => x.from === "web app" && x.idle_s < 20);
+    if (!picked && live && keep !== live.id) {
+      sel.value = live.id;
+      out(`Following the chat's browser: ${live.about || live.title}`);
+      refreshView(true);
+    } else if ([...sel.options].some((o) => o.value === keep)) {
+      sel.value = keep;
+    }
+    document.body.classList.toggle("bv-watching", !!sel.value);
   }
 
   async function answer(id, ok) {
@@ -137,6 +162,7 @@
     el("bv-back").onclick = () => step("browser_back");
     el("bv-fwd").onclick = () => step("browser_forward");
     el("bv-target").onchange = () => { store.set("am2-browser-target", target()); refreshView(true); };
+    el("bv-session").onchange = () => { picked = true; document.body.classList.toggle("bv-watching", !!watched()); refreshView(true); };
     el("bv-live").onchange = () => schedule();
     el("bv-img").addEventListener("click", (e) => { el("bv-screen").focus(); const p = at(e); step("browser_mouse", {action: "click", ...p}); });
     el("bv-img").addEventListener("dblclick", (e) => { const p = at(e); step("browser_mouse", {action: "double", ...p}); });

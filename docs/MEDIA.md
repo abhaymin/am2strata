@@ -71,6 +71,24 @@ each edit is shown over its original with a slider between them.
 - **`"image"`** starts a clip from a picture, on a model that takes a source image.
 - **The answer** is the clip in base64: MP4 by default, `"webp"` or `"gif"` on request.
 
+### Long videos: one request, one file
+
+A video of minutes is never made in pieces by the caller: one request makes the whole of it inside the server, as one
+background job, each clip continued from the one before (the media engine's chain), stitched into one file.
+
+- `"seconds": 120`: one scene that long.
+- `"scenes": [{"prompt", "seconds"}, ...]`: a story in scenes (up to 60), each its own prompt, as many clips as its
+  length takes; up to 15 minutes in all.
+- The chat tool `generate_video` and the job API (`POST /api/jobs {"tool": "generate_video", "arguments": {...}}`) take
+  the same; the model is told to make a long video in one call, never several.
+- **Following it:** `GET /api/jobs/{id}` (and the chat's job card) gives the clip now (`stage` of `stages`), the time so
+  far, and `log`, a line for each clip finished with its scene; the web app's card appends them as they clear.
+- **An API chat stays engaged:** a streaming chat (Chat Completions, Messages, Responses) from an API client that
+  queued media keeps its stream open after the answer, adding a line as each clip clears and, at the end,
+  `✓ video mj-N is ready: /v1/media/jobs/mj-N/content`. `"strata_media_wait": false` ends the stream with the answer.
+- Short asks stay one shot: one image, one clip, one sound. Long audio is one job too: `speak` reads up to ~20 minutes,
+  `produce` joins speech, songs and music into one file with chapters.
+
 ## Speech
 
 | Endpoint | Body | Answer |
@@ -122,6 +140,23 @@ curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: a
   pinned file stays until unpinned or deleted, and is never the one dropped for room.
 - **In the app:** Media › Library, with Edit this, Pin, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
   `media add <file>`, `media get <id> --out f`, `media rm <id>`, `media pin <id>`, `media unpin <id>`.
+
+## Image search and reverse image search
+
+Private to this machine: the searches run from here, in a throwaway browser session, and the results come back to you
+only. **Nothing is filtered for what an image shows** (Google is asked for `safe=off`). It is not for identifying a
+person from their face: no face-search engine is used.
+
+- `POST /v1/search/images` `{"query", "n"}`: images for some words, each with its image, its page, where it is from
+  and its licence when known. SearXNG's image search when the run config has one, else Wikimedia Commons.
+- `POST /v1/search/reverse` `{"image": a library id, a data: URL, base64 or a URL, "engines"?: ["yandex", "google_lens"], "n"}`:
+  where the image, or one like it, appears. **The image is sent to the engines named**; that is all that leaves this
+  machine. Yandex answers with what the image seems to show and the sites it is on, read in the server's own headless
+  browser. Google Lens asks a browser like that to prove it is a person; that is never solved here, so its answer is
+  `needs_you` with its results link, to open in your own browser. The image is kept in the media library.
+- **Chat tools** (with the web on, `"strata_web": true`): `image_search` and `reverse_image_search` (an `mf_` id or a URL).
+- **In the app:** Media › Tools › Image search, and **Find on the web** on each library image.
+  **CLI:** `am2strata-run media search -- "words"`, `am2strata-run media reverse -- <file | mf_id | url>`.
 
 ## Productions: one long piece from parts
 
