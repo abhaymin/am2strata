@@ -907,7 +907,7 @@ async fn route_media(s: crate::AppState, req: axum::extract::Request, next: axum
         return here().await;
     }
     let local_can = match kind {
-        "compose" => crate::media::ffmpeg_cached(),
+        "compose" => crate::media::compose_missing().is_empty(),
         k => s.media_jobs.capabilities().await["kinds"][k]["usable"] == true,
     };
     let busy = s.mgr.queue.busy() || (kind == "compose" && s.media_jobs.active(&["compose", "thumbnail"]) > 0);

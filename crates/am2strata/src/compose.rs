@@ -518,6 +518,15 @@ mod tests {
 
     /// A short clip in a long shot is held to the shot's whole length (Peace and Harmony's 5 s clips in 14 s shots
     /// once made a 15 s picture track under 200 s of audio). Only runs where ffmpeg is installed.
+    #[test]
+    fn an_ffmpeg_without_libass_cannot_compose() {
+        // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
+        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad";
+        let encoders = " V....D libx264  H.264\n A....D aac   AAC";
+        assert_eq!(crate::media::missing_for_compose(filters, encoders), ["subtitles"]);
+        assert!(crate::media::missing_for_compose(&format!("{filters}\n ... subtitles V->V burn"), encoders).is_empty());
+    }
+
     #[tokio::test]
     async fn a_short_clip_fills_its_whole_shot() {
         if !crate::media::ffmpeg_available() { return; }

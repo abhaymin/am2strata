@@ -318,7 +318,11 @@ impl Jobs {
     pub async fn capabilities(&self) -> Value {
         let mut v = self.capabilities_of_engine().await;
         // compose and thumbnails need only ffmpeg (a cluster master sends them to a worker that has it)
-        v["compose"] = json!(crate::media::ffmpeg_cached());
+        let missing = crate::media::compose_missing();
+        v["compose"] = json!(missing.is_empty());
+        if !missing.is_empty() {
+            v["compose_missing"] = json!(missing);
+        }
         v
     }
 

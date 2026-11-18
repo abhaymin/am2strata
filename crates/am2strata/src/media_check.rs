@@ -492,9 +492,10 @@ pub async fn check_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(
     }
     let audio = match load_audio(&req).await { Ok(x) => x, Err(e) => return bad(e) };
     let mut gray: Option<Vec<Vec<u8>>> = None;
+    let mut lengths: Option<(Option<f64>, Option<f64>)> = None;
     if let Some(src) = video_source(&req).await {
         match src {
-            Ok(b) => match video_grey_frames_any(&b, req["fps"].as_f64()).await {
+            Ok(b) => match { lengths = stream_lengths(&b).await; video_grey_frames_any(&b, req["fps"].as_f64()).await } {
                 Ok((g, fps)) => { gray = Some(g); req["fps"] = json!(fps); }
                 Err(e) => return Json(json!({"audio": null, "video": {"note": e}})).into_response(),
             },
@@ -502,9 +503,46 @@ pub async fn check_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(
         }
     }
     match run_check(&s, audio, gray.as_deref(), &req).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            if let Some((Some(pic), Some(snd))) = lengths {
+                v["video"]["picture_vs_sound"] = picture_vs_sound(pic, snd);
+            }
+            Json(v).into_response()
+        }
         Err(e) => bad(e),
     }
+}
+
+/// The picture track against the sound track: a video whose pictures stop long before its sound (a crossfade chain
+/// cut short) fails, so does one whose sound stops first. Within a second either way is fine.
+pub fn picture_vs_sound(picture_s: f64, sound_s: f64) -> Value {
+    let gap = picture_s - sound_s;
+    json!({"picture_seconds": r2(picture_s), "sound_seconds": r2(sound_s), "ok": gap.abs() <= 1.0,
+           "note": if gap < -1.0 { "the pictures end before the sound" } else if gap > 1.0 { "the sound ends before the pictures" } else { "same length" }})
+}
+
+/// A video file's picture and sound stream lengths in seconds (counted packets, so a wrong header cannot hide a short
+/// stream), by ffprobe when it is installed.
+async fn stream_lengths(video: &[u8]) -> Option<(Option<f64>, Option<f64>)> {
+    if !crate::media::ffmpeg_available() { return None; }
+    let dir = crate::media::tempdir().ok()?;
+    let f = dir.join("v.mp4");
+    std::fs::write(&f, video).ok()?;
+    let probe = |sel: &'static str| {
+        let f = f.clone();
+        async move {
+            let o = tokio::process::Command::new(crate::server_tls::program("ffprobe"))
+                .args(["-v", "error", "-select_streams", sel, "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
+                .arg(&f).output().await.ok()?;
+            // the last packet's start plus its length
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.lines().filter_map(|l| { let mut p = l.split(','); let a: f64 = p.next()?.parse().ok()?; let d: f64 = p.next().and_then(|x| x.parse().ok()).unwrap_or(0.0); Some(a + d) })
+                .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))))
+        }
+    };
+    let r = (probe("v:0").await, probe("a:0").await);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(r)
 }
 
 /// The `check_media` chat tool handle (holds the app state for Whisper transcription when no transcript is given).
@@ -522,6 +560,14 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_that_stop_before_the_sound_fail() {
+        // the Peace and Harmony bug: 15 s of pictures under 200 s of sound
+        assert_eq!(picture_vs_sound(15.07, 200.0)["ok"], json!(false));
+        assert_eq!(picture_vs_sound(15.07, 200.0)["note"], json!("the pictures end before the sound"));
+        assert_eq!(picture_vs_sound(199.6, 200.0)["ok"], json!(true));
+    }
 
     const SR: u32 = 16_000;
 
