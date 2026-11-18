@@ -59,7 +59,13 @@ pub async fn pick(mgr: &crate::manager::Manager, target: &str) -> Result<Arc<Bro
         "server" | "headless" | "mine" | "user" | "chrome" | "sandbox" | "vm" => {}
         other => return Err(format!("{other:?} is not a browser here: server, mine or sandbox")),
     }
-    let key = match t { "headless" => "server", "user" | "chrome" => "mine", "vm" => "sandbox", t => t }.to_string();
+    let mut key = match t { "headless" => "server", "user" | "chrome" => "mine", "vm" => "sandbox", t => t }.to_string();
+    // "mine" with no Chrome on its DevTools port: use this server's own headless browser rather than fail every step
+    if key == "mine" && base.settings.exe.is_some() && !answers("http://127.0.0.1:9222").await {
+        tracing::info!("browser: your Chrome is not on http://127.0.0.1:9222; the chat uses this server's headless browser");
+        if !is_mine { return Ok(base); }
+        key = "server".into();
+    }
     if let Some(b) = extra().lock().unwrap().get(&key).cloned() {
         if key != "sandbox" { return Ok(b); }
     }
@@ -93,6 +99,11 @@ pub async fn pick(mgr: &crate::manager::Manager, target: &str) -> Result<Arc<Bro
         tokio::spawn(async move { old.close().await });
     }
     Ok(b)
+}
+
+/// Whether a DevTools endpoint answers (a quick look, for falling back when the user's Chrome is not running).
+async fn answers(endpoint: &str) -> bool {
+    reqwest::Client::new().get(format!("{endpoint}/json/version")).timeout(Duration::from_millis(1500)).send().await.is_ok()
 }
 
 /// What each target is, for the Browser tab and `GET /api/browser`.
