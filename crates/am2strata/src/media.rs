@@ -194,7 +194,7 @@ pub fn compose_missing() -> Vec<&'static str> {
 /// The compose needs not in ffmpeg's `-filters` and `-encoders` listings.
 pub fn missing_for_compose(filters: &str, encoders: &str) -> Vec<&'static str> {
     let has = |list: &str, name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
-    let mut out: Vec<&'static str> = ["xfade", "zoompan", "overlay", "afade", "tpad", "fade", "deflicker"].into_iter().filter(|f| !has(filters, f)).collect();
+    let mut out: Vec<&'static str> = ["xfade", "zoompan", "overlay", "afade", "tpad", "fade", "deflicker", "framerate"].into_iter().filter(|f| !has(filters, f)).collect();
     out.extend(["libx264", "aac"].into_iter().filter(|e| !has(encoders, e)));
     out
 }

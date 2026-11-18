@@ -390,8 +390,11 @@ pub fn clip_filter(w: u32, h: u32, shot_s: f64, clip_s: Option<f64>) -> String {
     // slowed to fill its shot, by up to MAX_SLOW (calm motion slowed reads as calm; frozen reads as broken); evened
     // out first, as generated clips flicker from frame to frame
     let slow = clip_s.filter(|c| *c > 0.1).map(|c| (shot_s / c).clamp(1.0, MAX_SLOW)).unwrap_or(1.0);
-    format!("deflicker=size=5,setpts={slow:.4}*PTS,scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},\
-             tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p", shot_s.max(0.5) + 1.0)
+    // the new frames between a slowed clip's own are blended (a 16 fps Wan clip slowed 1.6x at 30 fps would show each
+    // picture three frames in a row: a judder the check sees as jumps)
+    format!("deflicker=size=5,setpts={slow:.4}*PTS,framerate=fps={FPS}:interp_start=0:interp_end=255:scene=100,\
+             scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p",
+            shot_s.max(0.5) + 1.0)
 }
 
 /// The most a clip is slowed to fill its shot.
@@ -618,7 +621,7 @@ mod tests {
     fn compose_needs_no_libass_only_stock_filters() {
         // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
         // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by am2Strata it composes all the same
-        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade\n ... deflicker V->V even";
+        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade\n ... deflicker V->V even\n ... framerate V->V blend";
         let encoders = " V....D libx264  H.264\n A....D aac   AAC";
         assert_eq!(crate::media::missing_for_compose(filters, encoders), ["overlay"]);
         assert!(crate::media::missing_for_compose(&format!("{filters}\n ... overlay VV->V over"), encoders).is_empty());

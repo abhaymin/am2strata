@@ -631,7 +631,8 @@ thumbnail (at least one frame would make a clear, striking thumbnail). \
 Answer with JSON only, no other text: {\"scores\": {\"picture\": n, \"captions\": n, \"fit\": n, \"sequence\": n, \
 \"thumbnail\": n}, \"issues\": [{\"frame\": k, \"problem\": \"...\", \"fix\": \"...\"}], \"best_thumbnail_frame\": k, \
 \"order\": \"a better scene order if the sequence is weak, else empty\", \"verdict\": \"pass\" or \"fail\"}. \
-Frames are numbered from 1. Be honest: a fail with clear fixes is more useful than a kind pass.";
+Frames are numbered from 1. List at most 6 issues, the most important first, each in one short sentence. Be honest: a \
+fail with clear fixes is more useful than a kind pass.";
 
 /// The JSON object in a model's answer (it may be wrapped in a code fence or have words around it).
 pub fn json_in(text: &str) -> Option<Value> {
@@ -656,7 +657,8 @@ fn cmd_judge(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     let video = data_url(&file)?;
     // 1. the hard checks: broken crossfades, frozen stretches, pictures shorter than the sound
     let mut problems = Vec::new();
-    let j: Value = send(client.post(format!("{url}/v1/media/check")).json(&json!({"video": video})))?.json().map_err(|e| e.to_string())?;
+    // a slow zoom over a painting changes ~0.4 grey levels a frame and is fine; a frozen picture changes ~0.03
+    let j: Value = send(client.post(format!("{url}/v1/media/check")).json(&json!({"video": video, "near_floor": 0.15})))?.json().map_err(|e| e.to_string())?;
     for (name, c) in j["video"].as_object().into_iter().flatten() {
         if c["ok"] == false { problems.push(format!("video.{name}: {}", c.get("note").and_then(Value::as_str).unwrap_or("not ok"))); }
         if c["ok"].is_boolean() { println!("check video.{name}: {}", if c["ok"] == true { "pass" } else { "FAIL" }); }
@@ -668,7 +670,7 @@ fn cmd_judge(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
         None => "No brief was given: judge it as a calm music video for a general audience.".into(),
     };
     let model = o.judge_model.clone().unwrap_or_else(|| "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k".into());
-    let body = json!({"model": model, "temperature": 0, "max_tokens": 1200, "video_frames": o.judge_frames,
+    let body = json!({"model": model, "temperature": 0, "max_tokens": 4000, "video_frames": o.judge_frames,
         "messages": [{"role": "system", "content": JUDGE_RUBRIC},
                      {"role": "user", "content": [{"type": "text", "text": format!("The brief:\n{brief}")},
                                                   {"type": "video_url", "video_url": {"url": video}}]}]});
