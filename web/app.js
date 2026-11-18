@@ -952,7 +952,7 @@ $("models-list").addEventListener("click", async (e) => {
   }
   if (load) { $("model-select").value = load.dataset.load; $("model-select").onchange(); }
   if (unload) {
-    if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+    if (running.size) { toast("warn", "Still writing", "Stop the answers first."); return; }
     unload.disabled = true;
     try {
       const r = await fetch("api/models/unload", {method: "POST", headers: headers(true), body: "{}"});
@@ -964,7 +964,7 @@ $("models-list").addEventListener("click", async (e) => {
 });
 $("model-select").onchange = async () => {
   const sel = $("model-select"), name = sel.value, before = sel.dataset.current;
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); sel.value = remoteModel || before; return; }
+  if (running.size) { toast("warn", "Still writing", "Stop the answers first."); sel.value = remoteModel || before; return; }
   if (sel.selectedOptions[0] && sel.selectedOptions[0].dataset.remote) {
     remoteModel = name;
     toast("info", `${name} answers`, "Sent to its provider; the model in memory stays loaded.");
@@ -1146,8 +1146,25 @@ function render(m) {
   } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.requests_page);
   if (tab === "monitor") renderMachines(live, hw, m.remote_active);
+  if (tab === "monitor") renderNow(m.queue, m.remote_active);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);
+}
+
+// Recent requests' top rows: what runs now and what waits (each chat waiting in the queue gets its own row), and the
+// requests a cluster worker is answering now, so a second chat is visible while the first one, or a media job, runs
+function renderNow(q, remote) {
+  q = q || {};
+  const label = (x) => x.label || (x.kind === "chat" ? "a chat" : x.kind ? `a ${x.kind} job` : "a request");
+  const need = (n) => !n ? "" : n === "gpu" ? "the GPU" : n === "any" ? "" : n.text_model || "";
+  const rows = [];
+  if (q.running) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span> <span class="st-badge st-badge--reading">${esc(q.running.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(q.running))}">${esc(label(q.running))}</td><td colspan="6" class="muted">${esc(need(q.running.need))}</td><td class="num">${fmt(q.running.running_s)} s</td></tr>`);
+  for (const r of Array.isArray(remote) ? remote : []) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span></td>
+    <td class="req-model">${esc(r.model || "–")} <span class="st-badge st-badge--reading">${esc(r.machine || "")}</span></td><td colspan="6" class="muted">answered by ${esc(r.machine || "a worker")}</td><td class="num">${fmt(r.elapsed_s)} s</td></tr>`);
+  for (const w of Array.isArray(q.waiting) ? q.waiting : []) rows.push(`<tr><td class="muted">#${esc(w.position)}</td><td><span class="st-badge st-badge--queued">Waiting</span> <span class="st-badge st-badge--reading">${esc(w.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(w))}">${esc(label(w))}</td><td colspan="6" class="muted">${esc([w.client, need(w.need) && `needs ${need(w.need)}`, w.eta_s != null ? `about ${fmt(w.eta_s)} s to go` : ""].filter(Boolean).join(" · "))}</td><td class="num">${fmt(w.waiting_s)} s</td></tr>`);
+  $("req-now").innerHTML = rows.join("");
 }
 
 // #596: the conversation cache - the prompt's state the engine keeps between requests (always), and the whole
@@ -1911,7 +1928,12 @@ let current = store.get("current-chat", chats[0] ? chats[0].id : null);
 if (!chats.some((c) => c.id === current)) current = chats[0] ? chats[0].id : null;
 let messages = current ? chats.find((c) => c.id === current).messages : [];
 let attachments = [];                 // {kind: "image"|"file"|"video"|"pdf", name, url | text | frames}
-let busy = null;                      // {controller, msg, cutoff?}
+// each chat's answer in progress: chat id -> {controller, msg, cutoff?}. Several chats answer at once (the server
+// queues them, or a cluster answers them in parallel); `busy` is the current chat's
+const running = new Map();
+let busy = null;                      // the current chat's entry of `running`, or null
+const isStreaming = (m) => [...running.values()].some((b) => b.msg === m);
+function syncBusy() { busy = running.get(current) || null; setBusy(!!busy); }
 // a chat is actively driving the computer or browser; the floating pill offers to stop it (reuses busy's controller)
 let usingComputer = false, usingBrowser = false;
 function updateUsePill() {
@@ -1953,23 +1975,23 @@ function saveChat() {
   renderChatList();
 }
 function newChat() {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return false; }
   messages = []; current = null; attachments = []; renderAttachments();
   store.set("current-chat", null);
+  syncBusy(); clearUsing();
   renderChat(); renderChatList(); openChats(false);
   return true;
 }
 function openChat(id) {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
   const c = chats.find((x) => x.id === id);
   if (!c) return;
   current = id; messages = c.messages; store.set("current-chat", id);
+  syncBusy();
   renderChat(); renderChatList(); openChats(false);
 }
 function deleteChat(id) {
   const i = chats.findIndex((x) => x.id === id);
   if (i < 0) return;
-  if (busy && id === current) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (running.has(id)) { toast("warn", "Still writing", "Stop this chat's answer first."); return; }
   const [gone] = chats.splice(i, 1);
   if (id === current) { messages = []; current = null; renderChat(); }
   store.set("chats", chats.map((c) => ({...c, messages: slim(c.messages)})));
@@ -1979,7 +2001,8 @@ function deleteChat(id) {
 // a chat with something running (its answer streaming or waiting in the queue, or a media job it started) gets a
 // blinking dot in the list, so work going on in another chat is visible from here
 function chatLive(c) {
-  if (busy && c.messages.includes(busy.msg)) return busy.msg.waitingMeta ? "waiting in the queue" : "answering";
+  const b = running.get(c.id);
+  if (b) return b.msg.waitingMeta ? "waiting in the queue" : "answering";
   for (const m of c.messages) for (const t of m.tools || []) {
     const j = t.job && jobs[t.job.id];
     if (j && !["done", "error", "gone"].includes(j.state)) return j.state === "running" ? "making media" : "media job waiting";
@@ -2236,6 +2259,11 @@ function onTool(m, x) {
   }
 }
 function updateAssistant(el, m, streaming) {
+  if (!el || !el.isConnected) {
+    const i = messages.indexOf(m), live = i >= 0 && $("chat").querySelector(`.st-msg[data-i="${i}"]`);
+    if (!live) return;
+    el = live;
+  }
   const det = el.querySelector("details.think");
   if (m.reasoning) {
     det.hidden = false;
@@ -2295,7 +2323,7 @@ $("chat").addEventListener("click", async (e) => {
     if (!r.ok) throw new Error(((await r.json()).error || {}).message || `HTTP ${r.status}`);
     if (t) t.approve.answered = ok;
   } catch (err) { toast("error", "Not answered", String(err.message || err), 6000); if (t) t.approve.answered = "ended"; }
-  if (t && m) updateAssistant(el, m, busy && busy.msg === m);
+  if (t && m) updateAssistant(el, m, isStreaming(m));
 });
 $("chat").addEventListener("click", (e) => {
   const cv = e.target.closest("[data-canvas]");
@@ -2319,7 +2347,7 @@ $("chat").addEventListener("click", (e) => {
     const el = sum.closest(".st-msg"), m = messages[+el.dataset.i], t = m && m.tools && m.tools[+sum.parentElement.dataset.tool];
     if (!t) return;
     t.open = !t.open;
-    updateAssistant(el, m, !!busy && busy.msg === m);
+    updateAssistant(el, m, isStreaming(m));
   }
 });
 $("chat").addEventListener("toggle", (e) => {
@@ -2395,7 +2423,7 @@ function setBusy(on) {
 
 async function send() {
   const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
+  if ((!text && !attachments.length) || running.has(current)) return;
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind === "image"),
                  files: attachments.filter((a) => a.kind === "file"),
                  media: attachments.filter((a) => a.kind === "video" || a.kind === "pdf" || a.kind === "audio"), time: Date.now()});
@@ -2405,12 +2433,14 @@ async function send() {
   autosize();
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
+  saveChat();     // the chat has its id before its answer starts, so the answer stays with it when another is opened
+  const chatId = current;
   renderChat();
    const el = $("chat").lastElementChild;
    const controller = new AbortController();
    clearUsing();   // a fresh answer starts with no computer/browser in use
-   busy = {controller, msg: m};
-   setBusy(true);
+   running.set(chatId, {controller, msg: m});
+   syncBusy();
 
    try {
      await streamInto(m, el, controller.signal);
@@ -2418,13 +2448,13 @@ async function send() {
      m.error = e.message || String(e);
      toast("error", "The request failed", m.error, 6000);
    }
-   busy = null;
-   setBusy(false);
-   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
+   running.delete(chatId);
+   syncBusy();
+   if (chatId === current) clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
   updateAssistant(el, m, false);
   saveChat();
-  scrollDown();
-  if (!m.error && !m.stopped) afterAnswer(m);
+  if (chatId === current) scrollDown();
+  if (!m.error && !m.stopped && chatId === current) afterAnswer(m);
 }
 
 // ------------------------------------------------------------------ variants (PolyStrata PR 74: swipes)
@@ -2459,7 +2489,7 @@ function swipeGo(i, delta) {
 }
 // A new answer at messages[i], kept beside the old one; on failure the old one comes back.
 async function regenerateMessage(i) {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (running.has(current)) { toast("warn", "Still writing", "Stop the answer first."); return; }
   const m = messages[i];
   if (!m || m.role !== "assistant") return;
   const el = $("chat").querySelector(`.st-msg[data-i="${i}"]`);
@@ -2470,12 +2500,13 @@ async function regenerateMessage(i) {
   Object.assign(m, {text: "", reasoning: "", tools: null, meta: null, thinkSecs: null, stopped: false, error: null, limit: null, dropped: null});
    const controller = new AbortController();
    clearUsing();   // regenerating starts a fresh answer with no computer/browser in use
-   busy = {controller, msg: m, cutoff: i};
+   const chatId = current;
+   running.set(chatId, {controller, msg: m, cutoff: i});
+   syncBusy();
   if (i < messages.length - 1) {
     toast("info", "Regenerating an earlier answer",
           `${messages.length - i - 1} later message(s) stay in the chat; this request sees the chat up to here.`, 7000);
   }
-  setBusy(true);
   updateAssistant(el, m, true);
   try {
     await streamInto(m, el, controller.signal);
@@ -2486,9 +2517,9 @@ async function regenerateMessage(i) {
     Object.assign(m, keep, {error: null});
     m.swipes[m.swipeIndex] = keep;
   }
-   busy = null;
-   setBusy(false);
-   clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
+   running.delete(chatId);
+   syncBusy();
+   if (chatId === current) clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
    updateAssistant(el, m, false);
    saveChat();
 }
@@ -2657,7 +2688,7 @@ async function streamInto(m, el, signal) {
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
 // stop a running answer (reuses the same AbortController) and hide the "using the computer/browser" pill
-function stopChat() { if (busy) busy.controller.abort(); clearUsing(); }
+function stopChat() { const b = running.get(current); if (b) b.controller.abort(); clearUsing(); }
 $("stop-btn").onclick = stopChat;
 $("use-pill-stop").onclick = stopChat;
 $("input").addEventListener("keydown", (e) => {

@@ -169,6 +169,9 @@ pub struct Cluster {
     code: Mutex<(String, Instant)>,
     fails: Mutex<(u32, Option<Instant>)>,
     masters: RwLock<Vec<Value>>,
+    /// while this PC is busy, a chat may go to an idle worker's loaded model when no worker has the model asked for
+    /// (run config `cluster.overflow`, on by default): the cluster answers in parallel instead of queueing
+    pub overflow: bool,
     // master side
     found: Mutex<HashMap<String, Found>>,
     polling: AtomicBool,
@@ -255,13 +258,14 @@ impl Cluster {
         Cluster { role: Role::Master, node: Node { id: String::new(), name: String::new() }, data_dir: None, identity: None,
                   tls_port: None, allow_plain: false, api_port: std::sync::atomic::AtomicU16::new(0),
                   workers: RwLock::new(Vec::new()), code: Mutex::new((new_code(), Instant::now())), fails: Mutex::new((0, None)),
-                  masters: RwLock::new(Vec::new()), found: Mutex::new(HashMap::new()), polling: AtomicBool::new(false) }
+                  masters: RwLock::new(Vec::new()), found: Mutex::new(HashMap::new()), polling: AtomicBool::new(false), overflow: true }
     }
 
     /// The run config's `"cluster"` and what was paired before (`<data>`).
     pub fn from_config(rest: &std::collections::BTreeMap<String, Value>, data_dir: Option<&Path>) -> Result<Cluster, String> {
         let mut c = Cluster::empty();
         let cfg = rest.get("cluster").cloned().unwrap_or(Value::Null);
+        c.overflow = cfg["overflow"].as_bool().unwrap_or(true);
         c.role = match cfg["role"].as_str() {
             None | Some("master") => Role::Master,
             Some("worker") => Role::Worker,
@@ -523,15 +527,25 @@ impl Cluster {
         let all = self.workers();
         let mut c: Vec<&Arc<Worker>> = all.iter().filter(|w| w.ready() && w.has(model)).collect();
         if local {
-            // only to take load off this PC: a worker with the model loaded and nothing to do
             if !local_busy {
                 return None;
             }
-            c.retain(|w| { let s = w.seen.lock().unwrap(); s.current.as_deref() == Some(model) && !s.running && s.waiting == 0 });
+            // only to take load off this PC: an idle worker that has the model (loaded beats installed, below)
+            c.retain(|w| { let s = w.seen.lock().unwrap(); !s.running && s.waiting == 0 });
         }
         // the one that will answer soonest: the model loaded first, then the shortest queue
         c.sort_by_key(|w| { let s = w.seen.lock().unwrap(); (s.current.as_deref() != Some(model), s.waiting + s.running as usize) });
         c.first().map(|w| (*w).clone())
+    }
+
+    /// While this PC is busy and no worker has the model asked for: an idle worker and the model it has loaded, so
+    /// a chat is answered now, in parallel, instead of waiting here (off with `cluster.overflow: false`).
+    pub fn overflow_pick(&self) -> Option<(Arc<Worker>, String)> {
+        if !self.overflow { return None; }
+        self.workers().into_iter().filter(|w| w.ready()).find_map(|w| {
+            let m = { let s = w.seen.lock().unwrap(); if s.running || s.waiting > 0 { None } else { s.current.clone() } };
+            m.map(|m| (w, m))
+        })
     }
 
     /// GET /api/cluster (the main key only).
@@ -660,14 +674,30 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         return next.run(req).await;
     }
     let (parts, body) = req.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, 256 << 20).await else {
+    let Ok(mut bytes) = axum::body::to_bytes(body, 256 << 20).await else {
         return crate::error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request is too large");
     };
     let model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v["model"].as_str().map(str::to_string));
     if let Some(model) = model {
         let local = s.mgr.entry(&model).is_some();
-        let busy = s.mgr.queue.snapshot()["waiting"].as_array().is_some_and(|a| !a.is_empty());
-        if let Some(w) = s.cluster.pick(&model, local, busy) {
+        // busy: a job runs here (a chat, or a media job holding the GPU) or waits; a new chat would wait behind it
+        let busy = s.mgr.queue.busy();
+        let original = bytes.clone();   // a failed forward is answered here, as asked
+        let mut model = model;
+        let mut picked = s.cluster.pick(&model, local, busy);
+        if picked.is_none() && busy && path != "/v1/completions" {
+            if let Some((w, other)) = s.cluster.overflow_pick() {
+                // the worker answers with the model it has loaded; the answer's "model" says which
+                if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
+                    tracing::info!("{path}: this PC is busy; {model} goes to worker {} as {other}", w.name);
+                    v["model"] = json!(other);
+                    bytes = axum::body::Bytes::from(serde_json::to_vec(&v).unwrap_or_default());
+                    model = other;
+                    picked = Some(w);
+                }
+            }
+        }
+        if let Some(w) = picked {
             let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or(path.clone());
             let mon = s.mgr.monitor.clone();
             let rid = mon.remote_begin(&w.name, &model, &path);
@@ -685,6 +715,7 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
                     mon.remote_end(rid, "error");
                     w.seen.lock().unwrap().error = Some(e.clone());
                     tracing::warn!("worker {} did not take the request ({e})", w.name);
+                    bytes = original;
                     if !local {
                         return crate::error(StatusCode::SERVICE_UNAVAILABLE, "server_error",
                                             format!("{model} is on worker {}, which did not answer ({e}); no other machine has it", w.name));
@@ -878,6 +909,20 @@ mod tests {
         let c = with(vec![worker("idle", &["tiel"], Some("tiel"), 0, true)]);
         assert!(c.pick("tiel", true, false).is_none(), "this PC is free: here");
         assert_eq!(c.pick("tiel", true, true).unwrap().name, "idle");
+        // busy here: an idle worker that has the model installed but not loaded takes it too
+        let c = with(vec![worker("cold", &["tiel"], Some("other"), 0, true)]);
+        assert_eq!(c.pick("tiel", true, true).unwrap().name, "cold");
+    }
+
+    #[test]
+    fn a_busy_pc_overflows_to_an_idle_workers_loaded_model() {
+        let c = with(vec![worker("busy", &["mini"], Some("mini"), 2, true), worker("mac", &["mini"], Some("mini"), 0, true),
+                          worker("empty", &["x"], None, 0, true)]);
+        let (w, m) = c.overflow_pick().unwrap();
+        assert_eq!((w.name.as_str(), m.as_str()), ("mac", "mini"), "idle, with a model loaded");
+        let mut c = with(vec![worker("mac", &["mini"], Some("mini"), 0, true)]);
+        c.overflow = false;
+        assert!(c.overflow_pick().is_none(), "cluster.overflow: false keeps chats here");
     }
 
     #[test]
