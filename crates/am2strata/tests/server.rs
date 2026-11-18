@@ -2718,7 +2718,7 @@ fn the_optimizer_tunes_a_model_on_the_mock() {
 #[test]
 fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
     let worker = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("Ok.\n</think>\n\nFrom the worker.")], json!({}));
-    let m = Model { extra: json!({"cluster": {"workers": {"pc2": {"url": worker.base, "key": KEY}}}}), ..Model::default() };
+    let m = Model { extra: json!({"cluster": {"workers": {"pc2": {"url": worker.base, "key": KEY}}}, "api_monitor": true}), ..Model::default() };
     let master = Server::start(&[m], &[ids("Ok.\n</think>\n\nFrom the master.")], json!({}));
     let t0 = Instant::now();
     let cl = loop {
@@ -2739,9 +2739,19 @@ fn a_master_routes_a_chat_to_the_worker_that_has_the_model() {
     let ev = master.stream("/v1/chat/completions", &json!({"model": "mock-b", "messages": [user("hi")], "stream": true}));
     let text: String = ev.iter().filter_map(|(_, v)| v.get("choices")).filter_map(|c| c[0]["delta"]["content"].as_str()).collect();
     assert_eq!(text, "From the worker.");
+    // the master's Monitor and API calls say which machine answered (the owner: the cluster truly integrated)
+    let m = master.get("/metrics", true).1;
+    let rows: Vec<&Value> = m["requests"].as_array().unwrap().iter().filter(|r| r["machine"] == "pc2").collect();
+    assert_eq!(rows.len(), 2, "both worker-answered chats in Monitor's history: {}", m["requests"]);
+    assert_eq!((rows[0]["model"].as_str(), rows[0]["finish"].as_str()), (Some("mock-b"), Some("stop")), "{}", rows[0]);
+    assert!(m["remote_active"].as_array().unwrap().is_empty(), "nothing still running on the worker: {m}");
+    let calls = master.get("/api/requests", true).1;
+    assert!(calls["requests"].as_array().unwrap().iter().filter(|r| r["path"] == "/v1/chat/completions").take(2).all(|r| r["machine"] == "pc2"), "{calls}");
     // its own model is answered here
     let (c, v) = master.post("/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("hi")]}));
     assert_eq!((c, v["choices"][0]["message"]["content"].as_str()), (200, Some("From the master.")), "{v}");
+    let calls = master.get("/api/requests", true).1;
+    assert_ne!(calls["requests"][0]["machine"], "pc2", "this one answered here: {}", calls["requests"][0]);
     // a request without the master's key is never sent on
     let r = reqwest::blocking::Client::new().post(format!("{}/v1/chat/completions", master.base))
         .json(&json!({"model": "mock-b", "messages": [user("hi")]})).send().unwrap();

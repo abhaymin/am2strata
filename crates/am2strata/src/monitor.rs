@@ -100,6 +100,8 @@ struct Inner {
     totals: Totals,
     last_timings: Option<Value>,
     last_at: Option<f64>,
+    /// requests answered by another machine of the cluster now: id -> (machine, model, path, started)
+    remote: HashMap<u64, (String, String, String, f64)>,
 }
 
 #[derive(Default)]
@@ -311,6 +313,27 @@ impl Monitor {
         crate::media_files::keep_generated(&bytes, meta)
     }
 
+    /// A request a cluster worker answers (cluster.rs forward): shown live under Monitor's machines and kept in the
+    /// history like the requests this machine answers. -> its id, for `remote_end`.
+    pub fn remote_begin(&self, machine: &str, model: &str, path: &str) -> u64 {
+        let mut g = self.inner.lock().unwrap();
+        g.next_id += 1;
+        let id = g.next_id;
+        g.remote.insert(id, (machine.to_string(), model.to_string(), path.to_string(), now()));
+        g.last_at = Some(now());
+        id
+    }
+
+    /// The worker's answer has ended (its stream finished, or the client went away): its history row.
+    pub fn remote_end(&self, id: u64, finish: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let Some((machine, model, path, started)) = g.remote.remove(&id) else { return };
+        let t = now();
+        let row = json!({"id": id, "time": started, "duration_s": ((t - started) * 10.0).round() / 10.0, "finish": finish,
+                         "kind": "chat", "model": model, "machine": machine, "path": path, "output": format!("answered by {machine}")});
+        self.push(&mut g, row);
+    }
+
     /// A long job's stage (a video's clip `stage` of `stages`, of the scene `what`): when it moves on, the stage before
     /// is logged as finished, with the time it took so far.
     pub fn media_stage(&self, id: u64, stage: u64, stages: u64, what: &str) {
@@ -481,7 +504,10 @@ impl Monitor {
         let tel = self.tel.lock().unwrap();
         let history: serde_json::Map<String, Value> =
             tel.hist.iter().map(|(k, v)| (k.to_string(), Value::Array(v.iter().cloned().collect()))).collect();
-        json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache,
+        // the requests other machines of the cluster are answering now
+        let remote: Vec<Value> = g.remote.values().map(|(m, model, path, st)| json!({"machine": m, "model": model, "path": path,
+                                                                                         "elapsed_s": (t - st).round()})).collect();
+        json!({"engine": engine, "live": live, "requests": hist, "conversation_cache": cache, "remote_active": remote,
                "requests_kept": total, "requests_page": {"page": page, "per": per, "pages": pages, "total": total}, "totals": totals, "hardware": tel.now, "hardware_static": tel.stat,
                "history": history, "time": t, "alerts": self.alerts()})
     }

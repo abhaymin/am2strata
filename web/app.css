@@ -765,3 +765,9 @@ body.resizing iframe { pointer-events: none; }
 .media-job__log { margin: 6px 0 0; padding-left: 18px; color: var(--st-ink-muted); max-height: 220px; overflow: auto; }
 details.media-job__log { padding-left: 0; }
 details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
+
+/* Monitor › Machines: each machine of the cluster, its work now and its load */
+.machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.machine { border: 1px solid var(--st-line-soft); border-radius: var(--st-r-lg); padding: 10px; display: grid; gap: 6px; font-size: 13px; }
+.machine b { font-size: 14px; }
+.machine .muted { font-size: 12px; }

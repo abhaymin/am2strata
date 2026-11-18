@@ -315,6 +315,11 @@ impl Cluster {
         self.workers.read().unwrap().is_empty()
     }
 
+    /// This machine's name (the node's, else the host's): what API calls and Monitor show as the one that answered.
+    pub fn node_name(&self) -> String {
+        if self.node.name.is_empty() { host_name() } else { self.node.name.clone() }
+    }
+
     pub fn workers(&self) -> Vec<Arc<Worker>> {
         self.workers.read().unwrap().clone()
     }
@@ -632,6 +637,20 @@ pub async fn forward(w: &Worker, path_and_query: &str, headers: &HeaderMap, body
     Ok(resp)
 }
 
+/// Closes a forwarded request's Monitor row when its answer's body is dropped: after its last byte, or when the client
+/// went away first.
+struct RemoteRow {
+    mon: std::sync::Arc<crate::monitor::Monitor>,
+    id: u64,
+    finish: &'static str,
+}
+
+impl Drop for RemoteRow {
+    fn drop(&mut self) {
+        self.mon.remote_end(self.id, self.finish);
+    }
+}
+
 /// The layer: a chat request whose model a worker should answer goes there.
 pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState>, req: axum::extract::Request,
                    next: axum::middleware::Next) -> Response {
@@ -650,12 +669,20 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         let busy = s.mgr.queue.snapshot()["waiting"].as_array().is_some_and(|a| !a.is_empty());
         if let Some(w) = s.cluster.pick(&model, local, busy) {
             let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or(path.clone());
+            let mon = s.mgr.monitor.clone();
+            let rid = mon.remote_begin(&w.name, &model, &path);
             match forward(&w, &pq, &parts.headers, bytes.clone()).await {
                 Ok(r) => {
                     tracing::info!("{path}: {model} answered by worker {}", w.name);
-                    return r;
+                    // the answer's end (its last byte, or the client gone) closes Monitor's row
+                    let ok = r.status().is_success();
+                    let (rp, body) = r.into_parts();
+                    let guard = RemoteRow { mon, id: rid, finish: if ok { "stop" } else { "error" } };
+                    let stream = futures::StreamExt::map(body.into_data_stream(), move |c| { let _ = &guard; c });
+                    return Response::from_parts(rp, Body::from_stream(stream));
                 }
                 Err(e) => {
+                    mon.remote_end(rid, "error");
                     w.seen.lock().unwrap().error = Some(e.clone());
                     tracing::warn!("worker {} did not take the request ({e})", w.name);
                     if !local {

@@ -1143,6 +1143,7 @@ function render(m) {
     setPill("queued", `${q.waiting.length} waiting${r}`);
   } else if (live.queued > 0) setPill("queued", `${live.queued} queued`);
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, m.requests_page);
+  if (tab === "monitor") renderMachines(live, hw, m.remote_active);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "settings") renderAbout(eng, hw, st);
 }
@@ -1189,6 +1190,39 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// a row another machine of the cluster answered: its name beside the model
+const machineBadge = (r) => r.machine ? ` <span class="st-badge st-badge--reading" title="answered by ${esc(r.machine)}">${esc(r.machine)}</span>` : "";
+
+// Monitor › Machines: this one and each worker, with what it is doing now (from /metrics' remote_active) and its load
+// (GET api/cluster/system, read every few seconds while Monitor is open); hidden on a machine with no workers
+let machinesAt = 0, machinesHw = [];
+async function renderMachines(live, hw, remote) {
+  if (Date.now() - machinesAt > 5000) {
+    machinesAt = Date.now();
+    try {
+      const r = await fetch("api/cluster/system", {headers: headers()});
+      machinesHw = r.ok ? (await r.json()).workers || [] : [];
+    } catch (e) { machinesHw = []; }
+  }
+  $("machines-card").hidden = !machinesHw.length;
+  if (!machinesHw.length) return;
+  const load = (s) => {
+    if (!s) return "load not read";
+    const g = (s.gpus || []).map((x) => x.util_pct).filter((x) => x != null);
+    return [s.cpu && s.cpu.util_pct != null ? `CPU ${fmt(s.cpu.util_pct)}%` : null, g.length ? `GPU ${g.map((x) => fmt(x) + "%").join(" · ")}` : null,
+            s.memory && s.memory.total_mib ? `RAM ${(s.memory.used_mib / 1024).toFixed(1)} of ${(s.memory.total_mib / 1024).toFixed(1)} GB` : null].filter(Boolean).join(" · ");
+  };
+  const here = live.state === "generating" ? `writing (${fmt(live.tok_s, 1)} tok/s)` : live.state === "reading" ? "reading a prompt"
+    : live.state === "media" ? mediaLabel(live.kind).toLowerCase() : "idle";
+  const mine = `<div class="machine"><b>This PC</b><span>${esc(here)}</span><span class="muted">${esc([hw.cpu != null ? `CPU ${fmt(hw.cpu)}%` : null,
+    hw.gpu_util != null ? `GPU ${fmt(hw.gpu_util)}%` : null].filter(Boolean).join(" · "))}</span></div>`;
+  $("machines").innerHTML = mine + machinesHw.map((w) => {
+    const busy = (remote || []).filter((x) => x.machine === w.name);
+    const doing = busy.length ? busy.map((x) => `answering ${x.model} (${fmt(x.elapsed_s)} s)`).join("; ") : (w.ready ? "idle" : "not answering");
+    return `<div class="machine"><b>${esc(w.name)}</b><span>${esc(doing)}</span><span class="muted">${esc(load(w.system))}</span></div>`;
+  }).join("");
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
@@ -1319,7 +1353,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
         const tm = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
         const media = (r.media || []).map((f) => `<span class="req-media" data-name="${esc(f.name)}" data-type="${esc(f.type)}"></span>`).join("");
         return `<tr><td>${esc(tm)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(r.kind)}</span></td>
-          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td>
+          <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td>
           <td colspan="6" class="muted req-out">${esc(r.output || "")}${r.steps ? ` · ${r.steps} ${mediaUnit(r.kind)}${r.steps === 1 ? "" : "s"}` : ""}${media ? `<div class="req-medias">${media}</div>` : ""}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
       }
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -1331,7 +1365,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${proj}</td>
-        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}</td><td class="num">${fmt(r.prompt_tokens)}</td>
+        <td class="req-model" title="${esc(r.model || "")}">${esc(r.model || "–")}${machineBadge(r)}</td><td class="num">${fmt(r.prompt_tokens)}</td>
         <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(prefillRate)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
@@ -3134,7 +3168,7 @@ async function refreshCalls() {
 let callsStamp = "";
 function renderCalls() {
   const q = $("calls-search").value.toLowerCase(), f = $("calls-filter").value;
-  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
+  const list = calls.filter((r) => `${r.id} ${r.path} ${r.model} ${r.machine || ""}`.toLowerCase().includes(q) && (f === "all" || (f === "active" ? callActive(r) : r.state === f)));
   const stamp = JSON.stringify([list, callSel]);
   if (stamp === callsStamp) return;
   callsStamp = stamp;
@@ -3143,7 +3177,7 @@ function renderCalls() {
     return `<button type="button" class="call-item" data-call="${esc(r.id)}" aria-current="${r.id === callSel}">` +
       `<span class="call-item__top"><span>${callWhen(r.started_at)}</span><span class="st-badge ${callTone(r.state)}">${esc(r.state)}</span></span>` +
       `<span class="call-item__path">POST ${esc(r.path)}</span>` +
-      `<span class="call-item__meta">${esc(r.model || "")} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
+      `<span class="call-item__meta">${esc(r.model || "")}${r.machine ? ` · on ${esc(r.machine)}` : ""} · ${secs(r.wallclock_s)}${sp ? ` · ${sp.toFixed(1)} tok/s` : ""}` +
       `${r.stream ? " · stream" : ""}${r.http_status && r.http_status !== 200 ? ` · HTTP ${r.http_status}` : ""}</span></button>`;
   }).join("") : `<p class="muted small">${calls.length ? "No call matches." : "No API calls yet: they appear here as clients send them."}</p>`;
 }
