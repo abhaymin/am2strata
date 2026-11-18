@@ -959,6 +959,19 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
                     let take = ((ctx * crate::production::RATE as f64) as usize * 2).min(prev.len());
                     b["continue_from"] = json!(base64::engine::general_purpose::STANDARD.encode(crate::production::wav(&prev[prev.len() - take..])));
                 }
+                if *kind == "audio" {
+                    // a file already made: read it, nothing is generated
+                    let src = body["file"].as_str().unwrap_or("").trim();
+                    let got = match s.media_jobs.bytes(src) {
+                        Some(b) => Ok(b),
+                        None => crate::media::load_source(src).await.map_err(|e| format!("{e:#}")),
+                    };
+                    let got = got.map_err(|e| format!("part {} of {total} (audio): {e}", i + 1))?;
+                    if let Some(f) = &kept {
+                        let _ = std::fs::write(f, &got);
+                    }
+                    got
+                } else {
                 let r = match *kind {
                     "speak" => crate::audio_api::speech(State(s.clone()), own_key(s), Json(b)).await,
                     _ => crate::music::music(State(s.clone()), own_key(s), Json(b)).await,
@@ -978,6 +991,7 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
                     let _ = std::fs::write(f, &body_bytes);
                 }
                 body_bytes
+                }
             }
         };
         let (rate, ch, samples) = crate::production::read_wav(&bytes).map_err(|e| format!("part {}: {e}", i + 1))?;

@@ -22,7 +22,8 @@ pub fn parts_of(plan: &Value) -> Result<Vec<(&'static str, Value)>, String> {
         let (kind, body) = if let Some(b) = p.get("speak") { ("speak", b) }
             else if let Some(b) = p.get("song") { ("song", b) }
             else if let Some(b) = p.get("music") { ("music", b) }
-            else { return Err(format!("parts[{i}]: one of speak, song, music")) };
+            else if let Some(b) = p.get("audio") { ("audio", b) }
+            else { return Err(format!("parts[{i}]: one of speak, song, music, audio")) };
         if !body.is_object() {
             return Err(format!("parts[{i}].{kind}: an object"));
         }
@@ -36,6 +37,9 @@ pub fn parts_of(plan: &Value) -> Result<Vec<(&'static str, Value)>, String> {
                 }
             }
             "song" if b["lyrics"].as_str().is_none_or(|t| t.trim().is_empty()) => return Err(format!("parts[{i}].song: give the lyrics")),
+            // a file already made (a track of a mix): a data: URL, a media job id or a library id, with its chapter title
+            "audio" if b["file"].as_str().is_none_or(|t| t.trim().is_empty()) =>
+                return Err(format!("parts[{i}].audio: give the \"file\" (a data: URL, an mj-N job id or an mf_ library id)")),
             "music" => {
                 b["lyrics"] = json!("[Instrumental]");
             }
@@ -64,6 +68,7 @@ pub fn title(kind: &str, body: &Value, i: usize) -> String {
     match kind {
         "speak" => format!("{}. {}", i + 1, first(body["input"].as_str().unwrap_or(""))),
         "song" => format!("{}. Song: {}", i + 1, first(body["lyrics"].as_str().unwrap_or(""))),
+        "audio" => format!("{}. {}", i + 1, body["title"].as_str().unwrap_or("Track")),
         _ => format!("{}. Music: {}", i + 1, body["genre"].as_str().or(body["style"].as_str()).unwrap_or("instrumental")),
     }
 }
@@ -229,6 +234,15 @@ pub fn mono_16k_wav(stereo_48k: &[f32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mix_joins_tracks_already_made() {
+        let plan = json!({"parts": [{"audio": {"file": "mj-3", "title": "First Light"}}, {"audio": {"file": "data:audio/wav;base64,UklG", "title": "Still Water"}}]});
+        let p = parts_of(&plan).unwrap();
+        assert_eq!(p.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["audio", "audio"]);
+        assert_eq!(title("audio", &p[0].1, 0), "1. First Light");
+        assert!(parts_of(&json!({"parts": [{"audio": {"title": "no file"}}]})).unwrap_err().contains("give the \"file\""));
+    }
 
     fn tone(rate: u32, ch: u16, secs: f64, amp: f32) -> Vec<u8> {
         let n = (rate as f64 * secs) as usize;

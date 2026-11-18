@@ -517,7 +517,10 @@ fn cmd_search(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<re
 fn cmd_produce(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
                first: &Option<String>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let req = parse_request(first, "produce")?;
+    let mut req = parse_request(first, "produce")?;
+    let base = first.as_ref().map(|f| Path::new(f)).filter(|p| p.is_file()).and_then(|p| p.parent()).map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    inline_files(&mut req, &base)?;
     let r = send(client.post(format!("{url}/v1/media/productions")).json(&req))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let id = j["id"].as_str().ok_or("no job id in the answer")?.to_string();
@@ -557,7 +560,7 @@ pub fn inline_files(v: &mut Value, base: &Path) -> Result<usize, String> {
     match v {
         Value::Object(o) => {
             for (k, x) in o.iter_mut() {
-                if let (true, Some(t)) = (matches!(k.as_str(), "audio" | "image" | "clip"), x.as_str()) {
+                if let (true, Some(t)) = (matches!(k.as_str(), "audio" | "image" | "clip" | "file"), x.as_str()) {
                     let t = t.trim();
                     if !(t.starts_with("data:") || t.starts_with("http://") || t.starts_with("https://") || t.starts_with("mj-") || t.starts_with("mf_")) {
                         let p = expand_path(Path::new(t));
