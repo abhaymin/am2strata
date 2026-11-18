@@ -997,7 +997,7 @@ pub async fn responses(State(s): State<AppState>, headers: HeaderMap, Json(mut r
     };
     let stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut opts = run::RunOpts { stream_tools: stream, budget: None, tool_choice: chat.get("tool_choice").cloned(),
-                           memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None, media_wait: stream && !(!crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) && chat.get("strata_media_wait") != Some(&Value::Bool(false)) };
+                           memory: crate::memory::scope_of(&chat, !crate::foreign_origin(&s, &headers) && headers.contains_key("origin")), pass: std::sync::Arc::new(std::sync::Mutex::new(early_pass)) , media: None, media_wait: stream && !(!crate::foreign_origin(&s, &headers) && headers.contains_key("origin")) && chat.get("strata_media_wait") != Some(&Value::Bool(false)), from_web: !crate::foreign_origin(&s, &headers) && headers.contains_key("origin") };
     // the server's own tools (MCP, memory, media) this request opted in to (the flags are the request's own)
     let offered = match crate::server_tools::offer(&s, &headers, &req, &mut prep, &mut opts, validator.is_some()).await {
         Ok(o) => o,

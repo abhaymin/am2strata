@@ -586,6 +586,9 @@ pub struct Browsers {
     jobs: std::sync::Mutex<JobMemory>,
     /// per tab (its target id): console messages, script errors, failed requests and the page's HTTP status, for site checks
     pub(crate) diag: Arc<std::sync::Mutex<HashMap<String, more::Diag>>>,
+    /// per session: where it came from ("web app", "API", "site test", "reverse search") and what it is about (the
+    /// chat's first words), for the Browser tab's list of live sessions
+    origins: std::sync::Mutex<HashMap<String, (String, String)>>,
 }
 
 /// The same step asked this many times in a row on a page it did not change is not run again.
@@ -626,7 +629,35 @@ fn allowed_host(url: &str, private: bool) -> futures::future::BoxFuture<'static,
 impl Browsers {
     pub fn new(settings: Settings) -> Browsers {
         Browsers { settings, run: Mutex::new(None), last: std::sync::Mutex::new(HashMap::new()), jobs: std::sync::Mutex::new(JobMemory::default()),
-                   downloads: Arc::new(std::sync::Mutex::new(HashMap::new())), diag: Arc::new(std::sync::Mutex::new(HashMap::new())) }
+                   downloads: Arc::new(std::sync::Mutex::new(HashMap::new())), diag: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                   origins: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    /// Where session `conv` came from and what it is about (set by its first step; kept while it lives).
+    pub fn note_session(&self, conv: &str, from: &str, about: &str) {
+        self.origins.lock().unwrap().entry(conv.to_string()).or_insert_with(|| (from.to_string(), about.chars().take(80).collect()));
+    }
+
+    /// The sessions with a page open now, most recently used first: {id, from, about, url, title, idle_s}.
+    pub async fn sessions(&self) -> Vec<Value> {
+        let lock = self.run.lock().await;
+        let Some(run) = lock.as_ref() else { return Vec::new() };
+        let origins = self.origins.lock().unwrap().clone();
+        let mut out: Vec<(u64, Value)> = Vec::new();
+        for (conv, tab) in &run.active {
+            let Some((_, t)) = run.tabs.iter().find(|(id, _)| id == tab) else { continue };
+            let url = t.page.url().await.ok().flatten().unwrap_or_default();
+            let title = t.page.get_title().await.ok().flatten().unwrap_or_default();
+            let (from, about) = origins.get(conv).cloned().unwrap_or_else(|| {
+                let from = conv.split(':').next().filter(|k| ["manual", "mcp"].contains(k)).map(|k| if k == "mcp" { "a coding agent" } else { "you" })
+                    .unwrap_or(if conv.starts_with("reverse-search") { "reverse search" } else { "API" });
+                (from.to_string(), String::new())
+            });
+            let idle = t.used.elapsed().as_secs();
+            out.push((idle, json!({"id": conv, "from": from, "about": about, "url": url, "title": title, "idle_s": idle})));
+        }
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(_, v)| v).collect()
     }
 
     /// This conversation+site is allowed to keep going (the one-time "allow this job to publish").

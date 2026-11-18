@@ -261,6 +261,9 @@ pub struct RunOpts {
     /// while this answer's media jobs run, a line for each clip or part cleared and the file's link at the end
     /// (`"strata_media_wait": false` turns it off)
     pub media_wait: bool,
+    /// the request came from this server's own web app (its page), not an API client: the Browser tab follows its
+    /// browser session live; an API client gets each step's result and screenshot in the answer
+    pub from_web: bool,
 }
 
 /// The answer's media jobs, followed to the end in the stream: a line for each stage cleared, then each file's link.
@@ -1047,6 +1050,10 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                     let b = &b;
                     let t0 = std::time::Instant::now();
                     let page_of = conv.clone().unwrap_or_else(|| "chat".to_string());
+                    // the Browser tab lists it: from the web app or an API client, and what the chat is about
+                    let about = crate::memory::content_text(&prep.messages.iter().rev().find(|m| m["role"] == "user")
+                        .map(|m| m["content"].clone()).unwrap_or(Value::Null));
+                    b.note_session(&page_of, if opts.from_web { "web app" } else { "API" }, &about);
                     // a risky step (a password, a form sent, a publishing click, an upload) waits for the user's yes
                     let mut allowed = true;
                     let mut approved_note = String::new(); // "approved" or "approved (job)", kept in the step result
