@@ -341,13 +341,19 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let picp = pictures.display().to_string();
     let audiop = dir.join("audio.wav").display().to_string();
     let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
-    let fc = format!("[0:v]subtitles='{}'[v];[1:a]atrim=0:setpts=N/SR/TB,afade=t=out:st={}:d=4[a]", subsp, played.max(4.0) - 4.0);
+    let fc = final_filter(&subsp, played);
     run_ffmpeg(&["-i", picp.as_str(), "-i", audiop.as_str(), "-filter_complex", fc.as_str(), "-map", "[v]", "-map", "[a]", "-t", played.to_string().as_str(), "-r", FPS.to_string().as_str(), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.display().to_string().as_str()]).await?;
 
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
     let _ = std::fs::remove_dir_all(&dir);
     Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
+}
+
+/// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
+/// fade out at the end. `subs` is the ASS file's path already escaped for a filter option.
+pub fn final_filter(subs: &str, played: f64) -> String {
+    format!("[0:v]subtitles='{}'[v];[1:a]atrim=start=0,asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, played.max(4.0) - 4.0)
 }
 
 /// The xfade chain that joins the shots in order, each beginning one crossfade before the previous ends (so their joins
@@ -611,11 +617,13 @@ mod tests {
         // pass 2: hold it to 3 s, burn in a caption with make()'s own ASS script and filter, and mux the tone (faststart)
         let subs = dir.join("subs.ass");
         std::fs::write(&subs, ass_script(1920, 1080, &[(0.2, 2.5, "Hello there".into())], Some("Title"), None, 3.0)).unwrap();
-        let fc = format!("[0:v]tpad=stop_mode=clone:stop_duration=1,subtitles='{}',format=yuv420p[v]",
-            subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"));
+        // the held picture first (make() joins its shots the same way), then make()'s own final filter
+        let held = dir.join("held.mp4");
+        run_ffmpeg(&["-y", "-i", &shot.display().to_string(), "-vf", "tpad=stop_mode=clone:stop_duration=1", "-c:v", "libx264", &held.display().to_string()]).await.unwrap();
+        let fc = final_filter(&subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"), 3.0);
         run_ffmpeg(&[
-            "-y", "-i", &shot.display().to_string(), "-i", &wav.display().to_string(),
-            "-filter_complex", &fc, "-map", "[v]", "-map", "1:a",
+            "-y", "-i", &held.display().to_string(), "-i", &wav.display().to_string(),
+            "-filter_complex", &fc, "-map", "[v]", "-map", "[a]",
             "-t", "3.0", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
             &out.display().to_string(),
         ]).await.unwrap();
