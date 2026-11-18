@@ -429,10 +429,13 @@ enum Cmd {
     },
     /// media generation from a terminal (docs/GAPS-PLAN B; docs/MEDIA.md has every example):
     /// image "prompt" [--size WxH] [--model M] [--n N] --out file.png | video "prompt" [--frames N] [--size WxH] [--format mp4|gif|apng] [--model M] --out file |
-    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
+    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--response-format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
     /// song "prompt" [--lyrics file.txt] [--seconds N] --out file.wav | check <file> [--expect "text"] [--language xx] (prints each finding; exit 1 when any is not ok) |
     /// dub <request.json> [--out file.wav] | produce <plan.json> [--out file.wav] (posts the plan, polls step N of M every 3 s, then downloads the content) |
-    /// job <id> [--out file] (the job status; with --out also its /content)
+    /// job <id> [--out file] (the job status; with --out also its /content) |
+    /// compose --out video.mp4 -- <request.json> (pictures, clips, audio and captions into one MP4; local files go inside the request) |
+    /// thumbnail --out thumb.jpg -- <request.json> | judge [--brief text|file] [--min-score 7] -- <video> (hard checks, then a model that sees
+    /// the frames scores picture, captions, fit, sequence and thumbnail; exit 1 unless it passes). A file argument goes after --
     Media {
         action: String,
         /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job
