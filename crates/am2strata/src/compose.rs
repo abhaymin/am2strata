@@ -462,6 +462,14 @@ pub fn xfade_chain(durations: &[f64], crossfade: f64) -> String {
         return String::new();
     }
     let xf = crossfade.clamp(0.0, 8.0);
+    // hard cuts: xfade cannot take a zero duration (the join stopped after the first shot), so the shots are
+    // concatenated in order instead
+    if xf < 0.04 {
+        let n = durations.len();
+        if n == 1 { return String::from("[0:v]"); }
+        let ins: String = (0..n).map(|k| format!("[{k}:v]")).collect();
+        return format!("{ins}concat=n={n}:v=1:a=0[v];[v]");
+    }
     // each shot's start in the final timeline: sum of the earlier lengths, minus a crossfade per join so far
     let mut starts = Vec::with_capacity(durations.len());
     let mut acc = 0.0f64;
@@ -685,13 +693,17 @@ mod tests {
     fn the_crossfade_chain_parses_in_ffmpeg() {
         let chain = xfade_chain(&[2.0, 2.0, 2.0], 0.5);
         assert_eq!(chain.matches(';').count(), 2, "{chain}");
+        // hard cuts join all three shots too (a zero-length xfade stopped after the first)
+        assert_eq!(xfade_chain(&[2.0, 2.0, 2.0], 0.0), "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v];[v]");
         if !crate::media::ffmpeg_available() { return; }
+        for chain in [chain, xfade_chain(&[2.0, 2.0, 2.0], 0.0)] {
         let mut args: Vec<String> = Vec::new();
         for _ in 0..3 { args.extend(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=2"].map(String::from)); }
         args.extend(["-filter_complex".into(), format!("{chain}fade=t=in:st=0:d=1.0,format=yuv420p[out]"),
                      "-map".into(), "[out]".into(), "-f".into(), "null".into(), "-".into()]);
         let out = std::process::Command::new(crate::server_tls::program("ffmpeg")).args(["-hide_banner", "-loglevel", "error"]).args(&args).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
     }
     use super::*;
 
