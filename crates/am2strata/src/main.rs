@@ -8,6 +8,7 @@
 mod agents;
 mod media_files;
 mod edit_controls;
+mod image_search;
 mod cluster;
 mod cluster_tls;
 mod workshop;
@@ -623,6 +624,8 @@ async fn main() -> Result<()> {
         .route("/v1/media/check", post(media_check::check_endpoint))
         .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
+        .route("/v1/search/images", post(image_search::images))
+        .route("/v1/search/reverse", post(image_search::reverse))
         .route("/v1/media/files", get(media_files::list).post(media_files::upload))
         .route("/v1/media/files/{id}", get(media_files::get).delete(media_files::delete).patch(media_files::patch))
         .route("/v1/media/files/{id}/content", get(media_files::content))

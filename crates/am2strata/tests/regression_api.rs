@@ -212,6 +212,8 @@ const ROUTES: &[Row] = &[
     row("GET", "/v1/media/jobs/{id}", Client).at("/v1/media/jobs/mj-999").ok(404),
     row("GET", "/v1/media/jobs/{id}/content", Client).at("/v1/media/jobs/mj-999/content").ok(404),
     row("GET", "/v1/media/jobs/{id}/captions.srt", Client).at("/v1/media/jobs/mj-999/captions.srt").ok(404),
+    row("POST", "/v1/search/images", Client).json(r#"{}"#).ok(400).note("no query: refused before anything leaves this machine"),
+    row("POST", "/v1/search/reverse", Client).json(r#"{}"#).ok(400).note("no image: refused before anything leaves this machine"),
     row("GET", "/v1/media/files", Client),
     row("POST", "/v1/media/files", Client).json(r#"{}"#).ok(400).note("nothing sent: refused before anything is kept"),
     row("GET", "/v1/media/files/{id}", Client).at("/v1/media/files/mf_0000000000000000").ok(404),

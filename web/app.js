@@ -740,7 +740,7 @@ async function loadLibrary() {
                  new Date(f.created * 1000).toLocaleString()].filter(Boolean).join(" · ");
     return `<figure data-lib="${esc(f.id)}" data-kind="${esc(f.kind)}"><div class="lib-media"></div>
       <figcaption>${what ? `<b>${esc(what.slice(0, 140))}</b><br>` : ""}${esc(sub)}<br><code>${esc(f.id)}</code></figcaption>
-      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button>` : ""}
+      <div class="lib-acts">${f.kind === "image" ? `<button type="button" class="st-btn st-btn--secondary" data-lib-act="edit">Edit this</button><button type="button" class="st-btn st-btn--secondary" data-lib-act="find">Find on the web</button>` : ""}
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="pin" data-pinned="${f.pinned ? 1 : 0}">${f.pinned ? "Unpin" : "Pin"}</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="copy">Copy id</button>
         <button type="button" class="st-btn st-btn--secondary" data-lib-act="save">Download</button>
@@ -756,6 +756,34 @@ async function loadLibrary() {
     }).catch(() => { fig.querySelector(".lib-media").textContent = "not read"; });
   }
 }
+// Media › Tools › Image search: by words (POST /v1/search/images) or by an image (POST /v1/search/reverse)
+$("search-form").onsubmit = async (ev) => {
+  ev.preventDefault();
+  const q = $("search-q").value.trim(), f = $("search-file").files[0], id = $("search-id").value.trim();
+  if (!q && !f && !id) return;
+  const byImage = !!(f || id);
+  $("search-go").disabled = true;
+  $("search-hint").textContent = byImage ? "Searching the engines (up to a minute)\u2026" : "Searching\u2026";
+  $("search-out").innerHTML = "";
+  try {
+    const body = byImage ? {image: f ? await asDataUrl(f) : id} : {query: q, n: 24};
+    const r = await fetch(byImage ? "v1/search/reverse" : "v1/search/images", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+    const j = await r.json();
+    if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
+    if (!byImage) {
+      $("search-out").innerHTML = `<p class="muted small">${j.data.length} from ${esc(j.backend)}</p><div class="search-grid">` +
+        j.data.map((x) => `<a href="${esc(x.page_url || x.image_url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(x.thumbnail || x.image_url)}" alt="${esc(x.title)}" loading="lazy" referrerpolicy="no-referrer">${esc(x.title)}${x.license ? ` · ${esc(x.license)}` : ""}</a>`).join("") + "</div>";
+    } else {
+      $("search-out").innerHTML = j.engines.map((e) => `<div><b>${esc(e.engine)}</b> <span class="st-badge ${e.status === "ok" ? "" : "st-badge--queued"}">${esc(e.status)}</span>` +
+        (e.contains && e.contains.length ? `<p class="small">Seems to show: ${esc(e.contains.join(", "))}</p>` : "") +
+        (e.sites && e.sites.length ? `<ul>${e.sites.map((x) => `<li><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a> <span class="muted">${esc(x.domain)}</span></li>`).join("")}</ul>` : "") +
+        (e.note ? `<p class="muted small">${esc(e.note)}</p>` : "") +
+        (e.results_url ? `<p class="small"><a href="${esc(e.results_url)}" target="_blank" rel="noopener noreferrer">All of ${esc(e.engine)}'s results</a></p>` : "") + "</div>").join("");
+    }
+    $("search-hint").textContent = "";
+  } catch (e) { $("search-hint").textContent = ""; toast("error", "No results", String(e.message || e), 8000); }
+  finally { $("search-go").disabled = false; }
+};
 $("lib-kind").onchange = loadLibrary;
 $("lib-source").onchange = loadLibrary;
 $("lib-add").onchange = async () => {
@@ -782,6 +810,11 @@ $("lib-grid").addEventListener("click", async (e) => {
   } else if (b.dataset.libAct === "delete") {
     const r = await fetch(`v1/media/files/${id}`, {method: "DELETE", headers: headers()});
     if (r.ok) { libUrls.delete(id); fig.remove(); } else toast("error", "Not deleted", `HTTP ${r.status}`);
+  } else if (b.dataset.libAct === "find") {
+    // to Tools › Image search with this file's id
+    $("media-kinds").querySelector('[data-kind="tools"]').click();
+    $("search-q").value = ""; $("search-file").value = ""; $("search-id").value = id;
+    $("search-form").requestSubmit();
   } else if (b.dataset.libAct === "edit") {
     // to the Image form with this file as the image to edit (sent by its id, not again as base64)
     $("media-kinds").querySelector('[data-kind="image"]').click();

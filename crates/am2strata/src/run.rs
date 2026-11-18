@@ -1094,6 +1094,12 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         },
                         _ = tx.closed() => return,
                     }
+                } else if let (true, None, Some(_)) = (c.name == "reverse_image_search", &route, mgr.web.get()) {
+                    // the server's own browser and the media library: not the web tools' plain HTTP
+                    tokio::select! {
+                        r = crate::image_search::tool_reverse(&mgr, &args) => r,
+                        _ = tx.closed() => return,
+                    }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {
                     if c.name == "web_search" {
                         web_queries += 1;

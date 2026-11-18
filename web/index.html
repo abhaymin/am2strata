@@ -357,6 +357,19 @@
 
       <!-- ============================ Tools: media check, dubbing, productions ============================ -->
       <div class="tools-forms" id="tools-forms" hidden>
+        <form class="st-card img-form" id="search-form">
+          <span class="card-title">Image search</span>
+          <label class="st-field">Find images for some words
+            <input class="st-input" id="search-q" placeholder="a lighthouse at dusk" aria-label="Words"></label>
+          <label class="st-field">or find where an image appears on the web (a file, or a library id mf_…)
+            <input class="st-input" id="search-file" type="file" accept="image/*" aria-label="An image"></label>
+          <input class="st-input mono" id="search-id" placeholder="mf_… (optional)" aria-label="A library id">
+          <div class="img-row"><button class="st-btn" id="search-go" type="submit">Search</button><span class="muted small" id="search-hint"></span></div>
+          <p class="muted small">Runs from this machine in a throwaway browser session; for an image search the image is sent to the
+            engines (Yandex, Google Lens), and the results stay here. Nothing is filtered for what an image shows. Not for identifying
+            a person from their face.</p>
+          <div class="search-out" id="search-out"></div>
+        </form>
         <form class="st-card img-form" id="check-form">
           <span class="card-title">Media check</span>
           <label class="st-field">File (audio or video)

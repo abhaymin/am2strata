@@ -141,6 +141,8 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
 ///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
+///   search "<words>"                                      (images on the web for some words)
+///   reverse <file | id | url>                             (where an image, or one like it, appears on the web)
 #[derive(Args)]
 pub struct MediaOpts {
     /// the answer's file (image, video, speech, song, dub and job --out all need it; refuse a missing one)
@@ -204,6 +206,8 @@ pub struct MediaOpts {
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
 ///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
+///   search "<words>"                                      (images on the web for some words)
+///   reverse <file | id | url>                             (where an image, or one like it, appears on the web)
 #[allow(clippy::too_many_arguments)]
 pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
@@ -234,7 +238,8 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
             "files" | "add" | "get" | "rm" | "pin" | "unpin" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
-            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm, pin, unpin")),
+            "search" | "reverse" => cmd_search(&client, &send, action, first.as_deref(), o, &url)?,
+            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm, pin, unpin, search, reverse")),
         }
         Ok(())
     })();
@@ -445,6 +450,41 @@ fn cmd_files(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
             send(client.delete(format!("{url}/v1/media/files/{id}")))?;
             println!("removed {id}");
         }
+    }
+    Ok(())
+}
+
+/// Image search by words (POST /v1/search/images) and reverse image search (POST /v1/search/reverse).
+fn cmd_search(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+              action: &str, first: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    let what = first.ok_or(if action == "search" { "search needs some words" } else { "reverse needs an image: a file, a library id or a URL" })?;
+    let j: Value = if action == "search" {
+        send(client.post(format!("{url}/v1/search/images")).json(&json!({"query": what, "n": o.n.max(1) * 10})))?.json().map_err(|e| e.to_string())?
+    } else {
+        let p = expand_path(Path::new(what));
+        let image = if p.is_file() { data_url(&p)? } else { what.to_string() };
+        send(client.post(format!("{url}/v1/search/reverse")).json(&json!({"image": image})))?.json().map_err(|e| e.to_string())?
+    };
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&j).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    if action == "search" {
+        for f in j["data"].as_array().into_iter().flatten() {
+            println!("{}\n  {}\n  {}", f["title"].as_str().unwrap_or(""), f["image_url"].as_str().unwrap_or(""), f["page_url"].as_str().unwrap_or(""));
+        }
+        return Ok(());
+    }
+    for e in j["engines"].as_array().into_iter().flatten() {
+        println!("{} ({})", e["engine"].as_str().unwrap_or(""), e["status"].as_str().unwrap_or(""));
+        if let Some(c) = e["contains"].as_array().filter(|c| !c.is_empty()) {
+            println!("  seems to show: {}", c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        for s in e["sites"].as_array().into_iter().flatten() {
+            println!("  {}  {}", s["domain"].as_str().unwrap_or(""), s["url"].as_str().unwrap_or(""));
+        }
+        if let Some(n) = e["note"].as_str() { println!("  {n}"); }
+        if let Some(u) = e["results_url"].as_str() { println!("  results: {u}"); }
     }
     Ok(())
 }
