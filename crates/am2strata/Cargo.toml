@@ -59,6 +59,8 @@ libc = "0.2"
 if-addrs = "0.13"
 # an edit's default size: the dimensions of the uploaded image
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rustybuzz = "0.20"
+ab_glyph = "0.2"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "multipart", "http2"] }

@@ -344,13 +344,34 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
             return Err(format!("the joined pictures play {got:.1} s of the {played:.1} s planned; not finished"));
         }
     }
-    // mux the picture chain with the audio, captions burned in by libass, one MP4 (H.264 + AAC, faststart)
+    // mux the picture chain with the audio and the captions and cards burned in, one MP4 (H.264 + AAC, faststart).
+    // The captions are drawn by am2Strata (captions.rs) and laid on with ffmpeg's overlay, which every ffmpeg has;
+    // "captions_engine": "libass" uses the subtitles filter instead
     let out = dir.join(format!("{id}.mp4"));
     let picp = pictures.display().to_string();
     let audiop = dir.join("audio.wav").display().to_string();
-    let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
-    let fc = final_filter(&subsp, played, from);
-    run_ffmpeg(&["-i", picp.as_str(), "-i", audiop.as_str(), "-filter_complex", fc.as_str(), "-map", "[v]", "-map", "[a]", "-t", played.to_string().as_str(), "-r", FPS.to_string().as_str(), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.display().to_string().as_str()]).await?;
+    let mut args: Vec<String> = vec!["-i".into(), picp, "-i".into(), audiop];
+    let fc = if req["captions_engine"].as_str() == Some("libass") {
+        let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
+        final_filter(&subsp, played, from)
+    } else {
+        let ovs = crate::captions::overlays(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s)?;
+        for (k, o) in ovs.iter().enumerate() {
+            let f = dir.join(format!("cap-{k:03}.png"));
+            std::fs::write(&f, &o.png).map_err(|e| format!("could not write a caption: {e}"))?;
+            args.extend(["-loop", "1", "-framerate", "30", "-t"].map(String::from));
+            args.push(format!("{:.3}", (o.b - o.a).max(0.3)));
+            args.push("-i".into());
+            args.push(f.display().to_string());
+        }
+        crate::captions::overlay_filter(&ovs, 2, played, from)
+    };
+    args.extend(["-filter_complex".to_string(), fc, "-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-t".into(), played.to_string(),
+                 "-r".into(), FPS.to_string(), "-c:v".into(), "libx264".into(), "-preset".into(), "medium".into(), "-crf".into(), "18".into(),
+                 "-pix_fmt".into(), "yuv420p".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-movflags".into(), "+faststart".into(),
+                 out.display().to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ffmpeg(&refs).await?;
 
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
@@ -544,12 +565,47 @@ mod tests {
     }
 
     #[test]
-    fn an_ffmpeg_without_libass_cannot_compose() {
+    fn compose_needs_no_libass_only_stock_filters() {
         // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
-        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad";
+        // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by am2Strata it composes all the same
+        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade";
         let encoders = " V....D libx264  H.264\n A....D aac   AAC";
-        assert_eq!(crate::media::missing_for_compose(filters, encoders), ["subtitles"]);
-        assert!(crate::media::missing_for_compose(&format!("{filters}\n ... subtitles V->V burn"), encoders).is_empty());
+        assert_eq!(crate::media::missing_for_compose(filters, encoders), ["overlay"]);
+        assert!(crate::media::missing_for_compose(&format!("{filters}\n ... overlay VV->V over"), encoders).is_empty());
+    }
+
+    /// The native captions burn in with the stock overlay filter: a held picture, a tone, a caption and a title card
+    /// make a video of the right length whose caption frame has the white type in the low box.
+    #[tokio::test]
+    async fn native_captions_burn_in_without_libass() {
+        if !crate::media::ffmpeg_available() { return; }
+        let dir = std::env::temp_dir().join(format!("strata-natcap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pic, wav, out) = (dir.join("p.mp4"), dir.join("t.wav"), dir.join("o.mp4"));
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "color=c=0x406080:s=640x360:r=30:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", &pic.display().to_string()]).await.unwrap();
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", &wav.display().to_string()]).await.unwrap();
+        let ovs = crate::captions::overlays(640, 360, &[(1.0, 3.5, "Peace in our hands".into())], Some("Title"), None, 4.0).unwrap();
+        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), pic.display().to_string(), "-i".into(), wav.display().to_string()];
+        for (k, o) in ovs.iter().enumerate() {
+            let f = dir.join(format!("c{k}.png"));
+            std::fs::write(&f, &o.png).unwrap();
+            args.extend(["-loop", "1", "-framerate", "30", "-t"].map(String::from));
+            args.push(format!("{:.3}", o.b - o.a));
+            args.extend(["-i".to_string(), f.display().to_string()]);
+        }
+        args.extend(["-filter_complex".into(), crate::captions::overlay_filter(&ovs, 2, 4.0, 0.0), "-map".into(), "[v]".into(), "-map".into(), "[a]".into(),
+                     "-t".into(), "4".into(), "-c:v".into(), "libx264".into(), "-c:a".into(), "aac".into(), out.display().to_string()]);
+        run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>()).await.unwrap();
+        let len = probe_seconds(&out).await.unwrap();
+        assert!((len - 4.0).abs() < 0.1, "{len}");
+        // the frame at 2 s: the caption box low in the picture, with white type in it
+        let shot = dir.join("f.png");
+        run_ffmpeg(&["-y", "-ss", "2", "-i", &out.display().to_string(), "-frames:v", "1", "-update", "1", &shot.display().to_string()]).await.unwrap();
+        let img = image::open(&shot).unwrap().to_rgb8();
+        let white_low = (250..340).flat_map(|y| (0..640).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        let white_high = (0..100).flat_map(|y| (0..640).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        assert!(white_low > 100 && white_high == 0, "type low: {white_low}, high: {white_high}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

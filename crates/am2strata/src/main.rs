@@ -45,6 +45,7 @@ mod mcp;
 mod memory;
 mod media;
 mod compose;
+mod captions;
 mod media_check;
 mod media_dub;
 mod media_jobs;
@@ -588,6 +589,7 @@ async fn main() -> Result<()> {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
     };
+    captions::set_font_dir(&web_dir); // the caption fonts ship in web/fonts/captions
     let app = Router::new()
         .route("/health", get(web::health))
         .route("/api/health", get(unsloth::health))
