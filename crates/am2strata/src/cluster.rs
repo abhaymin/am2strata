@@ -774,7 +774,7 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         let mut picked = if local && how.needs_master { None } else { s.cluster.pick(&model, local, busy) };
         // another model instead of the one asked for only for a plain chat: never for an agent's or a tool request
         // (a coding agent would silently get a much weaker model), unless it opts in with x-strata-overflow: any
-        if picked.is_none() && busy && path != "/v1/completions" && (how.plain_chat() || how.overflow_any) {
+        if picked.is_none() && busy && path != "/v1/completions" && (how.plain_chat() || (how.overflow_any && !how.media_in)) {
             if let Some((w, other)) = s.cluster.overflow_pick() {
                 // the worker answers with the model it has loaded; the answer's "model" says which
                 if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
@@ -827,6 +827,16 @@ pub struct Routing {
     tools: bool,
     /// x-strata-overflow: any (another loaded model is fine)
     pub overflow_any: bool,
+    /// it carries pictures, video or audio: only the model asked for (one that reads them) may answer
+    media_in: bool,
+}
+
+/// A chat request with an image, video or audio part in any message (OpenAI's and Anthropic's part types).
+pub fn has_media_parts(req: &Value) -> bool {
+    let kinds = ["image_url", "image", "input_image", "video_url", "video", "input_video", "input_audio", "audio"];
+    ["messages", "input"].iter().filter_map(|k| req[*k].as_array()).flatten().any(|m| {
+        m["content"].as_array().is_some_and(|parts| parts.iter().any(|p| p["type"].as_str().is_some_and(|t| kinds.contains(&t))))
+    })
 }
 
 impl Routing {
@@ -842,13 +852,14 @@ impl Routing {
             needs_master: mcp || memory,
             tools: req["tools"].as_array().is_some_and(|t| !t.is_empty()) || headers.contains_key("x-strata-tools") || client.is_some(),
             overflow_any: headers.get("x-strata-overflow").and_then(|v| v.to_str().ok()) == Some("any"),
+            media_in: has_media_parts(req),
             profile: client,
         }
     }
 
     /// A chat with no tools of its own from the main key (the web app's), which any loaded model may answer.
     pub fn plain_chat(&self) -> bool {
-        !self.tools && !self.needs_master
+        !self.tools && !self.needs_master && !self.media_in
     }
 
     /// The headers that carry the caller's tools to the worker: the worker runs the server tools it has for these
@@ -1203,7 +1214,7 @@ mod tests {
     #[test]
     fn the_routed_tools_carry_the_profile_without_memory_and_the_body_turns_memory_off() {
         let p = crate::clients::Profile::generated("agent-1".into(), ["web", "image", "memory", "mcp:files"].iter().map(|s| s.to_string()).collect(), "a".into());
-        let r = Routing { profile: Some(p), needs_master: true, tools: true, overflow_any: false };
+        let r = Routing { profile: Some(p), needs_master: true, tools: true, overflow_any: false, media_in: false };
         let h = r.headers();
         assert_eq!(h[0], ("x-strata-routed-tools", "web,image".to_string()));
         assert_eq!(h[1].1, "agent-1");
@@ -1214,8 +1225,16 @@ mod tests {
         assert!(v.get("strata_mcp").is_none());
         assert_eq!(v["strata_memory"], false);
         // the main key's plain chat (the web app's) may go to another loaded model, with no extra headers
-        let plain = Routing { profile: None, needs_master: false, tools: false, overflow_any: false };
+        let plain = Routing { profile: None, needs_master: false, tools: false, overflow_any: false, media_in: false };
         assert!(plain.plain_chat() && plain.headers().is_empty());
+        // a request with a picture or a video (am2Strata's judge sends frames to a vision model) never goes to another
+        // loaded model, which may not read images
+        let judge = json!({"model": "minicpm-v", "messages": [{"role": "user", "content": [{"type": "text", "text": "brief"},
+                           {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA"}}]}]});
+        assert!(has_media_parts(&judge));
+        assert!(!has_media_parts(&json!({"messages": [{"role": "user", "content": "hi"}]})));
+        let seen = Routing { media_in: true, ..plain };
+        assert!(!seen.plain_chat());
     }
     use super::*;
 
