@@ -47,6 +47,40 @@ pub const SERVICE: &str = "_am2strata._tcp.local.";
 /// The APIs a worker can answer (a model's chat), routed by the request's "model".
 pub const ROUTED: [&str; 4] = ["/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions"];
 
+/// The media requests a worker can make too, and the kind each needs (its /api/media/capabilities). The first five
+/// answer with the file; compose and thumbnails answer with a job, followed here (see `remote_job`).
+pub const MEDIA_ROUTED: [(&str, &str); 7] = [
+    ("/v1/images/generations", "image"), ("/v1/videos/generations", "video"), ("/v1/audio/music", "music"),
+    ("/v1/audio/speech", "tts"), ("/v1/audio/transcriptions", "stt"),
+    ("/v1/media/videos/compose", "compose"), ("/v1/media/thumbnails", "compose"),
+];
+
+/// The kinds a worker's capabilities say it can make now.
+pub fn media_kinds(caps: &Value) -> Vec<String> {
+    let mut out: Vec<String> = caps["kinds"].as_object().map(|k| k.iter().filter(|(_, v)| v["usable"] == true)
+        .map(|(n, _)| n.clone()).collect()).unwrap_or_default();
+    if caps["compose"] == true {
+        out.push("compose".into());
+    }
+    out
+}
+
+/// A media request another machine can make as sent: every file in it is in the request itself (a data: URL) or on
+/// the web, none a job id, library id or path of this PC.
+pub fn portable(v: &Value) -> bool {
+    match v {
+        Value::String(t) => {
+            let t = t.trim();
+            let id_like = |p: &str| t.strip_prefix(p).is_some_and(|r| !r.is_empty() && r.len() <= 80 && !r.contains(' '));
+            !(id_like("mj-") || id_like("mf_") || t.starts_with('/') || t.starts_with("file:") || t.starts_with("~/")
+              || t.starts_with("\\\\") || t.get(1..3) == Some(":\\"))
+        }
+        Value::Array(a) => a.iter().all(portable),
+        Value::Object(o) => o.iter().all(|(k, x)| k == "prompt" || k == "input" || k == "lyrics" || k == "captions" || portable(x)),
+        _ => true,
+    }
+}
+
 #[derive(Default, Clone)]
 struct Seen {
     models: Vec<String>,
@@ -56,6 +90,10 @@ struct Seen {
     at: Option<Instant>,
     error: Option<String>,
     routed: u64,
+    /// the media kinds it can make now (its /api/media/capabilities: image, video, tts, stt, music, compose), read every 30 s
+    media: Vec<String>,
+    /// media requests this master sent it that have not finished yet (a worker's compose does not show in its queue)
+    inflight: usize,
 }
 
 pub struct Worker {
@@ -119,13 +157,25 @@ impl Worker {
         self.seen.lock().unwrap().models.iter().any(|m| m == model)
     }
 
+    /// It can make this media kind (image, video, tts, stt, music, compose).
+    fn can(&self, kind: &str) -> bool {
+        self.seen.lock().unwrap().media.iter().any(|k| k == kind)
+    }
+
+    /// Nothing runs or waits there, and nothing this master sent is still being made.
+    fn idle(&self) -> bool {
+        let s = self.seen.lock().unwrap();
+        !s.running && s.waiting == 0 && s.inflight == 0
+    }
+
     fn view(&self) -> Value {
         let s = self.seen.lock().unwrap().clone();
         json!({"name": self.name, "url": self.url, "node_id": self.node_id, "paired": self.paired, "ready": self.ready(),
                "encrypted": self.tls_url.is_some(), "tls_url": self.tls_url,
                "transport": if self.tls_url.is_some() { "TLS 1.3, pinned certificates" } else { "plain HTTP: use a VPN" },
                "models": s.models, "loaded": s.current, "waiting": s.waiting, "running": s.running,
-               "seen_s_ago": s.at.map(|t| t.elapsed().as_secs()), "error": s.error, "requests_routed": s.routed})
+               "seen_s_ago": s.at.map(|t| t.elapsed().as_secs()), "error": s.error, "requests_routed": s.routed,
+               "media": s.media, "media_in_flight": s.inflight})
     }
 }
 
@@ -339,7 +389,7 @@ impl Cluster {
     pub(crate) fn add_test_worker(&self, name: &str, models: &[&str], ready: bool) {
         let w = Worker::new(name.into(), "http://x".into(), "k".into(), None, false);
         *w.seen.lock().unwrap() = Seen { models: models.iter().map(|m| m.to_string()).collect(), current: None, waiting: 0,
-                                         running: false, at: ready.then(Instant::now), error: None, routed: 0 };
+                                         running: false, at: ready.then(Instant::now), error: None, routed: 0, ..Default::default() };
         self.workers.write().unwrap().push(w);
     }
 
@@ -538,6 +588,17 @@ impl Cluster {
         c.first().map(|w| (*w).clone())
     }
 
+    /// A worker to make a media job of `kind`: a ready one that can make it, idle when `need_idle` (this PC is only
+    /// busy), else the least loaded one (this PC cannot make it at all).
+    pub fn pick_media(&self, kind: &str, need_idle: bool) -> Option<Arc<Worker>> {
+        let mut c: Vec<Arc<Worker>> = self.workers().into_iter().filter(|w| w.ready() && w.can(kind)).collect();
+        if need_idle {
+            c.retain(|w| w.idle());
+        }
+        c.sort_by_key(|w| { let s = w.seen.lock().unwrap(); s.inflight + s.waiting + s.running as usize });
+        c.into_iter().next()
+    }
+
     /// While this PC is busy and no worker has the model asked for: an idle worker and the model it has loaded, so
     /// a chat is answered now, in parallel, instead of waiting here (off with `cluster.overflow: false`).
     pub fn overflow_pick(&self) -> Option<(Arc<Worker>, String)> {
@@ -590,8 +651,17 @@ fn found_of(info: &mdns_sd::ServiceInfo) -> Option<(String, Found)> {
 /// Ask a worker for its models and queue every 5 s, until it is removed.
 fn spawn_poller(w: Arc<Worker>) {
     tokio::spawn(async move {
+        let mut round = 0u64;
         while !w.stop.load(Ordering::Relaxed) {
             let get = |p: &str| w.client.get(format!("{}{p}", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(4)).send();
+            // the media kinds it can make, every 30 s (the worker keeps its own answer for a minute)
+            if round % 6 == 0 {
+                let caps = async { get("/api/media/capabilities").await?.error_for_status()?.json::<Value>().await }.await;
+                if let Ok(c) = caps {
+                    w.seen.lock().unwrap().media = media_kinds(&c);
+                }
+            }
+            round += 1;
             let r = async {
                 let m: Value = get("/api/models").await?.error_for_status()?.json().await?;
                 let q: Value = get("/api/queue").await?.error_for_status()?.json().await?;
@@ -632,7 +702,16 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 }
 
 pub async fn forward(w: &Worker, path_and_query: &str, headers: &HeaderMap, body: axum::body::Bytes) -> Result<Response, String> {
+    forward_with(w, path_and_query, headers, body, &[]).await
+}
+
+/// `forward` with headers of this master's own added (the routed request's tools, on the pinned master link).
+pub async fn forward_with(w: &Worker, path_and_query: &str, headers: &HeaderMap, body: axum::body::Bytes,
+                          extra: &[(&'static str, String)]) -> Result<Response, String> {
     let mut rq = w.client.post(format!("{}{path_and_query}", w.base())).bearer_auth(&w.key).body(body);
+    for (h, v) in extra {
+        rq = rq.header(*h, v.as_str());
+    }
     // what shapes the answer; never the client's own key
     for h in ["content-type", "accept", "anthropic-version", "anthropic-beta", "openai-beta", "x-strata-priority"] {
         if let Some(v) = headers.get(h) {
@@ -669,23 +748,33 @@ impl Drop for RemoteRow {
 pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState>, req: axum::extract::Request,
                    next: axum::middleware::Next) -> Response {
     let path = req.uri().path().to_string();
-    if s.cluster.is_empty() || req.method() != axum::http::Method::POST || !ROUTED.contains(&path.as_str())
+    let media = MEDIA_ROUTED.iter().find(|(p, _)| *p == path).map(|(_, k)| *k);
+    if s.cluster.is_empty() || req.method() != axum::http::Method::POST || (!ROUTED.contains(&path.as_str()) && media.is_none())
         || !crate::api_authorized(&s, req.headers()) {
         return next.run(req).await;
+    }
+    if let Some(kind) = media {
+        return route_media(s, req, next, kind).await;
     }
     let (parts, body) = req.into_parts();
     let Ok(mut bytes) = axum::body::to_bytes(body, 256 << 20).await else {
         return crate::error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request is too large");
     };
-    let model = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v["model"].as_str().map(str::to_string));
+    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+    let model = parsed.as_ref().and_then(|v| v["model"].as_str().map(str::to_string));
     if let Some(model) = model {
         let local = s.mgr.entry(&model).is_some();
+        let req_v = parsed.unwrap_or(Value::Null);
+        let how = Routing::of(&s, &parts.headers, &req_v);
         // busy: a job runs here (a chat, or a media job holding the GPU) or waits; a new chat would wait behind it
         let busy = s.mgr.queue.busy();
         let original = bytes.clone();   // a failed forward is answered here, as asked
         let mut model = model;
-        let mut picked = s.cluster.pick(&model, local, busy);
-        if picked.is_none() && busy && path != "/v1/completions" {
+        // a request that needs this PC's memory or MCP servers stays here while this PC has its model
+        let mut picked = if local && how.needs_master { None } else { s.cluster.pick(&model, local, busy) };
+        // another model instead of the one asked for only for a plain chat: never for an agent's or a tool request
+        // (a coding agent would silently get a much weaker model), unless it opts in with x-strata-overflow: any
+        if picked.is_none() && busy && path != "/v1/completions" && (how.plain_chat() || how.overflow_any) {
             if let Some((w, other)) = s.cluster.overflow_pick() {
                 // the worker answers with the model it has loaded; the answer's "model" says which
                 if let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) {
@@ -701,7 +790,8 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
             let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or(path.clone());
             let mon = s.mgr.monitor.clone();
             let rid = mon.remote_begin(&w.name, &model, &path);
-            match forward(&w, &pq, &parts.headers, bytes.clone()).await {
+            let sent = how.body_for_worker(&bytes);
+            match forward_with(&w, &pq, &parts.headers, sent, &how.headers()).await {
                 Ok(r) => {
                     tracing::info!("{path}: {model} answered by worker {}", w.name);
                     // the answer's end (its last byte, or the client gone) closes Monitor's row
@@ -725,6 +815,189 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         }
     }
     next.run(axum::extract::Request::from_parts(parts, Body::from(bytes))).await
+}
+
+/// What a chat request carries that decides where it may run.
+pub struct Routing {
+    /// the caller's client profile (narrowed by x-strata-tools), when its key has one other than the main key's
+    profile: Option<crate::clients::Profile>,
+    /// the request uses this PC's memory or MCP servers, which a worker does not have
+    pub needs_master: bool,
+    /// it brings its own tools (a coding agent's), or names tool sets
+    tools: bool,
+    /// x-strata-overflow: any (another loaded model is fine)
+    pub overflow_any: bool,
+}
+
+impl Routing {
+    pub fn of(s: &crate::AppState, headers: &HeaderMap, req: &Value) -> Routing {
+        let mut profile = crate::api_access(s, headers).flatten();
+        if let (Some(p), Some(h)) = (profile.as_ref(), headers.get("x-strata-tools").and_then(|v| v.to_str().ok())) {
+            profile = p.narrowed(h).ok();
+        }
+        let client = profile.clone().filter(|p| p.name != "default");
+        let mcp = profile.as_ref().is_some_and(|p| { let (n, all) = p.mcp(); all || !n.is_empty() }) || req["strata_mcp"] == true;
+        let memory = client.as_ref().is_some_and(|p| p.has("memory")) || req["strata_memory"] == true;
+        Routing {
+            needs_master: mcp || memory,
+            tools: req["tools"].as_array().is_some_and(|t| !t.is_empty()) || headers.contains_key("x-strata-tools") || client.is_some(),
+            overflow_any: headers.get("x-strata-overflow").and_then(|v| v.to_str().ok()) == Some("any"),
+            profile: client,
+        }
+    }
+
+    /// A chat with no tools of its own from the main key (the web app's), which any loaded model may answer.
+    pub fn plain_chat(&self) -> bool {
+        !self.tools && !self.needs_master
+    }
+
+    /// The headers that carry the caller's tools to the worker: the worker runs the server tools it has for these
+    /// sets (web, image, browser, ...) with no memory and no MCP servers of its own (cluster: the worker trusts only
+    /// this master's key on the pinned link for them).
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let Some(p) = &self.profile else { return vec![] };
+        let sets: Vec<&str> = crate::clients::SETS.iter().copied().filter(|t| *t != "memory" && p.has(t)).collect();
+        vec![("x-strata-routed-tools", if sets.is_empty() { "none".into() } else { sets.join(",") }),
+             ("x-strata-routed-for", p.name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(64).collect())]
+    }
+
+    /// The body sent on: this PC's memory and MCP servers turned off there (the worker would use its own).
+    pub fn body_for_worker(&self, bytes: &axum::body::Bytes) -> axum::body::Bytes {
+        match serde_json::from_slice::<Value>(bytes) {
+            Ok(Value::Object(mut o)) => {
+                o.remove("strata_mcp");
+                o.insert("strata_memory".into(), Value::Bool(false));
+                axum::body::Bytes::from(serde_json::to_vec(&Value::Object(o)).unwrap_or_default())
+            }
+            _ => bytes.clone(),
+        }
+    }
+}
+
+/// Decrements a worker's in-flight media count when dropped.
+struct Inflight(Arc<Worker>);
+
+impl Inflight {
+    fn new(w: Arc<Worker>) -> Inflight {
+        w.seen.lock().unwrap().inflight += 1;
+        Inflight(w)
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        let mut s = self.0.seen.lock().unwrap();
+        s.inflight = s.inflight.saturating_sub(1);
+    }
+}
+
+/// A media request: made by a worker that can make it when this PC cannot, or when this PC is busy and the worker is
+/// idle; else here. Its files must travel in the request (`portable`). A compose or thumbnail answers with a job of
+/// this server's own, followed on the worker until its file is here.
+async fn route_media(s: crate::AppState, req: axum::extract::Request, next: axum::middleware::Next, kind: &'static str) -> Response {
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 512 << 20).await else {
+        return crate::error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request is too large");
+    };
+    let is_json = parts.headers.get("content-type").and_then(|v| v.to_str().ok()).is_none_or(|c| c.contains("json"));
+    let v: Value = if is_json { serde_json::from_slice(&bytes).unwrap_or(Value::Null) } else { Value::Null };
+    let here = || next.run(axum::extract::Request::from_parts(parts.clone(), Body::from(bytes.clone())));
+    // a multipart upload (a transcription's file) is the file itself: portable as it is
+    if is_json && (v.is_null() || !portable(&v)) {
+        return here().await;
+    }
+    let local_can = match kind {
+        "compose" => crate::media::ffmpeg_cached(),
+        k => s.media_jobs.capabilities().await["kinds"][k]["usable"] == true,
+    };
+    let busy = s.mgr.queue.busy() || (kind == "compose" && s.media_jobs.active(&["compose", "thumbnail"]) > 0);
+    if local_can && !busy {
+        return here().await;
+    }
+    let Some(w) = s.cluster.pick_media(kind, local_can) else { return here().await };
+    let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
+    let mon = s.mgr.monitor.clone();
+    let rid = mon.remote_begin(&w.name, kind, &pq);
+    let held = Inflight::new(w.clone());
+    tracing::info!("{pq}: {} goes to worker {} ({})", kind, w.name, if local_can { "this PC is busy" } else { "this PC cannot make it" });
+    let r = match forward(&w, &pq, &parts.headers, bytes.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            mon.remote_end(rid, "error");
+            drop(held);
+            w.seen.lock().unwrap().error = Some(e.clone());
+            tracing::warn!("worker {} did not take the {kind} request ({e}); made here", w.name);
+            return here().await;
+        }
+    };
+    if kind != "compose" {
+        // the file itself: streamed back, the row closed and the worker freed once it is all sent
+        let ok = r.status().is_success();
+        let (rp, body) = r.into_parts();
+        let guard = (RemoteRow { mon, id: rid, finish: if ok { "stop" } else { "error" } }, held);
+        let stream = futures::StreamExt::map(body.into_data_stream(), move |c| { let _ = &guard; c });
+        return Response::from_parts(rp, Body::from_stream(stream));
+    }
+    // a job there: one here that follows it, so the caller polls this server as usual
+    let status = r.status();
+    let raw = axum::body::to_bytes(r.into_body(), 4 << 20).await.unwrap_or_default();
+    let job: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    let Some(remote_id) = job["id"].as_str().filter(|_| status.is_success()).map(str::to_string) else {
+        mon.remote_end(rid, "error");
+        let mut resp = Response::new(Body::from(raw));
+        *resp.status_mut() = status;
+        resp.headers_mut().insert("content-type", axum::http::HeaderValue::from_static("application/json"));
+        return resp;
+    };
+    let thumb = parts.uri.path().ends_with("/thumbnails");
+    let (n, mut answer) = s.media_jobs.submit_remote(if thumb { "thumbnail" } else { "compose" }, &v, &w.name, &remote_id);
+    answer["worker"] = json!(w.name);
+    let s2 = s.clone();
+    tokio::spawn(async move {
+        let out = follow(&w, &remote_id).await;
+        mon.remote_end(rid, if out.is_ok() { "stop" } else { "error" });
+        drop(held);
+        s2.media_jobs.finish_remote(n, out);
+    });
+    axum::Json(answer).into_response()
+}
+
+/// A worker's media job followed until it is done, then its file read: (mime, bytes, meta).
+async fn follow(w: &Worker, id: &str) -> Result<(String, Vec<u8>, Value), String> {
+    let start = Instant::now();
+    let mut misses = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if start.elapsed() > Duration::from_secs(12 * 3600) {
+            return Err(format!("worker {} did not finish {id} in 12 hours", w.name));
+        }
+        let r = w.client.get(format!("{}/v1/media/jobs/{id}", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(10)).send().await;
+        let v: Value = match r {
+            Ok(r) if r.status().is_success() => r.json().await.unwrap_or(Value::Null),
+            Ok(r) => return Err(format!("worker {} answered HTTP {} for {id}", w.name, r.status().as_u16())),
+            Err(e) => {
+                misses += 1;
+                if misses > 60 { return Err(format!("worker {} stopped answering about {id}: {}", w.name, error_chain(&e))); }
+                continue;
+            }
+        };
+        misses = 0;
+        match v["state"].as_str() {
+            Some("done") => break,
+            Some("error") => return Err(format!("on worker {}: {}", w.name, v["error"].as_str().unwrap_or("failed"))),
+            _ => {}
+        }
+    }
+    let r = w.client.get(format!("{}/v1/media/jobs/{id}/content", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(600))
+        .send().await.map_err(|e| error_chain(&e))?;
+    let mime = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("application/octet-stream").to_string();
+    let st = w.client.get(format!("{}/v1/media/jobs/{id}", w.base())).bearer_auth(&w.key).timeout(Duration::from_secs(10)).send().await
+        .ok();
+    let bytes = r.bytes().await.map_err(|e| error_chain(&e))?.to_vec();
+    let mut meta = match st { Some(r) => r.json::<Value>().await.map(|v| v["meta"].clone()).unwrap_or(Value::Null), None => Value::Null };
+    if !meta.is_object() { meta = json!({}); }
+    meta["worker"] = json!(w.name);
+    Ok((mime, bytes, meta))
 }
 
 /// GET /api/cluster: this node, its workers (what they hold and whether they answer), the servers found on the LAN
@@ -883,12 +1156,73 @@ pub async fn remove(axum::extract::State(s): axum::extract::State<crate::AppStat
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_media_request_travels_only_when_its_files_are_in_it() {
+        // data: URLs and web addresses go with the request; this PC's job ids, library ids and paths do not
+        assert!(portable(&json!({"audio": "data:audio/wav;base64,UklG", "shots": [{"image": "https://x.org/a.png"}], "size": "1080x1920"})));
+        assert!(!portable(&json!({"audio": "mj-12", "shots": []})));
+        assert!(!portable(&json!({"shots": [{"clip": "mf_ab12cd"}]})));
+        assert!(!portable(&json!({"audio": "/home/me/song.wav"})));
+        assert!(!portable(&json!({"image": "file:///tmp/a.png"})));
+        assert!(!portable(&json!({"image": "C:\\pics\\a.png"})));
+        // the words are words: a prompt or caption that starts with a slash is not a path
+        assert!(portable(&json!({"prompt": "/imagine a lighthouse", "captions": [[0.0, 1.0, "/ chorus"]]})));
+    }
+
+    #[test]
+    fn a_media_job_goes_to_an_idle_worker_that_can_make_it() {
+        let c = Cluster::empty();
+        c.add_test_worker("mac", &["m"], true);
+        c.add_test_worker("pc2", &["m"], true);
+        for w in c.workers() {
+            w.seen.lock().unwrap().media = if w.name == "mac" { vec!["compose".into(), "stt".into()] } else { vec!["image".into()] };
+        }
+        assert_eq!(c.pick_media("compose", true).map(|w| w.name.clone()).as_deref(), Some("mac"));
+        assert_eq!(c.pick_media("image", true).map(|w| w.name.clone()).as_deref(), Some("pc2"));
+        assert!(c.pick_media("music", false).is_none(), "nobody can make music");
+        // busy with a job this master sent: not idle, so not picked while this PC could make it itself
+        let mac = c.workers().into_iter().find(|w| w.name == "mac").unwrap();
+        let held = Inflight::new(mac.clone());
+        assert!(c.pick_media("compose", true).is_none());
+        assert_eq!(c.pick_media("compose", false).map(|w| w.name.clone()).as_deref(), Some("mac"), "this PC cannot: the busy one still");
+        drop(held);
+        assert!(mac.idle());
+    }
+
+    #[test]
+    fn a_workers_capabilities_name_the_kinds_it_can_make() {
+        let caps = json!({"available": true, "compose": true, "kinds": {"image": {"usable": true}, "video": {"usable": false}, "stt": {"usable": true}}});
+        let mut k = media_kinds(&caps);
+        k.sort();
+        assert_eq!(k, ["compose", "image", "stt"]);
+        // an older worker says nothing of compose: it is not sent any
+        assert_eq!(media_kinds(&json!({"kinds": {}})), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_routed_tools_carry_the_profile_without_memory_and_the_body_turns_memory_off() {
+        let p = crate::clients::Profile::generated("agent-1".into(), ["web", "image", "memory", "mcp:files"].iter().map(|s| s.to_string()).collect(), "a".into());
+        let r = Routing { profile: Some(p), needs_master: true, tools: true, overflow_any: false };
+        let h = r.headers();
+        assert_eq!(h[0], ("x-strata-routed-tools", "web,image".to_string()));
+        assert_eq!(h[1].1, "agent-1");
+        // an agent never overflows to whatever model a worker has loaded
+        assert!(!r.plain_chat());
+        let b = r.body_for_worker(&axum::body::Bytes::from(r#"{"model":"m","strata_mcp":true,"strata_memory":true}"#));
+        let v: Value = serde_json::from_slice(&b).unwrap();
+        assert!(v.get("strata_mcp").is_none());
+        assert_eq!(v["strata_memory"], false);
+        // the main key's plain chat (the web app's) may go to another loaded model, with no extra headers
+        let plain = Routing { profile: None, needs_master: false, tools: false, overflow_any: false };
+        assert!(plain.plain_chat() && plain.headers().is_empty());
+    }
     use super::*;
 
     fn worker(name: &str, models: &[&str], current: Option<&str>, waiting: usize, seen: bool) -> Arc<Worker> {
         let w = Worker::new(name.into(), "http://x".into(), "k".into(), None, false);
         *w.seen.lock().unwrap() = Seen { models: models.iter().map(|m| m.to_string()).collect(), current: current.map(str::to_string),
-                                         waiting, running: false, at: seen.then(Instant::now), error: None, routed: 0 };
+                                         waiting, running: false, at: seen.then(Instant::now), error: None, routed: 0, ..Default::default() };
         w
     }
 

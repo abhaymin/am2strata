@@ -158,6 +158,19 @@ pub fn ffmpeg_available() -> bool {
     Command::new(crate::server_tls::program("ffmpeg")).arg("-version").output().is_ok_and(|o| o.status.success())
 }
 
+/// `ffmpeg_available`, asked at most once a minute (a cluster master reads it with each worker's capabilities).
+pub fn ffmpeg_cached() -> bool {
+    static AT: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    if let Some((t, v)) = *AT.lock().unwrap() {
+        if t.elapsed() < std::time::Duration::from_secs(60) {
+            return v;
+        }
+    }
+    let v = ffmpeg_available();
+    *AT.lock().unwrap() = Some((std::time::Instant::now(), v));
+    v
+}
+
 fn video_source(part: &Value) -> Option<String> {
     let kind = part.get("type").and_then(Value::as_str)?;
     if !matches!(kind, "video_url" | "video" | "input_video") {

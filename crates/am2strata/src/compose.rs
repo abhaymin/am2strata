@@ -505,7 +505,7 @@ mod tests {
         for _ in 0..3 { args.extend(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=2"].map(String::from)); }
         args.extend(["-filter_complex".into(), format!("{chain}fade=t=in:st=0:d=1.0,format=yuv420p[out]"),
                      "-map".into(), "[out]".into(), "-f".into(), "null".into(), "-".into()]);
-        let out = std::process::Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error"]).args(&args).output().unwrap();
+        let out = std::process::Command::new(crate::server_tls::program("ffmpeg")).args(["-hide_banner", "-loglevel", "error"]).args(&args).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
     use super::*;

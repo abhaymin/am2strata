@@ -156,6 +156,10 @@ impl Jobs {
     /// Run again the jobs the server stopped in (after `bind`).
     pub fn resume(&self, jobs: Vec<(u64, &'static str, Value)>) {
         for (n, kind, req) in jobs {
+            if let Some(w) = req["remote"].as_str() {
+                self.finish(n, Err(format!("this server restarted while worker {w} was making it; make it again")));
+                continue;
+            }
             tracing::info!("media job mj-{n} ({kind}) was not finished when the server stopped: it runs again");
             let s = self.app().clone();
             tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
@@ -312,6 +316,13 @@ impl Jobs {
     /// GET /api/media/capabilities: per kind, the model in use, whether it is downloaded and fits this PC, its sizes
     /// and limits, and the time the last job of it took.
     pub async fn capabilities(&self) -> Value {
+        let mut v = self.capabilities_of_engine().await;
+        // compose and thumbnails need only ffmpeg (a cluster master sends them to a worker that has it)
+        v["compose"] = json!(crate::media::ffmpeg_cached());
+        v
+    }
+
+    async fn capabilities_of_engine(&self) -> Value {
         if let Some((at, v)) = self.caps.lock().unwrap().clone() {
             if at.elapsed() < Duration::from_secs(60) || self.app().media.busy() {
                 return self.with_speeds(v);
@@ -726,6 +737,38 @@ impl Jobs {
     }
 
     /// Update a job's meta (a compose's progress, or a production's current part).
+    /// A job a cluster worker makes (cluster.rs follows it there): queued here under this server's own id, so the
+    /// caller polls this server as for any job. Its request is not kept (the worker has it); a restart ends it.
+    pub fn submit_remote(&self, kind: &'static str, req: &Value, worker: &str, remote_id: &str) -> (u64, Value) {
+        let n = {
+            let mut g = self.next.lock().unwrap();
+            *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
+            *g - 1
+        };
+        let id = format!("mj-{n}");
+        let shots = req["shots"].as_array().map(Vec::len).unwrap_or(0);
+        let prompt = if kind == "compose" { format!("{shots} shots") } else { "thumbnail".to_string() };
+        let job = Job { id: id.clone(), kind, model: "compose".into(), prompt, created: crate::now(), state: "queued", error: None,
+                        mime: None, data: None, meta: json!({"worker": worker, "remote_id": remote_id, "now": "on worker"}),
+                        seconds: None, req: json!({"remote": worker, "remote_id": remote_id}), file: None };
+        self.save(&job);
+        self.jobs.lock().unwrap().insert(n, job);
+        (n, json!({"id": id, "kind": kind_of(kind), "model": "compose", "shots": shots, "url": format!("/api/jobs/{id}")}))
+    }
+
+    /// A worker's job finished: its file (or why not) recorded here.
+    pub fn finish_remote(&self, n: u64, r: Result<(String, Vec<u8>, Value), String>) {
+        self.finish(n, r);
+    }
+
+    /// Jobs of these kinds queued or running here (not those a worker makes).
+    pub fn active(&self, kinds: &[&str]) -> usize {
+        self.jobs.lock().unwrap().values().filter(|j| j.state == "queued" && kinds.contains(&j.kind) && j.req.get("remote").is_none()).count()
+    }
+
     pub fn set_meta(&self, n: u64, meta: Value) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(j) = jobs.get_mut(&n) {

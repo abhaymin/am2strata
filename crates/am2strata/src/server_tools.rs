@@ -37,8 +37,10 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
                    -> Result<Offered, Response> {
     let mut offered: Offered = None;
     // the key's client profile (the main key's "default" one, if the run config has it), narrowed by x-strata-tools
-    let mut profile = crate::api_access(s, headers).flatten();
-    if let Some(h) = headers.get("x-strata-tools").and_then(|v| v.to_str().ok()) {
+    // a request a cluster master routed here: the caller's tool sets it sent, never this worker's memory or MCP servers
+    let routed = crate::is_master_request(s, headers);
+    let mut profile = if routed { crate::routed_profile(s, headers) } else { crate::api_access(s, headers).flatten() };
+    if let Some(h) = headers.get("x-strata-tools").and_then(|v| v.to_str().ok()).filter(|_| !routed) {
         profile = match profile {
             Some(p) => Some(p.narrowed(h).map_err(|e| error(StatusCode::FORBIDDEN, "permission_error", e))?),
             None => return Err(error(StatusCode::FORBIDDEN, "permission_error",
@@ -48,7 +50,9 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
     let has = |set: &str| profile.as_ref().is_some_and(|p| p.has(set));
     let client = profile.as_ref().filter(|p| p.name != "default");
     // memory: a client profile's requests use its own space, and only when the profile has memory
-    if let Some(p) = client {
+    if routed {
+        opts.memory = None;
+    } else if let Some(p) = client {
         opts.memory = p.has("memory").then(|| p.memory_space());
     } else if opts.memory.is_none() && has("memory") {
         opts.memory = Some(profile.as_ref().map(|p| p.memory_space()).filter(|m| m != "default").unwrap_or_else(|| "api".into()));
@@ -59,7 +63,7 @@ pub async fn offer(s: &AppState, headers: &HeaderMap, req: &Value, prep: &mut Pr
     }
     // MCP tools run with the user's rights on this PC: every server for this server's own page (strata_mcp), or the
     // servers a profile names (address servers with mcp:*; a program server only by its name); never another web page
-    let flag_mcp = req.get("strata_mcp").and_then(Value::as_bool) == Some(true);
+    let flag_mcp = !routed && req.get("strata_mcp").and_then(Value::as_bool) == Some(true);
     let (mcp_names, mcp_all) = profile.as_ref().map(|p| p.mcp()).unwrap_or_default();
     if let (true, Some(hub)) = (flag_mcp || !mcp_names.is_empty() || mcp_all, s.mcp.clone()) {
         if crate::foreign_origin(s, headers) {

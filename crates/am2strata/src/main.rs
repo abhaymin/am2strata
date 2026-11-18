@@ -275,6 +275,24 @@ pub fn authorized_or_master(state: &AppState, headers: &HeaderMap) -> bool {
     authorized(state, headers) || clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k, cluster_tls::peer_of(headers)))
 }
 
+/// On a worker: the request came from a cluster master, with the key this worker gave it (on its pinned link).
+pub fn is_master_request(state: &AppState, headers: &HeaderMap) -> bool {
+    !authorized(state, headers)
+        && clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k, cluster_tls::peer_of(headers)))
+}
+
+/// On a worker: the tool sets a master sent with a request it routed here (x-strata-routed-tools: the caller's
+/// profile on the master, without memory and MCP, which stay there), as a profile of its own. None without the header.
+pub fn routed_profile(state: &AppState, headers: &HeaderMap) -> Option<clients::Profile> {
+    if !is_master_request(state, headers) {
+        return None;
+    }
+    let sets = headers.get("x-strata-routed-tools")?.to_str().ok()?;
+    let tools = sets.split(',').map(str::trim).filter(|t| *t != "memory" && clients::SETS.contains(t)).map(str::to_string).collect();
+    let who = headers.get("x-strata-routed-for").and_then(|v| v.to_str().ok()).unwrap_or("master");
+    Some(clients::Profile::generated(format!("routed:{who}"), tools, "routed".into()))
+}
+
 pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     api_access(state, headers).is_some()
 }
