@@ -372,7 +372,7 @@ fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     let file = expand_path(Path::new(first.ok_or("check needs a file")?));
     let url_ = data_url(&file)?;
     // a video goes in "video" (its frames are checked, and its picture against its sound); a take in "audio"
-    let body = if url_.starts_with("data:video/") { json!({"video": url_}) } else { check_body(&url_, o.expect.as_deref(), o.language.as_deref()) };
+    let body = if url_.starts_with("data:video/") { json!({"video": url_, "near_floor": 0.15}) } else { check_body(&url_, o.expect.as_deref(), o.language.as_deref()) };
     let r = send(client.post(format!("{url}/v1/media/check")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let mut problems = 0usize;
