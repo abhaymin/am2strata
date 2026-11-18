@@ -771,3 +771,18 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .machine { border: 1px solid var(--st-line-soft); border-radius: var(--st-r-lg); padding: 10px; display: grid; gap: 6px; font-size: 13px; }
 .machine b { font-size: 14px; }
 .machine .muted { font-size: 12px; }
+
+/* Monitor layout: the machines as a compact strip above the row; Recent requests gets the wide column beside
+   Context fill; the conversation cache is one short block */
+.machines-card { display: flex; align-items: center; gap: var(--st-s-4); padding-block: 10px; }
+.machines-card .card-title { flex: none; }
+.machines-card .machines { flex: 1; display: flex; flex-wrap: wrap; gap: 8px; }
+.machines-card .machine { display: flex; align-items: baseline; gap: 10px; padding: 6px 12px; flex: 0 1 auto; }
+.st-metric__value--long { font-size: clamp(16px, 1.4vw, 22px) !important; overflow-wrap: anywhere; }
+.speed-values { min-width: 0; }
+.speed-values > div { min-width: 0; }
+.cc-card { gap: 6px; padding-block: 12px; }
+.cc-card .facts { display: flex; flex-wrap: wrap; gap: 4px 8px; font-size: 13px; }
+.cc-card .facts dt::after { content: ":"; }
+.cc-card .facts dd { margin-right: var(--st-s-5); }
+.cc-card .cc-note { font-size: 12px; }

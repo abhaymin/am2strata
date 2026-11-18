@@ -1025,7 +1025,9 @@ function spark(id, values, max) {
   svg.querySelector(".area").setAttribute("d", `${line}L100,32L0,32Z`);
 }
 function setMetric(key, value, unit, sub) {
-  $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  const el = $(`mv-${key}`);
+  el.innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
+  el.classList.toggle("st-metric__value--long", value != null && String(value).length > 6); // a seed: 10 digits
   $(`ms-${key}`).textContent = sub || "";
 }
 

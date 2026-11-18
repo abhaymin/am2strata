@@ -435,6 +435,11 @@
 
       <div class="metrics" id="metrics"></div>
 
+      <div class="st-card machines-card" id="machines-card" hidden>
+        <span class="card-title">Machines</span>
+        <div class="machines" id="machines"></div>
+      </div>
+
       <div class="monitor-row">
         <div class="st-card ctx-card">
           <span class="card-title">Context fill</span>
@@ -453,10 +458,6 @@
           <div class="st-progress" id="ram-progress"><div class="st-progress__bar" id="ram-bar" style="width:0%"></div></div>
           <div class="bar-row"><span>GPU temperature</span><span class="muted" id="temp-text">&ndash;</span></div>
           <div class="st-progress" data-tone="warn"><div class="st-progress__bar" id="temp-bar" style="width:0%"></div></div>
-        </div>
-        <div class="st-card machines-card" id="machines-card" hidden>
-          <span class="card-title">Machines</span>
-          <div class="machines" id="machines"></div>
         </div>
         <div class="st-card req-card">
           <div class="req-head"><span class="card-title">Recent requests</span>
