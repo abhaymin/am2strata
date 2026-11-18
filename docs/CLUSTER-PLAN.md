@@ -341,3 +341,53 @@ The numbers go in this file before the feature is called done.
 - llama.cpp's RPC backend (`rpc-server`): layers on remote machines; MIT licence, like the rest of llama.cpp.
 - Petals: layers across volunteers' machines over the internet.
 - Prior art on ring attention for long context.
+
+## One machine (owner, 2026-11-19)
+
+The owner's aim: the machines bond into **one larger machine**. Models, data, tools, compute, memory, storage and
+caches are shared through am2Strata's own pipeline. Each machine is the **main** one for the people using it, and the
+others are its subordinates; this works both ways, so the PC uses the Mac and the Mac uses the PC. It must work with
+**any number** of machines, not just two.
+
+It goes in phases. Each phase is measured before anything is claimed (see "Measurements before any claim").
+
+| # | Part | What it means | Status |
+|---|---|---|---|
+| A | Chat routing | a chat goes to the machine that has its model, or to an idle one when this one is busy | built (phase 1) |
+| B | Media routing | images, video, music, speech, transcription, compose and thumbnails go to an idle machine that can make them; a compose comes back as a job of the main machine's own | built, 1c3f457 |
+| C | Tools travel with a request | a routed request keeps its caller's tool sets (`x-strata-routed-tools`); memory and MCP stay on the main machine | built, 1c3f457 |
+| D | Both ways | each machine pairs with the other as its master too, so either can be the main one; the masters list and the workers list already allow it, and pairing in both directions is tested | next |
+| E | Tools across machines | a tool that exists on one machine only (its browser, its desktop, an MCP server, a model) is called from the other over the pinned link: a `remote_tool` call that the receiving side runs for its master's key, with the results streamed back | next |
+| F | Models and data shared | a model or media file on one machine is copied to another by am2Strata itself: content-addressed (the media library ids are hashes already), resumable, over the pinned TLS link, checked by hash, so no machine downloads the same model twice from the internet | next |
+| G | Caches shared | a prompt's KV prefix (the system prompt of an agent, a long document) made on one machine is reused by the other when it is cheaper to send than to recompute; embeddings and web-fetch caches are shared by key | after F |
+| H | Compute and memory pooled | one model split by layers across machines (phase 2 above: pipeline parallel, KV kept where its layers are). This is what pools memory: a model bigger than one machine runs at all, and the context is longer | after F, measured against llama.cpp RPC |
+| I | Storage pooled | a job's files are kept where they were made and read through the main machine (they already are, for media jobs); the free disk of each machine is shown and used by F | after F |
+
+**What the physics allows.** These limits are honest and are shown in the app:
+- Pooling **memory capacity** works: a larger model fits, and the context gets longer.
+- Pooling **memory bandwidth** does not speed up a single answer over Ethernet or Wi-Fi. Each token crosses every
+  machine in turn, so one answer is never faster than on the fastest single machine.
+- **Throughput** does add up: different requests and different media jobs run at the same time on different
+  machines. That is what parts A and B give today.
+- Over a USB4 or Thunderbolt link, splitting layers across machines may pay off even for a single answer. That is
+  measured first, not claimed.
+
+## Native media pipeline (owner, 2026-11-19)
+
+Compose and thumbnails need ffmpeg today, a tool to install on every machine. The aim: am2Strata's media engine does
+this itself, in Rust, so a new machine needs nothing else. Parts:
+- **Decode:**
+  - symphonia for audio (already in strata-media);
+  - openh264 for H.264 clips (already there, bundled and built from source);
+  - the `image` crate for pictures.
+- **Pictures:** scale, crop and zoompan done in Rust (bilinear, sub-pixel), and crossfades as a per-pixel blend in
+  yuv420p.
+- **Captions and cards:** rustybuzz for shaping (Devanagari and Malayalam need it) and ab_glyph to draw the glyphs,
+  with the fonts the app already ships plus Noto Devanagari/Malayalam. Fade in and out as libass is used today.
+- **Encode:**
+  - openh264 for H.264;
+  - the `mp4` crate to mux (already there, faststart);
+  - audio as Opus in MP4 (libopus is bundled and built from source; YouTube accepts it), with AAC-LC as a later step.
+- **Gate:** the same inputs through ffmpeg and through the Rust path are checked frame by frame, with SSIM ≥ 0.98 on
+  sampled frames, the same length within one frame, and audio within 1 ms. ffmpeg stays as the fallback until the
+  gate passes on both the PC and the Mac.
