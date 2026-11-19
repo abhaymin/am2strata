@@ -303,16 +303,37 @@ async fn transcribe_as(s: &AppState, b64: &str, language: Option<&str>, accurate
     }
 }
 
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn transcriptions(State(s): State<AppState>, headers: HeaderMap, req: Request) -> Response {
+    crate::run_detached(transcriptions_now(State(s), headers, req)).await
+}
+
+async fn transcriptions_now(State(s): State<AppState>, headers: HeaderMap, req: Request) -> Response {
     transcribe(s, headers, req, false).await
 }
 
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn translations(State(s): State<AppState>, headers: HeaderMap, req: Request) -> Response {
+    crate::run_detached(translations_now(State(s), headers, req)).await
+}
+
+async fn translations_now(State(s): State<AppState>, headers: HeaderMap, req: Request) -> Response {
     transcribe(s, headers, req, true).await
 }
 
 /// POST /v1/audio/speech
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn speech(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(speech_now(State(s), headers, Json(req))).await
+}
+
+async fn speech_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }

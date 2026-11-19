@@ -1445,6 +1445,21 @@ fn an_answer_for_a_client_that_went_away_does_not_go_to_the_next_request() {
     assert_eq!((code, r["task"].as_str()), (200, Some("transcribe")), "{r}");
 }
 
+/// 2026-11-19, am2Strata's producer: a `media image` client with a 60 s timeout gave up while the picture was made;
+/// the handler (and its GPU turn) was dropped, the queue gave the GPU to the next chat, and the text model was started
+/// again and again over the media engine still working on the GPU. Now the job keeps its turn until it is done.
+#[test]
+fn a_media_job_keeps_the_gpu_after_its_client_gives_up() {
+    let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 2500, "mem_gb": 64}));
+    let gone = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_millis(300)).build().unwrap()
+        .post(format!("{}/v1/images/generations", s.base)).bearer_auth(KEY).json(&json!({"prompt": "a lighthouse"})).send();
+    assert!(gone.is_err(), "the client should have timed out");
+    // a moment later the engine is still working: the queue still shows the media job running
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    let (_, q) = s.get("/api/queue", true);
+    assert_eq!(q["running"]["kind"], "media", "the media job still holds the GPU after its client left: {q}");
+}
+
 #[test]
 fn the_media_catalog_answers_at_once_while_an_image_is_made() {
     let s = Server::start(&[Model::default()], &[ids("x")], json!({"media_delay_ms": 3000}));

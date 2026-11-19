@@ -294,6 +294,16 @@ pub fn routed_profile(state: &AppState, headers: &HeaderMap) -> Option<clients::
     Some(clients::Profile::generated(format!("routed:{who}"), tools, "routed".into()))
 }
 
+/// Run a request's work as its own task (with the queue's priority and client carried over) and wait for it. If the
+/// client goes away, only the waiting stops: the work finishes and its GPU turn is held until then.
+pub async fn run_detached<F>(fut: F) -> Response
+where F: std::future::Future<Output = Response> + Send + 'static {
+    match tokio::spawn(crate::queue::carry(fut)).await {
+        Ok(r) => r,
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("the job stopped: {e}")),
+    }
+}
+
 pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     api_access(state, headers).is_some()
 }

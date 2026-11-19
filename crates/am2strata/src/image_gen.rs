@@ -263,7 +263,14 @@ fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(generations_now(State(s), headers, Json(req))).await
+}
+
+async fn generations_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     images(s, headers, req, Vec::new(), None).await
 }
 
@@ -865,7 +872,14 @@ fn starting_image(req: &Value) -> Result<Option<String>, String> {
 /// image. Longer than one clip ("seconds" or "total_frames" past `frames`): a chain of clips (mold's chain, each
 /// continuing from the one before on a model that takes a source image), stitched into one video. The answer is the clip
 /// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(video_generations_now(State(s), headers, Json(req))).await
+}
+
+async fn video_generations_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }

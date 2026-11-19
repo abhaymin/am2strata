@@ -104,7 +104,14 @@ fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn music(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(music_now(State(s), headers, Json(req))).await
+}
+
+async fn music_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
