@@ -100,6 +100,13 @@ fn media_cli_writes_and_reports_like_the_server() {
     assert!(!ok, "a clipped take exits non-zero: {err}");
     assert!(err.contains("not ok") || out.contains("FAIL"), "reports the failing finding: {out} {err}");
 
+    // analyze reports the music facts of a take over HTTP: a sustained A3 (220 Hz) reads as its tonic, and it exits 0.
+    let chant = dir.join("chant.wav");
+    std::fs::write(&chant, wav_16(8_000, &tone_then_silence(8_000, 16_000, 220.0, 0.3, 8_000))).unwrap();
+    let (ok, out, err) = run(&s, &["analyze", "--", chant.to_str().unwrap()]);
+    assert!(ok && !out.is_empty(), "an analyze of a take prints music facts: stdout {out:?}, stderr {err:?}");
+    assert!(out.contains("A3"), "the sustained A3 (220 Hz) is reported as the tonic: {out}");
+
     // an unknown job id is refused with the server's message (it names the id) and a non-zero exit.
     let (ok, _, err) = run(&s, &["job", "--", "mj-999"]);
     assert!(!ok && !err.is_empty(), "unknown job exits non-zero: {err}");
@@ -110,4 +117,33 @@ fn media_cli_writes_and_reports_like_the_server() {
     assert!(!ok && !err.is_empty(), "missing --out is refused: {out} {err}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The endpoint forwards any audio to the media engine's `analyze` op and returns its analysis without the `event` field, so a
+/// client calling /v1/media/analyze gets exactly what the engine reports. `from_s`/`seconds` reach the engine (recorded on the
+/// engine's own command line) and come back echoed, proving a window was applied; it reads an MP3 too, which WAV-only would not.
+#[test]
+fn analyze_endpoint_forwards_to_the_engine_and_carries_the_window() {
+    let s = Server::start(&[Model::default()], &[], json!({}));
+
+    // POST to the endpoint with a take (here a WAV base64 data URL; an MP3 works the same way it never did when WAV-only) and a
+    // window, exactly like /v1/media/analyze's documented body {"audio", "from_s", "seconds"}.
+    let chant = wav_16(8_000, &tone_then_silence(8_000, 16_000, 220.0, 0.3, 8_000));
+    use base64::Engine as _;
+    let data_url = format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(&chant));
+    let (code, j) = s.post("/v1/media/analyze", &json!({"audio": data_url, "from_s": 30, "seconds": 60}));
+
+    assert_eq!(code, 200, "the analyze endpoint answers: {j}");
+    assert!(j.get("event").is_none(), "the analysis comes back without its event field: {j}");
+    // the window reached the engine and came back echoed ...
+    assert_eq!(j["from_s"].as_f64(), Some(30.0), "from_s echoed: {j}");
+    assert_eq!(j["seconds"].as_f64(), Some(60.0), "seconds echoed: {j}");
+    // ... recorded on the engine's own command line, so it is not only the mock being asked to lie about it
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap_or_default();
+    assert!(rec.lines().any(|l| l.contains("\"op\":\"analyze\"") && l.contains("\"from_s\":30") && l.contains("\"seconds\":60")),
+            "the analyze command carried from_s/seconds to the engine: {rec}");
+
+    // no key is refused, as with /v1/media/check
+    let no_key = reqwest::blocking::Client::new().post(format!("{}/v1/media/analyze", s.base)).json(&json!({"audio": "AAAA"})).send().unwrap();
+    assert_eq!(no_key.status().as_u16(), 401, "a request without a key is unauthorized");
 }

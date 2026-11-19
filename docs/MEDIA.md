@@ -16,6 +16,7 @@ am2strata-run media speak "Welcome to the evening set." --voice laura --out intr
 am2strata-run media transcribe take.wav --model whisper-base            # its text on stdout (or --format srt|vtt|text)
 am2strata-run media song "warm acoustic ballad, female vocal" --lyrics words.txt --seconds 180 --out song.wav
 am2strata-run media check take.wav --expect "Welcome to the evening set."   # prints each finding; exit 1 when any is not ok
+am2strata-run media analyze take.wav --from 300 --seconds 120   # music facts of that window: tempo, repeat, tonic+range, swaras, phrases
 am2strata-run media dub dub-request.json --out soundtrack.wav
 am2strata-run media produce plan.json --out set.wav                     # posts the plan, polls step N of M, then downloads it
 am2strata-run media job mj-1234 --out set.wav                           # its status; with --out also /content
@@ -240,6 +241,23 @@ so the picture does not move:
 - **Without `heard_text`,** the take is transcribed in its own language with the most accurate Whisper on the server.
 - **Video checks need ffmpeg** (GAPS-PLAN A14).
 - **In the web app:** the Tools tab has a Check card — drop a take or a video, give the expected words if you have them, and it shows each check's result as pass or fail.
+
+## Analyzing the music of a take
+
+`POST /v1/media/analyze`: the facts a producer needs to learn before making a matching take — tempo, the drone's key and
+home note (the tonic), the notes the voice sits on (the swaras) with how long it spends on each, and every phrase with its
+timing and notes. It is pure math over the audio (a CPU job in the media engine, no model, no FFT), so it answers instantly
+for any size file it reads — MP3, WAV, FLAC, AAC, OGG — at most 200 MiB:
+
+```json
+{"audio": "data:audio/mp3;base64,…", "from_s": 0, "seconds": 0}
+```
+
+`from_s`/`seconds` select a window (both 0 mean the whole take); the CLI is `am2strata-run media analyze <file> [--from S] [--seconds N]`.
+The endpoint forwards the raw bytes to the engine's `analyze` op and returns its analysis (like `/v1/audio/transcriptions`
+forwards `transcribe`). The answer carries `tempo` (bpm, confidence, whether it is a steady pulse), `repeat` (one verse's
+period and how many times it repeats), `pitch.tonic` (note + hertz) with the `range`, each `swara` as `{name, share}`, and a
+`phrases` list. Send the file as a multipart `file` or as base64 / a data URL in JSON.
 
 ## Media from a chat
 

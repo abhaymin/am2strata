@@ -81,6 +81,20 @@ fn main() {
                     "duration": 1.5, "task": if cmd["translate"] == true { "translate" } else { "transcribe" }, "bytes_b64": n,
                     "device": cmd["device"], "segments": [{"id": 0, "start": 0.0, "end": 1.5, "text": text}]}));
             }
+            // media analyze (CPU only, no model): a fixed, plausible music analysis for the tests (window echoed so a test
+            // can see from_s / seconds reached it); the real engine does the DSP over MP3, WAV, FLAC, AAC, OGG
+            "analyze" => {
+                let r = serde_json::json!({"event": "analysis", "from_s": cmd["from_s"].clone(), "seconds": cmd["seconds"].clone(),
+                    "tempo": {"bpm": 60.0, "confidence": 0.25, "steady_pulse": false},
+                    "repeat": {"period_s": 20.3, "confidence": 0.53, "repeats_in_section": 6.0},
+                    "pitch": {"tonic": {"hz": 220.0, "note": "A3", "confidence": 0.70},
+                              "range": {"low_hz": 140.0, "high_hz": 380.0},
+                              "swaras": [{"name": "Sa", "share": 0.50}, {"name": "Pa", "share": 0.30}, {"name": "ma", "share": 0.20}]},
+                    "phrases": [
+                        {"start_s": 1.0, "end_s": 6.0, "median_note": "A3", "notes": ["Sa", "Pa"]},
+                        {"start_s": 8.0, "end_s": 12.0, "median_note": "A3", "notes": ["Sa"]}]});
+                emit(r);
+            }
             "song" => {
                 for s in 1..=8u64 {
                     emit(serde_json::json!({"event": "step", "step": s, "total": 8}));

@@ -47,6 +47,7 @@ mod media;
 mod compose;
 mod captions;
 mod media_check;
+mod media_analyze;
 mod media_dub;
 mod media_jobs;
 mod model_remove;
@@ -652,6 +653,7 @@ async fn main() -> Result<()> {
         .route("/v1/media/videos/compose", post(compose::compose_videos))
         .route("/v1/media/thumbnails", post(compose::thumbnails))
         .route("/v1/media/check", post(media_check::check_endpoint))
+        .route("/v1/media/analyze", post(media_analyze::analyze_endpoint))
         .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/search/images", post(image_search::images))
