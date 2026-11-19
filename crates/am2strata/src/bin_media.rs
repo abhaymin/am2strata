@@ -626,7 +626,9 @@ pub const JUDGE_RUBRIC: &str = "You are the strict final reviewer of a video bef
 evenly over the video, in order, and its brief. Score each part from 1 (bad) to 10 (perfect), looking only at what the \
 frames show: \
 picture (sharp, no artefacts, no warped hands, faces, animals or objects, no garbled text in the pictures), \
-captions (readable, not cut off, not covering the subject, the right words for the brief), \
+captions (readable, not cut off, not covering the subject, and the words you can see are correct words of the \
+brief's lyrics; you see only some frames, so a lyric line that is not in your frames was shown between them: never \
+count it as missing or skipped, and a line seen twice is a repeated chorus, not an error), \
 fit (every scene matches the brief's subject and mood; nothing off-topic or unsafe for a general audience), \
 sequence (the scenes flow in a sensible order with variety, no near-duplicate shots in a row, a strong opening that \
 makes a viewer stay in the first seconds, a clear ending), \
