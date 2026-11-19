@@ -125,11 +125,12 @@ pub fn ass_script(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<
         let t = format!("{{\\fad(250,250)}}{}", ass_text(text));
         out.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,120,,{}\n", ass_time(*a), ass_time(*b), t));
     }
+    let (title_end, end_len) = crate::captions::card_times(total);
     if let Some(t) = open {
-        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time(0.5), ass_time(9.0_f64.min(total)), ass_text(t)));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time(0.5), ass_time(title_end), ass_text(t)));
     }
     if let Some(t) = end {
-        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time((total - 10.0).max(0.0)), ass_time(total), ass_text(t)));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time((total - end_len).max(0.0)), ass_time(total), ass_text(t)));
     }
     out
 }
@@ -807,10 +808,10 @@ mod tests {
     #[test]
     fn the_captions_are_written_as_ass_for_libass() {
         let captions = vec![(0.5, 2.5, "Hello world".to_string()), (3.0, 5.0, "made by am2Strata".to_string())];
-        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 60.0);
+        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 200.0);
         // ASS's own line format: "Dialogue: Layer,Start,End,Style,...", so libass shows them (a "0=" was skipped)
         assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:02.50,Cap,"), "{ass}");
-        assert!(ass.contains("Dialogue: 0,0:00:50.00,0:01:00.00,Ttl,"), "the end card is the last 10 s: {ass}");
+        assert!(ass.contains("Dialogue: 0,0:03:10.00,0:03:20.00,Ttl,"), "a long video's end card is its last 10 s: {ass}");
         assert!(!ass.contains("Dialogue: 0="), "{ass}");
         let two = ass_script(1280, 720, &[(0.0, 1.0, "line one\nline {two}".to_string())], None, None, 5.0);
         assert!(two.contains("line one\\Nline (two)"), "newlines become \\N and braces cannot start an override: {two}");

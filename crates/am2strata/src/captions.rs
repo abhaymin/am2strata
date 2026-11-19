@@ -245,9 +245,16 @@ pub fn overlays(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<&s
         out.push(Overlay { png, a, b, x: (w - bw) / 2, y: (h.saturating_sub(bh)) / 2 });
         Ok(())
     };
-    if let Some(t) = open { card(t, 0.5, 9.0_f64.min(total))?; }
-    if let Some(t) = end { card(t, (total - 10.0).max(0.0), total)?; }
+    let (title_end, end_len) = card_times(total);
+    if let Some(t) = open { card(t, 0.5, title_end)?; }
+    if let Some(t) = end { card(t, (total - end_len).max(0.0), total)?; }
     Ok(out)
+}
+
+/// When the title card ends and how long the end card stays: 9 s and 10 s on a long video, shorter on a short one, so
+/// a 56 s Short shows its first picture in under 4 s and the end card does not cover its last fifth.
+pub fn card_times(total: f64) -> (f64, f64) {
+    ((0.5 + total * 0.06).clamp(3.0, 9.0).min(total), (total * 0.07).clamp(4.0, 10.0).min(total))
 }
 
 /// The filtergraph that lays the overlays (inputs `first`, `first+1`, … each a looped picture of its own length) on
@@ -310,8 +317,12 @@ mod tests {
         let o = overlays(1920, 1080, &caps, Some("Title"), Some("The end"), 60.0).unwrap();
         assert_eq!(o.len(), 3);
         assert!(o[0].y > 800, "caption low: {}", o[0].y);
-        assert!(o[1].y > 300 && o[1].y < 600 && o[1].a == 0.5 && o[1].b == 9.0, "title in the middle");
-        assert_eq!((o[2].a, o[2].b), (50.0, 60.0), "end card over the last 10 s");
+        assert!(o[1].y > 300 && o[1].y < 600 && o[1].a == 0.5 && (o[1].b - 4.1).abs() < 1e-9, "title in the middle, briefly on a 60 s video");
+        assert!((o[2].a - 55.8).abs() < 1e-9 && o[2].b == 60.0, "end card over the last 4.2 s");
+        // a long video keeps the full holds; a Short gets short ones
+        assert_eq!(card_times(200.0), (9.0, 10.0));
+        let (t, e) = card_times(56.0);
+        assert!(t < 4.0 && (e - 4.0).abs() < 0.01, "{t} {e}");
         let f = overlay_filter(&o, 2, 60.0, 0.0);
         assert!(f.contains("[2:v]format=rgba") && f.contains("[4:v]") && f.contains("[o2]format=yuv420p[v]"), "{f}");
         assert!(overlay_filter(&[], 2, 60.0, 0.0).starts_with("[0:v]format=yuv420p[v];"));
