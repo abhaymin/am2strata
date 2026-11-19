@@ -16,9 +16,10 @@ wgpu = ["cubecl/wgpu"]
 [dependencies]
 # 0.10: the last release for rustc 1.93 (0.11 needs 1.95)
 cubecl = { version = "=0.10.0", default-features = false, features = ["std", "cpu"] }
+# the IQ quants' grids (kernels::table_for)
+strata-pack = { path = "../strata-pack" }
 
 [dev-dependencies]
-strata-pack = { path = "../strata-pack" }
 
 # the native Metal backend (src/native.rs): objc2's bindings, the versions wgpu already brings in
 [target.'cfg(target_os = "macos")'.dependencies]

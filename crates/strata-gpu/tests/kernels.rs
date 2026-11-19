@@ -37,6 +37,7 @@ fn weights(ty: &str, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
             "Q8_0" | "Q4_0" => put(&mut b, 0, rng.unit() * 0.05),
             "Q4_K" | "Q5_K" => { put(&mut b, 0, rng.unit() * 0.01); put(&mut b, 2, rng.unit() * 0.01); }
             "Q6_K" => put(&mut b, 208, rng.unit() * 0.01),
+            "IQ3_XXS" => put(&mut b, 0, rng.unit() * 0.01),
             _ => unreachable!(),
         }
         out.extend(b);
@@ -52,7 +53,7 @@ fn every_kernel_matches_the_cpu_on_every_device() {
     let (rows, cols, tokens) = (70, 512, 3); // 70 rows: not a multiple of the cube; 3 vectors at once
     let mut rng = Rng(0x9e3779b97f4a7c15);
     let x: Vec<f32> = (0..cols * tokens).map(|_| rng.unit()).collect();
-    for ty in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K"] {
+    for ty in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS"] {
         let w = weights(ty, rows, cols, &mut rng);
         let row_bytes = w.len() / rows;
         // the reference: each row dequantized on the CPU, a dot in f64
@@ -314,5 +315,14 @@ fn a_wide_q6k_ffn_down_matches_the_cpu_on_every_device() {
         let wrong = y.iter().zip(&want).filter(|(a, (b, m))| !(((**a as f64 - *b as f64).abs() / m) < 1e-3)).count();
         eprintln!("{}: {wrong} of {rows} rows wrong", d.name);
         assert_eq!(wrong, 0, "{}: a 3072 x 9216 Q6_K product has {wrong} wrong rows", d.name);
+    }
+}
+
+/// IQ3_XXS's sign table is computed in the kernels (the 7 bits and a parity bit): it must be the table the CPU uses.
+#[test]
+fn the_computed_sign_table_is_the_cpus() {
+    for i in 0..128u32 {
+        let parity = (i.count_ones() & 1) << 7;
+        assert_eq!(i | parity, strata_pack::grids::KSIGNS_IQ2XS[i as usize] as u32, "entry {i}");
     }
 }

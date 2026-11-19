@@ -27,6 +27,28 @@ struct MvArgs {
 #define K_Q4_K 5
 #define K_Q5_K 6
 #define K_Q6_K 7
+#define K_IQ3_XXS 8
+
+// bytes of lookup table at the front of a matrix of this kind (IQ3_XXS's 256-word grid), before its first row
+static inline uint table_bytes(uint kind) { return kind == K_IQ3_XXS ? 1024u : 0u; }
+
+// IQ2_XS's sign table, as IQ3_XXS uses it: the 7 bits given, and an eighth that makes the count of minus signs even
+static inline uint ksigns(uint i) { uint p = i ^ (i >> 4); p ^= p >> 2; p ^= p >> 1; return i | ((p & 1u) << 7); }
+
+// the 32 values of group g of an IQ3_XXS block at o; the grid is the buffer's first 256 words (at base)
+static inline void iq3xxs_values(device const uchar* base, device const uchar* o, uint g, thread float* wv) {
+    device const uint* grid = (device const uint*)base;
+    float d = float(as_type<half>(ushort(o[0]) | (ushort(o[1]) << 8)));
+    uint sw = uint(o[66 + 4 * g]) | (uint(o[67 + 4 * g]) << 8) | (uint(o[68 + 4 * g]) << 16) | (uint(o[69 + 4 * g]) << 24);
+    float db = d * (0.5f + float(sw >> 28)) * 0.5f;
+    for (uint l = 0; l < 4; l++) {
+        uint ks = ksigns((sw >> (7 * l)) & 0x7f);
+        for (uint j = 0; j < 8; j++) {
+            uint gv = (grid[o[2 + 8 * g + 2 * l + j / 4]] >> (8 * (j % 4))) & 0xff;
+            wv[8 * l + j] = db * float(gv) * (((ks >> j) & 1u) ? -1.0f : 1.0f);
+        }
+    }
+}
 
 static inline float f16_at(device const uchar* p) {
     ushort u = ushort(p[0]) | (ushort(p[1]) << 8);
@@ -59,9 +81,13 @@ static inline void scale_min_k4(device const uchar* s, uint g, thread float& sc,
 }
 
 // The dot product of 32-value group g of the block at o with xv (the 32 x values, sum xs).
-static inline float group_dot(device const uchar* o, uint g, thread const float* xv, float xs, uint kind) {
+static inline float group_dot(device const uchar* base, device const uchar* o, uint g, thread const float* xv, float xs, uint kind) {
     float acc = 0.0f;
-    if (kind == K_Q4_K || kind == K_Q5_K) {
+    if (kind == K_IQ3_XXS) {
+        float wv[32];
+        iq3xxs_values(base, o, g, wv);
+        for (uint l = 0; l < 32; l++) acc += wv[l] * xv[l];
+    } else if (kind == K_Q4_K || kind == K_Q5_K) {
         float d = f16_at(o), dmin = f16_at(o + 2);
         float sc, mn;
         scale_min_k4(o + 4, g, sc, mn);
@@ -157,7 +183,7 @@ static inline void mv_rows(device const uchar* w, device const float* x, device 
         for (uint r = 0; r < NR; r++) {
             const uint row = r0 + r;
             if (row < a.rows) {
-                acc[r] += group_dot(w + row * a.row_bytes + b * bpb, g, xv, xs, a.kind);
+                acc[r] += group_dot(w, w + table_bytes(a.kind) + row * a.row_bytes + b * bpb, g, xv, xs, a.kind);
             }
         }
     }
@@ -319,8 +345,10 @@ kernel void attend(device const float* q [[buffer(0)]], device const half* k [[b
 // ------------------------------------------------------------------ a prompt chunk: several tokens per dispatch
 
 // The 32 values of group g of the block at o, dequantized (the same values group_dot multiplies).
-static inline void group_values(device const uchar* o, uint g, uint kind, thread float* wv) {
-    if (kind == K_Q4_K || kind == K_Q5_K) {
+static inline void group_values(device const uchar* base, device const uchar* o, uint g, uint kind, thread float* wv) {
+    if (kind == K_IQ3_XXS) {
+        iq3xxs_values(base, o, g, wv);
+    } else if (kind == K_Q4_K || kind == K_Q5_K) {
         float d = f16_at(o), dmin = f16_at(o + 2);
         float sc, mn;
         scale_min_k4(o + 4, g, sc, mn);
@@ -416,7 +444,7 @@ kernel void mm(device const uchar* w [[buffer(0)]],
             const uint row = r0 + tid;
             float wv[32];
             if (row < a.rows) {
-                group_values(w + row * a.row_bytes + (big ? gi / 8 : gi) * bpb, big ? gi % 8 : 0, a.kind, wv);
+                group_values(w, w + table_bytes(a.kind) + row * a.row_bytes + (big ? gi / 8 : gi) * bpb, big ? gi % 8 : 0, a.kind, wv);
             } else {
                 for (uint l = 0; l < 32; l++) wv[l] = 0.0f;
             }

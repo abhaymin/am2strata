@@ -254,9 +254,16 @@ impl Gpu {
         if data.len() != rows * row_bytes {
             return Err(format!("{} bytes for a {rows}x{cols} {ty} matrix (want {})", data.len(), rows * row_bytes));
         }
-        native!(self, n, Ok(Weights { handle: Mem::Mtl(n.upload(data)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
-                                      geometry, bytes: data.len(), wide_fits: false }));
-        // whole u32 words: the tail padded with zeros
+        native!(self, n, {
+            let t = kernels::table_for(ty);
+            let all: Vec<u8> = t.iter().chain(data).copied().collect();
+            Ok(Weights { handle: Mem::Mtl(n.upload(&all)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
+                         geometry, bytes: all.len(), wide_fits: false })
+        });
+        // whole u32 words: the kind's lookup table first (IQ3_XXS's grid), then the rows, the tail padded with zeros
+        let table = kernels::table_for(ty);
+        let data: Vec<u8> = if table.is_empty() { data.to_vec() } else { table.iter().chain(data).copied().collect() };
+        let data = &data[..];
         let mut words = vec![0u32; data.len().div_ceil(4)];
         for (i, c) in data.chunks(4).enumerate() {
             let mut b = [0u8; 4];
