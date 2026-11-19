@@ -5,7 +5,7 @@
 //!
 //! The look matches the libass style it replaces: bold white type in a dark box. A caption sits low and centred
 //! (58 px type and 120 px above the bottom, at the frame's own pixel size); a title or end card sits in the middle
-//! (96 px). The box is darker than before (62% instead of 41%), because a review found the old one hard to read on
+//! (96 px). The box is darker than before (78% instead of 41%), because a review found the old one hard to read on
 //! light pictures.
 //!
 //! Fonts: web/fonts/captions (DejaVu Sans Bold, Noto Sans Devanagari Bold and Noto Sans Malayalam Bold, with their
@@ -110,8 +110,8 @@ pub fn wrap(text: &str, px: f32, max: f32) -> Result<Vec<String>, String> {
 #[derive(Clone, Copy)]
 pub struct Style { pub px: f32, pub pad: f32, pub box_alpha: u8 }
 
-pub const CAPTION: Style = Style { px: 58.0, pad: 14.0, box_alpha: 158 };
-pub const CARD: Style = Style { px: 96.0, pad: 18.0, box_alpha: 158 };
+pub const CAPTION: Style = Style { px: 58.0, pad: 14.0, box_alpha: 200 };
+pub const CARD: Style = Style { px: 96.0, pad: 18.0, box_alpha: 200 };
 
 /// The text as one box picture (RGBA PNG) no wider than `max_w`: each line centred on its own dark box, the lines
 /// stacked. Returns the PNG and its size.
