@@ -206,6 +206,9 @@ pub struct MediaOpts {
     /// judge: how many frames, spread over the video, the model looks at
     #[arg(long, default_value_t = 16)]
     judge_frames: u32,
+    /// judge: how many reviews (each with frames at other places); the median score of each part counts
+    #[arg(long, default_value_t = 3)]
+    judge_runs: u32,
 }
 
 /// `am2strata-run media <action> ...`: /v1/images/generations, /v1/videos/generations, /v1/audio/speech and
@@ -641,6 +644,20 @@ pub fn json_in(text: &str) -> Option<Value> {
     serde_json::from_str(&text[a..=b]).ok()
 }
 
+/// Several reviews as one: each score the median of the reviews', the verdict "pass" when most of them say pass,
+/// and the issues, thumbnail frame and better order of the first review.
+pub fn median_review(reviews: &[Value]) -> Value {
+    let mut out = reviews.first().cloned().unwrap_or(json!({}));
+    for p in ["picture", "captions", "fit", "sequence", "thumbnail"] {
+        let mut v: Vec<f64> = reviews.iter().filter_map(|r| r["scores"][p].as_f64()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if !v.is_empty() { out["scores"][p] = json!(v[v.len() / 2]); }
+    }
+    let passes = reviews.iter().filter(|r| r["verdict"].as_str() == Some("pass")).count();
+    out["verdict"] = json!(if passes * 2 > reviews.len() { "pass" } else { "fail" });
+    out
+}
+
 /// The judge's review passes: a pass verdict and every score at least `min`.
 pub fn review_passes(review: &Value, min: u8) -> (bool, Vec<String>) {
     let mut low = Vec::new();
@@ -670,13 +687,31 @@ fn cmd_judge(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
         None => "No brief was given: judge it as a calm music video for a general audience.".into(),
     };
     let model = o.judge_model.clone().unwrap_or_else(|| "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k".into());
-    let body = json!({"model": model, "temperature": 0, "max_tokens": 4000, "video_frames": o.judge_frames,
-        "messages": [{"role": "system", "content": JUDGE_RUBRIC},
-                     {"role": "user", "content": [{"type": "text", "text": format!("The brief:\n{brief}")},
-                                                  {"type": "video_url", "video_url": {"url": video}}]}]});
-    let r: Value = send(client.post(format!("{url}/v1/chat/completions")).json(&body))?.json().map_err(|e| e.to_string())?;
-    let text = r["choices"][0]["message"]["content"].as_str().unwrap_or("");
-    let review = json_in(text).ok_or_else(|| format!("the judge's answer had no JSON: {}", text.chars().take(300).collect::<String>()))?;
+    // one model pass over 16 frames is noisy (the same video scored 7 and 5 on captions in two runs): review it a few
+    // times, each with its frames at other places, and take the median of each part
+    let runs = o.judge_runs.clamp(1, 7);
+    let mut reviews = Vec::new();
+    for k in 0..runs {
+        let frames = o.judge_frames + 3 * k;
+        let body = json!({"model": model, "temperature": 0, "max_tokens": 4000, "video_frames": frames,
+            "messages": [{"role": "system", "content": JUDGE_RUBRIC},
+                         {"role": "user", "content": [{"type": "text", "text": format!("The brief:\n{brief}")},
+                                                      {"type": "video_url", "video_url": {"url": video}}]}]});
+        let r: Value = send(client.post(format!("{url}/v1/chat/completions")).json(&body))?.json().map_err(|e| e.to_string())?;
+        let text = r["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        match json_in(text) {
+            Some(v) => {
+                let line: Vec<String> = ["picture", "captions", "fit", "sequence", "thumbnail"].iter()
+                    .map(|p| format!("{p} {}", v["scores"][*p])).collect();
+                println!("review {} of {runs} ({frames} frames): {} -> {}", k + 1, line.join(", "), v["verdict"].as_str().unwrap_or("?"));
+                reviews.push((frames, v));
+            }
+            None => println!("review {} of {runs}: no JSON in the answer", k + 1),
+        }
+    }
+    if reviews.is_empty() { return Err("the judge gave no review".into()); }
+    let review = median_review(&reviews.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>());
+    let frames_used = reviews[0].0;
     if o.json { println!("{}", serde_json::to_string_pretty(&review).unwrap_or_default()); }
     for (k, v) in review["scores"].as_object().into_iter().flatten() { println!("score {k}: {v}"); }
     for i in review["issues"].as_array().into_iter().flatten() {
@@ -684,7 +719,7 @@ fn cmd_judge(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     }
     if let Some(f) = review["best_thumbnail_frame"].as_u64() {
         let len = j["video"]["length_seconds"].as_f64().unwrap_or(0.0);
-        let at = if o.judge_frames > 0 { len * (f as f64 - 0.5) / o.judge_frames as f64 } else { 0.0 };
+        let at = if frames_used > 0 { len * (f as f64 - 0.5) / frames_used as f64 } else { 0.0 };
         println!("best thumbnail: frame {f} (about {at:.1} s)");
     }
     if let Some(ord) = review["order"].as_str().filter(|s| !s.is_empty()) { println!("better order: {ord}"); }
@@ -714,6 +749,16 @@ mod tests {
         assert_eq!(v["audio"], "https://x.org/s.wav");
         assert_eq!(v["captions"][0][2], "a.png", "caption words are words");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_reviews_count_by_their_median_and_majority() {
+        let r = |c: f64, v: &str| json!({"scores": {"picture": 8, "captions": c, "fit": 7, "sequence": 7, "thumbnail": 8}, "verdict": v});
+        let m = median_review(&[r(5.0, "fail"), r(8.0, "pass"), r(7.0, "pass")]);
+        assert_eq!(m["scores"]["captions"], 7.0, "the median, not the worst");
+        assert_eq!(m["verdict"], "pass");
+        assert!(review_passes(&m, 7).0);
+        assert_eq!(median_review(&[r(7.0, "fail"), r(7.0, "fail"), r(8.0, "pass")])["verdict"], "fail");
     }
 
     #[test]
