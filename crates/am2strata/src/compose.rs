@@ -389,13 +389,28 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
 /// fills all 14 s; held only briefly, the crossfade chain ended early and the video stopped long before the audio).
 pub fn clip_filter(w: u32, h: u32, shot_s: f64, clip_s: Option<f64>) -> String {
     // slowed to fill its shot, by up to MAX_SLOW (calm motion slowed reads as calm; frozen reads as broken); evened
-    // out first, as generated clips flicker from frame to frame
-    let slow = clip_s.filter(|c| *c > 0.1).map(|c| (shot_s / c).clamp(1.0, MAX_SLOW)).unwrap_or(1.0);
+    // out first, as generated clips flicker from frame to frame. A shot longer than that plays the clip forward and
+    // back again (and again), so its picture keeps moving to the end instead of freezing on the last frame.
+    let (bounce, slow) = clip_plan(shot_s, clip_s);
+    let motion = if bounce > 0 {
+        format!("split[cf][cb];[cb]reverse[cr];[cf][cr]concat=n=2:v=1:a=0{},", if bounce > 1 { format!(",loop=loop={}:size=32767:start=0", bounce - 1) } else { String::new() })
+    } else { String::new() };
     // the new frames between a slowed clip's own are blended (a 16 fps Wan clip slowed 1.6x at 30 fps would show each
     // picture three frames in a row: a judder the check sees as jumps)
-    format!("deflicker=size=5,setpts={slow:.4}*PTS,framerate=fps={FPS}:interp_start=0:interp_end=255:scene=100,\
+    format!("deflicker=size=5,{motion}setpts={slow:.4}*PTS,framerate=fps={FPS}:interp_start=0:interp_end=255:scene=100,\
              scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p",
             shot_s.max(0.5) + 1.0)
+}
+
+/// How a clip fills its shot: (forward-and-back plays, 0 for none, and the slow-down). A clip that fits slowed by up to
+/// MAX_SLOW just slows; a longer shot plays it forward and back as many times as needed, slowed the least it can be.
+pub fn clip_plan(shot_s: f64, clip_s: Option<f64>) -> (u32, f64) {
+    let Some(c) = clip_s.filter(|c| *c > 0.1) else { return (0, 1.0) };
+    if shot_s <= c * MAX_SLOW {
+        return (0, (shot_s / c).clamp(1.0, MAX_SLOW));
+    }
+    let bounce = (shot_s / (2.0 * c * MAX_SLOW)).ceil().max(1.0) as u32;
+    (bounce, (shot_s / (2.0 * c * bounce as f64)).clamp(1.0, MAX_SLOW))
 }
 
 /// The most a clip is slowed to fill its shot.
@@ -722,9 +737,23 @@ mod tests {
                      "-an", "-c:v", "libx264", &out.display().to_string()]).await.unwrap();
         let got = probe_seconds(&out).await.unwrap();
         assert!((got - 4.0).abs() < 0.05, "a 1 s clip plays its whole 4 s shot: {got}");
-        // slowed to 1.6 s of motion, then held only for the rest
-        assert!(clip_filter(160, 90, 4.0, Some(1.0)).contains("setpts=1.6000*PTS"));
+        // a clip that fits when slowed is slowed (2 s of shot from 1.5 s of clip); a longer shot plays it forward and back
+        assert!(clip_filter(160, 90, 2.0, Some(1.5)).contains("setpts=1.3333*PTS") && !clip_filter(160, 90, 2.0, Some(1.5)).contains("reverse"));
+        assert_eq!(clip_plan(4.0, Some(1.0)), (2, 1.0));
+        assert!(clip_filter(160, 90, 4.0, Some(1.0)).contains("reverse"));
         assert!(clip_filter(160, 90, 4.0, Some(5.0)).contains("setpts=1.0000*PTS"), "a long clip is not slowed");
+        // a 1 s clip in a 6 s shot plays forward and back twice, never frozen (Fireflies' 5 s clip in a 12 s shot froze ~4 s)
+        assert_eq!(clip_plan(6.0, Some(1.0)), (2, 1.5));
+        assert_eq!(clip_plan(12.0, Some(5.0625)).0, 1);
+        let long = dir.join("long.mp4");
+        let frames6 = frames_for(6.0);
+        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 6.0, Some(1.0)), "-frames:v", &frames6.to_string(),
+                     "-an", "-c:v", "libx264", &long.display().to_string()]).await.unwrap();
+        assert!((probe_seconds(&long).await.unwrap() - 6.0).abs() < 0.05);
+        let gray = crate::media_check::video_grey_frames(&std::fs::read(&long).unwrap(), Some(30.0)).unwrap().0;
+        let deltas = crate::media_check::grey_frame_deltas(&gray.iter().map(|f| f.as_slice()).collect::<Vec<_>>());
+        let held = crate::media_check::near_static_run(&deltas, 30.0, 0.05).1;
+        assert!(held < 0.5, "the picture keeps moving to the end: held {held} s");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
