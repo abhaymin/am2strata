@@ -195,6 +195,16 @@ fn is_mix_name(model: &str) -> bool {
     model == "mix" || model.starts_with("mix/")
 }
 
+/// Whether this server resolves `model` itself (a provider's model or a mix): such a request never waits in the
+/// local queue, so the cluster must not send it to a worker (whose overflow would swap in its own local model).
+pub fn resolves_here(model: &str) -> bool {
+    on().is_some_and(|(_, c)| resolves_in(&c, model))
+}
+
+fn resolves_in(c: &Config, model: &str) -> bool {
+    is_mix_name(model) || provider_of(c, model).is_some()
+}
+
 /// Whether a key's model list entry `grant` covers `model` (beyond the same name): `remote/*`, `<provider>/*`, `mix/*`.
 /// For api_keys.rs's check of a generated key's list; false while the feature is off.
 pub fn grant_covers(grant: &str, model: &str) -> bool {
@@ -945,6 +955,13 @@ mod tests {
         assert!(covers(&c, "remote/*", "openai/gpt-5.5") && covers(&c, "groq/*", "groq/x") && covers(&c, "openai/gpt-5.5", "openai/gpt-5.5"));
         assert!(!covers(&c, "groq/*", "openai/gpt-5.5") && !covers(&c, "remote/*", "mix") && !covers(&c, "remote/*", "mock-a"));
         assert!(covers(&c, "mix", "mix") && covers(&c, "mix/*", "mix/code") && !covers(&c, "mix/*", "mix") && !covers(&c, "remote/*", "nope/x"));
+    }
+
+    #[test]
+    fn provider_models_and_mixes_are_resolved_here_and_local_names_are_not() {
+        let c = cfg();
+        assert!(resolves_in(&c, "openai/gpt-5.5") && resolves_in(&c, "groq/anything") && resolves_in(&c, "mix") && resolves_in(&c, "mix/code"));
+        assert!(!resolves_in(&c, "ministral-3-3b") && !resolves_in(&c, "nope/x") && !resolves_in(&c, "openai/"));
     }
 
     #[test]

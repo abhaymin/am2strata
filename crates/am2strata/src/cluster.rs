@@ -761,7 +761,9 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         return crate::error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request is too large");
     };
     let parsed = serde_json::from_slice::<Value>(&bytes).ok();
-    let model = parsed.as_ref().and_then(|v| v["model"].as_str().map(str::to_string));
+    let model = parsed.as_ref().and_then(|v| v["model"].as_str().map(str::to_string))
+        // a model this server resolves through its own settings is answered here, never by a worker's other model
+        .filter(|m| !crate::remote::resolves_here(m));
     if let Some(model) = model {
         let local = s.mgr.entry(&model).is_some();
         let req_v = parsed.unwrap_or(Value::Null);
