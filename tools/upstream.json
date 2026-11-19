@@ -11,6 +11,12 @@
    "github": "Niko1221/Strata",
    "ref": "v0.2.8",
    "latest_tags": true
+  },
+  "basalt": {
+   "github": "jesdga95/basalt",
+   "ref": "main",
+   "latest_tags": true,
+   "note": "MIT downstream of Strata for Blackwell (sm_120) GPUs: MoE experts in RAM, peer expert tiers across GPUs, drafting (MTP, DSpark, DFlash 2, suffix). Ideas to port, not code to vendor (C++/CUDA + Python). Reviewed 2026-11-19."
   }
  },
  "files": [
