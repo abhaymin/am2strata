@@ -381,7 +381,8 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
+    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len(),
+                                   "captions_srt": srt(&captions)})))
 }
 
 /// A clip fitted to the frame and held on its last frame for as long as its shot plays (a 5 s clip in a 14 s shot
@@ -431,6 +432,12 @@ async fn probe_seconds(f: &std::path::Path) -> Option<f64> {
         .arg(f).output().await.ok()?;
     let frames: f64 = String::from_utf8_lossy(&o.stdout).trim().parse().ok()?;
     Some(frames / FPS as f64)
+}
+
+/// The captions as SubRip text (GET /v1/media/jobs/{id}/captions.srt; YouTube takes it as the video's subtitles).
+pub fn srt(captions: &[(f64, f64, String)]) -> String {
+    let ts = |t: f64| { let ms = (t.max(0.0) * 1000.0).round() as u64; format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000) };
+    captions.iter().enumerate().map(|(i, (a, b, t))| format!("{}\n{} --> {}\n{}\n", i + 1, ts(*a), ts(*b), t.trim())).collect::<Vec<_>>().join("\n")
 }
 
 /// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
@@ -614,6 +621,12 @@ mod tests {
         // a given length is kept; only clips share the audio evenly
         assert_eq!(layout(20.0, 0.0, &[(Some(3.0), None), (None, None)]), [3.0, 17.0]);
         assert_eq!(layout(10.0, 0.0, &[(None, Some(2.0)), (None, Some(2.0))]), [5.0, 5.0]);
+    }
+
+    #[test]
+    fn a_composed_video_has_its_captions_as_srt() {
+        let s = srt(&[(13.6, 18.0, "Morning light on a quiet sea".into()), (3725.25, 3726.5, "two".into())]);
+        assert_eq!(s, "1\n00:00:13,600 --> 00:00:18,000\nMorning light on a quiet sea\n\n2\n01:02:05,250 --> 01:02:06,500\ntwo\n");
     }
 
     #[test]
