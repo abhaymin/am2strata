@@ -56,6 +56,11 @@ pub fn song_request(prompt: &str, lyrics: Option<&str>, seconds: Option<u32>) ->
     r
 }
 
+/// A request with `seed` set when one is given (every generation endpoint takes it).
+pub fn with_seed(body: &mut Value, seed: Option<u64>) {
+    if let Some(s) = seed { body["seed"] = json!(s); }
+}
+
 /// The non-file fields of a transcription (OpenAI's multipart: `file`, `model`, `response_format`, `language`).
 /// `translate` does not change a field: it changes the endpoint (/v1/audio/transcriptions vs /v1/audio/translations).
 pub fn transcribe_fields(model: Option<&str>, response_format: Option<&str>, language: Option<&str>) -> Vec<(&'static str, String)> {
@@ -194,6 +199,9 @@ pub struct MediaOpts {
     /// print the raw server answer as JSON instead of a friendly rendering
     #[arg(long)]
     json: bool,
+    /// the seed (image, video, speak, song): the same seed and request give the same result; takes differ by seed
+    #[arg(long)]
+    seed: Option<u64>,
     /// judge: what the video is meant to be (text, or a file holding it): its title, audience, scenes and words
     #[arg(long)]
     brief: Option<String>,
@@ -283,7 +291,8 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
 fn cmd_image(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = image_request(prompt.ok_or("image needs a prompt")?, o.size.as_deref(), o.model.as_deref(), o.n);
+    let mut body = image_request(prompt.ok_or("image needs a prompt")?, o.size.as_deref(), o.model.as_deref(), o.n);
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/images/generations")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let data = j["data"].as_array().ok_or_else(|| "no images in the answer".to_string())?;
@@ -304,7 +313,8 @@ fn cmd_image(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
 fn cmd_video(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = video_request(prompt.ok_or("video needs a prompt")?, Some(o.frames), o.size.as_deref(), o.format.as_deref(), o.model.as_deref());
+    let mut body = video_request(prompt.ok_or("video needs a prompt")?, Some(o.frames), o.size.as_deref(), o.format.as_deref(), o.model.as_deref());
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/videos/generations")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let raw = j["data"][0]["b64"].as_str().unwrap_or("");
@@ -320,7 +330,8 @@ fn cmd_video(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
 fn cmd_speak(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = speak_request(prompt.ok_or("speak needs text")?, o.voice.as_deref(), o.model.as_deref());
+    let mut body = speak_request(prompt.ok_or("speak needs text")?, o.voice.as_deref(), o.model.as_deref());
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/audio/speech")).json(&body))?;
     let bytes = r.bytes().map_err(|e| e.to_string())?;
     write_file(&out, &bytes)?;
@@ -335,7 +346,8 @@ fn cmd_song(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqw
         Some(path) => Some(std::fs::read_to_string(expand_path(Path::new(path))).map_err(|e| format!("{path}: {e}"))?),
         None => None,
     };
-    let body = song_request(prompt.ok_or("song needs a prompt")?, lyrics.as_deref(), Some(o.seconds));
+    let mut body = song_request(prompt.ok_or("song needs a prompt")?, lyrics.as_deref(), Some(o.seconds));
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/audio/music")).json(&body))?;
     let bytes = r.bytes().map_err(|e| e.to_string())?;
     write_file(&out, &bytes)?;
@@ -797,6 +809,10 @@ mod tests {
     fn speech_and_song_send_only_the_fields() {
         assert_eq!(speak_request("hello world", None, None), json!({"input": "hello world"}));
         assert_eq!(speak_request("hi", Some("laura"), Some("m")), json!({"input": "hi", "voice": "laura", "model": "m"}));
+        // a song take by its seed (the producer makes takes 7, 21 and 42)
+        let mut b = song_request("chant", Some("ॐ त्र्यम्बकं"), Some(90));
+        with_seed(&mut b, Some(21));
+        assert_eq!(b, json!({"style": "chant", "lyrics": "ॐ त्र्यम्बकं", "duration": 90, "seed": 21}));
         assert_eq!(song_request("a ballad", None, None), json!({"style": "a ballad"}));
         assert_eq!(song_request("sad", Some("[verse]\n…"), Some(90)),
             json!({"style": "sad", "lyrics": "[verse]\n…", "duration": 90}));
