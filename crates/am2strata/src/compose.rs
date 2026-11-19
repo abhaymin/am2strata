@@ -516,16 +516,12 @@ fn drawtext_escape(s: &str) -> String {
 /// Make the thumbnail: one 1280×720 JPEG, the image with a left-dark gradient and big Outfit words drawn over it by
 /// ffmpeg's drawtext (the heavy type with a dark stroke, like thumbs.py). Returns the JPEG bytes.
 pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8>, Value), String> {
-    if !crate::media::ffmpeg_available() {
-        return Err(format!("this server cannot make a thumbnail: install ffmpeg ({})",
-            crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")).into());
-    }
     let (w, h) = (THUMB_W, THUMB_H);
     let image = source_bytes(s, "image", &req["image"]).await?;
     if kind_of_bytes(&image) != "image" {
         return Err("image: send a picture (PNG or JPEG), not a video".into());
     }
-    // the lines of words and the optional tag line beneath them
+    // the lines of words and the optional tag line above them
     let mut lines: Vec<(String, String)> = Vec::new();
     if let Some(arr) = req["lines"].as_array() {
         for l in arr {
@@ -538,38 +534,43 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     if lines.is_empty() {
         return Err("lines: give the words to show, as [[text, \"white\"|\"gold\"]]".into());
     }
-    let tag = req["tag"].as_str().filter(|t| !t.trim().is_empty());
+    let tag = req["tag"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+    let bytes = tokio::task::spawn_blocking(move || thumbnail_picture(&image, w, h, &lines, tag.as_deref()))
+        .await.map_err(|e| format!("the thumbnail could not be drawn: {e}"))??;
+    Ok(("image/jpeg".into(), bytes, json!({"width": w, "height": h})))
+}
 
-    let dir = crate::media::tempdir().map_err(|e| format!("could not make a temp folder: {e}"))?;
-    let id = format!("mj-{}", std::process::id()); // thumbnails keep nothing, so a plain id is fine here
-    let _ = &id;
-    let image_ = dir.join("image.jpg");
-    std::fs::write(&image_, &image).map_err(|e| format!("could not write the image: {e}"))?;
-    let font = outfit_font();
-    let out = dir.join("thumb.jpg");
-
-    // big words, centred, one row below the next: drawtext for each, with a dark shadow for the stroke look
-    let rows = thumbnail_lines(&lines, tag);
-    let base_y = (h as f64 * 0.72) as i32; // the lowest line's baseline
-    let mut draws = Vec::new();
-    for (row, (text, colour)) in rows {
-        let y = base_y - (row as i32) * 150;
-        let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
-        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture. The
-        // options are built as a list and joined with ':' so an absent fontfile leaves no empty field (drawtext=text=...,
-        // not drawtext=:text=...); a found Outfit font only leads with its fontfile
-        draws.push(thumbnail_drawtext(&text, &font, color, y));
+/// The thumbnail itself, drawn by am2Strata (no ffmpeg): the picture filled to the frame and darkened towards the
+/// bottom so the words read, then the lines in bold, big and shaped (any script), each with a dark outline, stacked
+/// upwards from the lower third; the first line is the biggest. A tag, if any, sits small above them.
+pub fn thumbnail_picture(image: &[u8], w: u32, h: u32, lines: &[(String, String)], tag: Option<&str>) -> Result<Vec<u8>, String> {
+    let src = image::load_from_memory(image).map_err(|e| format!("image: the picture could not be read ({e})"))?;
+    let mut img = src.resize_to_fill(w, h, image::imageops::FilterType::Lanczos3).to_rgba8();
+    // darker towards the bottom: 0.85 at the top to 0.45 at the bottom
+    for y in 0..h {
+        let k = 0.85 - 0.40 * (y as f32 / h as f32).powf(1.5);
+        for x in 0..w { let p = img.get_pixel_mut(x, y); for i in 0..3 { p[i] = (p[i] as f32 * k) as u8; } }
     }
-    // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
-    let _ = run_ffmpeg(&[
-        "-y", "-i", image_.display().to_string().as_str(),
-        "-vf", &format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},eq=brightness=-0.15,{}", draws.join(",")).as_str(),
-        "-vframes", "1", "-c:v", "mjpeg", "-q:v", "3", out.display().to_string().as_str(),
-    ]).await?;
-
-    let bytes = std::fs::read(&out).map_err(|e| format!("could not read the thumbnail: {e}"))?;
-    std::fs::remove_dir_all(&dir).ok();
-    Ok(("image/jpeg".into(), bytes, json!({"width": w, "height": h, "lines": lines.len()})))
+    let colour = |c: &str| match c { "gold" => [255u8, 214, 90], _ => [255u8, 255, 255] };
+    let max_w = w as f32 * 0.9;
+    let cx = w as f32 / 2.0;
+    // from the bottom up: the last line lowest
+    let mut y = h as f32 * 0.86;
+    let n = lines.len();
+    for (i, (text, c)) in lines.iter().enumerate().rev() {
+        let px = crate::captions::fit_px(text, if i == 0 { 128.0 } else { 84.0 }, max_w)?;
+        crate::captions::draw_line(&mut img, text, px, colour(c), cx, y, (px / 14.0).ceil() as i32)?;
+        y -= px * if i == 0 || n == 1 { 1.25 } else { 1.15 };
+    }
+    if let Some(t) = tag {
+        let px = crate::captions::fit_px(t, 46.0, max_w)?;
+        crate::captions::draw_line(&mut img, t, px, [255, 255, 255], cx, y - 10.0, 3)?;
+    }
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img).to_rgb8()
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90))
+        .map_err(|e| format!("could not write the thumbnail: {e}"))?;
+    Ok(out)
 }
 
 /// The Outfit font the web app ships (web/fonts/outfit-latin-wght.woff2), found beside this binary or in a checked-out
@@ -627,6 +628,33 @@ mod tests {
     fn a_composed_video_has_its_captions_as_srt() {
         let s = srt(&[(13.6, 18.0, "Morning light on a quiet sea".into()), (3725.25, 3726.5, "two".into())]);
         assert_eq!(s, "1\n00:00:13,600 --> 00:00:18,000\nMorning light on a quiet sea\n\n2\n01:02:05,250 --> 01:02:06,500\ntwo\n");
+    }
+
+    /// THUMB_LOOK=<picture> THUMB_OUT=<file.jpg> cargo test thumb_look -- --ignored: a thumbnail to look at.
+    #[test]
+    #[ignore = "writes a picture to look at"]
+    fn thumb_look() {
+        let (Some(i), Some(o)) = (std::env::var_os("THUMB_LOOK"), std::env::var_os("THUMB_OUT")) else { return };
+        let jpg = thumbnail_picture(&std::fs::read(i).unwrap(), 1280, 720,
+            &[("Peace and Harmony".into(), "white".into()), ("acoustic evening".into(), "gold".into())], Some("CALM • ACOUSTIC")).unwrap();
+        std::fs::write(o, jpg).unwrap();
+    }
+
+    #[test]
+    fn a_thumbnail_is_drawn_without_ffmpeg_in_big_bold_type() {
+        let mut pic = image::RgbImage::new(640, 360);
+        for p in pic.pixels_mut() { *p = image::Rgb([90, 140, 190]); }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(pic).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let jpg = thumbnail_picture(&png, 1280, 720, &[("Fireflies in the Valley".into(), "gold".into()), ("a calm song for sleep".into(), "white".into())],
+                                    Some("SLEEP • CALM")).unwrap();
+        let img = image::load_from_memory(&jpg).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (1280, 720));
+        // gold type in the lower half, a lot of it (bold and big), and the top stays the darkened picture
+        let gold = img.enumerate_pixels().filter(|(_, y, p)| *y > 360 && p[0] > 220 && p[1] > 180 && p[2] < 140).count();
+        assert!(gold > 15000, "big gold title: {gold} px");
+        let top = img.get_pixel(640, 20);
+        assert!(top[2] > 120 && top[2] < 170, "the top is the picture, a little darker: {top:?}");
     }
 
     #[test]

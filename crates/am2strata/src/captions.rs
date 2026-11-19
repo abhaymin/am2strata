@@ -166,6 +166,61 @@ pub fn render(text: &str, style: Style, max_w: u32) -> Result<(Vec<u8>, u32, u32
     Ok((png, w, h))
 }
 
+/// One line drawn straight onto a picture (a thumbnail): shaped like a caption, centred on `cx` with its baseline at
+/// `baseline`, in `rgb`, with a dark outline `outline` px wide so it reads on any picture. Returns its width.
+pub fn draw_line(img: &mut image::RgbaImage, text: &str, px: f32, rgb: [u8; 3], cx: f32, baseline: f32, outline: i32) -> Result<f32, String> {
+    use ab_glyph::Font;
+    let (script, glyphs, lw) = shape(text, px)?;
+    let f = ab_glyph::FontRef::try_from_slice(font(script)?).map_err(|e| format!("the font could not be read: {e}"))?;
+    let em = f.units_per_em().unwrap_or(1000.0);
+    let scale = px * f.height_unscaled() / em;
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    let left = cx - lw / 2.0;
+    // coverage of the whole line first, then the outline (the coverage spread by `outline` px) and the type over it
+    let mut cov = vec![0f32; (w * h) as usize];
+    for g in &glyphs {
+        let glyph = ab_glyph::GlyphId(g.id).with_scale_and_position(scale, ab_glyph::point(left + g.x, baseline + g.y));
+        if let Some(o) = f.outline_glyph(glyph) {
+            let b = o.px_bounds();
+            o.draw(|gx, gy, c| {
+                let (x, y) = (b.min.x as i32 + gx as i32, b.min.y as i32 + gy as i32);
+                if x >= 0 && y >= 0 && x < w && y < h { let k = (y * w + x) as usize; cov[k] = cov[k].max(c); }
+            });
+        }
+    }
+    if outline > 0 {
+        let r = outline;
+        let mut halo = vec![0f32; cov.len()];
+        for y in 0..h { for x in 0..w {
+            let c = cov[(y * w + x) as usize];
+            if c <= 0.0 { continue; }
+            for dy in -r..=r { for dx in -r..=r {
+                if dx * dx + dy * dy > r * r { continue; }
+                let (xx, yy) = (x + dx, y + dy + r / 2); // a little lower: the shadow's drop
+                if xx >= 0 && yy >= 0 && xx < w && yy < h { let k = (yy * w + xx) as usize; halo[k] = halo[k].max(c); }
+            }}
+        }}
+        for (k, a) in halo.iter().enumerate() {
+            if *a <= 0.0 { continue; }
+            let p = img.get_pixel_mut((k as i32 % w) as u32, (k as i32 / w) as u32);
+            let a = a * 0.85;
+            for i in 0..3 { p[i] = (p[i] as f32 * (1.0 - a)).round() as u8; }
+        }
+    }
+    for (k, c) in cov.iter().enumerate() {
+        if *c <= 0.0 { continue; }
+        let p = img.get_pixel_mut((k as i32 % w) as u32, (k as i32 / w) as u32);
+        for i in 0..3 { p[i] = (rgb[i] as f32 * c + p[i] as f32 * (1.0 - c)).round() as u8; }
+    }
+    Ok(lw)
+}
+
+/// The size at which `text` fits `max_w` pixels, no bigger than `px`.
+pub fn fit_px(text: &str, px: f32, max_w: f32) -> Result<f32, String> {
+    let w = shape(text, px)?.2;
+    Ok(if w > max_w { px * max_w / w } else { px })
+}
+
 /// One overlay: a box picture shown from `a` to `b` seconds at (x, y).
 pub struct Overlay { pub png: Vec<u8>, pub a: f64, pub b: f64, pub x: u32, pub y: u32 }
 
