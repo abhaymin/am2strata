@@ -38,7 +38,7 @@ static inline uint ksigns(uint i) { uint p = i ^ (i >> 4); p ^= p >> 2; p ^= p >
 // the 32 values of group g of an IQ3_XXS block at o; the grid is the buffer's first 256 words (at base)
 static inline void iq3xxs_values(device const uchar* base, device const uchar* o, uint g, thread float* wv) {
     device const uint* grid = (device const uint*)base;
-    float d = float(as_type<half>(ushort(o[0]) | (ushort(o[1]) << 8)));
+    float d = float(as_type<half>(ushort(ushort(o[0]) | (ushort(o[1]) << 8))));
     uint sw = uint(o[66 + 4 * g]) | (uint(o[67 + 4 * g]) << 8) | (uint(o[68 + 4 * g]) << 16) | (uint(o[69 + 4 * g]) << 24);
     float db = d * (0.5f + float(sw >> 28)) * 0.5f;
     for (uint l = 0; l < 4; l++) {
