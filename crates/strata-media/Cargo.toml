@@ -46,6 +46,10 @@ symphonia = { version = "0.5", default-features = false, features = ["aac", "fla
 name = "am2strata-media"
 path = "src/bin/am2strata-media.rs"
 
+[[bin]]
+name = "am2strata-textgate"
+path = "src/bin/am2strata-textgate.rs"
+
 [workspace]
 members = ["."]
 

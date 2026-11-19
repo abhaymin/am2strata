@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod config;
+pub mod gate;
 pub mod translate;
 
 use crate::manager::{Loaded, Manager};
@@ -40,6 +41,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(3);
 pub struct Remote {
     cfg: RwLock<Option<Config>>,
     pub keys: KeyStore,
+    /// the content gate's classifier (gate.rs)
+    pub gate: gate::Gate,
     lists: Mutex<HashMap<String, (Instant, Result<Vec<String>, String>)>>,
     sems: Mutex<HashMap<String, (usize, Arc<Semaphore>)>>,
     http: reqwest::Client,
@@ -62,7 +65,7 @@ pub fn init(rest: &BTreeMap<String, Value>, data_dir: &Path, config_path: Option
             .map(|a| (name.clone(), a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())))
         .collect();
     let r = Remote {
-        cfg: RwLock::new(cfg), keys: KeyStore::open(Some(data_dir.join("remote-keys.json"))), lists: Mutex::new(HashMap::new()),
+        cfg: RwLock::new(cfg), keys: KeyStore::open(Some(data_dir.join("remote-keys.json"))), gate: gate::Gate::new(data_dir), lists: Mutex::new(HashMap::new()),
         sems: Mutex::new(HashMap::new()), profile_models, config_path,
         http: reqwest::Client::builder().connect_timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?,
     };
@@ -544,6 +547,12 @@ impl RemoteRound {
         Ok(RemoteRound { mgr, p: p.clone(), model, full: full.to_string(), key, signed: Mutex::new(Vec::new()) })
     }
 
+    /// The content gate (gate.rs) on the body that would leave: a provider that does not take NSFW work gets only
+    /// what the local classifier rates safe. A held request is an error the route answers on this PC.
+    async fn gate(&self, r: &Remote, body: &Value) -> Result<(), ProviderError> {
+        held(r, &self.p, body).await
+    }
+
     /// The call, up to the provider's answer's start; the answer itself is read by a task of its own.
     async fn open(self: Arc<Self>, mut prep: Prepared, req: Value, opts: RunOpts) -> Result<Started, ProviderError> {
         let r = get().expect("remote models are set up");
@@ -562,6 +571,7 @@ impl RemoteRound {
         if !notes.is_empty() {
             with_route(|r| r.notes.extend(notes));
         }
+        self.gate(r, &body).await?;
         let permit = r.sem(&self.p).acquire_owned().await.map_err(|_| ProviderError::new(503, "api_error", "closed".into(), true, "closed".into()))?;
         let path = match self.p.kind { Kind::OpenAi => "/chat/completions", Kind::Anthropic => "/messages" };
         let rq = r.auth(r.http.post(self.p.url(path)), &self.p, &self.key).timeout(Duration::from_secs(self.p.timeout_s)).json(&body);
@@ -685,12 +695,32 @@ impl crate::run::Round for RemoteRound {
     }
 }
 
+/// Err when the content gate keeps `body` from `p` (never for a provider the owner marked as accepting NSFW work).
+async fn held(r: &Remote, p: &Provider, body: &Value) -> Result<(), ProviderError> {
+    if p.nsfw_accepts {
+        return Ok(());
+    }
+    let c = r.config().unwrap_or_default();
+    match r.gate.check(body, c.gate_model.as_deref(), c.release_under.unwrap_or(config::RELEASE_UNDER)).await {
+        gate::Verdict::Release => Ok(()),
+        gate::Verdict::Hold(why) => {
+            tracing::info!("remote: a request for {} stays here ({why})", p.name);
+            Err(ProviderError::new(403, "permission_error", format!("{}: {} - this request is answered on this machine only", p.name, gate::KEPT),
+                                   true, gate::KEPT.into()))
+        }
+    }
+}
+
 /// Start a request on a remote target: the first model of its route that answers (a mix tries the next once when one
 /// fails before answering), with the server's tools in the tool loop when it was offered them.
 pub async fn start(mgr: Arc<Manager>, cands: Vec<String>, mut prep: Prepared, req: Value, opts: RunOpts,
                    offered: crate::server_tools::Offered) -> Result<Started, Refusal> {
     translate::inline_images(&mut prep).await.map_err(|e| Refusal(400, e))?;
-    for (i, c) in cands.iter().enumerate() {
+    let mut cands = cands;
+    let mut i = 0;
+    while i < cands.len() {
+        let c = &cands[i].clone();
+        i += 1;
         if !is_remote_target(c) {
             // a mix's fallback to this PC's model
             let (loaded, pass) = mgr.ensure_for(local_name(c)).await.map_err(|e| Refusal(503, format!("{e:#}")))?;
@@ -717,9 +747,18 @@ pub async fn start(mgr: Arc<Manager>, cands: Vec<String>, mut prep: Prepared, re
                     None => Ok(first),
                 };
             }
-            Err(e) if e.retryable && i + 1 < cands.len() => {
-                tracing::warn!("remote: {c} did not answer ({}): {} is tried", e.short, cands[i + 1]);
-                with_route(|r| r.notes.push(format!("{c} did not answer ({}): {} was tried instead", e.short, cands[i + 1])));
+            Err(e) if e.short == gate::KEPT => {
+                // the content gate: this PC's model answers (the route's next local one, else its default)
+                with_route(|r| if !r.notes.iter().any(|n| n == gate::KEPT) { r.notes.push(gate::KEPT.into()) });
+                cands.retain(|x| !is_remote_target(x) || on().is_some_and(|(_, cf)| provider_of(&cf, x).is_some_and(|(p, _)| p.nsfw_accepts)));
+                i = 0;
+                if cands.is_empty() {
+                    cands.push("local".into());
+                }
+            }
+            Err(e) if e.retryable && i < cands.len() => {
+                tracing::warn!("remote: {c} did not answer ({}): {} is tried", e.short, cands[i]);
+                with_route(|r| r.notes.push(format!("{c} did not answer ({}): {} was tried instead", e.short, cands[i])));
             }
             Err(e) => {
                 tracing::warn!("remote: {c}: {}", e.message);
@@ -736,6 +775,27 @@ pub async fn start(mgr: Arc<Manager>, cands: Vec<String>, mut prep: Prepared, re
 }
 
 // ------------------------------------------------------------------ the layer
+
+/// The remote model that takes a request for this PC's own `model` (None: its default) now: `remote.overflow` is
+/// set, this PC is busy (a job runs or waits, or the GPU is with a media job), and no idle cluster worker has the
+/// same model (the cluster takes it then, as the same model answers).
+fn overflow_for(s: &AppState, c: &Config, family: Family, model: Option<&str>) -> Option<String> {
+    let target = c.overflow.as_ref()?;
+    if family == Family::Images || model.is_some_and(|m| is_mix_name(m) || provider_of(c, m).is_some() || s.mgr.entry(m).is_none()) {
+        return None;
+    }
+    let queue = &s.mgr.queue;
+    if !overflow_now(queue.busy(), matches!(queue.resident(), crate::queue::Resident::Text(_)),
+                     model.is_some_and(|m| s.cluster.pick(m, true, true).is_some())) {
+        return None;
+    }
+    Some(target.clone())
+}
+
+/// Overflow's rule: this PC is busy (or its text model is not the one loaded), and no worker can answer as the same model.
+fn overflow_now(busy: bool, text_loaded: bool, worker_has_it: bool) -> bool {
+    (busy || !text_loaded) && !worker_has_it
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Family {
@@ -801,18 +861,26 @@ pub async fn layer(axum::extract::State(s): axum::extract::State<AppState>, req:
         _ => v.get("model").and_then(Value::as_str).map(str::to_string),
     };
     let pass = |parts: axum::http::request::Parts, bytes: axum::body::Bytes| axum::extract::Request::from_parts(parts, Body::from(bytes));
-    let Some(model) = model.filter(|m| is_mix_name(m) || provider_of(&c, m).is_some()) else {
+    // overflow: a request for this PC's own model, while that model is busy, is answered by the remote one
+    let over = overflow_for(&s, &c, family, model.as_deref());
+    let model = if over.is_some() { Some(model.unwrap_or_else(|| "local".into())) } else { model };
+    let Some(model) = model.filter(|m| over.is_some() || is_mix_name(m) || provider_of(&c, m).is_some()) else {
         return next.run(pass(parts, bytes)).await;
     };
     let query_key = parts.uri.query().and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("key="))).map(percent_decoded);
     let Some(who) = caller(&s, &parts.headers, query_key.as_deref()) else {
-        if crate::clients::given_key(&parts.headers).is_some_and(|k| s.cluster.is_master_key(k, crate::cluster_tls::peer_of(&parts.headers))) {
+        if over.is_none() && crate::clients::given_key(&parts.headers).is_some_and(|k| s.cluster.is_master_key(k, crate::cluster_tls::peer_of(&parts.headers))) {
             return refuse(family, StatusCode::FORBIDDEN, "permission_error", format!("{model}: a cluster master may not use this server's remote models"));
         }
         // no key: the handler says so
         return next.run(pass(parts, bytes)).await;
     };
-    if !who.may(&c, &model) {
+    if let Some(target) = &over {
+        // a key that may not use the remote model simply waits for this PC's, as before
+        if !who.may(&c, target) {
+            return next.run(pass(parts, bytes)).await;
+        }
+    } else if !who.may(&c, &model) {
         return refuse(family, StatusCode::FORBIDDEN, "permission_error", format!("this key may not use the model {model:?}"));
     }
     if family == Family::Images {
@@ -823,7 +891,9 @@ pub async fn layer(axum::extract::State(s): axum::extract::State<AppState>, req:
             None => refuse(family, StatusCode::BAD_REQUEST, "invalid_request_error", format!("{model}: a mix routes chats, not images")),
         };
     }
-    let cands = if is_mix_name(&model) {
+    let cands = if let Some(target) = over {
+        vec![target, model.clone()]
+    } else if is_mix_name(&model) {
         let Some(m) = c.mix_of(&model) else {
             return refuse(family, StatusCode::NOT_FOUND, "not_found_error", format!("{model}: no such mix in the run config's remote.mixes"));
         };
@@ -904,6 +974,9 @@ async fn images(r: &Arc<Remote>, p: &Provider, model: &str, full: &str, mut v: V
         Err(e) => return fail(ProviderError::new(502, "api_error", e, false, "no key".into())),
     };
     v["model"] = json!(model);
+    if let Err(e) = held(r, p, &v).await {
+        return fail(ProviderError { retryable: false, ..e });
+    }
     let _permit = r.sem(p).acquire_owned().await;
     let resp = match r.auth(r.http.post(p.url("/images/generations")), p, &key).timeout(Duration::from_secs(p.timeout_s)).json(&v).send().await {
         Ok(x) => x,
@@ -962,6 +1035,28 @@ mod tests {
         let c = cfg();
         assert!(resolves_in(&c, "openai/gpt-5.5") && resolves_in(&c, "groq/anything") && resolves_in(&c, "mix") && resolves_in(&c, "mix/code"));
         assert!(!resolves_in(&c, "ministral-3-3b") && !resolves_in(&c, "nope/x") && !resolves_in(&c, "openai/"));
+    }
+
+    #[test]
+    fn overflow_only_while_this_pc_is_busy_and_no_worker_has_the_model() {
+        assert!(overflow_now(true, true, false) && overflow_now(false, false, false), "busy, or the GPU is with a media job");
+        assert!(!overflow_now(false, true, false), "an idle PC answers itself");
+        assert!(!overflow_now(true, true, true), "a worker with the same model answers first");
+    }
+
+    #[test]
+    fn the_block_keeps_overflow_the_gate_and_what_a_provider_accepts() {
+        let v = json!({"providers": {"a": {"kind": "openai", "base_url": "https://a.example/v1", "nsfw": "accepts"},
+                                     "b": {"kind": "openai", "base_url": "https://b.example/v1"}},
+                       "overflow": "b/m1", "gate": {"release_under": 0.1}});
+        let c = Config::parse(&v).unwrap();
+        assert!(c.provider("a").unwrap().nsfw_accepts && !c.provider("b").unwrap().nsfw_accepts);
+        assert_eq!((c.overflow.as_deref(), c.release_under), (Some("b/m1"), Some(0.1)));
+        assert_eq!(Config::parse(&c.to_value()).unwrap(), c, "written back as read");
+        for bad in [json!({"overflow": "local"}), json!({"overflow": "nope/x"}), json!({"gate": {"release_under": 1.5}}),
+                    json!({"providers": {"a": {"kind": "openai", "base_url": "https://a.example/v1", "nsfw": "yes"}}})] {
+            assert!(Config::parse(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

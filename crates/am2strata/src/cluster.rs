@@ -750,7 +750,8 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
     let path = req.uri().path().to_string();
     let media = MEDIA_ROUTED.iter().find(|(p, _)| *p == path).map(|(_, k)| *k);
     if s.cluster.is_empty() || req.method() != axum::http::Method::POST || (!ROUTED.contains(&path.as_str()) && media.is_none())
-        || !crate::api_authorized(&s, req.headers()) {
+        || !crate::api_authorized(&s, req.headers()) || crate::remote::planned() {
+        // (a request the remote layer already routed to a provider is answered through this server)
         return next.run(req).await;
     }
     if let Some(kind) = media {

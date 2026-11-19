@@ -209,15 +209,37 @@ fn remote_block(port: u16) -> Value {
     })
 }
 
+/// A stand-in for am2strata-textgate (the content gate's classifier): a text with the word EXPLICIT is rated NSFW,
+/// every other one safe.
+fn mock_gate() -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let p = std::env::temp_dir().join(format!("am2-textgate-mock-{}.sh", std::process::id()));
+    if !p.is_file() {
+        let tmp = p.with_extension(format!("{:?}.tmp", std::thread::current().id()));
+        std::fs::write(&tmp, "#!/bin/sh\necho '{\"ready\":true,\"labels\":[\"safe\",\"nsfw\"]}'\nwhile IFS= read -r line; do case \"$line\" in\n\
+            *EXPLICIT*) echo '{\"scores\":{\"safe\":0.01,\"nsfw\":0.99},\"windows\":1,\"truncated\":false}';;\n\
+            *) echo '{\"scores\":{\"safe\":0.99,\"nsfw\":0.01},\"windows\":1,\"truncated\":false}';;\nesac; done\n").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &p).unwrap();
+    }
+    p.display().to_string()
+}
+
 fn start(port: u16, extra_cfg: Value, replies: &[Vec<u32>], extra: Value) -> Server {
     let mut cfg = json!({"remote": remote_block(port), "api_monitor": true,
                          "mcp_servers": {"calc": {"command": env!("CARGO_BIN_EXE_strata-mock-mcp")}}});
     if let (Some(c), Some(e)) = (cfg.as_object_mut(), extra_cfg.as_object()) {
         c.extend(e.clone());
     }
-    let mut x = json!({"server_log": true, "env": {"AM2_TEST_PROVIDER_KEY": PROVIDER_KEY}});
+    let mut x = json!({"server_log": true, "env": {"AM2_TEST_PROVIDER_KEY": PROVIDER_KEY, "AM2STRATA_TEXTGATE_EXE": mock_gate()}});
     if let (Some(c), Some(e)) = (x.as_object_mut(), extra.as_object()) {
-        c.extend(e.clone());
+        for (k, v) in e {
+            // "env" adds to the environment above
+            match (k.as_str(), c.get_mut("env").and_then(Value::as_object_mut), v.as_object()) {
+                ("env", Some(have), Some(more)) => have.extend(more.clone()),
+                _ => { c.insert(k.clone(), v.clone()); }
+            }
+        }
     }
     Server::start(&[Model { vision: false, extra: cfg, ..Model::default() }], replies, x)
 }
@@ -542,7 +564,8 @@ fn a_key_file_others_can_read_is_refused() {
 #[test]
 fn the_mix_routes_by_size_pictures_and_falls_back_once() {
     let (port, _mock) = mock_providers();
-    let s = start(port, json!({}), &[ids("Thinking.\n</think>\n\nlocal answer")], json!({}));
+    let local = ids("Thinking.\n</think>\n\nlocal answer");
+    let s = start(port, json!({}), &[local.clone(), local.clone(), local], json!({}));
     // small, no pictures, local idle: the local model
     let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mix", "messages": [user("hi")]}));
     assert_eq!(code, 200, "{body}");
@@ -555,7 +578,11 @@ fn the_mix_routes_by_size_pictures_and_falls_back_once() {
     // a picture: has_images
     let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mix", "messages": [{"role": "user", "content": [
         {"type": "text", "text": "what is it?"}, {"type": "image_url", "image_url": {"url": png()}}]}]}));
-    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "openai/m1"), "{body}");
+    // (the content gate cannot read a picture, so it is answered here: the provider does not take NSFW work)
+    // (this test's local model has no image encoder, and says so: the picture still went nowhere)
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (400, "mock-a"), "{body}");
+    assert!(header(&h, "x-strata-note").contains("kept local (content)") && body.contains("image encoder"), "{h:?} {body}");
+    assert!(!_mock.bodies().iter().any(|b| b.to_string().contains("what is it?")));
     // a 500 before the answer: the next model, said in the headers
     let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mix/f500", "messages": [user("hi")]}));
     assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "anthropic/claude-x"), "{body}");
@@ -570,6 +597,101 @@ fn the_mix_routes_by_size_pictures_and_falls_back_once() {
     assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["type"], "rate_limit_error");
     // a mix that is not in the config
     assert_eq!(call(&s, KEY, "/v1/chat/completions", &json!({"model": "mix/nope", "messages": [user("hi")]})).0, 404);
+}
+
+/// The content gate: what the classifier does not rate safe never reaches a provider, unless the owner marked that
+/// provider as accepting it; the request is answered here, and x-strata-note says so.
+#[test]
+fn the_content_gate_keeps_unsafe_and_unreadable_requests_here() {
+    let (port, mock) = mock_providers();
+    let local = ids("Thinking.\n</think>\n\nlocal answer");
+    let s = start(port, json!({}), &vec![local.clone(); 6], json!({}));
+    let sent = |m: &Mock, word: &str| m.bodies().iter().any(|b| b.to_string().contains(word));
+    // safe text goes to the provider
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "openai/m1", "messages": [user("a plain question, PLAINWORD")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "openai/m1"), "{body}");
+    assert!(sent(&mock, "PLAINWORD") && header(&h, "x-strata-note").is_empty());
+    // rated NSFW: asked of the provider by name, of a mix, in both APIs - always answered here
+    for (path, req) in [
+        ("/v1/chat/completions", json!({"model": "openai/m1", "messages": [user("an EXPLICIT request")]})),
+        ("/v1/chat/completions", json!({"model": "openai/m1", "messages": [user("an EXPLICIT request")], "stream": true})),
+        ("/v1/messages", json!({"model": "anthropic/claude-x", "max_tokens": 50, "messages": [user("an EXPLICIT request")]})),
+        ("/v1/chat/completions", json!({"model": "mix", "messages": [user(&format!("EXPLICIT {}", "word ".repeat(3000)))]})),
+        // unsafe text anywhere in the conversation, not only the last message
+        ("/v1/chat/completions", json!({"model": "openai/m1", "messages": [{"role": "system", "content": "EXPLICIT persona"}, user("hi")]})),
+        // a language the classifier does not read
+        ("/v1/chat/completions", json!({"model": "openai/m1", "messages": [user("ॐ त्र्यम्बकं यजामहे सुगन्धिं पुष्टिवर्धनम् UNREADWORD")]})),
+    ] {
+        let (code, h, body) = call(&s, KEY, path, &req);
+        assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "mock-a"), "{path} {req}: {body}");
+        assert!(header(&h, "x-strata-note").contains("kept local (content)"), "{h:?}");
+        // (a streamed answer comes in pieces)
+        assert!(body.contains("local answer") || req["stream"] == json!(true), "{body}");
+    }
+    assert!(!sent(&mock, "EXPLICIT") && !sent(&mock, "UNREADWORD"), "nothing of them reached a provider");
+    // a picture prompt for the provider's image model is refused, not sent
+    let (code, _, body) = call(&s, KEY, "/v1/images/generations", &json!({"model": "openai/m1", "prompt": "an EXPLICIT picture"}));
+    assert_eq!(code, 403, "{body}");
+    assert!(body.contains("kept local (content)") && !sent(&mock, "EXPLICIT"));
+    drop(s);
+
+    // a provider the owner marked as accepting it gets it
+    let (port, mock) = mock_providers();
+    let mut block = remote_block(port);
+    block["providers"]["openai"]["nsfw"] = json!("accepts");
+    let s = start(port, json!({"remote": block}), &[local.clone()], json!({}));
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "openai/m1", "messages": [user("an EXPLICIT request")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "openai/m1"), "{body}");
+    assert!(sent(&mock, "EXPLICIT"));
+    drop(s);
+
+    // no classifier on this machine: nothing leaves, safe or not
+    let (port, mock) = mock_providers();
+    let s = start(port, json!({}), &[local], json!({"env": {"AM2STRATA_TEXTGATE_EXE": "/nonexistent/am2strata-textgate"}}));
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "openai/m1", "messages": [user("a plain question, PLAINWORD")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "mock-a"), "{body}");
+    assert!(header(&h, "x-strata-note").contains("kept local (content)") && !sent(&mock, "PLAINWORD"));
+}
+
+/// Overflow: a request for this PC's own model is answered by `remote.overflow` while that model is busy - when the
+/// content gate releases it - and by this PC otherwise.
+#[test]
+fn a_busy_local_model_overflows_to_the_remote_one_through_the_gate() {
+    let (port, mock) = mock_providers();
+    let mut block = remote_block(port);
+    block["overflow"] = json!("openai/busy-model");
+    let long = ids(&format!("Thinking.\n</think>\n\n{}", "slow ".repeat(30)));
+    let s = start(port, json!({"remote": block}), &vec![long; 5], json!({"delay_ms": 150}));
+    // idle: this PC answers its own model, and nothing is sent away
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("IDLEWORD")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{body}");
+    assert!(mock.bodies().is_empty());
+    let base = s.base.clone();
+    // one long answer keeps this PC busy (a second request would itself overflow, and nothing would ever wait)
+    let busy: Vec<_> = (0..1).map(|_| {
+        let base = base.clone();
+        std::thread::spawn(move || {
+            let _ = reqwest::blocking::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(KEY)
+                .json(&json!({"model": "mock-a", "messages": [{"role": "user", "content": "go"}]})).timeout(Duration::from_secs(60)).send();
+        })
+    }).collect();
+    let t0 = Instant::now();
+    while s.get("/api/queue", true).1["running"].is_null() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // busy: the remote model answers at once
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("hi OVERWORD")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "openai/busy-model"), "{body}");
+    assert!(t0.elapsed() < Duration::from_secs(4), "it did not wait for the local queue");
+    assert!(mock.bodies().iter().any(|b| b.to_string().contains("OVERWORD")));
+    // busy, but not safe to send: it waits for this PC
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("an EXPLICIT request")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, "mock-a"), "{body}");
+    assert!(header(&h, "x-strata-note").contains("kept local (content)"));
+    assert!(!mock.bodies().iter().any(|b| b.to_string().contains("EXPLICIT")));
+    for b in busy {
+        let _ = b.join();
+    }
 }
 
 #[test]

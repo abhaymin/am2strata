@@ -51,6 +51,9 @@ pub struct Provider {
     pub max_tokens_field: String,
     /// OpenAI kind: send the client's reasoning effort as `reasoning_effort`
     pub reasoning_effort: bool,
+    /// "nsfw": "accepts": the owner says this provider takes such work, so the content gate lets it through.
+    /// The default ("refuses"): text the gate does not rate safe never goes to it.
+    pub nsfw_accepts: bool,
 }
 
 impl Provider {
@@ -103,7 +106,15 @@ pub struct Config {
     pub mix: Mix,
     /// "mix/<name>"
     pub mixes: BTreeMap<String, Mix>,
+    /// "overflow": the <provider>/<model> that answers a request for this PC's own model while that model is busy
+    pub overflow: Option<String>,
+    /// "gate": {"model": the classifier's folder (default <data>/models/classifiers/distilbert-nsfw-text-classifier)}
+    pub gate_model: Option<String>,
+    /// "gate": {"release_under": 0.2}: a text leaves only when its nsfw score is under this
+    pub release_under: Option<f64>,
 }
+
+pub const RELEASE_UNDER: f64 = 0.2;
 
 fn name_ok(n: &str) -> bool {
     !n.is_empty() && n.len() <= 40 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -168,8 +179,14 @@ fn parse_provider(name: &str, v: &Value) -> Result<Provider, String> {
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err(format!("{}: true or false", at("reasoning_effort"))),
     };
+    let nsfw_accepts = match o.get("nsfw") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(x)) if x == "refuses" => false,
+        Some(Value::String(x)) if x == "accepts" => true,
+        Some(_) => return Err(format!("{}: \"refuses\" (the default) or \"accepts\"", at("nsfw"))),
+    };
     Ok(Provider {
-        name: name.to_string(), kind, base_url, key, models, max_concurrent, kinds,
+        name: name.to_string(), kind, base_url, key, models, max_concurrent, kinds, nsfw_accepts,
         context: num("context", 128_000, 1024, 10_000_000)? as usize,
         max_tokens: num("max_tokens", 8192, 1, 1_000_000)?,
         timeout_s: num("timeout_s", 600, 5, 86_400)?,
@@ -245,7 +262,20 @@ impl Config {
             }
             mixes.insert(name.clone(), parse_mix(m, &format!("config remote.mixes.{name}"), &providers)?);
         }
-        Ok(Config { providers, mix, mixes })
+        let overflow = match o.get("overflow").filter(|x| !x.is_null()) {
+            None => None,
+            Some(t) => Some(parse_target(t, "config remote.overflow", &providers).ok().filter(|t| t.contains('/'))
+                .ok_or("config remote.overflow: expected <provider>/<model> of remote.providers")?),
+        };
+        let (mut gate_model, mut release_under) = (None, None);
+        if let Some(g) = o.get("gate").filter(|g| !g.is_null()) {
+            let g = g.as_object().ok_or("config remote.gate: expected {\"model\": folder, \"release_under\": 0.2}")?;
+            gate_model = g.get("model").and_then(Value::as_str).map(str::to_string);
+            if let Some(x) = g.get("release_under").filter(|x| !x.is_null()) {
+                release_under = Some(x.as_f64().filter(|x| (0.001..=0.9).contains(x)).ok_or("config remote.gate.release_under: 0.001 to 0.9")?);
+            }
+        }
+        Ok(Config { providers, mix, mixes, overflow, gate_model, release_under })
     }
 
     pub fn provider(&self, name: &str) -> Option<&Provider> {
@@ -281,11 +311,23 @@ impl Config {
             if let Some(k) = &p.key {
                 v["key"] = json!(k);
             }
+            if p.nsfw_accepts {
+                v["nsfw"] = json!("accepts");
+            }
             providers.insert(p.name.clone(), v);
         }
         let mut out = json!({"providers": providers, "mix": mix(&self.mix)});
         if !self.mixes.is_empty() {
             out["mixes"] = Value::Object(self.mixes.iter().map(|(n, m)| (n.clone(), mix(m))).collect());
+        }
+        if let Some(o) = &self.overflow {
+            out["overflow"] = json!(o);
+        }
+        if self.gate_model.is_some() || self.release_under.is_some() {
+            let mut g = Map::new();
+            if let Some(m) = &self.gate_model { g.insert("model".into(), json!(m)); }
+            if let Some(x) = self.release_under { g.insert("release_under".into(), json!(x)); }
+            out["gate"] = Value::Object(g);
         }
         out
     }
