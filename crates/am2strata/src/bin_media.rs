@@ -61,6 +61,21 @@ pub fn with_seed(body: &mut Value, seed: Option<u64>) {
     if let Some(s) = seed { body["seed"] = json!(s); }
 }
 
+/// A long flag's value from the command line (`--name value` or `--name=value`), for options a single action takes that a
+/// shared clap field would clash with: `media analyze --seconds N`, since MediaOpts.seconds is a song's length, not this.
+pub fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(eq) = args[i].split_once('=') {
+            if eq.0 == name { return Some(eq.1.to_string()); }
+        } else if args[i] == name && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The non-file fields of a transcription (OpenAI's multipart: `file`, `model`, `response_format`, `language`).
 /// `translate` does not change a field: it changes the endpoint (/v1/audio/transcriptions vs /v1/audio/translations).
 pub fn transcribe_fields(model: Option<&str>, response_format: Option<&str>, language: Option<&str>) -> Vec<(&'static str, String)> {
@@ -142,6 +157,7 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file]
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
+///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts, polls every 3 s for step N of M, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
@@ -193,6 +209,9 @@ pub struct MediaOpts {
     /// song length in seconds (10 to 600)
     #[arg(long, default_value_t = 60)]
     seconds: u32,
+    /// for analyze only: how far into the file to start (seconds); --seconds alone is parsed from the command line
+    #[arg(long)]
+    from: Option<f64>,
     /// expected words for the check, so words_heard can be measured
     #[arg(long)]
     expect: Option<String>,
@@ -228,6 +247,7 @@ pub struct MediaOpts {
 ///   transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file]
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
+///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts the plan, polls step N of M every 3 s, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
@@ -267,6 +287,7 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "song"  => cmd_song(&client, &send, first.as_deref(), o, &url)?,
             "transcribe" => cmd_transcribe(&client, &send, first.as_ref(), o, &url)?,
             "check" => cmd_check(&client, &send, first.as_ref(), o, &url)?,
+            "analyze" => cmd_analyze(&client, &send, first.as_ref(), o, &url)?,
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
@@ -275,7 +296,7 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "judge" => cmd_judge(&client, &send, first.as_ref(), o, &url)?,
             "files" | "add" | "get" | "rm" | "pin" | "unpin" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
             "search" | "reverse" => cmd_search(&client, &send, action, first.as_deref(), o, &url)?,
-            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, compose, thumbnail, judge, files, add, get, rm, pin, unpin, search, reverse")),
+            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, analyze, dub, produce, job, compose, thumbnail, judge, files, add, get, rm, pin, unpin, search, reverse")),
         }
         Ok(())
     })();
@@ -407,6 +428,76 @@ fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     if j["audio"].get("error").is_some() || j["video"].get("error").is_some() { problems = problems.max(1); }
     if problems > 0 { return Err(format!("{problems} check(s) not ok")); }
     Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------- analyze
+
+fn cmd_analyze(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+               first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    use reqwest::blocking::multipart::{Form, Part};
+
+    // the audio goes in as multipart `file` (a base64 data URL works too); /v1/media/analyze reads any format and reports
+    // the music facts. --seconds is parsed from the command line itself, since MediaOpts.seconds is a song's length: it is
+    // 0 (the whole take) unless this analyze asks for a window; --from is clap's own field.
+    let (bytes, name) = read_bytes(&expand_path(Path::new(first.ok_or("analyze needs a file")?)))?;
+    let args: Vec<String> = std::env::args().collect();
+    let mut from_s = o.from.unwrap_or(0.0);
+    if let Some(v) = flag_value(&args, "--from") { if let Ok(x) = v.parse::<f64>() { from_s = x; } }
+    let seconds: f64 = flag_value(&args, "--seconds").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let mut form = Form::new().part("file", Part::bytes(bytes).file_name(name));
+    if from_s > 0.0 { form = form.text("from_s", format!("{from_s}")); }
+    if seconds > 0.0 { form = form.text("seconds", format!("{seconds}")); }
+    let r = send(client.post(format!("{url}/v1/media/analyze")).multipart(form))?;
+    let j: Value = r.json().map_err(|e| e.to_string())?;
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
+    print_analyze(&j);
+    Ok(())
+}
+
+/// The music facts of an analyze answer: tempo (bpm, steady/unsteady), the verse's repeat period, the drone's tonic (note + hertz)
+/// and range, every swara its voice spends on it, and each phrase's timing and notes.
+fn print_analyze(j: &Value) {
+    if let Some(e) = j["error"].as_str() { println!("analyze failed: {e}"); return; }
+    let sec = j["seconds"].as_f64().unwrap_or(0.0);
+    println!("analyzed {:.1} s", sec);
+    // tempo — the beat of the voice band above the drone
+    match j["tempo"]["bpm"].as_f64() {
+        Some(bpm) if bpm > 0.0 => {
+            let conf = j["tempo"]["confidence"].as_f64().unwrap_or(0.0);
+            let steady = j["tempo"]["steady_pulse"].as_bool().unwrap_or(true);
+            println!("tempo: {:.0} bpm, confidence {:.2}, {}", bpm, conf, if steady { "steady pulse" } else { "unsteady" });
+        }
+        _ => println!("tempo: none found"),
+    }
+    // repeat — one verse of the mantra
+    match j["repeat"]["period_s"].as_f64() {
+        Some(p) if p > 0.0 => println!("repeat: {:.1} s per verse ({} times in the clip)", p, j["repeat"]["repeats_in_section"].as_f64().unwrap_or(0.0)),
+        _ => println!("repeat: none found"),
+    }
+    // pitch — the drone's home note and where the voice travels
+    if let Some(tonic) = j["pitch"]["tonic"]["note"].as_str() {
+        let hz = j["pitch"]["tonic"]["hz"].as_f64().unwrap_or(0.0);
+        let conf = j["pitch"]["tonic"]["confidence"].as_f64().unwrap_or(0.0);
+        let low = j["pitch"]["range"]["low_hz"].as_f64().unwrap_or(0.0);
+        let high = j["pitch"]["range"]["high_hz"].as_f64().unwrap_or(0.0);
+        println!("tonic: {tonic} ({hz:.1} Hz, confidence {:.2})", conf);
+        if low > 0.0 && high > 0.0 { println!("range: {:.1}-{} Hz", low, high); }
+    }
+    // each swara and the share of voiced time the voice spends on it (sorted by share)
+    if let Some(arr) = j["pitch"]["swaras"].as_array() {
+        for s in arr {
+            println!("  {} {:.2}", s["name"].as_str().unwrap_or(""), s["share"].as_f64().unwrap_or(0.0));
+        }
+    }
+    // phrases — the voiced stretches and the notes each one moves through
+    if let Some(arr) = j["phrases"].as_array() {
+        println!("phrases: {}", arr.len());
+        for p in arr {
+            let start = p["start_s"].as_f64().unwrap_or(0.0);
+            let note = p["median_note"].as_str().unwrap_or("");
+            println!("  {:.1}-{} s, median {}", start, p["end_s"].as_f64().unwrap_or(0.0), note);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------- dub / produce / job
