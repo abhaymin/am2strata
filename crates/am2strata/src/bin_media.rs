@@ -390,6 +390,8 @@ fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     let body = if url_.starts_with("data:video/") { json!({"video": url_, "near_floor": 0.15}) } else { check_body(&url_, o.expect.as_deref(), o.language.as_deref()) };
     let r = send(client.post(format!("{url}/v1/media/check")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
+    // --json: every number (words heard and its rate, pause seconds, clip ratio, frames), not just pass/fail
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
     let mut problems = 0usize;
     for (family, obj) in [("audio", &j["audio"]), ("video", &j["video"])] {
         if let Some(checks) = obj.as_object() {
@@ -397,7 +399,8 @@ fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
                 if name == "note" || name == "error" { println!("{family}.{name}: {}", check.as_str().unwrap_or("")); continue; }
                 let ok = check["ok"].as_bool();
                 if matches!(ok, Some(false)) { problems += 1; }
-                println!("{family}.{name}: {}", match ok { Some(true) => "pass", Some(false) => "FAIL", None => "n/a" });
+                let num = ["rate", "seconds", "ratio", "peak_ratio", "count"].iter().find_map(|k| check.get(*k).filter(|v| v.is_number()).map(|v| format!(" ({k} {v})"))).unwrap_or_default();
+                println!("{family}.{name}: {}{num}", match ok { Some(true) => "pass", Some(false) => "FAIL", None => "n/a" });
             }
         }
     }
