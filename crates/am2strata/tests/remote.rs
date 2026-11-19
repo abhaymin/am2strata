@@ -661,7 +661,7 @@ fn a_busy_local_model_overflows_to_the_remote_one_through_the_gate() {
     let mut block = remote_block(port);
     block["overflow"] = json!("openai/busy-model");
     let long = ids(&format!("Thinking.\n</think>\n\n{}", "slow ".repeat(30)));
-    let s = start(port, json!({"remote": block}), &vec![long; 5], json!({"delay_ms": 150}));
+    let s = start(port, json!({"remote": block}), &vec![long; 7], json!({"delay_ms": 150}));
     // idle: this PC answers its own model, and nothing is sent away
     let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("IDLEWORD")]}));
     assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{body}");
@@ -692,6 +692,21 @@ fn a_busy_local_model_overflows_to_the_remote_one_through_the_gate() {
     for b in busy {
         let _ = b.join();
     }
+    // busy again, and a request with tools (an agent's): it waits for this PC's model, as asked
+    let base2 = s.base.clone();
+    let again = std::thread::spawn(move || {
+        let _ = reqwest::blocking::Client::new().post(format!("{base2}/v1/chat/completions")).bearer_auth(KEY)
+            .json(&json!({"model": "mock-a", "messages": [{"role": "user", "content": "go"}]})).timeout(Duration::from_secs(60)).send();
+    });
+    let t1 = Instant::now();
+    while s.get("/api/queue", true).1["running"].is_null() && t1.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let tools = json!([{"type": "function", "function": {"name": "f", "description": "d", "parameters": {"type": "object", "properties": {}}}}]);
+    let (code, h, body) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "messages": [user("hi TOOLWORD")], "tools": tools}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{body}");
+    assert!(!mock.bodies().iter().any(|b| b.to_string().contains("TOOLWORD")), "an agent's request stays with the model it named");
+    let _ = again.join();
 }
 
 #[test]

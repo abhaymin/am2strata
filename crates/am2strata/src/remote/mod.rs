@@ -862,7 +862,9 @@ pub async fn layer(axum::extract::State(s): axum::extract::State<AppState>, req:
     };
     let pass = |parts: axum::http::request::Parts, bytes: axum::body::Bytes| axum::extract::Request::from_parts(parts, Body::from(bytes));
     // overflow: a request for this PC's own model, while that model is busy, is answered by the remote one
-    let over = overflow_for(&s, &c, family, model.as_deref());
+    // (never a request with tools: a coding agent would silently get another model mid-task; "strata_overflow": true opts in)
+    let with_tools = v.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
+    let over = overflow_for(&s, &c, family, model.as_deref()).filter(|_| !with_tools || v.get("strata_overflow") == Some(&Value::Bool(true)));
     let model = if over.is_some() { Some(model.unwrap_or_else(|| "local".into())) } else { model };
     let Some(model) = model.filter(|m| over.is_some() || is_mix_name(m) || provider_of(&c, m).is_some()) else {
         return next.run(pass(parts, bytes)).await;
