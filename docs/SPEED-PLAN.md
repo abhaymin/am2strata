@@ -28,7 +28,28 @@ only ever an option on top of a portable path that works without it.
 | 4 | **Several cards that each hold different experts** (basalt's peer tiers, with no GPU-to-GPU link) | Each device holds its own set of experts; partial results come back through mapped host memory and are summed on the main device. The split is set by each card's free memory and measured speed | Works across vendors and backends (an NVIDIA card with an AMD card, a dGPU with an iGPU), because it needs only host-mapped buffers |
 | 5 | **Misses handled three ways at once**: cached ones on the GPU, some copied over PCIe and run on the GPU, the rest on the CPU | The PCIe share comes from a measured link probe (bytes per second for each device), not a constant | Unified-memory devices skip the copy share |
 | 6 | **Drafting**: MTP, a suffix/n-gram drafter, a cost-aware window length | Host-side Rust: the MTP block is loaded but not run yet; prompt lookup exists on the CPU. The window length comes from measured window costs | Backend-independent |
-| 7 | NVFP4 | Not taken: it needs Blackwell tensor cores and re-quantizing, and it is no faster on 16 GB cards (basalt's own rows) | - |
+| 7 | NVFP4 | Not portable (it needs Blackwell's FP4 tensor cores): it is part of the Blackwell tier below, for the cards where it is faster | Blackwell only |
+
+## Blackwell: basalt's way, as a fast tier (owner, 2026-11-19)
+
+On an NVIDIA Blackwell card (compute capability 12.x, sm_120: the RTX 50x0 series and RTX PRO Blackwell), the
+engine takes **basalt's own approach** as a fast tier. It is picked at run time from the device's compute
+capability, and every other GPU keeps the portable path above. The portable path stays the reference: the Blackwell
+tier must give the same tokens (the parity gate) and be measurably faster, or it is not used.
+
+| Blackwell feature (as basalt does it) | In am2Strata |
+|---|---|
+| Kernels tuned for sm_120: its tile sizes, warp layout and async copies (cp.async / TMA) for the expert products | CubeCL's CUDA target first, tuned for sm_120, with tensor-core matrix ops (CubeCL `cmma`) for prefill |
+| **NVFP4 weights** on Blackwell's FP4 tensor cores | Optional. A Workshop quantize step writes NVFP4 (our own GGUF writer), and an FP4 matrix kernel runs where the card has FP4 tensor cores. On 16 GB cards basalt measured no gain (156.6 against IQ3_XXS's 229.6), so it is for the bigger cards (32 GB and up), measured first |
+| basalt's tuned decode settings for sm_120: draft depth, window cost table, PCIe share | The same host logic as the portable path, with sm_120's measured costs as its starting table |
+
+**The open choice (the owner's):** basalt's fastest kernels are hand-written CUDA C++. am2Strata is all Rust (its
+GPU code is CubeCL).
+- **(a) CubeCL only.** The Blackwell tier is written in CubeCL with its CUDA-only features. It stays all Rust, but
+  may fall short of basalt where CubeCL cannot express a Blackwell instruction (FP4 MMA, TMA).
+- **(b) CubeCL, plus a small optional CUDA crate for the instructions CubeCL lacks.** basalt's MIT kernels are
+  ported with its notice, built only with `--features blackwell`, and checked against the CubeCL path.
+- The recommendation is (a), going to (b) only where a measured gap remains.
 
 **Live C++ engine, now (CUDA only, while the Rust engine catches up):** cheap A/B tests in an idle window: `--spec`
 6/8 with a lower `--spec-min-p`, `--pipeline-windows 2`, and a shorter context to give VRAM to experts.
