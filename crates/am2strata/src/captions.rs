@@ -113,6 +113,30 @@ pub struct Style { pub px: f32, pub pad: f32, pub box_alpha: u8 }
 pub const CAPTION: Style = Style { px: 58.0, pad: 14.0, box_alpha: 200 };
 pub const CARD: Style = Style { px: 96.0, pad: 18.0, box_alpha: 200 };
 
+/// Where a caption sits on the frame (at a 1080 short side): low (today's default, centred 120 px above the bottom),
+/// centre (centred vertically), or top (near the top). Only Low is written back as YouTube subtitles.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Place { Low, Centre, Top }
+
+impl Place {
+    /// From a request's "place": low/centre/top, with "center" accepted and anything else defaulting to low.
+    pub fn parse(s: &str) -> Place {
+        match s.trim() { "centre" | "center" => Place::Centre, "top" => Place::Top, _ => Place::Low }
+    }
+}
+
+/// One caption: its seconds, text, where it sits and how large the type is (1.0 = today's 58 px at a 1080 short side;
+/// the request clamps size to 0.5-3.0). An old `[start_s, end_s, text]` caption is Low at size 1.0.
+#[derive(Clone, Debug)]
+pub struct Caption { pub a: f64, pub b: f64, pub text: String, pub place: Place, pub size: f32 }
+
+impl Caption {
+    /// A caption from its parts; the request's `size` is clamped to 0.5-3.0 here.
+    pub fn new(a: f64, b: f64, text: impl Into<String>, place: Place, size: f32) -> Self {
+        Caption { a, b, text: text.into(), place, size: size.clamp(0.5, 3.0) }
+    }
+}
+
 /// The text as one box picture (RGBA PNG) no wider than `max_w`: each line centred on its own dark box, the lines
 /// stacked. Returns the PNG and its size.
 pub fn render(text: &str, style: Style, max_w: u32) -> Result<(Vec<u8>, u32, u32), String> {
@@ -224,24 +248,34 @@ pub fn fit_px(text: &str, px: f32, max_w: f32) -> Result<f32, String> {
 /// One overlay: a box picture shown from `a` to `b` seconds at (x, y).
 pub struct Overlay { pub png: Vec<u8>, pub a: f64, pub b: f64, pub x: u32, pub y: u32 }
 
-/// The captions and cards of a video as overlays, placed as the libass style placed them: captions centred 120 px
-/// above the bottom (at a 1080 short side; scaled for other sizes), the title from 0.5 s to 9 s and the end card over the last 10 s, both in the middle.
-pub fn overlays(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<&str>, end: Option<&str>, total: f64)
+/// The captions and cards of a video as overlays, placed the way each kind sits on the frame at a 1080 short side
+/// (scaled for others): a low caption centred 120 px above the bottom, a centre word vertically centred, a top one near
+/// the top. The title from 0.5 s to 9 s and the end card over the last 10 s sit in the middle. Captions may overlap in
+/// time, so a low line and a centre word shown together give two overlays (one each).
+pub fn overlays(w: u32, h: u32, captions: &[Caption], open: Option<&str>, end: Option<&str>, total: f64)
                 -> Result<Vec<Overlay>, String> {
     let mut out = Vec::new();
     // the sizes are for a frame whose short side is 1080 (1920x1080 and 1080x1920 alike); others scale to it
     let k = (w.min(h) as f32 / 1080.0).max(0.1);
-    let scaled = |st: Style| Style { px: st.px * k, pad: st.pad * k, box_alpha: st.box_alpha };
+    let scale = |st: Style| Style { px: st.px * k, pad: st.pad * k, box_alpha: st.box_alpha };
     let margin = (80.0 * k) as u32;
     let bottom = (120.0 * k) as u32;
-    for (a, b, text) in captions {
-        if *b <= *a || text.trim().is_empty() { continue; }
-        let (png, bw, bh) = render(text, scaled(CAPTION), w.saturating_sub(2 * margin))?;
-        out.push(Overlay { png, a: *a, b: (*b).min(total), x: (w - bw) / 2, y: h.saturating_sub(bottom + bh) });
+    for cap in captions {
+        if cap.b <= cap.a || cap.text.trim().is_empty() { continue; }
+        // size scales the whole caption (type and padding together), so a 2.0 box is twice as tall as a 1.0 one
+        let st = scale(Style { px: CAPTION.px * cap.size, pad: CAPTION.pad * cap.size, box_alpha: CAPTION.box_alpha });
+        let (png, bw, bh) = render(cap.text.as_str(), st, w.saturating_sub(2 * margin))?;
+        // low sits 120 px up from the bottom, centre is centred vertically, top near the top; all centred horizontally
+        let y = match cap.place {
+            Place::Low => h.saturating_sub(bottom + bh),
+            Place::Centre => (h.saturating_sub(bh)) / 2,
+            Place::Top => margin,
+        };
+        out.push(Overlay { png, a: cap.a, b: cap.b.min(total), x: (w - bw) / 2, y });
     }
     let mut card = |t: &str, a: f64, b: f64| -> Result<(), String> {
         if t.trim().is_empty() || b <= a { return Ok(()); }
-        let (png, bw, bh) = render(t, scaled(CARD), w.saturating_sub(2 * margin))?;
+        let (png, bw, bh) = render(t, scale(CARD), w.saturating_sub(2 * margin))?;
         out.push(Overlay { png, a, b, x: (w - bw) / 2, y: (h.saturating_sub(bh)) / 2 });
         Ok(())
     };
@@ -313,7 +347,7 @@ mod tests {
 
     #[test]
     fn captions_sit_low_and_cards_in_the_middle() {
-        let caps = vec![(1.0, 3.0, "hello".to_string())];
+        let caps = vec![Caption::new(1.0, 3.0, "hello", Place::Low, 1.0)];
         let o = overlays(1920, 1080, &caps, Some("Title"), Some("The end"), 60.0).unwrap();
         assert_eq!(o.len(), 3);
         assert!(o[0].y > 800, "caption low: {}", o[0].y);
@@ -326,6 +360,46 @@ mod tests {
         let f = overlay_filter(&o, 2, 60.0, 0.0);
         assert!(f.contains("[2:v]format=rgba") && f.contains("[4:v]") && f.contains("[o2]format=yuv420p[v]"), "{f}");
         assert!(overlay_filter(&[], 2, 60.0, 0.0).starts_with("[0:v]format=yuv420p[v];"));
+    }
+
+    #[test]
+    fn a_centre_caption_is_verticalised_and_a_bigger_size_is_taller() {
+        // a centre word sits vertically centred: its box's middle is the frame's middle (540 px on a 1080 side)
+        let centre = overlays(1920, 1080, &[Caption::new(1.0, 3.0, "Harmony", Place::Centre, 1.0)], None, None, 4.0).unwrap();
+        assert_eq!(centre.len(), 1);
+        let bh = image::load_from_memory(&centre[0].png).unwrap().height() as f64;
+        assert!((centre[0].y as f64 + bh / 2.0 - 540.0).abs() < 1.0, "centre box centred: y {}, height {bh}", centre[0].y);
+        // size scales the whole caption (type and padding together), so a 2.0 box is about twice as tall as a 1.0 one;
+        // one short word never wraps, so only the scale differs between the two sizes
+        let small = overlays(1920, 1080, &[Caption::new(1.0, 3.0, "Harmony", Place::Low, 1.0)], None, None, 4.0).unwrap();
+        let big = overlays(1920, 1080, &[Caption::new(1.0, 3.0, "Harmony", Place::Low, 2.0)], None, None, 4.0).unwrap();
+        let hs = image::load_from_memory(&small[0].png).unwrap().height() as f64;
+        let hb = image::load_from_memory(&big[0].png).unwrap().height() as f64;
+        assert!((hb / hs - 2.0).abs() < 0.1, "size 2.0 is about twice size 1.0: {hs} -> {hb}");
+    }
+
+    #[test]
+    fn overlapping_low_and_centre_captions_are_two_overlays() {
+        let caps = vec![
+            Caption::new(1.0, 3.0, "Peace in our hands", Place::Low, 1.0),
+            Caption::new(1.0, 3.0, "Harmony", Place::Centre, 2.0),
+        ];
+        let o = overlays(1920, 1080, &caps, None, None, 4.0).unwrap();
+        assert_eq!(o.len(), 2, "the low line and the centre word are drawn together");
+        // one is near the bottom (low verse line), the other centred vertically (centre word); the centre box is higher
+        let high: Vec<_> = o.iter().filter(|x| x.y <= 540).collect();
+        let low: Vec<_> = o.iter().filter(|x| x.y > 800).collect();
+        assert_eq!((high.len(), low.len()), (1, 1), "one high box, one low box");
+        let hb = image::load_from_memory(&high[0].png).unwrap().height() as f64;
+        assert!((high[0].y as f64 + hb / 2.0 - 540.0).abs() < 1.0, "the centre word is centred: y {}, height {hb}", high[0].y);
+        assert!(low[0].y > 800 && low[0].y > high[0].y, "the verse line stays low");
+    }
+
+    #[test]
+    fn an_old_three_element_caption_still_sits_low() {
+        let o = overlays(1920, 1080, &[Caption::new(1.0, 3.0, "Peace", Place::Low, 1.0)], None, None, 4.0).unwrap();
+        assert_eq!(o.len(), 1);
+        assert!(o[0].y > 800, "a bare [start, end, text] still sits low: {}", o[0].y);
     }
 }
 

@@ -187,13 +187,34 @@ person from their face: no face-search engine is used.
 These need ffmpeg on the server.
 
 - **`POST /v1/media/videos/compose`:**
-  `{"audio", "shots": [{"image"} | {"clip"}, …], "captions"?: [[start_s, end_s, text]], "title_card"?, "end_card"?, "size"?: "1920x1080", "crossfade_s"?: 0.8}`.
-  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in. The result is one MP4 (H.264 and
-  AAC).
+  `{"audio", "shots": [{"image"} | {"clip"}, …], "captions"?: [[start_s, end_s, text] | [start_s, end_s, text, {"place", "size"}]], "title_card"?, "end_card"?, "engine"?: "native"|"libass", "size"?: "1920x1080", "crossfade_s"?: 0.8}`.
+  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in (by am2Strata with ffmpeg's
+  `overlay`, or by libass on `"captions_engine": "libass"`). The result is one MP4 (H.264 and AAC).
 - **`POST /v1/media/thumbnails`:** `{"image", "lines": [[text, "white" | "gold"]], "tag"}`. The result is one
   1280×720 JPEG with big type over a dark gradient.
 
 Both are queued jobs, and their files are at `/v1/media/jobs/{id}/content`.
+
+### The caption's place and size
+
+A caption is normally `[start_s, end_s, text]` — the verse line, drawn centred low and 120 px above the bottom (and it
+is the only kind kept in `captions.srt`, so YouTube shows the verse). It can instead carry a fourth element giving where
+the word sits and how large the type is, so the mantra's half-verse can show low while the word being sung shows large
+in the centre at the same time:
+
+```json
+{"audio": "…", "shots": [{"image": "…"}], "captions": [
+  ["0.0", "8.0", "नमस्ते अस्तु भगवन्"],                    // low, today's look (size 1.0)
+  ["0.0", "8.0", "नमस्ते", {"place": "centre", "size": 2.5}] // the sung word, large, centred, shown with the line above
+]}
+```
+
+- `"place"` is `"low"` (the default) or `"centre"` (centred vertically) or `"top"`. A low caption and a centre word in
+  the same interval overlap in time and both are drawn.
+- `"size"` scales the type (`1.0` = today's 58 px at a 1080 short side; `0.5`–`3.0` are allowed). A size `2.0` box is
+  about twice as tall as a size `1.0` one.
+- The default engine draws them with am2Strata and ffmpeg's `overlay`; on `"captions_engine": "libass"` the centre word
+  rides a second ASS style (centred, sized by its `size`). Only the low captions go to `captions.srt`.
 
 ## Dubbing
 
