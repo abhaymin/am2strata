@@ -343,7 +343,7 @@ impl Jobs {
         let models = list["models"].as_array().cloned().unwrap_or_default();
         let find = |name: &str| models.iter().find(|m| m["name"] == name).cloned();
         // the text model is stopped for a GPU job, so the whole VRAM is the media model's; mold offloads past it
-        let vram_gb: f64 = s.mgr.hw.gpus.iter().map(|g| g.vram_mib as f64 / 1024.0).sum();
+        let vram_gb: f64 = gpu_memory_gb(&s.mgr.hw, s.media.gpu_kind().as_deref());
         let mut kinds = serde_json::Map::new();
         for (kind, model) in [("image", s.media.model()), ("video", s.media.video_model()), ("tts", s.media.tts_model()),
                               ("stt", s.media.stt_model())] {
@@ -379,7 +379,8 @@ impl Jobs {
         if let Some(m) = find(crate::music::MODEL) {
             let downloaded = m["downloaded"] == true;
             // a GPU of 7 GB or more makes a minute of song in seconds; without one it runs on the CPU, slowly
-            let gpu = s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000);
+            let gpu = s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000)
+                || (s.media.gpu_kind().as_deref() == Some("metal") && vram_gb >= 7.0);
             let mut k = json!({"model": crate::music::MODEL, "downloaded": downloaded, "size_gb": m["size_gb"], "fits": true,
                                "usable": downloaded, "gpu": gpu, "max_seconds": 600});
             if !downloaded {
@@ -1101,6 +1102,13 @@ pub async fn productions(State(s): State<AppState>, headers: HeaderMap, Json(req
         Ok(job) => Json(job).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     }
+}
+
+/// The memory a media model may use on the GPU: the cards' VRAM, or on Apple Silicon (a Metal engine, no NVIDIA card)
+/// three quarters of the shared memory, which is about what macOS lets the GPU keep (its recommended working set).
+pub(crate) fn gpu_memory_gb(hw: &strata_engine::hardware::Hardware, kind: Option<&str>) -> f64 {
+    let cards: f64 = hw.gpus.iter().map(|g| g.vram_mib as f64 / 1024.0).sum();
+    if cards > 0.0 || kind != Some("metal") { cards } else { hw.ram_mib as f64 / 1024.0 * 0.75 }
 }
 
 pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Response {

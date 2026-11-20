@@ -6,9 +6,10 @@
 //! `computer_open_app` opens only an app in the allow list (the rules engine refuses the rest before the step runs).
 
 /// The desktop computer tools, matched against a request's tool call in run.rs (`crate::computer::TOOL_NAMES`).
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 16] = [
     "computer_screenshot", "computer_click", "computer_type", "computer_key",
     "computer_scroll", "computer_open_app", "computer_wait",
+    "computer_double_click", "computer_drag", "computer_move", "computer_windows", "computer_focus", "computer_clipboard",
     // only in the sandbox VM mode
     "computer_shell", "computer_install", "computer_ads",
 ];
@@ -40,18 +41,47 @@ pub fn vm_tools() -> Vec<Value> {
 }
 
 /// The tools and their parameter schemas for the model (the `strata_computer: true` flag offers them; server_tools.rs).
-pub fn tools(vision: bool) -> Vec<Value> {
+/// `size` is the screenshot's size (the coordinate system of every x, y); `mac` says the keys are a Mac's (Cmd, Option).
+pub fn tools(vision: bool, size: crate::computer::backend::Size, mac: bool) -> Vec<Value> {
     let shot = if vision { " You get a screenshot after each step." } else { "" };
+    let (w, h) = (size.width, size.height);
+    let px = format!("pixels of the {w}x{h} screenshot");
+    let keys = if mac {
+        "Press a key or key combination on this Mac (e.g. \"Enter\", \"Cmd+c\", [\"Cmd\", \"Shift\", \"t\"]; Cmd, Option, Ctrl, Shift, Tab, Escape, arrows, F1-F12)."
+    } else {
+        "Press a key or key combination on the desktop (e.g. \"Enter\", or [\"Ctrl\", \"a\"] / \"Ctrl+a\")."
+    };
+    let mut t = base_tools(vision, &shot, &px, keys);
+    t.extend([
+        json!({"name": "computer_double_click", "description": format!("Double-click at x and y ({px}): open a file or select a word."),
+               "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}),
+        json!({"name": "computer_drag", "description": format!("Press at x, y, move to to_x, to_y and let go ({px}): move a file or window, a slider, select text."),
+               "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"},
+                                 "to_x": {"type": "number"}, "to_y": {"type": "number"}}, "required": ["x", "y", "to_x", "to_y"]}}),
+        json!({"name": "computer_move", "description": format!("Move the pointer to x, y ({px}) without clicking, to open a menu or tooltip that shows on hover."),
+               "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"}}, "required": ["x", "y"]}}),
+        json!({"name": "computer_windows", "description": "List the windows on screen: each one's id, title and app. Bring one to the front with computer_focus.",
+               "parameters": {"type": "object", "properties": {}}}),
+        json!({"name": "computer_focus", "description": "Bring a window to the front by its id from computer_windows.",
+               "parameters": {"type": "object", "properties": {"id": {"type": "number"}}, "required": ["id"]}}),
+        json!({"name": "computer_clipboard", "description": "With text: put it on the clipboard (then paste it with a key). Without: read what is on the clipboard (asks the owner first).",
+               "parameters": {"type": "object", "properties": {"text": {"type": "string"}}}}),
+    ]);
+    t
+}
+
+fn base_tools(_vision: bool, shot: &str, px: &str, keys: &str) -> Vec<Value> {
+    let (shot, px) = (shot.to_string(), px.to_string());
     vec![
         json!({"name": "computer_screenshot", "description": format!("Take a screenshot of the desktop.{} What is on screen is shown.", shot),
                "parameters": {"type": "object", "properties": {}}}),
-        json!({"name": "computer_click", "description": format!("Click the desktop at x and y (pixels of the {W}x{H} screenshot). Both coordinates are required."),
+        json!({"name": "computer_click", "description": format!("Click the desktop at x and y ({px}). Both coordinates are required."),
                "parameters": {"type": "object", "properties": {"x": {"type": "number"}, "y": {"type": "number"},
                                  "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"}},
                               "required": ["x", "y"]}}),
         json!({"name": "computer_type", "description": "Type text at the cursor in the focused element (it appends, it does not replace — click the field first to focus it).",
                "parameters": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}),
-        json!({"name": "computer_key", "description": "Press a key or key combination on the desktop (e.g. \"Enter\", or [\"Ctrl\", \"a\"] / \"Ctrl+a\").",
+        json!({"name": "computer_key", "description": keys,
                "parameters": {"type": "object", "properties": {
                    "keys": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}],
                             "description": "a key or combination, as one string ([\"Ctrl\", \"a\"]) or joined (\"Ctrl+a\")"}}}}),
@@ -64,9 +94,5 @@ pub fn tools(vision: bool) -> Vec<Value> {
                "parameters": {"type": "object", "properties": {"seconds": {"type": "number", "description": "default 1"}}}}),
     ]
 }
-
-/// A tool's display width and height, so the model knows the screenshot's coordinate system.
-const W: u32 = 1280;
-const H: u32 = 800;
 
 use serde_json::{json, Value};

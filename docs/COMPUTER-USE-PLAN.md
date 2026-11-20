@@ -110,8 +110,25 @@ trait Backend { // in computer/backend.rs
   out to standard tools on the chosen display (`XTEST_DISPLAY`, `xdotool`), which keeps the dependency list minimal and matches
   how `browser.rs` launches Chrome — no new OS crates, so it builds offline with the capped cargo. (An `x11rb` XTest backend is
   noted as a future refinement in §6; shelling out is enough to satisfy §2–§5.)
-- **macOS** (`CGEvent` + ScreenCaptureKit, needs Accessibility permission): designed in `computer/backend.rs` with a stub that
-  refuses with the permission message; build if time allows.
+- **macOS (done, `computer/macos.rs`)**: the owner's real desktop, since a Mac has no sandbox. Offered only in the
+  `watch-only`, `assist` and `trusted-job` modes; `sandbox` and `vm` offer nothing on a Mac. No new crates, only the system
+  frameworks:
+  - Input goes through Quartz events (`CGEventPost`). Typing is sent as Unicode, so it works with any keyboard layout.
+  - Screenshots come from `screencapture` on the main display. The picture is scaled to fit 1280x800 with its aspect kept,
+    and that picture is the click coordinate system.
+  - The window list comes from `CGWindowListCopyWindowInfo`, and windows are focused through the accessibility API.
+  - Apps open with `open -a`; the clipboard uses `pbcopy` and `pbpaste`.
+  - The accessibility API also reads the **label of the control under a click** and whether the **focused field is a
+    password field**. The rules engine then judges the real control: a pixel click on "Delete" asks first, and typing into
+    a password field is refused, even when the model never named the control.
+  - macOS asks the owner once, in System Settings › Privacy & Security › **Accessibility** and **Screen Recording**, for the
+    `am2strata` binary. Without that, every step returns that message.
+  - A rebuilt binary has a new signature, so the permission may need turning on again after an update.
+- **New tools for every desktop:** `computer_double_click`, `computer_drag`, `computer_move` (hover),
+  `computer_windows`, `computer_focus` and `computer_clipboard`. Reading the clipboard asks first.
+  - Shortcuts that quit, close, log out, lock, force-quit or move a file to the Trash also ask first (`rules::risky_keys`).
+  - `computer_wait` now really waits, for up to 60 s.
+  - The tool descriptions give the backend's real screenshot size, and on a Mac its keys (Cmd, Option).
 - **Windows** (`SendInput` + DXGI capture): designed as a stub that refuses with "needs the Screen Recording / Accessibility
   permission"; build if time allows.
 

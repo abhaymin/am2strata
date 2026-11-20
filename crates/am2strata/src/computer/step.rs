@@ -21,20 +21,34 @@ pub struct ComputerStep {
     pub name: Option<String>,
     /// seconds to wait (computer_wait); default 1
     pub seconds: u32,
+    /// where a drag ends (computer_drag)
+    pub to_x: Option<i32>,
+    pub to_y: Option<i32>,
+    /// the window to bring to the front (computer_focus), from computer_windows
+    pub window: Option<u64>,
 }
 
 impl ComputerStep {
     fn new(tool: &str) -> ComputerStep {
         ComputerStep { tool: tool.to_string(), x: None, y: None, button: Button::Left, text: None, keys: Vec::new(),
-                       dx: None, dy: None, name: None, seconds: 1 }
+                       dx: None, dy: None, name: None, seconds: 1, to_x: None, to_y: None, window: None }
     }
 }
 
 /// The tools this classifier recognizes (matches `computer::TOOL_NAMES`); anything else is not a computer step.
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 13] = [
     "computer_screenshot", "computer_click", "computer_type", "computer_key",
     "computer_scroll", "computer_open_app", "computer_wait",
+    "computer_double_click", "computer_drag", "computer_move", "computer_windows", "computer_focus", "computer_clipboard",
 ];
+
+/// The x and y a pointer step needs, or the message naming them.
+fn point(args: &Value, what: &str) -> Result<(i32, i32), String> {
+    match (number(args.get("x")), number(args.get("y"))) {
+        (Some(x), Some(y)) => Ok((x as i32, y as i32)),
+        _ => Err(format!("give x and y to {what}")),
+    }
+}
 
 /// A tool call into a validated step, or an error naming the missing/invalid argument. Unknown tools and arguments that
 /// do not match any tool are both errors, so run.rs can tell "not ours" apart from "ours but wrong".
@@ -68,6 +82,28 @@ pub fn classify_step(tool: &str, args: &Value) -> Result<ComputerStep, String> {
             let name = args.get("name").and_then(Value::as_str).ok_or("give the application name")?;
             Ok(ComputerStep { name: Some(name.to_string()), ..s })
         }
+        "computer_double_click" => {
+            let (x, y) = point(args, "double-click on")?;
+            Ok(ComputerStep { x: Some(x), y: Some(y), ..s })
+        }
+        "computer_move" => {
+            let (x, y) = point(args, "move the pointer to")?;
+            Ok(ComputerStep { x: Some(x), y: Some(y), ..s })
+        }
+        "computer_drag" => {
+            let (x, y) = point(args, "start the drag at")?;
+            match (number(args.get("to_x")), number(args.get("to_y"))) {
+                (Some(tx), Some(ty)) => Ok(ComputerStep { x: Some(x), y: Some(y), to_x: Some(tx as i32), to_y: Some(ty as i32), ..s }),
+                _ => Err("give to_x and to_y, where the drag ends".into()),
+            }
+        }
+        "computer_windows" => Ok(s),
+        "computer_focus" => {
+            let id = number(args.get("id")).filter(|v| *v >= 0.0).ok_or("give the window's id from computer_windows")?;
+            Ok(ComputerStep { window: Some(id as u64), ..s })
+        }
+        // with text it sets the clipboard, without it reads it
+        "computer_clipboard" => Ok(ComputerStep { text: args.get("text").and_then(Value::as_str).map(str::to_string), ..s }),
         _ => unreachable!("classify_step only accepts tools in TOOLS"),
     }
 }
@@ -146,6 +182,20 @@ mod tests {
         assert_eq!(classify_step("computer_scroll", &json!({})).unwrap(), ComputerStep::new("computer_scroll"));
         assert_eq!(classify_step("computer_open_app", &json!({"name": "firefox"})).unwrap().name, Some("firefox".into()));
         assert_eq!(classify_step("computer_open_app", &json!({})).unwrap_err(), "give the application name");
+    }
+
+    #[test]
+    fn the_pointer_and_window_steps() {
+        let d = classify_step("computer_drag", &json!({"x": 1, "y": 2, "to_x": 30, "to_y": 40})).unwrap();
+        assert_eq!((d.x, d.y, d.to_x, d.to_y), (Some(1), Some(2), Some(30), Some(40)));
+        assert_eq!(classify_step("computer_drag", &json!({"x": 1, "y": 2})).unwrap_err(), "give to_x and to_y, where the drag ends");
+        assert_eq!(classify_step("computer_double_click", &json!({"x": 3})).unwrap_err(), "give x and y to double-click on");
+        assert_eq!(classify_step("computer_move", &json!({"x": 3, "y": 4})).unwrap().x, Some(3));
+        assert_eq!(classify_step("computer_focus", &json!({"id": 812})).unwrap().window, Some(812));
+        assert!(classify_step("computer_focus", &json!({})).is_err());
+        assert_eq!(classify_step("computer_clipboard", &json!({})).unwrap().text, None);
+        assert_eq!(classify_step("computer_clipboard", &json!({"text": "hi"})).unwrap().text, Some("hi".into()));
+        assert_eq!(classify_step("computer_windows", &json!({})).unwrap().tool, "computer_windows");
     }
 
     #[test]

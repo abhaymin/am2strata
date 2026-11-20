@@ -10,6 +10,9 @@ license = "MIT AND Apache-2.0"
 default = []
 cuda = ["mold-ai-inference/cuda", "candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
 cudnn = ["mold-ai-inference/cudnn"]
+# Apple Silicon: the GPU through Metal for music (ACE-Step), speech (Whisper, Parler) and mold's image and video models.
+# The server's "cuda" (its word for "on the GPU") is the Metal device in this build.
+metal = ["mold-ai-inference/metal", "candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
 # ONNX models (Chatterbox) through ONNX Runtime, loaded at run time: nothing is downloaded or linked at build time
 onnx = ["dep:ort"]
 

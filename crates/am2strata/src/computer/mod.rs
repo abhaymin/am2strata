@@ -16,6 +16,8 @@
 pub mod backend;
 pub mod engine;
 pub mod live;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod rules;
 pub mod settings;
 pub mod step;
@@ -53,9 +55,10 @@ mod tests {
 
     #[test]
     fn the_registry_lists_the_desktop_tools() {
-        assert_eq!(TOOL_NAMES.len(), 10);
+        assert_eq!(TOOL_NAMES.len(), 16);
         for name in ["computer_screenshot", "computer_click", "computer_type", "computer_key",
-                     "computer_scroll", "computer_open_app", "computer_wait", "computer_shell", "computer_install", "computer_ads"] {
+                     "computer_scroll", "computer_open_app", "computer_wait", "computer_shell", "computer_install", "computer_ads",
+                     "computer_double_click", "computer_drag", "computer_move", "computer_windows", "computer_focus", "computer_clipboard"] {
             assert!(TOOL_NAMES.contains(&name), "{name} is a computer-use tool");
         }
     }

@@ -300,10 +300,25 @@ pub fn list() -> Vec<Value> {
 
 fn device(req: &Value) -> Result<Device> {
     match req["device"].as_str() {
-        Some("cuda") if cfg!(feature = "cuda") => Ok(Device::new_cuda(0)?),
-        Some("cuda") => bail!("this media engine was built without CUDA: set where speech runs (audio_device) to cpu, or build it with --features cuda"),
+        Some("cuda" | "gpu" | "metal") => gpu(0),
         _ => Ok(Device::Cpu),
     }
+}
+
+/// The GPU this engine was built for: CUDA card `n`, or the Mac's GPU through Metal. The server says "cuda" for any GPU.
+pub fn gpu(n: usize) -> Result<Device> {
+    if cfg!(feature = "cuda") {
+        Ok(Device::new_cuda(n)?)
+    } else if cfg!(feature = "metal") {
+        Ok(Device::new_metal(0)?)
+    } else {
+        bail!("this media engine was built without a GPU: set where speech runs (audio_device) to cpu, or build it with --features cuda (NVIDIA) or --features metal (Apple Silicon)")
+    }
+}
+
+/// Which GPU this build drives ("cuda", "metal"), or None for CPU only.
+pub fn gpu_kind() -> Option<&'static str> {
+    if cfg!(feature = "cuda") { Some("cuda") } else if cfg!(feature = "metal") { Some("metal") } else { None }
 }
 
 // ------------------------------------------------------------------ audio files

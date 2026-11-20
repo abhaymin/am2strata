@@ -38,7 +38,27 @@ const JOB_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// A tool that sends input to the desktop (clicks, types, presses keys, scrolls or opens an app). `watch-only` blocks
 /// all of these: it only reads the screen (a screenshot) or waits.
 fn sends_input(name: &str) -> bool {
-    matches!(name, "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "computer_open_app")
+    matches!(name, "computer_click" | "computer_type" | "computer_key" | "computer_scroll" | "computer_open_app"
+                 | "computer_double_click" | "computer_drag" | "computer_move" | "computer_focus")
+}
+
+/// The step's arguments with what the desktop itself can tell about it, so the rules judge the real control, not only
+/// what the model wrote: the label of the control under a click or a drag's start (a model clicking "Delete" by its
+/// pixels still asks first), and whether the focused field is a password field before typing.
+fn with_desktop_facts(backend: &(dyn Backend + Send + Sync), name: &str, args: &Value, x: Option<i32>, y: Option<i32>) -> Value {
+    let mut a = args.clone();
+    if !a.is_object() { return a; }
+    match name {
+        "computer_click" | "computer_double_click" | "computer_drag" => {
+            let given = a["text"].as_str().or(a["aria"].as_str()).is_some_and(|t| !t.trim().is_empty());
+            if let (false, Some(x), Some(y)) = (given, x, y) {
+                if let Some(label) = backend.label_at(x, y) { a["text"] = json!(label); }
+            }
+        }
+        "computer_type" if backend.focused_is_secure() => { a["type"] = json!("password"); }
+        _ => {}
+    }
+    a
 }
 
 /// Run one computer-use tool call over `backend`, after classifying it and checking the active preset, returning the
@@ -56,23 +76,24 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
         Ok(s) => s,
         Err(e) => return error_result(format!("error: the step was not run: {e}"), ms(t0)),
     };
-    // 1b. Refuse a click whose coordinates fall outside the sandbox display (item 3), before anything is sent; a click by
+    // 1b. Refuse a pointer step whose coordinates fall outside the screenshot (item 3), before anything is sent; a click by
     //    window title (no x, y) has no pixel to bounds-check against.
-    if name == "computer_click" {
-        if let (Some(x), Some(y)) = (step.x, step.y) {
+    for (x, y) in [(step.x, step.y), (step.to_x, step.to_y)] {
+        if let (Some(x), Some(y)) = (x, y) {
             if x < 0 || y < 0 || x >= display_size.width as i32 || y >= display_size.height as i32 {
-                return error_result(format!("error: the click at ({x}, {y}) is outside the {}x{} sandbox display; choose coordinates within it",
+                return error_result(format!("error: ({x}, {y}) is outside the {}x{} screenshot; choose coordinates within it",
                                              display_size.width, display_size.height), ms(t0));
             }
         }
     }
     // 2. In watch-only no input is sent: a click / type / key / scroll / open_app is declined without asking; only a
     //    screenshot (a read) or a wait go on.
-    if mode == Mode::WatchOnly && sends_input(name) {
+    if mode == Mode::WatchOnly && (sends_input(name) || (name == "computer_clipboard" && step.text.is_some())) {
         return error_result("error: the step was not run (watch-only mode does not send input)".to_string(), ms(t0));
     }
     // 3. Classify into an Intent and check it against the active preset. A refusal is never executed and names the rule;
     //    an "ask" waits for approval through the browser's own path.
+    let args = &with_desktop_facts(backend, name, args, step.x, step.y);
     let intent = rules::classify(name, args).unwrap_or(Intent::Screenshot);
     let decision = rules.check(&intent, &Ctx::default(), started_at, now);
     match &decision {
@@ -98,13 +119,38 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
         return error_result(format!("error: this job reached its limit of {max_steps} steps; approve it again to start a new job"), ms(t0));
     }
     *step_counts.entry(conv.to_string()).or_insert(0) += 1;
+    let (px, py) = (step.x.unwrap_or(0), step.y.unwrap_or(0));
+    // what a step that reads something hands back to the model (the window list, the clipboard)
+    let mut said: Option<String> = None;
     let err = match name {
-        "computer_screenshot" | "computer_wait" => Ok(()),
-        "computer_click" => backend.click(step.x.unwrap_or(0), step.y.unwrap_or(0), step.button),
+        "computer_screenshot" => Ok(()),
+        "computer_wait" => { tokio::time::sleep(Duration::from_secs(step.seconds.min(60) as u64)).await; Ok(()) }
+        "computer_click" => backend.click(px, py, step.button),
+        "computer_double_click" => backend.double_click(px, py),
+        "computer_drag" => backend.drag(px, py, step.to_x.unwrap_or(px), step.to_y.unwrap_or(py)),
+        "computer_move" => backend.move_mouse(px, py),
         "computer_type" => backend.type_text(step.text.as_deref().unwrap_or("")),
         "computer_key" => backend.press_keys(&step.keys),
         "computer_scroll" => backend.scroll(step.dx.unwrap_or(0), step.dy.unwrap_or(0)),
         "computer_open_app" => backend.open_app(step.name.as_deref().unwrap_or("")),
+        "computer_focus" => backend.focus(step.window.unwrap_or(0)),
+        "computer_windows" => backend.list_windows().map(|ws| {
+            said = Some(if ws.is_empty() { "No windows are on screen.".into() } else {
+                ws.iter().map(|w| format!("{}: {}{}", w.id, w.title,
+                                          w.process.as_deref().filter(|p| *p != w.title).map(|p| format!(" ({p})")).unwrap_or_default()))
+                  .collect::<Vec<_>>().join("\n")
+            });
+        }),
+        "computer_clipboard" => match &step.text {
+            Some(t) => backend.clipboard_set(t),
+            None => backend.clipboard_get().map(|c| {
+                said = Some(if c.is_empty() { "The clipboard is empty.".into() } else {
+                    let mut c = c;
+                    if c.chars().count() > 20_000 { c = c.chars().take(20_000).collect::<String>() + "…"; }
+                    format!("The clipboard holds:\n{c}")
+                });
+            }),
+        },
         _ => Ok(()),
     };
     if let Err(e) = err {
@@ -112,7 +158,7 @@ pub async fn run_one(backend: &(dyn Backend + Send + Sync), rules: &RuleSet, mod
     }
     // A screenshot follows every step, like the browser's, so a model that reads pictures sees what changed.
     let shot = backend.screenshot().ok().and_then(|b| b.jpeg_b64());
-    let text = format!("{name} ran.");
+    let text = said.unwrap_or_else(|| format!("{name} ran."));
     let mut r = json!({"ok": true, "chars": text.chars().count(), "text": text, "truncated": false, "ms": ms(t0)});
     if let Some(s) = shot { r["image"] = json!(s); }
     r
@@ -163,7 +209,8 @@ fn error_result(text: String, ms: u64) -> Value {
     /// sees them only for a request whose run config turned it on. `vision` adds that each step returns a screenshot.
     pub fn offered_tools(&self, vision: bool) -> Vec<Value> {
         if !self.enabled() { return Vec::new(); }
-        let mut t = crate::computer::tools::tools(vision);
+        let size = self.backend.as_ref().map(|b| b.size()).unwrap_or_default();
+        let mut t = crate::computer::tools::tools(vision, size, cfg!(target_os = "macos"));
         if self.computer_mode() == Mode::Vm {
             t.extend(crate::computer::tools::vm_tools());
         }
@@ -226,7 +273,8 @@ fn error_result(text: String, ms: u64) -> Value {
         let started_at = self.started_at;
         let now = Instant::now();
         let max_steps = self.config.computer.max_steps;
-        let disp_size = Size::parse(self.config.computer.display_size.as_deref());
+        // the backend's own screenshot size: the sandbox display's, or the Mac's screen scaled to fit
+        let disp_size = backend.size();
         let mut grants = self.grants.lock().await;
         let mut step_counts = self.steps.lock().await;
         run_one(backend, &rules, self.computer_mode(), conv, name, args, id, &mut grants, &mut step_counts, max_steps, disp_size, started_at, now, tx).await
@@ -380,7 +428,16 @@ fn select_backend(_mode: Mode, _size: Size) -> (Option<Box<dyn Backend + Send + 
         };
         (Some(backend), desktop)
     }
-    #[cfg(not(target_os = "linux"))]
+    // the Mac has no sandbox: its backend is the owner's own desktop, so only the modes meant for a real desktop get it
+    // (watch-only sends no input; assist and trusted-job act with the rules' approvals). Sandbox and VM offer nothing.
+    #[cfg(target_os = "macos")]
+    {
+        match _mode {
+            Mode::WatchOnly | Mode::Assist | Mode::TrustedJob => (Some(Box::new(crate::computer::macos::MacBackend::new())), None),
+            Mode::Sandbox | Mode::Vm => (None, None),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     { (None, None) }
 }
 
@@ -663,7 +720,7 @@ mod tests {
             let r = run_one(&mock, &ruleset(), Mode::Sandbox, "job", "computer_click",
                             &json!({"x": x, "y": y}), "oob1", &mut grants, &mut steps, LIMIT, small, Instant::now(), Instant::now(), &tx).await;
             assert_eq!(r["ok"], false, "{tag}: an out-of-bounds click is refused");
-            assert!(r["text"].as_str().unwrap().contains("outside the 100x100 sandbox display"), "{tag}: {}", r["text"]);
+            assert!(r["text"].as_str().unwrap().contains("outside the 100x100 screenshot"), "{tag}: {}", r["text"]);
         }
         // only the one in-bounds click reached the backend: out-of-bounds clicks never send anything.
         assert_eq!(mock.clicks.borrow().len(), 1, "only the in-bounds click ran");
@@ -712,5 +769,68 @@ mod tests {
         assert!(start_watchdog(d2.clone(), Duration::from_millis(10), s2.clone()), "a fresh watcher arms after the old one freed its slot");
         for _ in 0..200 { if d2.stopped.load(std::sync::atomic::Ordering::Relaxed) { break; } std::thread::sleep(Duration::from_millis(10)); }
         assert!(d2.stopped.load(std::sync::atomic::Ordering::Relaxed), "the fresh watcher stops the restarted display again");
+    }
+
+    /// A desktop that can read its controls (like the Mac's accessibility API): the control under every point is
+    /// labelled "Delete", the focused field is a password field, and it has two windows.
+    struct Reading;
+    unsafe impl Send for Reading {}
+    unsafe impl Sync for Reading {}
+    impl Backend for Reading {
+        fn screenshot(&self) -> Result<Buffer, String> { Ok(Buffer { width: 2, height: 2, rgba: vec![0u8; 16] }) }
+        fn list_windows(&self) -> Result<Vec<Window>, String> {
+            Ok(vec![Window { id: 7, title: "Notes".into(), process: Some("Notes".into()) },
+                    Window { id: 9, title: "Inbox".into(), process: Some("Mail".into()) }])
+        }
+        fn focus(&self, _id: WindowId) -> Result<(), String> { Ok(()) }
+        fn click(&self, _x: i32, _y: i32, _b: Button) -> Result<(), String> { Ok(()) }
+        fn type_text(&self, _t: &str) -> Result<(), String> { Ok(()) }
+        fn press_keys(&self, _k: &[Key]) -> Result<(), String> { Ok(()) }
+        fn scroll(&self, _dx: i32, _dy: i32) -> Result<(), String> { Ok(()) }
+        fn open_app(&self, _n: &str) -> Result<(), String> { Ok(()) }
+        fn label_at(&self, _x: i32, _y: i32) -> Option<String> { Some("Delete".into()) }
+        fn focused_is_secure(&self) -> bool { true }
+    }
+
+    #[test]
+    fn the_desktop_names_the_control_under_a_pixel_click() {
+        let a = with_desktop_facts(&Reading, "computer_click", &json!({"x": 3, "y": 4}), Some(3), Some(4));
+        assert_eq!(a["text"], "Delete");
+        assert!(matches!(rules::classify("computer_click", &a), Some(Intent::Click { risky: true, .. })), "a click on Delete is risky");
+        // a label the model gave is kept
+        let given = with_desktop_facts(&Reading, "computer_click", &json!({"x": 3, "y": 4, "text": "OK"}), Some(3), Some(4));
+        assert_eq!(given["text"], "OK");
+    }
+
+    #[tokio::test]
+    async fn typing_into_a_password_field_the_desktop_found_is_refused() {
+        let (mut grants, mut steps) = (HashMap::new(), HashMap::new());
+        let (tx, _rx) = channel();
+        let r = run_one(&Reading, &ruleset(), Mode::Assist, "conv", "computer_type", &json!({"text": "hunter2"}), "idP",
+                        &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r["ok"], false);
+        assert!(r["text"].as_str().unwrap().contains("no_password_fields"), "{}", r["text"]);
+    }
+
+    #[tokio::test]
+    async fn the_window_list_and_the_wait() {
+        let (mut grants, mut steps) = (HashMap::new(), HashMap::new());
+        let (tx, _rx) = channel();
+        let r = run_one(&Reading, &ruleset(), Mode::Assist, "conv", "computer_windows", &json!({}), "idW",
+                        &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(r["text"], "7: Notes\n9: Inbox (Mail)");
+        let t0 = Instant::now();
+        let w = run_one(&Reading, &ruleset(), Mode::Assist, "conv", "computer_wait", &json!({"seconds": 1}), "idT",
+                        &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(w["ok"], true);
+        assert!(t0.elapsed() >= Duration::from_millis(950), "computer_wait waits");
+        // watch-only sends no input: a hover is declined
+        let m = run_one(&Reading, &ruleset(), Mode::WatchOnly, "conv", "computer_move", &json!({"x": 1, "y": 1}), "idM",
+                        &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        assert_eq!(m["ok"], false);
+        // a drag that ends off the screenshot is refused before it runs
+        let d = run_one(&Reading, &ruleset(), Mode::Assist, "conv", "computer_drag", &json!({"x": 1, "y": 1, "to_x": 5000, "to_y": 1}), "idD",
+                        &mut grants, &mut steps, LIMIT, DEFAULT_DISPLAY, Instant::now(), Instant::now(), &tx).await;
+        assert!(d["text"].as_str().unwrap().contains("outside"), "{}", d["text"]);
     }
 }
