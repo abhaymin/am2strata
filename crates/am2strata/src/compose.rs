@@ -114,9 +114,9 @@ pub fn ass_script(w: u32, h: u32, captions: &[crate::captions::Caption], open: O
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {}\nPlayResY: {}\n\n[V4+ Styles]\nFormat: Name, Fontname, \
          Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, \
          ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Cap,DejaVu Sans,58,&H00FAF8F5,&H00FFFFFF,&H00180A06,&H96180A06,1,0,0,0,100,100,0,0,3,14,0,2,80,80,120,1\n\
-         Style: Word,DejaVu Sans,70,&H00FAF8F5,&H00FFFFFF,&H00180A06,&H96180A06,1,0,0,0,100,100,0,0,3,14,0,5,80,80,0,1\n\
-         Style: Ttl,DejaVu Sans,96,&H00FAF8F5,&H00FFFFFF,&H00180A06,&H96180A06,1,0,0,0,100,100,0,0,3,18,0,5,80,80,0,1\n\n\
+         Style: Cap,DejaVu Sans,58,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,14,0,2,80,80,120,1\n\
+         Style: Word,DejaVu Sans,70,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,14,0,5,80,80,0,1\n\
+         Style: Ttl,DejaVu Sans,96,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,18,0,5,80,80,0,1\n\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
         w, h,
     );
