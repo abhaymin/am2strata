@@ -461,7 +461,7 @@ impl Tab {
 /// In the `connect` mode, a tab the user already has open on a web page and no job holds: the first job works in it, so
 /// the user sees the job where they are looking (and its logins and open dialogs are there) instead of in a new tab.
 async fn adopt_user_tab(run: &mut Running) -> Option<Page> {
-    let targets = run.browser.fetch_targets().await.ok()?;
+    let targets = tokio::time::timeout(Duration::from_secs(5), run.browser.fetch_targets()).await.ok()?.ok()?;
     let held: Vec<String> = run.tabs.iter().map(|(_, t)| t.page.target_id().inner().clone()).collect();
     for t in targets {
         let web = t.url.starts_with("https://") || t.url.starts_with("http://");
@@ -743,6 +743,16 @@ impl Browsers {
 
     async fn ensure(&self) -> Result<(), String> {
         let mut run = self.run.lock().await;
+        // the user's own browser can be closed and started again under us: a connection to one that is gone never
+        // answers (every step would hang), so check it and attach afresh
+        if self.settings.connect.is_some() {
+            if let Some(r) = run.as_ref() {
+                if !tokio::time::timeout(Duration::from_secs(3), r.browser.version()).await.is_ok_and(|v| v.is_ok()) {
+                    tracing::warn!("browser: the user's browser does not answer; attaching again");
+                    *run = None;
+                }
+            }
+        }
         if run.is_some() {
             return Ok(());
         }
@@ -868,7 +878,8 @@ impl Browsers {
             None => {
                 let mut params = chromiumoxide::cdp::browser_protocol::target::CreateTargetParams::new("about:blank");
                 params.browser_context_id = context.clone();
-                run.browser.new_page(params).await.map_err(|e| e.to_string())?
+                tokio::time::timeout(Duration::from_secs(20), run.browser.new_page(params)).await
+                    .map_err(|_| "the browser did not open a tab in 20 s".to_string())?.map_err(|e| e.to_string())?
             }
         };
         // where a page's download lands (a folder, the file name sanitised when placed), or denied so it never reaches here
