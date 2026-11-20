@@ -56,8 +56,10 @@ pub struct Media {
     pub pull_job: std::sync::Mutex<Value>,
     /// the video formats the running engine can encode (its ready event); empty before it started
     pub video_formats: std::sync::Mutex<Vec<String>>,
-    /// the engine was built with CUDA (its ready event)
+    /// the engine was built with a GPU, CUDA or the Mac's Metal (its ready event)
     pub cuda: std::sync::atomic::AtomicBool,
+    /// which GPU the engine drives ("cuda", "metal"), once it has started; None for a CPU-only build or before it ran
+    gpu_kind: std::sync::Mutex<Option<String>>,
     /// the timer that frees the speech models after a while unused (audio_api.rs)
     pub audio_idle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub keep_text_model: bool,
@@ -67,12 +69,20 @@ pub struct Media {
     catalog: std::sync::Mutex<Option<Value>>,
 }
 
-/// The media engine: $AM2STRATA_MEDIA_EXE, else crates/strata-media's release build beside this binary's checkout.
+/// The media engine: $AM2STRATA_MEDIA_EXE, else `am2strata-media` beside this binary, else crates/strata-media's release
+/// build beside this binary's checkout.
 pub fn find_exe() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AM2STRATA_MEDIA_EXE").map(PathBuf::from) {
         return p.is_file().then_some(p);
     }
     let exe = std::env::current_exe().ok()?;
+    // an installed one beside this binary (bin/am2strata-media), then a checkout's release build
+    // (through a symlink like ~/.local/bin/am2strata, to where the binary really is)
+    let real = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    let beside = real.with_file_name(format!("am2strata-media{}", std::env::consts::EXE_SUFFIX));
+    if beside.is_file() {
+        return Some(beside);
+    }
     exe.ancestors().skip(1).take(5).map(|d| d.join("crates/strata-media/target/release/am2strata-media")).find(|p| p.is_file())
 }
 
@@ -95,6 +105,7 @@ impl Media {
             pull_job: std::sync::Mutex::new(json!({"state": "idle"})),
             video_formats: std::sync::Mutex::new(Vec::new()),
             cuda: std::sync::atomic::AtomicBool::new(true),
+            gpu_kind: std::sync::Mutex::new(None),
             audio_idle: std::sync::Mutex::new(None),
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
@@ -165,8 +176,14 @@ impl Media {
             .unwrap_or_else(|| vec!["apng".into(), "gif".into()]);
         *self.video_formats.lock().unwrap() = formats;
         self.cuda.store(v["cuda"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
+        // an older engine names no GPU kind: a GPU build of it was CUDA
+        let kind = v["gpu"].as_str().map(str::to_string).or_else(|| (v["cuda"] == true).then(|| "cuda".to_string()));
+        *self.gpu_kind.lock().unwrap() = kind;
         Ok(Proc { child, stdin, lines, unread: 0, writing: false })
     }
+
+    /// Which GPU the running engine drives: "cuda", "metal", or None (a CPU-only build, or not started yet).
+    pub fn gpu_kind(&self) -> Option<String> { self.gpu_kind.lock().unwrap().clone() }
 
     /// One command; `on_event` sees every event until the one that ends it (done / loaded / pulled / unloaded / error).
     /// The engine's catalog. While a job holds the engine (an image takes minutes), the last catalog is answered at once,
@@ -426,7 +443,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     }
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available",
-                     "image generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+                     format!("image generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
     }
     let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
         return bad("send {\"prompt\": \"...\"}");
@@ -658,7 +675,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !s.media.available() {
         let mut v = base;
         v["models"] = json!([]);
-        v["note"] = json!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+        v["note"] = json!(format!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
         return Json(v).into_response();
     }
     match s.media.list().await {
@@ -885,7 +902,7 @@ async fn video_generations_now(State(s): State<AppState>, headers: HeaderMap, Js
     }
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available",
-                     "video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+                     format!("video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
     }
     // "scenes": [{"prompt", "seconds"}, ...]: one long video, scene after scene, each continued from the one before
     // (the media engine's chain, one stage per clip), made as one job into one file
@@ -1128,3 +1145,6 @@ pub const MAX_CHAIN_FRAMES: u64 = 14_400;
 pub fn video_frame_step(family: &str) -> u64 {
     if family.starts_with("ltx") { 8 } else { 4 }
 }
+
+/// The media engine's GPU feature for this machine: Metal on Apple Silicon, CUDA elsewhere.
+const GPU_FEATURE: &str = if cfg!(target_os = "macos") { "metal" } else { "cuda" };

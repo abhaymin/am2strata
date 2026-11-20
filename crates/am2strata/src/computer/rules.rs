@@ -100,6 +100,10 @@ pub enum Intent {
     Scroll,
     Screenshot,
     Wait,
+    /// moving the pointer (a hover) or bringing a window to the front: input, but nothing is pressed
+    Pointer,
+    /// reading the clipboard (it may hold a password the owner just copied) or setting it
+    Clipboard { read: bool },
 }
 
 /// A browser step's context the rules can use: the site it is on (Strict and Creator differ only on listed sites).
@@ -207,7 +211,11 @@ impl RuleSet {
             // a text, email, or an unguarded password/payment field is ordinary (sign-in detection is separate: check_sign_in)
             Intent::TypeIntoField(FieldKind::Text | FieldKind::Email | FieldKind::Password | FieldKind::Payment) => Decision::Allowed,
             Intent::Click { label, risky } => self.check_click(label, *risky, ctx.site),
-            Intent::Key(_) | Intent::Scroll | Intent::Screenshot | Intent::Wait => Decision::Allowed,
+            // a shortcut that quits, logs out, locks, shuts down or deletes asks first, like a click on "Delete"
+            Intent::Key(keys) if self.ask_send_delete_install_buy_publish && risky_keys(keys) =>
+                Decision::Approval(format!("press {}", keys.join("+"))),
+            Intent::Clipboard { read: true } if self.ask_send_delete_install_buy_publish => Decision::Approval("read the clipboard".into()),
+            Intent::Key(_) | Intent::Scroll | Intent::Screenshot | Intent::Wait | Intent::Pointer | Intent::Clipboard { .. } => Decision::Allowed,
         }
     }
 
@@ -411,14 +419,41 @@ pub fn classify(tool: &str, args: &Value) -> Option<Intent> {
             let text = args["text"].as_str().unwrap_or("");
             Some(Intent::Click { label: if text.is_empty() { None } else { Some(text.to_string()) }, risky: false })
         }
-        "computer_click" => {
+        // a drag is judged by what it starts on (dragging "Delete" or a file onto the Trash's label asks first)
+        "computer_click" | "computer_double_click" | "computer_drag" => {
             let text = args["text"].as_str().or(args["aria"].as_str()).unwrap_or("");
             let label = if text.is_empty() { None } else { Some(text.to_string()) };
-            let risky = label.as_ref().is_some_and(|t| publishing_keyword(t));
+            let risky = label.as_ref().is_some_and(|t| publishing_keyword(t) || t.to_lowercase().contains("trash"));
             Some(Intent::Click { label, risky })
         }
+        "computer_move" | "computer_focus" => Some(Intent::Pointer),
+        "computer_windows" => Some(Intent::Screenshot),
+        "computer_clipboard" => Some(Intent::Clipboard { read: args["text"].as_str().is_none() }),
         _ => None,
     }
+}
+
+/// A key combination that quits an app, closes a window, logs out, locks, shuts down, force-quits or deletes a file
+/// (macOS and Linux / Windows shortcuts alike). The keys are compared without case; "Cmd" and "Super" are one key.
+pub fn risky_keys(keys: &[String]) -> bool {
+    let k: Vec<String> = keys.iter().map(|s| match s.trim().to_lowercase().as_str() {
+        "command" | "meta" | "super" | "win" | "⌘" => "cmd".to_string(),
+        "control" | "⌃" => "ctrl".to_string(),
+        "option" | "opt" | "⌥" => "alt".to_string(),
+        "backspace" => "delete".to_string(),
+        other => other.to_string(),
+    }).collect();
+    let has = |n: &str| k.iter().any(|x| x == n);
+    let main: Vec<&str> = k.iter().map(String::as_str).filter(|x| !matches!(*x, "cmd" | "ctrl" | "alt" | "shift")).collect();
+    let only = |n: &str| main == [n];
+    (has("cmd") && (only("q") || only("w") || only("delete")))            // quit, close, move to Trash
+        || (has("cmd") && has("alt") && only("escape"))                    // Force Quit
+        || (has("ctrl") && has("cmd") && (only("q") || only("power")))     // lock / restart
+        || (has("cmd") && has("shift") && only("q"))                       // log out
+        || (has("alt") && only("f4"))                                       // close (Linux / Windows)
+        || (has("ctrl") && has("alt") && only("delete"))
+        || (has("ctrl") && (only("q") || only("w")) && !has("cmd"))         // quit / close (Linux / Windows)
+        || only("power")
 }
 
 /// `computer_key` accepts either an array of keys (["Ctrl", "a"]) or a single string ("Enter"): return both forms.
@@ -674,5 +709,38 @@ mod tests {
         assert_eq!(protected_hit("cat /srv/prod/app.conf 2>/dev/null", &srv), None, "stderr to /dev/null is fine");
         assert_eq!(protected_hit("ls /srv/prod > /tmp/list", &srv), None, "a redirect onto /tmp is fine");
         assert_eq!(protected_hit("echo x >> /srv/prod/f", &srv), Some("/srv/prod".to_string()), ">> into a protected path is refused");
+    }
+
+    #[test]
+    fn shortcuts_that_quit_log_out_or_delete_ask_first() {
+        let r = strict_apps();
+        let ks = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for risky in [&["Cmd", "q"][..], &["Command", "W"], &["cmd", "Backspace"], &["Cmd", "Option", "Escape"],
+                      &["Ctrl", "Cmd", "q"], &["Cmd", "Shift", "q"], &["Alt", "F4"], &["Ctrl", "Alt", "Delete"], &["Ctrl", "q"]] {
+            assert!(risky_keys(&ks(risky)), "{risky:?} is risky");
+            assert!(matches!(r.check(&Intent::Key(ks(risky)), &Ctx::default(), now(), now()), Decision::Approval(_)), "{risky:?} asks");
+        }
+        for fine in [&["Cmd", "c"][..], &["Cmd", "v"], &["Cmd", "Shift", "t"], &["Enter"], &["Ctrl", "a"], &["Tab"], &["Cmd", "Tab"]] {
+            assert!(!risky_keys(&ks(fine)), "{fine:?} is ordinary");
+            assert_eq!(r.check(&Intent::Key(ks(fine)), &Ctx::default(), now(), now()), Decision::Allowed);
+        }
+    }
+
+    #[test]
+    fn the_new_desktop_steps_are_classified() {
+        let r = strict_apps();
+        assert_eq!(classify("computer_move", &json!({"x": 1, "y": 2})), Some(Intent::Pointer));
+        assert_eq!(classify("computer_focus", &json!({"id": 3})), Some(Intent::Pointer));
+        assert_eq!(classify("computer_windows", &json!({})), Some(Intent::Screenshot));
+        // reading the clipboard asks; setting it does not
+        let read = classify("computer_clipboard", &json!({})).unwrap();
+        assert!(matches!(r.check(&read, &Ctx::default(), now(), now()), Decision::Approval(_)));
+        let write = classify("computer_clipboard", &json!({"text": "x"})).unwrap();
+        assert_eq!(r.check(&write, &Ctx::default(), now(), now()), Decision::Allowed);
+        // a double-click or drag on a labelled "Delete" or "Move to Trash" asks, like a click
+        for tool in ["computer_double_click", "computer_drag"] {
+            let i = classify(tool, &json!({"x": 1, "y": 2, "text": "Move to Trash"})).unwrap();
+            assert!(matches!(r.check(&i, &Ctx::default(), now(), now()), Decision::Approval(_)), "{tool}");
+        }
     }
 }

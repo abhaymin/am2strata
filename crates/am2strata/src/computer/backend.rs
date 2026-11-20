@@ -121,7 +121,28 @@ pub trait Backend {
     fn press_keys(&self, keys: &[Key]) -> Result<(), String>;
     fn scroll(&self, dx: i32, dy: i32) -> Result<(), String>;
     fn open_app(&self, name: &str) -> Result<(), String>;
+
+    // The rest have defaults, so a backend (or a test mock) that lacks one still compiles and refuses it with a clear message.
+
+    /// The screenshot's size, which is also the coordinate system of every x, y the model sends. The sandbox display's own
+    /// size; the Mac's real screen is scaled to fit 1280x800 (its aspect kept), so a click lands where the model saw it.
+    fn size(&self) -> Size { Size::DEFAULT }
+    fn double_click(&self, _x: i32, _y: i32) -> Result<(), String> { Err(NOT_HERE.into()) }
+    /// Press the left button at (x, y), move to (to_x, to_y) and let go: drag a file, a slider, a selection.
+    fn drag(&self, _x: i32, _y: i32, _to_x: i32, _to_y: i32) -> Result<(), String> { Err(NOT_HERE.into()) }
+    /// Move the pointer without clicking (a hover: menus and tooltips that open on it).
+    fn move_mouse(&self, _x: i32, _y: i32) -> Result<(), String> { Err(NOT_HERE.into()) }
+    fn clipboard_get(&self) -> Result<String, String> { Err(NOT_HERE.into()) }
+    fn clipboard_set(&self, _text: &str) -> Result<(), String> { Err(NOT_HERE.into()) }
+    /// The label of the control at (x, y) (its accessibility title or description), when this desktop can read it: the
+    /// rules engine uses it to ask before a click on "Send", "Delete", "Buy" (`engine.rs`). None where it cannot.
+    fn label_at(&self, _x: i32, _y: i32) -> Option<String> { None }
+    /// Whether the focused field is a password field, when this desktop can tell (`no_password_fields`).
+    fn focused_is_secure(&self) -> bool { false }
 }
+
+/// A step this desktop has no way to do yet.
+const NOT_HERE: &str = "this desktop cannot do that step yet";
 
 // -------------------------------------------------------------------------------------------------------------- Linux
 
@@ -194,6 +215,45 @@ mod linux {
                 c.status_checked()?;
             }
             Ok(())
+        }
+
+        fn double_click(&self, x: i32, y: i32) -> Result<(), String> {
+            let disp = self.disp()?;
+            let mut m = dotool("mousemove --sync", &disp)?;
+            m.arg(x.to_string()).arg(y.to_string());
+            m.status_checked()?;
+            let mut c = dotool("click --repeat 2 --delay 80", &disp)?;
+            c.arg("1");
+            c.status_checked()
+        }
+
+        fn drag(&self, x: i32, y: i32, to_x: i32, to_y: i32) -> Result<(), String> {
+            let disp = self.disp()?;
+            let mut m = dotool("mousemove --sync", &disp)?;
+            m.arg(x.to_string()).arg(y.to_string());
+            m.status_checked()?;
+            let mut d = dotool("mousedown", &disp)?;
+            d.arg("1");
+            d.status_checked()?;
+            let mut m2 = dotool("mousemove --sync", &disp)?;
+            m2.arg(to_x.to_string()).arg(to_y.to_string());
+            let moved = m2.status_checked();
+            // let go even when the move failed, so the button is never left held down
+            let mut u = dotool("mouseup", &disp)?;
+            u.arg("1");
+            let up = u.status_checked();
+            moved.and(up)
+        }
+
+        fn move_mouse(&self, x: i32, y: i32) -> Result<(), String> {
+            let disp = self.disp()?;
+            let mut m = dotool("mousemove --sync", &disp)?;
+            m.arg(x.to_string()).arg(y.to_string());
+            m.status_checked()
+        }
+
+        fn size(&self) -> Size {
+            self.desktop.as_ref().map(|d| d.size()).unwrap_or(Size::DEFAULT)
         }
 
         fn open_app(&self, name: &str) -> Result<(), String> {
@@ -416,6 +476,9 @@ mod linux {
         pub fn new(size: Size) -> SandboxDesktop {
             SandboxDesktop { size, inner: std::sync::Mutex::new(State::Idle), last_used: std::sync::Mutex::new(std::time::Instant::now()), stopped: std::sync::atomic::AtomicBool::new(false) }
         }
+
+        /// The display's geometry (the screenshot's coordinate system).
+        pub fn size(&self) -> Size { self.size }
 
         /// The display a step drives, starting Xvfb lazily the first time (item 1) and refreshing the last-used clock.
         pub fn ensure(&self) -> Result<String, String> {

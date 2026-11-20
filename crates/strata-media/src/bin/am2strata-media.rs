@@ -462,7 +462,7 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         st.model = None;
         let device = match cmd["device"].as_str() {
             Some("cpu") => candle_core::Device::Cpu,
-            _ if cfg!(feature = "cuda") => candle_core::Device::new_cuda(cmd["gpu"].as_u64().unwrap_or(0) as usize)?,
+            _ if audio::gpu_kind().is_some() => audio::gpu(cmd["gpu"].as_u64().unwrap_or(0) as usize)?,
             _ => candle_core::Device::Cpu,
         };
         st.song = Some(acestep::pipeline::AceStep::load(&dir, &device)?);
@@ -1054,7 +1054,8 @@ fn main() {
                          #[cfg(feature = "onnx")]
                          chatterbox: None, song: None };
     // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
-    emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION"),
+    // "cuda" is the server's flag for "this engine has a GPU" (the Mac's Metal counts); "gpu" names which
+    emit(json!({"event": "ready", "cuda": audio::gpu_kind().is_some(), "gpu": audio::gpu_kind(), "version": env!("CARGO_PKG_VERSION"),
                 "video_formats": ["mp4", "apng", "gif"]}));
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };

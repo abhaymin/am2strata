@@ -174,6 +174,11 @@ impl AceStep {
         let src = match &plan {
             Some(sampling) => {
                 let codes = self.plan(s, sampling, secs, &mut |i, _| on_step(i, total))?;
+                // on a Mac the GPU shares the 16 GB or so with everything else: the planner's 3.4 GB go back once its
+                // codes are made, so the diffusion and the decoder have room (it loads again, from disk, next song)
+                if self.device.is_metal() {
+                    self.planner = None;
+                }
                 self.detok.hints(&codes, self.dtype, &self.device)?.narrow(1, 0, frames)?
             }
             None => self.silence.narrow(1, 0, frames)?,
@@ -192,17 +197,22 @@ impl AceStep {
     /// Stereo audio [2, samples] at 48 kHz from a latent [1, frames, 64], decoded in overlapping chunks (so a 10-minute
     /// song does not need the whole decoder in memory at once).
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
-        const CHUNK: usize = 128;
         const OVERLAP: usize = 16;
+        // smaller chunks on a Mac, whose GPU shares its memory with the rest of the machine
+        let chunk: usize = if self.device.is_metal() { 48 } else { 128 };
         let z = latent.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
         let frames = z.dim(2)?;
         let mut parts = Vec::new();
         let mut start = 0;
         while start < frames {
-            let end = (start + CHUNK).min(frames);
+            let end = (start + chunk).min(frames);
             let (a, b) = (start.saturating_sub(OVERLAP), (end + OVERLAP).min(frames));
             let audio = self.vae.decode(&z.narrow(2, a, b - a)?)?;
-            parts.push(audio.narrow(2, (start - a) * oobleck::HOP, (end - start) * oobleck::HOP)?);
+            let part = audio.narrow(2, (start - a) * oobleck::HOP, (end - start) * oobleck::HOP)?;
+            // on a Mac each chunk comes back to the CPU before the next starts: Metal runs ahead otherwise, holding every
+            // chunk's working buffers at once (the out-of-memory error came only at the end, after all of them)
+            parts.push(if self.device.is_metal() { part.to_device(&Device::Cpu)? } else { part });
+            if std::env::var_os("ACESTEP_TRACE").is_some() { eprintln!("decoded frames {a}..{b} of {frames}"); }
             start = end;
         }
         Ok(Tensor::cat(&parts, 2)?.squeeze(0)?)
@@ -312,6 +322,7 @@ impl AceStep {
 
     pub fn song(&mut self, s: &Song, on_step: &mut dyn FnMut(usize, usize)) -> Result<Tensor> {
         let latent = self.latent(s, on_step)?;
+        if std::env::var_os("ACESTEP_TRACE").is_some() { eprintln!("latent {:?}", latent.shape()); }
         self.decode(&latent)
     }
 }
